@@ -452,6 +452,31 @@ fn is_managed_sse(algorithm: &ServerSideEncryption) -> bool {
     matches!(algorithm.as_str(), "AES256" | "aws:kms")
 }
 
+/// Validate object key for control characters and log special characters
+///
+/// This function:
+/// 1. Rejects keys containing control characters (null bytes, newlines, carriage returns)
+/// 2. Logs debug information for keys containing spaces, plus signs, or percent signs
+///
+/// The s3s library handles URL decoding, so keys are already decoded when they reach this function.
+/// This validation ensures that invalid characters that could cause issues are rejected early.
+fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
+    // Validate object key doesn't contain control characters
+    if key.contains(['\0', '\n', '\r']) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("Object key contains invalid control characters: {:?}", key),
+        ));
+    }
+
+    // Log debug info for keys with special characters to help diagnose encoding issues
+    if key.contains([' ', '+', '%']) {
+        debug!("{} object with special characters in key: {:?}", operation, key);
+    }
+
+    Ok(())
+}
+
 impl FS {
     pub fn new() -> Self {
         // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
@@ -778,6 +803,10 @@ impl S3 for FS {
                 version_id,
             } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
         };
+
+        // Validate both source and destination keys
+        validate_object_key(&src_key, "COPY (source)")?;
+        validate_object_key(&key, "COPY (dest)")?;
 
         // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
 
@@ -1229,6 +1258,9 @@ impl S3 for FS {
         let DeleteObjectInput {
             bucket, key, version_id, ..
         } = req.input.clone();
+
+        // Validate object key
+        validate_object_key(&key, "DELETE")?;
 
         let replica = req
             .headers
@@ -1691,6 +1723,9 @@ impl S3 for FS {
             range,
             ..
         } = req.input.clone();
+
+        // Validate object key
+        validate_object_key(&key, "GET")?;
 
         // Try to get from cache for small, frequently accessed objects
         let manager = get_concurrency_manager();
@@ -2237,6 +2272,7 @@ impl S3 for FS {
             content_length: Some(response_content_length),
             last_modified,
             content_type,
+            content_encoding: info.content_encoding.clone(),
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
@@ -2314,6 +2350,9 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
+        // Validate object key
+        validate_object_key(&key, "HEAD")?;
+
         let part_number = part_number.map(|v| v as usize);
 
         if let Some(part_num) = part_number {
@@ -2350,8 +2389,10 @@ impl S3 for FS {
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         if let Some(match_etag) = if_none_match {
-            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
+            if let Some(strong_etag) = match_etag.as_strong() {
+                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
+                    return Err(S3Error::new(S3ErrorCode::NotModified));
+                }
             }
         }
 
@@ -2366,8 +2407,10 @@ impl S3 for FS {
         }
 
         if let Some(match_etag) = if_match {
-            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            if let Some(strong_etag) = match_etag.as_strong() {
+                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
+                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+                }
             }
         } else if let Some(unmodified_since) = if_unmodified_since {
             if info.mod_time.is_some_and(|mod_time| {
@@ -2456,6 +2499,7 @@ impl S3 for FS {
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
+            content_encoding: info.content_encoding.clone(),
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&metadata_map),
@@ -2583,6 +2627,12 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
+
+        // Log debug info for prefixes with special characters to help diagnose encoding issues
+        if prefix.contains([' ', '+', '%', '\n', '\r', '\0']) {
+            debug!("LIST objects with special characters in prefix: {:?}", prefix);
+        }
+
         let max_keys = max_keys.unwrap_or(1000);
         if max_keys < 0 {
             return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
@@ -2806,6 +2856,9 @@ impl S3 for FS {
             ..
         } = input;
 
+        // Validate object key
+        validate_object_key(&key, "PUT")?;
+
         if if_match.is_some() || if_none_match.is_some() {
             let Some(store) = new_object_layer_fn() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2815,13 +2868,17 @@ impl S3 for FS {
                 Ok(info) => {
                     if !info.delete_marker {
                         if let Some(ifmatch) = if_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
+                            if let Some(strong_etag) = ifmatch.as_strong() {
+                                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                         if let Some(ifnonematch) = if_none_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
+                            if let Some(strong_etag) = ifnonematch.as_strong() {
+                                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                     }
@@ -3614,7 +3671,12 @@ impl S3 for FS {
         // Validate copy conditions (simplified for now)
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
-                if etag != &if_match {
+                if let Some(strong_etag) = if_match.as_strong() {
+                    if etag != strong_etag {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
+                } else {
+                    // Weak ETag in If-Match should fail
                     return Err(s3_error!(PreconditionFailed));
                 }
             } else {
@@ -3624,9 +3686,12 @@ impl S3 for FS {
 
         if let Some(if_none_match) = copy_source_if_none_match {
             if let Some(ref etag) = src_info.etag {
-                if etag == &if_none_match {
-                    return Err(s3_error!(PreconditionFailed));
+                if let Some(strong_etag) = if_none_match.as_strong() {
+                    if etag == strong_etag {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
                 }
+                // Weak ETag in If-None-Match is ignored (doesn't match)
             }
         }
 
@@ -3898,19 +3963,23 @@ impl S3 for FS {
                 Ok(info) => {
                     if !info.delete_marker {
                         if let Some(ifmatch) = if_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
+                            if let Some(strong_etag) = ifmatch.as_strong() {
+                                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                         if let Some(ifnonematch) = if_none_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
+                            if let Some(strong_etag) = ifnonematch.as_strong() {
+                                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                     }
                 }
                 Err(err) => {
-                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                         return Err(ApiError::from(err).into());
                     }
 
@@ -4479,18 +4548,16 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
-            Ok((cfg, _)) => Some(cfg.rules),
+            Ok((cfg, _)) => cfg.rules,
             Err(_err) => {
-                // if BucketMetadataError::BucketLifecycleNotFound.is(&err) {
-                //     return Err(s3_error!(NoSuchLifecycleConfiguration));
-                // }
-                // warn!("get_lifecycle_config err {:?}", err);
-                None
+                // Return NoSuchLifecycleConfiguration error as expected by S3 clients
+                // This fixes issue #990 where Ansible S3 roles fail with KeyError: 'Rules'
+                return Err(s3_error!(NoSuchLifecycleConfiguration));
             }
         };
 
         Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
-            rules,
+            rules: Some(rules),
             ..Default::default()
         }))
     }
