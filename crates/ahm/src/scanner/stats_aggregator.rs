@@ -351,7 +351,8 @@ impl DecentralizedStatsAggregator {
 
         // update cache
         *self.cached_stats.write().await = Some(aggregated.clone());
-        *self.cache_timestamp.write().await = aggregation_timestamp;
+        // Use the time when aggregation completes as cache timestamp to avoid premature expiry during long runs
+        *self.cache_timestamp.write().await = SystemTime::now();
 
         Ok(aggregated)
     }
@@ -363,7 +364,8 @@ impl DecentralizedStatsAggregator {
 
         // update cache
         *self.cached_stats.write().await = Some(aggregated.clone());
-        *self.cache_timestamp.write().await = now;
+        // Cache timestamp should reflect completion time rather than aggregation start
+        *self.cache_timestamp.write().await = SystemTime::now();
 
         Ok(aggregated)
     }
