@@ -13,24 +13,32 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 
 | parameter | description | default value |
 | -- | -- | -- |
-| replicaCount   | Number of cluster nodes.   |  Default is `4`. |
-| mode.standalone.enabled | RustFS standalone mode support, namely one pod one pvc. | Default is `false` |
-| mode.distributed.enabled | RustFS distributed mode support, namely multiple pod multiple pvc. | Default is `true`. |
-| image.repository  | docker image repository.   |  rustfs/rustfs.  |
-| image.tag | the tag for rustfs docker image | "latest" |
-| secret.rustfs.access_key | RustFS Access Key ID | `rustfsadmin` |
-| secret.rustfs.secret_key | RustFS Secret Key ID | `rustfsadmin` |
-| storageclass.name | The name for StorageClass. | `local-path` |
-| storageclass.dataStorageSize | The storage size for data PVC. | `256Mi` |
-| storageclass.logStorageSize | The storage size for log PVC. | `256Mi` |
-| ingress.className | Specify the ingress class, traefik or nginx. | `nginx` |
+| replicaCount                      | Number of cluster nodes.                                           |  `4`.           |
+| imagePullSecrets                  | Secret to pull image from private registry.                        | `rustfs-regcred`|
+| imageRegistryCredentials.enabled  | To indicate whether pull image from private registry.              | `false`         |
+| imageRegistryCredentials.registry | Private registry url to pull rustfs image.                         | None            |
+| imageRegistryCredentials.username | The username to pull rustfs image from private registry.           | None            |
+| imageRegistryCredentials.password | The password to pull rustfs image from private registry.           | None            |
+| imageRegistryCredentials.email    | The email to pull rustfs image from private registry.              | None            |
+| mode.standalone.enabled           | RustFS standalone mode support, namely one pod one pvc.            | `false`         |
+| mode.distributed.enabled          | RustFS distributed mode support, namely multiple pod multiple pvc. | `true`          |
+| image.repository                  | RustFS docker image repository.                                    | `rustfs/rustfs` |
+| image.tag                         | The tag for rustfs docker image                                    | `latest`        |
+| secret.rustfs.access_key          | RustFS Access Key ID                                               | `rustfsadmin`   |
+| secret.rustfs.secret_key          | RustFS Secret Key ID                                               | `rustfsadmin`   |
+| storageclass.name                 | The name for StorageClass.                                         | `local-path`    |
+| storageclass.dataStorageSize      | The storage size for data PVC.                                     | `256Mi`         |
+| storageclass.logStorageSize       | The storage size for log PVC.                                      | `256Mi`         |
+| ingress.className                 | Specify the ingress class, traefik or nginx.                       | `nginx`         |
 
 
-**NOTE**: [`local-path`](https://github.com/rancher/local-path-provisioner) is used by k3s. If you want to use `local-path`, running the command,
+**NOTE**: 
 
-```
-kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.32/deploy/local-path-storage.yaml
-```
+- The chart default pull rustfs image from dockerhub,if your rustfs image stores in private registry,you should enable `imageRegistryCredentials.enabled` to `true`,and then specify the `imageRegistryCredentials.registry/username/password/email` as well as `image.repository`,`image.tag` to pull rustfs image from your private registry.
+
+- The default storageclass is [`local-path`](https://github.com/rancher/local-path-provisioner),if you want to specify your own storageclass, try to set parameter `storageclass.name`.
+
+- The default size for data and logs dir is **256Mi** which must satisfy the production usage,you should specify `storageclass.dataStorageSize` and `storageclass.logStorageSize` to change the size, for example, 1Ti for data and  1Gi for logs.
 
 # Installation
 
@@ -41,7 +49,7 @@ kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisione
 
 Due to the traefik and ingress has different session sticky/affinity annotations, and rustfs support both those two controller, you should specify parameter `ingress.className` to select the right one which suits for you.
 
-## Installation with traekfik controller
+## Installation with traefik controller
 
 If your ingress class is `traefik`, running the command:
 

@@ -20,6 +20,7 @@ use crate::auth::{check_key_valid, get_session_token};
 use base64::Engine;
 use hyper::{HeaderMap, StatusCode};
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{get_global_encryption_service, types::*};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
@@ -131,7 +132,7 @@ impl Operation for CreateKeyHandler {
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -325,7 +326,7 @@ impl Operation for GenerateDataKeyHandler {
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
