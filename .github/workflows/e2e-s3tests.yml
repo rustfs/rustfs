@@ -121,6 +121,25 @@ jobs:
             -d '{"secretKey":"'"${S3_ALT_SECRET_KEY}"'","status":"enabled","policy":"readwrite"}' \
             "http://127.0.0.1:9000/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}"
 
+          # Explicitly attach built-in policy via policy mapping.
+          # s3-tests relies on alt client being able to ListBuckets during setup cleanup.
+          awscurl \
+            --service s3 \
+            --region "${S3_REGION}" \
+            --access_key "${S3_ACCESS_KEY}" \
+            --secret_key "${S3_SECRET_KEY}" \
+            -X PUT \
+            "http://127.0.0.1:9000/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${S3_ALT_ACCESS_KEY}&isGroup=false"
+
+          # Sanity check: alt user can list buckets (should not be AccessDenied).
+          awscurl \
+            --service s3 \
+            --region "${S3_REGION}" \
+            --access_key "${S3_ALT_ACCESS_KEY}" \
+            --secret_key "${S3_ALT_SECRET_KEY}" \
+            -X GET \
+            "http://127.0.0.1:9000/" >/dev/null
+
       - name: Prepare s3-tests
         run: |
           python3 -m pip install --user --upgrade pip tox
@@ -320,6 +339,22 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"secretKey":"'"${S3_ALT_SECRET_KEY}"'","status":"enabled","policy":"readwrite"}' \
             "http://127.0.0.1:9000/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}"
+
+          awscurl \
+            --service s3 \
+            --region "${S3_REGION}" \
+            --access_key "${S3_ACCESS_KEY}" \
+            --secret_key "${S3_SECRET_KEY}" \
+            -X PUT \
+            "http://127.0.0.1:9000/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${S3_ALT_ACCESS_KEY}&isGroup=false"
+
+          awscurl \
+            --service s3 \
+            --region "${S3_REGION}" \
+            --access_key "${S3_ALT_ACCESS_KEY}" \
+            --secret_key "${S3_ALT_SECRET_KEY}" \
+            -X GET \
+            "http://127.0.0.1:9000/" >/dev/null
 
       - name: Prepare s3-tests
         run: |
