@@ -84,13 +84,11 @@ impl FuncKeyValue<StringFuncValue> {
             .iter()
             .map(|c| {
                 let mut c = Cow::from(c);
-                // 处理AWS策略变量
                 if let Some(vars) = aws_variables {
                     let resolved = resolve_aws_variables(&c, vars);
                     c = Cow::Owned(resolved);
                 }
 
-                // 处理现有条件变量
                 for key in KeyName::COMMON_KEYS {
                     match values.get(key.name()).and_then(|x| x.first()) {
                         Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
