@@ -552,7 +552,7 @@ mod test {
         conditions.insert("username".to_string(), vec!["testuser".to_string()]);
 
         let args = Args {
-            account: "otheruser", 
+            account: "otheruser",
             groups: &None,
             action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
             bucket: "testuser-bucket",
