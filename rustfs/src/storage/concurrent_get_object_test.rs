@@ -532,6 +532,8 @@ mod tests {
     /// Test advanced buffer sizing with file patterns
     #[tokio::test]
     async fn test_advanced_buffer_sizing() {
+        crate::storage::concurrency::reset_active_get_requests();
+
         let base_buffer = 256 * KI_B; // 256KB base
 
         // Test small file optimization

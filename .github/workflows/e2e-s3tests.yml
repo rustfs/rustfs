@@ -1,0 +1,296 @@
+name: e2e-s3tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/e2e-s3tests.yml"
+      - ".github/s3tests/**"
+      - "Dockerfile.source"
+      - "entrypoint.sh"
+      - "rustfs/**"
+      - "crates/**"
+  workflow_dispatch:
+    inputs:
+      run-multi:
+        description: "Run multi-node s3-tests as well"
+        required: false
+        default: "false"
+
+env:
+  S3_ACCESS_KEY: rustfsadmin
+  S3_SECRET_KEY: rustfsadmin
+  RUST_LOG: info
+  PLATFORM: linux/amd64
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  s3tests-single:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build RustFS image (source)
+        run: |
+          DOCKER_BUILDKIT=1 docker buildx build --load \
+            --platform ${PLATFORM} \
+            -t rustfs-ci \
+            -f Dockerfile.source .
+
+      - name: Create network
+        run: docker network inspect rustfs-net >/dev/null 2>&1 || docker network create rustfs-net
+
+      - name: Remove existing rustfs-single (if any)
+        run: docker rm -f rustfs-single >/dev/null 2>&1 || true
+
+      - name: Start single RustFS
+        run: |
+          docker run -d --name rustfs-single \
+            --network rustfs-net \
+            -e RUSTFS_ADDRESS=0.0.0.0:9000 \
+            -e RUSTFS_ACCESS_KEY=$S3_ACCESS_KEY \
+            -e RUSTFS_SECRET_KEY=$S3_SECRET_KEY \
+            -e RUSTFS_VOLUMES="/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3" \
+            -v /tmp/rustfs-single:/data \
+            rustfs-ci
+
+      - name: Wait for RustFS ready
+        run: |
+          for i in {1..30}; do
+            if docker run --rm --network rustfs-net curlimages/curl:latest \
+              -sf http://rustfs-single:9000/health >/dev/null 2>&1; then
+              echo "RustFS is ready"
+              exit 0
+            fi
+
+            if [ "$(docker inspect -f '{{.State.Running}}' rustfs-single 2>/dev/null)" != "true" ]; then
+              echo "RustFS container not running" >&2
+              docker logs rustfs-single || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "Health check failed; container is running, proceeding with caution" >&2
+          docker logs rustfs-single || true
+
+      - name: Prepare s3-tests
+        run: |
+          python3 -m pip install --user --upgrade pip tox
+          export PATH="$HOME/.local/bin:$PATH"
+          git clone --depth 1 https://github.com/ceph/s3-tests.git s3-tests
+
+      - name: Generate s3tests config
+        run: |
+          export S3_HOST=rustfs-single
+          envsubst < .github/s3tests/s3tests.conf > s3tests.conf
+          echo "Generated s3tests.conf:"
+          cat s3tests.conf
+
+      - name: Run ceph s3-tests (S3-compatible subset)
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p artifacts/s3tests-single
+          cd s3-tests
+
+          # Check available test directories
+          echo "Available test directories:"
+          ls -la s3tests*/functional/ 2>/dev/null || echo "No s3tests directories found"
+
+          # Use s3tests_boto3 if available, fallback to s3tests
+          if [ -f "s3tests_boto3/functional/test_s3.py" ]; then
+            TEST_FILE="s3tests_boto3/functional/test_s3.py"
+          else
+            TEST_FILE="s3tests/functional/test_s3.py"
+          fi
+          echo "Using test file: $TEST_FILE"
+
+          S3TEST_CONF=${GITHUB_WORKSPACE}/s3tests.conf \
+            tox -- \
+              -v \
+              --tb=short \
+              --junitxml=${GITHUB_WORKSPACE}/artifacts/s3tests-single/junit.xml \
+              "$TEST_FILE" \
+              -k 'not lifecycle and not versioning and not website and not logging and not encryption'
+
+      - name: Collect RustFS logs
+        if: always()
+        run: |
+          mkdir -p artifacts/rustfs-single
+          docker logs rustfs-single > artifacts/rustfs-single/rustfs.log 2>&1 || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3tests-single
+          path: artifacts/**
+
+  s3tests-multi:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run-multi == 'true'
+    needs: s3tests-single
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build RustFS image (source)
+        run: |
+          DOCKER_BUILDKIT=1 docker buildx build --load \
+            --platform ${PLATFORM} \
+            -t rustfs-ci \
+            -f Dockerfile.source .
+
+      - name: Prepare cluster compose
+        run: |
+          cat > compose.yml <<'EOF'
+          services:
+            rustfs1:
+              image: rustfs-ci
+              hostname: rustfs1
+              networks: [rustfs-net]
+              environment:
+                RUSTFS_ADDRESS: "0.0.0.0:9000"
+                RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
+                RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
+                RUSTFS_VOLUMES: "/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3"
+              volumes:
+                - rustfs1-data:/data
+            rustfs2:
+              image: rustfs-ci
+              hostname: rustfs2
+              networks: [rustfs-net]
+              environment:
+                RUSTFS_ADDRESS: "0.0.0.0:9000"
+                RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
+                RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
+                RUSTFS_VOLUMES: "/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3"
+              volumes:
+                - rustfs2-data:/data
+            rustfs3:
+              image: rustfs-ci
+              hostname: rustfs3
+              networks: [rustfs-net]
+              environment:
+                RUSTFS_ADDRESS: "0.0.0.0:9000"
+                RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
+                RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
+                RUSTFS_VOLUMES: "/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3"
+              volumes:
+                - rustfs3-data:/data
+            rustfs4:
+              image: rustfs-ci
+              hostname: rustfs4
+              networks: [rustfs-net]
+              environment:
+                RUSTFS_ADDRESS: "0.0.0.0:9000"
+                RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
+                RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
+                RUSTFS_VOLUMES: "/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3"
+              volumes:
+                - rustfs4-data:/data
+            lb:
+              image: haproxy:2.9
+              hostname: lb
+              networks: [rustfs-net]
+              ports:
+                - "9000:9000"
+              volumes:
+                - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+          networks:
+            rustfs-net:
+              name: rustfs-net
+          volumes:
+            rustfs1-data:
+            rustfs2-data:
+            rustfs3-data:
+            rustfs4-data:
+          EOF
+
+          cat > haproxy.cfg <<'EOF'
+          defaults
+            mode http
+            timeout connect 5s
+            timeout client  30s
+            timeout server  30s
+
+          frontend fe_s3
+            bind *:9000
+            default_backend be_s3
+
+          backend be_s3
+            balance roundrobin
+            server s1 rustfs1:9000 check
+            server s2 rustfs2:9000 check
+            server s3 rustfs3:9000 check
+            server s4 rustfs4:9000 check
+          EOF
+
+      - name: Launch cluster
+        run: docker compose -f compose.yml up -d
+
+      - name: Wait for LB ready
+        run: |
+          for i in {1..60}; do
+            if docker run --rm --network rustfs-net curlimages/curl \
+              -sf http://lb:9000/health >/dev/null 2>&1; then
+              echo "Load balancer is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "LB or backend not ready" >&2
+          docker compose -f compose.yml logs --tail=200 || true
+          exit 1
+
+      - name: Generate s3tests config
+        run: |
+          export S3_HOST=lb
+          envsubst < .github/s3tests/s3tests.conf > s3tests.conf
+          echo "Generated s3tests.conf:"
+          cat s3tests.conf
+
+      - name: Run ceph s3-tests (multi, S3-compatible subset)
+        run: |
+          mkdir -p artifacts/s3tests-multi
+          docker run --rm --network rustfs-net \
+            --platform ${PLATFORM} \
+            -e S3TEST_CONF=/tmp/s3tests.conf \
+            -v ${GITHUB_WORKSPACE}/s3tests.conf:/tmp/s3tests.conf:ro \
+            -v ${GITHUB_WORKSPACE}/artifacts/s3tests-multi:/mnt/logs \
+            quay.io/ceph/s3-tests:latest \
+            bash -c '
+              if [ -f "s3tests_boto3/functional/test_s3.py" ]; then
+                TEST_FILE="s3tests_boto3/functional/test_s3.py"
+              else
+                TEST_FILE="s3tests/functional/test_s3.py"
+              fi
+              echo "Using test file: $TEST_FILE"
+              pytest -v --tb=short \
+                --junitxml=/mnt/logs/junit.xml \
+                "$TEST_FILE" \
+                -k "not lifecycle and not versioning and not website and not logging and not encryption"
+            '
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p artifacts/cluster
+          docker compose -f compose.yml logs --no-color > artifacts/cluster/cluster.log 2>&1 || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3tests-multi
+          path: artifacts/**

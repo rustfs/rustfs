@@ -13,6 +13,8 @@ elif [ "${1#-}" != "$1" ]; then
 elif [ "$1" = "rustfs" ]; then
   shift
   set -- /usr/bin/rustfs "$@"
+elif [ "$1" = "/usr/bin/rustfs" ]; then
+  : # already normalized
 elif [ "$1" = "cargo" ]; then
   : # Pass through cargo command as-is
 else
