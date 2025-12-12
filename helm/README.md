@@ -38,7 +38,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 
 - The default storageclass is [`local-path`](https://github.com/rancher/local-path-provisioner),if you want to specify your own storageclass, try to set parameter `storageclass.name`.
 
-- The default size for data and logs dir is **256Mi** which must staisfy the production useage,you should specify `storageclass.dataStorageSize` and `storageclass.logStorageSize` to change the size, for example, 1Ti for data and  1Gi for logs.
+- The default size for data and logs dir is **256Mi** which must satisfy the production usage,you should specify `storageclass.dataStorageSize` and `storageclass.logStorageSize` to change the size, for example, 1Ti for data and  1Gi for logs.
 
 # Installation
 
