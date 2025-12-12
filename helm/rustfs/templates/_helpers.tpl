@@ -89,12 +89,13 @@ Return the default imagePullSecret name
 {{- end }}
 
 {{/*
-Render imagePullSecrets for workloads
+Render imagePullSecrets for workloads - appends registry secret
 */}}
 {{- define "chart.imagePullSecrets" -}}
-{{- if .Values.imagePullSecrets }}
-{{- toYaml .Values.imagePullSecrets }}
-{{- else if .Values.imageRegistryCredentials.enabled }}
-- name: {{ include "rustfs.imagePullSecret.name" . }}
+{{- $secrets := .Values.imagePullSecrets | default list }}
+{{- if .Values.imageRegistryCredentials.enabled }}
+{{- $secrets = append $secrets (dict "name" (include "rustfs.imagePullSecret.name" .)) }}
 {{- end }}
+{{- toYaml $secrets }}
 {{- end }}
+
