@@ -2773,7 +2773,7 @@ impl S3 for FS {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.size),
-                    version_id: v.version_id.map(|v| v.to_string()),
+                    version_id: Some(v.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
                     is_latest: Some(v.is_latest),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
                     ..Default::default() // TODO: another fields
@@ -2795,7 +2795,7 @@ impl S3 for FS {
             .filter(|o| o.delete_marker)
             .map(|o| DeleteMarkerEntry {
                 key: Some(o.name.clone()),
-                version_id: o.version_id.map(|v| v.to_string()),
+                version_id: Some(o.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
                 is_latest: Some(o.is_latest),
                 last_modified: o.mod_time.map(Timestamp::from),
                 ..Default::default()
