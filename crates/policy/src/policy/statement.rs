@@ -15,6 +15,7 @@
 use super::{
     ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, ID, Principal, ResourceSet, Validator,
     action::Action,
+    variables::{create_aws_variables_map},
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,26 @@ impl Statement {
     }
 
     pub fn is_allowed(&self, args: &Args) -> bool {
+        let principal_type = if args.claims.contains_key("roleArn") {
+            "AssumedRole"
+        } else if args.account == "root" || args.account == "admin" {
+            "Account"
+        } else {
+            "User"
+        };
+        
+        let username = args.conditions.get("username")
+            .and_then(|v| v.first())
+            .map(|s| s.as_str())
+            .unwrap_or(args.account);
+
+        let userid = args.conditions.get("userid")
+            .and_then(|v| v.first())
+            .map(|s| s.as_str())
+            .unwrap_or(args.account);
+
+        let aws_variables = create_aws_variables_map(username, userid, principal_type);
+
         let check = 'c: {
             if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
                 break 'c false;
@@ -86,14 +107,14 @@ impl Statement {
             }
 
             if self.is_kms() && (resource == "/" || self.resources.is_empty()) {
-                break 'c self.conditions.evaluate(args.conditions);
+                break 'c self.conditions.evaluate(args.conditions, Some(&aws_variables));
             }
 
-            if !self.resources.is_match(&resource, args.conditions) && !self.is_admin() && !self.is_sts() {
+            if !self.resources.is_match(&resource, args.conditions, Some(&aws_variables)) && !self.is_admin() && !self.is_sts() {
                 break 'c false;
             }
 
-            self.conditions.evaluate(args.conditions)
+            self.conditions.evaluate(args.conditions, Some(&aws_variables))
         };
 
         self.effect.is_allowed(check)
@@ -176,15 +197,15 @@ impl BPStatement {
                 resource.push('/');
             }
 
-            if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions) {
+            if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions, None) {
                 break 'c false;
             }
 
-            if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions) {
+            if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions, None) {
                 break 'c false;
             }
 
-            self.conditions.evaluate(args.conditions)
+            self.conditions.evaluate(args.conditions, None)
         };
 
         self.effect.is_allowed(check)

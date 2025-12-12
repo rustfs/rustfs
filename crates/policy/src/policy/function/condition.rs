@@ -106,16 +106,16 @@ impl Condition {
         }
     }
 
-    pub fn evaluate(&self, for_all: bool, values: &HashMap<String, Vec<String>>) -> bool {
+    pub fn evaluate(&self, for_all: bool, values: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
         use Condition::*;
 
         let r = match self {
-            StringEquals(s) => s.evaluate(for_all, false, false, false, values),
-            StringNotEquals(s) => s.evaluate(for_all, false, false, true, values),
-            StringEqualsIgnoreCase(s) => s.evaluate(for_all, true, false, false, values),
-            StringNotEqualsIgnoreCase(s) => s.evaluate(for_all, true, false, true, values),
-            StringLike(s) => s.evaluate(for_all, false, true, false, values),
-            StringNotLike(s) => s.evaluate(for_all, false, true, true, values),
+            StringEquals(s) => s.evaluate(for_all, false, false, false, values, aws_variables),
+            StringNotEquals(s) => s.evaluate(for_all, false, false, true, values, aws_variables),
+            StringEqualsIgnoreCase(s) => s.evaluate(for_all, true, false, false, values, aws_variables),
+            StringNotEqualsIgnoreCase(s) => s.evaluate(for_all, true, false, true, values, aws_variables),
+            StringLike(s) => s.evaluate(for_all, false, true, false, values, aws_variables),
+            StringNotLike(s) => s.evaluate(for_all, false, true, true, values, aws_variables),
             BinaryEquals(s) => s.evaluate(values),
             IpAddress(s) => s.evaluate(values),
             NotIpAddress(s) => s.evaluate(values),

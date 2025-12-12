@@ -24,6 +24,7 @@ use crate::policy::utils::wildcard;
 use serde::{Deserialize, Deserializer, Serialize, de, ser::SerializeSeq};
 
 use super::{func::InnerFunc, key_name::KeyName};
+use crate::policy::variables::resolve_aws_variables;
 
 pub type StringFunc = InnerFunc<StringFuncValue>;
 
@@ -35,12 +36,13 @@ impl StringFunc {
         like: bool,
         negate: bool,
         values: &HashMap<String, Vec<String>>,
+        aws_variables: Option<&HashMap<String, String>>,
     ) -> bool {
         for inner in self.0.iter() {
             let result = if like {
-                inner.eval_like(for_all, values) ^ negate
+                inner.eval_like(for_all, values, aws_variables) ^ negate
             } else {
-                inner.eval(for_all, ignore_case, values) ^ negate
+                inner.eval(for_all, ignore_case, values, aws_variables) ^ negate
             };
 
             if !result {
@@ -53,7 +55,7 @@ impl StringFunc {
 }
 
 impl FuncKeyValue<StringFuncValue> {
-    fn eval(&self, for_all: bool, ignore_case: bool, values: &HashMap<String, Vec<String>>) -> bool {
+    fn eval(&self, for_all: bool, ignore_case: bool, values: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
         let rvalues = values
             // http.CanonicalHeaderKey ?
             .get(self.key.name().as_str())
@@ -76,6 +78,13 @@ impl FuncKeyValue<StringFuncValue> {
             .iter()
             .map(|c| {
                 let mut c = Cow::from(c);
+                // 处理AWS策略变量
+                if let Some(vars) = aws_variables {
+                    let resolved = resolve_aws_variables(&c, vars);
+                    c = Cow::Owned(resolved);
+                }
+
+                // 处理现有条件变量
                 for key in KeyName::COMMON_KEYS {
                     match values.get(key.name()).and_then(|x| x.first()) {
                         Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
@@ -97,7 +106,7 @@ impl FuncKeyValue<StringFuncValue> {
         }
     }
 
-    fn eval_like(&self, for_all: bool, values: &HashMap<String, Vec<String>>) -> bool {
+    fn eval_like(&self, for_all: bool, values: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
         if let Some(rvalues) = values.get(self.key.name().as_str()) {
             for v in rvalues.iter() {
                 let matched = self
@@ -106,6 +115,11 @@ impl FuncKeyValue<StringFuncValue> {
                     .iter()
                     .map(|c| {
                         let mut c = Cow::from(c);
+                        if let Some(vars) = aws_variables {
+                            let resolved = resolve_aws_variables(&c, vars);
+                            c = Cow::Owned(resolved);
+                        }
+                        
                         for key in KeyName::COMMON_KEYS {
                             match values.get(key.name()).and_then(|x| x.first()) {
                                 Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
@@ -282,6 +296,7 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
                 .collect(),
+            None,
         );
 
         result ^ negate
@@ -386,6 +401,7 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
                 .collect(),
+            None,
         );
 
         result ^ negate

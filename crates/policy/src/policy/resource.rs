@@ -24,15 +24,16 @@ use super::{
     Error as IamError, Validator,
     function::key_name::KeyName,
     utils::{path, wildcard},
+    variables::resolve_aws_variables,
 };
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ResourceSet(pub HashSet<Resource>);
 
 impl ResourceSet {
-    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
+    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
         for re in self.0.iter() {
-            if re.is_match(resource, conditions) {
+            if re.is_match(resource, conditions, aws_variables) {
                 return true;
             }
         }
@@ -85,11 +86,16 @@ pub enum Resource {
 impl Resource {
     pub const S3_PREFIX: &'static str = "arn:aws:s3:::";
 
-    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
+    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
         let mut pattern = match self {
             Resource::S3(s) => s.to_owned(),
             Resource::Kms(s) => s.to_owned(),
         };
+
+        if let Some(vars) = aws_variables {
+            pattern = resolve_aws_variables(&pattern, vars);
+        }
+
         if !conditions.is_empty() {
             for key in KeyName::COMMON_KEYS {
                 if let Some(rvalue) = conditions.get(key.name()) {
@@ -109,7 +115,7 @@ impl Resource {
     }
 
     pub fn match_resource(&self, resource: &str) -> bool {
-        self.is_match(resource, &HashMap::new())
+        self.is_match(resource, &HashMap::new(), None)
     }
 }
 
@@ -197,6 +203,26 @@ mod tests {
     #[test_case("arn:aws:s3:::mybucket","mybucket/myobject" => false; "15")]
     fn test_resource_is_match(resource: &str, object: &str) -> bool {
         let resource: Resource = resource.try_into().unwrap();
-        resource.is_match(object, &HashMap::new())
+        resource.is_match(object, &HashMap::new(), None)
+    }
+
+    #[test]
+    fn test_aws_username_variable_substitution() {
+        let resource: Resource = "arn:aws:s3:::${aws:username}-*".try_into().unwrap();
+        let mut aws_variables = HashMap::new();
+        aws_variables.insert("aws:username".to_string(), "testuser".to_string());
+
+        assert!(resource.is_match("testuser-bucket", &HashMap::new(), Some(&aws_variables)));
+        assert!(!resource.is_match("otheruser-bucket", &HashMap::new(), Some(&aws_variables)));
+    }
+
+    #[test]
+    fn test_aws_userid_variable_substitution() {
+        let resource: Resource = "arn:aws:s3:::${aws:userid}-*".try_into().unwrap();
+        let mut aws_variables = HashMap::new();
+        aws_variables.insert("aws:userid".to_string(), "AIDACKCEVSQ6C2EXAMPLE".to_string());
+
+        assert!(resource.is_match("AIDACKCEVSQ6C2EXAMPLE-bucket", &HashMap::new(), Some(&aws_variables)));
+        assert!(!resource.is_match("OTHERUSERID-bucket", &HashMap::new(), Some(&aws_variables)));
     }
 }
