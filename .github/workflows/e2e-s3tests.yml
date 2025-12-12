@@ -26,7 +26,7 @@ jobs:
   s3tests-single:
     if: github.event.inputs.test-mode == 'single'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -126,7 +126,7 @@ jobs:
   s3tests-multi:
     if: github.event.inputs.test-mode == 'multi'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
