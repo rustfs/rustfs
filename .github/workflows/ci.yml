@@ -114,6 +114,10 @@ jobs:
           sudo mkswap /swapfile
           sudo swapon /swapfile
           sudo sysctl vm.swappiness=10
+      - name: (Optional) Install lld to provide alternate linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lld || true    
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -125,10 +129,13 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Build all crates serially to avoid concurrent linkers
+        run: |
+          cargo build -j 1 --all
       - name: Run tests
         run: |
           cargo nextest run -j 2 --all --exclude e2e_test
-          cargo test --all --doc
+          cargo test -j 1 --all --doc
 
       - name: Check code formatting
         run: cargo fmt --all --check
