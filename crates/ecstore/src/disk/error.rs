@@ -16,7 +16,6 @@
 use std::hash::{Hash, Hasher};
 use std::io::{self};
 use std::path::PathBuf;
-use tracing::error;
 
 pub type Error = DiskError;
 pub type Result<T> = core::result::Result<T, Error>;

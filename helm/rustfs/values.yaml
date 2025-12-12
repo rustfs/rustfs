@@ -50,6 +50,7 @@ config:
     rust_log: "debug"
     console_enable: "true"
     obs_log_directory: "/logs"
+    region: "us-east-1"
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:

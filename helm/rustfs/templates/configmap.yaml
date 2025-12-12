@@ -8,6 +8,9 @@ data:
   RUSTFS_OBS_LOG_DIRECTORY: {{ .Values.config.rustfs.obs_log_directory | quote }}
   RUSTFS_CONSOLE_ENABLE: {{ .Values.config.rustfs.console_enable | quote }}
   RUSTFS_OBS_LOGGER_LEVEL: {{ .Values.config.rustfs.log_level | quote }}
+  {{- if .Values.config.rustfs.region }}
+  RUSTFS_REGION: {{ .Values.config.rustfs.region | quote }}
+  {{- end }}
   {{- if .Values.mode.distributed.enabled }}
   {{- if eq (int .Values.replicaCount) 4 }}
   RUSTFS_VOLUMES: "http://{{ include "rustfs.fullname" . }}-{0...3}.{{ include "rustfs.fullname" . }}-headless:9000/data/rustfs{0...3}"
