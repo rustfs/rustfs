@@ -118,7 +118,7 @@ jobs:
             --secret_key "${S3_SECRET_KEY}" \
             -X PUT \
             -H 'Content-Type: application/json' \
-            -d '{"secretKey":"'"${S3_ALT_SECRET_KEY}"'","status":"enabled"}' \
+            -d '{"secretKey":"'"${S3_ALT_SECRET_KEY}"'","status":"enabled","policy":"readwrite"}' \
             "http://127.0.0.1:9000/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}"
 
       - name: Prepare s3-tests
@@ -318,7 +318,7 @@ jobs:
             --secret_key "${S3_SECRET_KEY}" \
             -X PUT \
             -H 'Content-Type: application/json' \
-            -d '{"secretKey":"'"${S3_ALT_SECRET_KEY}"'","status":"enabled"}' \
+            -d '{"secretKey":"'"${S3_ALT_SECRET_KEY}"'","status":"enabled","policy":"readwrite"}' \
             "http://127.0.0.1:9000/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}"
 
       - name: Prepare s3-tests
