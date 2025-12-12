@@ -18,6 +18,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | mode.distributed.enabled | RustFS distributed mode support, namely multiple pod multiple pvc. | Default is `true`. |
 | image.repository  | docker image repository.   |  rustfs/rustfs.  |
 | image.tag | the tag for rustfs docker image | "latest" |
+| imagePullSecrets | A List of secrets to pull image from private registry. | `name: secret-name`|
 | secret.rustfs.access_key | RustFS Access Key ID | `rustfsadmin` |
 | secret.rustfs.secret_key | RustFS Secret Key ID | `rustfsadmin` |
 | storageclass.name | The name for StorageClass. | `local-path` |
