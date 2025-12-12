@@ -265,7 +265,7 @@ jobs:
       - name: Run end-to-end tests
         run: |
           s3s-e2e --version
-          ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
+          ./scripts/e2e-run.sh "$RUNNER_TEMP/cargo-target"/debug/rustfs /tmp/rustfs
 
       - name: Upload test logs
         if: failure()
