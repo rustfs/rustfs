@@ -499,17 +499,18 @@ impl AsyncRead for HashReader {
                         let content_hash = hasher.finalize();
 
                         if content_hash != expected_content_hash.raw {
+                            let expected_hex = hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower);
+                            let actual_hex = hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower);
                             error!(
                                 "Content hash mismatch, type={:?}, encoded={:?}, expected={:?}, actual={:?}",
-                                expected_content_hash.checksum_type,
-                                expected_content_hash.encoded,
-                                hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower),
-                                hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower)
+                                expected_content_hash.checksum_type, expected_content_hash.encoded, expected_hex, actual_hex
                             );
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "Content hash mismatch",
-                            )));
+                            // Use ChecksumMismatch error so that API layer can return BadDigest
+                            let checksum_err = crate::errors::ChecksumMismatch {
+                                want: expected_hex,
+                                got: actual_hex,
+                            };
+                            return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, checksum_err)));
                         }
                     }
 

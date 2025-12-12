@@ -13,6 +13,10 @@ elif [ "${1#-}" != "$1" ]; then
 elif [ "$1" = "rustfs" ]; then
   shift
   set -- /usr/bin/rustfs "$@"
+elif [ "$1" = "/usr/bin/rustfs" ]; then
+  : # already normalized
+elif [ "$1" = "cargo" ]; then
+  : # Pass through cargo command as-is
 else
   set -- /usr/bin/rustfs "$@"
 fi
@@ -22,8 +26,35 @@ DATA_VOLUMES=""
 process_data_volumes() {
   VOLUME_RAW="${RUSTFS_VOLUMES:-/data}"
   # Convert comma/tab to space
-  VOLUME_LIST=$(echo "$VOLUME_RAW" | tr ',\t' ' ')
+  VOLUME_LIST_RAW=$(echo "$VOLUME_RAW" | tr ',\t' ' ')
   
+  VOLUME_LIST=""
+  for vol in $VOLUME_LIST_RAW; do
+      # Helper to manually expand {N..M} since sh doesn't support it on variables
+      if echo "$vol" | grep -E -q "\{[0-9]+\.\.[0-9]+\}"; then
+           PREFIX=${vol%%\{*}
+           SUFFIX=${vol##*\}}
+           RANGE=${vol#*\{}
+           RANGE=${RANGE%\}}
+           START=${RANGE%%..*}
+           END=${RANGE##*..}
+           
+           # Check if START and END are numbers
+           if [ "$START" -eq "$START" ] 2>/dev/null && [ "$END" -eq "$END" 2>/dev/null ]; then
+               i=$START
+               while [ "$i" -le "$END" ]; do
+                 VOLUME_LIST="$VOLUME_LIST ${PREFIX}${i}${SUFFIX}"
+                 i=$((i+1))
+               done
+           else
+               # Fallback if not numbers
+               VOLUME_LIST="$VOLUME_LIST $vol"
+           fi
+      else
+           VOLUME_LIST="$VOLUME_LIST $vol"
+      fi
+  done
+
   for vol in $VOLUME_LIST; do
     case "$vol" in
       /*)
@@ -55,7 +86,20 @@ process_data_volumes() {
 
 # 3) Process log directory (separate from data volumes)
 process_log_directory() {
-  LOG_DIR="${RUSTFS_OBS_LOG_DIRECTORY:-/logs}"
+  # Output logs to stdout
+  if [ -z "$RUSTFS_OBS_LOG_DIRECTORY" ]; then
+    echo "OBS log directory not configured and logs outputs to stdout"
+    return
+  fi
+
+  # Output logs to remote endpoint
+  if [ "${RUSTFS_OBS_LOG_DIRECTORY}" != "${RUSTFS_OBS_LOG_DIRECTORY#*://}" ]; then
+    echo "Output logs to remote endpoint"
+    return
+  fi
+
+  # Outputs logs to local directory
+  LOG_DIR="${RUSTFS_OBS_LOG_DIRECTORY}"
   
   echo "Initializing log directory: $LOG_DIR"
   if [ ! -d "$LOG_DIR" ]; then

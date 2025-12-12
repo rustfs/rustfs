@@ -264,5 +264,5 @@ deploy:
 
 ## References
 
-- RustFS Documentation: https://rustfs.io
+- RustFS Documentation: https://rustfs.com
 - Docker Compose Documentation: https://docs.docker.com/compose/
