@@ -224,13 +224,6 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install s3s-e2e test tool
-        uses: taiki-e/cache-cargo-install-action@v2
-        with:
-          tool: s3s-e2e
-          git: https://github.com/Nugine/s3s.git
-          rev: b7714bfaa17ddfa9b23ea01774a1e7bbdbfc2ca3
-
       - name: Disk diagnostics & cleanup
         run: |
           df -h
@@ -254,6 +247,13 @@ jobs:
           else
             echo "Not enough free space to create swap; skipping"
           fi
+
+      - name: Install s3s-e2e test tool
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: s3s-e2e
+          git: https://github.com/Nugine/s3s.git
+          rev: b7714bfaa17ddfa9b23ea01774a1e7bbdbfc2ca3
 
       - name: Build debug binary
         run: |
