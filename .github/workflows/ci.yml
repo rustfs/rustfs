@@ -176,13 +176,13 @@ jobs:
           export CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target"
           mkdir -p "$CARGO_TARGET_DIR"
           echo "Building with CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
-          cargo build -j 1 --all
+          cargo build -j 2 --all
       - name: Run tests
         run: |
           export CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target"
           echo "Running nextest with CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
           cargo nextest run -j 2 --all --exclude e2e_test
-          cargo test -j 1 --all --doc
+          cargo test -j 2 --all --doc
 
       - name: Check code formatting
         run: cargo fmt --all --check
