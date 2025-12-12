@@ -77,12 +77,6 @@ jobs:
           echo "Health check failed; container is running, proceeding with caution" >&2
           docker logs rustfs-single || true
 
-      - name: Prepare s3-tests
-        run: |
-          python3 -m pip install --user --upgrade pip tox
-          export PATH="$HOME/.local/bin:$PATH"
-          git clone --depth 1 https://github.com/ceph/s3-tests.git s3-tests
-
       - name: Generate s3tests config
         run: |
           export S3_HOST=rustfs-single
@@ -92,29 +86,38 @@ jobs:
 
       - name: Run ceph s3-tests (S3-compatible subset)
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
           mkdir -p artifacts/s3tests-single
-          cd s3-tests
-
-          # Check available test directories
-          echo "Available test directories:"
-          ls -la s3tests*/functional/ 2>/dev/null || echo "No s3tests directories found"
-
-          # Use s3tests_boto3 if available, fallback to s3tests
-          if [ -f "s3tests_boto3/functional/test_s3.py" ]; then
-            TEST_FILE="s3tests_boto3/functional/test_s3.py"
-          else
-            TEST_FILE="s3tests/functional/test_s3.py"
-          fi
-          echo "Using test file: $TEST_FILE"
-
-          S3TEST_CONF=${GITHUB_WORKSPACE}/s3tests.conf \
-            tox -- \
-              -v \
-              --tb=short \
-              --junitxml=${GITHUB_WORKSPACE}/artifacts/s3tests-single/junit.xml \
-              "$TEST_FILE" \
-              -k 'not lifecycle and not versioning and not website and not logging and not encryption'
+          
+          # Run tests inside a Docker container on the same network as RustFS
+          # This fixes DNS resolution issues and allows proper connectivity
+          docker run --rm \
+            --network rustfs-net \
+            -v ${GITHUB_WORKSPACE}/s3tests.conf:/etc/s3tests.conf:ro \
+            -v ${GITHUB_WORKSPACE}/artifacts/s3tests-single:/artifacts \
+            -w /s3-tests \
+            --platform ${PLATFORM} \
+            python:3.12-slim \
+            bash -c '
+              set -e
+              echo "Installing dependencies..."
+              apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1
+              git clone --depth 1 https://github.com/ceph/s3-tests.git /s3-tests
+              cd /s3-tests
+              pip install -q --no-cache-dir -r requirements.txt pytest-xdist
+              
+              echo "Running S3 compatibility tests..."
+              # Use pytest directly with parallel execution (-n auto)
+              # Filter out unsupported features using markers
+              S3TEST_CONF=/etc/s3tests.conf pytest \
+                -v \
+                --tb=short \
+                -n 4 \
+                --dist=loadgroup \
+                --maxfail=50 \
+                --junitxml=/artifacts/junit.xml \
+                s3tests/functional/test_s3.py \
+                -m "not lifecycle and not versioning and not s3website and not bucket_logging and not encryption and not sse_s3 and not cloud_transition and not cloud_restore and not lifecycle_expiration and not lifecycle_transition"
+            '
 
       - name: Upload artifacts
         if: always()
@@ -252,23 +255,35 @@ jobs:
       - name: Run ceph s3-tests (multi, S3-compatible subset)
         run: |
           mkdir -p artifacts/s3tests-multi
-          docker run --rm --network rustfs-net \
+          
+          # Run tests inside a Docker container on the same network as the cluster
+          docker run --rm \
+            --network rustfs-net \
+            -v ${GITHUB_WORKSPACE}/s3tests.conf:/etc/s3tests.conf:ro \
+            -v ${GITHUB_WORKSPACE}/artifacts/s3tests-multi:/artifacts \
+            -w /s3-tests \
             --platform ${PLATFORM} \
-            -e S3TEST_CONF=/tmp/s3tests.conf \
-            -v ${GITHUB_WORKSPACE}/s3tests.conf:/tmp/s3tests.conf:ro \
-            -v ${GITHUB_WORKSPACE}/artifacts/s3tests-multi:/mnt/logs \
-            quay.io/ceph/s3-tests:latest \
+            python:3.12-slim \
             bash -c '
-              if [ -f "s3tests_boto3/functional/test_s3.py" ]; then
-                TEST_FILE="s3tests_boto3/functional/test_s3.py"
-              else
-                TEST_FILE="s3tests/functional/test_s3.py"
-              fi
-              echo "Using test file: $TEST_FILE"
-              pytest -v --tb=short \
-                --junitxml=/mnt/logs/junit.xml \
-                "$TEST_FILE" \
-                -k "not lifecycle and not versioning and not website and not logging and not encryption"
+              set -e
+              echo "Installing dependencies..."
+              apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1
+              git clone --depth 1 https://github.com/ceph/s3-tests.git /s3-tests
+              cd /s3-tests
+              pip install -q --no-cache-dir -r requirements.txt pytest-xdist
+              
+              echo "Running S3 compatibility tests against multi-node cluster..."
+              # Use pytest directly with parallel execution
+              # Filter out unsupported features using markers
+              S3TEST_CONF=/etc/s3tests.conf pytest \
+                -v \
+                --tb=short \
+                -n 4 \
+                --dist=loadgroup \
+                --maxfail=50 \
+                --junitxml=/artifacts/junit.xml \
+                s3tests/functional/test_s3.py \
+                -m "not lifecycle and not versioning and not s3website and not bucket_logging and not encryption and not sse_s3 and not cloud_transition and not cloud_restore and not lifecycle_expiration and not lifecycle_transition"
             '
 
       - name: Upload artifacts
