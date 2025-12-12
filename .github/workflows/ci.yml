@@ -102,6 +102,8 @@ jobs:
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
@@ -125,7 +127,7 @@ jobs:
 
       - name: Run tests
         run: |
-          cargo nextest run --all --exclude e2e_test
+          cargo nextest run -j 2 --all --exclude e2e_test
           cargo test --all --doc
 
       - name: Check code formatting
