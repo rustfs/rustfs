@@ -14,8 +14,7 @@
 
 use super::{
     ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, ID, Principal, ResourceSet, Validator,
-    action::Action,
-    variables::{create_aws_variables_map},
+    action::Action, variables::create_aws_variables_map,
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -77,13 +76,17 @@ impl Statement {
         } else {
             "User"
         };
-        
-        let username = args.conditions.get("username")
+
+        let username = args
+            .conditions
+            .get("username")
             .and_then(|v| v.first())
             .map(|s| s.as_str())
             .unwrap_or(args.account);
 
-        let userid = args.conditions.get("userid")
+        let userid = args
+            .conditions
+            .get("userid")
             .and_then(|v| v.first())
             .map(|s| s.as_str())
             .unwrap_or(args.account);

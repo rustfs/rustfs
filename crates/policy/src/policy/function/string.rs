@@ -55,7 +55,13 @@ impl StringFunc {
 }
 
 impl FuncKeyValue<StringFuncValue> {
-    fn eval(&self, for_all: bool, ignore_case: bool, values: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
+    fn eval(
+        &self,
+        for_all: bool,
+        ignore_case: bool,
+        values: &HashMap<String, Vec<String>>,
+        aws_variables: Option<&HashMap<String, String>>,
+    ) -> bool {
         let rvalues = values
             // http.CanonicalHeaderKey ?
             .get(self.key.name().as_str())
@@ -106,7 +112,12 @@ impl FuncKeyValue<StringFuncValue> {
         }
     }
 
-    fn eval_like(&self, for_all: bool, values: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
+    fn eval_like(
+        &self,
+        for_all: bool,
+        values: &HashMap<String, Vec<String>>,
+        aws_variables: Option<&HashMap<String, String>>,
+    ) -> bool {
         if let Some(rvalues) = values.get(self.key.name().as_str()) {
             for v in rvalues.iter() {
                 let matched = self
@@ -119,7 +130,7 @@ impl FuncKeyValue<StringFuncValue> {
                             let resolved = resolve_aws_variables(&c, vars);
                             c = Cow::Owned(resolved);
                         }
-                        
+
                         for key in KeyName::COMMON_KEYS {
                             match values.get(key.name()).and_then(|x| x.first()) {
                                 Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),

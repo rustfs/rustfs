@@ -563,7 +563,7 @@ mod test {
             claims: &claims,
             deny_only: false,
         };
-        
+
         assert!(policy.is_allowed(&args));
 
         Ok(())

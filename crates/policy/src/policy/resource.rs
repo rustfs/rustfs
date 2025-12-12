@@ -31,7 +31,12 @@ use super::{
 pub struct ResourceSet(pub HashSet<Resource>);
 
 impl ResourceSet {
-    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
+    pub fn is_match(
+        &self,
+        resource: &str,
+        conditions: &HashMap<String, Vec<String>>,
+        aws_variables: Option<&HashMap<String, String>>,
+    ) -> bool {
         for re in self.0.iter() {
             if re.is_match(resource, conditions, aws_variables) {
                 return true;
@@ -86,7 +91,12 @@ pub enum Resource {
 impl Resource {
     pub const S3_PREFIX: &'static str = "arn:aws:s3:::";
 
-    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
+    pub fn is_match(
+        &self,
+        resource: &str,
+        conditions: &HashMap<String, Vec<String>>,
+        aws_variables: Option<&HashMap<String, String>>,
+    ) -> bool {
         let mut pattern = match self {
             Resource::S3(s) => s.to_owned(),
             Resource::Kms(s) => s.to_owned(),

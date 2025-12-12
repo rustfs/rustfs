@@ -35,8 +35,11 @@ pub fn create_aws_variables_map(username: &str, userid: &str, principal_type: &s
     vars.insert("aws:SecureTransport".to_string(), "false".to_string());
 
     let now = OffsetDateTime::now_utc();
-    vars.insert("aws:CurrentTime".to_string(),
-                now.format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| now.to_string()));
+    vars.insert(
+        "aws:CurrentTime".to_string(),
+        now.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| now.to_string()),
+    );
     vars.insert("aws:EpochTime".to_string(), now.unix_timestamp().to_string());
 
     vars

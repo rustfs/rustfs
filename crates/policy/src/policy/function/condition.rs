@@ -106,7 +106,12 @@ impl Condition {
         }
     }
 
-    pub fn evaluate(&self, for_all: bool, values: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
+    pub fn evaluate(
+        &self,
+        for_all: bool,
+        values: &HashMap<String, Vec<String>>,
+        aws_variables: Option<&HashMap<String, String>>,
+    ) -> bool {
         use Condition::*;
 
         let r = match self {
