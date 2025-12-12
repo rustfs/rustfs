@@ -105,6 +105,13 @@ jobs:
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
+      - name: Add 8GB swap to increase available memory
+        run: |
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl vm.swappiness=10
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -151,6 +158,14 @@ jobs:
           tool: s3s-e2e
           git: https://github.com/Nugine/s3s.git
           rev: b7714bfaa17ddfa9b23ea01774a1e7bbdbfc2ca3
+
+      - name: Add 8GB swap to increase available memory
+        run: |
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl vm.swappiness=10
 
       - name: Build debug binary
         run: |
