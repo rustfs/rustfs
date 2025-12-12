@@ -18,7 +18,6 @@ use time::OffsetDateTime;
 pub fn resolve_aws_variables(pattern: &str, aws_variables: &HashMap<String, String>) -> String {
     let mut result = pattern.to_string();
 
-    // 处理所有AWS变量
     for (key, value) in aws_variables {
         let var_placeholder = format!("${{{}}}", key);
         result = result.replace(&var_placeholder, value);
@@ -35,7 +34,6 @@ pub fn create_aws_variables_map(username: &str, userid: &str, principal_type: &s
     vars.insert("aws:PrincipalType".to_string(), principal_type.to_string());
     vars.insert("aws:SecureTransport".to_string(), "false".to_string());
 
-    // 添加时间相关变量
     let now = OffsetDateTime::now_utc();
     vars.insert("aws:CurrentTime".to_string(),
                 now.format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| now.to_string()));
