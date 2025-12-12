@@ -548,19 +548,18 @@ mod test {
 
         let policy = Policy::parse_config(data.as_bytes())?;
 
-        let mut claims = HashMap::new();
-        claims.insert("username".to_string(), Value::String("testuser".to_string()));
-        claims.insert("userid".to_string(), Value::String("AIDACKCEVSQ6C2EXAMPLE".to_string()));
+        let mut conditions = HashMap::new();
+        conditions.insert("username".to_string(), vec!["testuser".to_string()]);
 
         let args = Args {
-            account: "testuser",
+            account: "otheruser", 
             groups: &None,
             action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
             bucket: "testuser-bucket",
-            conditions: &HashMap::new(),
+            conditions: &conditions,
             is_owner: false,
             object: "",
-            claims: &claims,
+            claims: &HashMap::new(),
             deny_only: false,
         };
 
@@ -586,19 +585,18 @@ mod test {
 
         let policy = Policy::parse_config(data.as_bytes())?;
 
-        let mut claims = HashMap::new();
-        claims.insert("username".to_string(), Value::String("testuser".to_string()));
-        claims.insert("userid".to_string(), Value::String("AIDACKCEVSQ6C2EXAMPLE".to_string()));
+        let mut conditions = HashMap::new();
+        conditions.insert("userid".to_string(), vec!["AIDACKCEVSQ6C2EXAMPLE".to_string()]);
 
         let args = Args {
             account: "testuser",
             groups: &None,
             action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
             bucket: "AIDACKCEVSQ6C2EXAMPLE-bucket",
-            conditions: &HashMap::new(),
+            conditions: &conditions,
             is_owner: false,
             object: "",
-            claims: &claims,
+            claims: &HashMap::new(),
             deny_only: false,
         };
 
