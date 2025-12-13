@@ -44,7 +44,7 @@ spec:
   {{- if .Values.ingress.enabled }}
   type: ClusterIP
   {{- else }}
-  type: NodePort
+  type: {{ .Values.service.type }}
   sessionAffinity: ClientIP
   sessionAffinityConfig:
     clientIP:
