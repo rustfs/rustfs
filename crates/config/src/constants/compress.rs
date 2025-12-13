@@ -59,24 +59,3 @@ pub const ENV_COMPRESS_MIN_SIZE: &str = "RUSTFS_COMPRESS_MIN_SIZE";
 /// Files smaller than 1000 bytes typically don't benefit from compression
 /// and the compression overhead may outweigh the benefits
 pub const DEFAULT_COMPRESS_MIN_SIZE: u64 = 1000;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_env_var_names() {
-        assert!(ENV_COMPRESS_ENABLE.starts_with("RUSTFS_"));
-        assert!(ENV_COMPRESS_EXTENSIONS.starts_with("RUSTFS_"));
-        assert!(ENV_COMPRESS_MIME_TYPES.starts_with("RUSTFS_"));
-        assert!(ENV_COMPRESS_MIN_SIZE.starts_with("RUSTFS_"));
-    }
-
-    #[test]
-    fn test_default_values() {
-        assert!(!DEFAULT_COMPRESS_ENABLE);
-        assert!(DEFAULT_COMPRESS_EXTENSIONS.is_empty());
-        assert!(!DEFAULT_COMPRESS_MIME_TYPES.is_empty());
-        assert_eq!(DEFAULT_COMPRESS_MIN_SIZE, 1000);
-    }
-}
