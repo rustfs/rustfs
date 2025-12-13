@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod cold_tier_config;
 pub mod tier;
 pub mod tier_admin;
 pub mod tier_config;
