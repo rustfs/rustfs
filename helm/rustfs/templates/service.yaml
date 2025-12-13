@@ -5,24 +5,20 @@ metadata:
   name: {{ include "rustfs.fullname" . }}-headless
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
+  {{- /* headless service */}}
   clusterIP: None
   publishNotReadyAddresses: true
   ports:
-    {{- if .Values.ingress.enabled }}
-    - port: 9000
-    {{- else }}
     - port: {{ .Values.service.ep_port }}
-    {{- end }}
-      targetPort: {{ .Values.service.ep_port }}
-      protocol: TCP
       name: endpoint
     - port: {{ .Values.service.console_port }}
-      targetPort: 9001
-      protocol: TCP
       name: console
   selector:
-    app: {{ include "rustfs.name" . }}
+    {{- include "rustfs.selectorLabels" . | nindent 4 }}
 {{- end }}
 
 ---
@@ -40,6 +36,9 @@ metadata:
   {{- end }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   {{- if .Values.ingress.enabled }}
   type: ClusterIP
@@ -52,12 +51,8 @@ spec:
   {{- end }}
   ports:
     - port: {{ .Values.service.ep_port }}
-      targetPort: {{ .Values.service.ep_port }}
-      protocol: TCP
       name: endpoint
     - port: {{ .Values.service.console_port }}
-      targetPort: {{ .Values.service.console_port }}
-      protocol: TCP
       name: console
   selector:
-    app: {{ include "rustfs.name" . }}
+    {{- include "rustfs.selectorLabels" . | nindent 4 }}
