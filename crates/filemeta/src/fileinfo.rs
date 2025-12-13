@@ -213,6 +213,8 @@ pub struct FileInfo {
     // Combined checksum when object was uploaded
     pub checksum: Option<Bytes>,
     pub versioned: bool,
+    // Last time this object was accessed (GET operation) - used for cold file tiering
+    pub last_access_time: Option<OffsetDateTime>,
 }
 
 impl FileInfo {
