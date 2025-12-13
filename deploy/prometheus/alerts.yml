@@ -1,0 +1,120 @@
+# Prometheus Alert Rules for RustFS Cluster Power-Off Resilience
+# 
+# These alerts monitor the health of RustFS clusters and detect issues
+# related to abrupt node failures, metadata lock timeouts, disk state checks,
+# cascading failures, and lock health degradation (P0, P1, P2, P3).
+
+groups:
+  - name: rustfs_metadata_health
+    interval: 30s
+    rules:
+      # Alert when IAM lock timeouts are frequent
+      - alert: IAMLockTimeoutHigh
+        expr: rate(rustfs_config_lock_timeouts_total{operation="iam"}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          component: iam
+        annotations:
+          summary: "High rate of IAM lock timeouts detected"
+          description: "IAM lock timeout rate is {{ $value | humanize }} per second for the last 5 minutes. This indicates distributed lock contention or dead nodes."
+          remediation: "Check for dead nodes in the cluster. Consider restarting affected nodes if lock contention persists."
+
+      # Alert when config read operations timeout frequently
+      - alert: ConfigReadTimeoutHigh
+        expr: rate(rustfs_config_read_timeouts_total[5m]) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          component: metadata
+        annotations:
+          summary: "High rate of config read timeouts"
+          description: "Config read timeout rate is {{ $value | humanize }} per second. This may indicate network issues or dead nodes."
+          remediation: "Investigate network connectivity and node health. Check logs for timeout patterns."
+
+      # Alert when disk state check timeouts are frequent
+      - alert: DiskStateCheckTimeoutHigh
+        expr: rate(rustfs_disk_state_check_timeouts_total[5m]) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "High rate of disk state check timeouts"
+          description: "Disk state check timeout rate is {{ $value | humanize }} per second. Remote disks or nodes may be unresponsive."
+          remediation: "Check disk connectivity and node health. Verify network between nodes."
+
+  - name: rustfs_p3_advanced_health
+    interval: 30s
+    rules:
+      # P3: Alert when lock health status degrades
+      - alert: LockHealthDegraded
+        expr: rustfs_lock_health_status < 1.0
+        for: 5m
+        labels:
+          severity: warning
+          component: distributed_locks
+        annotations:
+          summary: "Distributed lock health degraded"
+          description: "Lock {{ $labels.path }} health status is {{ $value }}. Recent timeouts detected."
+          remediation: "Monitor lock contention. If persists, consider restarting nodes with lock issues."
+
+      # P3: Alert when lock becomes unhealthy
+      - alert: LockHealthUnhealthy
+        expr: rustfs_lock_health_status == 0.0
+        for: 2m
+        labels:
+          severity: critical
+          component: distributed_locks
+        annotations:
+          summary: "Distributed lock is UNHEALTHY"
+          description: "Lock {{ $labels.path }} is unhealthy with consecutive timeouts. Operations may fail."
+          remediation: "URGENT: Investigate affected nodes. Manual lock breaking may be required."
+
+      # P3: Alert when cascading failure pattern detected
+      - alert: CascadingFailureDetected
+        expr: rate(rustfs_cascading_failure_patterns_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: cluster_health
+        annotations:
+          summary: "Cascading failure pattern detected in cluster"
+          description: "Cascading failure pattern {{ $labels.initial }} detected. Multiple components failing."
+          remediation: "CRITICAL: Check cluster health immediately. Initial failure may be triggering cascade."
+
+      # P3: Alert when cascading failures become recurring
+      - alert: RecurringCascadingFailures
+        expr: rustfs_cascading_failure_critical > 0
+        for: 30s
+        labels:
+          severity: emergency
+          component: cluster_health
+        annotations:
+          summary: "EMERGENCY: Recurring cascading failures"
+          description: "Cascading failure pattern {{ $labels.pattern }} recurring multiple times. Cluster stability at risk."
+          remediation: "EMERGENCY: Immediate operator intervention required. Cluster may need rolling restart."
+
+      # P3: Alert when lock health timeout events are accumulating
+      - alert: LockHealthTimeoutsAccumulating
+        expr: rate(rustfs_lock_health_timeouts_total[5m]) > 1.0
+        for: 3m
+        labels:
+          severity: warning
+          component: distributed_locks
+        annotations:
+          summary: "Lock health timeouts accumulating"
+          description: "Lock timeout rate for {{ $labels.path }} is {{ $value | humanize }} per second."
+          remediation: "Investigate lock contention. Check for slow or unresponsive nodes."
+
+      # P3: Alert when cascading failure events spike
+      - alert: CascadingFailureEventsSpike
+        expr: rate(rustfs_cascading_failure_events_total[5m]) > 5.0
+        for: 2m
+        labels:
+          severity: warning
+          component: cluster_health
+        annotations:
+          summary: "Spike in cascading failure events"
+          description: "Failure event rate for {{ $labels.type }} is {{ $value | humanize }} per second. Potential cascade in progress."
+          remediation: "Monitor cluster health closely. Identify root cause of initial failures."

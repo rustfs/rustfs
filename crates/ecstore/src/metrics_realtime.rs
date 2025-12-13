@@ -20,7 +20,7 @@ use crate::{
 };
 use chrono::Utc;
 use rustfs_common::{
-    globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Addr},
+    globals::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR},
     heal_channel::DriveState,
     metrics::global_metrics,
 };
@@ -86,7 +86,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
         return real_time_metrics;
     }
 
-    let mut by_host_name = GLOBAL_Rustfs_Addr.read().await.clone();
+    let mut by_host_name = GLOBAL_RUSTFS_ADDR.read().await.clone();
     if !opts.hosts.is_empty() {
         let server = get_local_server_property().await;
         if opts.hosts.contains(&server.endpoint) {
@@ -95,7 +95,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
             return real_time_metrics;
         }
     }
-    let local_node_name = GLOBAL_Local_Node_Name.read().await.clone();
+    let local_node_name = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
     if by_host_name.starts_with(":") && !local_node_name.starts_with(":") {
         by_host_name = local_node_name;
     }

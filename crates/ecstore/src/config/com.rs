@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{Config, GLOBAL_STORAGE_CLASS, storageclass};
+use crate::cascading_failure_detector::{FailureType, GLOBAL_CASCADING_DETECTOR};
+use crate::config::{Config, GLOBAL_STORAGE_CLASS, lock_health::GLOBAL_LOCK_HEALTH_MONITOR, storageclass};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
@@ -42,6 +43,104 @@ pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u
 }
 
 pub async fn read_config_with_metadata<S: StorageAPI>(
+    api: Arc<S>,
+    file: &str,
+    opts: &ObjectOptions,
+) -> Result<(Vec<u8>, ObjectInfo)> {
+    // P3: Proactive lock health checking
+    GLOBAL_LOCK_HEALTH_MONITOR.record_attempt(file).await;
+
+    // Add timeout with retry logic for lock contention resilience
+    const CONFIG_READ_TIMEOUT_SECS: u64 = 10;
+    const MAX_LOCK_RETRIES: usize = 3;
+    const LOCK_RETRY_BASE_DELAY_MS: u64 = 100;
+
+    let mut attempts = 0;
+    let start = std::time::Instant::now();
+    let operation_type = if file.contains("/iam/") { "iam" } else { "config" };
+
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(CONFIG_READ_TIMEOUT_SECS),
+            read_config_with_metadata_inner(api.clone(), file, opts),
+        )
+        .await
+        {
+            Ok(Ok(result)) => {
+                let duration = start.elapsed().as_secs_f64();
+                metrics::histogram!("rustfs_config_read_duration_seconds", "operation" => operation_type).record(duration);
+                // P3: Record lock success for health tracking
+                GLOBAL_LOCK_HEALTH_MONITOR.record_success(file).await;
+                return Ok(result);
+            }
+            Ok(Err(err)) => {
+                // P3: Record lock timeout for health tracking
+                if is_lock_timeout_error(&err) {
+                    GLOBAL_LOCK_HEALTH_MONITOR.record_timeout(file).await;
+                    // P3: Record cascading failure event
+                    GLOBAL_CASCADING_DETECTOR
+                        .record_failure(FailureType::LockTimeout, file.to_string())
+                        .await;
+                }
+
+                // Retry on lock timeout errors with exponential backoff
+                if is_lock_timeout_error(&err) && attempts < MAX_LOCK_RETRIES {
+                    attempts += 1;
+                    let delay_ms = LOCK_RETRY_BASE_DELAY_MS * 2_u64.pow(attempts as u32);
+                    metrics::counter!("rustfs_config_lock_retries_total", "operation" => operation_type).increment(1);
+                    warn!("Lock timeout on {}, retry {}/{} after {}ms", file, attempts, MAX_LOCK_RETRIES, delay_ms);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                let duration = start.elapsed().as_secs_f64();
+                metrics::histogram!("rustfs_config_read_duration_seconds", "operation" => operation_type).record(duration);
+                if is_lock_timeout_error(&err) {
+                    metrics::counter!("rustfs_config_lock_timeouts_total", "operation" => operation_type).increment(1);
+                    // P3: Record IAM operation timeout if it's an IAM file
+                    if file.contains("/iam/") {
+                        GLOBAL_CASCADING_DETECTOR
+                            .record_failure(FailureType::IAMOperationTimeout, file.to_string())
+                            .await;
+                    }
+                }
+                return Err(err);
+            }
+            Err(_) => {
+                // P3: Record timeout for health tracking
+                GLOBAL_LOCK_HEALTH_MONITOR.record_timeout(file).await;
+                // P3: Record cascading failure event
+                GLOBAL_CASCADING_DETECTOR
+                    .record_failure(FailureType::LockTimeout, file.to_string())
+                    .await;
+                if file.contains("/iam/") {
+                    GLOBAL_CASCADING_DETECTOR
+                        .record_failure(FailureType::IAMOperationTimeout, file.to_string())
+                        .await;
+                }
+
+                metrics::counter!("rustfs_config_read_timeouts_total", "operation" => operation_type).increment(1);
+                error!(
+                    "read_config_with_metadata timed out after {}s for file: {} (likely dead node or lock contention)",
+                    CONFIG_READ_TIMEOUT_SECS, file
+                );
+                return Err(Error::ConfigNotFound);
+            }
+        }
+    }
+}
+
+/// Check if error is a lock timeout that can be retried
+fn is_lock_timeout_error(err: &Error) -> bool {
+    match err {
+        Error::Io(io_err) => {
+            let msg = io_err.to_string();
+            msg.contains("lock acquisition timed out") || msg.contains("lock timeout")
+        }
+        _ => false,
+    }
+}
+
+async fn read_config_with_metadata_inner<S: StorageAPI>(
     api: Arc<S>,
     file: &str,
     opts: &ObjectOptions,

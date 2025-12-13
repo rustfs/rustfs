@@ -15,6 +15,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::cascading_failure_detector::{FailureType, GLOBAL_CASCADING_DETECTOR};
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
@@ -40,7 +41,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_common::{
-    globals::GLOBAL_Local_Node_Name,
+    globals::GLOBAL_LOCAL_NODE_NAME,
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
@@ -147,15 +148,43 @@ impl Sets {
                     disk = local_disk;
                 }
 
-                let has_disk_id = disk.as_ref().unwrap().get_disk_id().await.unwrap_or_else(|err| {
-                    if err == DiskError::UnformattedDisk {
-                        error!("get_disk_id err {:?}", err);
-                    } else {
-                        warn!("get_disk_id err {:?}", err);
+                // Add timeout to prevent hanging on dead nodes during disk state checks
+                const DISK_STATE_CHECK_TIMEOUT_SECS: u64 = 3;
+                let start = std::time::Instant::now();
+                let has_disk_id = match tokio::time::timeout(
+                    std::time::Duration::from_secs(DISK_STATE_CHECK_TIMEOUT_SECS),
+                    disk.as_ref().unwrap().get_disk_id(),
+                )
+                .await
+                {
+                    Ok(Ok(id)) => {
+                        let duration = start.elapsed().as_secs_f64();
+                        metrics::histogram!("rustfs_disk_state_check_duration_seconds").record(duration);
+                        id
                     }
-
-                    None
-                });
+                    Ok(Err(err)) => {
+                        let duration = start.elapsed().as_secs_f64();
+                        metrics::histogram!("rustfs_disk_state_check_duration_seconds").record(duration);
+                        if err == DiskError::UnformattedDisk {
+                            error!("get_disk_id err {:?}", err);
+                        } else {
+                            warn!("get_disk_id err {:?}", err);
+                        }
+                        None
+                    }
+                    Err(_) => {
+                        metrics::counter!("rustfs_disk_state_check_timeouts_total", "set" => format!("{}-{}", i, j)).increment(1);
+                        error!(
+                            "get_disk_id timed out after {}s for set_drive {}-{} (likely dead node)",
+                            DISK_STATE_CHECK_TIMEOUT_SECS, i, j
+                        );
+                        // P3: Record cascading failure event
+                        GLOBAL_CASCADING_DETECTOR
+                            .record_failure(FailureType::DiskStateCheckTimeout, format!("set-{}-{}", i, j))
+                            .await;
+                        None
+                    }
+                };
 
                 if let Some(_disk_id) = has_disk_id {
                     set_drive.push(disk);
@@ -170,7 +199,7 @@ impl Sets {
 
             let set_disks = SetDisks::new(
                 fast_lock_manager.clone(),
-                GLOBAL_Local_Node_Name.read().await.to_string(),
+                GLOBAL_LOCAL_NODE_NAME.read().await.to_string(),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
                 parity_count,

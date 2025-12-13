@@ -40,3 +40,4 @@ rmp-serde = { workspace = true }
 async-trait = { workspace = true }
 s3s = { workspace = true }
 tracing = { workspace = true }
+reqwest = { workspace = true }
