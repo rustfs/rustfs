@@ -42,7 +42,7 @@ use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Constants from Go code
 const DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1);
@@ -122,8 +122,10 @@ impl ScannerItem {
         size_summary: &mut SizeSummary,
     ) {
         if object_infos.is_empty() {
+            debug!("apply_actions: no object infos for object: {}", self.object_path());
             return;
         }
+        debug!("apply_actions: applying actions for object: {}", self.object_path());
 
         let versioning_config = match BucketVersioningSys::get(&self.bucket).await {
             Ok(versioning_config) => versioning_config,
@@ -152,8 +154,11 @@ impl ScannerItem {
             }
 
             self.alert_excessive_versions(object_infos.len(), cumulative_size);
+            info!("apply_actions: done for now no lifecycle config");
             return;
         };
+
+        debug!("apply_actions: got lifecycle config for object: {}", self.object_path());
 
         let object_opts = object_infos
             .iter()
@@ -244,6 +249,8 @@ impl ScannerItem {
         actual_size: i64,
         size_summary: &mut SizeSummary,
     ) -> i64 {
+        warn!("heal_actions: healing object: {} {}", self.object_path(), oi.name);
+
         let mut size = actual_size;
 
         if self.heal_enabled {
@@ -257,15 +264,22 @@ impl ScannerItem {
 
     async fn heal_replication(&mut self, oi: &ObjectInfo, size_summary: &mut SizeSummary) {
         if oi.version_id.is_none_or(|v| v.is_nil()) {
+            info!("heal_replication: no version id for object: {} {}", self.object_path(), oi.name);
             return;
         }
 
         let Some(replication) = self.replication.clone() else {
+            info!("heal_replication: no replication config for object: {} {}", self.object_path(), oi.name);
             return;
         };
 
         let roi = queue_replication_heal_internal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
         if oi.delete_marker || oi.version_purge_status.is_empty() {
+            info!(
+                "heal_replication: delete marker or version purge status is empty for object: {} {}",
+                self.object_path(),
+                oi.name
+            );
             return;
         }
 
@@ -308,7 +322,7 @@ impl ScannerItem {
     }
 
     async fn apply_heal<S: StorageAPI>(&mut self, store: Arc<S>, oi: &ObjectInfo) -> i64 {
-        debug!(
+        info!(
             "apply_heal: bucket: {}, object_path: {}, version_id: {}",
             self.bucket,
             self.object_path(),
@@ -369,7 +383,7 @@ pub struct FolderScanner {
     disks: Vec<Arc<Disk>>,
     disks_quorum: usize,
 
-    updates: Option<Arc<Mutex<mpsc::Sender<DataUsageEntry>>>>,
+    updates: Option<mpsc::Sender<DataUsageEntry>>,
     last_update: SystemTime,
 
     update_current_path: UpdateCurrentPathFn,
@@ -467,15 +481,18 @@ impl FolderScanner {
 
         let elapsed = self.last_update.elapsed().unwrap_or(Duration::from_secs(0));
         if elapsed < Duration::from_secs(60) {
+            info!("send_update: done for now elapsed time is less than 60 seconds");
             return;
         }
 
         if let Some(flat) = self.update_cache.size_recursive(&self.new_cache.info.name) {
             if let Some(ref updates) = self.updates {
                 // Try to send without blocking
-                let updates = updates.lock().await;
-                let _ = updates.send(flat.clone()).await;
+                if let Err(e) = updates.send(flat.clone()).await {
+                    error!("send_update: failed to send update: {}", e);
+                }
                 self.last_update = SystemTime::now();
+                debug!("send_update: sent update for folder: {}", self.new_cache.info.name);
             }
         }
     }
@@ -511,6 +528,7 @@ impl FolderScanner {
                 abandoned_children = self.old_cache.find_children_copy(this_hash.clone());
             }
 
+            warn!("scan_folder : {}/{}", &self.root, &folder.name);
             let (_, prefix) = path2_bucket_object_with_base_path(&self.root, &folder.name);
 
             let active_life_cycle = if self
@@ -543,8 +561,6 @@ impl FolderScanner {
             let mut found_objects = false;
 
             let dir_path = path_join_buf(&[&self.root, &folder.name]);
-
-            warn!("scan_folder: dir_path: {:?}", dir_path);
 
             let mut dir_reader = tokio::fs::read_dir(&dir_path)
                 .await
@@ -596,7 +612,8 @@ impl FolderScanner {
                     let h = hash_path(&entry_name);
 
                     if h == this_hash {
-                        break;
+                        info!("scan_folder: done for now self folder");
+                        continue;
                     }
 
                     let exists = self.old_cache.cache.contains_key(&h.key());
@@ -616,7 +633,8 @@ impl FolderScanner {
                     } else {
                         new_folders.push(this);
                     }
-                    break;
+                    info!("scan_folder: done for now folder exists");
+                    continue;
                 }
 
                 let mut wait = wait_time;
@@ -644,6 +662,7 @@ impl FolderScanner {
                 let sz = match self.local_disk.get_size(item.clone()).await {
                     Ok(sz) => sz,
                     Err(e) => {
+                        warn!("scan_folder: failed to get size for item {}: {}", item.path, e);
                         // TODO: check error type
                         if let Some(t) = wait {
                             if let Ok(elapsed) = t.elapsed() {
@@ -657,6 +676,8 @@ impl FolderScanner {
                         continue;
                     }
                 };
+
+                warn!("scan_folder: got size for item {}: {:?}", item.path, &sz);
 
                 found_objects = true;
 
@@ -677,6 +698,7 @@ impl FolderScanner {
 
             if found_objects && is_erasure().await {
                 // If we found an object in erasure mode, we skip subdirs (only datadirs)...
+                info!("scan_folder: done for now found an object in erasure mode");
                 break;
             }
 
@@ -905,6 +927,7 @@ pub async fn scan_data_folder(
     disks: Vec<Arc<Disk>>,
     local_disk: Arc<Disk>,
     cache: DataUsageCache,
+    updates: Option<mpsc::Sender<DataUsageEntry>>,
     scan_mode: HealScanMode,
     we_sleep: Box<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<DataUsageCache, ScannerError> {
@@ -933,8 +956,6 @@ pub async fn scan_data_folder(
 
     let disks_quorum = disks.len() / 2;
 
-    let updates = cache.info.updates.clone();
-
     // Create folder scanner
     let mut scanner = FolderScanner {
         root: base_path,
@@ -954,7 +975,7 @@ pub async fn scan_data_folder(
         disks,
         disks_quorum,
         updates,
-        last_update: SystemTime::now(),
+        last_update: SystemTime::UNIX_EPOCH,
         update_current_path,
         skip_heal,
         local_disk,

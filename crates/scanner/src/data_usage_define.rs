@@ -589,8 +589,6 @@ pub struct DataUsageCacheInfo {
     pub skip_healing: bool,
     pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
     pub replication: Option<Arc<ReplicationConfig>>,
-    #[serde(skip)]
-    pub updates: Option<Arc<Mutex<mpsc::Sender<DataUsageEntry>>>>,
 }
 
 /// Data usage cache
@@ -1012,63 +1010,68 @@ impl DataUsageCache {
                         }
                     }
                 }
-                Err(err) => match err {
-                    Error::FileNotFound | Error::VolumeNotFound => {
-                        // Try second location: DATA_USAGE_BUCKET/name
-                        match store
-                            .get_object_reader(
-                                &DATA_USAGE_BUCKET,
-                                load_name,
-                                None,
-                                HeaderMap::new(),
-                                &ObjectOptions {
-                                    no_lock: true,
-                                    ..Default::default()
+                Err(err) => {
+                    match err {
+                        Error::FileNotFound | Error::VolumeNotFound | Error::ObjectNotFound(_, _) | Error::BucketNotFound(_) => {
+                            // Try second location: DATA_USAGE_BUCKET/name
+                            match store
+                                .get_object_reader(
+                                    &DATA_USAGE_BUCKET,
+                                    load_name,
+                                    None,
+                                    HeaderMap::new(),
+                                    &ObjectOptions {
+                                        no_lock: true,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(mut reader) => match reader.read_all().await {
+                                    Ok(data) => match DataUsageCache::unmarshal(&data) {
+                                        Ok(cache) => Ok(Some(cache)),
+                                        Err(_) => Ok(None),
+                                    },
+                                    Err(e) => Err(e),
                                 },
-                            )
-                            .await
-                        {
-                            Ok(mut reader) => match reader.read_all().await {
-                                Ok(data) => match DataUsageCache::unmarshal(&data) {
-                                    Ok(cache) => Ok(Some(cache)),
-                                    Err(_) => Ok(None),
-                                },
-                                Err(e) => Err(e),
-                            },
-                            Err(inner_err) => match inner_err {
-                                Error::FileNotFound | Error::VolumeNotFound => {
-                                    // Object not found in both locations
-                                    Ok(None)
-                                }
-                                Error::ErasureReadQuorum => {
-                                    // InsufficientReadQuorum - retry
-                                    Ok(None)
-                                }
-                                _ => {
-                                    // Other storage errors - retry
-                                    if matches!(
-                                        inner_err,
-                                        Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown
-                                    ) {
-                                        return Ok(None);
+                                Err(inner_err) => match inner_err {
+                                    Error::FileNotFound
+                                    | Error::VolumeNotFound
+                                    | Error::ObjectNotFound(_, _)
+                                    | Error::BucketNotFound(_) => {
+                                        // Object not found in both locations
+                                        Ok(None)
                                     }
-                                    Err(inner_err)
-                                }
-                            },
+                                    Error::ErasureReadQuorum => {
+                                        // InsufficientReadQuorum - retry
+                                        Ok(None)
+                                    }
+                                    _ => {
+                                        // Other storage errors - retry
+                                        if matches!(
+                                            inner_err,
+                                            Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown
+                                        ) {
+                                            return Ok(None);
+                                        }
+                                        Err(inner_err)
+                                    }
+                                },
+                            }
+                        }
+                        Error::ErasureReadQuorum => {
+                            // InsufficientReadQuorum - retry
+                            Ok(None)
+                        }
+                        _ => {
+                            // Other storage errors - retry
+                            if matches!(err, Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown) {
+                                return Ok(None);
+                            }
+                            Err(err)
                         }
                     }
-                    Error::ErasureReadQuorum => {
-                        // InsufficientReadQuorum - retry
-                        Ok(None)
-                    }
-                    _ => {
-                        // Other storage errors - retry
-                        if matches!(err, Error::FaultyDisk | Error::DiskFull | Error::StorageFull | Error::SlowDown) {
-                            return Ok(None);
-                        }
-                        Err(err)
-                    }
-                },
+                }
             }
         };
 

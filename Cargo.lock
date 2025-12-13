@@ -7042,6 +7042,7 @@ dependencies = [
  "rustfs-rio",
  "rustfs-s3select-api",
  "rustfs-s3select-query",
+ "rustfs-scanner",
  "rustfs-targets",
  "rustfs-utils",
  "rustfs-zip",

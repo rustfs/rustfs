@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[allow(dead_code)]
 #[derive(Debug, Default)]
-struct TimedAction {
+pub struct TimedAction {
     count: u64,
     acc_time: u64,
     min_time: Option<u64>,

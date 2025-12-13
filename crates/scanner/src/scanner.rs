@@ -29,12 +29,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const DATA_USAGE_UPDATE_DIR_CYCLES: usize = 16;
 const DATA_SCANNER_START_DELAY: Duration = Duration::from_secs(60);
 
-pub fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
+pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     let ctx_clone = ctx.clone();
     let storeapi_clone = storeapi.clone();
     tokio::spawn(async move {
@@ -49,7 +49,6 @@ pub fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Resu
             tokio::time::sleep(DATA_SCANNER_START_DELAY).await;
         }
     });
-    Ok(())
 }
 
 fn get_cycle_scan_mode(_current_cycle: u64, _bitrot_start_cycle: u64, _bitrot_start_time: Option<DateTime<Utc>>) -> HealScanMode {
@@ -221,6 +220,8 @@ pub async fn store_data_usage_in_backend(
         if ctx.is_cancelled() {
             break;
         }
+
+        debug!("store_data_usage_in_backend: received data usage info: {:?}", &data_usage_info);
 
         // Serialize to JSON
         let data = match serde_json::to_vec(&data_usage_info) {

@@ -32,7 +32,7 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 #[async_trait::async_trait]
 pub trait ScannerIO: Send + Sync + Debug + 'static {
@@ -63,7 +63,7 @@ pub trait ScannerIODisk: Send + Sync + Debug + 'static {
         &self,
         ctx: CancellationToken,
         cache: DataUsageCache,
-        updates: mpsc::Sender<DataUsageEntry>,
+        updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache>;
 
@@ -263,7 +263,7 @@ impl ScannerIOCache for SetDisks {
             }
         }
 
-        drop(bucket_tx);
+        // drop(bucket_tx);
 
         let cache_mutex: Arc<Mutex<DataUsageCache>> = Arc::new(Mutex::new(cache));
 
@@ -272,7 +272,7 @@ impl ScannerIOCache for SetDisks {
         let cache_mutex_clone = cache_mutex.clone();
         let store_clone = self.clone();
         let ctx_clone = ctx.clone();
-        let update_fut = tokio::spawn(async move {
+        let send_update_fut = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(30 + rand::random::<u64>() % 10));
 
             let mut last_update = None;
@@ -342,6 +342,8 @@ impl ScannerIOCache for SetDisks {
                         break;
                     }
 
+                    debug!("nsscanner_disk: got bucket: {}", bucket.name);
+
                     let cache_name = path_join_buf(&[&bucket.name, DATA_USAGE_CACHE_NAME]);
 
                     let mut cache = DataUsageCache::default();
@@ -393,7 +395,7 @@ impl ScannerIOCache for SetDisks {
 
                     cache = match disk
                         .clone()
-                        .nsscanner_disk(ctx_clone.clone(), cache.clone(), updates_tx, scan_mode)
+                        .nsscanner_disk(ctx_clone.clone(), cache.clone(), Some(updates_tx), scan_mode)
                         .await
                     {
                         Ok(cache) => cache,
@@ -415,8 +417,10 @@ impl ScannerIOCache for SetDisks {
                         }
                     };
 
+                    debug!("nsscanner_disk: got cache: {}", cache.info.name);
+
                     if let Err(e) = update_fut.await {
-                        error!("Failed to update data usage cache: {}", e);
+                        error!("nsscanner_disk: Failed to update data usage cache: {}", e);
                     }
 
                     let root = if let Some(r) = cache.root() {
@@ -429,6 +433,8 @@ impl ScannerIOCache for SetDisks {
                         break;
                     }
 
+                    debug!("nsscanner_disk: sending data usage entry info: {}", cache.info.name);
+
                     if let Err(e) = bucket_result_tx_clone_clone
                         .lock()
                         .await
@@ -439,11 +445,11 @@ impl ScannerIOCache for SetDisks {
                         })
                         .await
                     {
-                        error!("Failed to send data usage entry info: {}", e);
+                        error!("nsscanner_disk: Failed to send data usage entry info: {}", e);
                     }
 
                     if let Err(e) = cache.save(store_clone_clone.clone(), &cache_name).await {
-                        error!("Failed to save data usage cache: {}", e);
+                        error!("nsscanner_disk: Failed to save data usage cache: {}", e);
                     }
                 }
             }));
@@ -451,7 +457,9 @@ impl ScannerIOCache for SetDisks {
 
         let _ = join_all(futs).await;
 
-        update_fut.await?;
+        drop(bucket_result_tx_clone);
+
+        send_update_fut.await?;
 
         Ok(())
     }
@@ -469,7 +477,7 @@ impl ScannerIODisk for Disk {
         &self,
         ctx: CancellationToken,
         cache: DataUsageCache,
-        updates: mpsc::Sender<DataUsageEntry>,
+        updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache> {
         match self {
@@ -556,7 +564,7 @@ impl ScannerIODisk for LocalDisk {
         &self,
         ctx: CancellationToken,
         cache: DataUsageCache,
-        updates: mpsc::Sender<DataUsageEntry>,
+        updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache> {
         let _guard = self.start_scan();
@@ -618,12 +626,10 @@ impl ScannerIODisk for LocalDisk {
 
         let disks = disks_result.into_iter().flatten().collect::<Vec<Arc<Disk>>>();
 
-        cache.info.updates = Some(Arc::new(Mutex::new(updates)));
-
         // Create we_sleep function (always return false for now, can be enhanced later)
         let we_sleep: Box<dyn Fn() -> bool + Send + Sync> = Box::new(|| false);
 
-        let result = scan_data_folder(ctx, disks, local_disk, cache, scan_mode, we_sleep).await;
+        let result = scan_data_folder(ctx, disks, local_disk, cache, updates, scan_mode, we_sleep).await;
 
         match result {
             Ok(mut data_usage_info) => {
@@ -644,7 +650,7 @@ impl ScannerIODisk for RemoteDisk {
         &self,
         ctx: CancellationToken,
         cache: DataUsageCache,
-        updates: mpsc::Sender<DataUsageEntry>,
+        updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache> {
         todo!()
