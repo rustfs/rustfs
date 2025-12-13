@@ -33,5 +33,6 @@ pub struct TargetLog<E> {
     /// The object key
     pub key: String,
     /// The list of events
+    #[serde(rename = "Records")]
     pub records: Vec<E>,
 }
