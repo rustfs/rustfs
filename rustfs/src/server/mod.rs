@@ -13,13 +13,13 @@
 // limitations under the License.
 
 mod audit;
+mod compress;
+mod event;
 mod http;
 mod hybrid;
 mod layer;
-mod service_state;
-
-mod event;
 mod runtime;
+mod service_state;
 
 pub(crate) use audit::{start_audit_system, stop_audit_system};
 pub(crate) use event::{init_event_notifier, shutdown_event_notifier};

@@ -3,7 +3,89 @@
 ## Overview
 
 This document outlines best practices for HTTP response compression in RustFS, based on lessons learned from fixing the
-NoSuchKey error response regression (Issue #901).
+NoSuchKey error response regression (Issue #901) and the whitelist-based compression redesign (Issue #902).
+
+## Whitelist-Based Compression (Issue #902)
+
+### Design Philosophy
+
+After Issue #901, we identified that the blacklist approach (compress everything except known problematic types) was
+still causing issues with browser downloads showing "unknown file size". In Issue #902, we redesigned the compression
+system using a **whitelist approach** aligned with MinIO's behavior:
+
+1. **Compression is disabled by default** - Opt-in rather than opt-out
+2. **Only explicitly configured content types are compressed** - Preserves Content-Length for all other responses
+3. **Fine-grained configuration** - Control via file extensions, MIME types, and size thresholds
+4. **Skip already-encoded content** - Avoid double compression
+
+### Configuration Options
+
+RustFS provides flexible compression configuration via environment variables and command-line arguments:
+
+| Environment Variable | CLI Argument | Default | Description |
+|---------------------|--------------|---------|-------------|
+| `RUSTFS_COMPRESS_ENABLE` |  | `false` | Enable/disable compression |
+| `RUSTFS_COMPRESS_EXTENSIONS` |  | `""` | File extensions to compress (e.g., `.txt,.log,.csv`) |
+| `RUSTFS_COMPRESS_MIME_TYPES` |  | `text/*,application/json,...` | MIME types to compress (supports wildcards) |
+| `RUSTFS_COMPRESS_MIN_SIZE` |  | `1000` | Minimum file size (bytes) for compression |
+
+### Usage Examples
+
+```bash
+# Enable compression for text files and JSON
+RUSTFS_COMPRESS_ENABLE=on \
+RUSTFS_COMPRESS_EXTENSIONS=.txt,.log,.csv,.json,.xml \
+RUSTFS_COMPRESS_MIME_TYPES=text/*,application/json,application/xml \
+RUSTFS_COMPRESS_MIN_SIZE=1000 \
+rustfs /data
+
+# Or using command-line arguments
+rustfs /data \
+  --compress-enable \
+  --compress-extensions ".txt,.log,.csv" \
+  --compress-mime-types "text/*,application/json" \
+  --compress-min-size 1000
+```
+
+### Implementation Details
+
+The `CompressionPredicate` implements intelligent compression decisions:
+
+```rust
+impl Predicate for CompressionPredicate {
+    fn should_compress<B>(&self, response: &Response<B>) -> bool {
+        // 1. Check if compression is enabled
+        if !self.config.enabled { return false; }
+
+        // 2. Never compress error responses
+        if status.is_client_error() || status.is_server_error() { return false; }
+
+        // 3. Skip already-encoded content (gzip, br, deflate, etc.)
+        if has_content_encoding(response) { return false; }
+
+        // 4. Check minimum size threshold
+        if content_length < self.config.min_size { return false; }
+
+        // 5. Check whitelist: extension OR MIME type must match
+        if matches_extension(response) || matches_mime_type(response) {
+            return true;
+        }
+
+        // 6. Default: don't compress (whitelist approach)
+        false
+    }
+}
+```
+
+### Benefits of Whitelist Approach
+
+| Aspect | Blacklist (Old) | Whitelist (New) |
+|--------|-----------------|-----------------|
+| Default behavior | Compress most content | No compression |
+| Content-Length | Often removed | Preserved for unmatched types |
+| Browser downloads | "Unknown file size" | Accurate file size shown |
+| Configuration | Complex exclusion rules | Simple inclusion rules |
+| MinIO compatibility | Different behavior | Aligned behavior |
 
 ## Key Principles
 
@@ -38,21 +120,54 @@ if status.is_client_error() || status.is_server_error() {
 - May actually increase payload size
 - Adds latency without benefit
 
-**Recommended Threshold**: 256 bytes minimum
+**Recommended Threshold**: 1000 bytes minimum (configurable via `RUSTFS_COMPRESS_MIN_SIZE`)
 
 **Implementation**:
 
 ```rust
 if let Some(content_length) = response.headers().get(CONTENT_LENGTH) {
     if let Ok(length) = content_length.to_str()?.parse::<u64>()? {
-        if length < 256 {
+        if length < self.config.min_size {
             return false; // Don't compress small responses
         }
     }
 }
 ```
 
-### 3. Maintain Observability
+### 3. Skip Already-Encoded Content
+
+**Rationale**: If the response already has a `Content-Encoding` header (e.g., gzip, br, deflate, zstd), the content
+is already compressed. Re-compressing provides no benefit and may cause issues:
+
+- Double compression wastes CPU cycles
+- May corrupt data or increase size
+- Breaks decompression on client side
+
+**Implementation**:
+
+```rust
+// Skip if content is already encoded (e.g., gzip, br, deflate, zstd)
+if let Some(content_encoding) = response.headers().get(CONTENT_ENCODING) {
+    if let Ok(encoding) = content_encoding.to_str() {
+        let encoding_lower = encoding.to_lowercase();
+        // "identity" means no encoding, so we can still compress
+        if encoding_lower != "identity" && !encoding_lower.is_empty() {
+            debug!("Skipping compression for already encoded response: {}", encoding);
+            return false;
+        }
+    }
+}
+```
+
+**Common Content-Encoding Values**:
+
+- `gzip` - GNU zip compression
+- `br` - Brotli compression
+- `deflate` - Deflate compression
+- `zstd` - Zstandard compression
+- `identity` - No encoding (compression allowed)
+
+### 4. Maintain Observability
 
 **Rationale**: Compression decisions can affect debugging and troubleshooting. Always log when compression is skipped.
 
@@ -84,38 +199,58 @@ grep "Skipping compression" logs/rustfs.log | wc -l
 .layer(CompressionLayer::new())
 ```
 
-**Problem**: Can cause Content-Length mismatches with error responses
+**Problem**: Can cause Content-Length mismatches with error responses and browser download issues
 
-### ✅ Using Intelligent Predicates
-
-```rust
-// GOOD - Filter based on status and size
-.layer(CompressionLayer::new().compress_when(ShouldCompress))
-```
-
-### ❌ Ignoring Content-Length Header
+### ❌ Using Blacklist Approach
 
 ```rust
-// BAD - Only checking status
+// BAD - Blacklist approach (compress everything except...)
 fn should_compress(&self, response: &Response<B>) -> bool {
-    !response.status().is_client_error()
+    // Skip images, videos, archives...
+    if is_already_compressed_type(content_type) { return false; }
+    true  // Compress everything else
 }
 ```
 
-**Problem**: May compress tiny responses unnecessarily
+**Problem**: Removes Content-Length for many file types, causing "unknown file size" in browsers
 
-### ✅ Checking Both Status and Size
+### ✅ Using Whitelist-Based Predicate
 
 ```rust
-// GOOD - Multi-criteria decision
+// GOOD - Whitelist approach with configurable predicate
+.layer(CompressionLayer::new().compress_when(CompressionPredicate::new(config)))
+```
+
+### ❌ Ignoring Content-Encoding Header
+
+```rust
+// BAD - May double-compress already compressed content
 fn should_compress(&self, response: &Response<B>) -> bool {
-    // Check status
+    matches_mime_type(response)  // Missing Content-Encoding check
+}
+```
+
+**Problem**: Double compression wastes CPU and may corrupt data
+
+### ✅ Comprehensive Checks
+
+```rust
+// GOOD - Multi-criteria whitelist decision
+fn should_compress(&self, response: &Response<B>) -> bool {
+    // 1. Must be enabled
+    if !self.config.enabled { return false; }
+
+    // 2. Skip error responses
     if response.status().is_error() { return false; }
 
-    // Check size
-    if get_content_length(response) < 256 { return false; }
+    // 3. Skip already-encoded content
+    if has_content_encoding(response) { return false; }
 
-    true
+    // 4. Check minimum size
+    if get_content_length(response) < self.config.min_size { return false; }
+
+    // 5. Must match whitelist (extension OR MIME type)
+    matches_extension(response) || matches_mime_type(response)
 }
 ```
 
@@ -224,28 +359,52 @@ async fn test_error_response_not_truncated() {
 
 ## Migration Guide
 
+### Migrating from Blacklist to Whitelist Approach
+
+If you're upgrading from an older RustFS version with blacklist-based compression:
+
+1. **Compression is now disabled by default**
+   - Set `RUSTFS_COMPRESS_ENABLE=on` to enable
+   - This ensures backward compatibility for existing deployments
+
+2. **Configure your whitelist**
+   ```bash
+   # Example: Enable compression for common text formats
+   RUSTFS_COMPRESS_ENABLE=on
+   RUSTFS_COMPRESS_EXTENSIONS=.txt,.log,.csv,.json,.xml,.html,.css,.js
+   RUSTFS_COMPRESS_MIME_TYPES=text/*,application/json,application/xml,application/javascript
+   RUSTFS_COMPRESS_MIN_SIZE=1000
+   ```
+
+3. **Verify browser downloads**
+   - Check that file downloads show accurate file sizes
+   - Verify Content-Length headers are preserved for non-compressed content
+
 ### Updating Existing Code
 
 If you're adding compression to an existing service:
 
-1. **Start Conservative**: Only compress responses > 1KB
-2. **Monitor Impact**: Watch CPU and latency metrics
-3. **Lower Threshold Gradually**: Test with smaller thresholds
-4. **Always Exclude Errors**: Never compress 4xx/5xx
+1. **Start with compression disabled** (default)
+2. **Define your whitelist**: Identify content types that benefit from compression
+3. **Set appropriate thresholds**: Start with 1KB minimum size
+4. **Enable and monitor**: Watch CPU, latency, and download behavior
 
 ### Rollout Strategy
 
 1. **Stage 1**: Deploy to canary (5% traffic)
     - Monitor for 24 hours
     - Check error rates and latency
+    - Verify browser download behavior
 
 2. **Stage 2**: Expand to 25% traffic
     - Monitor for 48 hours
     - Validate compression ratios
+    - Check Content-Length preservation
 
 3. **Stage 3**: Full rollout (100% traffic)
     - Continue monitoring for 1 week
     - Document any issues
+    - Fine-tune whitelist based on actual usage
 
 ## Related Documentation
 
@@ -253,13 +412,33 @@ If you're adding compression to an existing service:
 - [tower-http Compression](https://docs.rs/tower-http/latest/tower_http/compression/)
 - [HTTP Content-Encoding](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding)
 
+## Architecture
+
+### Module Structure
+
+The compression functionality is organized in a dedicated module for maintainability:
+
+```
+rustfs/src/server/
+├── compress.rs        # Compression configuration and predicate
+├── http.rs            # HTTP server (uses compress module)
+└── mod.rs             # Module declarations
+```
+
+### Key Components
+
+1. **`CompressionConfig`** - Stores compression settings parsed from environment/CLI
+2. **`CompressionPredicate`** - Implements `tower_http::compression::predicate::Predicate`
+3. **Configuration Constants** - Defined in `crates/config/src/constants/compress.rs`
+
 ## References
 
 1. Issue #901: NoSuchKey error response regression
-2. [Google Web Fundamentals - Text Compression](https://web.dev/reduce-network-payloads-using-text-compression/)
-3. [AWS Best Practices - Response Compression](https://docs.aws.amazon.com/whitepapers/latest/s3-optimizing-performance-best-practices/)
+2. Issue #902: Whitelist-based compression redesign
+3. [Google Web Fundamentals - Text Compression](https://web.dev/reduce-network-payloads-using-text-compression/)
+4. [AWS Best Practices - Response Compression](https://docs.aws.amazon.com/whitepapers/latest/s3-optimizing-performance-best-practices/)
 
 ---
 
-**Last Updated**: 2025-11-24  
+**Last Updated**: 2025-12-13  
 **Maintainer**: RustFS Team
