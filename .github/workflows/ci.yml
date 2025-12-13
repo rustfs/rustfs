@@ -103,20 +103,65 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: 4
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
-      - name: Add 8GB swap to increase available memory
-        run: |
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          sudo sysctl vm.swappiness=10
+       
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Disk diagnostics (before cleanup)
+        run: |
+          echo "=== df -h ==="
+          df -h
+          echo "=== du -sh /home/runner || true ==="
+          du -sh /home/runner || true
+          echo "=== du -sh $GITHUB_WORKSPACE || true ==="
+          du -sh "$GITHUB_WORKSPACE" || true
+
+      - name: Aggressive cleanup to free disk (may remove preinstalled heavy tool dirs)
+        run: |
+          sudo apt-get clean || true
+          sudo rm -rf /opt/hostedtoolcache || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/go || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/local/lib/emscripten || true
+          # Clean apt lists
+          sudo rm -rf /var/lib/apt/lists/* || true
+          echo "After cleanup:"
+          df -h
+
+      - name: Ensure target dir empty (free previous builds) and prepare RUNNER_TEMP cargo dir
+        run: |
+          echo "Cleaning previous target dirs to free space"
+          rm -rf ./target || true
+          # create runner temp cargo-target directory
+          mkdir -p "$RUNNER_TEMP/cargo-target"
+          echo "Runner temp is: $RUNNER_TEMP"
+          du -sh "$RUNNER_TEMP" || true
+
+      - name: Add 8GB swap (optional — helps memory but consumes disk)
+        run: |
+          # Only create swap if there's free space; abort gracefully otherwise
+          FREE_KB=$(df --output=avail / | tail -n1)
+          # require > 9GB free to create 8GB swap
+          if [ "$FREE_KB" -gt $((9 * 1024 * 1024)) ]; then
+            sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+            sudo sysctl vm.swappiness=10
+            echo "Swap enabled"
+          else
+            echo "Not enough free space to create swap; skipping"
+          fi
+      - name: (Optional) Install lld to provide alternate linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lld || true
+          
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
@@ -125,16 +170,41 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Build all crates serially to avoid concurrent linkers
+        run: |
+          # use runner temp as cargo target dir to avoid filling workspace
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target"
+          mkdir -p "$CARGO_TARGET_DIR"
+          echo "Building with CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+          cargo build -j 2 --all
       - name: Run tests
         run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target"
+          echo "Running nextest with CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
           cargo nextest run -j 2 --all --exclude e2e_test
-          cargo test --all --doc
+          cargo test -j 2 --all --doc
 
       - name: Check code formatting
         run: cargo fmt --all --check
 
       - name: Run clippy lints
         run: cargo clippy --all-targets --all-features -- -D warnings
+        
+      - name: Post-build disk usage
+        if: always()
+        run: |
+          echo "=== df -h after build ==="
+          df -h
+          echo "=== du -sh $RUNNER_TEMP/cargo-target || true ==="
+          du -sh "$RUNNER_TEMP/cargo-target" || true
+
+      - name: Clean target to release disk (optional)
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/cargo-target" || true
+          rm -rf ./target || true
+          echo "Disk after cleaning:"
+          df -h
 
   e2e-tests:
     name: End-to-End Tests
@@ -154,6 +224,30 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Disk diagnostics & cleanup
+        run: |
+          df -h
+          sudo apt-get clean || true
+          sudo rm -rf /opt/hostedtoolcache || true
+          rm -rf ./target || true
+          rm -rf "$RUNNER_TEMP/cargo-target" || true
+          mkdir -p "$RUNNER_TEMP/cargo-target"
+          df -h
+
+      - name: Add 8GB swap (optional)
+        run: |
+          FREE_KB=$(df --output=avail / | tail -n1)
+          if [ "$FREE_KB" -gt $((9 * 1024 * 1024)) ]; then
+            sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+            sudo sysctl vm.swappiness=10
+            echo "Swap enabled"
+          else
+            echo "Not enough free space to create swap; skipping"
+          fi
+
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@v2
         with:
@@ -161,23 +255,17 @@ jobs:
           git: https://github.com/Nugine/s3s.git
           rev: b7714bfaa17ddfa9b23ea01774a1e7bbdbfc2ca3
 
-      - name: Add 8GB swap to increase available memory
-        run: |
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          sudo sysctl vm.swappiness=10
-
       - name: Build debug binary
         run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target"
+          mkdir -p "$CARGO_TARGET_DIR"
           touch rustfs/build.rs
           cargo build -p rustfs --bins
 
       - name: Run end-to-end tests
         run: |
           s3s-e2e --version
-          ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
+          ./scripts/e2e-run.sh "$RUNNER_TEMP/cargo-target"/debug/rustfs /tmp/rustfs
 
       - name: Upload test logs
         if: failure()
@@ -186,3 +274,10 @@ jobs:
           name: e2e-test-logs-${{ github.run_number }}
           path: /tmp/rustfs.log
           retention-days: 3
+          
+      - name: Clean target after e2e (always)
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/cargo-target" || true
+          rm -rf ./target || true
+          df -h
