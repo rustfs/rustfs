@@ -124,6 +124,27 @@ pub struct Opt {
     /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
     #[arg(long, default_value_t = String::from("GeneralPurpose"), env = "RUSTFS_BUFFER_PROFILE")]
     pub buffer_profile: String,
+
+    /// Enable HTTP response compression (gzip)
+    /// When enabled, responses matching the configured extensions/MIME types will be compressed
+    /// Default: false (disabled, aligned with MinIO behavior)
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_COMPRESS_ENABLE, env = "RUSTFS_COMPRESS_ENABLE")]
+    pub compress_enable: bool,
+
+    /// File extensions that should be compressed (comma-separated)
+    /// Example: .txt,.log,.csv,.json,.xml,.html,.css,.js
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_COMPRESS_EXTENSIONS.to_string(), env = "RUSTFS_COMPRESS_EXTENSIONS")]
+    pub compress_extensions: String,
+
+    /// MIME types that should be compressed (comma-separated, supports wildcard)
+    /// Example: text/*,application/json,application/xml
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_COMPRESS_MIME_TYPES.to_string(), env = "RUSTFS_COMPRESS_MIME_TYPES")]
+    pub compress_mime_types: String,
+
+    /// Minimum file size (in bytes) for compression to apply
+    /// Files smaller than this size will not be compressed
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_COMPRESS_MIN_SIZE, env = "RUSTFS_COMPRESS_MIN_SIZE")]
+    pub compress_min_size: u64,
 }
 
 // lazy_static::lazy_static! {
