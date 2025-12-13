@@ -15,9 +15,9 @@ spec:
       labels:
         app: {{ include "rustfs.name" . }}
     spec:
-      {{- if .Values.imageRegistryCredentials.enabled }}
+      {{- with include "chart.imagePullSecrets" . }}
       imagePullSecrets:
-        - name: {{ .Values.imagePullSecrets }}
+        {{- . | nindent 8 }}
       {{- end }}
       {{- if .Values.podSecurityContext }}
       securityContext:

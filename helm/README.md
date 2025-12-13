@@ -14,7 +14,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | parameter | description | default value |
 | -- | -- | -- |
 | replicaCount                      | Number of cluster nodes.                                           |  `4`.           |
-| imagePullSecrets                  | Secret to pull image from private registry.                        | `rustfs-regcred`|
+| imagePullSecrets                  | A List of secrets to pull image from private registry.             | `name: secret-name`|
 | imageRegistryCredentials.enabled  | To indicate whether pull image from private registry.              | `false`         |
 | imageRegistryCredentials.registry | Private registry url to pull rustfs image.                         | None            |
 | imageRegistryCredentials.username | The username to pull rustfs image from private registry.           | None            |
@@ -34,7 +34,27 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 
 **NOTE**: 
 
-- The chart default pull rustfs image from dockerhub,if your rustfs image stores in private registry,you should enable `imageRegistryCredentials.enabled` to `true`,and then specify the `imageRegistryCredentials.registry/username/password/email` as well as `image.repository`,`image.tag` to pull rustfs image from your private registry.
+The chart pulls the rustfs image from Docker Hub by default. For private registries, provide either:
+
+- **Existing secrets**: Set `imagePullSecrets` with an array of secret names
+  ```yaml
+  imagePullSecrets:
+    - name: my-existing-secret
+  ```
+
+- **Auto-generated secret**: Enable `imageRegistryCredentials.enabled: true` and specify credentials plus your image details
+  ```yaml
+  imageRegistryCredentials:
+    enabled: true
+    registry: myregistry.com
+    username: myuser
+    password: mypass
+    email: user@example.com
+  ```
+
+Both approaches support pulling from private registries seamlessly and you can also combine them.
+
+- The chart default pull rustfs image from dockerhub, if your rustfs image stores in private registry, you can use either existing image Pull secrets with parameter `imagePullSecrets` or create one setting `imageRegistryCredentials.enabled` to `true`,and then specify the `imageRegistryCredentials.registry/username/password/email` as well as `image.repository`,`image.tag` to pull rustfs image from your private registry.
 
 - The default storageclass is [`local-path`](https://github.com/rancher/local-path-provisioner),if you want to specify your own storageclass, try to set parameter `storageclass.name`.
 
