@@ -91,6 +91,7 @@
                 "RUSTFS_VOLUMES": "./target/volume/test{1...4}",
                 "RUSTFS_ADDRESS": ":9000",
                 "RUSTFS_CONSOLE_ENABLE": "true",
+                // "RUSTFS_COMPRESS_ENABLE": "true",
                 "RUSTFS_CONSOLE_ADDRESS": "127.0.0.1:9001",
                 "RUSTFS_OBS_LOG_DIRECTORY": "./target/logs",
             },
