@@ -214,9 +214,7 @@ mod tests {
             // Allow widened range due to parallel test execution affecting global counter
             assert!(
                 (64 * KI_B..=MI_B).contains(&buffer_size),
-                "{}: buffer should be in valid range 64KB-1MB, got {} bytes",
-                description,
-                buffer_size
+                "{description}: buffer should be in valid range 64KB-1MB, got {buffer_size} bytes"
             );
         }
     }
@@ -229,22 +227,20 @@ mod tests {
         let min_buffer = get_concurrency_aware_buffer_size(small_file, 64 * KI_B);
         assert!(
             min_buffer >= 32 * KI_B,
-            "Buffer should have minimum size of 32KB for tiny files, got {}",
-            min_buffer
+            "Buffer should have minimum size of 32KB for tiny files, got {min_buffer}"
         );
 
         // Test maximum buffer size (capped at 1MB when base is reasonable)
         let huge_file = 10 * 1024 * MI_B as i64; // 10GB file
         let max_buffer = get_concurrency_aware_buffer_size(huge_file, MI_B);
-        assert!(max_buffer <= MI_B, "Buffer should not exceed 1MB cap when requested, got {}", max_buffer);
+        assert!(max_buffer <= MI_B, "Buffer should not exceed 1MB cap when requested, got {max_buffer}");
 
         // Test buffer size scaling with base - when base is small, result respects the limits
         let medium_file = 200 * KI_B as i64; // 200KB file (>100KB so minimum is 64KB)
         let buffer = get_concurrency_aware_buffer_size(medium_file, 128 * KI_B);
         assert!(
             (64 * KI_B..=MI_B).contains(&buffer),
-            "Buffer should be between 64KB and 1MB, got {}",
-            buffer
+            "Buffer should be between 64KB and 1MB, got {buffer}"
         );
     }
 
@@ -271,7 +267,7 @@ mod tests {
 
         let elapsed = start.elapsed();
         // With 64 permits, 10 concurrent tasks should complete quickly
-        assert!(elapsed < Duration::from_secs(1), "Should complete within 1 second, took {:?}", elapsed);
+        assert!(elapsed < Duration::from_secs(1), "Should complete within 1 second, took {elapsed:?}");
     }
 
     /// Test Moka cache operations: insert, retrieve, stats, and clear.
@@ -373,7 +369,7 @@ mod tests {
         let num_objects = 20; // Total 120MB > 100MB limit
 
         for i in 0..num_objects {
-            let key = format!("test/object{}", i);
+            let key = format!("test/object{i}");
             let data = vec![i as u8; object_size];
             manager.cache_object(key, data).await;
             sleep(Duration::from_millis(10)).await; // Give Moka time to process
@@ -407,7 +403,7 @@ mod tests {
 
         // Cache multiple objects
         for i in 0..10 {
-            let key = format!("batch/object{}", i);
+            let key = format!("batch/object{i}");
             let data = vec![i as u8; 100 * KI_B]; // 100KB each
             manager.cache_object(key, data).await;
         }
@@ -415,14 +411,14 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
 
         // Test batch get
-        let keys: Vec<String> = (0..10).map(|i| format!("batch/object{}", i)).collect();
+        let keys: Vec<String> = (0..10).map(|i| format!("batch/object{i}")).collect();
         let results = manager.get_cached_batch(&keys).await;
 
         assert_eq!(results.len(), 10, "Should return result for each key");
 
         // Verify all objects were retrieved
         let hits = results.iter().filter(|r| r.is_some()).count();
-        assert!(hits >= 8, "Most objects should be cached (got {}/10 hits)", hits);
+        assert!(hits >= 8, "Most objects should be cached (got {hits}/10 hits)");
 
         // Mix of existing and non-existing keys
         let mixed_keys = vec![
@@ -442,7 +438,7 @@ mod tests {
 
         // Prepare objects for warming
         let objects: Vec<(String, Vec<u8>)> = (0..5)
-            .map(|i| (format!("warm/object{}", i), vec![i as u8; 500 * KI_B]))
+            .map(|i| (format!("warm/object{i}"), vec![i as u8; 500 * KI_B]))
             .collect();
 
         // Warm cache
@@ -452,8 +448,8 @@ mod tests {
         // Verify all objects are cached
         for (key, data) in objects {
             let cached = manager.get_cached(&key).await;
-            assert!(cached.is_some(), "Warmed object {} should be cached", key);
-            assert_eq!(*cached.unwrap(), data, "Cached data for {} should match", key);
+            assert!(cached.is_some(), "Warmed object {key} should be cached");
+            assert_eq!(*cached.unwrap(), data, "Cached data for {key} should match");
         }
 
         let stats = manager.cache_stats().await;
@@ -467,7 +463,7 @@ mod tests {
 
         // Cache objects with different access patterns
         for i in 0..5 {
-            let key = format!("hot/object{}", i);
+            let key = format!("hot/object{i}");
             let data = vec![i as u8; 100 * KI_B];
             manager.cache_object(key, data).await;
         }
@@ -532,25 +528,23 @@ mod tests {
     /// Test advanced buffer sizing with file patterns
     #[tokio::test]
     async fn test_advanced_buffer_sizing() {
+        crate::storage::concurrency::reset_active_get_requests();
+
         let base_buffer = 256 * KI_B; // 256KB base
 
         // Test small file optimization
         let small_size = get_advanced_buffer_size(128 * KI_B as i64, base_buffer, false);
         assert!(
             small_size < base_buffer,
-            "Small files should use smaller buffers: {} < {}",
-            small_size,
-            base_buffer
+            "Small files should use smaller buffers: {small_size} < {base_buffer}"
         );
-        assert!(small_size >= 16 * KI_B, "Should not go below minimum: {}", small_size);
+        assert!(small_size >= 16 * KI_B, "Should not go below minimum: {small_size}");
 
         // Test sequential read optimization
         let seq_size = get_advanced_buffer_size(32 * MI_B as i64, base_buffer, true);
         assert!(
             seq_size >= base_buffer,
-            "Sequential reads should use larger buffers: {} >= {}",
-            seq_size,
-            base_buffer
+            "Sequential reads should use larger buffers: {seq_size} >= {base_buffer}"
         );
 
         // Test large file with high concurrency
@@ -558,9 +552,7 @@ mod tests {
         let large_concurrent = get_advanced_buffer_size(100 * MI_B as i64, base_buffer, false);
         assert!(
             large_concurrent <= base_buffer,
-            "High concurrency should reduce buffer: {} <= {}",
-            large_concurrent,
-            base_buffer
+            "High concurrency should reduce buffer: {large_concurrent} <= {base_buffer}"
         );
     }
 
@@ -571,7 +563,7 @@ mod tests {
 
         // Pre-populate cache
         for i in 0..20 {
-            let key = format!("concurrent/object{}", i);
+            let key = format!("concurrent/object{i}");
             let data = vec![i as u8; 100 * KI_B];
             manager.cache_object(key, data).await;
         }
@@ -600,8 +592,7 @@ mod tests {
         // Moka's lock-free design should handle this quickly
         assert!(
             elapsed < Duration::from_millis(500),
-            "Concurrent cache access should be fast (took {:?})",
-            elapsed
+            "Concurrent cache access should be fast (took {elapsed:?})"
         );
     }
 
@@ -635,7 +626,7 @@ mod tests {
 
         // Cache some objects
         for i in 0..5 {
-            let key = format!("hitrate/object{}", i);
+            let key = format!("hitrate/object{i}");
             let data = vec![i as u8; 100 * KI_B];
             manager.cache_object(key, data).await;
         }
@@ -645,16 +636,16 @@ mod tests {
         // Mix of hits and misses
         for i in 0..10 {
             let key = if i < 5 {
-                format!("hitrate/object{}", i) // Hit
+                format!("hitrate/object{i}") // Hit
             } else {
-                format!("hitrate/missing{}", i) // Miss
+                format!("hitrate/missing{i}") // Miss
             };
             let _ = manager.get_cached(&key).await;
         }
 
         // Hit rate should be around 50%
         let hit_rate = manager.cache_hit_rate();
-        assert!((40.0..=60.0).contains(&hit_rate), "Hit rate should be ~50%, got {:.1}%", hit_rate);
+        assert!((40.0..=60.0).contains(&hit_rate), "Hit rate should be ~50%, got {hit_rate:.1}%");
     }
 
     /// Test TTL expiration (Moka automatic cleanup)
@@ -686,7 +677,7 @@ mod tests {
 
         // Pre-populate
         for i in 0..50 {
-            let key = format!("bench/object{}", i);
+            let key = format!("bench/object{i}");
             let data = vec![i as u8; 500 * KI_B];
             manager.cache_object(key, data).await;
         }
@@ -1222,14 +1213,13 @@ mod tests {
         // Average should be around 20ms
         assert!(
             avg >= Duration::from_millis(15) && avg <= Duration::from_millis(25),
-            "Average should be around 20ms, got {:?}",
-            avg
+            "Average should be around 20ms, got {avg:?}"
         );
 
         // Max should be 30ms
         assert_eq!(max, Duration::from_millis(30), "Max should be 30ms");
 
         // P95 should be at or near 30ms
-        assert!(p95 >= Duration::from_millis(25), "P95 should be near 30ms, got {:?}", p95);
+        assert!(p95 >= Duration::from_millis(25), "P95 should be near 30ms, got {p95:?}");
     }
 }

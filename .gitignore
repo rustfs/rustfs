@@ -24,3 +24,9 @@ profile.json
 *.pb
 *.svg
 deploy/logs/*.log.*
+
+# s3-tests local artifacts (root directory only)
+/s3-tests/
+/s3-tests-local/
+/s3tests.conf
+/s3tests.conf.*
