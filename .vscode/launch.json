@@ -92,12 +92,8 @@
                     "test",
                     "--no-run",
                     "--lib",
-                    "--package=ecstore"
-                ],
-                "filter": {
-                    "name": "ecstore",
-                    "kind": "lib"
-                }
+                    "--package=rustfs-ecstore"
+                ]
             },
             "args": [],
             "cwd": "${workspaceFolder}"
