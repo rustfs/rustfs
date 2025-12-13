@@ -46,7 +46,7 @@ fn main() -> Result<(), AnyError> {
     };
 
     if !need_compile {
-        println!("no need to compile protos.{}", need_compile);
+        println!("no need to compile protos.{need_compile}");
         return Ok(());
     }
 
