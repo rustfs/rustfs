@@ -24,10 +24,10 @@ RustFS provides flexible compression configuration via environment variables and
 
 | Environment Variable | CLI Argument | Default | Description |
 |---------------------|--------------|---------|-------------|
-| `RUSTFS_COMPRESS_ENABLE` | `--compress-enable` | `false` | Enable/disable compression |
-| `RUSTFS_COMPRESS_EXTENSIONS` | `--compress-extensions` | `""` | File extensions to compress (e.g., `.txt,.log,.csv`) |
-| `RUSTFS_COMPRESS_MIME_TYPES` | `--compress-mime-types` | `text/*,application/json,...` | MIME types to compress (supports wildcards) |
-| `RUSTFS_COMPRESS_MIN_SIZE` | `--compress-min-size` | `1000` | Minimum file size (bytes) for compression |
+| `RUSTFS_COMPRESS_ENABLE` |  | `false` | Enable/disable compression |
+| `RUSTFS_COMPRESS_EXTENSIONS` |  | `""` | File extensions to compress (e.g., `.txt,.log,.csv`) |
+| `RUSTFS_COMPRESS_MIME_TYPES` |  | `text/*,application/json,...` | MIME types to compress (supports wildcards) |
+| `RUSTFS_COMPRESS_MIN_SIZE` |  | `1000` | Minimum file size (bytes) for compression |
 
 ### Usage Examples
 

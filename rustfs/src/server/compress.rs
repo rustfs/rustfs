@@ -41,8 +41,12 @@
 //! rustfs /data
 //! ```
 
-use crate::config;
 use http::Response;
+use rustfs_config::{
+    DEFAULT_COMPRESS_ENABLE, DEFAULT_COMPRESS_EXTENSIONS, DEFAULT_COMPRESS_MIME_TYPES, DEFAULT_COMPRESS_MIN_SIZE,
+    ENV_COMPRESS_ENABLE, ENV_COMPRESS_EXTENSIONS, ENV_COMPRESS_MIME_TYPES, ENV_COMPRESS_MIN_SIZE, EnableState,
+};
+use std::str::FromStr;
 use tower_http::compression::predicate::Predicate;
 use tracing::debug;
 
@@ -68,12 +72,27 @@ pub struct CompressionConfig {
 }
 
 impl CompressionConfig {
-    /// Create a new compression configuration from command line options
-    pub fn from_opt(opt: &config::Opt) -> Self {
-        let extensions: Vec<String> = if opt.compress_extensions.is_empty() {
+    /// Create a new compression configuration from environment variables
+    ///
+    /// Reads the following environment variables:
+    /// - `RUSTFS_COMPRESS_ENABLE` - Enable/disable compression (default: false)
+    /// - `RUSTFS_COMPRESS_EXTENSIONS` - File extensions to compress (default: "")
+    /// - `RUSTFS_COMPRESS_MIME_TYPES` - MIME types to compress (default: "text/*,application/json,...")
+    /// - `RUSTFS_COMPRESS_MIN_SIZE` - Minimum file size for compression (default: 1000)
+    pub fn from_env() -> Self {
+        // Read compression enable state
+        let enabled = std::env::var(ENV_COMPRESS_ENABLE)
+            .ok()
+            .and_then(|v| EnableState::from_str(&v).ok())
+            .map(|state| state.is_enabled())
+            .unwrap_or(DEFAULT_COMPRESS_ENABLE);
+
+        // Read file extensions
+        let extensions_str = std::env::var(ENV_COMPRESS_EXTENSIONS).unwrap_or_else(|_| DEFAULT_COMPRESS_EXTENSIONS.to_string());
+        let extensions: Vec<String> = if extensions_str.is_empty() {
             Vec::new()
         } else {
-            opt.compress_extensions
+            extensions_str
                 .split(',')
                 .map(|s| {
                     let s = s.trim().to_lowercase();
@@ -83,21 +102,29 @@ impl CompressionConfig {
                 .collect()
         };
 
-        let mime_patterns: Vec<String> = if opt.compress_mime_types.is_empty() {
+        // Read MIME type patterns
+        let mime_types_str = std::env::var(ENV_COMPRESS_MIME_TYPES).unwrap_or_else(|_| DEFAULT_COMPRESS_MIME_TYPES.to_string());
+        let mime_patterns: Vec<String> = if mime_types_str.is_empty() {
             Vec::new()
         } else {
-            opt.compress_mime_types
+            mime_types_str
                 .split(',')
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect()
         };
 
+        // Read minimum file size
+        let min_size = std::env::var(ENV_COMPRESS_MIN_SIZE)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_COMPRESS_MIN_SIZE);
+
         Self {
-            enabled: opt.compress_enable,
+            enabled,
             extensions,
             mime_patterns,
-            min_size: opt.compress_min_size,
+            min_size,
         }
     }
 
@@ -170,7 +197,11 @@ impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
             enabled: rustfs_config::DEFAULT_COMPRESS_ENABLE,
-            extensions: Vec::new(),
+            extensions: rustfs_config::DEFAULT_COMPRESS_EXTENSIONS
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
             mime_patterns: rustfs_config::DEFAULT_COMPRESS_MIME_TYPES
                 .split(',')
                 .map(|s| s.trim().to_lowercase())

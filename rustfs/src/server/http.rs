@@ -237,8 +237,8 @@ pub async fn start_http_server(
         Some(cors_allowed_origins)
     };
 
-    // Create compression configuration from options
-    let compression_config = CompressionConfig::from_opt(opt);
+    // Create compression configuration from environment variables
+    let compression_config = CompressionConfig::from_env();
     if compression_config.enabled {
         info!(
             "HTTP response compression enabled: extensions={:?}, mime_types={:?}, min_size={} bytes",
