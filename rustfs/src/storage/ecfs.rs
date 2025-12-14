@@ -2776,6 +2776,7 @@ impl S3 for FS {
                     version_id: v.version_id.map(|v| v.to_string()),
                     is_latest: Some(v.is_latest),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
                     ..Default::default() // TODO: another fields
                 }
             })
