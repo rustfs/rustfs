@@ -38,8 +38,7 @@ fn get_platform_info() -> (String, String, String) {
 pub async fn dump_cpu_pprof_for(_duration: std::time::Duration) -> Result<std::path::PathBuf, String> {
     let (target_os, target_env, target_arch) = get_platform_info();
     let msg = format!(
-        "CPU profiling is not supported on this platform. target_os={}, target_env={}, target_arch={}",
-        target_os, target_env, target_arch
+        "CPU profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}"
     );
     Err(msg)
 }
@@ -48,8 +47,7 @@ pub async fn dump_cpu_pprof_for(_duration: std::time::Duration) -> Result<std::p
 pub async fn dump_memory_pprof_now() -> Result<std::path::PathBuf, String> {
     let (target_os, target_env, target_arch) = get_platform_info();
     let msg = format!(
-        "Memory profiling is not supported on this platform. target_os={}, target_env={}, target_arch={}",
-        target_os, target_env, target_arch
+        "Memory profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}"
     );
     Err(msg)
 }
