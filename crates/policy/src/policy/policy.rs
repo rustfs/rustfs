@@ -525,4 +525,83 @@ mod test {
         // assert_eq!(p, p2);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_aws_username_policy_variable() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": ["arn:aws:s3:::${aws:username}-*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::${aws:username}-*/*"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert("username".to_string(), vec!["testuser".to_string()]);
+
+        let args = Args {
+            account: "otheruser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "testuser-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &HashMap::new(),
+            deny_only: false,
+        };
+
+        assert!(policy.is_allowed(&args));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_userid_policy_variable() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${aws:userid}-bucket"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert("userid".to_string(), vec!["AIDACKCEVSQ6C2EXAMPLE".to_string()]);
+
+        let args = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "AIDACKCEVSQ6C2EXAMPLE-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &HashMap::new(),
+            deny_only: false,
+        };
+
+        assert!(policy.is_allowed(&args));
+
+        Ok(())
+    }
 }

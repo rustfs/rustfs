@@ -37,21 +37,21 @@ pub struct Functions {
 }
 
 impl Functions {
-    pub fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
+    pub fn evaluate(&self, values: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
         for c in self.for_any_value.iter() {
-            if !c.evaluate(false, values) {
+            if !c.evaluate(false, values, aws_variables) {
                 return false;
             }
         }
 
         for c in self.for_all_values.iter() {
-            if !c.evaluate(true, values) {
+            if !c.evaluate(true, values, aws_variables) {
                 return false;
             }
         }
 
         for c in self.for_normal.iter() {
-            if !c.evaluate(false, values) {
+            if !c.evaluate(false, values, aws_variables) {
                 return false;
             }
         }

@@ -24,6 +24,7 @@ mod principal;
 pub mod resource;
 pub mod statement;
 pub(crate) mod utils;
+pub mod variables;
 
 pub use action::ActionSet;
 pub use doc::PolicyDoc;
