@@ -6,7 +6,7 @@
             "request": "launch",
             "name": "Debug(only) executable 'rustfs'",
             "env": {
-              // "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug,iam=debug",
+              "RUST_LOG": "rustfs=info,ecstore=info,s3s=info,iam=info",
               "RUSTFS_SKIP_BACKGROUND_TASK": "on"
               //"RUSTFS_OBS_LOG_DIRECTORY": "./deploy/logs",
               // "RUSTFS_POLICY_PLUGIN_URL":"http://localhost:8181/v1/data/rustfs/authz/allow",
