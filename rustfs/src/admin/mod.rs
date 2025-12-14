@@ -66,6 +66,18 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         format!("{}{}", ADMIN_PREFIX, "/v3/service").as_str(),
         AdminOperation(&handlers::ServiceHandle {}),
     )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/file-history").as_str(),
+        AdminOperation(&handlers::file_history::GetFileHistoryHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/file-at-time").as_str(),
+        AdminOperation(&handlers::file_history::GetObjectAtTimeHandler {}),
+    )?;
     // 1
     r.insert(
         Method::GET,

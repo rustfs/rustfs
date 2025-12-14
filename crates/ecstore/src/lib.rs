@@ -48,6 +48,7 @@ pub mod store_utils;
 pub mod client;
 pub mod event;
 pub mod event_notification;
+pub mod point_in_time;
 pub mod tier;
 
 pub use global::new_object_layer_fn;
