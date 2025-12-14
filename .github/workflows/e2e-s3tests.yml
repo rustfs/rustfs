@@ -165,24 +165,20 @@ jobs:
           if [ -z "$XDIST" ]; then XDIST="0"; fi
           XDIST_ARGS=""
           if [ "$XDIST" != "0" ]; then
-            python3 -m pip install --user --upgrade pytest-xdist
+            # Add pytest-xdist to requirements.txt so tox installs it inside
+            # its virtualenv. Installing outside tox does NOT work.
+            echo "pytest-xdist" >> requirements.txt
             XDIST_ARGS="-n $XDIST --dist=loadgroup"
           fi
 
-          # Prefer boto3 tests directory if present (per upstream README).
-          TEST_FILE="s3tests/functional/test_s3.py"
-          if [ -f "s3test_boto3/functional/test_s3.py" ]; then
-            TEST_FILE="s3test_boto3/functional/test_s3.py"
-          fi
-          echo "Using test file: $TEST_FILE"
-
+          # Run tests from s3tests/functional (boto2+boto3 combined directory).
           S3TEST_CONF=${GITHUB_WORKSPACE}/s3tests.conf \
             tox -- \
               -vv -ra --showlocals --tb=long \
               --maxfail="$MAXFAIL" \
               --junitxml=${GITHUB_WORKSPACE}/artifacts/s3tests-single/junit.xml \
               $XDIST_ARGS \
-              "$TEST_FILE" \
+              s3tests/functional/test_s3.py \
               -m "$MARKEXPR" \
               2>&1 | tee ${GITHUB_WORKSPACE}/artifacts/s3tests-single/pytest.log
 
@@ -381,23 +377,20 @@ jobs:
           if [ -z "$XDIST" ]; then XDIST="0"; fi
           XDIST_ARGS=""
           if [ "$XDIST" != "0" ]; then
-            python3 -m pip install --user --upgrade pytest-xdist
+            # Add pytest-xdist to requirements.txt so tox installs it inside
+            # its virtualenv. Installing outside tox does NOT work.
+            echo "pytest-xdist" >> requirements.txt
             XDIST_ARGS="-n $XDIST --dist=loadgroup"
           fi
 
-          TEST_FILE="s3tests/functional/test_s3.py"
-          if [ -f "s3test_boto3/functional/test_s3.py" ]; then
-            TEST_FILE="s3test_boto3/functional/test_s3.py"
-          fi
-          echo "Using test file: $TEST_FILE"
-
+          # Run tests from s3tests/functional (boto2+boto3 combined directory).
           S3TEST_CONF=${GITHUB_WORKSPACE}/s3tests.conf \
             tox -- \
               -vv -ra --showlocals --tb=long \
               --maxfail="$MAXFAIL" \
               --junitxml=${GITHUB_WORKSPACE}/artifacts/s3tests-multi/junit.xml \
               $XDIST_ARGS \
-              "$TEST_FILE" \
+              s3tests/functional/test_s3.py \
               -m "$MARKEXPR" \
               2>&1 | tee ${GITHUB_WORKSPACE}/artifacts/s3tests-multi/pytest.log
 
