@@ -94,7 +94,10 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct Config {
     #[serde(skip)]
+    #[allow(dead_code)]
     port: u16,
+    #[serde(skip)]
+    api_public_endpoint: Option<String>,
     api: Api,
     s3: S3,
     release: Release,
@@ -103,9 +106,10 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    fn new(local_ip: IpAddr, port: u16, version: &str, date: &str) -> Self {
+    fn new(local_ip: IpAddr, port: u16, version: &str, date: &str, api_public_endpoint: Option<String>) -> Self {
         Config {
             port,
+            api_public_endpoint,
             api: Api {
                 base_url: format!("http://{local_ip}:{port}/{RUSTFS_ADMIN_PREFIX}"),
             },
@@ -184,7 +188,7 @@ struct License {
 static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 
 #[allow(clippy::const_is_empty)]
-pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
+pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16, api_public_endpoint: Option<String>) {
     CONSOLE_CONFIG.get_or_init(|| {
         let ver = {
             if !build::TAG.is_empty() {
@@ -196,7 +200,7 @@ pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
             }
         };
 
-        Config::new(local_ip, port, ver.as_str(), build::COMMIT_DATE_3339)
+        Config::new(local_ip, port, ver.as_str(), build::COMMIT_DATE_3339, api_public_endpoint)
     });
 }
 
@@ -280,19 +284,52 @@ async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl 
         .and_then(|value| value.to_str().ok())
         .unwrap_or_else(|| uri.scheme().map(|s| s.as_str()).unwrap_or("http"));
 
-    let raw_host = uri.host().unwrap_or(host.as_str());
-    let host_for_url = if let Ok(socket_addr) = raw_host.parse::<SocketAddr>() {
+    // Check X-Forwarded-Host header first, then fall back to Host header
+    let forwarded_host = headers
+        .get(HeaderName::from_static("x-forwarded-host"))
+        .and_then(|value| value.to_str().ok());
+
+    let raw_host = forwarded_host.unwrap_or_else(|| uri.host().unwrap_or(host.as_str()));
+
+    // Extract hostname and port from the host string
+    let (host_for_url, port_from_host) = if let Ok(socket_addr) = raw_host.parse::<SocketAddr>() {
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.
         let ip = socket_addr.ip();
-        if ip.is_ipv6() { format!("[{ip}]") } else { format!("{ip}") }
+        let hostname = if ip.is_ipv6() { format!("[{ip}]") } else { format!("{ip}") };
+        (hostname, Some(socket_addr.port()))
     } else if let Ok(ip) = raw_host.parse::<IpAddr>() {
         // Pure IP (no ports)
-        if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() }
+        let hostname = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
+        (hostname, None)
     } else {
-        // The domain name may not be able to resolve directly to IP, remove the port
-        raw_host.split(':').next().unwrap_or(raw_host).to_string()
+        // Domain name - may or may not include a port
+        if let Some((hostname, port_str)) = raw_host.rsplit_once(':') {
+            // Check if the part after ':' is actually a port number
+            if let Ok(port) = port_str.parse::<u16>() {
+                (hostname.to_string(), Some(port))
+            } else {
+                // Not a port, might be an IPv6 address without brackets
+                (raw_host.to_string(), None)
+            }
+        } else {
+            (raw_host.to_string(), None)
+        }
     };
+
+    // Check for explicit X-Forwarded-Port header
+    let forwarded_port = headers
+        .get(HeaderName::from_static("x-forwarded-port"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|s| s.parse::<u16>().ok());
+
+    // Determine the port to use:
+    // 1. X-Forwarded-Port header (highest priority)
+    // 2. Port from Host/X-Forwarded-Host header
+    // 3. Default port based on scheme (443 for https, 80 for http)
+    let port = forwarded_port
+        .or(port_from_host)
+        .unwrap_or_else(|| if scheme == "https" { 443 } else { 80 });
 
     // Make a copy of the current configuration
     let mut cfg = match CONSOLE_CONFIG.get() {
@@ -306,9 +343,17 @@ async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl 
         }
     };
 
-    let url = format!("{}://{}:{}", scheme, host_for_url, cfg.port);
+    // Build the URL - omit port if it's the default for the scheme
+    let url = if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
+        format!("{}://{}", scheme, host_for_url)
+    } else {
+        format!("{}://{}:{}", scheme, host_for_url, port)
+    };
+
     cfg.api.base_url = format!("{url}{RUSTFS_ADMIN_PREFIX}");
-    cfg.s3.endpoint = url;
+
+    // Use the configured public API endpoint if available, otherwise fall back to the console URL
+    cfg.s3.endpoint = cfg.api_public_endpoint.clone().unwrap_or(url);
 
     Response::builder()
         .header("content-type", "application/json")
