@@ -2819,7 +2819,7 @@ impl S3 for FS {
 
     // #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
         if req
             .headers
             .get("X-Amz-Meta-Snowball-Auto-Extract")
@@ -3141,6 +3141,12 @@ impl S3 for FS {
         let put_bucket = bucket.clone();
         let put_key = key.clone();
         let put_version = obj_info.version_id.map(|v| v.to_string());
+
+        helper = helper.object(obj_info.clone());
+        if let Some(version_id) = &put_version {
+            helper = helper.version_id(version_id.clone());
+        }
+
         tokio::spawn(async move {
             manager
                 .invalidate_cache_versioned(&put_bucket, &put_key, put_version.as_deref())
