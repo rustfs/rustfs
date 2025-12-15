@@ -951,6 +951,20 @@ impl S3 for FS {
             src_info.user_defined.insert(k, v);
         }
 
+        // Store SSE-C metadata for GET responses
+        if let Some(ref sse_alg) = sse_customer_algorithm {
+            src_info.user_defined.insert(
+                "x-amz-server-side-encryption-customer-algorithm".to_string(),
+                sse_alg.as_str().to_string(),
+            );
+        }
+        if let Some(ref sse_md5) = sse_customer_key_md5 {
+            src_info.user_defined.insert(
+                "x-amz-server-side-encryption-customer-key-md5".to_string(),
+                sse_md5.clone(),
+            );
+        }
+
         // TODO: src tags
 
         let oi = store
