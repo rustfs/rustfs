@@ -1721,6 +1721,10 @@ impl S3 for FS {
             version_id,
             part_number,
             range,
+            if_none_match,
+            if_match,
+            if_modified_since,
+            if_unmodified_since,
             ..
         } = req.input.clone();
 
@@ -1915,6 +1919,39 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
+
+        if let Some(match_etag) = if_none_match {
+            if let Some(strong_etag) = match_etag.as_strong() {
+                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
+                    return Err(S3Error::new(S3ErrorCode::NotModified));
+                }
+            }
+        }
+
+        if let Some(modified_since) = if_modified_since {
+            // obj_time < givenTime + 1s
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = modified_since.into();
+                mod_time < give_time.add(time::Duration::seconds(1))
+            }) {
+                return Err(S3Error::new(S3ErrorCode::NotModified));
+            }
+        }
+
+        if let Some(match_etag) = if_match {
+            if let Some(strong_etag) = match_etag.as_strong() {
+                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
+                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+                }
+            }
+        } else if let Some(unmodified_since) = if_unmodified_since {
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = unmodified_since.into();
+                mod_time > give_time.add(time::Duration::seconds(1))
+            }) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        }
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in &info.parts {
