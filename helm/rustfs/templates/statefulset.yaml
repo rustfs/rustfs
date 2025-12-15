@@ -135,6 +135,8 @@ spec:
           readinessProbe:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: logs
               mountPath: {{ $logDir }}
             {{- if eq (int .Values.replicaCount) 4 }}
@@ -146,6 +148,9 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: logs
