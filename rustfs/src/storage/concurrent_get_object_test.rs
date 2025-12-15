@@ -718,15 +718,15 @@ mod tests {
 
         assert!(seq_duration > Duration::from_micros(0), "Sequential access should take some time");
         assert!(conc_duration > Duration::from_micros(0), "Concurrent access should take some time");
-        
+
         // Record performance indicators for analysis, but not as a basis for testing failure
         let speedup_ratio = seq_duration.as_secs_f64() / conc_duration.as_secs_f64();
         if speedup_ratio < 0.8 {
-            println!("Warning: Concurrent access is significantly slower than sequential ({:.2}x)", speedup_ratio);
+            println!("Warning: Concurrent access is significantly slower than sequential ({speedup_ratio:.2}x)");
         } else if speedup_ratio > 1.2 {
-            println!("Info: Concurrent access is significantly faster than sequential ({:.2}x)", speedup_ratio);
+            println!("Info: Concurrent access is significantly faster than sequential ({speedup_ratio:.2}x)");
         } else {
-            println!("Info: Performance difference between concurrent and sequential access is modest ({:.2}x)", speedup_ratio);
+            println!("Info: Performance difference between concurrent and sequential access is modest ({speedup_ratio:.2}x)");
         }
     }
 
