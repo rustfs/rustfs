@@ -125,7 +125,6 @@ use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::convert::Infallible;
-use std::ops::Add;
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -741,6 +740,59 @@ async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store
         .map_err(ApiError::from)?;
 
     Ok(store)
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct HTTPPreconditions {
+    pub if_match: Option<ETag>,
+    pub if_none_match: Option<ETag>,
+    pub if_modified_since: Option<Timestamp>,
+    pub if_unmodified_since: Option<Timestamp>,
+}
+
+impl HTTPPreconditions {
+    fn check(&self, info: &ObjectInfo) -> S3Result<(), S3Error> {
+        let HTTPPreconditions {
+            if_match,
+            if_none_match,
+            if_modified_since,
+            if_unmodified_since,
+        } = self;
+
+        if let Some(match_etag) = if_match {
+            if let Some(strong_etag) = match_etag.as_strong() {
+                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
+                    return Err(s3_error!(PreconditionFailed));
+                }
+            }
+        }
+        if let Some(unmodified_since) = if_unmodified_since {
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = unmodified_since.clone().into();
+                // HTTP-date ony supports second precision
+                mod_time.unix_timestamp() > give_time.unix_timestamp()
+            }) {
+                return Err(s3_error!(PreconditionFailed));
+            }
+        }
+        if let Some(match_etag) = if_none_match {
+            if let Some(strong_etag) = match_etag.as_strong() {
+                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
+                    return Err(s3_error!(NotModified));
+                }
+            }
+        }
+        if let Some(modified_since) = if_modified_since {
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = modified_since.clone().into();
+                // HTTP-date ony supports second precision
+                mod_time.unix_timestamp() <= give_time.unix_timestamp()
+            }) {
+                return Err(s3_error!(NotModified));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1721,10 +1773,6 @@ impl S3 for FS {
             version_id,
             part_number,
             range,
-            if_none_match,
-            if_match,
-            if_modified_since,
-            if_unmodified_since,
             ..
         } = req.input.clone();
 
@@ -1920,38 +1968,13 @@ impl S3 for FS {
 
         let info = reader.object_info;
 
-        if let Some(match_etag) = if_none_match {
-            if let Some(strong_etag) = match_etag.as_strong() {
-                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
-                    return Err(S3Error::new(S3ErrorCode::NotModified));
-                }
-            }
-        }
-
-        if let Some(modified_since) = if_modified_since {
-            // obj_time < givenTime + 1s
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = modified_since.into();
-                mod_time < give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-
-        if let Some(match_etag) = if_match {
-            if let Some(strong_etag) = match_etag.as_strong() {
-                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
-                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-                }
-            }
-        } else if let Some(unmodified_since) = if_unmodified_since {
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = unmodified_since.into();
-                mod_time > give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        }
+        let preconditions = HTTPPreconditions {
+            if_match: req.input.if_match,
+            if_none_match: req.input.if_none_match,
+            if_modified_since: req.input.if_modified_since,
+            if_unmodified_since: req.input.if_unmodified_since,
+        };
+        preconditions.check(&info)?;
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in &info.parts {
@@ -2380,10 +2403,6 @@ impl S3 for FS {
             version_id,
             part_number,
             range,
-            if_none_match,
-            if_match,
-            if_modified_since,
-            if_unmodified_since,
             ..
         } = req.input.clone();
 
@@ -2424,39 +2443,13 @@ impl S3 for FS {
         };
 
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
-
-        if let Some(match_etag) = if_none_match {
-            if let Some(strong_etag) = match_etag.as_strong() {
-                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
-                    return Err(S3Error::new(S3ErrorCode::NotModified));
-                }
-            }
-        }
-
-        if let Some(modified_since) = if_modified_since {
-            // obj_time < givenTime + 1s
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = modified_since.into();
-                mod_time < give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-
-        if let Some(match_etag) = if_match {
-            if let Some(strong_etag) = match_etag.as_strong() {
-                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
-                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-                }
-            }
-        } else if let Some(unmodified_since) = if_unmodified_since {
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = unmodified_since.into();
-                mod_time > give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        }
+        let preconditions = HTTPPreconditions {
+            if_match: req.input.if_match,
+            if_none_match: req.input.if_none_match,
+            if_modified_since: req.input.if_modified_since,
+            if_unmodified_since: req.input.if_unmodified_since,
+        };
+        preconditions.check(&info)?;
 
         let event_info = info.clone();
         let content_type = {
@@ -5593,6 +5586,7 @@ mod tests {
     use super::*;
     use rustfs_config::MI_B;
     use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
+    use time::OffsetDateTime;
 
     #[test]
     fn test_fs_creation() {
@@ -5861,6 +5855,72 @@ mod tests {
         assert_eq!(get_buffer_size_opt_in(-1), MI_B);
 
         set_buffer_profile_enabled(false);
+    }
+
+    #[test]
+    fn test_no_precondition_check() {
+        let info = ObjectInfo {
+            etag: Some("abc123".to_string()),
+            ..Default::default()
+        };
+        let preconditions: HTTPPreconditions = Default::default();
+        assert!(matches!(preconditions.check(&info), Ok(())));
+    }
+
+    #[test]
+    fn test_if_match_precondition_failed() {
+        let preconditions = HTTPPreconditions {
+            if_match: ETag::from_str("\"abc123\"").ok(),
+            ..Default::default()
+        };
+        let info = ObjectInfo {
+            etag: Some("def123".to_string()),
+            ..Default::default()
+        };
+        let err = preconditions.check(&info).expect_err("should PreconditionFailed");
+        assert_eq!(err.code(), s3_error!(PreconditionFailed).code());
+    }
+
+    #[test]
+    fn test_if_unmodified_since_match_precondition_failed() {
+        let preconditions = HTTPPreconditions {
+            if_unmodified_since: Timestamp::parse(TimestampFormat::EpochSeconds, "1").ok(),
+            ..Default::default()
+        };
+        let info = ObjectInfo {
+            mod_time: OffsetDateTime::from_unix_timestamp(2).ok(),
+            ..Default::default()
+        };
+        let err = preconditions.check(&info).expect_err("should PreconditionFailed");
+        assert_eq!(err.code(), s3_error!(PreconditionFailed).code());
+    }
+
+    #[test]
+    fn test_if_none_match_not_modified() {
+        let preconditions = HTTPPreconditions {
+            if_none_match: ETag::from_str("\"abc123\"").ok(),
+            ..Default::default()
+        };
+        let info = ObjectInfo {
+            etag: Some("abc123".to_string()),
+            ..Default::default()
+        };
+        let err = preconditions.check(&info).expect_err("should NotModified");
+        assert_eq!(err.code(), s3_error!(NotModified).code());
+    }
+
+    #[test]
+    fn test_if_modified_since_not_modified() {
+        let preconditions = HTTPPreconditions {
+            if_modified_since: Timestamp::parse(TimestampFormat::EpochSeconds, "1").ok(),
+            ..Default::default()
+        };
+        let info = ObjectInfo {
+            mod_time: OffsetDateTime::from_unix_timestamp(1).ok(),
+            ..Default::default()
+        };
+        let err = preconditions.check(&info).expect_err("should NotModified");
+        assert_eq!(err.code(), s3_error!(NotModified).code());
     }
 
     // Note: S3Request structure is complex and requires many fields.
