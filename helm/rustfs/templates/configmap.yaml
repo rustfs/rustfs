@@ -2,22 +2,20 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "rustfs.fullname" . }}-config
+  labels:
+    {{- toYaml .Values.commonLabels | nindent 4 }}
 data:
   RUSTFS_ADDRESS: {{ .Values.config.rustfs.address | quote }}
   RUSTFS_CONSOLE_ADDRESS: {{ .Values.config.rustfs.console_address | quote }}
-  RUSTFS_OBS_LOG_DIRECTORY: {{ .Values.config.rustfs.obs_log_directory | quote }}
   RUSTFS_CONSOLE_ENABLE: {{ .Values.config.rustfs.console_enable | quote }}
+  RUSTFS_OBS_LOG_DIRECTORY: {{ .Values.config.rustfs.obs_log_directory | quote }}
   RUSTFS_OBS_LOGGER_LEVEL: {{ .Values.config.rustfs.log_level | quote }}
+  RUSTFS_OBS_ENVIRONMENT: {{ .Values.config.rustfs.obs_environment | quote }}
   {{- if .Values.config.rustfs.region }}
   RUSTFS_REGION: {{ .Values.config.rustfs.region | quote }}
   {{- end }}
   {{- if .Values.mode.distributed.enabled }}
-  {{- if eq (int .Values.replicaCount) 4 }}
-  RUSTFS_VOLUMES: "http://{{ include "rustfs.fullname" . }}-{0...3}.{{ include "rustfs.fullname" . }}-headless:9000/data/rustfs{0...3}"
-  {{- else if eq (int .Values.replicaCount) 16 }}
-  RUSTFS_VOLUMES: "http://{{ include "rustfs.fullname" . }}-{0...15}.{{ include "rustfs.fullname" . }}-headless:9000/data"
-  {{- end }}
+  RUSTFS_VOLUMES: {{ .Values.config.rustfs.volumes | default (include "rustfs.volumes" .) }}
   {{- else }}
   RUSTFS_VOLUMES: "/data"
   {{- end }}
-  RUSTFS_OBS_ENVIRONMENT: "develop"

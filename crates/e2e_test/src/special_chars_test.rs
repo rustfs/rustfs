@@ -256,7 +256,7 @@ mod tests {
 
             let output = result.unwrap();
             let body_bytes = output.body.collect().await.unwrap().into_bytes();
-            assert_eq!(body_bytes.as_ref(), *content, "Content mismatch for key '{}'", key);
+            assert_eq!(body_bytes.as_ref(), *content, "Content mismatch for key '{key}'");
 
             info!("✅ PUT/GET succeeded for key: {}", key);
         }
@@ -472,7 +472,7 @@ mod tests {
         info!("Testing COPY from '{}' to '{}'", src_key, dest_key);
 
         // COPY object
-        let copy_source = format!("{}/{}", bucket, src_key);
+        let copy_source = format!("{bucket}/{src_key}");
         let result = client
             .copy_object()
             .bucket(bucket)
@@ -543,7 +543,7 @@ mod tests {
 
             let output = result.unwrap();
             let body_bytes = output.body.collect().await.unwrap().into_bytes();
-            assert_eq!(body_bytes.as_ref(), *content, "Content mismatch for Unicode key '{}'", key);
+            assert_eq!(body_bytes.as_ref(), *content, "Content mismatch for Unicode key '{key}'");
 
             info!("✅ PUT/GET succeeded for Unicode key: {}", key);
         }
@@ -610,7 +610,7 @@ mod tests {
 
             let output = result.unwrap();
             let body_bytes = output.body.collect().await.unwrap().into_bytes();
-            assert_eq!(body_bytes.as_ref(), *content, "Content mismatch for key '{}'", key);
+            assert_eq!(body_bytes.as_ref(), *content, "Content mismatch for key '{key}'");
 
             info!("✅ PUT/GET succeeded for key: {}", key);
         }
@@ -658,7 +658,7 @@ mod tests {
             // Note: The validation happens on the server side, so we expect an error
             // For null byte, newline, and carriage return
             if key.contains('\0') || key.contains('\n') || key.contains('\r') {
-                assert!(result.is_err(), "Control character should be rejected for key: {:?}", key);
+                assert!(result.is_err(), "Control character should be rejected for key: {key:?}");
                 if let Err(e) = result {
                     info!("✅ Control character correctly rejected: {:?}", e);
                 }
