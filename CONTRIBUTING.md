@@ -2,6 +2,8 @@
 
 ## 📋 Code Quality Requirements
 
+For instructions on setting up and running the local development environment, please see [Development Guide](docs/DEVELOPMENT.md).
+
 ### 🔧 Code Formatting Rules
 
 **MANDATORY**: All code must be properly formatted before committing. This project enforces strict formatting standards to maintain code consistency and readability.
