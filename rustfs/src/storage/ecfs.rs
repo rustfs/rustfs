@@ -794,6 +794,7 @@ impl S3 for FS {
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
             sse_customer_algorithm,
+            sse_customer_key,
             sse_customer_key_md5,
             ..
         } = req.input.clone();
@@ -938,6 +939,42 @@ impl S3 for FS {
                 effective_kms_key_id = Some(kms_key_used.clone());
 
                 let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
+                reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
+            }
+        }
+
+        // Apply SSE-C encryption if customer-provided key is specified
+        if let (Some(sse_alg), Some(sse_key), Some(sse_md5)) =
+            (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
+        {
+            if sse_alg.as_str() == "AES256" {
+                let key_bytes = BASE64_STANDARD.decode(sse_key.as_str()).map_err(|e| {
+                    error!("Failed to decode SSE-C key: {}", e);
+                    ApiError::from(StorageError::other("Invalid SSE-C key"))
+                })?;
+
+                if key_bytes.len() != 32 {
+                    return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
+                }
+
+                let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
+                if computed_md5 != sse_md5.as_str() {
+                    return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+                }
+
+                // Store original size before encryption
+                src_info.user_defined.insert(
+                    "x-amz-server-side-encryption-customer-original-size".to_string(),
+                    actual_size.to_string(),
+                );
+
+                let key_array: [u8; 32] = key_bytes.try_into().expect("key length already checked");
+                // Generate deterministic nonce from bucket-key
+                let nonce_source = format!("{bucket}-{key}");
+                let nonce_hash = md5::compute(nonce_source.as_bytes());
+                let nonce: [u8; 12] = nonce_hash.0[..12].try_into().unwrap();
+
+                let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
                 reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
             }
         }
@@ -2055,8 +2092,8 @@ impl S3 for FS {
                     let mut key_array = [0u8; 32];
                     key_array.copy_from_slice(&key_bytes[..32]);
 
-                    // Verify MD5 hash of the key matches what we expect
-                    let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+                    // Verify MD5 hash of the key matches what the client claims
+                    let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
                     if computed_md5 != *sse_key_md5_provided {
                         return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
                     }
@@ -3082,8 +3119,8 @@ impl S3 for FS {
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key_bytes[..32]);
 
-            // Verify MD5 hash of the key
-            let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+            // Verify MD5 hash of the key matches what the client claims
+            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != *sse_key_md5_provided {
                 return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
             }
@@ -3513,8 +3550,8 @@ impl S3 for FS {
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key_bytes[..32]);
 
-            // Verify MD5 hash of the key
-            let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+            // Verify MD5 hash of the key matches what the client claims
+            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != *sse_key_md5_provided {
                 return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
             }
