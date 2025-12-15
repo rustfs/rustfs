@@ -4,24 +4,56 @@ kind: Deployment
 metadata:
   name: {{ include "rustfs.fullname" . }}
   labels:
-    app: {{ include "rustfs.name" . }}
+    {{- include "rustfs.labels" . | nindent 4 }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: {{ include "rustfs.name" . }}
+      {{- include "rustfs.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        app: {{ include "rustfs.name" . }}
+        {{- include "rustfs.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       {{- with include "chart.imagePullSecrets" . }}
       imagePullSecrets:
         {{- . | nindent 8 }}
       {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- if .Values.affinity.nodeAffinity }}
+        nodeAffinity:
+        {{- toYaml .Values.affinity.nodeAffinity | nindent 10 }}
+        {{- if .Values.affinity.podAntiAffinity.enabled }}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - {{ include "rustfs.name" . }}
+              topologyKey: {{ .Values.affinity.podAntiAffinity.topologyKey }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- if .Values.tolerations }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      {{- end }}
       {{- if .Values.podSecurityContext }}
       securityContext:
-      {{- toYaml .Values.podSecurityContext | nindent 12 }}
+      {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- end }}
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       {{- end }}
       initContainers:
         - name: init-step
@@ -90,7 +122,11 @@ spec:
               mountPath: /logs
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: logs
           persistentVolumeClaim:
             claimName: {{ include "rustfs.fullname" . }}-logs
