@@ -122,7 +122,11 @@ spec:
               mountPath: /logs
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: logs
           persistentVolumeClaim:
             claimName: {{ include "rustfs.fullname" . }}-logs
