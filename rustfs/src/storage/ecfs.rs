@@ -793,6 +793,8 @@ impl S3 for FS {
             key,
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -979,6 +981,8 @@ impl S3 for FS {
             copy_object_result: Some(copy_object_result),
             server_side_encryption: effective_sse,
             ssekms_key_id: effective_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
             ..Default::default()
         };
 
@@ -2811,6 +2815,8 @@ impl S3 for FS {
             common_prefixes: Some(common_prefixes),
             versions: Some(objects),
             delete_markers: Some(delete_markers),
+            next_key_marker: object_infos.next_marker,
+            next_version_id_marker: object_infos.next_version_idmarker,
             ..Default::default()
         };
 
