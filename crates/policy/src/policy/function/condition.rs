@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use serde::Deserialize;
+use crate::policy::variables::PolicyVariableResolver;
 use serde::de::{Error, MapAccess};
 use serde::ser::SerializeMap;
 use std::collections::HashMap;
@@ -106,21 +107,22 @@ impl Condition {
         }
     }
 
-    pub fn evaluate(
+    pub fn evaluate_with_resolver(
         &self,
         for_all: bool,
         values: &HashMap<String, Vec<String>>,
         aws_variables: Option<&HashMap<String, String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         use Condition::*;
 
         let r = match self {
-            StringEquals(s) => s.evaluate(for_all, false, false, false, values, aws_variables),
-            StringNotEquals(s) => s.evaluate(for_all, false, false, true, values, aws_variables),
-            StringEqualsIgnoreCase(s) => s.evaluate(for_all, true, false, false, values, aws_variables),
-            StringNotEqualsIgnoreCase(s) => s.evaluate(for_all, true, false, true, values, aws_variables),
-            StringLike(s) => s.evaluate(for_all, false, true, false, values, aws_variables),
-            StringNotLike(s) => s.evaluate(for_all, false, true, true, values, aws_variables),
+            StringEquals(s) => s.evaluate_with_resolver(for_all, false, false, false, values, aws_variables, resolver),
+            StringNotEquals(s) => s.evaluate_with_resolver(for_all, false, false, true, values, aws_variables, resolver),
+            StringEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, false, values, aws_variables, resolver),
+            StringNotEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, true, values, aws_variables, resolver),
+            StringLike(s) => s.evaluate_with_resolver(for_all, false, true, false, values, aws_variables, resolver),
+            StringNotLike(s) => s.evaluate_with_resolver(for_all, false, true, true, values, aws_variables, resolver),
             BinaryEquals(s) => s.evaluate(values),
             IpAddress(s) => s.evaluate(values),
             NotIpAddress(s) => s.evaluate(values),

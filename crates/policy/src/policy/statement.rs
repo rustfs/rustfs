@@ -14,7 +14,7 @@
 
 use super::{
     ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, ID, Principal, ResourceSet, Validator,
-    action::Action, variables::create_aws_variables_map,
+    action::Action, variables::{VariableResolver, VariableContext},
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -69,31 +69,25 @@ impl Statement {
     }
 
     pub fn is_allowed(&self, args: &Args) -> bool {
-        let principal_type = if args.claims.contains_key("roleArn") {
-            "AssumedRole"
-        } else if args.account == "root" || args.account == "admin" {
-            "Account"
+        let mut context = VariableContext::new();
+        context.claims = Some(args.claims.clone());
+        context.conditions = args.conditions.clone();
+        context.account_id = Some(args.account.to_string());
+        
+        let username = if let Some(parent) = args.claims.get("parent").and_then(|v| v.as_str()) {
+            // For temp credentials or service account credentials, username is parent_user
+            parent.to_string()
         } else {
-            "User"
+            // For regular user credentials, username is access_key
+            args.account.to_string()
         };
 
-        let username = args
-            .conditions
-            .get("username")
-            .and_then(|v| v.first())
-            .map(|s| s.as_str())
-            .unwrap_or(args.account);
+        context.username = Some(username);
 
-        let userid = args
-            .conditions
-            .get("userid")
-            .and_then(|v| v.first())
-            .map(|s| s.as_str())
-            .unwrap_or(args.account);
-
-        let aws_variables = create_aws_variables_map(username, userid, principal_type);
+        let resolver = VariableResolver::new(context);
 
         let check = 'c: {
+
             if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
                 break 'c false;
             }
@@ -110,14 +104,14 @@ impl Statement {
             }
 
             if self.is_kms() && (resource == "/" || self.resources.is_empty()) {
-                break 'c self.conditions.evaluate(args.conditions, Some(&aws_variables));
+                break 'c self.conditions.evaluate_with_resolver(args.conditions, None, Some(&resolver));
             }
 
-            if !self.resources.is_match(&resource, args.conditions, Some(&aws_variables)) && !self.is_admin() && !self.is_sts() {
+            if !self.resources.is_match_with_resolver(&resource, args.conditions, None, Some(&resolver)) && !self.is_admin() && !self.is_sts() {
                 break 'c false;
             }
 
-            self.conditions.evaluate(args.conditions, Some(&aws_variables))
+            self.conditions.evaluate_with_resolver(args.conditions, None, Some(&resolver))
         };
 
         self.effect.is_allowed(check)
