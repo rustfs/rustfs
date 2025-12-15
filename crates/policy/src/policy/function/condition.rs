@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::Deserialize;
 use crate::policy::variables::PolicyVariableResolver;
+use serde::Deserialize;
 use serde::de::{Error, MapAccess};
 use serde::ser::SerializeMap;
 use std::collections::HashMap;

@@ -48,6 +48,12 @@ impl VariableContext {
     }
 }
 
+impl Default for VariableContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Variable resolution cache
 struct CachedVariable {
     value: String,
@@ -114,7 +120,7 @@ impl PolicyVariableResolver for CachedAwsVariableResolver {
         if self.is_dynamic(variable_name) {
             return self.inner.resolve(variable_name);
         }
-        
+
         if let Some(cached) = self.cache.borrow_mut().get(variable_name) {
             return Some(cached);
         }
@@ -130,7 +136,7 @@ impl PolicyVariableResolver for CachedAwsVariableResolver {
         if self.is_dynamic(variable_name) {
             return self.inner.resolve_multiple(variable_name);
         }
-        
+
         self.inner.resolve_multiple(variable_name)
     }
 
@@ -205,7 +211,7 @@ impl VariableResolver {
             if claims.contains_key("roleArn") {
                 return "AssumedRole".to_string();
             }
-            
+
             if claims.contains_key("parent") && claims.contains_key("sa-policy") {
                 return "ServiceAccount".to_string();
             }
@@ -248,7 +254,7 @@ impl VariableResolver {
 
 impl PolicyVariableResolver for VariableResolver {
     fn resolve(&self, variable_name: &str) -> Option<String> {
-        let value = match variable_name {
+        match variable_name {
             "aws:username" => self.resolve_username(),
             "aws:userid" => self.resolve_userid(),
             "aws:PrincipalType" => Some(self.resolve_principal_type()),
@@ -266,9 +272,7 @@ impl PolicyVariableResolver for VariableResolver {
                     None
                 }
             }
-        };
-
-        value
+        }
     }
 
     fn resolve_multiple(&self, variable_name: &str) -> Option<Vec<String>> {
@@ -280,15 +284,13 @@ impl PolicyVariableResolver for VariableResolver {
                 } else {
                     None
                 }
-            },
+            }
             "aws:userid" => {
                 // Check claims for sub or parent
                 self.get_claim_as_strings("sub")
                     .or_else(|| self.get_claim_as_strings("parent"))
-            },
-            _ => {
-                self.resolve(variable_name).map(|s| vec![s])
             }
+            _ => self.resolve(variable_name).map(|s| vec![s]),
         }
     }
 
@@ -487,4 +489,3 @@ mod tests {
         assert_eq!(result, vec!["test-bucket".to_string()]);
     }
 }
-

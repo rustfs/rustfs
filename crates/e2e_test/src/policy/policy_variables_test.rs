@@ -21,11 +21,16 @@ use serial_test::serial;
 use tracing::info;
 
 /// Helper function to create a regular user with given credentials
-async fn create_user(env: &PolicyTestEnvironment, username: &str, password: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn create_user(
+    env: &PolicyTestEnvironment,
+    username: &str,
+    password: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let create_user_body = serde_json::json!({
         "secretKey": password,
         "status": "enabled"
-    }).to_string();
+    })
+    .to_string();
 
     let create_user_url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
     awscurl_put(&create_user_url, &create_user_body, &env.access_key, &env.secret_key).await?;
@@ -33,15 +38,23 @@ async fn create_user(env: &PolicyTestEnvironment, username: &str, password: &str
 }
 
 /// Helper function to create an STS user with given credentials
-async fn create_sts_user(env: &PolicyTestEnvironment, username: &str, password: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn create_sts_user(
+    env: &PolicyTestEnvironment,
+    username: &str,
+    password: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // For STS, we create a regular user first, then use it to assume roles
     create_user(env, username, password).await?;
     Ok(())
 }
 
-
 /// Helper function to create and attach a policy
-async fn create_and_attach_policy(env: &PolicyTestEnvironment, policy_name: &str, username: &str, policy_document: serde_json::Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn create_and_attach_policy(
+    env: &PolicyTestEnvironment,
+    policy_name: &str,
+    username: &str,
+    policy_document: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let policy_string = policy_document.to_string();
 
     // Create policy
@@ -77,9 +90,24 @@ async fn cleanup_user_and_policy(env: &PolicyTestEnvironment, username: &str, po
 
     // Try to delete objects and buckets
     for bucket_name in &bucket_patterns {
-        let _ = admin_client.delete_object().bucket(bucket_name).key("test-object.txt").send().await;
-        let _ = admin_client.delete_object().bucket(bucket_name).key("test-sts-object.txt").send().await;
-        let _ = admin_client.delete_object().bucket(bucket_name).key("test-service-object.txt").send().await;
+        let _ = admin_client
+            .delete_object()
+            .bucket(bucket_name)
+            .key("test-object.txt")
+            .send()
+            .await;
+        let _ = admin_client
+            .delete_object()
+            .bucket(bucket_name)
+            .key("test-sts-object.txt")
+            .send()
+            .await;
+        let _ = admin_client
+            .delete_object()
+            .bucket(bucket_name)
+            .key("test-service-object.txt")
+            .send()
+            .await;
         let _ = admin_client.delete_bucket().bucket(bucket_name).send().await;
     }
 
@@ -105,13 +133,15 @@ pub async fn test_aws_policy_variables_single_value_impl() -> Result<(), Box<dyn
     init_logging();
     info!("Starting AWS policy variables single-value test");
 
-        let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
 
     test_aws_policy_variables_single_value_impl_with_env(&env).await
 }
 
 /// Implementation function for single-value policy variables test with shared environment
-pub async fn test_aws_policy_variables_single_value_impl_with_env(env: &PolicyTestEnvironment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn test_aws_policy_variables_single_value_impl_with_env(
+    env: &PolicyTestEnvironment,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user
     let test_user = "testuser1";
     let test_password = "testpassword123";
@@ -125,7 +155,8 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(env: &PolicyTe
     let create_user_body = serde_json::json!({
         "secretKey": test_password,
         "status": "enabled"
-    }).to_string();
+    })
+    .to_string();
 
     let create_user_url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, test_user);
     awscurl_put(&create_user_url, &create_user_body, &env.access_key, &env.secret_key).await?;
@@ -155,7 +186,8 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(env: &PolicyTe
                 "Resource": [format!("arn:aws:s3:::{}-*/*", "${aws:username}")]
             }
         ]
-    }).to_string();
+    })
+    .to_string();
 
     let add_policy_url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", env.url, policy_name);
     awscurl_put(&add_policy_url, &policy_document, &env.access_key, &env.secret_key).await?;
@@ -254,13 +286,15 @@ pub async fn test_aws_policy_variables_multi_value_impl() -> Result<(), Box<dyn 
     init_logging();
     info!("Starting AWS policy variables multi-value test");
 
-        let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
 
     test_aws_policy_variables_multi_value_impl_with_env(&env).await
 }
 
 /// Implementation function for multi-value policy variables test with shared environment
-pub async fn test_aws_policy_variables_multi_value_impl_with_env(env: &PolicyTestEnvironment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn test_aws_policy_variables_multi_value_impl_with_env(
+    env: &PolicyTestEnvironment,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user
     let test_user = "testuser2";
     let test_password = "testpassword123";
@@ -378,13 +412,15 @@ pub async fn test_aws_policy_variables_concatenation_impl() -> Result<(), Box<dy
     init_logging();
     info!("Starting AWS policy variables concatenation test");
 
-        let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
 
     test_aws_policy_variables_concatenation_impl_with_env(&env).await
 }
 
 /// Implementation function for concatenation policy variables test with shared environment
-pub async fn test_aws_policy_variables_concatenation_impl_with_env(env: &PolicyTestEnvironment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn test_aws_policy_variables_concatenation_impl_with_env(
+    env: &PolicyTestEnvironment,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user
     let test_user = "testuser3";
     let test_password = "testpassword123";
@@ -490,7 +526,9 @@ pub async fn test_aws_policy_variables_sts_impl() -> Result<(), Box<dyn std::err
 }
 
 /// Implementation function for nested policy variables test with shared environment
-pub async fn test_aws_policy_variables_nested_impl_with_env(env: &PolicyTestEnvironment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn test_aws_policy_variables_nested_impl_with_env(
+    env: &PolicyTestEnvironment,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user
     let test_user = "testuser4";
     let test_password = "testpassword123";
@@ -541,11 +579,7 @@ pub async fn test_aws_policy_variables_nested_impl_with_env(env: &PolicyTestEnvi
     let expected_bucket = format!("{}-test", test_user);
 
     // Attempt to create bucket with resolved name
-    let create_result = test_client
-        .create_bucket()
-        .bucket(&expected_bucket)
-        .send()
-        .await;
+    let create_result = test_client.create_bucket().bucket(&expected_bucket).send().await;
 
     // Verify bucket creation succeeds (nested variable resolved correctly)
     if let Err(e) = create_result {
@@ -555,11 +589,7 @@ pub async fn test_aws_policy_variables_nested_impl_with_env(env: &PolicyTestEnvi
 
     // Verify bucket creation fails with unresolved variable
     let unresolved_bucket = format!("${{}}-test {}", test_user);
-    let create_unresolved = test_client
-        .create_bucket()
-        .bucket(&unresolved_bucket)
-        .send()
-        .await;
+    let create_unresolved = test_client.create_bucket().bucket(&unresolved_bucket).send().await;
 
     if create_unresolved.is_ok() {
         cleanup().await;
@@ -575,7 +605,9 @@ pub async fn test_aws_policy_variables_nested_impl_with_env(env: &PolicyTestEnvi
 }
 
 /// Implementation function for STS policy variables test with shared environment
-pub async fn test_aws_policy_variables_sts_impl_with_env(env: &PolicyTestEnvironment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn test_aws_policy_variables_sts_impl_with_env(
+    env: &PolicyTestEnvironment,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user for STS
     let test_user = "testuser-sts";
     let test_password = "testpassword123";
@@ -689,9 +721,10 @@ pub async fn test_aws_policy_variables_deny_impl() -> Result<(), Box<dyn std::er
     test_aws_policy_variables_deny_impl_with_env(&env).await
 }
 
-
 /// Implementation function for deny policy variables test with shared environment
-pub async fn test_aws_policy_variables_deny_impl_with_env(env: &PolicyTestEnvironment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn test_aws_policy_variables_deny_impl_with_env(
+    env: &PolicyTestEnvironment,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user
     let test_user = "testuser5";
     let test_password = "testpassword123";
@@ -763,4 +796,3 @@ pub async fn test_aws_policy_variables_deny_impl_with_env(env: &PolicyTestEnviro
     info!("AWS policy variables deny test completed successfully");
     Ok(())
 }
-

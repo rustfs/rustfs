@@ -17,8 +17,8 @@
 //! This module provides a custom test environment that doesn't automatically
 //! stop servers when destroyed, addressing the server stopping issue.
 
-use aws_sdk_s3::config::{Config, Credentials, Region};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::{Config, Credentials, Region};
 use std::net::TcpStream;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -68,7 +68,6 @@ impl PolicyTestEnvironment {
         Client::from_conf(config)
     }
 
-    
     /// Wait for RustFS server to be ready by checking TCP connectivity
     pub async fn wait_for_server_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Waiting for RustFS server to be ready on {}", self.address);

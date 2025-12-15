@@ -14,7 +14,8 @@
 
 use super::{
     ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, ID, Principal, ResourceSet, Validator,
-    action::Action, variables::{VariableResolver, VariableContext},
+    action::Action,
+    variables::{VariableContext, VariableResolver},
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -73,7 +74,7 @@ impl Statement {
         context.claims = Some(args.claims.clone());
         context.conditions = args.conditions.clone();
         context.account_id = Some(args.account.to_string());
-        
+
         let username = if let Some(parent) = args.claims.get("parent").and_then(|v| v.as_str()) {
             // For temp credentials or service account credentials, username is parent_user
             parent.to_string()
@@ -87,7 +88,6 @@ impl Statement {
         let resolver = VariableResolver::new(context);
 
         let check = 'c: {
-
             if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
                 break 'c false;
             }
@@ -107,7 +107,12 @@ impl Statement {
                 break 'c self.conditions.evaluate_with_resolver(args.conditions, None, Some(&resolver));
             }
 
-            if !self.resources.is_match_with_resolver(&resource, args.conditions, None, Some(&resolver)) && !self.is_admin() && !self.is_sts() {
+            if !self
+                .resources
+                .is_match_with_resolver(&resource, args.conditions, None, Some(&resolver))
+                && !self.is_admin()
+                && !self.is_sts()
+            {
                 break 'c false;
             }
 

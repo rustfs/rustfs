@@ -42,7 +42,12 @@ impl Functions {
         self.evaluate_with_resolver(values, aws_variables, None)
     }
 
-    pub fn evaluate_with_resolver(&self, values: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>, resolver: Option<&dyn PolicyVariableResolver>) -> bool {
+    pub fn evaluate_with_resolver(
+        &self,
+        values: &HashMap<String, Vec<String>>,
+        aws_variables: Option<&HashMap<String, String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+    ) -> bool {
         for c in self.for_any_value.iter() {
             if !c.evaluate_with_resolver(false, values, aws_variables, resolver) {
                 return false;

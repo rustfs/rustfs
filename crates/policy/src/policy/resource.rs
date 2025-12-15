@@ -24,7 +24,7 @@ use super::{
     Error as IamError, Validator,
     function::key_name::KeyName,
     utils::{path, wildcard},
-    variables::{resolve_aws_variables, PolicyVariableResolver},
+    variables::{PolicyVariableResolver, resolve_aws_variables},
 };
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -121,15 +121,13 @@ impl Resource {
             Resource::S3(s) => s.to_owned(),
             Resource::Kms(s) => s.to_owned(),
         };
-        
 
         let patterns = if let Some(res) = resolver {
             resolve_aws_variables(&pattern, res)
         } else {
             vec![pattern.clone()]
         };
-        
-        
+
         for pattern in patterns {
             let mut resolved_pattern = pattern;
 
@@ -247,25 +245,5 @@ mod tests {
     fn test_resource_is_match(resource: &str, object: &str) -> bool {
         let resource: Resource = resource.try_into().unwrap();
         resource.is_match(object, &HashMap::new(), None)
-    }
-
-    #[test]
-    fn test_aws_username_variable_substitution() {
-        let resource: Resource = "arn:aws:s3:::${aws:username}-*".try_into().unwrap();
-        let mut aws_variables = HashMap::new();
-        aws_variables.insert("aws:username".to_string(), "testuser".to_string());
-
-        assert!(resource.is_match("testuser-bucket", &HashMap::new(), Some(&aws_variables)));
-        assert!(!resource.is_match("otheruser-bucket", &HashMap::new(), Some(&aws_variables)));
-    }
-
-    #[test]
-    fn test_aws_userid_variable_substitution() {
-        let resource: Resource = "arn:aws:s3:::${aws:userid}-*".try_into().unwrap();
-        let mut aws_variables = HashMap::new();
-        aws_variables.insert("aws:userid".to_string(), "AIDACKCEVSQ6C2EXAMPLE".to_string());
-
-        assert!(resource.is_match("AIDACKCEVSQ6C2EXAMPLE-bucket", &HashMap::new(), Some(&aws_variables)));
-        assert!(!resource.is_match("OTHERUSERID-bucket", &HashMap::new(), Some(&aws_variables)));
     }
 }

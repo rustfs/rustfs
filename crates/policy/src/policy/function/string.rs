@@ -24,11 +24,12 @@ use crate::policy::utils::wildcard;
 use serde::{Deserialize, Deserializer, Serialize, de, ser::SerializeSeq};
 
 use super::{func::InnerFunc, key_name::KeyName};
-use crate::policy::variables::{resolve_aws_variables, PolicyVariableResolver};
+use crate::policy::variables::{PolicyVariableResolver, resolve_aws_variables};
 
 pub type StringFunc = InnerFunc<StringFuncValue>;
 
 impl StringFunc {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn evaluate_with_resolver(
         &self,
         for_all: bool,

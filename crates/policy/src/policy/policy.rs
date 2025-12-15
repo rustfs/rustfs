@@ -766,10 +766,10 @@ mod test {
 
         let mut claims = HashMap::new();
         // Test with array value for username
-        claims.insert("username".to_string(), Value::Array(vec![
-            Value::String("user1".to_string()),
-            Value::String("user2".to_string())
-        ]));
+        claims.insert(
+            "username".to_string(),
+            Value::Array(vec![Value::String("user1".to_string()), Value::String("user2".to_string())]),
+        );
 
         let conditions = HashMap::new();
 

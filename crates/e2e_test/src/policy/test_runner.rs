@@ -29,8 +29,7 @@ pub enum TestCategory {
     DenyScenarios,
 }
 
-impl TestCategory {
-}
+impl TestCategory {}
 
 /// Test case definition
 #[derive(Debug, Clone)]
@@ -177,7 +176,11 @@ impl PolicyTestSuite {
     }
 
     /// Run a single test
-    async fn run_single_test(&self, test_def: &TestDefinition, env: &PolicyTestEnvironment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn run_single_test(
+        &self,
+        test_def: &TestDefinition,
+        env: &PolicyTestEnvironment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match test_def.name.as_str() {
             "test_aws_policy_variables_single_value" => {
                 super::policy_variables_test::test_aws_policy_variables_single_value_impl_with_env(env).await
@@ -228,7 +231,9 @@ impl PolicyTestSuite {
 #[serial]
 #[ignore = "Connects to existing rustfs server"]
 async fn test_policy_critical_suite() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = TestSuiteConfig { include_critical_only: true };
+    let config = TestSuiteConfig {
+        include_critical_only: true,
+    };
     let suite = PolicyTestSuite::new().with_config(config);
     let results = suite.run_test_suite().await;
 
