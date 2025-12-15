@@ -23,11 +23,9 @@ imageRegistryCredentials:
   password: ""
   email: ""
 
-
 # This is to override the chart name.
 nameOverride: ""
 fullnameOverride: ""
-
 
 mode:
   standalone:
@@ -43,14 +41,18 @@ secret:
 
 config:
   rustfs:
-    volume: "/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3"
-    address: "0.0.0.0:9000"
-    console_address: "0.0.0.0:9001"
+    # Examples
+    # volumes: "/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3"
+    # volumes: "http://rustfs-{0...3}.rustfs-headless:9000/data/rustfs{0...3}"
+    volumes: ""
+    address: ":9000"
+    console_enable: "true"
+    console_address: ":9001"
     log_level: "debug"
     rust_log: "debug"
-    console_enable: "true"
-    obs_log_directory: "/logs"
     region: "us-east-1"
+    obs_log_directory: "/logs"
+    obs_environment: "develop"
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
@@ -67,13 +69,17 @@ serviceAccount:
 # This is for setting Kubernetes Annotations to a Pod.
 # For more information checkout: https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/
 podAnnotations: {}
+
 # This is for setting Kubernetes Labels to a Pod.
 # For more information checkout: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
 podLabels: {}
 
+# Labels to add to all deployed objects
+commonLabels: {}
+
 podSecurityContext:
   fsGroup: 10001
-  runAsUser: 10001 
+  runAsUser: 10001
   runAsGroup: 10001
 
 containerSecurityContext:
@@ -135,25 +141,32 @@ resources:
 livenessProbe:
   httpGet:
     path: /health
-    port: http
+    port: endpoint
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  successThreshold: 1
+  failureThreshold: 3
+
 readinessProbe:
   httpGet:
     path: /health
-    port: http
-
-# This section is for setting up autoscaling more information can be found here: https://kubernetes.io/docs/concepts/workloads/autoscaling/
-autoscaling:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 100
-  targetCPUUtilizationPercentage: 80
-  # targetMemoryUtilizationPercentage: 80
+    port: endpoint
+  initialDelaySeconds: 30
+  periodSeconds: 5
+  timeoutSeconds: 3
+  successThreshold: 1
+  failureThreshold: 3
 
 nodeSelector: {}
 
 tolerations: []
 
-affinity: {}
+affinity:
+  podAntiAffinity:
+    enabled: true
+    topologyKey: kubernetes.io/hostname
+  nodeAffinity: {}
 
 storageclass:
   name: local-path
