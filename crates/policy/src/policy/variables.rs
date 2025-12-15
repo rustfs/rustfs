@@ -376,7 +376,7 @@ fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolver) -> 
                     for resolved_var_name in resolved_inner {
                         let prefix = &results[i][..actual_pos];
                         let suffix = &results[i][end_pos + 1..];
-                        new_results.push(format!("{}{}{}", prefix, resolved_var_name, suffix));
+                        new_results.push(format!("{prefix}{resolved_var_name}{suffix}"));
                     }
 
                     if !new_results.is_empty() {
@@ -398,7 +398,7 @@ fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolver) -> 
                             let suffix = &results[i][end_pos + 1..];
 
                             for value in values {
-                                new_results.push(format!("{}{}{}", prefix, value, suffix));
+                                new_results.push(format!("{prefix}{value}{suffix}"));
                             }
 
                             results.splice(i..i + 1, new_results);
@@ -409,7 +409,7 @@ fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolver) -> 
                             let mut new_results = Vec::new();
                             let prefix = &results[i][..actual_pos];
                             let suffix = &results[i][end_pos + 1..];
-                            new_results.push(format!("{}{}", prefix, suffix));
+                            new_results.push(format!("{prefix}{suffix}"));
 
                             results.splice(i..i + 1, new_results);
                             modified = true;
