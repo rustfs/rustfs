@@ -353,16 +353,15 @@ pub async fn start_http_server(
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
 
-            process_connection(
-                socket,
-                tls_acceptor.clone(),
-                http_server.clone(),
-                s3_service.clone(),
-                graceful.clone(),
-                cors_layer.clone(),
+            let connection_ctx = ConnectionContext {
+                http_server: http_server.clone(),
+                s3_service: s3_service.clone(),
+                cors_layer: cors_layer.clone(),
+                compression_config: compression_config.clone(),
                 is_console,
-                compression_config.clone(),
-            );
+            };
+
+            process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.clone());
         }
 
         worker_state_manager.update(ServiceState::Stopping);
@@ -455,6 +454,15 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
     Ok(None)
 }
 
+#[derive(Clone)]
+struct ConnectionContext {
+    http_server: Arc<ConnBuilder<TokioExecutor>>,
+    s3_service: S3Service,
+    cors_layer: CorsLayer,
+    compression_config: CompressionConfig,
+    is_console: bool,
+}
+
 /// Process a single incoming TCP connection.
 ///
 /// This function is executed in a new Tokio task and it will:
@@ -466,14 +474,18 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 fn process_connection(
     socket: TcpStream,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
-    http_server: Arc<ConnBuilder<TokioExecutor>>,
-    s3_service: S3Service,
+    context: ConnectionContext,
     graceful: Arc<GracefulShutdown>,
-    cors_layer: CorsLayer,
-    is_console: bool,
-    compression_config: CompressionConfig,
 ) {
     tokio::spawn(async move {
+        let ConnectionContext {
+            http_server,
+            s3_service,
+            cors_layer,
+            compression_config,
+            is_console,
+        } = context;
+
         // Build services inside each connected task to avoid passing complex service types across tasks,
         // It also ensures that each connection has an independent service instance.
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);

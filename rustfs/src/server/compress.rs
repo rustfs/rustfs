@@ -96,7 +96,7 @@ impl CompressionConfig {
                 .split(',')
                 .map(|s| {
                     let s = s.trim().to_lowercase();
-                    if s.starts_with('.') { s } else { format!(".{}", s) }
+                    if s.starts_with('.') { s } else { format!(".{s}") }
                 })
                 .filter(|s| s.len() > 1)
                 .collect()
@@ -177,10 +177,10 @@ impl CompressionConfig {
             let rest = &header_value[start..];
 
             // Check if it's quoted
-            if rest.starts_with('"') {
+            if let Some(stripped) = rest.strip_prefix('"') {
                 // Find closing quote
-                if let Some(end_quote) = rest[1..].find('"') {
-                    return Some(rest[1..end_quote + 1].to_string());
+                if let Some(end_quote) = stripped.find('"') {
+                    return Some(stripped[..end_quote].to_string());
                 }
             } else {
                 // Unquoted - take until semicolon or end
@@ -442,7 +442,7 @@ mod tests {
             .split(',')
             .map(|s| {
                 let s = s.trim().to_lowercase();
-                if s.starts_with('.') { s } else { format!(".{}", s) }
+                if s.starts_with('.') { s } else { format!(".{s}") }
             })
             .filter(|s| s.len() > 1)
             .collect();
