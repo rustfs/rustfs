@@ -39,6 +39,7 @@ object_store = { workspace = true }
 pin-project-lite.workspace = true
 s3s.workspace = true
 snafu = { workspace = true, features = ["backtrace"] }
+parking_lot.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
