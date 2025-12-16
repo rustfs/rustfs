@@ -46,6 +46,8 @@ reqwest.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 moka.workspace = true
+async-trait = "0.1.89"
+futures = "0.3"
 
 [dev-dependencies]
 test-case.workspace = true

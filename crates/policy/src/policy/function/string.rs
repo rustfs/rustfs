@@ -24,7 +24,7 @@ use crate::policy::utils::wildcard;
 use serde::{Deserialize, Deserializer, Serialize, de, ser::SerializeSeq};
 
 use super::{func::InnerFunc, key_name::KeyName};
-use crate::policy::variables::{PolicyVariableResolver, resolve_aws_variables};
+use crate::policy::variables::{PolicyVariableResolver, resolve_aws_variables_sync};
 
 pub type StringFunc = InnerFunc<StringFuncValue>;
 
@@ -85,7 +85,7 @@ impl FuncKeyValue<StringFuncValue> {
             .iter()
             .flat_map(|c| {
                 if let Some(res) = resolver {
-                    resolve_aws_variables(c, res)
+                    resolve_aws_variables_sync(c, res)
                 } else {
                     vec![c.to_string()]
                 }
@@ -127,7 +127,7 @@ impl FuncKeyValue<StringFuncValue> {
                     .iter()
                     .flat_map(|c| {
                         if let Some(res) = resolver {
-                            resolve_aws_variables(c, res)
+                            resolve_aws_variables_sync(c, res)
                         } else {
                             vec![c.to_string()]
                         }

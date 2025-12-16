@@ -7461,8 +7461,10 @@ dependencies = [
 name = "rustfs-policy"
 version = "0.0.5"
 dependencies = [
+ "async-trait",
  "base64-simd",
  "chrono",
+ "futures",
  "ipnetwork",
  "jsonwebtoken",
  "moka",

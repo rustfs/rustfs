@@ -24,7 +24,7 @@ use super::{
     Error as IamError, Validator,
     function::key_name::KeyName,
     utils::{path, wildcard},
-    variables::{PolicyVariableResolver, resolve_aws_variables},
+    variables::{PolicyVariableResolver, resolve_aws_variables_sync},
 };
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -111,7 +111,7 @@ impl Resource {
         };
 
         let patterns = if let Some(res) = resolver {
-            resolve_aws_variables(&pattern, res)
+            resolve_aws_variables_sync(&pattern, res)
         } else {
             vec![pattern.clone()]
         };
