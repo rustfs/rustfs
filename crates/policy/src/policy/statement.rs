@@ -109,7 +109,7 @@ impl Statement {
 
             if !self
                 .resources
-                .is_match_with_resolver(&resource, args.conditions, None, Some(&resolver))
+                .is_match_with_resolver(&resource, args.conditions, Some(&resolver))
                 && !self.is_admin()
                 && !self.is_sts()
             {
@@ -199,11 +199,11 @@ impl BPStatement {
                 resource.push('/');
             }
 
-            if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions, None) {
+            if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions) {
                 break 'c false;
             }
 
-            if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions, None) {
+            if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions) {
                 break 'c false;
             }
 

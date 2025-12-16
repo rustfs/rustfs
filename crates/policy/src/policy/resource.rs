@@ -31,24 +31,18 @@ use super::{
 pub struct ResourceSet(pub HashSet<Resource>);
 
 impl ResourceSet {
-    pub fn is_match(
-        &self,
-        resource: &str,
-        conditions: &HashMap<String, Vec<String>>,
-        aws_variables: Option<&HashMap<String, String>>,
-    ) -> bool {
-        self.is_match_with_resolver(resource, conditions, aws_variables, None)
+    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
+        self.is_match_with_resolver(resource, conditions, None)
     }
 
     pub fn is_match_with_resolver(
         &self,
         resource: &str,
         conditions: &HashMap<String, Vec<String>>,
-        aws_variables: Option<&HashMap<String, String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         for re in self.0.iter() {
-            if re.is_match_with_resolver(resource, conditions, aws_variables, resolver) {
+            if re.is_match_with_resolver(resource, conditions, resolver) {
                 return true;
             }
         }
@@ -101,20 +95,14 @@ pub enum Resource {
 impl Resource {
     pub const S3_PREFIX: &'static str = "arn:aws:s3:::";
 
-    pub fn is_match(
-        &self,
-        resource: &str,
-        conditions: &HashMap<String, Vec<String>>,
-        aws_variables: Option<&HashMap<String, String>>,
-    ) -> bool {
-        self.is_match_with_resolver(resource, conditions, aws_variables, None)
+    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
+        self.is_match_with_resolver(resource, conditions, None)
     }
 
     pub fn is_match_with_resolver(
         &self,
         resource: &str,
         conditions: &HashMap<String, Vec<String>>,
-        _aws_variables: Option<&HashMap<String, String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         let pattern = match self {
@@ -156,7 +144,7 @@ impl Resource {
     }
 
     pub fn match_resource(&self, resource: &str) -> bool {
-        self.is_match(resource, &HashMap::new(), None)
+        self.is_match(resource, &HashMap::new())
     }
 }
 
@@ -244,6 +232,6 @@ mod tests {
     #[test_case("arn:aws:s3:::mybucket","mybucket/myobject" => false; "15")]
     fn test_resource_is_match(resource: &str, object: &str) -> bool {
         let resource: Resource = resource.try_into().unwrap();
-        resource.is_match(object, &HashMap::new(), None)
+        resource.is_match(object, &HashMap::new())
     }
 }

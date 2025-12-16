@@ -85,7 +85,7 @@ async fn cleanup_user_and_policy(env: &PolicyTestEnvironment, username: &str, po
         format!("{}-test", username),
         format!("{}-sts-bucket", username),
         format!("{}-service-bucket", username),
-        format!("private-test-bucket"), // For deny test
+        "private-test-bucket".to_string(), // For deny test
     ];
 
     // Try to delete objects and buckets
@@ -209,7 +209,7 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(
     let list_result = test_client.list_buckets().send().await;
     if let Err(e) = list_result {
         cleanup().await;
-        return Err(format!("User should be able to list buckets: {}", e).into());
+        return Err(format!("User should be able to list buckets: {e}").into());
     }
 
     // Test 2: User should be able to create bucket matching username pattern
@@ -218,7 +218,7 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(
     let create_result = test_client.create_bucket().bucket(&bucket_name).send().await;
     if let Err(e) = create_result {
         cleanup().await;
-        return Err(format!("User should be able to create bucket matching username pattern: {}", e).into());
+        return Err(format!("User should be able to create bucket matching username pattern: {e}").into());
     }
 
     // Test 3: User should be able to list objects in their own bucket
@@ -226,7 +226,7 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(
     let list_objects_result = test_client.list_objects_v2().bucket(&bucket_name).send().await;
     if let Err(e) = list_objects_result {
         cleanup().await;
-        return Err(format!("User should be able to list objects in their own bucket: {}", e).into());
+        return Err(format!("User should be able to list objects in their own bucket: {e}").into());
     }
 
     // Test 4: User should be able to put object in their own bucket
@@ -240,7 +240,7 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(
         .await;
     if let Err(e) = put_result {
         cleanup().await;
-        return Err(format!("User should be able to put object in their own bucket: {}", e).into());
+        return Err(format!("User should be able to put object in their own bucket: {e}").into());
     }
 
     // Test 5: User should be able to get object from their own bucket
@@ -253,7 +253,7 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(
         .await;
     if let Err(e) = get_result {
         cleanup().await;
-        return Err(format!("User should be able to get object from their own bucket: {}", e).into());
+        return Err(format!("User should be able to get object from their own bucket: {e}").into());
     }
 
     // Test 6: User should NOT be able to create bucket NOT matching username pattern
@@ -349,7 +349,7 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
     let create_result1 = test_client.create_bucket().bucket(&bucket1_name).send().await;
     if let Err(e) = create_result1 {
         cleanup().await;
-        return Err(format!("User should be able to create first bucket matching multi-value pattern: {}", e).into());
+        return Err(format!("User should be able to create first bucket matching multi-value pattern: {e}").into());
     }
 
     info!("Test 2: User creating second bucket matching multi-value pattern");
@@ -357,7 +357,7 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
     let create_result2 = test_client.create_bucket().bucket(&bucket2_name).send().await;
     if let Err(e) = create_result2 {
         cleanup().await;
-        return Err(format!("User should be able to create second bucket matching multi-value pattern: {}", e).into());
+        return Err(format!("User should be able to create second bucket matching multi-value pattern: {e}").into());
     }
 
     info!("Test 3: User creating third bucket matching multi-value pattern");
@@ -365,7 +365,7 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
     let create_result3 = test_client.create_bucket().bucket(&bucket3_name).send().await;
     if let Err(e) = create_result3 {
         cleanup().await;
-        return Err(format!("User should be able to create third bucket matching multi-value pattern: {}", e).into());
+        return Err(format!("User should be able to create third bucket matching multi-value pattern: {e}").into());
     }
 
     // Test 4: User should NOT be able to create bucket NOT matching any multi-value pattern
@@ -382,13 +382,13 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
     let list_objects_result1 = test_client.list_objects_v2().bucket(&bucket1_name).send().await;
     if let Err(e) = list_objects_result1 {
         cleanup().await;
-        return Err(format!("User should be able to list objects in first allowed bucket: {}", e).into());
+        return Err(format!("User should be able to list objects in first allowed bucket: {e}").into());
     }
 
     let list_objects_result2 = test_client.list_objects_v2().bucket(&bucket2_name).send().await;
     if let Err(e) = list_objects_result2 {
         cleanup().await;
-        return Err(format!("User should be able to list objects in second allowed bucket: {}", e).into());
+        return Err(format!("User should be able to list objects in second allowed bucket: {e}").into());
     }
 
     // Cleanup
@@ -470,7 +470,7 @@ pub async fn test_aws_policy_variables_concatenation_impl_with_env(
     let create_result = test_client.create_bucket().bucket(&bucket_name).send().await;
     if let Err(e) = create_result {
         cleanup().await;
-        return Err(format!("User should be able to create bucket matching concatenated pattern: {}", e).into());
+        return Err(format!("User should be able to create bucket matching concatenated pattern: {e}").into());
     }
 
     // Test: User should be able to list objects in the concatenated pattern bucket
@@ -478,7 +478,7 @@ pub async fn test_aws_policy_variables_concatenation_impl_with_env(
     let list_objects_result = test_client.list_objects_v2().bucket(&bucket_name).send().await;
     if let Err(e) = list_objects_result {
         cleanup().await;
-        return Err(format!("User should be able to list objects in concatenated pattern bucket: {}", e).into());
+        return Err(format!("User should be able to list objects in concatenated pattern bucket: {e}").into());
     }
 
     // Cleanup
@@ -584,7 +584,7 @@ pub async fn test_aws_policy_variables_nested_impl_with_env(
     // Verify bucket creation succeeds (nested variable resolved correctly)
     if let Err(e) = create_result {
         cleanup().await;
-        return Err(format!("User should be able to create bucket with nested variable: {}", e).into());
+        return Err(format!("User should be able to create bucket with nested variable: {e}").into());
     }
 
     // Verify bucket creation fails with unresolved variable
@@ -657,7 +657,7 @@ pub async fn test_aws_policy_variables_sts_impl_with_env(
     let create_result = test_client.create_bucket().bucket(&bucket_name).send().await;
     if let Err(e) = create_result {
         cleanup().await;
-        return Err(format!("User should be able to create STS bucket: {}", e).into());
+        return Err(format!("User should be able to create STS bucket: {e}").into());
     }
 
     // Test: User should be able to put object in STS bucket
@@ -671,7 +671,7 @@ pub async fn test_aws_policy_variables_sts_impl_with_env(
         .await;
     if let Err(e) = put_result {
         cleanup().await;
-        return Err(format!("User should be able to put object in STS bucket: {}", e).into());
+        return Err(format!("User should be able to put object in STS bucket: {e}").into());
     }
 
     // Test: User should be able to get object from STS bucket
@@ -684,7 +684,7 @@ pub async fn test_aws_policy_variables_sts_impl_with_env(
         .await;
     if let Err(e) = get_result {
         cleanup().await;
-        return Err(format!("User should be able to get object from STS bucket: {}", e).into());
+        return Err(format!("User should be able to get object from STS bucket: {e}").into());
     }
 
     // Test: User should be able to list objects in STS bucket
@@ -692,7 +692,7 @@ pub async fn test_aws_policy_variables_sts_impl_with_env(
     let list_result = test_client.list_objects_v2().bucket(&bucket_name).send().await;
     if let Err(e) = list_result {
         cleanup().await;
-        return Err(format!("User should be able to list objects in STS bucket: {}", e).into());
+        return Err(format!("User should be able to list objects in STS bucket: {e}").into());
     }
 
     // Cleanup
@@ -773,11 +773,11 @@ pub async fn test_aws_policy_variables_deny_impl_with_env(
 
     // Test 1: User should be able to create bucket matching username pattern
     info!("Test 1: User creating bucket matching username pattern");
-    let bucket_name = format!("{}-test-bucket", test_user);
+    let bucket_name = format!("{test_user}-test-bucket");
     let create_result = test_client.create_bucket().bucket(&bucket_name).send().await;
     if let Err(e) = create_result {
         cleanup().await;
-        return Err(format!("User should be able to create bucket matching username pattern: {}", e).into());
+        return Err(format!("User should be able to create bucket matching username pattern: {e}").into());
     }
 
     // Test 2: User should NOT be able to create bucket with "private" in the name (deny rule)

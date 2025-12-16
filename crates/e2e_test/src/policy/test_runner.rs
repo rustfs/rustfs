@@ -239,7 +239,7 @@ async fn test_policy_critical_suite() -> Result<(), Box<dyn std::error::Error + 
 
     let failed = results.iter().filter(|r| !r.success).count();
     if failed > 0 {
-        return Err(format!("Critical tests failed: {} failures", failed).into());
+        return Err(format!("Critical tests failed: {failed} failures").into());
     }
 
     info!("All critical tests passed");
