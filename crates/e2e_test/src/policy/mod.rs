@@ -12,28 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod reliant;
+//! Policy-specific tests for RustFS
+//!
+//! This module provides comprehensive tests for AWS IAM policy variables
+//! including single-value, multi-value, and nested variable scenarios.
 
-// Common utilities for all E2E tests
-#[cfg(test)]
-pub mod common;
-
-// Data usage regression tests
-#[cfg(test)]
-mod data_usage_test;
-
-// KMS-specific test modules
-#[cfg(test)]
-mod kms;
-
-// Special characters in path test modules
-#[cfg(test)]
-mod special_chars_test;
-
-// Content-Encoding header preservation test
-#[cfg(test)]
-mod content_encoding_test;
-
-// Policy variables tests
-#[cfg(test)]
-mod policy;
+mod policy_variables_test;
+mod test_env;
+mod test_runner;

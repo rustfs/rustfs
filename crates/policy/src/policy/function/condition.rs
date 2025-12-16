@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::policy::variables::PolicyVariableResolver;
 use serde::Deserialize;
 use serde::de::{Error, MapAccess};
 use serde::ser::SerializeMap;
@@ -106,16 +107,21 @@ impl Condition {
         }
     }
 
-    pub fn evaluate(&self, for_all: bool, values: &HashMap<String, Vec<String>>) -> bool {
+    pub fn evaluate_with_resolver(
+        &self,
+        for_all: bool,
+        values: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+    ) -> bool {
         use Condition::*;
 
         let r = match self {
-            StringEquals(s) => s.evaluate(for_all, false, false, false, values),
-            StringNotEquals(s) => s.evaluate(for_all, false, false, true, values),
-            StringEqualsIgnoreCase(s) => s.evaluate(for_all, true, false, false, values),
-            StringNotEqualsIgnoreCase(s) => s.evaluate(for_all, true, false, true, values),
-            StringLike(s) => s.evaluate(for_all, false, true, false, values),
-            StringNotLike(s) => s.evaluate(for_all, false, true, true, values),
+            StringEquals(s) => s.evaluate_with_resolver(for_all, false, false, false, values, resolver),
+            StringNotEquals(s) => s.evaluate_with_resolver(for_all, false, false, true, values, resolver),
+            StringEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, false, values, resolver),
+            StringNotEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, true, values, resolver),
+            StringLike(s) => s.evaluate_with_resolver(for_all, false, true, false, values, resolver),
+            StringNotLike(s) => s.evaluate_with_resolver(for_all, false, true, true, values, resolver),
             BinaryEquals(s) => s.evaluate(values),
             IpAddress(s) => s.evaluate(values),
             NotIpAddress(s) => s.evaluate(values),
