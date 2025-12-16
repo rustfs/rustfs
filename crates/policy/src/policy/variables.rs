@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use moka::future::Cache;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -79,9 +80,7 @@ impl CachedAwsVariableResolver {
             cache: VariableResolverCache::new(100, 300), // 100 entries, 5 minutes expiration
         }
     }
-}
 
-impl CachedAwsVariableResolver {
     pub fn is_dynamic(&self, variable_name: &str) -> bool {
         self.inner.is_dynamic(variable_name)
     }

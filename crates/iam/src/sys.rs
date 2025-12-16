@@ -755,10 +755,10 @@ impl<T: Store> IamSys<T> {
 
         let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
         if has_session_policy {
-            return is_allowed_sp && (is_owner || pollster::block_on(combined_policy.is_allowed(args)));
+            return is_allowed_sp && (is_owner || combined_policy.is_allowed(args).await);
         }
 
-        is_owner || pollster::block_on(combined_policy.is_allowed(args))
+        is_owner || combined_policy.is_allowed(args).await
     }
 
     pub async fn is_allowed_service_account(&self, args: &Args<'_>, parent_user: &str) -> bool {
@@ -814,15 +814,15 @@ impl<T: Store> IamSys<T> {
         };
 
         if sa_str == INHERITED_POLICY_TYPE {
-            return is_owner || pollster::block_on(combined_policy.is_allowed(&parent_args));
+            return is_owner || combined_policy.is_allowed(&parent_args).await;
         }
 
         let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy_for_service_account(args);
         if has_session_policy {
-            return is_allowed_sp && (is_owner || pollster::block_on(combined_policy.is_allowed(&parent_args)));
+            return is_allowed_sp && (is_owner || combined_policy.is_allowed(&parent_args).await);
         }
 
-        is_owner || pollster::block_on(combined_policy.is_allowed(&parent_args))
+        is_owner || combined_policy.is_allowed(&parent_args).await
     }
 
     pub async fn get_combined_policy(&self, policies: &[String]) -> Policy {
@@ -857,7 +857,7 @@ impl<T: Store> IamSys<T> {
             return false;
         }
 
-        pollster::block_on(self.get_combined_policy(&policies).await.is_allowed(args))
+        self.get_combined_policy(&policies).await.is_allowed(args).await
     }
 }
 
