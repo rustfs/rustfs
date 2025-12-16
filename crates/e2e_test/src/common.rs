@@ -328,7 +328,7 @@ pub async fn execute_awscurl(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!("awscurl failed: stderr='{}', stdout='{}'", stderr, stdout).into());
+        return Err(format!("awscurl failed: stderr='{stderr}', stdout='{stdout}'").into());
     }
 
     let response = String::from_utf8_lossy(&output.stdout).to_string();

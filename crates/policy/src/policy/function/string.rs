@@ -311,7 +311,6 @@ mod tests {
                 .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
                 .collect(),
             None,
-            None,
         );
 
         result ^ negate
@@ -416,7 +415,6 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
                 .collect(),
-            None,
             None,
         );
 

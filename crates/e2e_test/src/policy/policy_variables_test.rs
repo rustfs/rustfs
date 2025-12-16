@@ -77,14 +77,14 @@ async fn cleanup_user_and_policy(env: &PolicyTestEnvironment, username: &str, po
 
     // Delete buckets that might have been created by this user
     let bucket_patterns = [
-        format!("{}-test-bucket", username),
-        format!("{}-bucket1", username),
-        format!("{}-bucket2", username),
-        format!("{}-bucket3", username),
-        format!("prefix-{}-suffix", username),
-        format!("{}-test", username),
-        format!("{}-sts-bucket", username),
-        format!("{}-service-bucket", username),
+        format!("{username}-test-bucket"),
+        format!("{username}-bucket1"),
+        format!("{username}-bucket2"),
+        format!("{username}-bucket3"),
+        format!("prefix-{username}-suffix"),
+        format!("{username}-test"),
+        format!("{username}-sts-bucket"),
+        format!("{username}-service-bucket"),
         "private-test-bucket".to_string(), // For deny test
     ];
 
@@ -214,7 +214,7 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(
 
     // Test 2: User should be able to create bucket matching username pattern
     info!("Test 2: User creating bucket matching pattern");
-    let bucket_name = format!("{}-test-bucket", test_user);
+    let bucket_name = format!("{test_user}-test-bucket");
     let create_result = test_client.create_bucket().bucket(&bucket_name).send().await;
     if let Err(e) = create_result {
         cleanup().await;
@@ -345,7 +345,7 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
 
     // Test 1: User should be able to create buckets matching any of the multi-value patterns
     info!("Test 1: User creating first bucket matching multi-value pattern");
-    let bucket1_name = format!("{}-bucket1", test_user);
+    let bucket1_name = format!("{test_user}-bucket1");
     let create_result1 = test_client.create_bucket().bucket(&bucket1_name).send().await;
     if let Err(e) = create_result1 {
         cleanup().await;
@@ -353,7 +353,7 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
     }
 
     info!("Test 2: User creating second bucket matching multi-value pattern");
-    let bucket2_name = format!("{}-bucket2", test_user);
+    let bucket2_name = format!("{test_user}-bucket2");
     let create_result2 = test_client.create_bucket().bucket(&bucket2_name).send().await;
     if let Err(e) = create_result2 {
         cleanup().await;
@@ -361,7 +361,7 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
     }
 
     info!("Test 3: User creating third bucket matching multi-value pattern");
-    let bucket3_name = format!("{}-bucket3", test_user);
+    let bucket3_name = format!("{test_user}-bucket3");
     let create_result3 = test_client.create_bucket().bucket(&bucket3_name).send().await;
     if let Err(e) = create_result3 {
         cleanup().await;
@@ -370,7 +370,7 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
 
     // Test 4: User should NOT be able to create bucket NOT matching any multi-value pattern
     info!("Test 4: User attempting to create bucket NOT matching any pattern");
-    let other_bucket_name = format!("{}-other-bucket", test_user);
+    let other_bucket_name = format!("{test_user}-other-bucket");
     let create_other_result = test_client.create_bucket().bucket(&other_bucket_name).send().await;
     if create_other_result.is_ok() {
         cleanup().await;
@@ -466,7 +466,7 @@ pub async fn test_aws_policy_variables_concatenation_impl_with_env(
 
     // Test: User should be able to create bucket matching concatenated pattern
     info!("Test: User creating bucket matching concatenated pattern");
-    let bucket_name = format!("prefix-{}-suffix", test_user);
+    let bucket_name = format!("prefix-{test_user}-suffix");
     let create_result = test_client.create_bucket().bucket(&bucket_name).send().await;
     if let Err(e) = create_result {
         cleanup().await;
@@ -576,7 +576,7 @@ pub async fn test_aws_policy_variables_nested_impl_with_env(
     info!("Test: Nested variable resolution");
 
     // Create bucket with expected resolved name
-    let expected_bucket = format!("{}-test", test_user);
+    let expected_bucket = format!("{test_user}-test");
 
     // Attempt to create bucket with resolved name
     let create_result = test_client.create_bucket().bucket(&expected_bucket).send().await;
@@ -588,7 +588,7 @@ pub async fn test_aws_policy_variables_nested_impl_with_env(
     }
 
     // Verify bucket creation fails with unresolved variable
-    let unresolved_bucket = format!("${{}}-test {}", test_user);
+    let unresolved_bucket = format!("${{}}-test {test_user}");
     let create_unresolved = test_client.create_bucket().bucket(&unresolved_bucket).send().await;
 
     if create_unresolved.is_ok() {
@@ -653,7 +653,7 @@ pub async fn test_aws_policy_variables_sts_impl_with_env(
 
     // Test: User should be able to create bucket matching STS pattern
     info!("Test: User creating bucket matching STS pattern");
-    let bucket_name = format!("{}-sts-bucket", test_user);
+    let bucket_name = format!("{test_user}-sts-bucket");
     let create_result = test_client.create_bucket().bucket(&bucket_name).send().await;
     if let Err(e) = create_result {
         cleanup().await;
