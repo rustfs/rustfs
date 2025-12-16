@@ -357,7 +357,7 @@ mod tests {
         let event_name = EventName::Everything;
         let serialized_str = "\"\"";
         let serialized = serde_json::to_string(&event_name);
-        assert!(serialized.is_ok(), "Serialization failed for `{}`", serialized_str);
+        assert!(serialized.is_ok(), "Serialization failed for `{serialized_str}`");
         assert_eq!(serialized.unwrap(), serialized_str);
 
         let deserialized = serde_json::from_str::<EventName>(serialized_str);
