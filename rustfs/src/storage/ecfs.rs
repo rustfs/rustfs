@@ -124,6 +124,7 @@ use rustfs_utils::{
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use urlencoding::encode;
 use std::convert::Infallible;
 use std::ops::Add;
 use std::{
@@ -2671,6 +2672,7 @@ impl S3 for FS {
             bucket,
             continuation_token,
             delimiter,
+            encoding_type,
             fetch_owner,
             max_keys,
             prefix,
@@ -2733,13 +2735,31 @@ impl S3 for FS {
 
         // warn!("object_infos objects {:?}", object_infos.objects);
 
+        // Apply URL encoding if encoding_type is "url"
+        // Note: S3 URL encoding should encode special characters but preserve path separators (/)
+        let should_encode = encoding_type.as_ref().map(|e| e.as_str() == "url").unwrap_or(false);
+
+        // Helper function to encode S3 keys/prefixes (preserving /)
+        // S3 URL encoding encodes special characters but keeps '/' unencoded
+        let encode_s3_name = |name: &str| -> String {
+            name.split('/')
+                .map(|part| encode(part).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
         let objects: Vec<Object> = object_infos
             .objects
             .iter()
             .filter(|v| !v.name.is_empty())
             .map(|v| {
+                let key = if should_encode {
+                    encode_s3_name(&v.name)
+                } else {
+                    v.name.to_owned()
+                };
                 let mut obj = Object {
-                    key: Some(v.name.to_owned()),
+                    key: Some(key),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
@@ -2760,7 +2780,14 @@ impl S3 for FS {
         let common_prefixes: Vec<CommonPrefix> = object_infos
             .prefixes
             .into_iter()
-            .map(|v| CommonPrefix { prefix: Some(v) })
+            .map(|v| {
+                let prefix = if should_encode {
+                    encode_s3_name(&v)
+                } else {
+                    v
+                };
+                CommonPrefix { prefix: Some(prefix) }
+            })
             .collect();
 
         // KeyCount should include both objects and common prefixes per S3 API spec
@@ -2779,6 +2806,7 @@ impl S3 for FS {
             max_keys: Some(max_keys),
             contents: Some(objects),
             delimiter,
+            encoding_type: encoding_type.clone(),
             name: Some(bucket),
             prefix: Some(prefix),
             common_prefixes: Some(common_prefixes),
@@ -5657,26 +5685,53 @@ mod tests {
         // Test that KeyCount calculation includes both objects and common prefixes
         // This verifies the fix for S3 API compatibility where KeyCount should equal
         // the sum of Contents and CommonPrefixes lengths
-
+        
         // Simulate the calculation logic from list_objects_v2
         let objects_count = 3_usize;
         let common_prefixes_count = 2_usize;
-
+        
         // KeyCount should include both objects and common prefixes per S3 API spec
         let key_count = (objects_count + common_prefixes_count) as i32;
-
+        
         assert_eq!(key_count, 5);
-
+        
         // Edge cases: verify calculation logic
         let no_objects = 0_usize;
         let no_prefixes = 0_usize;
         assert_eq!((no_objects + no_prefixes) as i32, 0);
-
+        
         let one_object = 1_usize;
         assert_eq!((one_object + no_prefixes) as i32, 1);
-
+        
         let one_prefix = 1_usize;
         assert_eq!((no_objects + one_prefix) as i32, 1);
+    }
+
+    #[test]
+    fn test_s3_url_encoding_preserves_slash() {
+        // Test that S3 URL encoding preserves path separators (/)
+        // This verifies the encoding logic for EncodingType=url parameter
+        
+        use urlencoding::encode;
+        
+        // Helper function matching the implementation
+        let encode_s3_name = |name: &str| -> String {
+            name.split('/')
+                .map(|part| encode(part).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        
+        // Test cases from s3-tests
+        assert_eq!(encode_s3_name("asdf+b"), "asdf%2Bb");
+        assert_eq!(encode_s3_name("foo+1/bar"), "foo%2B1/bar");
+        assert_eq!(encode_s3_name("foo/"), "foo/");
+        assert_eq!(encode_s3_name("quux ab/"), "quux%20ab/");
+        
+        // Edge cases
+        assert_eq!(encode_s3_name("normal/key"), "normal/key");
+        assert_eq!(encode_s3_name("key+with+plus"), "key%2Bwith%2Bplus");
+        assert_eq!(encode_s3_name("key with spaces"), "key%20with%20spaces");
     }
 
     #[test]
