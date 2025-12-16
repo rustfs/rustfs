@@ -2652,16 +2652,52 @@ impl S3 for FS {
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
-        Ok(v2_resp.map_output(|v2| ListObjectsOutput {
-            contents: v2.contents,
-            delimiter: v2.delimiter,
-            encoding_type: v2.encoding_type,
-            name: v2.name,
-            prefix: v2.prefix,
-            max_keys: v2.max_keys,
-            common_prefixes: v2.common_prefixes,
-            is_truncated: v2.is_truncated,
-            ..Default::default()
+        Ok(v2_resp.map_output(|v2| {
+            // For ListObjects (v1) API, NextMarker should be the last item returned when truncated
+            // When both Contents and CommonPrefixes are present, NextMarker should be the
+            // lexicographically last item (either last key or last prefix)
+            let next_marker = if v2.is_truncated.unwrap_or(false) {
+                let last_key = v2
+                    .contents
+                    .as_ref()
+                    .and_then(|contents| contents.last())
+                    .and_then(|obj| obj.key.as_ref())
+                    .cloned();
+                
+                let last_prefix = v2
+                    .common_prefixes
+                    .as_ref()
+                    .and_then(|prefixes| prefixes.last())
+                    .and_then(|prefix| prefix.prefix.as_ref())
+                    .cloned();
+                
+                // NextMarker should be the lexicographically last item
+                // This matches Ceph S3 behavior used by s3-tests
+                match (last_key, last_prefix) {
+                    (Some(k), Some(p)) => {
+                        // Return the lexicographically greater one
+                        if k > p { Some(k) } else { Some(p) }
+                    }
+                    (Some(k), None) => Some(k),
+                    (None, Some(p)) => Some(p),
+                    (None, None) => None,
+                }
+            } else {
+                None
+            };
+
+            ListObjectsOutput {
+                contents: v2.contents,
+                delimiter: v2.delimiter,
+                encoding_type: v2.encoding_type,
+                name: v2.name,
+                prefix: v2.prefix,
+                max_keys: v2.max_keys,
+                common_prefixes: v2.common_prefixes,
+                is_truncated: v2.is_truncated,
+                next_marker,
+                ..Default::default()
+            }
         }))
     }
 
