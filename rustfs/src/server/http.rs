@@ -13,6 +13,7 @@
 // limitations under the License.
 
 // Ensure the correct path for parse_license is imported
+use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
@@ -43,7 +44,7 @@ use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::compression::{CompressionLayer, predicate::Predicate};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
@@ -106,60 +107,6 @@ fn get_cors_allowed_origins() -> String {
         .unwrap_or_else(|_| rustfs_config::DEFAULT_CORS_ALLOWED_ORIGINS.to_string())
         .parse::<String>()
         .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
-}
-
-/// Predicate to determine if a response should be compressed.
-///
-/// This predicate implements intelligent compression selection to avoid issues
-/// with error responses and small payloads. It excludes:
-/// - Client error responses (4xx status codes) - typically small XML/JSON error messages
-/// - Server error responses (5xx status codes) - ensures error details are preserved
-/// - Very small responses (< 256 bytes) - compression overhead outweighs benefits
-///
-/// # Rationale
-/// The CompressionLayer can cause Content-Length header mismatches with error responses,
-/// particularly when the s3s library generates XML error responses (~119 bytes for NoSuchKey).
-/// By excluding these responses from compression, we ensure:
-/// 1. Error responses are sent with accurate Content-Length headers
-/// 2. Clients receive complete error bodies without truncation
-/// 3. Small responses avoid compression overhead
-///
-/// # Performance
-/// This predicate is evaluated per-response and has O(1) complexity.
-#[derive(Clone, Copy, Debug)]
-struct ShouldCompress;
-
-impl Predicate for ShouldCompress {
-    fn should_compress<B>(&self, response: &Response<B>) -> bool
-    where
-        B: http_body::Body,
-    {
-        let status = response.status();
-
-        // Never compress error responses (4xx and 5xx status codes)
-        // This prevents Content-Length mismatch issues with error responses
-        if status.is_client_error() || status.is_server_error() {
-            debug!("Skipping compression for error response: status={}", status.as_u16());
-            return false;
-        }
-
-        // Check Content-Length header to avoid compressing very small responses
-        // Responses smaller than 256 bytes typically don't benefit from compression
-        // and may actually increase in size due to compression overhead
-        if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH) {
-            if let Ok(length_str) = content_length.to_str() {
-                if let Ok(length) = length_str.parse::<u64>() {
-                    if length < 256 {
-                        debug!("Skipping compression for small response: size={} bytes", length);
-                        return false;
-                    }
-                }
-            }
-        }
-
-        // Compress successful responses with sufficient size
-        true
-    }
 }
 
 pub async fn start_http_server(
@@ -290,6 +237,17 @@ pub async fn start_http_server(
         Some(cors_allowed_origins)
     };
 
+    // Create compression configuration from environment variables
+    let compression_config = CompressionConfig::from_env();
+    if compression_config.enabled {
+        info!(
+            "HTTP response compression enabled: extensions={:?}, mime_patterns={:?}, min_size={} bytes",
+            compression_config.extensions, compression_config.mime_patterns, compression_config.min_size
+        );
+    } else {
+        debug!("HTTP response compression is disabled");
+    }
+
     let is_console = opt.console_enable;
     tokio::spawn(async move {
         // Create CORS layer inside the server loop closure
@@ -395,15 +353,15 @@ pub async fn start_http_server(
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
 
-            process_connection(
-                socket,
-                tls_acceptor.clone(),
-                http_server.clone(),
-                s3_service.clone(),
-                graceful.clone(),
-                cors_layer.clone(),
+            let connection_ctx = ConnectionContext {
+                http_server: http_server.clone(),
+                s3_service: s3_service.clone(),
+                cors_layer: cors_layer.clone(),
+                compression_config: compression_config.clone(),
                 is_console,
-            );
+            };
+
+            process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.clone());
         }
 
         worker_state_manager.update(ServiceState::Stopping);
@@ -496,6 +454,15 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
     Ok(None)
 }
 
+#[derive(Clone)]
+struct ConnectionContext {
+    http_server: Arc<ConnBuilder<TokioExecutor>>,
+    s3_service: S3Service,
+    cors_layer: CorsLayer,
+    compression_config: CompressionConfig,
+    is_console: bool,
+}
+
 /// Process a single incoming TCP connection.
 ///
 /// This function is executed in a new Tokio task and it will:
@@ -507,13 +474,18 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 fn process_connection(
     socket: TcpStream,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
-    http_server: Arc<ConnBuilder<TokioExecutor>>,
-    s3_service: S3Service,
+    context: ConnectionContext,
     graceful: Arc<GracefulShutdown>,
-    cors_layer: CorsLayer,
-    is_console: bool,
 ) {
     tokio::spawn(async move {
+        let ConnectionContext {
+            http_server,
+            s3_service,
+            cors_layer,
+            compression_config,
+            is_console,
+        } = context;
+
         // Build services inside each connected task to avoid passing complex service types across tasks,
         // It also ensures that each connection has an independent service instance.
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
@@ -577,8 +549,9 @@ fn process_connection(
             )
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(cors_layer)
-            // Compress responses, but exclude error responses to avoid Content-Length mismatch issues
-            .layer(CompressionLayer::new().compress_when(ShouldCompress))
+            // Compress responses based on whitelist configuration
+            // Only compresses when enabled and matches configured extensions/MIME types
+            .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
 
