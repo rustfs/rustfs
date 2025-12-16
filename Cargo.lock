@@ -7559,6 +7559,7 @@ dependencies = [
  "futures-core",
  "http 1.4.0",
  "object_store",
+ "parking_lot",
  "pin-project-lite",
  "rustfs-common",
  "rustfs-ecstore",
