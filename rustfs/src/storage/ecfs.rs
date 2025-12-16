@@ -769,7 +769,7 @@ impl HTTPPreconditions {
         if let Some(unmodified_since) = if_unmodified_since {
             if info.mod_time.is_some_and(|mod_time| {
                 let given_time: OffsetDateTime = unmodified_since.clone().into();
-                // HTTP-date ony supports second precision
+                // HTTP-date only supports second precision
                 mod_time.unix_timestamp() > given_time.unix_timestamp()
             }) {
                 return Err(s3_error!(PreconditionFailed));
@@ -785,7 +785,7 @@ impl HTTPPreconditions {
         if let Some(modified_since) = if_modified_since {
             if info.mod_time.is_some_and(|mod_time| {
                 let given_time: OffsetDateTime = modified_since.clone().into();
-                // HTTP-date ony supports second precision
+                // HTTP-date only supports second precision
                 mod_time.unix_timestamp() <= given_time.unix_timestamp()
             }) {
                 return Err(s3_error!(NotModified));
