@@ -327,7 +327,8 @@ pub async fn execute_awscurl(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("awscurl failed: {stderr}").into());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("awscurl failed: stderr='{stderr}', stdout='{stdout}'").into());
     }
 
     let response = String::from_utf8_lossy(&output.stdout).to_string();
@@ -351,4 +352,14 @@ pub async fn awscurl_get(
     secret_key: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     execute_awscurl(url, "GET", None, access_key, secret_key).await
+}
+
+/// Helper function for PUT requests
+pub async fn awscurl_put(
+    url: &str,
+    body: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    execute_awscurl(url, "PUT", Some(body), access_key, secret_key).await
 }

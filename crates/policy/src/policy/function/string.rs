@@ -24,23 +24,26 @@ use crate::policy::utils::wildcard;
 use serde::{Deserialize, Deserializer, Serialize, de, ser::SerializeSeq};
 
 use super::{func::InnerFunc, key_name::KeyName};
+use crate::policy::variables::{PolicyVariableResolver, resolve_aws_variables};
 
 pub type StringFunc = InnerFunc<StringFuncValue>;
 
 impl StringFunc {
-    pub(crate) fn evaluate(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn evaluate_with_resolver(
         &self,
         for_all: bool,
         ignore_case: bool,
         like: bool,
         negate: bool,
         values: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         for inner in self.0.iter() {
             let result = if like {
-                inner.eval_like(for_all, values) ^ negate
+                inner.eval_like(for_all, values, resolver) ^ negate
             } else {
-                inner.eval(for_all, ignore_case, values) ^ negate
+                inner.eval(for_all, ignore_case, values, resolver) ^ negate
             };
 
             if !result {
@@ -53,7 +56,13 @@ impl StringFunc {
 }
 
 impl FuncKeyValue<StringFuncValue> {
-    fn eval(&self, for_all: bool, ignore_case: bool, values: &HashMap<String, Vec<String>>) -> bool {
+    fn eval(
+        &self,
+        for_all: bool,
+        ignore_case: bool,
+        values: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+    ) -> bool {
         let rvalues = values
             // http.CanonicalHeaderKey ?
             .get(self.key.name().as_str())
@@ -74,8 +83,15 @@ impl FuncKeyValue<StringFuncValue> {
             .values
             .0
             .iter()
-            .map(|c| {
-                let mut c = Cow::from(c);
+            .flat_map(|c| {
+                if let Some(res) = resolver {
+                    resolve_aws_variables(c, res)
+                } else {
+                    vec![c.to_string()]
+                }
+            })
+            .map(|resolved_c| {
+                let mut c = Cow::from(resolved_c);
                 for key in KeyName::COMMON_KEYS {
                     match values.get(key.name()).and_then(|x| x.first()) {
                         Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
@@ -97,15 +113,27 @@ impl FuncKeyValue<StringFuncValue> {
         }
     }
 
-    fn eval_like(&self, for_all: bool, values: &HashMap<String, Vec<String>>) -> bool {
+    fn eval_like(
+        &self,
+        for_all: bool,
+        values: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+    ) -> bool {
         if let Some(rvalues) = values.get(self.key.name().as_str()) {
             for v in rvalues.iter() {
                 let matched = self
                     .values
                     .0
                     .iter()
-                    .map(|c| {
-                        let mut c = Cow::from(c);
+                    .flat_map(|c| {
+                        if let Some(res) = resolver {
+                            resolve_aws_variables(c, res)
+                        } else {
+                            vec![c.to_string()]
+                        }
+                    })
+                    .map(|resolved_c| {
+                        let mut c = Cow::from(resolved_c);
                         for key in KeyName::COMMON_KEYS {
                             match values.get(key.name()).and_then(|x| x.first()) {
                                 Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
@@ -282,6 +310,7 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
                 .collect(),
+            None,
         );
 
         result ^ negate
@@ -386,6 +415,7 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
                 .collect(),
+            None,
         );
 
         result ^ negate
