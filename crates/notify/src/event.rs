@@ -20,6 +20,7 @@ use url::form_urlencoded;
 
 /// Represents the identity of the user who triggered the event
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Identity {
     /// The principal ID of the user
     pub principal_id: String,
@@ -27,6 +28,7 @@ pub struct Identity {
 
 /// Represents the bucket that the object is in
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Bucket {
     /// The name of the bucket
     pub name: String,
@@ -38,6 +40,7 @@ pub struct Bucket {
 
 /// Represents the object that the event occurred on
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct Object {
     /// The key (name) of the object
     pub key: String,
@@ -62,6 +65,7 @@ pub struct Object {
 
 /// Metadata about the event
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Metadata {
     /// The schema version of the event
     #[serde(rename = "s3SchemaVersion")]
@@ -76,13 +80,13 @@ pub struct Metadata {
 
 /// Information about the source of the event
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Source {
     /// The host where the event originated
     pub host: String,
     /// The port on the host
     pub port: String,
     /// The user agent that caused the event
-    #[serde(rename = "userAgent")]
     pub user_agent: String,
 }
 
