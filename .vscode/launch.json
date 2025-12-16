@@ -1,9 +1,31 @@
 {
-    // 使用 IntelliSense 了解相关属性。 
-    // 悬停以查看现有属性的描述。
-    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+          {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug(only) executable 'rustfs'",
+            "env": {
+              "RUST_LOG": "rustfs=info,ecstore=info,s3s=info,iam=info",
+              "RUSTFS_SKIP_BACKGROUND_TASK": "on"
+              //"RUSTFS_OBS_LOG_DIRECTORY": "./deploy/logs",
+              // "RUSTFS_POLICY_PLUGIN_URL":"http://localhost:8181/v1/data/rustfs/authz/allow",
+              // "RUSTFS_POLICY_PLUGIN_AUTH_TOKEN":"your-opa-token"
+            },
+            "program": "${workspaceFolder}/target/debug/rustfs",
+            "args": [
+              "--access-key",
+              "rustfsadmin",
+              "--secret-key",
+              "rustfsadmin",
+              "--address",
+              "0.0.0.0:9010",
+              "--server-domains",
+              "127.0.0.1:9010",
+              "./target/volume/test{1...4}"
+            ],
+            "cwd": "${workspaceFolder}"
+        },
         {
             "type": "lldb",
             "request": "launch",
@@ -67,12 +89,8 @@
                     "test",
                     "--no-run",
                     "--lib",
-                    "--package=ecstore"
-                ],
-                "filter": {
-                    "name": "ecstore",
-                    "kind": "lib"
-                }
+                    "--package=rustfs-ecstore"
+                ]
             },
             "args": [],
             "cwd": "${workspaceFolder}"
