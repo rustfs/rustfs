@@ -9,30 +9,105 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 
 **NOTE**: Please make sure which mode suits for you situation and specify the right parameter to install rustfs on kubernetes.
 
+---
+
 # Parameters Overview
 
-| parameter | description | default value |
-| -- | -- | -- |
-| replicaCount                      | Number of cluster nodes.                                           |  `4`.           |
-| imagePullSecrets                  | A List of secrets to pull image from private registry.             | `name: secret-name`|
-| imageRegistryCredentials.enabled  | To indicate whether pull image from private registry.              | `false`         |
-| imageRegistryCredentials.registry | Private registry url to pull rustfs image.                         | None            |
-| imageRegistryCredentials.username | The username to pull rustfs image from private registry.           | None            |
-| imageRegistryCredentials.password | The password to pull rustfs image from private registry.           | None            |
-| imageRegistryCredentials.email    | The email to pull rustfs image from private registry.              | None            |
-| mode.standalone.enabled           | RustFS standalone mode support, namely one pod one pvc.            | `false`         |
-| mode.distributed.enabled          | RustFS distributed mode support, namely multiple pod multiple pvc. | `true`          |
-| image.repository                  | RustFS docker image repository.                                    | `rustfs/rustfs` |
-| image.tag                         | The tag for rustfs docker image                                    | `latest`        |
-| secret.rustfs.access_key          | RustFS Access Key ID                                               | `rustfsadmin`   |
-| secret.rustfs.secret_key          | RustFS Secret Key ID                                               | `rustfsadmin`   |
-| storageclass.name                 | The name for StorageClass.                                         | `local-path`    |
-| storageclass.dataStorageSize      | The storage size for data PVC.                                     | `256Mi`         |
-| storageclass.logStorageSize       | The storage size for log PVC.                                      | `256Mi`         |
-| ingress.className                 | Specify the ingress class, traefik or nginx.                       | `nginx`         |
+| Parameter | Type | Default value | Description |
+|-----|------|---------|-------------|
+| affinity.nodeAffinity | object | `{}` |  |
+| affinity.podAntiAffinity.enabled | bool | `true` |  |
+| affinity.podAntiAffinity.topologyKey | string | `"kubernetes.io/hostname"` |  |
+| commonLabels | object | `{}` | Labels to add to all deployed objects. |
+| config.rustfs.address | string | `":9000"` |  |
+| config.rustfs.console_address | string | `":9001"` |  |
+| config.rustfs.console_enable | string | `"true"` |  |
+| config.rustfs.log_level | string | `"debug"` |  |
+| config.rustfs.obs_environment | string | `"develop"` |  |
+| config.rustfs.obs_log_directory | string | `"/logs"` |  |
+| config.rustfs.region | string | `"us-east-1"` |  |
+| config.rustfs.rust_log | string | `"debug"` |  |
+| config.rustfs.volumes | string | `""` |  |
+| containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
+| containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
+| containerSecurityContext.runAsNonRoot | bool | `true` |  |
+| extraManifests | list | `[]` | List of additional k8s manifests. |
+| fullnameOverride | string | `""` |  |
+| image.pullPolicy | string | `"IfNotPresent"` |  |
+| image.repository | string | `"rustfs/rustfs"` | RustFS docker image repository. |
+| image.tag | string | `"latest"` | The tag for rustfs docker image.  |
+| imagePullSecrets | list | `[]` | A List of secrets to pull image from private registry. |
+| imageRegistryCredentials.email | string | `""` | The email to pull rustfs image from private registry.  |
+| imageRegistryCredentials.enabled | bool | `false` | To indicate whether pull image from private registry.  |
+| imageRegistryCredentials.password | string | `""` | The password to pull rustfs image from private registry.  |
+| imageRegistryCredentials.registry | string | `""` | Private registry url to pull rustfs image. |
+| imageRegistryCredentials.username | string | `""` | The username to pull rustfs image from private registry. |
+| ingress.className | string | `"traefik"` | Specify the ingress class, traefik or nginx. |
+| ingress.enabled | bool | `true` |  |
+| ingress.hosts[0].host | string | `"your.rustfs.com"` |  |
+| ingress.hosts[0].paths[0].path | string | `"/"` |  |
+| ingress.hosts[0].paths[0].pathType | string | `"ImplementationSpecific"` |  |
+| ingress.nginxAnnotations."nginx.ingress.kubernetes.io/affinity" | string | `"cookie"` |  |
+| ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-expires" | string | `"3600"` |  |
+| ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-hash" | string | `"sha1"` |  |
+| ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-max-age" | string | `"3600"` |  |
+| ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-name" | string | `"rustfs"` |  |
+| ingress.tls[0].hosts[0] | string | `"your.rustfs.com"` |  |
+| ingress.tls[0].secretName | string | `"rustfs-tls"` |  |
+| ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie" | string | `"true"` |  |
+| ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.httponly" | string | `"true"` |  |
+| ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.name" | string | `"rustfs"` |  |
+| ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.samesite" | string | `"none"` |  |
+| ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.secure" | string | `"true"` |  |
+| livenessProbe.failureThreshold | int | `3` |  |
+| livenessProbe.httpGet.path | string | `"/health"` |  |
+| livenessProbe.httpGet.port | string | `"endpoint"` |  |
+| livenessProbe.initialDelaySeconds | int | `10` |  |
+| livenessProbe.periodSeconds | int | `5` |  |
+| livenessProbe.successThreshold | int | `1` |  |
+| livenessProbe.timeoutSeconds | int | `3` |  |
+| mode.distributed.enabled | bool | `true` | RustFS distributed mode support, namely multiple pod multiple pvc. |
+| mode.standalone.enabled | bool | `false` | RustFS standalone mode support, namely one pod one pvc.  |
+| nameOverride | string | `""` |  |
+| nodeSelector | object | `{}` |  |
+| podAnnotations | object | `{}` |  |
+| podLabels | object | `{}` |  |
+| podSecurityContext.fsGroup | int | `10001` |  |
+| podSecurityContext.runAsGroup | int | `10001` |  |
+| podSecurityContext.runAsUser | int | `10001` |  |
+| readinessProbe.failureThreshold | int | `3` |  |
+| readinessProbe.httpGet.path | string | `"/health"` |  |
+| readinessProbe.httpGet.port | string | `"endpoint"` |  |
+| readinessProbe.initialDelaySeconds | int | `30` |  |
+| readinessProbe.periodSeconds | int | `5` |  |
+| readinessProbe.successThreshold | int | `1` |  |
+| readinessProbe.timeoutSeconds | int | `3` |  |
+| replicaCount | int | `4` | Number of cluster nodes. |
+| resources.limits.cpu | string | `"200m"` |  |
+| resources.limits.memory | string | `"512Mi"` |  |
+| resources.requests.cpu | string | `"100m"` |  |
+| resources.requests.memory | string | `"128Mi"` |  |
+| secret.existingSecret | string | `""` | Use existing secret with a credentials. |
+| secret.rustfs.access_key | string | `"rustfsadmin"` | RustFS Access Key ID |
+| secret.rustfs.secret_key | string | `"rustfsadmin"` | RustFS Secret Key ID |
+| service.console_port | int | `9001` |  |
+| service.ep_port | int | `9000` |  |
+| service.type | string | `"NodePort"` |  |
+| serviceAccount.annotations | object | `{}` |  |
+| serviceAccount.automount | bool | `true` |  |
+| serviceAccount.create | bool | `true` |  |
+| serviceAccount.name | string | `""` |  |
+| storageclass.dataStorageSize | string | `"256Mi"` | The storage size for data PVC. |
+| storageclass.logStorageSize | string | `"256Mi"` | The storage size for logs PVC. |
+| storageclass.name | string | `"local-path"` | The name for StorageClass. |
+| tls.crt | string | `"tls.crt"` |  |
+| tls.enabled | bool | `false` |  |
+| tls.key | string | `"tls.key"` |  |
+| tolerations | list | `[]` |  |
 
+---
 
-**NOTE**: 
+**NOTE**:
 
 The chart pulls the rustfs image from Docker Hub by default. For private registries, provide either:
 
@@ -112,11 +187,11 @@ Access the rustfs cluster via `https://your.rustfs.com` with the default usernam
 
 # TLS configuration
 
-By default, tls is not enabled.If you want to enable tls(recommendated),you can follow below steps:
+By default, tls is not enabled. If you want to enable tls(recommendated),you can follow below steps:
 
 * Step 1: Certification generation
 
-You can request cert and key from CA or use the self-signed cert(**not recommendated on prod**),and put those two files(eg, `tls.crt` and `tls.key`) under some directory on server, for example `tls` directory.
+You can request cert and key from CA or use the self-signed cert(**not recommendated on prod**), and put those two files(eg, `tls.crt` and `tls.key`) under some directory on server, for example `tls` directory.
 
 * Step 2: Certification specifying
 
