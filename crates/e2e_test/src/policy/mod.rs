@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod app;
-pub(crate) mod body_limits;
-pub(crate) mod compress;
-pub(crate) mod console;
-pub(crate) mod env;
-pub(crate) mod heal;
-pub(crate) mod object;
-pub(crate) mod profiler;
-pub(crate) mod runtime;
-pub(crate) mod targets;
-pub(crate) mod tls;
+//! Policy-specific tests for RustFS
+//!
+//! This module provides comprehensive tests for AWS IAM policy variables
+//! including single-value, multi-value, and nested variable scenarios.
+
+mod policy_variables_test;
+mod test_env;
+mod test_runner;

@@ -251,6 +251,7 @@ walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
+lru = "0.7.1"
 zip = "6.0.0"
 zstd = "0.13.3"
 
