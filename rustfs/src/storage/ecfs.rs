@@ -124,7 +124,6 @@ use rustfs_utils::{
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
-use urlencoding::encode;
 use std::convert::Infallible;
 use std::ops::Add;
 use std::{
@@ -140,6 +139,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
+use urlencoding::encode;
 use uuid::Uuid;
 
 macro_rules! try_ {
@@ -2781,11 +2781,7 @@ impl S3 for FS {
             .prefixes
             .into_iter()
             .map(|v| {
-                let prefix = if should_encode {
-                    encode_s3_name(&v)
-                } else {
-                    v
-                };
+                let prefix = if should_encode { encode_s3_name(&v) } else { v };
                 CommonPrefix { prefix: Some(prefix) }
             })
             .collect();
@@ -2883,6 +2879,10 @@ impl S3 for FS {
             })
             .collect::<Vec<_>>();
 
+        // Only set next_version_id_marker if it has a value, per AWS S3 API spec
+        // boto3 expects it to be a string or omitted, not None
+        let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
+
         let output = ListObjectVersionsOutput {
             is_truncated: Some(object_infos.is_truncated),
             max_keys: Some(key_count),
@@ -2893,7 +2893,7 @@ impl S3 for FS {
             versions: Some(objects),
             delete_markers: Some(delete_markers),
             next_key_marker: object_infos.next_marker,
-            next_version_id_marker: object_infos.next_version_idmarker,
+            next_version_id_marker,
             ..Default::default()
         };
 
@@ -5685,24 +5685,24 @@ mod tests {
         // Test that KeyCount calculation includes both objects and common prefixes
         // This verifies the fix for S3 API compatibility where KeyCount should equal
         // the sum of Contents and CommonPrefixes lengths
-        
+
         // Simulate the calculation logic from list_objects_v2
         let objects_count = 3_usize;
         let common_prefixes_count = 2_usize;
-        
+
         // KeyCount should include both objects and common prefixes per S3 API spec
         let key_count = (objects_count + common_prefixes_count) as i32;
-        
+
         assert_eq!(key_count, 5);
-        
+
         // Edge cases: verify calculation logic
         let no_objects = 0_usize;
         let no_prefixes = 0_usize;
         assert_eq!((no_objects + no_prefixes) as i32, 0);
-        
+
         let one_object = 1_usize;
         assert_eq!((one_object + no_prefixes) as i32, 1);
-        
+
         let one_prefix = 1_usize;
         assert_eq!((no_objects + one_prefix) as i32, 1);
     }
@@ -5711,9 +5711,9 @@ mod tests {
     fn test_s3_url_encoding_preserves_slash() {
         // Test that S3 URL encoding preserves path separators (/)
         // This verifies the encoding logic for EncodingType=url parameter
-        
+
         use urlencoding::encode;
-        
+
         // Helper function matching the implementation
         let encode_s3_name = |name: &str| -> String {
             name.split('/')
@@ -5721,13 +5721,13 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("/")
         };
-        
+
         // Test cases from s3-tests
         assert_eq!(encode_s3_name("asdf+b"), "asdf%2Bb");
         assert_eq!(encode_s3_name("foo+1/bar"), "foo%2B1/bar");
         assert_eq!(encode_s3_name("foo/"), "foo/");
         assert_eq!(encode_s3_name("quux ab/"), "quux%20ab/");
-        
+
         // Edge cases
         assert_eq!(encode_s3_name("normal/key"), "normal/key");
         assert_eq!(encode_s3_name("key+with+plus"), "key%2Bwith%2Bplus");
