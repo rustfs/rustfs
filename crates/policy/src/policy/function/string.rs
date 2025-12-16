@@ -37,14 +37,13 @@ impl StringFunc {
         like: bool,
         negate: bool,
         values: &HashMap<String, Vec<String>>,
-        aws_variables: Option<&HashMap<String, String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         for inner in self.0.iter() {
             let result = if like {
-                inner.eval_like(for_all, values, aws_variables, resolver) ^ negate
+                inner.eval_like(for_all, values, resolver) ^ negate
             } else {
-                inner.eval(for_all, ignore_case, values, aws_variables, resolver) ^ negate
+                inner.eval(for_all, ignore_case, values, resolver) ^ negate
             };
 
             if !result {
@@ -62,7 +61,6 @@ impl FuncKeyValue<StringFuncValue> {
         for_all: bool,
         ignore_case: bool,
         values: &HashMap<String, Vec<String>>,
-        _aws_variables: Option<&HashMap<String, String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         let rvalues = values
@@ -119,7 +117,6 @@ impl FuncKeyValue<StringFuncValue> {
         &self,
         for_all: bool,
         values: &HashMap<String, Vec<String>>,
-        _aws_variables: Option<&HashMap<String, String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         if let Some(rvalues) = values.get(self.key.name().as_str()) {

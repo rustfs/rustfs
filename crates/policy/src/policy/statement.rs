@@ -104,7 +104,7 @@ impl Statement {
             }
 
             if self.is_kms() && (resource == "/" || self.resources.is_empty()) {
-                break 'c self.conditions.evaluate_with_resolver(args.conditions, None, Some(&resolver));
+                break 'c self.conditions.evaluate_with_resolver(args.conditions, Some(&resolver));
             }
 
             if !self
@@ -116,7 +116,7 @@ impl Statement {
                 break 'c false;
             }
 
-            self.conditions.evaluate_with_resolver(args.conditions, None, Some(&resolver))
+            self.conditions.evaluate_with_resolver(args.conditions, Some(&resolver))
         };
 
         self.effect.is_allowed(check)
@@ -207,7 +207,7 @@ impl BPStatement {
                 break 'c false;
             }
 
-            self.conditions.evaluate(args.conditions, None)
+            self.conditions.evaluate(args.conditions)
         };
 
         self.effect.is_allowed(check)

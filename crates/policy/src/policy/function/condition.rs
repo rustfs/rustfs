@@ -111,18 +111,17 @@ impl Condition {
         &self,
         for_all: bool,
         values: &HashMap<String, Vec<String>>,
-        aws_variables: Option<&HashMap<String, String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         use Condition::*;
 
         let r = match self {
-            StringEquals(s) => s.evaluate_with_resolver(for_all, false, false, false, values, aws_variables, resolver),
-            StringNotEquals(s) => s.evaluate_with_resolver(for_all, false, false, true, values, aws_variables, resolver),
-            StringEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, false, values, aws_variables, resolver),
-            StringNotEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, true, values, aws_variables, resolver),
-            StringLike(s) => s.evaluate_with_resolver(for_all, false, true, false, values, aws_variables, resolver),
-            StringNotLike(s) => s.evaluate_with_resolver(for_all, false, true, true, values, aws_variables, resolver),
+            StringEquals(s) => s.evaluate_with_resolver(for_all, false, false, false, values, resolver),
+            StringNotEquals(s) => s.evaluate_with_resolver(for_all, false, false, true, values, resolver),
+            StringEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, false, values, resolver),
+            StringNotEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, true, values, resolver),
+            StringLike(s) => s.evaluate_with_resolver(for_all, false, true, false, values, resolver),
+            StringNotLike(s) => s.evaluate_with_resolver(for_all, false, true, true, values, resolver),
             BinaryEquals(s) => s.evaluate(values),
             IpAddress(s) => s.evaluate(values),
             NotIpAddress(s) => s.evaluate(values),

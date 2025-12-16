@@ -38,30 +38,29 @@ pub struct Functions {
 }
 
 impl Functions {
-    pub fn evaluate(&self, values: &HashMap<String, Vec<String>>, aws_variables: Option<&HashMap<String, String>>) -> bool {
-        self.evaluate_with_resolver(values, aws_variables, None)
+    pub fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
+        self.evaluate_with_resolver(values, None)
     }
 
     pub fn evaluate_with_resolver(
         &self,
         values: &HashMap<String, Vec<String>>,
-        aws_variables: Option<&HashMap<String, String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         for c in self.for_any_value.iter() {
-            if !c.evaluate_with_resolver(false, values, aws_variables, resolver) {
+            if !c.evaluate_with_resolver(false, values, resolver) {
                 return false;
             }
         }
 
         for c in self.for_all_values.iter() {
-            if !c.evaluate_with_resolver(true, values, aws_variables, resolver) {
+            if !c.evaluate_with_resolver(true, values, resolver) {
                 return false;
             }
         }
 
         for c in self.for_normal.iter() {
-            if !c.evaluate_with_resolver(false, values, aws_variables, resolver) {
+            if !c.evaluate_with_resolver(false, values, resolver) {
                 return false;
             }
         }
