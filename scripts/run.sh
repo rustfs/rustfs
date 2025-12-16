@@ -106,9 +106,53 @@ export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
 
 
 export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
-# exportRUSTFS_SKIP_BACKGROUND_TASK=true
+# export RUSTFS_SKIP_BACKGROUND_TASK=true
 
-# export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
+# Storage level compression (compression at object storage level)
+# export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable storage-level compression for objects
+
+# HTTP Response Compression (whitelist-based, aligned with MinIO)
+# By default, HTTP response compression is DISABLED (aligned with MinIO behavior)
+# When enabled, only explicitly configured file types will be compressed
+# This preserves Content-Length headers for better browser download experience
+
+# Enable HTTP response compression
+# export RUSTFS_COMPRESS_ENABLE=on
+
+# Example 1: Compress text files and logs
+# Suitable for log files, text documents, CSV files
+# export RUSTFS_COMPRESS_ENABLE=on
+# export RUSTFS_COMPRESS_EXTENSIONS=.txt,.log,.csv
+# export RUSTFS_COMPRESS_MIME_TYPES=text/*
+# export RUSTFS_COMPRESS_MIN_SIZE=1000
+
+# Example 2: Compress JSON and XML API responses
+# Suitable for API services that return JSON/XML data
+# export RUSTFS_COMPRESS_ENABLE=on
+# export RUSTFS_COMPRESS_EXTENSIONS=.json,.xml
+# export RUSTFS_COMPRESS_MIME_TYPES=application/json,application/xml
+# export RUSTFS_COMPRESS_MIN_SIZE=1000
+
+# Example 3: Comprehensive web content compression
+# Suitable for web applications (HTML, CSS, JavaScript, JSON)
+# export RUSTFS_COMPRESS_ENABLE=on
+# export RUSTFS_COMPRESS_EXTENSIONS=.html,.css,.js,.json,.xml,.txt,.svg
+# export RUSTFS_COMPRESS_MIME_TYPES=text/*,application/json,application/xml,application/javascript,image/svg+xml
+# export RUSTFS_COMPRESS_MIN_SIZE=1000
+
+# Example 4: Compress only large text files (minimum 10KB)
+# Useful when you want to avoid compression overhead for small files
+# export RUSTFS_COMPRESS_ENABLE=on
+# export RUSTFS_COMPRESS_EXTENSIONS=.txt,.log
+# export RUSTFS_COMPRESS_MIME_TYPES=text/*
+# export RUSTFS_COMPRESS_MIN_SIZE=10240
+
+# Notes:
+# - Only files matching EITHER extensions OR MIME types will be compressed (whitelist approach)
+# - Error responses (4xx, 5xx) are never compressed to avoid Content-Length issues
+# - Already encoded content (gzip, br, deflate, zstd) is automatically skipped
+# - Minimum size threshold prevents compression of small files where overhead > benefit
+# - Wildcard patterns supported in MIME types (e.g., text/* matches text/plain, text/html, etc.)
 
 #export RUSTFS_REGION="us-east-1"
 
