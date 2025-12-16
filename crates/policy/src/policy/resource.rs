@@ -24,6 +24,7 @@ use super::{
     Error as IamError, Validator,
     function::key_name::KeyName,
     utils::{path, wildcard},
+    variables::{PolicyVariableResolver, resolve_aws_variables},
 };
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -31,8 +32,17 @@ pub struct ResourceSet(pub HashSet<Resource>);
 
 impl ResourceSet {
     pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
+        self.is_match_with_resolver(resource, conditions, None)
+    }
+
+    pub fn is_match_with_resolver(
+        &self,
+        resource: &str,
+        conditions: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+    ) -> bool {
         for re in self.0.iter() {
-            if re.is_match(resource, conditions) {
+            if re.is_match_with_resolver(resource, conditions, resolver) {
                 return true;
             }
         }
@@ -86,26 +96,51 @@ impl Resource {
     pub const S3_PREFIX: &'static str = "arn:aws:s3:::";
 
     pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
-        let mut pattern = match self {
+        self.is_match_with_resolver(resource, conditions, None)
+    }
+
+    pub fn is_match_with_resolver(
+        &self,
+        resource: &str,
+        conditions: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+    ) -> bool {
+        let pattern = match self {
             Resource::S3(s) => s.to_owned(),
             Resource::Kms(s) => s.to_owned(),
         };
-        if !conditions.is_empty() {
-            for key in KeyName::COMMON_KEYS {
-                if let Some(rvalue) = conditions.get(key.name()) {
-                    if matches!(rvalue.first().map(|c| !c.is_empty()), Some(true)) {
-                        pattern = pattern.replace(&key.var_name(), &rvalue[0]);
+
+        let patterns = if let Some(res) = resolver {
+            resolve_aws_variables(&pattern, res)
+        } else {
+            vec![pattern.clone()]
+        };
+
+        for pattern in patterns {
+            let mut resolved_pattern = pattern;
+
+            // Apply condition substitutions
+            if !conditions.is_empty() {
+                for key in KeyName::COMMON_KEYS {
+                    if let Some(rvalue) = conditions.get(key.name()) {
+                        if matches!(rvalue.first().map(|c| !c.is_empty()), Some(true)) {
+                            resolved_pattern = resolved_pattern.replace(&key.var_name(), &rvalue[0]);
+                        }
                     }
                 }
             }
+
+            let cp = path::clean(resource);
+            if cp != "." && cp == resolved_pattern.as_str() {
+                return true;
+            }
+
+            if wildcard::is_match(resolved_pattern, resource) {
+                return true;
+            }
         }
 
-        let cp = path::clean(resource);
-        if cp != "." && cp == pattern.as_str() {
-            return true;
-        }
-
-        wildcard::is_match(pattern, resource)
+        false
     }
 
     pub fn match_resource(&self, resource: &str) -> bool {
