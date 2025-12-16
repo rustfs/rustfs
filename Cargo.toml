@@ -103,6 +103,7 @@ axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"], defaul
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
+pollster = "0.4.0"
 hyper = { version = "1.8.1", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "ring", "webpki-roots"] }
 hyper-util = { version = "0.1.19", features = ["tokio", "server-auto", "server-graceful"] }

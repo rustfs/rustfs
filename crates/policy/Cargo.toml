@@ -46,11 +46,11 @@ reqwest.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 moka.workspace = true
-async-trait = "0.1.89"
-futures = "0.3"
-pollster = "0.3"
+async-trait.workspace = true
+futures.workspace = true
+pollster.workspace = true
 
 [dev-dependencies]
-pollster = "0.3"
+pollster.workspace = true
 test-case.workspace = true
 temp-env = { workspace = true }
