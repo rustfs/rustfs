@@ -108,7 +108,7 @@ hyper-rustls = { version = "0.27.7", default-features = false, features = ["nati
 hyper-util = { version = "0.1.19", features = ["tokio", "server-auto", "server-graceful"] }
 http = "1.4.0"
 http-body = "1.0.1"
-reqwest = { version = "0.12.25", default-features = false, features = ["rustls-tls-webpki-roots", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
+reqwest = { version = "0.12.26", default-features = false, features = ["rustls-tls-webpki-roots", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
 socket2 = "0.6.1"
 tokio = { version = "1.48.0", features = ["fs", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
@@ -139,7 +139,7 @@ schemars = "1.1.0"
 
 # Cryptography and Security
 aes-gcm = { version = "0.11.0-rc.2", features = ["rand_core"] }
-argon2 = { version = "0.6.0-rc.4", features = ["std"] }
+argon2 = { version = "0.6.0-rc.5" }
 blake3 = { version = "1.8.2", features = ["rayon", "mmap"] }
 chacha20poly1305 = { version = "0.11.0-rc.2" }
 crc-fast = "1.6.0"
@@ -196,7 +196,7 @@ ipnetwork = { version = "0.21.1", features = ["serde"] }
 lazy_static = "1.5.0"
 libc = "0.2.178"
 libsystemd = "0.7.2"
-local-ip-address = "0.6.7"
+local-ip-address = "0.6.8"
 lz4 = "1.28.1"
 matchit = "0.9.0"
 md-5 = "0.11.0-rc.3"
