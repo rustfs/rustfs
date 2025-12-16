@@ -1798,12 +1798,12 @@ impl S3 for FS {
                     mod_time: cached
                         .last_modified
                         .as_ref()
-                        .and_then(|s| time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()),
+                        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()),
                     size: cached.content_length,
                     actual_size: cached.content_length,
                     is_dir: false,
                     user_defined: cached.user_metadata.clone(),
-                    version_id: cached.version_id.as_ref().and_then(|v| uuid::Uuid::parse_str(v).ok()),
+                    version_id: cached.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
                     delete_marker: cached.delete_marker,
                     content_type: cached.content_type.clone(),
                     content_encoding: cached.content_encoding.clone(),
@@ -2165,17 +2165,15 @@ impl S3 for FS {
             }
 
             // Build CachedGetObject with full metadata for cache writeback
-            let last_modified_str = info
-                .mod_time
-                .and_then(|t| match t.format(&time::format_description::well_known::Rfc3339) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        warn!("Failed to format last_modified for cache writeback: {}", e);
-                        None
-                    }
-                });
+            let last_modified_str = info.mod_time.and_then(|t| match t.format(&Rfc3339) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Failed to format last_modified for cache writeback: {}", e);
+                    None
+                }
+            });
 
-            let cached_response = CachedGetObject::new(bytes::Bytes::from(buf.clone()), response_content_length)
+            let cached_response = CachedGetObject::new(Bytes::from(buf.clone()), response_content_length)
                 .with_content_type(info.content_type.clone().unwrap_or_default())
                 .with_e_tag(info.etag.clone().unwrap_or_default())
                 .with_last_modified(last_modified_str.unwrap_or_default());
@@ -2389,8 +2387,12 @@ impl S3 for FS {
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         if let Some(match_etag) = if_none_match {
-            if let Some(strong_etag) = match_etag.as_strong() {
-                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
+            if let Some(strong_etag) = match_etag.into_etag() {
+                if info
+                    .etag
+                    .as_ref()
+                    .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+                {
                     return Err(S3Error::new(S3ErrorCode::NotModified));
                 }
             }
@@ -2407,8 +2409,12 @@ impl S3 for FS {
         }
 
         if let Some(match_etag) = if_match {
-            if let Some(strong_etag) = match_etag.as_strong() {
-                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
+            if let Some(strong_etag) = match_etag.into_etag() {
+                if info
+                    .etag
+                    .as_ref()
+                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                {
                     return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
                 }
             }
@@ -2820,7 +2826,7 @@ impl S3 for FS {
 
     // #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
         if req
             .headers
             .get("X-Amz-Meta-Snowball-Auto-Extract")
@@ -2869,15 +2875,23 @@ impl S3 for FS {
                 Ok(info) => {
                     if !info.delete_marker {
                         if let Some(ifmatch) = if_match {
-                            if let Some(strong_etag) = ifmatch.as_strong() {
-                                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
+                            if let Some(strong_etag) = ifmatch.into_etag() {
+                                if info
+                                    .etag
+                                    .as_ref()
+                                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                                {
                                     return Err(s3_error!(PreconditionFailed));
                                 }
                             }
                         }
                         if let Some(ifnonematch) = if_none_match {
-                            if let Some(strong_etag) = ifnonematch.as_strong() {
-                                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
+                            if let Some(strong_etag) = ifnonematch.into_etag() {
+                                if info
+                                    .etag
+                                    .as_ref()
+                                    .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+                                {
                                     return Err(s3_error!(PreconditionFailed));
                                 }
                             }
@@ -3142,6 +3156,12 @@ impl S3 for FS {
         let put_bucket = bucket.clone();
         let put_key = key.clone();
         let put_version = obj_info.version_id.map(|v| v.to_string());
+
+        helper = helper.object(obj_info.clone());
+        if let Some(version_id) = &put_version {
+            helper = helper.version_id(version_id.clone());
+        }
+
         tokio::spawn(async move {
             manager
                 .invalidate_cache_versioned(&put_bucket, &put_key, put_version.as_deref())
@@ -3672,8 +3692,8 @@ impl S3 for FS {
         // Validate copy conditions (simplified for now)
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
-                if let Some(strong_etag) = if_match.as_strong() {
-                    if etag != strong_etag {
+                if let Some(strong_etag) = if_match.into_etag() {
+                    if ETag::Strong(etag.clone()) != strong_etag {
                         return Err(s3_error!(PreconditionFailed));
                     }
                 } else {
@@ -3687,8 +3707,8 @@ impl S3 for FS {
 
         if let Some(if_none_match) = copy_source_if_none_match {
             if let Some(ref etag) = src_info.etag {
-                if let Some(strong_etag) = if_none_match.as_strong() {
-                    if etag == strong_etag {
+                if let Some(strong_etag) = if_none_match.into_etag() {
+                    if ETag::Strong(etag.clone()) == strong_etag {
                         return Err(s3_error!(PreconditionFailed));
                     }
                 }
@@ -3964,15 +3984,23 @@ impl S3 for FS {
                 Ok(info) => {
                     if !info.delete_marker {
                         if let Some(ifmatch) = if_match {
-                            if let Some(strong_etag) = ifmatch.as_strong() {
-                                if info.etag.as_ref().is_some_and(|etag| etag != strong_etag) {
+                            if let Some(strong_etag) = ifmatch.into_etag() {
+                                if info
+                                    .etag
+                                    .as_ref()
+                                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                                {
                                     return Err(s3_error!(PreconditionFailed));
                                 }
                             }
                         }
                         if let Some(ifnonematch) = if_none_match {
-                            if let Some(strong_etag) = ifnonematch.as_strong() {
-                                if info.etag.as_ref().is_some_and(|etag| etag == strong_etag) {
+                            if let Some(strong_etag) = ifnonematch.into_etag() {
+                                if info
+                                    .etag
+                                    .as_ref()
+                                    .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+                                {
                                     return Err(s3_error!(PreconditionFailed));
                                 }
                             }

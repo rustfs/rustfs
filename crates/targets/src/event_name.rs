@@ -12,7 +12,6 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Error returned when parsing event name string fails.
@@ -29,7 +28,7 @@ impl std::error::Error for ParseEventNameError {}
 
 /// Represents the type of event that occurs on the object.
 /// Based on AWS S3 event type and includes RustFS extension.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum EventName {
     // Single event type (values are 1-32 for compatible mask logic)
     ObjectAccessedGet = 1,
@@ -287,5 +286,81 @@ impl fmt::Display for EventName {
 impl From<&str> for EventName {
     fn from(event_str: &str) -> Self {
         EventName::parse(event_str).unwrap_or_else(|e| panic!("{}", e))
+    }
+}
+
+impl serde::ser::Serialize for EventName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::de::Deserialize<'de> for EventName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let s = Self::parse(&s).map_err(serde::de::Error::custom)?;
+        Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // test serialization
+    #[test]
+    fn test_event_name_serialization_and_deserialization() {
+        struct TestCase {
+            event: EventName,
+            serialized_str: &'static str,
+        }
+
+        let test_cases = vec![
+            TestCase {
+                event: EventName::BucketCreated,
+                serialized_str: "\"s3:BucketCreated:*\"",
+            },
+            TestCase {
+                event: EventName::ObjectCreatedAll,
+                serialized_str: "\"s3:ObjectCreated:*\"",
+            },
+            TestCase {
+                event: EventName::ObjectCreatedPut,
+                serialized_str: "\"s3:ObjectCreated:Put\"",
+            },
+        ];
+
+        for case in &test_cases {
+            let serialized = serde_json::to_string(&case.event);
+            assert!(serialized.is_ok(), "Serialization failed for `{}`", case.serialized_str);
+            assert_eq!(serialized.unwrap(), case.serialized_str);
+
+            let deserialized = serde_json::from_str::<EventName>(case.serialized_str);
+            assert!(deserialized.is_ok(), "Deserialization failed for `{}`", case.serialized_str);
+            assert_eq!(deserialized.unwrap(), case.event);
+        }
+    }
+
+    #[test]
+    fn test_invalid_event_name_deserialization() {
+        let invalid_str = "\"s3:InvalidEvent:Test\"";
+        let deserialized = serde_json::from_str::<EventName>(invalid_str);
+        assert!(deserialized.is_err(), "Deserialization should fail for invalid event name");
+
+        // empty string should be successful only serialization
+        let event_name = EventName::Everything;
+        let serialized_str = "\"\"";
+        let serialized = serde_json::to_string(&event_name);
+        assert!(serialized.is_ok(), "Serialization failed for `{serialized_str}`");
+        assert_eq!(serialized.unwrap(), serialized_str);
+
+        let deserialized = serde_json::from_str::<EventName>(serialized_str);
+        assert!(deserialized.is_err(), "Deserialization should fail for empty string");
     }
 }
