@@ -24,25 +24,25 @@ use super::{
     Error as IamError, Validator,
     function::key_name::KeyName,
     utils::{path, wildcard},
-    variables::{PolicyVariableResolver, resolve_aws_variables},
+    variables::PolicyVariableResolver,
 };
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ResourceSet(pub HashSet<Resource>);
 
 impl ResourceSet {
-    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
-        self.is_match_with_resolver(resource, conditions, None)
+    pub async fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
+        self.is_match_with_resolver(resource, conditions, None).await
     }
 
-    pub fn is_match_with_resolver(
+    pub async fn is_match_with_resolver(
         &self,
         resource: &str,
         conditions: &HashMap<String, Vec<String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         for re in self.0.iter() {
-            if re.is_match_with_resolver(resource, conditions, resolver) {
+            if re.is_match_with_resolver(resource, conditions, resolver).await {
                 return true;
             }
         }
@@ -50,9 +50,9 @@ impl ResourceSet {
         false
     }
 
-    pub fn match_resource(&self, resource: &str) -> bool {
+    pub async fn match_resource(&self, resource: &str) -> bool {
         for re in self.0.iter() {
-            if re.match_resource(resource) {
+            if re.match_resource(resource).await {
                 return true;
             }
         }
@@ -95,11 +95,11 @@ pub enum Resource {
 impl Resource {
     pub const S3_PREFIX: &'static str = "arn:aws:s3:::";
 
-    pub fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
-        self.is_match_with_resolver(resource, conditions, None)
+    pub async fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
+        self.is_match_with_resolver(resource, conditions, None).await
     }
 
-    pub fn is_match_with_resolver(
+    pub async fn is_match_with_resolver(
         &self,
         resource: &str,
         conditions: &HashMap<String, Vec<String>>,
@@ -111,7 +111,7 @@ impl Resource {
         };
 
         let patterns = if let Some(res) = resolver {
-            resolve_aws_variables(&pattern, res)
+            super::variables::resolve_aws_variables(&pattern, res).await
         } else {
             vec![pattern.clone()]
         };
@@ -143,8 +143,8 @@ impl Resource {
         false
     }
 
-    pub fn match_resource(&self, resource: &str) -> bool {
-        self.is_match(resource, &HashMap::new())
+    pub async fn match_resource(&self, resource: &str) -> bool {
+        self.is_match(resource, &HashMap::new()).await
     }
 }
 
@@ -232,6 +232,7 @@ mod tests {
     #[test_case("arn:aws:s3:::mybucket","mybucket/myobject" => false; "15")]
     fn test_resource_is_match(resource: &str, object: &str) -> bool {
         let resource: Resource = resource.try_into().unwrap();
-        resource.is_match(object, &HashMap::new())
+
+        pollster::block_on(resource.is_match(object, &HashMap::new()))
     }
 }

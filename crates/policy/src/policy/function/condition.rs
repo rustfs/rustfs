@@ -107,7 +107,7 @@ impl Condition {
         }
     }
 
-    pub fn evaluate_with_resolver(
+    pub async fn evaluate_with_resolver(
         &self,
         for_all: bool,
         values: &HashMap<String, Vec<String>>,
@@ -116,12 +116,12 @@ impl Condition {
         use Condition::*;
 
         let r = match self {
-            StringEquals(s) => s.evaluate_with_resolver(for_all, false, false, false, values, resolver),
-            StringNotEquals(s) => s.evaluate_with_resolver(for_all, false, false, true, values, resolver),
-            StringEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, false, values, resolver),
-            StringNotEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, true, values, resolver),
-            StringLike(s) => s.evaluate_with_resolver(for_all, false, true, false, values, resolver),
-            StringNotLike(s) => s.evaluate_with_resolver(for_all, false, true, true, values, resolver),
+            StringEquals(s) => s.evaluate_with_resolver(for_all, false, false, false, values, resolver).await,
+            StringNotEquals(s) => s.evaluate_with_resolver(for_all, false, false, true, values, resolver).await,
+            StringEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, false, values, resolver).await,
+            StringNotEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, true, values, resolver).await,
+            StringLike(s) => s.evaluate_with_resolver(for_all, false, true, false, values, resolver).await,
+            StringNotLike(s) => s.evaluate_with_resolver(for_all, false, true, true, values, resolver).await,
             BinaryEquals(s) => s.evaluate(values),
             IpAddress(s) => s.evaluate(values),
             NotIpAddress(s) => s.evaluate(values),
