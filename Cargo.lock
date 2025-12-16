@@ -6052,6 +6052,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pollster"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22686f4785f02a4fcc856d3b3bb19bf6c8160d103f7a99cc258bddd0251dc7f2"
+
+[[package]]
 name = "poly1305"
 version = "0.9.0-rc.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7308,6 +7314,7 @@ dependencies = [
  "base64-simd",
  "futures",
  "jsonwebtoken",
+ "pollster",
  "rand 0.10.0-rc.5",
  "rustfs-crypto",
  "rustfs-ecstore",
@@ -7468,6 +7475,7 @@ dependencies = [
  "ipnetwork",
  "jsonwebtoken",
  "moka",
+ "pollster",
  "rand 0.10.0-rc.5",
  "regex",
  "reqwest",

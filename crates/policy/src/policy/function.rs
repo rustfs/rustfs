@@ -38,29 +38,29 @@ pub struct Functions {
 }
 
 impl Functions {
-    pub fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
-        self.evaluate_with_resolver(values, None)
+    pub async fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
+        self.evaluate_with_resolver(values, None).await
     }
 
-    pub fn evaluate_with_resolver(
+    pub async fn evaluate_with_resolver(
         &self,
         values: &HashMap<String, Vec<String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         for c in self.for_any_value.iter() {
-            if !c.evaluate_with_resolver(false, values, resolver) {
+            if !c.evaluate_with_resolver(false, values, resolver).await {
                 return false;
             }
         }
 
         for c in self.for_all_values.iter() {
-            if !c.evaluate_with_resolver(true, values, resolver) {
+            if !c.evaluate_with_resolver(true, values, resolver).await {
                 return false;
             }
         }
 
         for c in self.for_normal.iter() {
-            if !c.evaluate_with_resolver(false, values, resolver) {
+            if !c.evaluate_with_resolver(false, values, resolver).await {
                 return false;
             }
         }

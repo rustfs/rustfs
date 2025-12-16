@@ -404,7 +404,7 @@ where
 
         let ret = m
             .into_iter()
-            .filter(|(_, v)| bucket_name.is_empty() || v.policy.match_resource(bucket_name))
+            .filter(|(_, v)| bucket_name.is_empty() || pollster::block_on(v.policy.match_resource(bucket_name)))
             .map(|(k, v)| (k, v.policy))
             .collect();
 
@@ -458,7 +458,7 @@ where
 
         let ret = m
             .into_iter()
-            .filter(|(_, v)| bucket_name.is_empty() || v.policy.match_resource(bucket_name))
+            .filter(|(_, v)| bucket_name.is_empty() || pollster::block_on(v.policy.match_resource(bucket_name)))
             .collect();
 
         Ok(ret)
@@ -470,7 +470,7 @@ where
             .policy_docs
             .load()
             .iter()
-            .filter(|(_, v)| bucket_name.is_empty() || v.policy.match_resource(bucket_name))
+            .filter(|(_, v)| bucket_name.is_empty() || pollster::block_on(v.policy.match_resource(bucket_name)))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
@@ -1753,7 +1753,7 @@ fn filter_policies(cache: &Cache, policy_name: &str, bucket_name: &str) -> (Stri
         }
 
         if let Some(p) = cache.policy_docs.load().get(&policy) {
-            if bucket_name.is_empty() || p.policy.match_resource(bucket_name) {
+            if bucket_name.is_empty() || pollster::block_on(p.policy.match_resource(bucket_name)) {
                 policies.push(policy);
                 to_merge.push(p.policy.clone());
             }

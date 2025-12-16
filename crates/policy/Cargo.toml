@@ -48,7 +48,9 @@ tracing.workspace = true
 moka.workspace = true
 async-trait = "0.1.89"
 futures = "0.3"
+pollster = "0.3"
 
 [dev-dependencies]
+pollster = "0.3"
 test-case.workspace = true
 temp-env = { workspace = true }

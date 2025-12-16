@@ -69,7 +69,7 @@ impl Statement {
         false
     }
 
-    pub fn is_allowed(&self, args: &Args) -> bool {
+    pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
         let mut context = VariableContext::new();
         context.claims = Some(args.claims.clone());
         context.conditions = args.conditions.clone();
@@ -104,19 +104,20 @@ impl Statement {
             }
 
             if self.is_kms() && (resource == "/" || self.resources.is_empty()) {
-                break 'c self.conditions.evaluate_with_resolver(args.conditions, Some(&resolver));
+                break 'c self.conditions.evaluate_with_resolver(args.conditions, Some(&resolver)).await;
             }
 
             if !self
                 .resources
                 .is_match_with_resolver(&resource, args.conditions, Some(&resolver))
+                .await
                 && !self.is_admin()
                 && !self.is_sts()
             {
                 break 'c false;
             }
 
-            self.conditions.evaluate_with_resolver(args.conditions, Some(&resolver))
+            self.conditions.evaluate_with_resolver(args.conditions, Some(&resolver)).await
         };
 
         self.effect.is_allowed(check)
@@ -178,7 +179,7 @@ pub struct BPStatement {
 }
 
 impl BPStatement {
-    pub fn is_allowed(&self, args: &BucketPolicyArgs) -> bool {
+    pub async fn is_allowed(&self, args: &BucketPolicyArgs<'_>) -> bool {
         let check = 'c: {
             if !self.principal.is_match(args.account) {
                 break 'c false;
@@ -199,15 +200,15 @@ impl BPStatement {
                 resource.push('/');
             }
 
-            if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions) {
+            if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions).await {
                 break 'c false;
             }
 
-            if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions) {
+            if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions).await {
                 break 'c false;
             }
 
-            self.conditions.evaluate(args.conditions)
+            self.conditions.evaluate(args.conditions).await
         };
 
         self.effect.is_allowed(check)

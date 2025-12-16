@@ -285,24 +285,6 @@ pub async fn resolve_aws_variables(pattern: &str, resolver: &dyn PolicyVariableR
     results
 }
 
-pub fn resolve_aws_variables_sync(pattern: &str, resolver: &dyn PolicyVariableResolver) -> Vec<String> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            // When already in a tokio runtime, cannot create another runtime
-            // Use block_in_place to avoid "Cannot start a runtime from within a runtime" error
-            tokio::task::block_in_place(|| handle.block_on(resolve_aws_variables(pattern, resolver)))
-        }
-        Err(_) => {
-            // When not in a tokio runtime, create new runtime to execute async code
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime");
-            rt.block_on(resolve_aws_variables(pattern, resolver))
-        }
-    }
-}
-
 // Need to box the future to avoid infinite size due to recursion
 fn resolve_aws_variables_boxed<'a>(
     pattern: &'a str,

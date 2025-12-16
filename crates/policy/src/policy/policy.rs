@@ -62,9 +62,9 @@ pub struct Policy {
 }
 
 impl Policy {
-    pub fn is_allowed(&self, args: &Args) -> bool {
+    pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
-            if !statement.is_allowed(args) {
+            if !statement.is_allowed(args).await {
                 return false;
             }
         }
@@ -74,7 +74,7 @@ impl Policy {
         }
 
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Allow)) {
-            if statement.is_allowed(args) {
+            if statement.is_allowed(args).await {
                 return true;
             }
         }
@@ -82,9 +82,9 @@ impl Policy {
         false
     }
 
-    pub fn match_resource(&self, resource: &str) -> bool {
+    pub async fn match_resource(&self, resource: &str) -> bool {
         for statement in self.statements.iter() {
-            if statement.resources.match_resource(resource) {
+            if statement.resources.match_resource(resource).await {
                 return true;
             }
         }
@@ -188,9 +188,9 @@ pub struct BucketPolicy {
 }
 
 impl BucketPolicy {
-    pub fn is_allowed(&self, args: &BucketPolicyArgs) -> bool {
+    pub async fn is_allowed(&self, args: &BucketPolicyArgs<'_>) -> bool {
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
-            if !statement.is_allowed(args) {
+            if !statement.is_allowed(args).await {
                 return false;
             }
         }
@@ -200,7 +200,7 @@ impl BucketPolicy {
         }
 
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Allow)) {
-            if statement.is_allowed(args) {
+            if statement.is_allowed(args).await {
                 return true;
             }
         }
@@ -527,7 +527,6 @@ mod test {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_aws_username_policy_variable() -> Result<()> {
         let data = r#"
 {
@@ -578,14 +577,13 @@ mod test {
             deny_only: false,
         };
 
-        assert!(policy.is_allowed(&args1));
-        assert!(!policy.is_allowed(&args2));
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
 
         Ok(())
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_aws_userid_policy_variable() -> Result<()> {
         let data = r#"
 {
@@ -633,14 +631,13 @@ mod test {
             deny_only: false,
         };
 
-        assert!(policy.is_allowed(&args1));
-        assert!(!policy.is_allowed(&args2));
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
 
         Ok(())
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_aws_policy_variables_concatenation() -> Result<()> {
         let data = r#"
 {
@@ -689,14 +686,13 @@ mod test {
             deny_only: false,
         };
 
-        assert!(policy.is_allowed(&args1));
-        assert!(!policy.is_allowed(&args2));
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
 
         Ok(())
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_aws_policy_variables_nested() -> Result<()> {
         let data = r#"
 {
@@ -745,14 +741,13 @@ mod test {
             deny_only: false,
         };
 
-        assert!(policy.is_allowed(&args1));
-        assert!(!policy.is_allowed(&args2));
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
 
         Ok(())
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_aws_policy_variables_multi_value() -> Result<()> {
         let data = r#"
 {
@@ -803,7 +798,7 @@ mod test {
         };
 
         // Either user1 or user2 should be allowed
-        assert!(policy.is_allowed(&args1) || policy.is_allowed(&args2));
+        assert!(pollster::block_on(policy.is_allowed(&args1)) || pollster::block_on(policy.is_allowed(&args2)));
 
         Ok(())
     }
