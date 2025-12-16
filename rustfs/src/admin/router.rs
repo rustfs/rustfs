@@ -96,12 +96,16 @@ where
         }
 
         // AssumeRole
-        if method == Method::POST && path == "/" {
-            if let Some(val) = headers.get(header::CONTENT_TYPE) {
-                if val.as_bytes() == b"application/x-www-form-urlencoded" {
-                    return true;
-                }
-            }
+        if method == Method::POST
+            && path == "/"
+            && headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| ct.split(';').next().unwrap_or("").trim())
+                .map(|ct| ct == "application/x-www-form-urlencoded")
+                .unwrap_or(false)
+        {
+            return true;
         }
 
         path.starts_with(ADMIN_PREFIX) || path.starts_with(RPC_PREFIX) || is_console_path(path)
