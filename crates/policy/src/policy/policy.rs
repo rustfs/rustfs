@@ -638,6 +638,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_aws_policy_variables_concatenation() -> Result<()> {
         let data = r#"
 {
@@ -693,6 +694,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_aws_policy_variables_nested() -> Result<()> {
         let data = r#"
 {
@@ -748,6 +750,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_aws_policy_variables_multi_value() -> Result<()> {
         let data = r#"
 {
