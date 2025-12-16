@@ -2663,14 +2663,14 @@ impl S3 for FS {
                     .and_then(|contents| contents.last())
                     .and_then(|obj| obj.key.as_ref())
                     .cloned();
-                
+
                 let last_prefix = v2
                     .common_prefixes
                     .as_ref()
                     .and_then(|prefixes| prefixes.last())
                     .and_then(|prefix| prefix.prefix.as_ref())
                     .cloned();
-                
+
                 // NextMarker should be the lexicographically last item
                 // This matches Ceph S3 behavior used by s3-tests
                 match (last_key, last_prefix) {
