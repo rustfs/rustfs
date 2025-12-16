@@ -199,17 +199,16 @@ impl Default for CompressionConfig {
             enabled: rustfs_config::DEFAULT_COMPRESS_ENABLE,
             extensions: rustfs_config::DEFAULT_COMPRESS_EXTENSIONS
                 .split(',')
-                .map(|s| {
+                .filter_map(|s| {
                     let s = s.trim().to_lowercase();
                     if s.is_empty() {
                         None
                     } else if s.starts_with('.') {
                         Some(s)
                     } else {
-                        Some(format!(".{}", s))
+                        Some(format!(".{s}"))
                     }
                 })
-                .filter_map(|s| s)
                 .collect(),
             mime_patterns: rustfs_config::DEFAULT_COMPRESS_MIME_TYPES
                 .split(',')
