@@ -241,7 +241,7 @@ pub async fn start_http_server(
     let compression_config = CompressionConfig::from_env();
     if compression_config.enabled {
         info!(
-            "HTTP response compression enabled: extensions={:?}, mime_types={:?}, min_size={} bytes",
+            "HTTP response compression enabled: extensions={:?}, mime_patterns={:?}, min_size={} bytes",
             compression_config.extensions, compression_config.mime_patterns, compression_config.min_size
         );
     } else {
