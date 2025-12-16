@@ -465,7 +465,7 @@ fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
     if key.contains(['\0', '\n', '\r']) {
         return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
-            format!("Object key contains invalid control characters: {:?}", key),
+            format!("Object key contains invalid control characters: {key:?}"),
         ));
     }
 
@@ -2152,7 +2152,7 @@ impl S3 for FS {
             let mut buf = Vec::with_capacity(response_content_length as usize);
             if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
                 error!("Failed to read object into memory for caching: {}", e);
-                return Err(ApiError::from(StorageError::other(format!("Failed to read object for caching: {}", e))).into());
+                return Err(ApiError::from(StorageError::other(format!("Failed to read object for caching: {e}"))).into());
             }
 
             // Verify we read the expected amount
@@ -2776,6 +2776,7 @@ impl S3 for FS {
                     version_id: v.version_id.map(|v| v.to_string()),
                     is_latest: Some(v.is_latest),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
                     ..Default::default() // TODO: another fields
                 }
             })

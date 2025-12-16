@@ -45,6 +45,7 @@ regex = { workspace = true }
 reqwest.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+lru.workspace = true
 
 [dev-dependencies]
 test-case.workspace = true

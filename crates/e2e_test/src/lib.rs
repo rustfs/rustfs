@@ -33,3 +33,7 @@ mod special_chars_test;
 // Content-Encoding header preservation test
 #[cfg(test)]
 mod content_encoding_test;
+
+// Policy variables tests
+#[cfg(test)]
+mod policy;
