@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use lru::LruCache;
+use moka::future::Cache;
 use serde_json::Value;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use time::OffsetDateTime;
 
 /// Context information for variable resolution
@@ -55,63 +53,87 @@ impl Default for VariableContext {
 }
 
 /// Variable resolution cache
+#[derive(Clone)]
 struct CachedVariable {
     value: String,
-    timestamp: Instant,
-    is_dynamic: bool,
 }
 
 pub struct VariableResolverCache {
-    /// LRU cache storing resolved results
-    cache: LruCache<String, CachedVariable>,
-    /// Cache expiration time
-    ttl: Duration,
+    /// Moka cache storing resolved results
+    cache: Cache<String, CachedVariable>,
 }
 
 impl VariableResolverCache {
     pub fn new(capacity: usize, ttl_seconds: u64) -> Self {
-        Self {
-            cache: LruCache::new(usize::from(NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(100).unwrap()))),
-            ttl: Duration::from_secs(ttl_seconds),
+        let cache = Cache::builder()
+            .max_capacity(capacity as u64)
+            .time_to_live(Duration::from_secs(ttl_seconds))
+            .build();
+
+        Self { cache }
+    }
+
+    pub async fn get(&self, key: &str) -> Option<String> {
+        if let Some(cached) = self.cache.get(key).await {
+            // Moka handles TTL automatically
+            Some(cached.value)
+        } else {
+            None
         }
     }
 
-    pub fn get(&mut self, key: &str) -> Option<String> {
-        if let Some(cached) = self.cache.get(key) {
-            // Check if expired
-            if !cached.is_dynamic && cached.timestamp.elapsed() < self.ttl {
-                return Some(cached.value.clone());
-            }
-        }
-        None
+    pub async fn put(&self, key: String, value: String) {
+        let cached = CachedVariable { value };
+        self.cache.insert(key, cached).await;
     }
 
-    pub fn put(&mut self, key: String, value: String, is_dynamic: bool) {
-        let cached = CachedVariable {
-            value,
-            timestamp: Instant::now(),
-            is_dynamic,
-        };
-        self.cache.put(key, cached);
-    }
-
-    pub fn clear(&mut self) {
-        self.cache.clear();
+    pub async fn clear(&self) {
+        self.cache.invalidate_all();
     }
 }
 
 /// Cached dynamic AWS variable resolver
 pub struct CachedAwsVariableResolver {
     inner: VariableResolver,
-    cache: RefCell<VariableResolverCache>,
+    cache: VariableResolverCache,
 }
 
 impl CachedAwsVariableResolver {
     pub fn new(context: VariableContext) -> Self {
         Self {
             inner: VariableResolver::new(context),
-            cache: RefCell::new(VariableResolverCache::new(100, 300)), // 100 entries, 5 minutes expiration
+            cache: VariableResolverCache::new(100, 300), // 100 entries, 5 minutes expiration
         }
+    }
+}
+
+impl CachedAwsVariableResolver {
+    pub async fn resolve_async(&self, variable_name: &str) -> Option<String> {
+        if self.is_dynamic(variable_name) {
+            return self.inner.resolve(variable_name);
+        }
+
+        if let Some(cached_value) = self.cache.get(variable_name).await {
+            return Some(cached_value);
+        }
+
+        let value = self.inner.resolve(variable_name)?;
+
+        self.cache.put(variable_name.to_string(), value.clone()).await;
+
+        Some(value)
+    }
+
+    pub async fn resolve_multiple_async(&self, variable_name: &str) -> Option<Vec<String>> {
+        if self.is_dynamic(variable_name) {
+            return self.inner.resolve_multiple(variable_name);
+        }
+
+        self.inner.resolve_multiple(variable_name)
+    }
+
+    pub fn is_dynamic(&self, variable_name: &str) -> bool {
+        self.inner.is_dynamic(variable_name)
     }
 }
 
@@ -121,15 +143,9 @@ impl PolicyVariableResolver for CachedAwsVariableResolver {
             return self.inner.resolve(variable_name);
         }
 
-        if let Some(cached) = self.cache.borrow_mut().get(variable_name) {
-            return Some(cached);
-        }
-
-        let value = self.inner.resolve(variable_name)?;
-
-        self.cache.borrow_mut().put(variable_name.to_string(), value.clone(), false);
-
-        Some(value)
+        // For non-dynamic variables, we need to use a blocking approach or accept that
+        // caching won't work in synchronous context
+        self.inner.resolve(variable_name)
     }
 
     fn resolve_multiple(&self, variable_name: &str) -> Option<Vec<String>> {
