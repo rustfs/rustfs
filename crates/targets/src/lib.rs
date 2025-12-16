@@ -27,12 +27,12 @@ pub use target::Target;
 
 /// Represents a log of events for sending to targets
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct TargetLog<E> {
     /// The event name
     pub event_name: EventName,
     /// The object key
     pub key: String,
     /// The list of events
-    #[serde(rename = "Records")]
     pub records: Vec<E>,
 }
