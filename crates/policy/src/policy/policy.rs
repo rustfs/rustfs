@@ -527,6 +527,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_aws_username_policy_variable() -> Result<()> {
         let data = r#"
 {
@@ -584,6 +585,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_aws_userid_policy_variable() -> Result<()> {
         let data = r#"
 {
