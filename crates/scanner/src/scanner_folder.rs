@@ -24,6 +24,7 @@ use crate::metrics::{UpdateCurrentPathFn, current_path_updater};
 use crate::scanner_io::ScannerIODisk as _;
 use rustfs_common::heal_channel::{HEAL_DELETE_DANGLING, HealChannelRequest, HealOpts, HealScanMode, send_heal_request};
 use rustfs_common::metrics::IlmAction;
+use rustfs_config::{DEFAULT_HEAL_OBJECT_SELECT_PROB, ENV_HEAL_OBJECT_SELECT_PROB};
 use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_rule;
@@ -58,7 +59,9 @@ const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
 const DATA_SCANNER_COMPACT_AT_CHILDREN: usize = 10000;
 const DATA_SCANNER_COMPACT_AT_FOLDERS: usize = DATA_SCANNER_COMPACT_AT_CHILDREN / 4;
 const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
-const HEAL_OBJECT_SELECT_PROB: u32 = 10; // TODO: 1024
+fn heal_object_select_prob() -> u32 {
+    rustfs_utils::get_env_usize(ENV_HEAL_OBJECT_SELECT_PROB, DEFAULT_HEAL_OBJECT_SELECT_PROB as usize) as u32
+}
 
 /// Cached folder information for scanning
 #[derive(Clone, Debug)]
@@ -1130,7 +1133,7 @@ pub async fn scan_data_folder(
 
     // Create heal_object_select flag
     let heal_object_select = if is_erasure_mode && !cache.info.skip_healing {
-        HEAL_OBJECT_SELECT_PROB
+        heal_object_select_prob()
     } else {
         0
     };

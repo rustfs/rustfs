@@ -86,3 +86,18 @@ pub const DEFAULT_HEAL_TASK_TIMEOUT_SECS: u64 = 300; // 5 minutes
 /// - Rationale: This default concurrency limit helps balance healing speed with resource usage, preventing system overload.
 /// - Adjustments: Users may modify this value via the `RUSTFS_HEAL_MAX_CONCURRENT_HEALS` environment variable based on their system capacity and expected heal workload.
 pub const DEFAULT_HEAL_MAX_CONCURRENT_HEALS: usize = 4;
+
+/// Environment variable name that specifies the heal object select probability.
+/// - Purpose: Control the probability of selecting objects for healing operations.
+/// - Unit: integer probability value.
+/// - Valid values: any positive integer.
+/// - Semantics: Higher values increase the likelihood of object selection for healing; tune according to healing aggressiveness and system capacity.
+/// - Example: `export RUSTFS_HEAL_OBJECT_SELECT_PROB=1024`
+/// - Note: This probability affects how frequently objects are selected for background healing operations.
+pub const ENV_HEAL_OBJECT_SELECT_PROB: &str = "RUSTFS_HEAL_OBJECT_SELECT_PROB";
+
+/// Default heal object select probability if not specified in the environment variable.
+/// - Value: 10.
+/// - Rationale: This default provides a conservative selection rate for healing operations.
+/// - Adjustments: Users may modify this value via the `RUSTFS_HEAL_OBJECT_SELECT_PROB` environment variable based on their healing requirements and system performance.
+pub const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
