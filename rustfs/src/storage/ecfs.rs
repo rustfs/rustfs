@@ -971,7 +971,9 @@ impl S3 for FS {
                 // Generate deterministic nonce from bucket-key
                 let nonce_source = format!("{bucket}-{key}");
                 let nonce_hash = md5::compute(nonce_source.as_bytes());
-                let nonce: [u8; 12] = nonce_hash.0[..12].try_into().unwrap();
+                let nonce: [u8; 12] = nonce_hash.0[..12]
+                    .try_into()
+                    .expect("MD5 hash is always 16 bytes; taking first 12 bytes for nonce is safe");
 
                 let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
                 reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
