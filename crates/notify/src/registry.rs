@@ -19,6 +19,7 @@ use hashbrown::{HashMap, HashSet};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, notify::NOTIFY_ROUTE_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::{Target, TargetError, target::ChannelTargetType};
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 /// Registry for managing target factories
@@ -121,6 +122,10 @@ impl TargetRegistry {
                     || value.eq_ignore_ascii_case(rustfs_config::EnableState::On.as_str())
                     || value.eq_ignore_ascii_case(rustfs_config::EnableState::True.as_str())
                     || value.eq_ignore_ascii_case(rustfs_config::EnableState::Yes.as_str())
+                    || value.eq_ignore_ascii_case(rustfs_config::EnableState::Enabled.as_str())
+                    || value.eq_ignore_ascii_case(rustfs_config::EnableState::Ok.as_str())
+                    || value.eq_ignore_ascii_case(rustfs_config::EnableState::Success.as_str())
+                    || value.eq_ignore_ascii_case(rustfs_config::EnableState::Active.as_str())
                 {
                     if let Some(id) = key.strip_prefix(&enable_prefix) {
                         if !id.is_empty() {
@@ -212,6 +217,10 @@ impl TargetRegistry {
                             || v.eq_ignore_ascii_case(rustfs_config::EnableState::On.as_str())
                             || v.eq_ignore_ascii_case(rustfs_config::EnableState::True.as_str())
                             || v.eq_ignore_ascii_case(rustfs_config::EnableState::Yes.as_str())
+                            || v.eq_ignore_ascii_case(rustfs_config::EnableState::Enabled.as_str())
+                            || v.eq_ignore_ascii_case(rustfs_config::EnableState::Ok.as_str())
+                            || v.eq_ignore_ascii_case(rustfs_config::EnableState::Success.as_str())
+                            || v.eq_ignore_ascii_case(rustfs_config::EnableState::Active.as_str())
                     })
                     .unwrap_or(false);
 
@@ -220,10 +229,10 @@ impl TargetRegistry {
                     // 5.3. Create asynchronous tasks for enabled instances
                     let target_type_clone = target_type.clone();
                     let tid = id.clone();
-                    let merged_config_arc = std::sync::Arc::new(merged_config);
+                    let merged_config_arc = Arc::new(merged_config);
                     tasks.push(async move {
                         let result = factory.create_target(tid.clone(), &merged_config_arc).await;
-                        (target_type_clone, tid, result, std::sync::Arc::clone(&merged_config_arc))
+                        (target_type_clone, tid, result, Arc::clone(&merged_config_arc))
                     });
                 } else {
                     info!(instance_id = %id, "Skip the disabled target and will be removed from the final configuration");
