@@ -967,6 +967,8 @@ impl S3 for FS {
                     .user_defined
                     .insert("x-amz-server-side-encryption-customer-original-size".to_string(), actual_size.to_string());
 
+                // SAFETY: The length of `key_bytes` is checked to be 32 bytes above,
+                // so this conversion cannot fail.
                 let key_array: [u8; 32] = key_bytes.try_into().expect("key length already checked");
                 // Generate deterministic nonce from bucket-key
                 let nonce_source = format!("{bucket}-{key}");
