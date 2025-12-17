@@ -19,7 +19,7 @@ use std::{error::Error, time::Duration};
 
 pub use generated::*;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::globals::{GLOBAL_Conn_Map, evict_connection};
+use rustfs_common::globals::{GLOBAL_CONN_MAP, evict_connection};
 use tonic::{
     Request, Status,
     metadata::MetadataValue,
@@ -74,7 +74,7 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 
     // Cache the new connection
     {
-        GLOBAL_Conn_Map.write().await.insert(addr.to_string(), channel.clone());
+        GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel.clone());
     }
 
     debug!("Successfully created and cached gRPC channel to: {}", addr);
@@ -111,7 +111,7 @@ pub async fn node_service_time_out_client(
     let token: MetadataValue<_> = "rustfs rpc".parse()?;
 
     // Try to get cached channel
-    let cached_channel = { GLOBAL_Conn_Map.read().await.get(addr).cloned() };
+    let cached_channel = { GLOBAL_CONN_MAP.read().await.get(addr).cloned() };
 
     let channel = match cached_channel {
         Some(channel) => {
