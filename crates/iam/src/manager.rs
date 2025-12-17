@@ -23,6 +23,7 @@ use crate::{
         UpdateServiceAccountOpts,
     },
 };
+use futures::future::join_all;
 use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
@@ -402,13 +403,25 @@ where
 
         self.cache.policy_docs.store(Arc::new(cache));
 
-        let ret = m
+        let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.policy.clone())).collect();
+
+        let futures: Vec<_> = items.iter().map(|(_, policy)| policy.match_resource(bucket_name)).collect();
+
+        let results = join_all(futures).await;
+
+        let filtered = items
             .into_iter()
-            .filter(|(_, v)| bucket_name.is_empty() || v.policy.match_resource(bucket_name))
-            .map(|(k, v)| (k, v.policy))
+            .zip(results)
+            .filter_map(|((k, policy), matches)| {
+                if bucket_name.is_empty() || matches {
+                    Some((k, policy))
+                } else {
+                    None
+                }
+            })
             .collect();
 
-        Ok(ret)
+        Ok(filtered)
     }
 
     pub async fn merge_policies(&self, name: &str) -> (String, Policy) {
@@ -456,22 +469,51 @@ where
 
         self.cache.policy_docs.store(Arc::new(cache));
 
-        let ret = m
-            .into_iter()
-            .filter(|(_, v)| bucket_name.is_empty() || v.policy.match_resource(bucket_name))
+        let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.clone())).collect();
+
+        let futures: Vec<_> = items
+            .iter()
+            .map(|(_, policy_doc)| policy_doc.policy.match_resource(bucket_name))
             .collect();
 
-        Ok(ret)
+        let results = join_all(futures).await;
+
+        let filtered = items
+            .into_iter()
+            .zip(results)
+            .filter_map(|((k, policy_doc), matches)| {
+                if bucket_name.is_empty() || matches {
+                    Some((k, policy_doc))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(filtered)
     }
 
     pub async fn list_policy_docs_internal(&self, bucket_name: &str) -> Result<HashMap<String, PolicyDoc>> {
-        let ret = self
-            .cache
-            .policy_docs
-            .load()
+        let cache = self.cache.policy_docs.load();
+        let items: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        let futures: Vec<_> = items
             .iter()
-            .filter(|(_, v)| bucket_name.is_empty() || v.policy.match_resource(bucket_name))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(_, policy_doc)| policy_doc.policy.match_resource(bucket_name))
+            .collect();
+
+        let results = join_all(futures).await;
+
+        let ret = items
+            .into_iter()
+            .zip(results)
+            .filter_map(|((k, policy_doc), matches)| {
+                if bucket_name.is_empty() || matches {
+                    Some((k, policy_doc))
+                } else {
+                    None
+                }
+            })
             .collect();
 
         Ok(ret)
@@ -1753,7 +1795,7 @@ fn filter_policies(cache: &Cache, policy_name: &str, bucket_name: &str) -> (Stri
         }
 
         if let Some(p) = cache.policy_docs.load().get(&policy) {
-            if bucket_name.is_empty() || p.policy.match_resource(bucket_name) {
+            if bucket_name.is_empty() || pollster::block_on(p.policy.match_resource(bucket_name)) {
                 policies.push(policy);
                 to_merge.push(p.policy.clone());
             }
