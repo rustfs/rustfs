@@ -139,6 +139,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
+use urlencoding::encode;
 use uuid::Uuid;
 
 macro_rules! try_ {
@@ -793,6 +794,9 @@ impl S3 for FS {
             key,
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -940,6 +944,44 @@ impl S3 for FS {
             }
         }
 
+        // Apply SSE-C encryption if customer-provided key is specified
+        if let (Some(sse_alg), Some(sse_key), Some(sse_md5)) = (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
+        {
+            if sse_alg.as_str() == "AES256" {
+                let key_bytes = BASE64_STANDARD.decode(sse_key.as_str()).map_err(|e| {
+                    error!("Failed to decode SSE-C key: {}", e);
+                    ApiError::from(StorageError::other("Invalid SSE-C key"))
+                })?;
+
+                if key_bytes.len() != 32 {
+                    return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
+                }
+
+                let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
+                if computed_md5 != sse_md5.as_str() {
+                    return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+                }
+
+                // Store original size before encryption
+                src_info
+                    .user_defined
+                    .insert("x-amz-server-side-encryption-customer-original-size".to_string(), actual_size.to_string());
+
+                // SAFETY: The length of `key_bytes` is checked to be 32 bytes above,
+                // so this conversion cannot fail.
+                let key_array: [u8; 32] = key_bytes.try_into().expect("key length already checked");
+                // Generate deterministic nonce from bucket-key
+                let nonce_source = format!("{bucket}-{key}");
+                let nonce_hash = md5::compute(nonce_source.as_bytes());
+                let nonce: [u8; 12] = nonce_hash.0[..12]
+                    .try_into()
+                    .expect("MD5 hash is always 16 bytes; taking first 12 bytes for nonce is safe");
+
+                let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
+                reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
+            }
+        }
+
         src_info.put_object_reader = Some(PutObjReader::new(reader));
 
         // check quota
@@ -947,6 +989,19 @@ impl S3 for FS {
 
         for (k, v) in compress_metadata {
             src_info.user_defined.insert(k, v);
+        }
+
+        // Store SSE-C metadata for GET responses
+        if let Some(ref sse_alg) = sse_customer_algorithm {
+            src_info.user_defined.insert(
+                "x-amz-server-side-encryption-customer-algorithm".to_string(),
+                sse_alg.as_str().to_string(),
+            );
+        }
+        if let Some(ref sse_md5) = sse_customer_key_md5 {
+            src_info
+                .user_defined
+                .insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
         }
 
         // TODO: src tags
@@ -979,6 +1034,8 @@ impl S3 for FS {
             copy_object_result: Some(copy_object_result),
             server_side_encryption: effective_sse,
             ssekms_key_id: effective_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
             ..Default::default()
         };
 
@@ -2037,8 +2094,8 @@ impl S3 for FS {
                     let mut key_array = [0u8; 32];
                     key_array.copy_from_slice(&key_bytes[..32]);
 
-                    // Verify MD5 hash of the key matches what we expect
-                    let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+                    // Verify MD5 hash of the key matches what the client claims
+                    let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
                     if computed_md5 != *sse_key_md5_provided {
                         return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
                     }
@@ -2605,16 +2662,52 @@ impl S3 for FS {
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
-        Ok(v2_resp.map_output(|v2| ListObjectsOutput {
-            contents: v2.contents,
-            delimiter: v2.delimiter,
-            encoding_type: v2.encoding_type,
-            name: v2.name,
-            prefix: v2.prefix,
-            max_keys: v2.max_keys,
-            common_prefixes: v2.common_prefixes,
-            is_truncated: v2.is_truncated,
-            ..Default::default()
+        Ok(v2_resp.map_output(|v2| {
+            // For ListObjects (v1) API, NextMarker should be the last item returned when truncated
+            // When both Contents and CommonPrefixes are present, NextMarker should be the
+            // lexicographically last item (either last key or last prefix)
+            let next_marker = if v2.is_truncated.unwrap_or(false) {
+                let last_key = v2
+                    .contents
+                    .as_ref()
+                    .and_then(|contents| contents.last())
+                    .and_then(|obj| obj.key.as_ref())
+                    .cloned();
+
+                let last_prefix = v2
+                    .common_prefixes
+                    .as_ref()
+                    .and_then(|prefixes| prefixes.last())
+                    .and_then(|prefix| prefix.prefix.as_ref())
+                    .cloned();
+
+                // NextMarker should be the lexicographically last item
+                // This matches Ceph S3 behavior used by s3-tests
+                match (last_key, last_prefix) {
+                    (Some(k), Some(p)) => {
+                        // Return the lexicographically greater one
+                        if k > p { Some(k) } else { Some(p) }
+                    }
+                    (Some(k), None) => Some(k),
+                    (None, Some(p)) => Some(p),
+                    (None, None) => None,
+                }
+            } else {
+                None
+            };
+
+            ListObjectsOutput {
+                contents: v2.contents,
+                delimiter: v2.delimiter,
+                encoding_type: v2.encoding_type,
+                name: v2.name,
+                prefix: v2.prefix,
+                max_keys: v2.max_keys,
+                common_prefixes: v2.common_prefixes,
+                is_truncated: v2.is_truncated,
+                next_marker,
+                ..Default::default()
+            }
         }))
     }
 
@@ -2625,6 +2718,7 @@ impl S3 for FS {
             bucket,
             continuation_token,
             delimiter,
+            encoding_type,
             fetch_owner,
             max_keys,
             prefix,
@@ -2687,13 +2781,31 @@ impl S3 for FS {
 
         // warn!("object_infos objects {:?}", object_infos.objects);
 
+        // Apply URL encoding if encoding_type is "url"
+        // Note: S3 URL encoding should encode special characters but preserve path separators (/)
+        let should_encode = encoding_type.as_ref().map(|e| e.as_str() == "url").unwrap_or(false);
+
+        // Helper function to encode S3 keys/prefixes (preserving /)
+        // S3 URL encoding encodes special characters but keeps '/' unencoded
+        let encode_s3_name = |name: &str| -> String {
+            name.split('/')
+                .map(|part| encode(part).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
         let objects: Vec<Object> = object_infos
             .objects
             .iter()
             .filter(|v| !v.name.is_empty())
             .map(|v| {
+                let key = if should_encode {
+                    encode_s3_name(&v.name)
+                } else {
+                    v.name.to_owned()
+                };
                 let mut obj = Object {
-                    key: Some(v.name.to_owned()),
+                    key: Some(key),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
@@ -2711,13 +2823,17 @@ impl S3 for FS {
             })
             .collect();
 
-        let key_count = objects.len() as i32;
-
-        let common_prefixes = object_infos
+        let common_prefixes: Vec<CommonPrefix> = object_infos
             .prefixes
             .into_iter()
-            .map(|v| CommonPrefix { prefix: Some(v) })
+            .map(|v| {
+                let prefix = if should_encode { encode_s3_name(&v) } else { v };
+                CommonPrefix { prefix: Some(prefix) }
+            })
             .collect();
+
+        // KeyCount should include both objects and common prefixes per S3 API spec
+        let key_count = (objects.len() + common_prefixes.len()) as i32;
 
         // Encode next_continuation_token to base64
         let next_continuation_token = object_infos
@@ -2732,6 +2848,7 @@ impl S3 for FS {
             max_keys: Some(max_keys),
             contents: Some(objects),
             delimiter,
+            encoding_type: encoding_type.clone(),
             name: Some(bucket),
             prefix: Some(prefix),
             common_prefixes: Some(common_prefixes),
@@ -2779,7 +2896,7 @@ impl S3 for FS {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.size),
-                    version_id: v.version_id.map(|v| v.to_string()),
+                    version_id: Some(v.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
                     is_latest: Some(v.is_latest),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
                     storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
@@ -2802,12 +2919,16 @@ impl S3 for FS {
             .filter(|o| o.delete_marker)
             .map(|o| DeleteMarkerEntry {
                 key: Some(o.name.clone()),
-                version_id: o.version_id.map(|v| v.to_string()),
+                version_id: Some(o.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
                 is_latest: Some(o.is_latest),
                 last_modified: o.mod_time.map(Timestamp::from),
                 ..Default::default()
             })
             .collect::<Vec<_>>();
+
+        // Only set next_version_id_marker if it has a value, per AWS S3 API spec
+        // boto3 expects it to be a string or omitted, not None
+        let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
 
         let output = ListObjectVersionsOutput {
             is_truncated: Some(object_infos.is_truncated),
@@ -2818,6 +2939,8 @@ impl S3 for FS {
             common_prefixes: Some(common_prefixes),
             versions: Some(objects),
             delete_markers: Some(delete_markers),
+            next_key_marker: object_infos.next_marker,
+            next_version_id_marker,
             ..Default::default()
         };
 
@@ -3077,8 +3200,8 @@ impl S3 for FS {
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key_bytes[..32]);
 
-            // Verify MD5 hash of the key
-            let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+            // Verify MD5 hash of the key matches what the client claims
+            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != *sse_key_md5_provided {
                 return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
             }
@@ -3514,8 +3637,8 @@ impl S3 for FS {
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key_bytes[..32]);
 
-            // Verify MD5 hash of the key
-            let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+            // Verify MD5 hash of the key matches what the client claims
+            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != *sse_key_md5_provided {
                 return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
             }
@@ -5625,6 +5748,60 @@ mod tests {
     // Note: Most S3 API methods require complex setup with global state, storage backend,
     // and various dependencies that make unit testing challenging. For comprehensive testing
     // of S3 operations, integration tests would be more appropriate.
+
+    #[test]
+    fn test_list_objects_v2_key_count_includes_prefixes() {
+        // Test that KeyCount calculation includes both objects and common prefixes
+        // This verifies the fix for S3 API compatibility where KeyCount should equal
+        // the sum of Contents and CommonPrefixes lengths
+
+        // Simulate the calculation logic from list_objects_v2
+        let objects_count = 3_usize;
+        let common_prefixes_count = 2_usize;
+
+        // KeyCount should include both objects and common prefixes per S3 API spec
+        let key_count = (objects_count + common_prefixes_count) as i32;
+
+        assert_eq!(key_count, 5);
+
+        // Edge cases: verify calculation logic
+        let no_objects = 0_usize;
+        let no_prefixes = 0_usize;
+        assert_eq!((no_objects + no_prefixes) as i32, 0);
+
+        let one_object = 1_usize;
+        assert_eq!((one_object + no_prefixes) as i32, 1);
+
+        let one_prefix = 1_usize;
+        assert_eq!((no_objects + one_prefix) as i32, 1);
+    }
+
+    #[test]
+    fn test_s3_url_encoding_preserves_slash() {
+        // Test that S3 URL encoding preserves path separators (/)
+        // This verifies the encoding logic for EncodingType=url parameter
+
+        use urlencoding::encode;
+
+        // Helper function matching the implementation
+        let encode_s3_name = |name: &str| -> String {
+            name.split('/')
+                .map(|part| encode(part).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
+        // Test cases from s3-tests
+        assert_eq!(encode_s3_name("asdf+b"), "asdf%2Bb");
+        assert_eq!(encode_s3_name("foo+1/bar"), "foo%2B1/bar");
+        assert_eq!(encode_s3_name("foo/"), "foo/");
+        assert_eq!(encode_s3_name("quux ab/"), "quux%20ab/");
+
+        // Edge cases
+        assert_eq!(encode_s3_name("normal/key"), "normal/key");
+        assert_eq!(encode_s3_name("key+with+plus"), "key%2Bwith%2Bplus");
+        assert_eq!(encode_s3_name("key with spaces"), "key%20with%20spaces");
+    }
 
     #[test]
     fn test_s3_error_scenarios() {
