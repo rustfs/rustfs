@@ -28,6 +28,11 @@ use tonic::{
 };
 use tracing::{debug, warn};
 
+// Type alias for the complex client type
+pub type NodeServiceClientType = NodeServiceClient<
+    InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
+>;
+
 // Default 100 MB
 pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 

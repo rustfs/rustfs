@@ -229,7 +229,9 @@ pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) ->
 
     for disk in disks.iter() {
         futures.push(async move {
-            if let Some(disk) = disk {
+            if let Some(disk) = disk
+                && disk.is_online().await
+            {
                 load_format_erasure(disk, heal).await
             } else {
                 Err(DiskError::DiskNotFound)
@@ -312,17 +314,22 @@ async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<For
 }
 
 pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -> disk::error::Result<()> {
-    if disk.is_none() {
+    let Some(disk) = disk else {
+        return Err(DiskError::DiskNotFound);
+    };
+
+    if !disk.is_online().await {
         return Err(DiskError::DiskNotFound);
     }
 
-    let format = format.as_ref().unwrap();
+    let Some(format) = format else {
+        return Err(DiskError::other("format is none"));
+    };
 
     let json_data = format.to_json()?;
 
     let tmpfile = Uuid::new_v4().to_string();
 
-    let disk = disk.as_ref().unwrap();
     disk.write_all(RUSTFS_META_BUCKET, tmpfile.as_str(), json_data.into_bytes().into())
         .await?;
 

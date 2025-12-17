@@ -69,7 +69,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FormatInfo {
     pub id: Option<Uuid>,
     pub data: Bytes,
@@ -83,7 +83,7 @@ impl FormatInfo {
         self.file_info.is_some()
             && self.id.is_some()
             && self.last_check.is_some()
-            && (now.unix_timestamp() - self.last_check.unwrap().unix_timestamp() <= 1)
+            && (now.unix_timestamp() - self.last_check.unwrap().unix_timestamp() <= 3)
     }
 }
 
@@ -1295,7 +1295,7 @@ impl DiskAPI for LocalDisk {
     }
     #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
-        self.check_format_json().await.is_ok()
+        true
     }
 
     #[tracing::instrument(skip(self))]
@@ -1342,7 +1342,10 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
-        let mut format_info = self.format_info.write().await;
+        let format_info = {
+            let format_info = self.format_info.read().await;
+            format_info.clone()
+        };
 
         let id = format_info.id;
 
@@ -1354,7 +1357,9 @@ impl DiskAPI for LocalDisk {
 
         if let Some(file_info) = &format_info.file_info {
             if super::fs::same_file(&file_meta, file_info) {
+                let mut format_info = self.format_info.write().await;
                 format_info.last_check = Some(OffsetDateTime::now_utc());
+                drop(format_info);
 
                 return Ok(id);
             }
@@ -1375,20 +1380,19 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::InconsistentDisk);
         }
 
+        let mut format_info = self.format_info.write().await;
         format_info.id = Some(disk_id);
         format_info.file_info = Some(file_meta);
         format_info.data = b.into();
         format_info.last_check = Some(OffsetDateTime::now_utc());
+        drop(format_info);
 
         Ok(Some(disk_id))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
+    async fn set_disk_id(&self, _id: Option<Uuid>) -> Result<()> {
         // No setup is required locally
-        // TODO: add check_id_store
-        let mut format_info = self.format_info.write().await;
-        format_info.id = id;
         Ok(())
     }
 
