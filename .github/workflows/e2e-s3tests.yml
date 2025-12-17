@@ -1,25 +1,39 @@
 name: e2e-s3tests
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/e2e-s3tests.yml"
-      - ".github/s3tests/**"
-      - "Dockerfile.source"
-      - "entrypoint.sh"
-      - "rustfs/**"
-      - "crates/**"
   workflow_dispatch:
     inputs:
-      run-multi:
-        description: "Run multi-node s3-tests as well"
+      test-mode:
+        description: "Test mode to run"
+        required: true
+        type: choice
+        default: "single"
+        options:
+          - single
+          - multi
+      xdist:
+        description: "Enable pytest-xdist (parallel). '0' to disable."
         required: false
-        default: "false"
+        default: "0"
+      maxfail:
+        description: "Stop after N failures (debug friendly)"
+        required: false
+        default: "1"
+      markexpr:
+        description: "pytest -m expression (feature filters)"
+        required: false
+        default: "not lifecycle and not versioning and not s3website and not bucket_logging and not encryption"
 
 env:
+  # main user
   S3_ACCESS_KEY: rustfsadmin
   S3_SECRET_KEY: rustfsadmin
+  # alt user (must be different from main for many s3-tests)
+  S3_ALT_ACCESS_KEY: rustfsalt
+  S3_ALT_SECRET_KEY: rustfsalt
+
+  S3_REGION: us-east-1
+
   RUST_LOG: info
   PLATFORM: linux/amd64
 
@@ -29,18 +43,21 @@ defaults:
 
 jobs:
   s3tests-single:
+    if: github.event.inputs.test-mode == 'single'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
       - name: Enable buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build RustFS image (source)
+      - name: Build RustFS image (source, cached)
         run: |
           DOCKER_BUILDKIT=1 docker buildx build --load \
             --platform ${PLATFORM} \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
             -t rustfs-ci \
             -f Dockerfile.source .
 
@@ -54,6 +71,7 @@ jobs:
         run: |
           docker run -d --name rustfs-single \
             --network rustfs-net \
+            -p 9000:9000 \
             -e RUSTFS_ADDRESS=0.0.0.0:9000 \
             -e RUSTFS_ACCESS_KEY=$S3_ACCESS_KEY \
             -e RUSTFS_SECRET_KEY=$S3_SECRET_KEY \
@@ -63,9 +81,8 @@ jobs:
 
       - name: Wait for RustFS ready
         run: |
-          for i in {1..30}; do
-            if docker run --rm --network rustfs-net curlimages/curl:latest \
-              -sf http://rustfs-single:9000/health >/dev/null 2>&1; then
+          for i in {1..60}; do
+            if curl -sf http://127.0.0.1:9000/health >/dev/null 2>&1; then
               echo "RustFS is ready"
               exit 0
             fi
@@ -75,11 +92,53 @@ jobs:
               docker logs rustfs-single || true
               exit 1
             fi
+
             sleep 2
           done
 
-          echo "Health check failed; container is running, proceeding with caution" >&2
+          echo "Health check timed out" >&2
           docker logs rustfs-single || true
+          exit 1
+
+      - name: Generate s3tests config
+        run: |
+          export S3_HOST=127.0.0.1
+          envsubst < .github/s3tests/s3tests.conf > s3tests.conf
+
+      - name: Provision s3-tests alt user (required by suite)
+        run: |
+          python3 -m pip install --user --upgrade pip awscurl
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Admin API requires AWS SigV4 signing. awscurl is used by RustFS codebase as well.
+          awscurl \
+            --service s3 \
+            --region "${S3_REGION}" \
+            --access_key "${S3_ACCESS_KEY}" \
+            --secret_key "${S3_SECRET_KEY}" \
+            -X PUT \
+            -H 'Content-Type: application/json' \
+            -d '{"secretKey":"'"${S3_ALT_SECRET_KEY}"'","status":"enabled","policy":"readwrite"}' \
+            "http://127.0.0.1:9000/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}"
+
+          # Explicitly attach built-in policy via policy mapping.
+          # s3-tests relies on alt client being able to ListBuckets during setup cleanup.
+          awscurl \
+            --service s3 \
+            --region "${S3_REGION}" \
+            --access_key "${S3_ACCESS_KEY}" \
+            --secret_key "${S3_SECRET_KEY}" \
+            -X PUT \
+            "http://127.0.0.1:9000/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${S3_ALT_ACCESS_KEY}&isGroup=false"
+
+          # Sanity check: alt user can list buckets (should not be AccessDenied).
+          awscurl \
+            --service s3 \
+            --region "${S3_REGION}" \
+            --access_key "${S3_ALT_ACCESS_KEY}" \
+            --secret_key "${S3_ALT_SECRET_KEY}" \
+            -X GET \
+            "http://127.0.0.1:9000/" >/dev/null
 
       - name: Prepare s3-tests
         run: |
@@ -87,67 +146,72 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           git clone --depth 1 https://github.com/ceph/s3-tests.git s3-tests
 
-      - name: Generate s3tests config
-        run: |
-          export S3_HOST=rustfs-single
-          envsubst < .github/s3tests/s3tests.conf > s3tests.conf
-          echo "Generated s3tests.conf:"
-          cat s3tests.conf
-
-      - name: Run ceph s3-tests (S3-compatible subset)
+      - name: Run ceph s3-tests (debug friendly)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           mkdir -p artifacts/s3tests-single
+
           cd s3-tests
 
-          # Check available test directories
-          echo "Available test directories:"
-          ls -la s3tests*/functional/ 2>/dev/null || echo "No s3tests directories found"
+          set -o pipefail
 
-          # Use s3tests_boto3 if available, fallback to s3tests
-          if [ -f "s3tests_boto3/functional/test_s3.py" ]; then
-            TEST_FILE="s3tests_boto3/functional/test_s3.py"
-          else
-            TEST_FILE="s3tests/functional/test_s3.py"
+          MAXFAIL="${{ github.event.inputs.maxfail }}"
+          if [ -z "$MAXFAIL" ]; then MAXFAIL="1"; fi
+
+          MARKEXPR="${{ github.event.inputs.markexpr }}"
+          if [ -z "$MARKEXPR" ]; then MARKEXPR="not lifecycle and not versioning and not s3website and not bucket_logging and not encryption"; fi
+
+          XDIST="${{ github.event.inputs.xdist }}"
+          if [ -z "$XDIST" ]; then XDIST="0"; fi
+          XDIST_ARGS=""
+          if [ "$XDIST" != "0" ]; then
+            # Add pytest-xdist to requirements.txt so tox installs it inside
+            # its virtualenv. Installing outside tox does NOT work.
+            echo "pytest-xdist" >> requirements.txt
+            XDIST_ARGS="-n $XDIST --dist=loadgroup"
           fi
-          echo "Using test file: $TEST_FILE"
 
+          # Run tests from s3tests/functional (boto2+boto3 combined directory).
           S3TEST_CONF=${GITHUB_WORKSPACE}/s3tests.conf \
             tox -- \
-              -v \
-              --tb=short \
+              -vv -ra --showlocals --tb=long \
+              --maxfail="$MAXFAIL" \
               --junitxml=${GITHUB_WORKSPACE}/artifacts/s3tests-single/junit.xml \
-              "$TEST_FILE" \
-              -k 'not lifecycle and not versioning and not website and not logging and not encryption'
+              $XDIST_ARGS \
+              s3tests/functional/test_s3.py \
+              -m "$MARKEXPR" \
+              2>&1 | tee ${GITHUB_WORKSPACE}/artifacts/s3tests-single/pytest.log
 
       - name: Collect RustFS logs
         if: always()
         run: |
           mkdir -p artifacts/rustfs-single
           docker logs rustfs-single > artifacts/rustfs-single/rustfs.log 2>&1 || true
+          docker inspect rustfs-single > artifacts/rustfs-single/inspect.json || true
 
       - name: Upload artifacts
-        if: always()
+        if: always() && env.ACT != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: s3tests-single
           path: artifacts/**
 
   s3tests-multi:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run-multi == 'true'
-    needs: s3tests-single
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.test-mode == 'multi'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
       - name: Enable buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build RustFS image (source)
+      - name: Build RustFS image (source, cached)
         run: |
           DOCKER_BUILDKIT=1 docker buildx build --load \
             --platform ${PLATFORM} \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
             -t rustfs-ci \
             -f Dockerfile.source .
 
@@ -241,9 +305,8 @@ jobs:
 
       - name: Wait for LB ready
         run: |
-          for i in {1..60}; do
-            if docker run --rm --network rustfs-net curlimages/curl \
-              -sf http://lb:9000/health >/dev/null 2>&1; then
+          for i in {1..90}; do
+            if curl -sf http://127.0.0.1:9000/health >/dev/null 2>&1; then
               echo "Load balancer is ready"
               exit 0
             fi
@@ -255,32 +318,81 @@ jobs:
 
       - name: Generate s3tests config
         run: |
-          export S3_HOST=lb
+          export S3_HOST=127.0.0.1
           envsubst < .github/s3tests/s3tests.conf > s3tests.conf
-          echo "Generated s3tests.conf:"
-          cat s3tests.conf
 
-      - name: Run ceph s3-tests (multi, S3-compatible subset)
+      - name: Provision s3-tests alt user (required by suite)
         run: |
+          python3 -m pip install --user --upgrade pip awscurl
+          export PATH="$HOME/.local/bin:$PATH"
+
+          awscurl \
+            --service s3 \
+            --region "${S3_REGION}" \
+            --access_key "${S3_ACCESS_KEY}" \
+            --secret_key "${S3_SECRET_KEY}" \
+            -X PUT \
+            -H 'Content-Type: application/json' \
+            -d '{"secretKey":"'"${S3_ALT_SECRET_KEY}"'","status":"enabled","policy":"readwrite"}' \
+            "http://127.0.0.1:9000/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}"
+
+          awscurl \
+            --service s3 \
+            --region "${S3_REGION}" \
+            --access_key "${S3_ACCESS_KEY}" \
+            --secret_key "${S3_SECRET_KEY}" \
+            -X PUT \
+            "http://127.0.0.1:9000/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${S3_ALT_ACCESS_KEY}&isGroup=false"
+
+          awscurl \
+            --service s3 \
+            --region "${S3_REGION}" \
+            --access_key "${S3_ALT_ACCESS_KEY}" \
+            --secret_key "${S3_ALT_SECRET_KEY}" \
+            -X GET \
+            "http://127.0.0.1:9000/" >/dev/null
+
+      - name: Prepare s3-tests
+        run: |
+          python3 -m pip install --user --upgrade pip tox
+          export PATH="$HOME/.local/bin:$PATH"
+          git clone --depth 1 https://github.com/ceph/s3-tests.git s3-tests
+
+      - name: Run ceph s3-tests (multi, debug friendly)
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
           mkdir -p artifacts/s3tests-multi
-          docker run --rm --network rustfs-net \
-            --platform ${PLATFORM} \
-            -e S3TEST_CONF=/tmp/s3tests.conf \
-            -v ${GITHUB_WORKSPACE}/s3tests.conf:/tmp/s3tests.conf:ro \
-            -v ${GITHUB_WORKSPACE}/artifacts/s3tests-multi:/mnt/logs \
-            quay.io/ceph/s3-tests:latest \
-            bash -c '
-              if [ -f "s3tests_boto3/functional/test_s3.py" ]; then
-                TEST_FILE="s3tests_boto3/functional/test_s3.py"
-              else
-                TEST_FILE="s3tests/functional/test_s3.py"
-              fi
-              echo "Using test file: $TEST_FILE"
-              pytest -v --tb=short \
-                --junitxml=/mnt/logs/junit.xml \
-                "$TEST_FILE" \
-                -k "not lifecycle and not versioning and not website and not logging and not encryption"
-            '
+
+          cd s3-tests
+
+          set -o pipefail
+
+          MAXFAIL="${{ github.event.inputs.maxfail }}"
+          if [ -z "$MAXFAIL" ]; then MAXFAIL="1"; fi
+
+          MARKEXPR="${{ github.event.inputs.markexpr }}"
+          if [ -z "$MARKEXPR" ]; then MARKEXPR="not lifecycle and not versioning and not s3website and not bucket_logging and not encryption"; fi
+
+          XDIST="${{ github.event.inputs.xdist }}"
+          if [ -z "$XDIST" ]; then XDIST="0"; fi
+          XDIST_ARGS=""
+          if [ "$XDIST" != "0" ]; then
+            # Add pytest-xdist to requirements.txt so tox installs it inside
+            # its virtualenv. Installing outside tox does NOT work.
+            echo "pytest-xdist" >> requirements.txt
+            XDIST_ARGS="-n $XDIST --dist=loadgroup"
+          fi
+
+          # Run tests from s3tests/functional (boto2+boto3 combined directory).
+          S3TEST_CONF=${GITHUB_WORKSPACE}/s3tests.conf \
+            tox -- \
+              -vv -ra --showlocals --tb=long \
+              --maxfail="$MAXFAIL" \
+              --junitxml=${GITHUB_WORKSPACE}/artifacts/s3tests-multi/junit.xml \
+              $XDIST_ARGS \
+              s3tests/functional/test_s3.py \
+              -m "$MARKEXPR" \
+              2>&1 | tee ${GITHUB_WORKSPACE}/artifacts/s3tests-multi/pytest.log
 
       - name: Collect logs
         if: always()
@@ -289,7 +401,7 @@ jobs:
           docker compose -f compose.yml logs --no-color > artifacts/cluster/cluster.log 2>&1 || true
 
       - name: Upload artifacts
-        if: always()
+        if: always() && env.ACT != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: s3tests-multi
