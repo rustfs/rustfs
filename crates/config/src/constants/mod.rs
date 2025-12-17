@@ -21,5 +21,6 @@ pub(crate) mod heal;
 pub(crate) mod object;
 pub(crate) mod profiler;
 pub(crate) mod runtime;
+pub(crate) mod scanner;
 pub(crate) mod targets;
 pub(crate) mod tls;

@@ -683,7 +683,7 @@ impl LocalDisk {
             return Err(DiskError::FileNotFound);
         }
 
-        warn!("read_raw: file_path: {:?}", file_path.as_ref());
+        debug!("read_raw: file_path: {:?}", file_path.as_ref());
 
         let meta_path = file_path.as_ref().join(Path::new(STORAGE_FORMAT_FILE));
 

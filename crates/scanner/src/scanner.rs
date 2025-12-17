@@ -21,6 +21,7 @@ use crate::scanner_io::ScannerIO;
 use crate::{DataUsageInfo, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
+use rustfs_config::{DEFAULT_DATA_SCANNER_START_DELAY_SECS, ENV_DATA_SCANNER_START_DELAY_SECS};
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::error::Error as EcstoreError;
 use rustfs_ecstore::global::is_erasure_sd;
@@ -32,7 +33,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const DATA_USAGE_UPDATE_DIR_CYCLES: usize = 16;
-const DATA_SCANNER_START_DELAY: Duration = Duration::from_secs(10);
+
+fn data_scanner_start_delay() -> Duration {
+    let secs = rustfs_utils::get_env_u64(ENV_DATA_SCANNER_START_DELAY_SECS, DEFAULT_DATA_SCANNER_START_DELAY_SECS);
+    Duration::from_secs(secs)
+}
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     let ctx_clone = ctx.clone();
@@ -46,7 +51,7 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
             if let Err(e) = run_data_scanner(ctx_clone.clone(), storeapi_clone.clone()).await {
                 error!("Failed to run data scanner: {e}");
             }
-            tokio::time::sleep(DATA_SCANNER_START_DELAY).await;
+            tokio::time::sleep(data_scanner_start_delay()).await;
         }
     });
 }
@@ -132,7 +137,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
         }
     }
 
-    let mut ticker = tokio::time::interval(DATA_SCANNER_START_DELAY);
+    let mut ticker = tokio::time::interval(data_scanner_start_delay());
     loop {
         tokio::select! {
             _ = ctx.cancelled() => {

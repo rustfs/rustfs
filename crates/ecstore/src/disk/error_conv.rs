@@ -15,7 +15,6 @@
 use super::error::DiskError;
 
 pub fn to_file_error(io_err: std::io::Error) -> std::io::Error {
-    tracing::warn!("to_file_error: io_err: {:?}", io_err);
     match io_err.kind() {
         std::io::ErrorKind::NotFound => DiskError::FileNotFound.into(),
         std::io::ErrorKind::PermissionDenied => DiskError::FileAccessDenied.into(),

@@ -33,6 +33,8 @@ pub use constants::profiler::*;
 #[cfg(feature = "constants")]
 pub use constants::runtime::*;
 #[cfg(feature = "constants")]
+pub use constants::scanner::*;
+#[cfg(feature = "constants")]
 pub use constants::targets::*;
 #[cfg(feature = "constants")]
 pub use constants::tls::*;
