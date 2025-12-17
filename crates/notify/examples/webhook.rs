@@ -110,10 +110,10 @@ async fn reset_webhook_count(Query(params): Query<ResetParams>, headers: HeaderM
 
     let reason = params.reason.unwrap_or_else(|| "Reason not provided".to_string());
     println!("Reset webhook count, reason: {reason}");
-
+    let time_now = chrono::offset::Utc::now().to_string();
     for header in headers {
         let (key, value) = header;
-        println!("Header: {key:?}: {value:?}");
+        println!("Header: {key:?}: {value:?}, time: {time_now}");
     }
 
     println!("Reset webhook count printed headers");
