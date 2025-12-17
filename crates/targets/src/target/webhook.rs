@@ -21,7 +21,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
-use rustfs_config::notify::STORE_EXTENSION;
+use rustfs_config::audit::AUDIT_STORE_EXTENSION;
+use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{
@@ -155,8 +156,8 @@ where
                 PathBuf::from(&args.queue_dir).join(format!("rustfs-{}-{}", ChannelTargetType::Webhook.as_str(), target_id.id));
 
             let extension = match args.target_type {
-                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => STORE_EXTENSION,
+                TargetType::AuditLog => AUDIT_STORE_EXTENSION,
+                TargetType::NotifyEvent => NOTIFY_STORE_EXTENSION,
             };
 
             let store = crate::store::QueueStore::<EntityTarget<E>>::new(queue_dir, args.queue_limit, extension);

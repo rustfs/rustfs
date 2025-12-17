@@ -120,10 +120,11 @@ async fn reset_webhook_count(Query(params): Query<ResetParams>, headers: HeaderM
     // Reset the counter to 0
     WEBHOOK_COUNT.store(0, Ordering::SeqCst);
     println!("Webhook count has been reset to 0.");
+    let time_now = chrono::offset::Utc::now().to_string();
     Response::builder()
         .header("Foo", "Bar")
         .status(StatusCode::OK)
-        .body(format!("Webhook count reset successfully current_count:{current_count}"))
+        .body(format!("Webhook count reset successfully current_count:{current_count},time: {time_now}"))
         .unwrap()
 }
 

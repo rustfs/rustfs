@@ -130,7 +130,7 @@ where
             debug!(target_id = %target_id, path = %specific_queue_path.display(), "Initializing queue store for MQTT target");
             let extension = match args.target_type {
                 TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => rustfs_config::notify::STORE_EXTENSION,
+                TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
             };
 
             let store = crate::store::QueueStore::<EntityTarget<E>>::new(specific_queue_path, args.queue_limit, extension);

@@ -87,7 +87,7 @@ impl AuditSystem {
 
         // Create targets from configuration
         let mut registry = self.registry.lock().await;
-        match registry.create_targets_from_config(&config).await {
+        match registry.create_audit_targets_from_config(&config).await {
             Ok(targets) => {
                 if targets.is_empty() {
                     info!("No enabled audit targets found, keeping audit system stopped");
