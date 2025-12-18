@@ -267,9 +267,9 @@ impl NotificationSystem {
         self.update_config_and_reload(|config| {
             config
                 .0
-                .entry(target_type.to_string())
+                .entry(target_type.to_lowercase())
                 .or_default()
-                .insert(target_name.to_string(), kvs.clone());
+                .insert(target_name.to_lowercase(), kvs.clone());
             true // The configuration is always modified
         })
         .await
