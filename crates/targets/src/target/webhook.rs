@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::target::{ChannelTargetType, EntityTarget, TargetType};
 use crate::{
     StoreError, Target, TargetLog,
     arn::TargetID,
     error::TargetError,
-    store::{Key, Store},
+    store::{Key, QueueStore, Store},
+    target::{ChannelTargetType, EntityTarget, TargetType},
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
@@ -160,7 +160,7 @@ where
                 TargetType::NotifyEvent => NOTIFY_STORE_EXTENSION,
             };
 
-            let store = crate::store::QueueStore::<EntityTarget<E>>::new(queue_dir, args.queue_limit, extension);
+            let store = QueueStore::<EntityTarget<E>>::new(queue_dir, args.queue_limit, extension);
 
             if let Err(e) = store.open() {
                 error!("Failed to open store for Webhook target {}: {}", target_id.id, e);

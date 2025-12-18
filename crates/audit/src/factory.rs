@@ -74,7 +74,7 @@ impl TargetFactory for WebhookTargetFactory {
                 .unwrap_or(DEFAULT_LIMIT),
             client_cert: config.lookup(WEBHOOK_CLIENT_CERT).unwrap_or_default(),
             client_key: config.lookup(WEBHOOK_CLIENT_KEY).unwrap_or_default(),
-            target_type: rustfs_targets::target::TargetType::NotifyEvent,
+            target_type: rustfs_targets::target::TargetType::AuditLog,
         };
 
         let target = rustfs_targets::target::webhook::WebhookTarget::new(id, args)?;
@@ -164,7 +164,7 @@ impl TargetFactory for MQTTTargetFactory {
                 .lookup(MQTT_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DEFAULT_LIMIT),
-            target_type: rustfs_targets::target::TargetType::NotifyEvent,
+            target_type: rustfs_targets::target::TargetType::AuditLog,
         };
 
         let target = rustfs_targets::target::mqtt::MQTTTarget::new(id, args)?;

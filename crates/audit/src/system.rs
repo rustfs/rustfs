@@ -423,7 +423,7 @@ impl AuditSystem {
     /// * `target` - The target to which audit entries will be sent
     ///
     /// This function spawns a background task that continuously reads audit entries from the provided store
-    /// and attempts to send them to the specified target. It implements retry logic with exponential back
+    /// and attempts to send them to the specified target. It implements retry logic with exponential backoff
     fn start_audit_stream_with_batching(
         &self,
         store: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send>,

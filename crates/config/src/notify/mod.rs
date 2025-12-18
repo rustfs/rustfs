@@ -39,18 +39,10 @@ pub const NOTIFY_PREFIX: &str = "notify";
 /// Example: "notify:/"
 pub const NOTIFY_ROUTE_PREFIX: &str = const_str::concat!(NOTIFY_PREFIX, DEFAULT_DELIMITER);
 
-/// Environment variable for target stream concurrency
-/// Used in notification system
-/// Example: RUSTFS_NOTIFY_TARGET_STREAM_CONCURRENCY=20
-/// Sets the concurrency for target stream processing to 20
-/// If not set, defaults to DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY
-/// This controls how many target streams can be processed in parallel by the notification system at any given time.
-/// Higher values can improve throughput but may increase resource usage.
-/// To set this variable, use the following command in your shell before starting the application:
-/// export RUSTFS_NOTIFY_TARGET_STREAM_CONCURRENCY=20
-/// Replace 20 with your desired concurrency level.
-/// Make sure to choose a value that balances performance and resource consumption based on your deployment environment.
-/// For example, in a high-load environment, you might want to increase this value to handle more concurrent notifications.
+/// Name of the environment variable that configures target stream concurrency.
+/// Controls how many target streams are processed in parallel by the notification system.
+/// Defaults to [`DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY`] if not set.
+/// Example: `RUSTFS_NOTIFY_TARGET_STREAM_CONCURRENCY=20`.
 pub const ENV_NOTIFY_TARGET_STREAM_CONCURRENCY: &str = "RUSTFS_NOTIFY_TARGET_STREAM_CONCURRENCY";
 
 /// Default concurrency for target stream processing in the notification system
