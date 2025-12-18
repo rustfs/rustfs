@@ -273,6 +273,19 @@ impl Predicate for CompressionPredicate {
             return false;
         }
 
+        // Never compress Range request responses (206 Partial Content)
+        // Range responses must return exact byte ranges without compression
+        if status.as_u16() == 206 {
+            debug!("Skipping compression for Range request response: status=206 Partial Content");
+            return false;
+        }
+
+        // Skip if Content-Range header is present (Range request response)
+        if response.headers().contains_key(http::header::CONTENT_RANGE) {
+            debug!("Skipping compression for Range request response: Content-Range header present");
+            return false;
+        }
+
         // Skip if content is already encoded (e.g., gzip, br, deflate, zstd)
         // Re-compressing already compressed content provides no benefit and may cause issues
         if let Some(content_encoding) = response.headers().get(http::header::CONTENT_ENCODING) {
