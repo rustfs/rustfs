@@ -9,13 +9,16 @@ CONTAINER_NAME ?= rustfs-dev
 DOCKERFILE_PRODUCTION = Dockerfile
 DOCKERFILE_SOURCE = Dockerfile.source
 
-# Rust Installation
-.PHONY: install-rust
-install-rust:
-	@echo "🔧 Installing Rust..."
-	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-	@echo 'export PATH="$$HOME/.cargo/bin:$$PATH"' >> ~/.bashrc
-	@echo "✅ Rust installation complete!"
+REQUIRED_CMDS := cargo rustfmt
+
+missing := $(strip $(foreach cmd,$(REQUIRED_CMDS),\
+	$(if $(shell command -v $(cmd) 2>/dev/null),,$(cmd))))
+
+ifneq ($(missing),)
+$(foreach cmd,$(missing),\
+	$(info Missing: $(cmd)))
+$(error Aborting due to missing dependencies.Install From: https://rustup.rs)
+endif
 
 # Code quality and formatting targets
 .PHONY: fmt
@@ -51,7 +54,7 @@ test:
 	cargo test --all --doc
 
 .PHONY: pre-commit
-pre-commit: install-rust fmt clippy check test
+pre-commit: fmt clippy check test
 	@echo "✅ All pre-commit checks passed!"
 
 .PHONY: setup-hooks
