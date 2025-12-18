@@ -9,6 +9,14 @@ CONTAINER_NAME ?= rustfs-dev
 DOCKERFILE_PRODUCTION = Dockerfile
 DOCKERFILE_SOURCE = Dockerfile.source
 
+# Rust Installation
+.PHONY: install-rust
+install-rust:
+	@echo "🔧 Installing Rust..."
+	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+	@echo 'export PATH="$$HOME/.cargo/bin:$$PATH"' >> ~/.bashrc
+	@echo "✅ Rust installation complete!"
+
 # Code quality and formatting targets
 .PHONY: fmt
 fmt:
@@ -43,7 +51,7 @@ test:
 	cargo test --all --doc
 
 .PHONY: pre-commit
-pre-commit: fmt clippy check test
+pre-commit: install-rust fmt clippy check test
 	@echo "✅ All pre-commit checks passed!"
 
 .PHONY: setup-hooks
