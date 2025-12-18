@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # RustFS Binary Build Script
 # This script compiles RustFS binaries for different platforms and architectures

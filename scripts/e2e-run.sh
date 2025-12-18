@@ -1,4 +1,5 @@
-#!/bin/bash -ex
+#!/usr/bin/env bash
+set -ex
 # Copyright 2024 RustFS Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

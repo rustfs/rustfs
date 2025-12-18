@@ -62,17 +62,25 @@ on:
 permissions:
   contents: read
 
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  
+  CARGO_BUILD_JOBS: 4
 
 jobs:
+
   skip-check:
     name: Skip Duplicate Actions
     permissions:
       actions: write
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest 
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
@@ -83,13 +91,12 @@ jobs:
           concurrent_skipping: "same_content_newer"
           cancel_others: true
           paths_ignore: '["*.md", "docs/**", "deploy/**"]'
-          # Never skip release events and tag pushes
           do_not_skip: '["workflow_dispatch", "schedule", "merge_group", "release", "push"]'
-
 
   typos:
     name: Typos
-    runs-on: ubuntu-latest
+
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -100,11 +107,12 @@ jobs:
     name: Test and Lint
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest
+
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 60
     steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
+
+
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -112,11 +120,17 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
+       
           cache-shared-key: ci-test-${{ hashFiles('**/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Run tests
+
         run: |
           cargo nextest run --all --exclude e2e_test
           cargo test --all --doc
@@ -131,11 +145,19 @@ jobs:
     name: End-to-End Tests
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest
+
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+
+
+      - name: Clean up previous test run
+        run: |
+          rm -rf /tmp/rustfs
+          rm -f /tmp/rustfs.log
+          # 如果有 docker 容器残留，也建议清理
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -155,7 +177,8 @@ jobs:
       - name: Build debug binary
         run: |
           touch rustfs/build.rs
-          cargo build -p rustfs --bins
+          # 限制并发，防止 build --bins 导致 OOM
+          cargo build -p rustfs --bins --jobs 4
 
       - name: Run end-to-end tests
         run: |
