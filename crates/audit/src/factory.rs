@@ -18,9 +18,9 @@ use hashbrown::HashSet;
 use rumqttc::QoS;
 use rustfs_config::audit::{AUDIT_MQTT_KEYS, AUDIT_WEBHOOK_KEYS, ENV_AUDIT_MQTT_KEYS, ENV_AUDIT_WEBHOOK_KEYS};
 use rustfs_config::{
-    DEFAULT_DIR, DEFAULT_LIMIT, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT,
-    MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY,
-    WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+    AUDIT_DEFAULT_DIR, DEFAULT_LIMIT, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
+    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT,
+    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
 use rustfs_ecstore::config::KVS;
 use rustfs_targets::{
@@ -67,7 +67,7 @@ impl TargetFactory for WebhookTargetFactory {
             enable: true, // If we are here, it's already enabled.
             endpoint: endpoint_url,
             auth_token: config.lookup(WEBHOOK_AUTH_TOKEN).unwrap_or_default(),
-            queue_dir: config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(DEFAULT_DIR.to_string()),
+            queue_dir: config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(AUDIT_DEFAULT_DIR.to_string()),
             queue_limit: config
                 .lookup(WEBHOOK_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
@@ -100,7 +100,7 @@ impl TargetFactory for WebhookTargetFactory {
             ));
         }
 
-        let queue_dir = config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(DEFAULT_DIR.to_string());
+        let queue_dir = config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(AUDIT_DEFAULT_DIR.to_string());
         if !queue_dir.is_empty() && !std::path::Path::new(&queue_dir).is_absolute() {
             return Err(TargetError::Configuration("Webhook queue directory must be an absolute path".to_string()));
         }
@@ -159,7 +159,7 @@ impl TargetFactory for MQTTTargetFactory {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(Duration::from_secs)
                 .unwrap_or_else(|| Duration::from_secs(30)),
-            queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or(DEFAULT_DIR.to_string()),
+            queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or(AUDIT_DEFAULT_DIR.to_string()),
             queue_limit: config
                 .lookup(MQTT_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
