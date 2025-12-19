@@ -103,7 +103,7 @@ The RustFS container runs as a non-root user `rustfs` (UID `10001`). If you run 
  docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
  # Using specific version
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.68
+ docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-alpha.76
 ```
 
 You can also use Docker Compose. Using the `docker-compose.yml` file in the root directory:
