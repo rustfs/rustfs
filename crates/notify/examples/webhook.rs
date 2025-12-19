@@ -168,7 +168,11 @@ async fn receive_webhook(Json(payload): Json<Value>) -> StatusCode {
         serde_json::to_string_pretty(&payload).unwrap()
     );
     WEBHOOK_COUNT.fetch_add(1, Ordering::SeqCst);
-    println!("Total webhook requests received: {}", WEBHOOK_COUNT.load(Ordering::SeqCst));
+    println!(
+        "Total webhook requests received: {} , Time: {}",
+        WEBHOOK_COUNT.load(Ordering::SeqCst),
+        chrono::offset::Utc::now()
+    );
     StatusCode::OK
 }
 
