@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::pattern;
-use super::target_id_set::TargetIdSet;
+use crate::rules::pattern;
+use crate::rules::TargetIdSet;
 use hashbrown::HashMap;
 use rayon::prelude::*;
 use rustfs_targets::arn::TargetID;
@@ -27,22 +27,39 @@ pub struct PatternRules {
 }
 
 impl PatternRules {
+    /// Create a new, empty PatternRules.
     pub fn new() -> Self {
         Default::default()
     }
 
     /// Add rules: Pattern and Target ID.
     /// If the schema already exists, add target_id to the existing TargetIdSet.
+    ///
+    /// # arguments
+    /// * `pattern` - The object name pattern.
+    /// * `target_id` - The TargetID to associate with the pattern.
     pub fn add(&mut self, pattern: String, target_id: TargetID) {
         self.rules.entry(pattern).or_default().insert(target_id);
     }
 
     /// Checks if there are any rules that match the given object name.
+    ///
+    /// # arguments
+    /// * `object_name` - The object name to match against the patterns.
+    ///
+    /// # returns
+    /// `true` if any pattern matches the object name, otherwise `false`.
     pub fn match_simple(&self, object_name: &str) -> bool {
         self.rules.keys().any(|p| pattern::match_simple(p, object_name))
     }
 
     /// Returns all TargetIDs that match the object name.
+    ///
+    /// # arguments
+    /// * `object_name` - The object name to match against the patterns.
+    ///
+    /// # returns
+    /// A TargetIdSet containing all TargetIDs that match the object name.
     pub fn match_targets(&self, object_name: &str) -> TargetIdSet {
         self.rules
             .par_iter()
@@ -65,6 +82,11 @@ impl PatternRules {
 
     /// Merge another PatternRules.
     /// Corresponding to Go's `Rules.Union`.
+    /// # arguments
+    /// * `other` - The PatternRules to merge with.
+    ///
+    /// # returns
+    /// A new PatternRules containing the union of both.
     pub fn union(&self, other: &Self) -> Self {
         let mut new_rules = self.clone();
         for (pattern, their_targets) in &other.rules {
@@ -76,6 +98,13 @@ impl PatternRules {
 
     /// Calculate the difference from another PatternRules.
     /// Corresponding to Go's `Rules.Difference`.
+    /// The result contains only the patterns and TargetIDs that are in `self` but not in `other`.
+    ///
+    /// # arguments
+    /// * `other` - The PatternRules to compare against.
+    ///
+    /// # returns
+    /// A new PatternRules containing the difference.
     pub fn difference(&self, other: &Self) -> Self {
         let mut result_rules = HashMap::new();
         for (pattern, self_targets) in &self.rules {
@@ -93,5 +122,47 @@ impl PatternRules {
             }
         }
         PatternRules { rules: result_rules }
+    }
+
+    pub fn union_in_place(&mut self, other: &Self) {
+        for (pattern, their_targets) in &other.rules {
+            self.rules
+                .entry(pattern.clone())
+                .or_default()
+                .extend(their_targets.iter().cloned());
+        }
+    }
+
+    pub fn difference_in_place(&mut self, other: &Self) {
+        self.rules.retain(|pattern, self_targets| {
+            if let Some(other_targets) = other.rules.get(pattern) {
+                // Remove other_targets from self_targets
+                self_targets.retain(|tid| !other_targets.contains(tid));
+            }
+            !self_targets.is_empty()
+        });
+    }
+
+    pub fn remove_pattern(&mut self, pattern: &str) -> bool {
+        self.rules.remove(pattern).is_some()
+    }
+
+    /// Determine whether the current PatternRules contains the specified TargetID (referenced by any pattern).
+    ///
+    /// # Parameters
+    /// * `target_id` - The TargetID to check for existence within the PatternRules
+    ///
+    /// # Returns
+    /// * `true` if the TargetID exists in any of the patterns; `false` otherwise.
+    pub fn contains_target_id(&self, target_id: &TargetID) -> bool {
+        self.rules.values().any(|set| set.contains(target_id))
+    }
+
+    /// Expose the internal rules for use in scenarios such as BucketNotificationConfig::validate.
+    ///
+    /// # Returns
+    /// A reference to the internal HashMap of patterns to TargetIdSets.
+    pub fn inner(&self) -> &HashMap<String, TargetIdSet> {
+        &self.rules
     }
 }

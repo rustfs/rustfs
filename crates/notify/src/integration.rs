@@ -231,15 +231,18 @@ impl NotificationSystem {
     pub async fn remove_target(&self, target_id: &TargetID, target_type: &str) -> Result<(), NotificationError> {
         info!("Attempting to remove target: {}", target_id);
 
+        let ttype = target_type.to_lowercase();
+        let tname = target_id.name.to_lowercase();
+
         self.update_config_and_reload(|config| {
             let mut changed = false;
-            if let Some(targets_of_type) = config.0.get_mut(target_type) {
-                if targets_of_type.remove(&target_id.name).is_some() {
+            if let Some(targets_of_type) = config.0.get_mut(&ttype) {
+                if targets_of_type.remove(&tname).is_some() {
                     info!("Removed target {} from configuration", target_id);
                     changed = true;
                 }
                 if targets_of_type.is_empty() {
-                    config.0.remove(target_type);
+                    config.0.remove(&ttype);
                 }
             }
             if !changed {
@@ -264,12 +267,10 @@ impl NotificationSystem {
     /// If the target configuration is invalid, it returns Err(NotificationError::Configuration).
     pub async fn set_target_config(&self, target_type: &str, target_name: &str, kvs: KVS) -> Result<(), NotificationError> {
         info!("Setting config for target {} of type {}", target_name, target_type);
+        let ttype = target_type.to_lowercase();
+        let tname = target_name.to_lowercase();
         self.update_config_and_reload(|config| {
-            config
-                .0
-                .entry(target_type.to_lowercase())
-                .or_default()
-                .insert(target_name.to_lowercase(), kvs.clone());
+            config.0.entry(ttype.clone()).or_default().insert(tname.clone(), kvs.clone());
             true // The configuration is always modified
         })
         .await
@@ -294,10 +295,27 @@ impl NotificationSystem {
     /// If the target configuration does not exist, it returns Ok(()) without making any changes.
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
         info!("Removing config for target {} of type {}", target_name, target_type);
+
+        let ttype = target_type.to_lowercase();
+        let tname = target_name.to_lowercase();
+
+        let target_id = TargetID {
+            id: tname.clone(),
+            name: ttype.clone(),
+        };
+
+        // Deletion is prohibited if bucket rules refer to it
+        if self.notifier.is_target_bound_to_any_bucket(&target_id).await {
+            return Err(NotificationError::Configuration(format!(
+                "Target is still bound to bucket rules and deletion is prohibited: type={} name={}",
+                ttype, tname
+            )));
+        }
+
         self.update_config_and_reload(|config| {
             let mut changed = false;
-            if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
-                if targets.remove(&target_name.to_lowercase()).is_some() {
+            if let Some(targets) = config.0.get_mut(&ttype) {
+                if targets.remove(&tname).is_some() {
                     changed = true;
                 }
                 if targets.is_empty() {
@@ -341,6 +359,9 @@ impl NotificationSystem {
             let _ = cancel_tx.send(()).await;
         }
 
+        // Clear the target_list and ensure that reload is a replacement reconstruction (solve the target_list len unchanged/residual problem)
+        self.notifier.remove_all_bucket_targets().await;
+
         // Update the config
         self.update_config(new_config.clone()).await;
 
@@ -371,15 +392,20 @@ impl NotificationSystem {
 
                     // The storage of the cloned target and the target itself
                     let store_clone = store.boxed_clone();
-                    let target_box = target.clone_dyn();
-                    let target_arc = Arc::from(target_box);
+                    // let target_box = target.clone_dyn();
+                    let target_arc = Arc::from(target.clone_dyn());
 
                     // Add a reference to the monitoring metrics
-                    let metrics = self.metrics.clone();
-                    let semaphore = self.concurrency_limiter.clone();
+                    // let metrics = self.metrics.clone();
+                    // let semaphore = self.concurrency_limiter.clone();
 
                     // Encapsulated enhanced version of start_event_stream
-                    let cancel_tx = self.enhanced_start_event_stream(store_clone, target_arc, metrics, semaphore);
+                    let cancel_tx = self.enhanced_start_event_stream(
+                        store_clone,
+                        target_arc,
+                        self.metrics.clone(),
+                        self.concurrency_limiter.clone(),
+                    );
 
                     // Start event stream processing and save cancel sender
                     // let cancel_tx = start_event_stream(store_clone, target_clone);

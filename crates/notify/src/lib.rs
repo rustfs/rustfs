@@ -23,6 +23,7 @@ mod event;
 pub mod factory;
 mod global;
 pub mod integration;
+mod notification_system_subscriber;
 pub mod notifier;
 pub mod registry;
 pub mod rules;

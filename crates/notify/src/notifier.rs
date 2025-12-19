@@ -44,6 +44,23 @@ impl EventNotifier {
         }
     }
 
+    ///Check whether a TargetID is still referenced by any bucket's rules.
+    ///
+    /// # Arguments
+    /// * `target_id` - The TargetID to check.
+    ///
+    /// # Returns
+    /// Returns `true` if the TargetID is bound to any bucket, otherwise `false`.
+    pub async fn is_target_bound_to_any_bucket(&self, target_id: &TargetID) -> bool {
+        // `AsyncShardedHashMap::iter()`: Traverse (bucket_name, rules_map)
+        for (_bucket, rules_map) in self.bucket_rules_map.iter() {
+            if rules_map.contains_target_id(target_id) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Returns a reference to the target list
     /// This method provides access to the target list for external use.
     ///

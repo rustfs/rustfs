@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::pattern_rules::PatternRules;
-use super::target_id_set::TargetIdSet;
+use crate::rules::{PatternRules, TargetIdSet};
 use hashbrown::HashMap;
 use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
@@ -69,10 +68,11 @@ impl RulesMap {
     /// `RulesMap.Add(rulesMap2 RulesMap) corresponding to Go
     pub fn add_map(&mut self, other_map: &Self) {
         for (event_name, other_pattern_rules) in &other_map.map {
-            let self_pattern_rules = self.map.entry(*event_name).or_default();
-            // PatternRules::union Returns the new PatternRules, we need to modify the existing ones
-            let merged_rules = self_pattern_rules.union(other_pattern_rules);
-            *self_pattern_rules = merged_rules;
+            // let self_pattern_rules = self.map.entry(*event_name).or_default();
+            // // PatternRules::union Returns the new PatternRules, we need to modify the existing ones
+            // let merged_rules = self_pattern_rules.union(other_pattern_rules);
+            // *self_pattern_rules = merged_rules;
+            self.map.entry(*event_name).or_default().union_in_place(other_pattern_rules);
         }
         // Directly merge two masks.
         self.total_events_mask |= other_map.total_events_mask;
@@ -85,7 +85,8 @@ impl RulesMap {
         let mut events_to_remove = Vec::new();
         for (event_name, self_pattern_rules) in &mut self.map {
             if let Some(other_pattern_rules) = other_map.map.get(event_name) {
-                *self_pattern_rules = self_pattern_rules.difference(other_pattern_rules);
+                // *self_pattern_rules = self_pattern_rules.difference(other_pattern_rules);
+                self_pattern_rules.difference_in_place(other_pattern_rules);
                 if self_pattern_rules.is_empty() {
                     events_to_remove.push(*event_name);
                 }
@@ -118,13 +119,13 @@ impl RulesMap {
             return TargetIdSet::new(); // No matching rules
         }
 
-        // First try to directly match the event name
-        if let Some(pattern_rules) = self.map.get(&event_name) {
-            let targets = pattern_rules.match_targets(object_key);
-            if !targets.is_empty() {
-                return targets;
-            }
-        }
+        // // First try to directly match the event name
+        // if let Some(pattern_rules) = self.map.get(&event_name) {
+        //     let targets = pattern_rules.match_targets(object_key);
+        //     if !targets.is_empty() {
+        //         return targets;
+        //     }
+        // }
         // Go's RulesMap[eventName] is directly retrieved, and if it does not exist, it is empty Rules.
         // Rust's HashMap::get returns Option. If the event name does not exist, there is no rule.
         // Compound events (such as ObjectCreatedAll) have been expanded as a single event when add_rule_config.
@@ -142,6 +143,17 @@ impl RulesMap {
     /// Check if RulesMap is empty.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// Determine whether the current RulesMap contains the specified TargetID (referenced by any event / pattern).
+    ///
+    /// # Parameters
+    /// * `target_id` - The TargetID to check for existence within the RulesMap
+    ///
+    /// # Returns
+    /// * `true` if the TargetID exists in any of the PatternRules; `false` otherwise.
+    pub fn contains_target_id(&self, target_id: &TargetID) -> bool {
+        self.map.values().any(|pr| pr.contains_target_id(target_id))
     }
 
     /// Returns a clone of internal rules for use in scenarios such as BucketNotificationConfig::validate.
@@ -162,12 +174,19 @@ impl RulesMap {
     /// Remove rules and optimize performance
     #[allow(dead_code)]
     pub fn remove_rule(&mut self, event_name: &EventName, pattern: &str) {
+        let mut remove_event = false;
+
         if let Some(pattern_rules) = self.map.get_mut(event_name) {
-            pattern_rules.rules.remove(pattern);
+            pattern_rules.remove_pattern(pattern);
             if pattern_rules.is_empty() {
-                self.map.remove(event_name);
+                remove_event = true;
             }
         }
+
+        if remove_event {
+            self.map.remove(event_name);
+        }
+
         self.recalculate_mask(); // Delay calculation mask
     }
 

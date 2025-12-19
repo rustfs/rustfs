@@ -262,6 +262,7 @@ async fn process_batch(
 
         // Retry logic
         while retry_count < max_retries && !success {
+            // After sending successfully, the event in the storage is deleted synchronously.
             match target.send_from_store(key.clone()).await {
                 Ok(_) => {
                     info!("Successfully sent event for target: {}, Key: {}", target.name(), key.to_string());

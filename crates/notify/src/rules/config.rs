@@ -15,13 +15,12 @@
 use super::rules_map::RulesMap;
 use super::xml_config::ParseConfigError as BucketNotificationConfigError;
 use crate::rules::NotificationConfiguration;
-use crate::rules::pattern_rules;
-use crate::rules::target_id_set;
-use hashbrown::HashMap;
+use crate::rules::subscriber_snapshot::{BucketRulesSnapshot, DynRulesContainer, RuleEvents, RulesContainer};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
+use std::sync::Arc;
 
 /// Configuration for bucket notifications.
 /// This struct now holds the parsed and validated rules in the new RulesMap format.
@@ -119,11 +118,39 @@ impl BucketNotificationConfig {
     pub fn set_region(&mut self, region: &str) {
         self.region = region.to_string();
     }
-}
 
-// Add a helper to PatternRules if not already present
-impl pattern_rules::PatternRules {
-    pub fn inner(&self) -> &HashMap<String, target_id_set::TargetIdSet> {
-        &self.rules
+    /// Compiles the current BucketNotificationConfig into a BucketRulesSnapshot.
+    /// This involves transforming the rules into a format suitable for runtime use,
+    /// and calculating the event mask based on the subscribed events of the rules.
+    ///
+    /// # Returns
+    /// A BucketRulesSnapshot containing the compiled rules and event mask.
+    pub fn compile_snapshot(&self) -> BucketRulesSnapshot<DynRulesContainer> {
+        // 1) Compile the current configuration into a "rule container" (you need to replace it with a real type here)
+        //
+        // You need to provide a concrete type `CompiledRules` that implements `RulesContainer`,
+        // And its Rule implements `RuleEvents` and can return the subscribed `EventName` list.
+        //
+        // Below is a placeholder empty implementation to ensure compilability.
+        #[derive(Debug)]
+        struct CompiledRules;
+        impl RulesContainer for CompiledRules {
+            type Rule = dyn RuleEvents;
+            fn iter_rules<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Self::Rule> + 'a> {
+                Box::new(std::iter::empty())
+            }
+        }
+
+        let rules: Arc<DynRulesContainer> = Arc::new(CompiledRules) as Arc<DynRulesContainer>;
+
+        // 2) Calculate event_mask (based on events declared by rules)
+        let mut mask = 0u64;
+        for rule in rules.iter_rules() {
+            for ev in rule.subscribed_events() {
+                mask |= ev.mask();
+            }
+        }
+
+        BucketRulesSnapshot { event_mask: mask, rules }
     }
 }
