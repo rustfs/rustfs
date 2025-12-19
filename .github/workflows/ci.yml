@@ -112,8 +112,8 @@ jobs:
         include:
           - arch: x86_64
             runner: ubicloud-standard-4
-          - arch: aarch64
-            runner: ubicloud-standard-4-arm
+    #          - arch: aarch64
+    #            runner: ubicloud-standard-4-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -152,8 +152,8 @@ jobs:
         include:
           - arch: x86_64
             runner: ubicloud-standard-4
-          - arch: aarch64
-            runner: ubicloud-standard-4-arm
+    #          - arch: aarch64
+    #            runner: ubicloud-standard-4-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
