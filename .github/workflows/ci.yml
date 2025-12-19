@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#      http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -62,7 +62,6 @@ on:
 permissions:
   contents: read
 
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -70,8 +69,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  
-  CARGO_BUILD_JOBS: 4
+  CARGO_BUILD_JOBS: 8
 
 jobs:
 
@@ -95,8 +93,7 @@ jobs:
 
   typos:
     name: Typos
-
-    runs-on: [ self-hosted, linux, x64 ]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -107,12 +104,9 @@ jobs:
     name: Test and Lint
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-
-    runs-on: [ self-hosted, linux, x64 ]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-
-
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -120,17 +114,14 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-
           cache-shared-key: ci-test-${{ hashFiles('**/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
       - name: Run tests
-
         run: |
           cargo nextest run --all --exclude e2e_test
           cargo test --all --doc
@@ -145,19 +136,16 @@ jobs:
     name: End-to-End Tests
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-
-    runs-on: [ self-hosted, linux, x64 ]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-
       - name: Clean up previous test run
         run: |
           rm -rf /tmp/rustfs
           rm -f /tmp/rustfs.log
-          # If there are any docker containers left, it is also recommended to clean them
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -171,13 +159,13 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: s3s-e2e
-          git: https://github.com/s3s-project/s3s.git
-          rev: df2434d7ad2f0b774e68f25cae90c053dcb84f24
+          git: https://github.com/Nugine/s3s.git
+          rev: b7714bfaa17ddfa9b23ea01774a1e7bbdbfc2ca3
 
       - name: Build debug binary
         run: |
           touch rustfs/build.rs
-          # Limit concurrency to prevent build --bins from causing OOM
+          # Limit concurrency to prevent OOM
           cargo build -p rustfs --bins --jobs 4
 
       - name: Run end-to-end tests
