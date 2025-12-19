@@ -1068,7 +1068,7 @@ curl http://localhost:9001/health
 #### Docker Migration Example
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
 # migrate-docker.sh
 
 # Stop old container

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # E2E Test Runner Script
 # Automatically starts RustFS instance, runs tests, and cleans up

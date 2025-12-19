@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Install flatc 25.9.23 on macOS
 
 set -e

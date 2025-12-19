@@ -226,14 +226,19 @@ impl Default for CompressionConfig {
 /// - Only compresses responses that match configured file extensions OR MIME types
 /// - Respects minimum file size threshold
 /// - Always skips error responses (4xx, 5xx) to avoid Content-Length issues
-/// - Skips already encoded responses (Content-Encoding header present)
 ///
 /// # Design Philosophy
 /// Unlike the previous blacklist approach, this whitelist approach:
 /// 1. Only compresses explicitly configured content types
 /// 2. Preserves Content-Length for all other responses (better browser UX)
 /// 3. Aligns with MinIO's opt-in compression behavior
-/// 4. Avoids double compression by checking Content-Encoding header
+///
+/// # Note on tower-http Integration
+/// The `tower-http::CompressionLayer` automatically handles:
+/// - Skipping responses with `Content-Encoding` header (already compressed)
+/// - Skipping responses with `Content-Range` header (Range requests)
+///
+/// These checks are performed before calling this predicate, so we don't need to check them here.
 ///
 /// # Extension Matching
 /// File extension matching works by extracting the filename from the
@@ -273,19 +278,8 @@ impl Predicate for CompressionPredicate {
             return false;
         }
 
-        // Skip if content is already encoded (e.g., gzip, br, deflate, zstd)
-        // Re-compressing already compressed content provides no benefit and may cause issues
-        if let Some(content_encoding) = response.headers().get(http::header::CONTENT_ENCODING) {
-            if let Ok(encoding) = content_encoding.to_str() {
-                let encoding_lower = encoding.to_lowercase();
-                // Check for common compression encodings
-                // "identity" means no encoding, so we can still compress
-                if encoding_lower != "identity" && !encoding_lower.is_empty() {
-                    debug!("Skipping compression for already encoded response: Content-Encoding={}", encoding);
-                    return false;
-                }
-            }
-        }
+        // Note: CONTENT_ENCODING and CONTENT_RANGE checks are handled by tower-http's
+        // CompressionLayer before calling this predicate, so we don't need to check them here.
 
         // Check Content-Length header for minimum size threshold
         if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH) {
