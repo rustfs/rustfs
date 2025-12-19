@@ -5122,6 +5122,7 @@ impl S3 for FS {
         let (clear_result, event_rules) = tokio::join!(clear_rules, parse_rules);
 
         clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
+        warn!("notify event rules: {:?}", &event_rules);
 
         // Add a new notification rule
         notifier_global::add_event_specific_rules(&bucket, &region, &event_rules)
