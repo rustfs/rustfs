@@ -88,7 +88,7 @@ impl Default for SubscriberIndex {
         #[derive(Debug)]
         struct EmptyRules;
         impl crate::rules::subscriber_snapshot::RulesContainer for EmptyRules {
-            type Rule = dyn crate::rules::subscriber_snapshot::RuleEvents;
+            type Rule = Arc<dyn crate::rules::subscriber_snapshot::RuleEvents + Send + Sync>;
             fn iter_rules<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Self::Rule> + 'a> {
                 Box::new(std::iter::empty())
             }
