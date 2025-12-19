@@ -36,7 +36,6 @@ use std::{
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument};
-use urlencoding;
 
 /// Arguments for configuring a Webhook target
 #[derive(Debug, Clone)]
@@ -221,10 +220,8 @@ where
 
     async fn send(&self, event: &EntityTarget<E>) -> Result<(), TargetError> {
         info!("Webhook Sending event to webhook target: {}", self.id);
-        // Decode form-urlencoded object name: replace + with space, then percent-decode
-        let replaced = event.object_name.replace("+", " ");
-        let object_name =
-            urlencoding::decode(&replaced).map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
+        // Decode form-urlencoded object name
+        let object_name = super::decode_object_name(&event.object_name)?;
 
         let key = format!("{}/{}", event.bucket_name, object_name);
 
@@ -426,7 +423,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::target::decode_object_name;
     use url::form_urlencoded;
 
     #[test]
@@ -438,9 +435,8 @@ mod tests {
         let form_encoded = form_urlencoded::byte_serialize(object_name.as_bytes()).collect::<String>();
         assert_eq!(form_encoded, "greeting+file+%282%29.csv");
 
-        // Simulate what webhook.rs should do: decode form-urlencoded (+ becomes space)
-        let replaced = form_encoded.replace("+", " ");
-        let decoded = urlencoding::decode(&replaced).unwrap();
+        // Test the decode_object_name helper function
+        let decoded = decode_object_name(&form_encoded).unwrap();
         assert_eq!(decoded, object_name);
         assert!(!decoded.contains('+'), "Decoded string should not contain + symbols");
     }
@@ -456,9 +452,8 @@ mod tests {
         ];
 
         for (original, form_encoded) in test_cases {
-            // Decode form-urlencoded string
-            let replaced = form_encoded.replace("+", " ");
-            let decoded = urlencoding::decode(&replaced).unwrap();
+            // Test the decode_object_name helper function
+            let decoded = decode_object_name(form_encoded).unwrap();
             assert_eq!(decoded, original, "Failed to decode: {}", form_encoded);
         }
     }
@@ -469,8 +464,7 @@ mod tests {
         let object_name = "simple-file.txt";
         let form_encoded = form_urlencoded::byte_serialize(object_name.as_bytes()).collect::<String>();
 
-        let replaced = form_encoded.replace("+", " ");
-        let decoded = urlencoding::decode(&replaced).unwrap();
+        let decoded = decode_object_name(&form_encoded).unwrap();
         assert_eq!(decoded, object_name);
     }
 }

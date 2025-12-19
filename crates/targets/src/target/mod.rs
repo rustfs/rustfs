@@ -159,3 +159,30 @@ impl std::fmt::Display for TargetType {
         }
     }
 }
+
+/// Decodes a form-urlencoded object name to its original form.
+///
+/// This function properly handles form-urlencoded strings where spaces are
+/// represented as `+` symbols. It first replaces `+` with spaces, then
+/// performs standard percent-decoding.
+///
+/// # Arguments
+/// * `encoded` - The form-urlencoded string to decode
+///
+/// # Returns
+/// The decoded string, or an error if decoding fails
+///
+/// # Example
+/// ```
+/// use rustfs_targets::target::decode_object_name;
+///
+/// let encoded = "greeting+file+%282%29.csv";
+/// let decoded = decode_object_name(encoded).unwrap();
+/// assert_eq!(decoded, "greeting file (2).csv");
+/// ```
+pub fn decode_object_name(encoded: &str) -> Result<String, TargetError> {
+    let replaced = encoded.replace("+", " ");
+    urlencoding::decode(&replaced)
+        .map(|s| s.into_owned())
+        .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))
+}
