@@ -221,7 +221,7 @@ where
     async fn send(&self, event: &EntityTarget<E>) -> Result<(), TargetError> {
         info!("Webhook Sending event to webhook target: {}", self.id);
         // Decode form-urlencoded object name
-        let object_name = super::decode_object_name(&event.object_name)?;
+        let object_name = crate::target::decode_object_name(&event.object_name)?;
 
         let key = format!("{}/{}", event.bucket_name, object_name);
 

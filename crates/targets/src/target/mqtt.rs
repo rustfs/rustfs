@@ -258,7 +258,7 @@ where
             .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
 
         // Decode form-urlencoded object name
-        let object_name = super::decode_object_name(&event.object_name)?;
+        let object_name = crate::target::decode_object_name(&event.object_name)?;
 
         let key = format!("{}/{}", event.bucket_name, object_name);
 
