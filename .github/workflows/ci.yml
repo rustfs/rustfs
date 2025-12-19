@@ -78,7 +78,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    runs-on: ubicloud-standard-4 
+    runs-on: ubicloud-standard-4
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
