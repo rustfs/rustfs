@@ -166,23 +166,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux builds
+          # Linux x86_64 builds on x86 runners
           - os: ubicloud-standard-4
             target: x86_64-unknown-linux-musl
             cross: false
             platform: linux
-          - os: ubicloud-standard-4
-            target: aarch64-unknown-linux-musl
-            cross: true
-            platform: linux
+            arch: x86_64
           - os: ubicloud-standard-4
             target: x86_64-unknown-linux-gnu
             cross: false
             platform: linux
-          - os: ubicloud-standard-4
-            target: aarch64-unknown-linux-gnu
-            cross: true
+            arch: x86_64
+          # Linux aarch64 builds on ARM runners (native compilation)
+          - os: ubicloud-standard-4-arm
+            target: aarch64-unknown-linux-musl
+            cross: false
             platform: linux
+            arch: aarch64
+          - os: ubicloud-standard-4-arm
+            target: aarch64-unknown-linux-gnu
+            cross: false
+            platform: linux
+            arch: aarch64
           # macOS builds
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -212,7 +217,7 @@ jobs:
         with:
           rust-version: stable
           target: ${{ matrix.target }}
-          cache-shared-key: build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          cache-shared-key: build-${{ matrix.arch }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
           install-cross-tools: ${{ matrix.cross }}
@@ -259,6 +264,10 @@ jobs:
               cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
             fi
           else
+            # Native compilation - use mold linker on Linux for faster linking
+            if [[ "${{ matrix.platform }}" == "linux" ]]; then
+              export RUSTFLAGS="${RUSTFLAGS} -C link-arg=-fuse-ld=mold"
+            fi
             cargo build --release --target ${{ matrix.target }} -p rustfs --bins
           fi
 
@@ -758,7 +767,7 @@ jobs:
           OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
           OSS_REGION: cn-beijing
-          OSS_ENDPOINT: https://oss-accelerate.aliyuncs.com
+          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
         shell: bash
         run: |
           if [[ -z "$OSS_ACCESS_KEY_ID" ]]; then

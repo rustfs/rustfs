@@ -258,37 +258,21 @@ jobs:
 
   # Build multi-arch Docker images
   # Strategy: Build images using pre-built binaries from dl.rustfs.com
-  # Supports both release and dev channel binaries based on build context
+  # Optimization: Build each architecture on its native runner to avoid QEMU overhead
   # Only runs when should_build is true (which includes workflow success check)
-  build-docker:
-    name: Build Docker Images
+  
+  # Prepare metadata for both builds
+  prepare-metadata:
+    name: Prepare Docker Metadata
     needs: build-check
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ubicloud-standard-4
-    timeout-minutes: 60
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+      docker_release: ${{ steps.meta.outputs.docker_release }}
+      docker_channel: ${{ steps.meta.outputs.docker_channel }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # - name: Login to GitHub Container Registry
-      #   uses: docker/login-action@v3
-      #   with:
-      #     registry: ghcr.io
-      #     username: ${{ github.actor }}
-      #     password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Extract metadata and generate tags
         id: meta
         run: |
@@ -368,41 +352,143 @@ jobs:
           echo "📋 Build type: $BUILD_TYPE"
           echo "🔖 Version: $VERSION"
 
-      - name: Build and push Docker image
+  # Build amd64 image on x86 runner (native build)
+  build-docker-amd64:
+    name: Build Docker Image (amd64)
+    needs: [build-check, prepare-metadata]
+    if: needs.build-check.outputs.should_build == 'true'
+    runs-on: ubicloud-standard-4
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image_name: ${{ steps.build.outputs.imageid }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (amd64)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          platforms: ${{ env.DOCKER_PLATFORMS }}
+          platforms: linux/amd64
           push: ${{ needs.build-check.outputs.should_push == 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: ${{ needs.prepare-metadata.outputs.labels }}
           cache-from: |
-            type=gha,scope=docker-binary
+            type=gha,scope=docker-amd64
           cache-to: |
-            type=gha,mode=max,scope=docker-binary
+            type=gha,mode=max,scope=docker-amd64
           build-args: |
             BUILDTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
             VERSION=${{ needs.build-check.outputs.version }}
             BUILD_TYPE=${{ needs.build-check.outputs.build_type }}
             REVISION=${{ github.sha }}
-            RELEASE=${{ steps.meta.outputs.docker_release }}
-            CHANNEL=${{ steps.meta.outputs.docker_channel }}
+            RELEASE=${{ needs.prepare-metadata.outputs.docker_release }}
+            CHANNEL=${{ needs.prepare-metadata.outputs.docker_channel }}
             BUILDKIT_INLINE_CACHE=1
-          # Enable advanced BuildKit features for better performance
           provenance: false
           sbom: false
-          # Add retry mechanism by splitting the build process
-          no-cache: false
-          pull: true
+          outputs: type=image,name=${{ env.REGISTRY_DOCKERHUB }},push-by-digest=true,name-canonical=true,push=${{ needs.build-check.outputs.should_push == 'true' }}
 
-  # Note: Manifest creation is no longer needed as we only build one variant
-  # Multi-arch manifests are automatically created by docker/build-push-action
+  # Build arm64 image on ARM runner (native build)
+  build-docker-arm64:
+    name: Build Docker Image (arm64)
+    needs: [build-check, prepare-metadata]
+    if: needs.build-check.outputs.should_build == 'true'
+    runs-on: ubicloud-standard-4-arm
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image_name: ${{ steps.build.outputs.imageid }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (arm64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/arm64
+          push: ${{ needs.build-check.outputs.should_push == 'true' }}
+          labels: ${{ needs.prepare-metadata.outputs.labels }}
+          cache-from: |
+            type=gha,scope=docker-arm64
+          cache-to: |
+            type=gha,mode=max,scope=docker-arm64
+          build-args: |
+            BUILDTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VERSION=${{ needs.build-check.outputs.version }}
+            BUILD_TYPE=${{ needs.build-check.outputs.build_type }}
+            REVISION=${{ github.sha }}
+            RELEASE=${{ needs.prepare-metadata.outputs.docker_release }}
+            CHANNEL=${{ needs.prepare-metadata.outputs.docker_channel }}
+            BUILDKIT_INLINE_CACHE=1
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.REGISTRY_DOCKERHUB }},push-by-digest=true,name-canonical=true,push=${{ needs.build-check.outputs.should_push == 'true' }}
+
+  # Merge manifests to create multi-arch image
+  merge-manifests:
+    name: Create Multi-Arch Manifest
+    needs: [build-check, prepare-metadata, build-docker-amd64, build-docker-arm64]
+    if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
+    runs-on: ubicloud-standard-4
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push multi-arch manifest
+        run: |
+          TAGS="${{ needs.prepare-metadata.outputs.tags }}"
+          
+          echo "🐳 Creating multi-arch manifest for tags:"
+          echo "$TAGS" | tr ',' '\n' | sed 's/^/  - /'
+          
+          # Convert comma-separated tags to array
+          IFS=',' read -ra TAG_ARRAY <<< "$TAGS"
+          
+          # Create manifest for each tag
+          for TAG in "${TAG_ARRAY[@]}"; do
+            echo "Creating manifest for: $TAG"
+            docker buildx imagetools create \
+              -t "$TAG" \
+              "${{ env.REGISTRY_DOCKERHUB }}@${{ needs.build-docker-amd64.outputs.digest }}" \
+              "${{ env.REGISTRY_DOCKERHUB }}@${{ needs.build-docker-arm64.outputs.digest }}"
+          done
+          
+          echo "✅ Multi-arch manifest created and pushed successfully"
 
   # Docker build summary
   docker-summary:
     name: Docker Build Summary
-    needs: [ build-check, build-docker ]
+    needs: [ build-check, prepare-metadata, build-docker-amd64, build-docker-arm64, merge-manifests ]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubicloud-standard-4
     steps:
@@ -415,7 +501,9 @@ jobs:
           echo "🐳 Docker build completed successfully!"
           echo "📦 Build type: $BUILD_TYPE"
           echo "🔢 Version: $VERSION"
-          echo "🚀 Strategy: Images using pre-built binaries (release channel only)"
+          echo "🚀 Strategy: Native builds on each architecture (no QEMU overhead)"
+          echo "  - amd64: Built on x86 runner"
+          echo "  - arm64: Built on ARM runner"
           echo ""
 
           case "$BUILD_TYPE" in
