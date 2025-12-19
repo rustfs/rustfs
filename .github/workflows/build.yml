@@ -758,7 +758,7 @@ jobs:
           OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
           OSS_REGION: cn-beijing
-          OSS_ENDPOINT: https://oss-accelerate.aliyuncs.com
+          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
         shell: bash
         run: |
           if [[ -z "$OSS_ACCESS_KEY_ID" ]]; then
