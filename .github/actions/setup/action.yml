@@ -55,6 +55,32 @@ runs:
           pkg-config \
           libssl-dev
 
+    - name: Install mold linker (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # Install mold for faster linking
+        MOLD_VERSION="2.34.1"
+        ARCH=$(uname -m)
+        
+        if [[ "$ARCH" == "x86_64" ]]; then
+          MOLD_ARCH="x86_64"
+        elif [[ "$ARCH" == "aarch64" ]]; then
+          MOLD_ARCH="aarch64"
+        else
+          echo "Unsupported architecture: $ARCH"
+          exit 0
+        fi
+        
+        curl -L "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-${MOLD_ARCH}-linux.tar.gz" | tar xzf -
+        sudo cp mold-${MOLD_VERSION}-${MOLD_ARCH}-linux/bin/mold /usr/local/bin/
+        sudo mkdir -p /usr/local/libexec
+        sudo cp mold-${MOLD_VERSION}-${MOLD_ARCH}-linux/libexec/mold /usr/local/libexec/ || true
+        rm -rf mold-${MOLD_VERSION}-${MOLD_ARCH}-linux
+        
+        # Verify installation
+        mold --version || echo "mold installation verification failed"
+
     - name: Install protoc
       uses: arduino/setup-protoc@v3
       with:
