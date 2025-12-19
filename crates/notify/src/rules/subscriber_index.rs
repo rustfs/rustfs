@@ -16,18 +16,25 @@ use crate::rules::{BucketRulesSnapshot, BucketSnapshotRef, DynRulesContainer};
 use arc_swap::ArcSwap;
 use rustfs_targets::EventName;
 use starshard::ShardedHashMap;
+use std::fmt;
 use std::sync::Arc;
 
 /// A global bucket -> snapshot index.
 ///
 /// Read path: lock-free load (ArcSwap)
 /// Write path: atomic replacement after building a new snapshot
-#[derive(Debug)]
 pub struct SubscriberIndex {
     // Use starshard for sharding to reduce lock competition when the number of buckets is large
     inner: ShardedHashMap<String, Arc<ArcSwap<BucketRulesSnapshot<DynRulesContainer>>>>,
     // Cache an "empty rule container" for empty snapshots (avoids building every time)
     empty_rules: Arc<DynRulesContainer>,
+}
+
+/// Avoid deriving fields that do not support Debug
+impl fmt::Debug for SubscriberIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SubscriberIndex").finish_non_exhaustive()
+    }
 }
 
 impl SubscriberIndex {
@@ -88,7 +95,7 @@ impl Default for SubscriberIndex {
         #[derive(Debug)]
         struct EmptyRules;
         impl crate::rules::subscriber_snapshot::RulesContainer for EmptyRules {
-            type Rule = Arc<dyn crate::rules::subscriber_snapshot::RuleEvents + Send + Sync>;
+            type Rule = dyn crate::rules::subscriber_snapshot::RuleEvents;
             fn iter_rules<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Self::Rule> + 'a> {
                 Box::new(std::iter::empty())
             }

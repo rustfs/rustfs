@@ -53,7 +53,8 @@ impl EventNotifier {
     /// Returns `true` if the TargetID is bound to any bucket, otherwise `false`.
     pub async fn is_target_bound_to_any_bucket(&self, target_id: &TargetID) -> bool {
         // `AsyncShardedHashMap::iter()`: Traverse (bucket_name, rules_map)
-        for (_bucket, rules_map) in self.bucket_rules_map.iter() {
+        let items = self.bucket_rules_map.iter().await;
+        for (_bucket, rules_map) in items {
             if rules_map.contains_target_id(target_id) {
                 return true;
             }
