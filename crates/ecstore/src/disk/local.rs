@@ -77,16 +77,6 @@ pub struct FormatInfo {
     pub last_check: Option<OffsetDateTime>,
 }
 
-impl FormatInfo {
-    pub fn last_check_valid(&self) -> bool {
-        let now = OffsetDateTime::now_utc();
-        self.file_info.is_some()
-            && self.id.is_some()
-            && self.last_check.is_some()
-            && (now.unix_timestamp() - self.last_check.unwrap().unix_timestamp() <= 3)
-    }
-}
-
 /// A helper enum to handle internal buffer types for writing data.
 pub enum InternalBuf<'a> {
     Ref(&'a [u8]),
@@ -1349,8 +1339,17 @@ impl DiskAPI for LocalDisk {
 
         let id = format_info.id;
 
-        if format_info.last_check_valid() {
-            return Ok(id);
+        // if format_info.last_check_valid() {
+        //     return Ok(id);
+        // }
+
+        if format_info.file_info.is_some() && id.is_some() {
+            // check last check time
+            if let Some(last_check) = format_info.last_check {
+                if last_check.unix_timestamp() + 10 < OffsetDateTime::now_utc().unix_timestamp() {
+                    return Ok(id);
+                }
+            }
         }
 
         let file_meta = self.check_format_json().await?;
@@ -1364,6 +1363,8 @@ impl DiskAPI for LocalDisk {
                 return Ok(id);
             }
         }
+
+        debug!("get_disk_id: read format.json");
 
         let b = fs::read(&self.format_path).await.map_err(to_unformatted_disk_error)?;
 
@@ -2707,39 +2708,6 @@ mod test {
             assert!(LocalDisk::is_valid_volname("valid/name"));
             assert!(LocalDisk::is_valid_volname("valid:name"));
         }
-    }
-
-    #[tokio::test]
-    async fn test_format_info_last_check_valid() {
-        let now = OffsetDateTime::now_utc();
-
-        // Valid format info
-        let valid_format_info = FormatInfo {
-            id: Some(Uuid::new_v4()),
-            data: vec![1, 2, 3].into(),
-            file_info: Some(fs::metadata("../../../..").await.unwrap()),
-            last_check: Some(now),
-        };
-        assert!(valid_format_info.last_check_valid());
-
-        // Invalid format info (missing id)
-        let invalid_format_info = FormatInfo {
-            id: None,
-            data: vec![1, 2, 3].into(),
-            file_info: Some(fs::metadata("../../../..").await.unwrap()),
-            last_check: Some(now),
-        };
-        assert!(!invalid_format_info.last_check_valid());
-
-        // Invalid format info (old timestamp)
-        let old_time = OffsetDateTime::now_utc() - time::Duration::seconds(10);
-        let old_format_info = FormatInfo {
-            id: Some(Uuid::new_v4()),
-            data: vec![1, 2, 3].into(),
-            file_info: Some(fs::metadata("../../../..").await.unwrap()),
-            last_check: Some(old_time),
-        };
-        assert!(!old_format_info.last_check_valid());
     }
 
     #[tokio::test]
