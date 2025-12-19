@@ -229,9 +229,7 @@ pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) ->
 
     for disk in disks.iter() {
         futures.push(async move {
-            if let Some(disk) = disk
-                && disk.is_online().await
-            {
+            if let Some(disk) = disk {
                 load_format_erasure(disk, heal).await
             } else {
                 Err(DiskError::DiskNotFound)
@@ -267,7 +265,10 @@ pub async fn load_format_erasure(disk: &DiskStore, heal: bool) -> disk::error::R
         .map_err(|e| match e {
             DiskError::FileNotFound => DiskError::UnformattedDisk,
             DiskError::DiskNotFound => DiskError::UnformattedDisk,
-            _ => e,
+            _ => {
+                warn!("load_format_erasure err: {:?} {:?}", disk.to_string(), e);
+                e
+            }
         })?;
 
     let mut fm = FormatV3::try_from(data.as_ref())?;
@@ -317,10 +318,6 @@ pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3
     let Some(disk) = disk else {
         return Err(DiskError::DiskNotFound);
     };
-
-    if !disk.is_online().await {
-        return Err(DiskError::DiskNotFound);
-    }
 
     let Some(format) = format else {
         return Err(DiskError::other("format is none"));
