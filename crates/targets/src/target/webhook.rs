@@ -36,7 +36,6 @@ use std::{
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument};
-use urlencoding;
 
 /// Arguments for configuring a Webhook target
 #[derive(Debug, Clone)]
@@ -221,8 +220,8 @@ where
 
     async fn send(&self, event: &EntityTarget<E>) -> Result<(), TargetError> {
         info!("Webhook Sending event to webhook target: {}", self.id);
-        let object_name = urlencoding::decode(&event.object_name)
-            .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
+        // Decode form-urlencoded object name
+        let object_name = crate::target::decode_object_name(&event.object_name)?;
 
         let key = format!("{}/{}", event.bucket_name, object_name);
 
@@ -419,5 +418,53 @@ where
 
     fn is_enabled(&self) -> bool {
         self.args.enable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::target::decode_object_name;
+    use url::form_urlencoded;
+
+    #[test]
+    fn test_decode_object_name_with_spaces() {
+        // Test case from the issue: "greeting file (2).csv"
+        let object_name = "greeting file (2).csv";
+
+        // Simulate what event.rs does: form-urlencoded encoding (spaces become +)
+        let form_encoded = form_urlencoded::byte_serialize(object_name.as_bytes()).collect::<String>();
+        assert_eq!(form_encoded, "greeting+file+%282%29.csv");
+
+        // Test the decode_object_name helper function
+        let decoded = decode_object_name(&form_encoded).unwrap();
+        assert_eq!(decoded, object_name);
+        assert!(!decoded.contains('+'), "Decoded string should not contain + symbols");
+    }
+
+    #[test]
+    fn test_decode_object_name_with_special_chars() {
+        // Test with various special characters
+        let test_cases = vec![
+            ("folder/greeting file (2).csv", "folder%2Fgreeting+file+%282%29.csv"),
+            ("test file.txt", "test+file.txt"),
+            ("my file (copy).pdf", "my+file+%28copy%29.pdf"),
+            ("file with spaces and (parentheses).doc", "file+with+spaces+and+%28parentheses%29.doc"),
+        ];
+
+        for (original, form_encoded) in test_cases {
+            // Test the decode_object_name helper function
+            let decoded = decode_object_name(form_encoded).unwrap();
+            assert_eq!(decoded, original, "Failed to decode: {}", form_encoded);
+        }
+    }
+
+    #[test]
+    fn test_decode_object_name_without_spaces() {
+        // Test that files without spaces still work correctly
+        let object_name = "simple-file.txt";
+        let form_encoded = form_urlencoded::byte_serialize(object_name.as_bytes()).collect::<String>();
+
+        let decoded = decode_object_name(&form_encoded).unwrap();
+        assert_eq!(decoded, object_name);
     }
 }

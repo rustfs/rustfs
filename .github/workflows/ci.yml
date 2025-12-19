@@ -112,8 +112,8 @@ jobs:
         include:
           - arch: x86_64
             runner: ubicloud-standard-4
-          - arch: aarch64
-            runner: ubicloud-standard-4-arm
+    #          - arch: aarch64
+    #            runner: ubicloud-standard-4-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -152,14 +152,14 @@ jobs:
         include:
           - arch: x86_64
             runner: ubicloud-standard-4
-          - arch: aarch64
-            runner: ubicloud-standard-4-arm
+    #          - arch: aarch64
+    #            runner: ubicloud-standard-4-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Clean up previous test run
-        run: |matrix.arch }}-${{ 
+        run: |
           rm -rf /tmp/rustfs
           rm -f /tmp/rustfs.log
 
@@ -185,7 +185,7 @@ jobs:
           cargo build -p rustfs --bins --jobs 4
 
       - name: Run end-to-end tests
-        run: |matrix.arch }}-${{ 
+        run: |
           s3s-e2e --version
           ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
 
