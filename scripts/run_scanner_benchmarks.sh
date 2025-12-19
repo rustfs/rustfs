@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Scanner performance benchmark runner
 # Usage: ./scripts/run_scanner_benchmarks.sh [test_type] [quick]

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # RustFS Enhanced Docker Deployment Examples
 # This script demonstrates various deployment scenarios for RustFS with console separation

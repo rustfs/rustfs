@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#      http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -62,17 +62,23 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: 4
 
 jobs:
+
   skip-check:
     name: Skip Duplicate Actions
     permissions:
       actions: write
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-4 
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
@@ -83,15 +89,13 @@ jobs:
           concurrent_skipping: "same_content_newer"
           cancel_others: true
           paths_ignore: '["*.md", "docs/**", "deploy/**"]'
-          # Never skip release events and tag pushes
           do_not_skip: '["workflow_dispatch", "schedule", "merge_group", "release", "push"]'
-
 
   typos:
     name: Typos
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-4
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Typos check with custom config file
         uses: crate-ci/typos@master
@@ -100,13 +104,11 @@ jobs:
     name: Test and Lint
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-4
     timeout-minutes: 60
     steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -115,6 +117,9 @@ jobs:
           cache-shared-key: ci-test-${{ hashFiles('**/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Run tests
         run: |
@@ -131,11 +136,16 @@ jobs:
     name: End-to-End Tests
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-4
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
+
+      - name: Clean up previous test run
+        run: |
+          rm -rf /tmp/rustfs
+          rm -f /tmp/rustfs.log
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -155,7 +165,8 @@ jobs:
       - name: Build debug binary
         run: |
           touch rustfs/build.rs
-          cargo build -p rustfs --bins
+          # Limit concurrency to prevent OOM
+          cargo build -p rustfs --bins --jobs 4
 
       - name: Run end-to-end tests
         run: |

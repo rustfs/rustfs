@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # RustFS Docker Quick Start Script
 # This script provides easy deployment commands for different scenarios
