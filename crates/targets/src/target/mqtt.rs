@@ -258,8 +258,10 @@ where
             .as_ref()
             .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
 
-        let object_name = urlencoding::decode(&event.object_name)
-            .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
+        // Decode form-urlencoded object name: replace + with space, then percent-decode
+        let replaced = event.object_name.replace("+", " ");
+        let object_name =
+            urlencoding::decode(&replaced).map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
 
         let key = format!("{}/{}", event.bucket_name, object_name);
 

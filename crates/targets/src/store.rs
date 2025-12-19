@@ -312,7 +312,7 @@ where
             compress: true,
         };
 
-        let data = serde_json::to_vec(&item).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let data = serde_json::to_vec(&*item).map_err(|e| StoreError::Serialization(e.to_string()))?;
         self.write_file(&key, &data)?;
 
         Ok(key)
