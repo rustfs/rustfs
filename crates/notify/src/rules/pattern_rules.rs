@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rules::pattern;
 use crate::rules::TargetIdSet;
+use crate::rules::pattern;
 use hashbrown::HashMap;
 use rayon::prelude::*;
 use rustfs_targets::arn::TargetID;
