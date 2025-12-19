@@ -159,7 +159,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Clean up previous test run
-        run: |matrix.arch }}-${{ 
+        run: |
           rm -rf /tmp/rustfs
           rm -f /tmp/rustfs.log
 
@@ -175,8 +175,8 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: s3s-e2e
-          git: https://github.com/Nugine/s3s.git
-          rev: b7714bfaa17ddfa9b23ea01774a1e7bbdbfc2ca3
+          git: https://github.com/s3s-project/s3s.git
+          rev: df2434d7ad2f0b774e68f25cae90c053dcb84f24
 
       - name: Build debug binary
         run: |
@@ -185,7 +185,7 @@ jobs:
           cargo build -p rustfs --bins --jobs 4
 
       - name: Run end-to-end tests
-        run: |matrix.arch }}-${{ 
+        run: |
           s3s-e2e --version
           ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
 
