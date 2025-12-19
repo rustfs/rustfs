@@ -123,7 +123,7 @@ ingress:
   tls: 
     enabled: false # Enable tls and access rustfs via https.
     certManager:
-      enabled: false # Enable certmanager to generate ceritificate for rustfs, default false.
+      enabled: false # Enable certmanager to generate certificate for rustfs, default false.
       issuer:
         name: letsencrypt-staging # Specify cert manager issuer name
         kind: Issuer # Specify cert manager issuer kind, Issuer or ClusterIssuer.
