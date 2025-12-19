@@ -17,7 +17,7 @@ missing := $(strip $(foreach cmd,$(REQUIRED_CMDS),\
 ifneq ($(missing),)
 $(foreach cmd,$(missing),\
 	$(info Missing: $(cmd)))
-$(error Aborting due to missing dependencies.Install From: https://rustup.rs)
+$(error Aborting due to missing dependencies. Install From: https://rustup.rs)
 endif
 
 # Code quality and formatting targets
