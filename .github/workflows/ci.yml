@@ -69,7 +69,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CARGO_BUILD_JOBS: 4
+  CARGO_BUILD_JOBS: 8
 
 jobs:
 
@@ -78,7 +78,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    runs-on: ubicloud-standard-4 
+    runs-on: ubicloud-standard-4
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
@@ -95,7 +95,7 @@ jobs:
     name: Typos
     runs-on: ubicloud-standard-4
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Typos check with custom config file
         uses: crate-ci/typos@master
@@ -108,7 +108,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -140,7 +140,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Clean up previous test run
         run: |

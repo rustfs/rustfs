@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::store::Key;
-use crate::target::{ChannelTargetType, EntityTarget, TargetType};
-use crate::{StoreError, Target, TargetLog, arn::TargetID, error::TargetError, store::Store};
+use crate::{
+    StoreError, Target, TargetLog,
+    arn::TargetID,
+    error::TargetError,
+    store::{Key, QueueStore, Store},
+    target::{ChannelTargetType, EntityTarget, TargetType},
+};
 use async_trait::async_trait;
-use rumqttc::{AsyncClient, EventLoop, MqttOptions, Outgoing, Packet, QoS};
-use rumqttc::{ConnectionError, mqttbytes::Error as MqttBytesError};
+use rumqttc::{AsyncClient, ConnectionError, EventLoop, MqttOptions, Outgoing, Packet, QoS, mqttbytes::Error as MqttBytesError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
@@ -130,10 +133,10 @@ where
             debug!(target_id = %target_id, path = %specific_queue_path.display(), "Initializing queue store for MQTT target");
             let extension = match args.target_type {
                 TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => rustfs_config::notify::STORE_EXTENSION,
+                TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
             };
 
-            let store = crate::store::QueueStore::<EntityTarget<E>>::new(specific_queue_path, args.queue_limit, extension);
+            let store = QueueStore::<EntityTarget<E>>::new(specific_queue_path, args.queue_limit, extension);
             if let Err(e) = store.open() {
                 error!(
                     target_id = %target_id,
