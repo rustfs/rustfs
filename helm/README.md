@@ -58,7 +58,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.samesite" | string | `"none"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.secure" | string | `"true"` |  |
 | ingress.tls.enabled | bool | `false` | Enable tls and access rustfs via https. |
-| ingress.tls.certManager.enabled | string | `false` | Enable cert manager support to generate ceritificate automatically. |
+| ingress.tls.certManager.enabled | string | `false` | Enable cert manager support to generate certificate automatically. |
 | ingress.tls.certManager.issuer.name | string | `false` | The name of cert manager issuer. |
 | ingress.tls.certManager.issuer.kind | string | `false` | The kind of cert manager issuer, issuer or cluster-issuer. |
 | ingress.tls.crt | string | "" | The content of certificate file. |
