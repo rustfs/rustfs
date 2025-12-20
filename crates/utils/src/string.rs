@@ -416,7 +416,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
 pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
     let pattern = [ELLIPSES, OPEN_BRACES, CLOSE_BRACES];
 
-    s.iter().any(|v| pattern.iter().any(|p| v.as_ref().contains(p)))
+    s.iter().any(|v| pattern.iter().all(|p| v.as_ref().contains(p)))
 }
 
 /// Parses an ellipses range pattern of following style
