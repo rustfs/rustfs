@@ -195,6 +195,9 @@ impl EventNotifier {
     ) -> Result<(), NotificationError> {
         // Currently active, simpler logic
         let mut target_list_guard = self.target_list.write().await; //Gets a write lock for the TargetList
+
+        target_list_guard.clear();
+
         for target_boxed in targets_to_init {
             // Traverse the incoming Box<dyn Target >
             debug!("init bucket target: {}", target_boxed.name());
@@ -238,6 +241,11 @@ impl TargetList {
         }
         self.targets.insert(id, target);
         Ok(())
+    }
+
+    /// Clears all targets from the list
+    pub fn clear(&mut self) {
+        self.targets.clear();
     }
 
     /// Removes a target by ID. Note: This does not stop its associated event stream.
