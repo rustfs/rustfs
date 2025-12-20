@@ -88,6 +88,22 @@ fn print_server_info() {
     info!("Docs: https://rustfs.com/docs/");
 }
 
+#[cfg(target_os = "linux")]
+fn notify_systemd_ready() {
+    use libsystemd::daemon;
+    match daemon::notify(false, &[daemon::NotifyState::Ready(true), daemon::NotifyState::Status("Running")]) {
+        Ok(sent) => {
+            if sent {
+                info!("Sent systemd ready notification");
+            }
+        }
+        Err(e) => error!("Failed to send systemd notification: {}", e),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn notify_systemd_ready() {}
+
 fn main() -> Result<()> {
     let runtime = server::get_tokio_runtime_builder()
         .build()
@@ -328,6 +344,10 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+
+    // Notify systemd that we are ready
+    notify_systemd_ready();
+
     // listen to the shutdown signal
     match wait_for_shutdown().await {
         #[cfg(unix)]
