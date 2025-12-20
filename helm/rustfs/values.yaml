@@ -90,9 +90,13 @@ containerSecurityContext:
   runAsNonRoot: true
 
 service:
-  type: NodePort
-  ep_port: 9000
-  console_port: 9001
+  type: ClusterIP
+  endpoint:
+    port: 9000
+    nodePort: 32000
+  console:
+    port: 9001
+    nodePort: 32001
 
 # This block is for setting up the ingress for more information can be found here: https://kubernetes.io/docs/concepts/services-networking/ingress/
 ingress:
