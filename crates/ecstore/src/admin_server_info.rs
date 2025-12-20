@@ -23,7 +23,7 @@ use crate::{
 };
 
 use crate::data_usage::load_data_usage_cache;
-use rustfs_common::{globals::GLOBAL_Local_Node_Name, heal_channel::DriveState};
+use rustfs_common::{globals::GLOBAL_LOCAL_NODE_NAME, heal_channel::DriveState};
 use rustfs_madmin::{
     BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, ServerProperties,
 };
@@ -128,7 +128,7 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
 }
 
 pub async fn get_local_server_property() -> ServerProperties {
-    let addr = GLOBAL_Local_Node_Name.read().await.clone();
+    let addr = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
     let mut pool_numbers = HashSet::new();
     let mut network = HashMap::new();
 

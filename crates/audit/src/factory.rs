@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::Event;
+use crate::AuditEntry;
 use async_trait::async_trait;
 use hashbrown::HashSet;
 use rumqttc::QoS;
-use rustfs_config::notify::{ENV_NOTIFY_MQTT_KEYS, ENV_NOTIFY_WEBHOOK_KEYS, NOTIFY_MQTT_KEYS, NOTIFY_WEBHOOK_KEYS};
+use rustfs_config::audit::{AUDIT_MQTT_KEYS, AUDIT_WEBHOOK_KEYS, ENV_AUDIT_MQTT_KEYS, ENV_AUDIT_WEBHOOK_KEYS};
 use rustfs_config::{
-    DEFAULT_LIMIT, EVENT_DEFAULT_DIR, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
+    AUDIT_DEFAULT_DIR, DEFAULT_LIMIT, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
     MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT,
     WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
@@ -36,7 +36,7 @@ use url::Url;
 #[async_trait]
 pub trait TargetFactory: Send + Sync {
     /// Creates a target from configuration
-    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<Event> + Send + Sync>, TargetError>;
+    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError>;
 
     /// Validates target configuration
     fn validate_config(&self, id: &str, config: &KVS) -> Result<(), TargetError>;
@@ -55,7 +55,7 @@ pub struct WebhookTargetFactory;
 
 #[async_trait]
 impl TargetFactory for WebhookTargetFactory {
-    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<Event> + Send + Sync>, TargetError> {
+    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError> {
         // All config values are now read directly from the merged `config` KVS.
         let endpoint = config
             .lookup(WEBHOOK_ENDPOINT)
@@ -67,14 +67,14 @@ impl TargetFactory for WebhookTargetFactory {
             enable: true, // If we are here, it's already enabled.
             endpoint: endpoint_url,
             auth_token: config.lookup(WEBHOOK_AUTH_TOKEN).unwrap_or_default(),
-            queue_dir: config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(EVENT_DEFAULT_DIR.to_string()),
+            queue_dir: config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(AUDIT_DEFAULT_DIR.to_string()),
             queue_limit: config
                 .lookup(WEBHOOK_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DEFAULT_LIMIT),
             client_cert: config.lookup(WEBHOOK_CLIENT_CERT).unwrap_or_default(),
             client_key: config.lookup(WEBHOOK_CLIENT_KEY).unwrap_or_default(),
-            target_type: rustfs_targets::target::TargetType::NotifyEvent,
+            target_type: rustfs_targets::target::TargetType::AuditLog,
         };
 
         let target = rustfs_targets::target::webhook::WebhookTarget::new(id, args)?;
@@ -100,7 +100,7 @@ impl TargetFactory for WebhookTargetFactory {
             ));
         }
 
-        let queue_dir = config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(EVENT_DEFAULT_DIR.to_string());
+        let queue_dir = config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(AUDIT_DEFAULT_DIR.to_string());
         if !queue_dir.is_empty() && !std::path::Path::new(&queue_dir).is_absolute() {
             return Err(TargetError::Configuration("Webhook queue directory must be an absolute path".to_string()));
         }
@@ -109,11 +109,11 @@ impl TargetFactory for WebhookTargetFactory {
     }
 
     fn get_valid_fields(&self) -> HashSet<String> {
-        NOTIFY_WEBHOOK_KEYS.iter().map(|s| s.to_string()).collect()
+        AUDIT_WEBHOOK_KEYS.iter().map(|s| s.to_string()).collect()
     }
 
     fn get_valid_env_fields(&self) -> HashSet<String> {
-        ENV_NOTIFY_WEBHOOK_KEYS.iter().map(|s| s.to_string()).collect()
+        ENV_AUDIT_WEBHOOK_KEYS.iter().map(|s| s.to_string()).collect()
     }
 }
 
@@ -122,7 +122,7 @@ pub struct MQTTTargetFactory;
 
 #[async_trait]
 impl TargetFactory for MQTTTargetFactory {
-    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<Event> + Send + Sync>, TargetError> {
+    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError> {
         let broker = config
             .lookup(MQTT_BROKER)
             .ok_or_else(|| TargetError::Configuration("Missing MQTT broker".to_string()))?;
@@ -159,12 +159,12 @@ impl TargetFactory for MQTTTargetFactory {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(Duration::from_secs)
                 .unwrap_or_else(|| Duration::from_secs(30)),
-            queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or(EVENT_DEFAULT_DIR.to_string()),
+            queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or(AUDIT_DEFAULT_DIR.to_string()),
             queue_limit: config
                 .lookup(MQTT_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DEFAULT_LIMIT),
-            target_type: rustfs_targets::target::TargetType::NotifyEvent,
+            target_type: rustfs_targets::target::TargetType::AuditLog,
         };
 
         let target = rustfs_targets::target::mqtt::MQTTTarget::new(id, args)?;
@@ -214,10 +214,10 @@ impl TargetFactory for MQTTTargetFactory {
     }
 
     fn get_valid_fields(&self) -> HashSet<String> {
-        NOTIFY_MQTT_KEYS.iter().map(|s| s.to_string()).collect()
+        AUDIT_MQTT_KEYS.iter().map(|s| s.to_string()).collect()
     }
 
     fn get_valid_env_fields(&self) -> HashSet<String> {
-        ENV_NOTIFY_MQTT_KEYS.iter().map(|s| s.to_string()).collect()
+        ENV_AUDIT_MQTT_KEYS.iter().map(|s| s.to_string()).collect()
     }
 }

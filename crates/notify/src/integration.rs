@@ -16,6 +16,7 @@ use crate::{
     Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
 };
 use hashbrown::HashMap;
+use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
@@ -108,17 +109,14 @@ pub struct NotificationSystem {
 impl NotificationSystem {
     /// Creates a new NotificationSystem
     pub fn new(config: Config) -> Self {
+        let concurrency_limiter =
+            rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
         NotificationSystem {
             notifier: Arc::new(EventNotifier::new()),
             registry: Arc::new(TargetRegistry::new()),
             config: Arc::new(RwLock::new(config)),
             stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
-            concurrency_limiter: Arc::new(Semaphore::new(
-                std::env::var("RUSTFS_TARGET_STREAM_CONCURRENCY")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(20),
-            )), // Limit the maximum number of concurrent processing events to 20
+            concurrency_limiter: Arc::new(Semaphore::new(concurrency_limiter)), // Limit the maximum number of concurrent processing events to 20
             metrics: Arc::new(NotificationMetrics::new()),
         }
     }
@@ -269,9 +267,9 @@ impl NotificationSystem {
         self.update_config_and_reload(|config| {
             config
                 .0
-                .entry(target_type.to_string())
+                .entry(target_type.to_lowercase())
                 .or_default()
-                .insert(target_name.to_string(), kvs.clone());
+                .insert(target_name.to_lowercase(), kvs.clone());
             true // The configuration is always modified
         })
         .await

@@ -44,7 +44,7 @@ async fn test_audit_system_startup_performance() {
 #[tokio::test]
 async fn test_concurrent_target_creation() {
     // Test that multiple targets can be created concurrently
-    let mut registry = AuditRegistry::new();
+    let registry = AuditRegistry::new();
 
     // Create config with multiple webhook instances
     let mut config = rustfs_ecstore::config::Config(std::collections::HashMap::new());
@@ -63,7 +63,7 @@ async fn test_concurrent_target_creation() {
     let start = Instant::now();
 
     // This will fail due to server storage not being initialized, but we can measure timing
-    let result = registry.create_targets_from_config(&config).await;
+    let result = registry.create_audit_targets_from_config(&config).await;
     let elapsed = start.elapsed();
 
     println!("Concurrent target creation took: {elapsed:?}");
