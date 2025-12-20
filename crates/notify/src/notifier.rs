@@ -196,6 +196,7 @@ impl EventNotifier {
         // Currently active, simpler logic
         let mut target_list_guard = self.target_list.write().await; //Gets a write lock for the TargetList
 
+        // Clear existing targets first - rebuild from scratch to ensure consistency with new configuration
         target_list_guard.clear();
 
         for target_boxed in targets_to_init {

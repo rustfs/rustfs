@@ -299,29 +299,27 @@ impl NotificationSystem {
     /// If the target configuration does not exist, it returns Ok(()) without making any changes.
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
         info!("Removing config for target {} of type {}", target_name, target_type);
-        let config_result = self.update_config_and_reload(|config| {
-            let mut changed = false;
-            if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
-                if targets.remove(&target_name.to_lowercase()).is_some() {
-                    changed = true;
+        let config_result = self
+            .update_config_and_reload(|config| {
+                let mut changed = false;
+                if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
+                    if targets.remove(&target_name.to_lowercase()).is_some() {
+                        changed = true;
+                    }
+                    if targets.is_empty() {
+                        config.0.remove(target_type);
+                    }
                 }
-                if targets.is_empty() {
-                    config.0.remove(target_type);
+                if !changed {
+                    info!("Target {} of type {} not found, no changes made.", target_name, target_type);
                 }
-            }
-            if !changed {
-                info!("Target {} of type {} not found, no changes made.", target_name, target_type);
-            }
-            debug!("Config after remove: {:?}", config);
-            changed
-        })
-        .await;
-        
+                debug!("Config after remove: {:?}", config);
+                changed
+            })
+            .await;
+
         if config_result.is_ok() {
-            let target_id = TargetID::new(
-                target_name.to_string(),
-                target_type.to_string()
-            );
+            let target_id = TargetID::new(target_name.to_string(), target_type.to_string());
 
             // Remove from target list
             let target_list = self.notifier.target_list();
