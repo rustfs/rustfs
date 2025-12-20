@@ -13,15 +13,16 @@ spec:
   clusterIP: None
   publishNotReadyAddresses: true
   ports:
-    - port: {{ .Values.service.ep_port }}
-      name: endpoint
-    - port: {{ .Values.service.console_port }}
-      name: console
+    - name: endpoint
+      port: {{ .Values.service.endpoint.port }}
+    - name: console
+      port: {{ .Values.service.console.port }}
   selector:
     {{- include "rustfs.selectorLabels" . | nindent 4 }}
 {{- end }}
 
 ---
+{{- $serviceType := .Values.service.type }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -40,19 +41,27 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
-  {{- if .Values.ingress.enabled }}
+  {{- if eq $serviceType "ClusterIP" }}
   type: ClusterIP
-  {{- else }}
-  type: {{ .Values.service.type }}
+  {{- else if eq $serviceType "NodePort" }}
+  type: NodePort
   sessionAffinity: ClientIP
   sessionAffinityConfig:
     clientIP:
       timeoutSeconds: 10800
   {{- end }}
   ports:
-    - port: {{ .Values.service.ep_port }}
-      name: endpoint
-    - port: {{ .Values.service.console_port }}
-      name: console
+    - name: endpoint
+      port: {{ .Values.service.endpoint.port }}
+      targetPort: {{ .Values.service.endpoint.port }}
+      {{- if eq $serviceType "NodePort" }}
+      nodePort: {{ .Values.service.endpoint.nodePort }}
+      {{- end }}
+    - name: console
+      port: {{ .Values.service.console.port }}
+      targetPort: {{ .Values.service.console.port }}
+      {{- if eq $serviceType "NodePort" }}
+      nodePort: {{ .Values.service.console.nodePort }}
+      {{- end }}
   selector:
     {{- include "rustfs.selectorLabels" . | nindent 4 }}
