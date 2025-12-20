@@ -53,6 +53,12 @@ config:
     region: "us-east-1"
     obs_log_directory: "/logs"
     obs_environment: "develop"
+    # Additional variables
+    # Example
+    # extraEnv:
+    #   RUSTFS_FOO: foo
+    #   RUSTFS_BAR: bar
+    extraEnv: {}
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
@@ -124,7 +130,7 @@ ingress:
       paths:
         - path: /
           pathType: Prefix
-  tls: 
+  tls:
     enabled: false # Enable tls and access rustfs via https.
     certManager:
       enabled: false # Enable certmanager to generate certificate for rustfs, default false.
