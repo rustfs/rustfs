@@ -91,7 +91,7 @@ fn print_server_info() {
 #[cfg(target_os = "linux")]
 fn notify_systemd_ready() {
     use libsystemd::daemon;
-    match daemon::notify(false, &[daemon::NotifyState::Ready(true), daemon::NotifyState::Status("Running")]) {
+    match daemon::notify(false, &[daemon::NotifyState::Ready, daemon::NotifyState::Status("Running".to_string())]) {
         Ok(sent) => {
             if sent {
                 info!("Sent systemd ready notification");
