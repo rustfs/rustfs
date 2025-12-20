@@ -163,9 +163,7 @@ impl ObjectStore {
 
     pub async fn new(object_api: Arc<ECStore>) -> Self {
         // Load previous credentials from persistent storage in .rustfs.sys bucket
-        let prev_cred = Self::load_prev_cred(object_api.clone())
-            .await
-            .or_else(|| get_global_action_cred());
+        let prev_cred = Self::load_prev_cred(object_api.clone()).await.or_else(get_global_action_cred);
 
         Self { object_api, prev_cred }
     }
