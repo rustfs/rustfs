@@ -89,6 +89,18 @@ pub const RUSTFS_TLS_KEY: &str = "rustfs_key.pem";
 /// This is the default cert for TLS.
 pub const RUSTFS_TLS_CERT: &str = "rustfs_cert.pem";
 
+/// Default public certificate filename for rustfs
+/// This is the default public certificate filename for rustfs.
+/// It is used to store the public certificate of the application.
+/// Default value: public.crt
+pub const RUSTFS_PUBLIC_CERT: &str = "public.crt";
+
+/// ca.crt
+/// This is the default CA certificate filename for rustfs.
+/// It is used to store the CA certificate of the application.
+/// Default value: ca.crt
+pub const RUSTFS_CA_CERT: &str = "ca.crt";
+
 /// Default port for rustfs
 /// This is the default port for rustfs.
 /// This is used to bind the server to a specific port.
