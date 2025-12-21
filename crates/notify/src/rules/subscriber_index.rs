@@ -40,7 +40,7 @@ impl fmt::Debug for SubscriberIndex {
 impl SubscriberIndex {
     /// Create a new SubscriberIndex.
     ///
-    /// #Arguments
+    /// # Arguments
     /// * `empty_rules` - An Arc to an empty rules container used for empty snapshots
     ///
     /// Returns a new instance of SubscriberIndex.
@@ -54,7 +54,7 @@ impl SubscriberIndex {
     /// Get the current snapshot of a bucket.
     /// If it does not exist, return empty snapshot.
     ///
-    /// #Arguments
+    /// # Arguments
     /// * `bucket` - The name of the bucket to load.
     ///
     /// Returns the snapshot reference for the specified bucket.
@@ -68,7 +68,7 @@ impl SubscriberIndex {
     /// Quickly determine whether the bucket has a subscription to an event.
     /// This judgment can be consistent with subsequent rule matching when reading the same snapshot.
     ///
-    /// #Arguments
+    /// # Arguments
     /// * `bucket` - The name of the bucket to check.
     /// * `event` - The event name to check for subscriptions.
     ///
@@ -87,7 +87,7 @@ impl SubscriberIndex {
     /// - The caller first builds the complete `BucketRulesSnapshot` (including event\_mask and rules).
     /// - This method ensures that the read path will not observe intermediate states.
     ///
-    /// #Arguments
+    /// # Arguments
     /// * `bucket` - The name of the bucket to update.
     /// * `new_snapshot` - The new snapshot to store for the bucket.
     pub fn store_snapshot(&self, bucket: &str, new_snapshot: BucketRulesSnapshot<DynRulesContainer>) {
@@ -105,7 +105,7 @@ impl SubscriberIndex {
 
     /// Delete the bucket's subscription view (make it empty).
     ///
-    /// #Arguments
+    /// # Arguments
     /// * `bucket` - The name of the bucket to clear.
     pub fn clear_bucket(&self, bucket: &str) {
         if let Some(cell) = self.inner.get(&bucket.to_string()) {

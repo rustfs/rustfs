@@ -162,12 +162,15 @@ pub async fn start_http_server(
                 socket.set_reuse_address(true)?;
                 socket.set_nonblocking(true)?;
                 socket.bind(&server_addr.into())?;
+                // [FIX] Ensure fallback socket is moved to listening state as well.
+                socket.listen(backlog)?;
             } else {
                 return Err(bind_err);
             }
+        } else {
+            // Listen on the socket when initial bind succeeded
+            socket.listen(backlog)?;
         }
-
-        socket.listen(backlog)?;
         TcpListener::from_std(socket.into())?
     };
 
