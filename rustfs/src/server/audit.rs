@@ -12,8 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use rustfs_audit::system::AuditSystemState;
-use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system};
+use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use tracing::{info, warn};
@@ -69,7 +68,9 @@ pub(crate) async fn start_audit_system() -> AuditResult<()> {
         mqtt_config.is_some(),
         webhook_config.is_some()
     );
+    // 3. Initialize and start the audit system
     let system = init_audit_system();
+    // Check if the audit system is already running
     let state = system.get_state().await;
     if state == AuditSystemState::Running {
         warn!(

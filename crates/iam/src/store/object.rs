@@ -120,18 +120,52 @@ fn split_path(s: &str, last_index: bool) -> (&str, &str) {
 #[derive(Clone)]
 pub struct ObjectStore {
     object_api: Arc<ECStore>,
+    prev_cred: Option<rustfs_policy::auth::Credentials>,
 }
 
 impl ObjectStore {
     const BUCKET_NAME: &'static str = ".rustfs.sys";
+    const PREV_CRED_FILE: &'static str = "config/iam/prev_cred.json";
 
-    pub fn new(object_api: Arc<ECStore>) -> Self {
-        Self { object_api }
+    /// Load previous credentials from persistent storage in .rustfs.sys bucket
+    async fn load_prev_cred(object_api: Arc<ECStore>) -> Option<rustfs_policy::auth::Credentials> {
+        match read_config(object_api, Self::PREV_CRED_FILE).await {
+            Ok(data) => serde_json::from_slice::<rustfs_policy::auth::Credentials>(&data).ok(),
+            Err(_) => None,
+        }
     }
 
-    fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
-        let de = rustfs_crypto::decrypt_data(get_global_action_cred().unwrap_or_default().secret_key.as_bytes(), data)?;
-        Ok(de)
+    /// Save previous credentials to persistent storage in .rustfs.sys bucket
+    async fn save_prev_cred(object_api: Arc<ECStore>, cred: &Option<rustfs_policy::auth::Credentials>) -> Result<()> {
+        match cred {
+            Some(c) => {
+                let data = serde_json::to_vec(c).map_err(|e| Error::other(format!("Failed to serialize cred: {}", e)))?;
+                save_config(object_api, Self::PREV_CRED_FILE, data)
+                    .await
+                    .map_err(|e| Error::other(format!("Failed to write cred to storage: {}", e)))
+            }
+            None => {
+                // If no credentials, remove the config
+                match delete_config(object_api, Self::PREV_CRED_FILE).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        // Ignore ConfigNotFound error when trying to delete non-existent config
+                        if matches!(e, rustfs_ecstore::error::StorageError::ConfigNotFound) {
+                            Ok(())
+                        } else {
+                            Err(Error::other(format!("Failed to delete cred from storage: {}", e)))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn new(object_api: Arc<ECStore>) -> Self {
+        // Load previous credentials from persistent storage in .rustfs.sys bucket
+        let prev_cred = Self::load_prev_cred(object_api.clone()).await.or_else(get_global_action_cred);
+
+        Self { object_api, prev_cred }
     }
 
     fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
@@ -139,10 +173,65 @@ impl ObjectStore {
         Ok(en)
     }
 
+    /// Decrypt data with credential fallback mechanism
+    /// First tries current credentials, then falls back to previous credentials if available
+    async fn decrypt_fallback(&self, data: &[u8], path: &str) -> Result<Vec<u8>> {
+        let current_cred = get_global_action_cred().unwrap_or_default();
+
+        // Try current credentials first
+        match rustfs_crypto::decrypt_data(current_cred.secret_key.as_bytes(), data) {
+            Ok(decrypted) => {
+                // Update persistent storage with current credentials for consistency
+                let _ = Self::save_prev_cred(self.object_api.clone(), &Some(current_cred)).await;
+                Ok(decrypted)
+            }
+            Err(_) => {
+                // Current credentials failed, try previous credentials
+                if let Some(ref prev_cred) = self.prev_cred {
+                    match rustfs_crypto::decrypt_data(prev_cred.secret_key.as_bytes(), data) {
+                        Ok(prev_decrypted) => {
+                            warn!("Decryption succeeded with previous credentials, path: {}", path);
+
+                            // Re-encrypt with current credentials
+                            match rustfs_crypto::encrypt_data(current_cred.secret_key.as_bytes(), &prev_decrypted) {
+                                Ok(re_encrypted) => {
+                                    let _ = save_config(self.object_api.clone(), path, re_encrypted).await;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to re-encrypt with current credentials: {}, path: {}", e, path);
+                                }
+                            }
+
+                            // Update persistent storage with current credentials
+                            let _ = Self::save_prev_cred(self.object_api.clone(), &Some(current_cred)).await;
+                            Ok(prev_decrypted)
+                        }
+                        Err(_) => {
+                            // Both attempts failed
+                            warn!("Decryption failed with both current and previous credentials, deleting config: {}", path);
+                            let _ = self.delete_iam_config(path).await;
+                            Err(Error::ConfigNotFound)
+                        }
+                    }
+                } else {
+                    // No previous credentials available
+                    warn!(
+                        "Decryption failed with current credentials and no previous credentials available, deleting config: {}",
+                        path
+                    );
+                    let _ = self.delete_iam_config(path).await;
+                    Err(Error::ConfigNotFound)
+                }
+            }
+        }
+    }
+
     async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, ObjectInfo)> {
         let (data, obj) = read_config_with_metadata(self.object_api.clone(), path.as_ref(), &ObjectOptions::default()).await?;
 
-        Ok((Self::decrypt_data(&data)?, obj))
+        let decrypted_data = self.decrypt_fallback(&data, path.as_ref()).await?;
+
+        Ok((decrypted_data, obj))
     }
 
     async fn list_iam_config_items(&self, prefix: &str, ctx: CancellationToken, sender: Sender<StringOrErr>) {
@@ -386,15 +475,7 @@ impl Store for ObjectStore {
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
         let mut data = read_config(self.object_api.clone(), path.as_ref()).await?;
 
-        data = match Self::decrypt_data(&data) {
-            Ok(v) => v,
-            Err(err) => {
-                warn!("delete the config file when decrypt failed failed: {}, path: {}", err, path.as_ref());
-                // delete the config file when decrypt failed
-                let _ = self.delete_iam_config(path.as_ref()).await;
-                return Err(Error::ConfigNotFound);
-            }
-        };
+        data = self.decrypt_fallback(&data, path.as_ref()).await?;
 
         Ok(serde_json::from_slice(&data)?)
     }

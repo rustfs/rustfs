@@ -55,7 +55,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::Rng as _;
-use rustfs_common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
+use rustfs_common::globals::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_filemeta::FileInfo;
 use rustfs_madmin::heal_commands::HealResultItem;
@@ -127,11 +127,11 @@ impl ECStore {
         info!("ECStore new address: {}", address.to_string());
         let mut host = address.ip().to_string();
         if host.is_empty() {
-            host = GLOBAL_Rustfs_Host.read().await.to_string()
+            host = GLOBAL_RUSTFS_HOST.read().await.to_string()
         }
         let mut port = address.port().to_string();
         if port.is_empty() {
-            port = GLOBAL_Rustfs_Port.read().await.to_string()
+            port = GLOBAL_RUSTFS_PORT.read().await.to_string()
         }
         info!("ECStore new host: {}, port: {}", host, port);
         init_local_peer(&endpoint_pools, &host, &port).await;
@@ -767,6 +767,12 @@ impl ECStore {
 
             def_pool = pinfo.clone();
             has_def_pool = true;
+            // https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-deletes.html
+            if is_err_object_not_found(err) {
+                if let Err(err) = opts.precondition_check(&pinfo.object_info) {
+                    return Err(err.clone());
+                }
+            }
 
             if !is_err_object_not_found(err) && !is_err_version_not_found(err) {
                 return Err(err.clone());
@@ -1392,6 +1398,7 @@ impl StorageAPI for ECStore {
 
         let (info, _) = self.get_latest_object_info_with_idx(bucket, object.as_str(), opts).await?;
 
+        opts.precondition_check(&info)?;
         Ok(info)
     }
 
@@ -2322,15 +2329,15 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
 
     if peer_set.is_empty() {
         if !host.is_empty() {
-            *GLOBAL_Local_Node_Name.write().await = format!("{host}:{port}");
+            *GLOBAL_LOCAL_NODE_NAME.write().await = format!("{host}:{port}");
             return;
         }
 
-        *GLOBAL_Local_Node_Name.write().await = format!("127.0.0.1:{port}");
+        *GLOBAL_LOCAL_NODE_NAME.write().await = format!("127.0.0.1:{port}");
         return;
     }
 
-    *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();
+    *GLOBAL_LOCAL_NODE_NAME.write().await = peer_set[0].clone();
 }
 
 pub fn is_valid_object_prefix(_object: &str) -> bool {

@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::store::Key;
-use crate::target::{ChannelTargetType, EntityTarget, TargetType};
-use crate::{StoreError, Target, TargetLog, arn::TargetID, error::TargetError, store::Store};
+use crate::{
+    StoreError, Target, TargetLog,
+    arn::TargetID,
+    error::TargetError,
+    store::{Key, QueueStore, Store},
+    target::{ChannelTargetType, EntityTarget, TargetType},
+};
 use async_trait::async_trait;
-use rumqttc::{AsyncClient, EventLoop, MqttOptions, Outgoing, Packet, QoS};
-use rumqttc::{ConnectionError, mqttbytes::Error as MqttBytesError};
+use rumqttc::{AsyncClient, ConnectionError, EventLoop, MqttOptions, Outgoing, Packet, QoS, mqttbytes::Error as MqttBytesError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
@@ -29,7 +32,6 @@ use std::{
 use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
-use urlencoding;
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const EVENT_LOOP_POLL_TIMEOUT: Duration = Duration::from_secs(10); // For initial connection check in task
@@ -130,10 +132,10 @@ where
             debug!(target_id = %target_id, path = %specific_queue_path.display(), "Initializing queue store for MQTT target");
             let extension = match args.target_type {
                 TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => rustfs_config::notify::STORE_EXTENSION,
+                TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
             };
 
-            let store = crate::store::QueueStore::<EntityTarget<E>>::new(specific_queue_path, args.queue_limit, extension);
+            let store = QueueStore::<EntityTarget<E>>::new(specific_queue_path, args.queue_limit, extension);
             if let Err(e) = store.open() {
                 error!(
                     target_id = %target_id,
@@ -255,8 +257,8 @@ where
             .as_ref()
             .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
 
-        let object_name = urlencoding::decode(&event.object_name)
-            .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
+        // Decode form-urlencoded object name
+        let object_name = crate::target::decode_object_name(&event.object_name)?;
 
         let key = format!("{}/{}", event.bucket_name, object_name);
 

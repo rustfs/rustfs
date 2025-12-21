@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Setup test binaries for Docker build testing
 # This script creates temporary binary files for testing Docker build process

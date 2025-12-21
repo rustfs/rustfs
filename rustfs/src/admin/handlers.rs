@@ -24,6 +24,7 @@ use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
+use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_HEAL_REQUEST_SIZE};
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
@@ -89,6 +90,13 @@ pub mod tier;
 pub mod trace;
 pub mod user;
 
+#[derive(Debug, Serialize)]
+pub struct IsAdminResponse {
+    pub is_admin: bool,
+    pub access_key: String,
+    pub message: String,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
@@ -140,6 +148,43 @@ impl Operation for HealthCheckHandler {
         let body = Body::from(body_str);
 
         Ok(S3Response::with_headers((StatusCode::OK, body), headers))
+    }
+}
+
+pub struct IsAdminHandler {}
+#[async_trait::async_trait]
+impl Operation for IsAdminHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, _owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        let access_key_to_check = input_cred.access_key.clone();
+
+        // Check if the user is admin by comparing with global credentials
+        let is_admin = if let Some(sys_cred) = get_global_action_cred() {
+            crate::auth::constant_time_eq(&access_key_to_check, &sys_cred.access_key)
+                || crate::auth::constant_time_eq(&cred.parent_user, &sys_cred.access_key)
+        } else {
+            false
+        };
+
+        let response = IsAdminResponse {
+            is_admin,
+            access_key: access_key_to_check,
+            message: format!("User is {}an administrator", if is_admin { "" } else { "not " }),
+        };
+
+        let data = serde_json::to_vec(&response)
+            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse IsAdminResponse failed"))?;
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 
@@ -816,11 +861,11 @@ impl Operation for HealHandler {
         let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
         info!("cred: {:?}", cred);
         let mut input = req.input;
-        let bytes = match input.store_all_unlimited().await {
+        let bytes = match input.store_all_limited(MAX_HEAL_REQUEST_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "heal request body too large or failed to read"));
             }
         };
         info!("bytes: {:?}", bytes);
@@ -1008,11 +1053,11 @@ impl Operation for SetRemoteTargetHandler {
             .map_err(ApiError::from)?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "remote target configuration body too large or failed to read"));
             }
         };
 
@@ -1276,15 +1321,19 @@ pub struct ProfileHandler {}
 #[async_trait::async_trait]
 impl Operation for ProfileHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        #[cfg(target_os = "windows")]
+        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         {
-            return Ok(S3Response::new((
-                StatusCode::NOT_IMPLEMENTED,
-                Body::from("CPU profiling is not supported on Windows platform".to_string()),
-            )));
+            let requested_url = req.uri.to_string();
+            let target_os = std::env::consts::OS;
+            let target_arch = std::env::consts::ARCH;
+            let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
+            let msg = format!(
+                "CPU profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}, requested_url={requested_url}"
+            );
+            return Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(msg))));
         }
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         {
             use rustfs_config::{DEFAULT_CPU_FREQ, ENV_CPU_FREQ};
             use rustfs_utils::get_env_usize;
@@ -1369,15 +1418,17 @@ impl Operation for ProfileStatusHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         use std::collections::HashMap;
 
-        #[cfg(target_os = "windows")]
+        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+        let message = format!("CPU profiling is not supported on {} platform", std::env::consts::OS);
+        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         let status = HashMap::from([
             ("enabled", "false"),
             ("status", "not_supported"),
-            ("platform", "windows"),
-            ("message", "CPU profiling is not supported on Windows platform"),
+            ("platform", std::env::consts::OS),
+            ("message", message.as_str()),
         ]);
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         let status = {
             use rustfs_config::{DEFAULT_ENABLE_PROFILING, ENV_ENABLE_PROFILING};
             use rustfs_utils::get_env_bool;

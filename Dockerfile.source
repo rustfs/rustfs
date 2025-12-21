@@ -39,7 +39,9 @@ RUN set -eux; \
     libssl-dev \
     lld \
     protobuf-compiler \
-    flatbuffers-compiler; \
+    flatbuffers-compiler \
+    gcc-aarch64-linux-gnu \
+    gcc-x86-64-linux-gnu; \
     rm -rf /var/lib/apt/lists/*
 
 # Optional: cross toolchain for aarch64 (only when targeting linux/arm64)
@@ -51,18 +53,18 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Add Rust targets based on TARGETPLATFORM
+# Add Rust targets for both arches (to support cross-builds on multi-arch runners)
 RUN set -eux; \
-    case "${TARGETPLATFORM:-linux/amd64}" in \
-    linux/amd64) rustup target add x86_64-unknown-linux-gnu ;; \
-    linux/arm64) rustup target add aarch64-unknown-linux-gnu ;; \
-    *) echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; exit 1 ;; \
-    esac
+    rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; \
+    rustup component add rust-std-x86_64-unknown-linux-gnu rust-std-aarch64-unknown-linux-gnu
 
 # Cross-compilation environment (used only when targeting aarch64)
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
 ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
+ENV CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc
+ENV CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++
 
 WORKDIR /usr/src/rustfs
 
@@ -72,7 +74,6 @@ COPY Cargo.toml Cargo.lock ./
 # 2) workspace member manifests (adjust if workspace layout changes)
 COPY rustfs/Cargo.toml rustfs/Cargo.toml
 COPY crates/*/Cargo.toml crates/
-COPY cli/rustfs-gui/Cargo.toml cli/rustfs-gui/Cargo.toml
 
 # Pre-fetch dependencies for better caching
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -116,6 +117,49 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; exit 1 \
     ;; \
     esac
+
+# -----------------------------
+# Development stage (keeps toolchain)
+# -----------------------------
+FROM builder AS dev
+
+ARG BUILD_DATE
+ARG VCS_REF
+
+LABEL name="RustFS (dev-source)" \
+    maintainer="RustFS Team" \
+    build-date="${BUILD_DATE}" \
+    vcs-ref="${VCS_REF}" \
+    description="RustFS - local development with Rust toolchain."
+
+# Install runtime dependencies that might be missing in partial builder
+# (builder already has build-essential, lld, etc.)
+WORKDIR /app
+
+ENV CARGO_INCREMENTAL=1
+
+# Ensure we have the same default env vars available
+ENV RUSTFS_ADDRESS=":9000" \
+    RUSTFS_ACCESS_KEY="rustfsadmin" \
+    RUSTFS_SECRET_KEY="rustfsadmin" \
+    RUSTFS_CONSOLE_ENABLE="true" \
+    RUSTFS_VOLUMES="/data" \
+    RUST_LOG="warn" \
+    RUSTFS_OBS_LOG_DIRECTORY="/logs" \
+    RUSTFS_USERNAME="rustfs" \
+    RUSTFS_GROUPNAME="rustfs" \
+    RUSTFS_UID="1000" \
+    RUSTFS_GID="1000"
+
+# Note: We don't COPY source here because we expect it to be mounted at /app
+# We rely on cargo run to build and run
+EXPOSE 9000 9001
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["cargo", "run", "--bin", "rustfs", "--"]
 
 # -----------------------------
 # Runtime stage (Ubuntu minimal)
@@ -166,14 +210,13 @@ ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_CONSOLE_ENABLE="true" \
     RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
-    RUSTFS_OBS_LOG_DIRECTORY="/logs" \
     RUSTFS_USERNAME="rustfs" \
     RUSTFS_GROUPNAME="rustfs" \
     RUSTFS_UID="1000" \
     RUSTFS_GID="1000"
 
 EXPOSE 9000
-VOLUME ["/data", "/logs"]
+VOLUME ["/data"]
 
 # Keep root here; entrypoint will drop privileges using chroot --userspec
 ENTRYPOINT ["/entrypoint.sh"]

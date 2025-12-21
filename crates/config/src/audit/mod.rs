@@ -29,7 +29,7 @@ pub const AUDIT_PREFIX: &str = "audit";
 pub const AUDIT_ROUTE_PREFIX: &str = const_str::concat!(AUDIT_PREFIX, DEFAULT_DELIMITER);
 
 pub const AUDIT_WEBHOOK_SUB_SYS: &str = "audit_webhook";
-pub const AUDIT_MQTT_SUB_SYS: &str = "mqtt_webhook";
+pub const AUDIT_MQTT_SUB_SYS: &str = "audit_mqtt";
 
 pub const AUDIT_STORE_EXTENSION: &str = ".audit";
 #[allow(dead_code)]

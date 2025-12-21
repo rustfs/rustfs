@@ -23,8 +23,8 @@ pub mod utils;
 mod console_test;
 
 use handlers::{
-    GetReplicationMetricsHandler, HealthCheckHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
-    bucket_meta,
+    GetReplicationMetricsHandler, HealthCheckHandler, IsAdminHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler,
+    SetRemoteTargetHandler, bucket_meta,
     event::{ListNotificationTargets, ListTargetsArns, NotificationTarget, RemoveNotificationTarget},
     group, kms, kms_dynamic, kms_keys, policies, pools,
     profile::{TriggerProfileCPU, TriggerProfileMemory},
@@ -51,6 +51,12 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
 
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/is-admin").as_str(),
+        AdminOperation(&IsAdminHandler {}),
+    )?;
 
     register_rpc_route(&mut r)?;
     register_user_route(&mut r)?;

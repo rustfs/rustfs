@@ -103,7 +103,7 @@ The RustFS container runs as a non-root user `rustfs` (UID `10001`). If you run 
  docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
  # Using specific version
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.68
+ docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-alpha.76
 ```
 
 You can also use Docker Compose. Using the `docker-compose.yml` file in the root directory:
@@ -152,6 +152,23 @@ make help-docker                      # Show all Docker-related commands
 ### 4\. Build with Helm Chart (Option 4) - Cloud Native
 
 Follow the instructions in the [Helm Chart README](https://charts.rustfs.com/) to install RustFS on a Kubernetes cluster.
+
+### 5\. Nix Flake (Option 5)
+
+If you have [Nix with flakes enabled](https://nixos.wiki/wiki/Flakes#Enable_flakes):
+
+```bash
+# Run directly without installing
+nix run github:rustfs/rustfs
+
+# Build the binary
+nix build github:rustfs/rustfs
+./result/bin/rustfs --help
+
+# Or from a local checkout
+nix build
+nix run
+```
 
 -----
 

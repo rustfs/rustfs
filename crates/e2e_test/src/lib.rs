@@ -18,6 +18,22 @@ mod reliant;
 #[cfg(test)]
 pub mod common;
 
+// Data usage regression tests
+#[cfg(test)]
+mod data_usage_test;
+
 // KMS-specific test modules
 #[cfg(test)]
 mod kms;
+
+// Special characters in path test modules
+#[cfg(test)]
+mod special_chars_test;
+
+// Content-Encoding header preservation test
+#[cfg(test)]
+mod content_encoding_test;
+
+// Policy variables tests
+#[cfg(test)]
+mod policy;

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 pub(crate) mod app;
+pub(crate) mod body_limits;
+pub(crate) mod compress;
 pub(crate) mod console;
 pub(crate) mod env;
 pub(crate) mod heal;

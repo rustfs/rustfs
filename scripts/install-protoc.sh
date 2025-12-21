@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Install protoc 33.1 on macOS
 
 set -e

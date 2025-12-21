@@ -16,6 +16,7 @@ use crate::{
     Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
 };
 use hashbrown::HashMap;
+use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
@@ -108,17 +109,14 @@ pub struct NotificationSystem {
 impl NotificationSystem {
     /// Creates a new NotificationSystem
     pub fn new(config: Config) -> Self {
+        let concurrency_limiter =
+            rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
         NotificationSystem {
             notifier: Arc::new(EventNotifier::new()),
             registry: Arc::new(TargetRegistry::new()),
             config: Arc::new(RwLock::new(config)),
             stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
-            concurrency_limiter: Arc::new(Semaphore::new(
-                std::env::var("RUSTFS_TARGET_STREAM_CONCURRENCY")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(20),
-            )), // Limit the maximum number of concurrent processing events to 20
+            concurrency_limiter: Arc::new(Semaphore::new(concurrency_limiter)), // Limit the maximum number of concurrent processing events to 20
             metrics: Arc::new(NotificationMetrics::new()),
         }
     }
@@ -214,6 +212,11 @@ impl NotificationSystem {
             return Ok(());
         }
 
+        // Save the modified configuration to storage
+        rustfs_ecstore::config::com::save_server_config(store, &new_config)
+            .await
+            .map_err(|e| NotificationError::SaveConfig(e.to_string()))?;
+
         info!("Configuration updated. Reloading system...");
         self.reload_config(new_config).await
     }
@@ -269,9 +272,9 @@ impl NotificationSystem {
         self.update_config_and_reload(|config| {
             config
                 .0
-                .entry(target_type.to_string())
+                .entry(target_type.to_lowercase())
                 .or_default()
-                .insert(target_name.to_string(), kvs.clone());
+                .insert(target_name.to_lowercase(), kvs.clone());
             true // The configuration is always modified
         })
         .await
@@ -296,23 +299,35 @@ impl NotificationSystem {
     /// If the target configuration does not exist, it returns Ok(()) without making any changes.
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
         info!("Removing config for target {} of type {}", target_name, target_type);
-        self.update_config_and_reload(|config| {
-            let mut changed = false;
-            if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
-                if targets.remove(&target_name.to_lowercase()).is_some() {
-                    changed = true;
+        let config_result = self
+            .update_config_and_reload(|config| {
+                let mut changed = false;
+                if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
+                    if targets.remove(&target_name.to_lowercase()).is_some() {
+                        changed = true;
+                    }
+                    if targets.is_empty() {
+                        config.0.remove(target_type);
+                    }
                 }
-                if targets.is_empty() {
-                    config.0.remove(target_type);
+                if !changed {
+                    info!("Target {} of type {} not found, no changes made.", target_name, target_type);
                 }
-            }
-            if !changed {
-                info!("Target {} of type {} not found, no changes made.", target_name, target_type);
-            }
-            debug!("Config after remove: {:?}", config);
-            changed
-        })
-        .await
+                debug!("Config after remove: {:?}", config);
+                changed
+            })
+            .await;
+
+        if config_result.is_ok() {
+            let target_id = TargetID::new(target_name.to_string(), target_type.to_string());
+
+            // Remove from target list
+            let target_list = self.notifier.target_list();
+            let mut target_list_guard = target_list.write().await;
+            let _ = target_list_guard.remove_target_only(&target_id).await;
+        }
+
+        config_result
     }
 
     /// Enhanced event stream startup function, including monitoring and concurrency control

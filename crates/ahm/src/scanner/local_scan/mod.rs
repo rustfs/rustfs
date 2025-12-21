@@ -84,6 +84,9 @@ pub async fn scan_and_persist_local_usage(store: Arc<ECStore>) -> Result<LocalSc
                 guard.clone()
             };
 
+            // Use the first local online disk in the set to avoid missing stats when disk 0 is down
+            let mut picked = false;
+
             for (disk_index, disk_opt) in disks.into_iter().enumerate() {
                 let Some(disk) = disk_opt else {
                     continue;
@@ -93,10 +96,16 @@ pub async fn scan_and_persist_local_usage(store: Arc<ECStore>) -> Result<LocalSc
                     continue;
                 }
 
-                // Count objects once by scanning only disk index zero from each set.
-                if disk_index != 0 {
+                if picked {
                     continue;
                 }
+
+                // Skip offline disks; keep looking for an online candidate
+                if !disk.is_online().await {
+                    continue;
+                }
+
+                picked = true;
 
                 let disk_id = match disk.get_disk_id().await.map_err(Error::from)? {
                     Some(id) => id.to_string(),

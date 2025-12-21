@@ -143,16 +143,16 @@ impl PriorityHealQueue {
                 format!("object:{}:{}:{}", bucket, object, version_id.as_deref().unwrap_or(""))
             }
             HealType::Bucket { bucket } => {
-                format!("bucket:{}", bucket)
+                format!("bucket:{bucket}")
             }
             HealType::ErasureSet { set_disk_id, .. } => {
-                format!("erasure_set:{}", set_disk_id)
+                format!("erasure_set:{set_disk_id}")
             }
             HealType::Metadata { bucket, object } => {
-                format!("metadata:{}:{}", bucket, object)
+                format!("metadata:{bucket}:{object}")
             }
             HealType::MRF { meta_path } => {
-                format!("mrf:{}", meta_path)
+                format!("mrf:{meta_path}")
             }
             HealType::ECDecode {
                 bucket,
@@ -173,7 +173,7 @@ impl PriorityHealQueue {
 
     /// Check if an erasure set heal request for a specific set_disk_id exists
     fn contains_erasure_set(&self, set_disk_id: &str) -> bool {
-        let key = format!("erasure_set:{}", set_disk_id);
+        let key = format!("erasure_set:{set_disk_id}");
         self.dedup_keys.contains(&key)
     }
 }
@@ -327,7 +327,7 @@ impl HealManager {
 
         if queue_len >= queue_capacity {
             return Err(Error::ConfigurationError {
-                message: format!("Heal queue is full ({}/{})", queue_len, queue_capacity),
+                message: format!("Heal queue is full ({queue_len}/{queue_capacity})"),
             });
         }
 

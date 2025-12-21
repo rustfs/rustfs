@@ -194,6 +194,12 @@ pub enum StorageError {
     #[error("Precondition failed")]
     PreconditionFailed,
 
+    #[error("Not modified")]
+    NotModified,
+
+    #[error("Invalid part number: {0}")]
+    InvalidPartNumber(usize),
+
     #[error("Invalid range specified: {0}")]
     InvalidRangeSpec(String),
 }
@@ -427,6 +433,8 @@ impl Clone for StorageError {
             StorageError::InsufficientReadQuorum(a, b) => StorageError::InsufficientReadQuorum(a.clone(), b.clone()),
             StorageError::InsufficientWriteQuorum(a, b) => StorageError::InsufficientWriteQuorum(a.clone(), b.clone()),
             StorageError::PreconditionFailed => StorageError::PreconditionFailed,
+            StorageError::NotModified => StorageError::NotModified,
+            StorageError::InvalidPartNumber(a) => StorageError::InvalidPartNumber(*a),
             StorageError::InvalidRangeSpec(a) => StorageError::InvalidRangeSpec(a.clone()),
         }
     }
@@ -496,6 +504,8 @@ impl StorageError {
             StorageError::PreconditionFailed => 0x3B,
             StorageError::EntityTooSmall(_, _, _) => 0x3C,
             StorageError::InvalidRangeSpec(_) => 0x3D,
+            StorageError::NotModified => 0x3E,
+            StorageError::InvalidPartNumber(_) => 0x3F,
         }
     }
 
@@ -566,6 +576,8 @@ impl StorageError {
             0x3B => Some(StorageError::PreconditionFailed),
             0x3C => Some(StorageError::EntityTooSmall(Default::default(), Default::default(), Default::default())),
             0x3D => Some(StorageError::InvalidRangeSpec(Default::default())),
+            0x3E => Some(StorageError::NotModified),
+            0x3F => Some(StorageError::InvalidPartNumber(Default::default())),
             _ => None,
         }
     }
@@ -677,6 +689,10 @@ pub fn is_err_bucket_not_found(err: &Error) -> bool {
 
 pub fn is_err_data_movement_overwrite(err: &Error) -> bool {
     matches!(err, &StorageError::DataMovementOverwriteErr(_, _, _))
+}
+
+pub fn is_err_io(err: &Error) -> bool {
+    matches!(err, &StorageError::Io(_))
 }
 
 pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {

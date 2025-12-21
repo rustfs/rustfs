@@ -62,9 +62,9 @@ pub struct Policy {
 }
 
 impl Policy {
-    pub fn is_allowed(&self, args: &Args) -> bool {
+    pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
-            if !statement.is_allowed(args) {
+            if !statement.is_allowed(args).await {
                 return false;
             }
         }
@@ -74,7 +74,7 @@ impl Policy {
         }
 
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Allow)) {
-            if statement.is_allowed(args) {
+            if statement.is_allowed(args).await {
                 return true;
             }
         }
@@ -82,9 +82,9 @@ impl Policy {
         false
     }
 
-    pub fn match_resource(&self, resource: &str) -> bool {
+    pub async fn match_resource(&self, resource: &str) -> bool {
         for statement in self.statements.iter() {
-            if statement.resources.match_resource(resource) {
+            if statement.resources.match_resource(resource).await {
                 return true;
             }
         }
@@ -188,9 +188,9 @@ pub struct BucketPolicy {
 }
 
 impl BucketPolicy {
-    pub fn is_allowed(&self, args: &BucketPolicyArgs) -> bool {
+    pub async fn is_allowed(&self, args: &BucketPolicyArgs<'_>) -> bool {
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
-            if !statement.is_allowed(args) {
+            if !statement.is_allowed(args).await {
                 return false;
             }
         }
@@ -200,7 +200,7 @@ impl BucketPolicy {
         }
 
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Allow)) {
-            if statement.is_allowed(args) {
+            if statement.is_allowed(args).await {
                 return true;
             }
         }
@@ -523,6 +523,283 @@ mod test {
         let _p2 = Policy::parse_config(str.as_bytes())?;
 
         // assert_eq!(p, p2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_username_policy_variable() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${aws:username}-*"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let conditions = HashMap::new();
+
+        // Test allowed case - user testuser accessing testuser-bucket
+        let mut claims1 = HashMap::new();
+        claims1.insert("username".to_string(), Value::String("testuser".to_string()));
+
+        let args1 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "testuser-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims1,
+            deny_only: false,
+        };
+
+        // Test denied case - user otheruser accessing testuser-bucket
+        let mut claims2 = HashMap::new();
+        claims2.insert("username".to_string(), Value::String("otheruser".to_string()));
+
+        let args2 = Args {
+            account: "otheruser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "testuser-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims2,
+            deny_only: false,
+        };
+
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_userid_policy_variable() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${aws:userid}-bucket"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), Value::String("AIDACKCEVSQ6C2EXAMPLE".to_string()));
+
+        let conditions = HashMap::new();
+
+        // Test allowed case
+        let args1 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "AIDACKCEVSQ6C2EXAMPLE-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Test denied case
+        let args2 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "OTHERUSER-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_policy_variables_concatenation() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${aws:username}-${aws:userid}-bucket"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let mut claims = HashMap::new();
+        claims.insert("username".to_string(), Value::String("testuser".to_string()));
+        claims.insert("sub".to_string(), Value::String("AIDACKCEVSQ6C2EXAMPLE".to_string()));
+
+        let conditions = HashMap::new();
+
+        // Test allowed case
+        let args1 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "testuser-AIDACKCEVSQ6C2EXAMPLE-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Test denied case
+        let args2 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "otheruser-AIDACKCEVSQ6C2EXAMPLE-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_policy_variables_nested() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${${aws:PrincipalType}-${aws:userid}}"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), Value::String("AIDACKCEVSQ6C2EXAMPLE".to_string()));
+        // For PrincipalType, it will default to "User" when not explicitly set
+
+        let conditions = HashMap::new();
+
+        // Test allowed case
+        let args1 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "User-AIDACKCEVSQ6C2EXAMPLE",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Test denied case
+        let args2 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "User-OTHERUSER",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_policy_variables_multi_value() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${aws:username}-bucket"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let mut claims = HashMap::new();
+        // Test with array value for username
+        claims.insert(
+            "username".to_string(),
+            Value::Array(vec![Value::String("user1".to_string()), Value::String("user2".to_string())]),
+        );
+
+        let conditions = HashMap::new();
+
+        let args1 = Args {
+            account: "user1",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "user1-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let args2 = Args {
+            account: "user2",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "user2-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Either user1 or user2 should be allowed
+        assert!(pollster::block_on(policy.is_allowed(&args1)) || pollster::block_on(policy.is_allowed(&args2)));
+
         Ok(())
     }
 }

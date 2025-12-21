@@ -15,9 +15,10 @@
 use std::fmt::Display;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use parking_lot::RwLock;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
@@ -132,7 +133,7 @@ pub struct QueryStateMachine {
     pub session: SessionCtx,
     pub query: Query,
 
-    state: AtomicPtr<QueryState>,
+    state: RwLock<QueryState>,
     start: Instant,
 }
 
@@ -141,14 +142,14 @@ impl QueryStateMachine {
         Self {
             session,
             query,
-            state: AtomicPtr::new(Box::into_raw(Box::new(QueryState::ACCEPTING))),
+            state: RwLock::new(QueryState::ACCEPTING),
             start: Instant::now(),
         }
     }
 
     pub fn begin_analyze(&self) {
         // TODO record time
-        self.translate_to(Box::new(QueryState::RUNNING(RUNNING::ANALYZING)));
+        self.translate_to(QueryState::RUNNING(RUNNING::ANALYZING));
     }
 
     pub fn end_analyze(&self) {
@@ -157,7 +158,7 @@ impl QueryStateMachine {
 
     pub fn begin_optimize(&self) {
         // TODO record time
-        self.translate_to(Box::new(QueryState::RUNNING(RUNNING::OPTIMIZING)));
+        self.translate_to(QueryState::RUNNING(RUNNING::OPTIMIZING));
     }
 
     pub fn end_optimize(&self) {
@@ -166,7 +167,7 @@ impl QueryStateMachine {
 
     pub fn begin_schedule(&self) {
         // TODO
-        self.translate_to(Box::new(QueryState::RUNNING(RUNNING::SCHEDULING)));
+        self.translate_to(QueryState::RUNNING(RUNNING::SCHEDULING));
     }
 
     pub fn end_schedule(&self) {
@@ -175,29 +176,29 @@ impl QueryStateMachine {
 
     pub fn finish(&self) {
         // TODO
-        self.translate_to(Box::new(QueryState::DONE(DONE::FINISHED)));
+        self.translate_to(QueryState::DONE(DONE::FINISHED));
     }
 
     pub fn cancel(&self) {
         // TODO
-        self.translate_to(Box::new(QueryState::DONE(DONE::CANCELLED)));
+        self.translate_to(QueryState::DONE(DONE::CANCELLED));
     }
 
     pub fn fail(&self) {
         // TODO
-        self.translate_to(Box::new(QueryState::DONE(DONE::FAILED)));
+        self.translate_to(QueryState::DONE(DONE::FAILED));
     }
 
-    pub fn state(&self) -> &QueryState {
-        unsafe { &*self.state.load(Ordering::Relaxed) }
+    pub fn state(&self) -> QueryState {
+        self.state.read().clone()
     }
 
     pub fn duration(&self) -> Duration {
         self.start.elapsed()
     }
 
-    fn translate_to(&self, state: Box<QueryState>) {
-        self.state.store(Box::into_raw(state), Ordering::Relaxed);
+    fn translate_to(&self, state: QueryState) {
+        *self.state.write() = state;
     }
 }
 

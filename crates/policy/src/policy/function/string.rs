@@ -21,26 +21,30 @@ use std::{borrow::Cow, collections::HashMap};
 
 use crate::policy::function::func::FuncKeyValue;
 use crate::policy::utils::wildcard;
+use futures::future;
 use serde::{Deserialize, Deserializer, Serialize, de, ser::SerializeSeq};
 
 use super::{func::InnerFunc, key_name::KeyName};
+use crate::policy::variables::PolicyVariableResolver;
 
 pub type StringFunc = InnerFunc<StringFuncValue>;
 
 impl StringFunc {
-    pub(crate) fn evaluate(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn evaluate_with_resolver(
         &self,
         for_all: bool,
         ignore_case: bool,
         like: bool,
         negate: bool,
         values: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         for inner in self.0.iter() {
             let result = if like {
-                inner.eval_like(for_all, values) ^ negate
+                inner.eval_like(for_all, values, resolver).await ^ negate
             } else {
-                inner.eval(for_all, ignore_case, values) ^ negate
+                inner.eval(for_all, ignore_case, values, resolver).await ^ negate
             };
 
             if !result {
@@ -53,7 +57,13 @@ impl StringFunc {
 }
 
 impl FuncKeyValue<StringFuncValue> {
-    fn eval(&self, for_all: bool, ignore_case: bool, values: &HashMap<String, Vec<String>>) -> bool {
+    async fn eval(
+        &self,
+        for_all: bool,
+        ignore_case: bool,
+        values: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+    ) -> bool {
         let rvalues = values
             // http.CanonicalHeaderKey ?
             .get(self.key.name().as_str())
@@ -70,12 +80,20 @@ impl FuncKeyValue<StringFuncValue> {
             })
             .unwrap_or_default();
 
-        let fvalues = self
-            .values
-            .0
-            .iter()
-            .map(|c| {
-                let mut c = Cow::from(c);
+        let resolved_values: Vec<Vec<String>> = futures::future::join_all(self.values.0.iter().map(|c| async {
+            if let Some(res) = resolver {
+                super::super::variables::resolve_aws_variables(c, res).await
+            } else {
+                vec![c.to_string()]
+            }
+        }))
+        .await;
+
+        let fvalues = resolved_values
+            .into_iter()
+            .flatten()
+            .map(|resolved_c| {
+                let mut c = Cow::from(resolved_c);
                 for key in KeyName::COMMON_KEYS {
                     match values.get(key.name()).and_then(|x| x.first()) {
                         Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
@@ -97,15 +115,32 @@ impl FuncKeyValue<StringFuncValue> {
         }
     }
 
-    fn eval_like(&self, for_all: bool, values: &HashMap<String, Vec<String>>) -> bool {
+    async fn eval_like(
+        &self,
+        for_all: bool,
+        values: &HashMap<String, Vec<String>>,
+        resolver: Option<&dyn PolicyVariableResolver>,
+    ) -> bool {
         if let Some(rvalues) = values.get(self.key.name().as_str()) {
             for v in rvalues.iter() {
-                let matched = self
+                let resolved_futures: Vec<_> = self
                     .values
                     .0
                     .iter()
-                    .map(|c| {
-                        let mut c = Cow::from(c);
+                    .map(|c| async {
+                        if let Some(res) = resolver {
+                            super::super::variables::resolve_aws_variables(c, res).await
+                        } else {
+                            vec![c.to_string()]
+                        }
+                    })
+                    .collect();
+                let resolved_values = future::join_all(resolved_futures).await;
+                let matched = resolved_values
+                    .into_iter()
+                    .flatten()
+                    .map(|resolved_c| {
+                        let mut c = Cow::from(resolved_c);
                         for key in KeyName::COMMON_KEYS {
                             match values.get(key.name()).and_then(|x| x.first()) {
                                 Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
@@ -214,6 +249,7 @@ mod tests {
         key_name::AwsKeyName::*,
         key_name::KeyName::{self, *},
     };
+    use std::collections::HashMap;
 
     use crate::policy::function::key_name::S3KeyName::S3LocationConstraint;
     use test_case::test_case;
@@ -275,16 +311,13 @@ mod tests {
         negate: bool,
         values: Vec<(&str, Vec<&str>)>,
     ) -> bool {
-        let result = s.eval(
-            for_all,
-            ignore_case,
-            &values
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
-                .collect(),
-        );
+        let map: HashMap<String, Vec<String>> = values
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
+            .collect();
+        let result = s.eval(for_all, ignore_case, &map, None);
 
-        result ^ negate
+        pollster::block_on(result) ^ negate
     }
 
     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => true ; "1")]
@@ -380,15 +413,13 @@ mod tests {
     }
 
     fn test_eval_like(s: FuncKeyValue<StringFuncValue>, for_all: bool, negate: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
-        let result = s.eval_like(
-            for_all,
-            &values
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
-                .collect(),
-        );
+        let map: HashMap<String, Vec<String>> = values
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
+            .collect();
+        let result = s.eval_like(for_all, &map, None);
 
-        result ^ negate
+        pollster::block_on(result) ^ negate
     }
 
     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => true ; "1")]

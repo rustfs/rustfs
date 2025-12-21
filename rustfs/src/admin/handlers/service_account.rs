@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use crate::admin::utils::has_space_be;
-use crate::auth::{get_condition_values, get_session_token};
+use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::{admin::router::Operation, auth::check_key_valid};
 use http::HeaderMap;
 use hyper::StatusCode;
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
@@ -48,11 +49,14 @@ impl Operation for AddServiceAccount {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &req_cred.access_key).await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "service account configuration body too large or failed to read"
+                ));
             }
         };
 
@@ -83,7 +87,7 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "get sys cred failed"));
         };
 
-        if sys_cred.access_key == create_req.access_key {
+        if constant_time_eq(&sys_cred.access_key, &create_req.access_key) {
             return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
         }
 
@@ -107,7 +111,7 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        let deny_only = cred.access_key == target_user || cred.parent_user == target_user;
+        let deny_only = constant_time_eq(&cred.access_key, &target_user) || constant_time_eq(&cred.parent_user, &target_user);
 
         if !iam_store
             .is_allowed(&Args {
@@ -235,11 +239,14 @@ impl Operation for UpdateServiceAccount {
         // })?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "service account configuration body too large or failed to read"
+                ));
             }
         };
 
@@ -439,8 +446,8 @@ impl Operation for ListServiceAccount {
 
         let query = {
             if let Some(query) = req.uri.query() {
-                let input: ListServiceAccountQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                let input: ListServiceAccountQuery = from_bytes(query.as_bytes())
+                    .map_err(|_e| s3_error!(InvalidArgument, "invalid service account query parameters"))?;
                 input
             } else {
                 ListServiceAccountQuery::default()
@@ -549,8 +556,8 @@ impl Operation for DeleteServiceAccount {
 
         let query = {
             if let Some(query) = req.uri.query() {
-                let input: AccessKeyQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                let input: AccessKeyQuery = from_bytes(query.as_bytes())
+                    .map_err(|_e| s3_error!(InvalidArgument, "invalid access key query parameters"))?;
                 input
             } else {
                 AccessKeyQuery::default()
