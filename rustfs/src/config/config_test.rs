@@ -208,7 +208,7 @@ mod tests {
         let total_drives = layout.get_set_count(0) * layout.get_drives_per_set(0);
         assert_eq!(total_drives, 20, "Expected 20 drives from /data{{0...3}}/vol{{0...4}}");
 
-        // Test case 10: Multiple pools with nested ellipses patterns
+        // Test case 11: Multiple pools with nested ellipses patterns
         let args = vec!["rustfs", "/data{0...3}/vol{0...4}", "/data{4...7}/vol{0...4}"];
         let opt = Opt::parse_from(args);
         assert_eq!(opt.volumes.len(), 2);
