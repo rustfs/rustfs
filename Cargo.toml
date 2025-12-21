@@ -97,8 +97,8 @@ async-channel = "2.5.0"
 async-compression = { version = "0.4.19" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
-axum = "0.8.7"
-axum-extra = "0.12.2"
+axum = "0.8.8"
+axum-extra = "0.12.3"
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"], default-features = false }
 futures = "0.3.31"
 futures-core = "0.3.31"
@@ -126,7 +126,7 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 bytes = { version = "1.11.0", features = ["serde"] }
 bytesize = "2.3.1"
 byteorder = "1.5.0"
-flatbuffers = "25.9.23"
+flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.1"
 quick-xml = "0.38.4"
@@ -203,7 +203,7 @@ matchit = "0.9.0"
 md-5 = "0.11.0-rc.3"
 md5 = "0.8.0"
 mime_guess = "2.0.5"
-moka = { version = "0.12.11", features = ["future"] }
+moka = { version = "0.12.12", features = ["future"] }
 netif = "0.1.6"
 nix = { version = "0.30.1", features = ["fs"] }
 nu-ansi-term = "0.50.3"
@@ -224,7 +224,7 @@ rust-embed = { version = "8.9.0" }
 rustc-hash = { version = "2.1.1" }
 s3s = { version = "0.12.0-rc.6", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", branch = "main" }
 serial_test = "3.2.0"
-shadow-rs = { version = "1.4.0", default-features = false }
+shadow-rs = { version = "1.5.0", default-features = false }
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 smartstring = "1.0.1"
@@ -252,7 +252,7 @@ walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
-zip = "6.0.0"
+zip = "7.0.0"
 zstd = "0.13.3"
 
 # Observability and Metrics

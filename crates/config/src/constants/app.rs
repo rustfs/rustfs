@@ -101,6 +101,18 @@ pub const RUSTFS_PUBLIC_CERT: &str = "public.crt";
 /// Default value: ca.crt
 pub const RUSTFS_CA_CERT: &str = "ca.crt";
 
+/// Default HTTP prefix for rustfs
+/// This is the default HTTP prefix for rustfs.
+/// It is used to identify HTTP URLs.
+/// Default value: http://
+pub const RUSTFS_HTTP_PREFIX: &str = "http://";
+
+/// Default HTTPS prefix for rustfs
+/// This is the default HTTPS prefix for rustfs.
+/// It is used to identify HTTPS URLs.
+/// Default value: https://
+pub const RUSTFS_HTTPS_PREFIX: &str = "https://";
+
 /// Default port for rustfs
 /// This is the default port for rustfs.
 /// This is used to bind the server to a specific port.

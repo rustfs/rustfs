@@ -46,6 +46,12 @@ const HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 3;
 /// Overall RPC timeout - maximum time for any single RPC operation
 const RPC_TIMEOUT_SECS: u64 = 30;
 
+/// Default HTTPS prefix for rustfs
+/// This is the default HTTPS prefix for rustfs.
+/// It is used to identify HTTPS URLs.
+/// Default value: https://
+const RUSTFS_HTTPS_PREFIX: &str = "https://";
+
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
 ///
 /// This function is designed to detect dead peers quickly:
@@ -70,11 +76,25 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         // Overall timeout for any RPC - fail fast on unresponsive peers
         .timeout(Duration::from_secs(RPC_TIMEOUT_SECS));
 
-    if addr.starts_with("https://") {
-        let root_cert = GLOBAL_ROOT_CERT.read().await;
+    let root_cert = GLOBAL_ROOT_CERT.read().await;
+    if addr.starts_with(RUSTFS_HTTPS_PREFIX) {
         if let Some(cert_pem) = root_cert.as_ref() {
             let ca = Certificate::from_pem(cert_pem);
-            let tls = ClientTlsConfig::new().ca_certificate(ca);
+            // Derive the hostname from the HTTPS URL for TLS hostname verification.
+            let domain = addr
+                .trim_start_matches(RUSTFS_HTTPS_PREFIX)
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("");
+            let tls = if !domain.is_empty() {
+                ClientTlsConfig::new().ca_certificate(ca).domain_name(domain)
+            } else {
+                // Fallback: configure TLS without explicit domain if parsing fails.
+                ClientTlsConfig::new().ca_certificate(ca)
+            };
             connector = connector.tls_config(tls)?;
             debug!("Configured TLS with custom root certificate for: {}", addr);
         } else {
@@ -82,7 +102,6 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         }
     } else {
         // Custom root certificates are configured but will be ignored for non-HTTPS addresses.
-        let root_cert = GLOBAL_ROOT_CERT.read().await;
         if root_cert.is_some() {
             warn!("Custom root certificates are configured but not used because the address does not use HTTPS: {addr}");
         }

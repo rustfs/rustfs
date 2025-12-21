@@ -22,7 +22,7 @@ use tracing::{debug, info};
 /// Additionally, it tries to load system root certificates from common locations
 /// to ensure trust for public CAs when mixing self-signed and public certificates.
 /// If any certificates are found, they are set as the global root certificates.
-pub(crate) async fn init_cert(tls_path: &String) {
+pub(crate) async fn init_cert(tls_path: &str) {
     let mut cert_data = Vec::new();
 
     // Try rustfs_cert.pem (custom cert name)
@@ -36,33 +36,37 @@ pub(crate) async fn init_cert(tls_path: &String) {
     let ca_cert_path = std::path::Path::new(tls_path).join(RUSTFS_CA_CERT);
     load_cert_file(ca_cert_path.to_str().unwrap_or_default(), &mut cert_data, "CA certificate").await;
 
-    // Attempt to load system root certificates to maintain trust for public CAs
-    // This is important when mixing self-signed internal certs with public external certs
-    let system_ca_paths = [
-        "/etc/ssl/certs/ca-certificates.crt",                  // Debian/Ubuntu/Alpine
-        "/etc/pki/tls/certs/ca-bundle.crt",                    // Fedora/RHEL/CentOS
-        "/etc/ssl/ca-bundle.pem",                              // OpenSUSE
-        "/etc/pki/tls/cacert.pem",                             // OpenELEC
-        "/etc/ssl/cert.pem",                                   // macOS/FreeBSD
-        "/usr/local/etc/openssl/cert.pem",                     // macOS/Homebrew OpenSSL
-        "/usr/local/share/certs/ca-root-nss.crt",              // FreeBSD
-        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",   // RHEL
-        "/usr/share/pki/ca-trust-legacy/ca-bundle.legacy.crt", // RHEL legacy
-    ];
+    let trust_system_ca = rustfs_utils::get_env_bool(rustfs_config::ENV_TRUST_SYSTEM_CA, rustfs_config::DEFAULT_TRUST_SYSTEM_CA);
+    if !trust_system_ca {
+        // Attempt to load system root certificates to maintain trust for public CAs
+        // This is important when mixing self-signed internal certs with public external certs
+        let system_ca_paths = [
+            "/etc/ssl/certs/ca-certificates.crt",                  // Debian/Ubuntu/Alpine
+            "/etc/pki/tls/certs/ca-bundle.crt",                    // Fedora/RHEL/CentOS
+            "/etc/ssl/ca-bundle.pem",                              // OpenSUSE
+            "/etc/pki/tls/cacert.pem",                             // OpenELEC
+            "/etc/ssl/cert.pem",                                   // macOS/FreeBSD
+            "/usr/local/etc/openssl/cert.pem",                     // macOS/Homebrew OpenSSL
+            "/usr/local/share/certs/ca-root-nss.crt",              // FreeBSD
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",   // RHEL
+            "/usr/share/pki/ca-trust-legacy/ca-bundle.legacy.crt", // RHEL legacy
+        ];
 
-    let mut system_cert_loaded = false;
-    for path in system_ca_paths {
-        if load_cert_file(path, &mut cert_data, "system root certificates").await {
-            system_cert_loaded = true;
-            info!("Loaded system root certificates from {}", path);
-            break; // Stop after finding the first valid bundle
+        let mut system_cert_loaded = false;
+        for path in system_ca_paths {
+            if load_cert_file(path, &mut cert_data, "system root certificates").await {
+                system_cert_loaded = true;
+                info!("Loaded system root certificates from {}", path);
+                break; // Stop after finding the first valid bundle
+            }
         }
-    }
 
-    if !system_cert_loaded {
-        debug!("Could not find system root certificates in common locations.");
+        if !system_cert_loaded {
+            debug!("Could not find system root certificates in common locations.");
+        }
+    } else {
+        info!("Loading system root certificates disabled via RUSTFS_TRUST_SYSTEM_CA");
     }
-
     if !cert_data.is_empty() {
         set_global_root_cert(cert_data).await;
         info!("Configured custom root certificates for inter-node communication");
@@ -88,9 +92,24 @@ async fn load_cert_file(path: &str, cert_data: &mut Vec<u8>, desc: &str) -> bool
     }
 }
 
-/// Recursively walk through the directory at `path` to find and load certificates
-/// matching `cert_name`. Loaded certificate data is appended to `cert_data`.
-/// This function uses an iterative approach with a stack to avoid deep recursion.
+/// Load the certificate file if its name matches `cert_name`.
+/// If it matches, the certificate data is appended to `cert_data`.
+///
+/// # Parameters
+/// - `entry`: The directory entry to check.
+/// - `cert_name`: The name of the certificate file to match.
+/// - `cert_data`: A mutable vector to append loaded certificate data.
+async fn load_if_matches(entry: &tokio::fs::DirEntry, cert_name: &str, cert_data: &mut Vec<u8>) {
+    let fname = entry.file_name().to_string_lossy().to_string();
+    if fname == cert_name {
+        let p = entry.path();
+        load_cert_file(&p.to_string_lossy(), cert_data, "certificate").await;
+    }
+}
+
+/// Search the directory at `path` and one level of subdirectories to find and load
+/// certificates matching `cert_name`. Loaded certificate data is appended to
+/// `cert_data`.
 /// # Parameters
 /// - `path`: The starting directory path to search for certificates.
 /// - `cert_name`: The name of the certificate file to look for.
@@ -99,22 +118,15 @@ async fn walk_dir(path: std::path::PathBuf, cert_name: &str, cert_data: &mut Vec
     if let Ok(mut rd) = tokio::fs::read_dir(&path).await {
         while let Ok(Some(entry)) = rd.next_entry().await {
             if let Ok(ft) = entry.file_type().await {
-                let p = entry.path();
                 if ft.is_file() {
-                    let fname = entry.file_name().to_string_lossy().to_string();
-                    if fname == cert_name {
-                        load_cert_file(&p.to_string_lossy(), cert_data, "certificate").await;
-                    }
+                    load_if_matches(&entry, cert_name, cert_data).await;
                 } else if ft.is_dir() {
                     // Only check direct subdirectories, no deeper recursion
-                    if let Ok(mut sub_rd) = tokio::fs::read_dir(&p).await {
+                    if let Ok(mut sub_rd) = tokio::fs::read_dir(&entry.path()).await {
                         while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
                             if let Ok(sub_ft) = sub_entry.file_type().await {
                                 if sub_ft.is_file() {
-                                    let sub_fname = sub_entry.file_name().to_string_lossy().to_string();
-                                    if sub_fname == cert_name {
-                                        load_cert_file(&sub_entry.path().to_string_lossy(), cert_data, "certificate").await;
-                                    }
+                                    load_if_matches(&sub_entry, cert_name, cert_data).await;
                                 }
                                 // Ignore subdirectories and symlinks in subdirs to limit to one level
                             }
@@ -122,23 +134,16 @@ async fn walk_dir(path: std::path::PathBuf, cert_name: &str, cert_data: &mut Vec
                     }
                 } else if ft.is_symlink() {
                     // Follow symlink and treat target as file or directory, but limit to one level
-                    if let Ok(meta) = tokio::fs::metadata(&p).await {
+                    if let Ok(meta) = tokio::fs::metadata(&entry.path()).await {
                         if meta.is_file() {
-                            let fname = entry.file_name().to_string_lossy().to_string();
-                            if fname == cert_name {
-                                load_cert_file(&p.to_string_lossy(), cert_data, "certificate").await;
-                            }
+                            load_if_matches(&entry, cert_name, cert_data).await;
                         } else if meta.is_dir() {
                             // Treat as directory but only check its direct contents
-                            if let Ok(mut sub_rd) = tokio::fs::read_dir(&p).await {
+                            if let Ok(mut sub_rd) = tokio::fs::read_dir(&entry.path()).await {
                                 while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
                                     if let Ok(sub_ft) = sub_entry.file_type().await {
                                         if sub_ft.is_file() {
-                                            let sub_fname = sub_entry.file_name().to_string_lossy().to_string();
-                                            if sub_fname == cert_name {
-                                                load_cert_file(&sub_entry.path().to_string_lossy(), cert_data, "certificate")
-                                                    .await;
-                                            }
+                                            load_if_matches(&sub_entry, cert_name, cert_data).await;
                                         }
                                         // Ignore deeper levels
                                     }
