@@ -212,6 +212,11 @@ impl NotificationSystem {
             return Ok(());
         }
 
+        // Save the modified configuration to storage
+        rustfs_ecstore::config::com::save_server_config(store, &new_config)
+            .await
+            .map_err(|e| NotificationError::SaveConfig(e.to_string()))?;
+
         info!("Configuration updated. Reloading system...");
         self.reload_config(new_config).await
     }
@@ -294,23 +299,35 @@ impl NotificationSystem {
     /// If the target configuration does not exist, it returns Ok(()) without making any changes.
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
         info!("Removing config for target {} of type {}", target_name, target_type);
-        self.update_config_and_reload(|config| {
-            let mut changed = false;
-            if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
-                if targets.remove(&target_name.to_lowercase()).is_some() {
-                    changed = true;
+        let config_result = self
+            .update_config_and_reload(|config| {
+                let mut changed = false;
+                if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
+                    if targets.remove(&target_name.to_lowercase()).is_some() {
+                        changed = true;
+                    }
+                    if targets.is_empty() {
+                        config.0.remove(target_type);
+                    }
                 }
-                if targets.is_empty() {
-                    config.0.remove(target_type);
+                if !changed {
+                    info!("Target {} of type {} not found, no changes made.", target_name, target_type);
                 }
-            }
-            if !changed {
-                info!("Target {} of type {} not found, no changes made.", target_name, target_type);
-            }
-            debug!("Config after remove: {:?}", config);
-            changed
-        })
-        .await
+                debug!("Config after remove: {:?}", config);
+                changed
+            })
+            .await;
+
+        if config_result.is_ok() {
+            let target_id = TargetID::new(target_name.to_string(), target_type.to_string());
+
+            // Remove from target list
+            let target_list = self.notifier.target_list();
+            let mut target_list_guard = target_list.write().await;
+            let _ = target_list_guard.remove_target_only(&target_id).await;
+        }
+
+        config_result
     }
 
     /// Enhanced event stream startup function, including monitoring and concurrency control
