@@ -183,6 +183,9 @@ export RUSTFS_ENABLE_PROFILING=false
 # Heal configuration queue size
 export RUSTFS_HEAL_QUEUE_SIZE=10000
 
+# rustfs trust system CA certificates
+export RUSTFS_TRUST_SYSTEM_CA=true
+
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
