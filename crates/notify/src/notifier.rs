@@ -39,6 +39,9 @@ impl Default for EventNotifier {
 
 impl EventNotifier {
     /// Creates a new EventNotifier
+    ///
+    /// # Returns
+    /// Returns a new instance of EventNotifier.
     pub fn new() -> Self {
         let max_inflight = rustfs_utils::get_env_usize(ENV_NOTIFY_SEND_CONCURRENCY, DEFAULT_NOTIFY_SEND_CONCURRENCY);
         EventNotifier {
@@ -48,7 +51,7 @@ impl EventNotifier {
         }
     }
 
-    ///Check whether a TargetID is still referenced by any bucket's rules.
+    /// Checks whether a TargetID is still referenced by any bucket's rules.
     ///
     /// # Arguments
     /// * `target_id` - The TargetID to check.
@@ -209,7 +212,7 @@ impl EventNotifier {
                     object_name: object_key.to_string(),
                     bucket_name: bucket_name.to_string(),
                     event_name,
-                    data: event_clone.clone().as_ref().clone(),
+                    data: event_clone.as_ref().clone(),
                 });
                 let handle = tokio::spawn(async move {
                     let _permit = match limiter.acquire_owned().await {

@@ -35,7 +35,7 @@ impl PatternRules {
     /// Add rules: Pattern and Target ID.
     /// If the schema already exists, add target_id to the existing TargetIdSet.
     ///
-    /// # arguments
+    /// # Arguments
     /// * `pattern` - The object name pattern.
     /// * `target_id` - The TargetID to associate with the pattern.
     pub fn add(&mut self, pattern: String, target_id: TargetID) {
@@ -44,10 +44,10 @@ impl PatternRules {
 
     /// Checks if there are any rules that match the given object name.
     ///
-    /// # arguments
+    /// # Arguments
     /// * `object_name` - The object name to match against the patterns.
     ///
-    /// # returns
+    /// # Returns
     /// `true` if any pattern matches the object name, otherwise `false`.
     pub fn match_simple(&self, object_name: &str) -> bool {
         self.rules.keys().any(|p| pattern::match_simple(p, object_name))
@@ -59,10 +59,10 @@ impl PatternRules {
     /// 1) Small collections are serialized directly to avoid rayon scheduling/merging overhead
     /// 2) When hitting, no longer temporarily allocate TargetIdSet for each rule, but directly extend
     ///
-    /// # arguments
+    /// # Arguments
     /// * `object_name` - The object name to match against the patterns.
     ///
-    /// # returns
+    /// # Returns
     /// A TargetIdSet containing all TargetIDs that match the object name.
     pub fn match_targets(&self, object_name: &str) -> TargetIdSet {
         let n = self.rules.len();
@@ -85,13 +85,6 @@ impl PatternRules {
         // Parallel path: Each thread accumulates a local set and finally merges it to reduce frequent allocations
         self.rules
             .par_iter()
-            // .filter_map(|(pattern_str, target_set)| {
-            //     if pattern::match_simple(pattern_str, object_name) {
-            //         Some(target_set.iter().cloned().collect::<TargetIdSet>())
-            //     } else {
-            //         None
-            //     }
-            // })
             .fold(TargetIdSet::new, |mut local, (pattern_str, target_set)| {
                 if pattern::match_simple(pattern_str, object_name) {
                     local.extend(target_set.iter().cloned());
@@ -110,10 +103,10 @@ impl PatternRules {
 
     /// Merge another PatternRules.
     /// Corresponding to Go's `Rules.Union`.
-    /// # arguments
+    /// # Arguments
     /// * `other` - The PatternRules to merge with.
     ///
-    /// # returns
+    /// # Returns
     /// A new PatternRules containing the union of both.
     pub fn union(&self, other: &Self) -> Self {
         let mut new_rules = self.clone();
@@ -128,10 +121,10 @@ impl PatternRules {
     /// Corresponding to Go's `Rules.Difference`.
     /// The result contains only the patterns and TargetIDs that are in `self` but not in `other`.
     ///
-    /// # arguments
+    /// # Arguments
     /// * `other` - The PatternRules to compare against.
     ///
-    /// # returns
+    /// # Returns
     /// A new PatternRules containing the difference.
     pub fn difference(&self, other: &Self) -> Self {
         let mut result_rules = HashMap::new();
@@ -152,6 +145,10 @@ impl PatternRules {
         PatternRules { rules: result_rules }
     }
 
+    /// Merge another PatternRules into self in place.
+    /// Corresponding to Go's `Rules.UnionInPlace`.
+    /// # Arguments
+    /// * `other` - The PatternRules to merge with.
     pub fn union_in_place(&mut self, other: &Self) {
         for (pattern, their_targets) in &other.rules {
             self.rules
@@ -161,6 +158,11 @@ impl PatternRules {
         }
     }
 
+    /// Calculate the difference from another PatternRules in place.
+    /// Corresponding to Go's `Rules.DifferenceInPlace`.
+    /// The result contains only the patterns and TargetIDs that are in `self` but not in `other`.
+    /// # Arguments
+    /// * `other` - The PatternRules to compare against.
     pub fn difference_in_place(&mut self, other: &Self) {
         self.rules.retain(|pattern, self_targets| {
             if let Some(other_targets) = other.rules.get(pattern) {
@@ -171,6 +173,10 @@ impl PatternRules {
         });
     }
 
+    /// Remove a pattern and its associated TargetID set from the PatternRules.
+    ///
+    /// # Arguments
+    /// * `pattern` - The pattern to remove.
     pub fn remove_pattern(&mut self, pattern: &str) -> bool {
         self.rules.remove(pattern).is_some()
     }

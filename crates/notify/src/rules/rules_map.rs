@@ -30,6 +30,9 @@ pub struct RulesMap {
 
 impl RulesMap {
     /// Create a new, empty RulesMap.
+    ///
+    /// # Returns
+    /// A new instance of RulesMap with an empty map and a total_events_mask set to 0.
     pub fn new() -> Self {
         Default::default()
     }
@@ -66,12 +69,11 @@ impl RulesMap {
 
     /// Merge another RulesMap.
     /// `RulesMap.Add(rulesMap2 RulesMap) corresponding to Go
+    ///
+    /// # Parameters
+    /// * `other_map` - The other RulesMap to be merged into the current one.
     pub fn add_map(&mut self, other_map: &Self) {
         for (event_name, other_pattern_rules) in &other_map.map {
-            // let self_pattern_rules = self.map.entry(*event_name).or_default();
-            // // PatternRules::union Returns the new PatternRules, we need to modify the existing ones
-            // let merged_rules = self_pattern_rules.union(other_pattern_rules);
-            // *self_pattern_rules = merged_rules;
             self.map.entry(*event_name).or_default().union_in_place(other_pattern_rules);
         }
         // Directly merge two masks.
@@ -81,11 +83,13 @@ impl RulesMap {
     /// Remove another rule defined in the RulesMap from the current RulesMap.
     ///
     /// After the rule is removed, `total_events_mask` is recalculated to ensure its accuracy.
+    ///
+    /// # Parameters
+    /// * `other_map` - The other RulesMap containing rules to be removed from the current one.
     pub fn remove_map(&mut self, other_map: &Self) {
         let mut events_to_remove = Vec::new();
         for (event_name, self_pattern_rules) in &mut self.map {
             if let Some(other_pattern_rules) = other_map.map.get(event_name) {
-                // *self_pattern_rules = self_pattern_rules.difference(other_pattern_rules);
                 self_pattern_rules.difference_in_place(other_pattern_rules);
                 if self_pattern_rules.is_empty() {
                     events_to_remove.push(*event_name);
@@ -103,6 +107,9 @@ impl RulesMap {
     ///
     /// This method uses a bitmask for a quick check of O(1) complexity.
     /// `event_name` can be a compound type, such as `ObjectCreatedAll`.
+    ///
+    /// # Parameters
+    /// * `event_name` - The event name to check for subscribers.
     pub fn has_subscriber(&self, event_name: &EventName) -> bool {
         // event_name.mask() will handle compound events correctly
         (self.total_events_mask & event_name.mask()) != 0
@@ -113,20 +120,19 @@ impl RulesMap {
     /// # Notice
     /// The `event_name` parameter should be a specific, non-compound event type.
     /// Because this is taken from the `Event` object that actually occurs.
+    ///
+    /// # Parameters
+    /// * `event_name` - The specific event name to match against.
+    /// * `object_key` - The object key to match against the patterns in the rules.
+    ///
+    /// # Returns
+    /// * A set of TargetIDs that match the given event and object key.
     pub fn match_rules(&self, event_name: EventName, object_key: &str) -> TargetIdSet {
         // Use bitmask to quickly determine whether there is a matching rule
         if (self.total_events_mask & event_name.mask()) == 0 {
             return TargetIdSet::new(); // No matching rules
         }
 
-        // // First try to directly match the event name
-        // let pattern_rules = self.map.get(&event_name);
-        // if let Some(pattern_rules) = pattern_rules {
-        //     let targets = pattern_rules.match_targets(object_key);
-        //     if !targets.is_empty() {
-        //         return targets;
-        //     }
-        // }
         // In Go, RulesMap[eventName] returns empty rules if the key doesn't exist.
         // Rust's HashMap::get returns Option, so missing key means no rules.
         // Compound events like ObjectCreatedAll are expanded into specific events during add_rule_config.
@@ -140,6 +146,9 @@ impl RulesMap {
     }
 
     /// Check if RulesMap is empty.
+    ///
+    /// # Returns
+    /// * `true` if there are no rules in the map; `false` otherwise
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -223,6 +232,9 @@ impl RulesMap {
     /// Iterate all EventName keys contained in this RulesMap.
     ///
     /// Used by snapshot compilation to compute bucket event_mask.
+    ///
+    /// # Returns
+    /// An iterator over all EventName keys in the RulesMap.
     #[inline]
     pub fn iter_events(&self) -> impl Iterator<Item = EventName> + '_ {
         // `inner()` is already used by config.rs, so we reuse it here.

@@ -59,8 +59,8 @@ pub const ENV_NOTIFY_SEND_CONCURRENCY: &str = "RUSTFS_NOTIFY_SEND_CONCURRENCY";
 
 /// Default concurrency for send operations in the notification system
 /// This value is used if the environment variable `RUSTFS_NOTIFY_SEND_CONCURRENCY` is not set.
-/// It defines how many send operations can be processed in parallel by the notification system at any given
-/// Adjust this value based on your system's capabilities and expected load time.
+/// It defines how many send operations can be processed in parallel by the notification system at any given time.
+/// Adjust this value based on your system's capabilities and expected load.
 pub const DEFAULT_NOTIFY_SEND_CONCURRENCY: usize = 64;
 
 #[allow(dead_code)]

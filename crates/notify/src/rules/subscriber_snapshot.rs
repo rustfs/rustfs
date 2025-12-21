@@ -34,8 +34,8 @@ pub trait RulesContainer {
 
 /// Represents a bucket's notification subscription view snapshot (immutable).
 ///
-/// \- `event_mask`: Quickly determine whether there is a subscription to a certain type of event (bitset/flags).
-/// \- `rules`: precise rule mapping (prefix/suffix/pattern -> targets).
+/// - `event_mask`: Quickly determine whether there is a subscription to a certain type of event (bitset/flags).
+/// - `rules`: precise rule mapping (prefix/suffix/pattern -> targets).
 ///
 /// The read path only reads this snapshot to ensure consistency.
 #[derive(Debug, Clone)]
@@ -51,22 +51,40 @@ impl<R> BucketRulesSnapshot<R>
 where
     R: RulesContainer + ?Sized,
 {
+    /// Create an empty snapshot with no subscribed events and no rules.
+    ///
+    /// # Arguments
+    /// * `rules` - An Arc to a rules container (can be an empty container).
+    ///
+    /// # Returns
+    /// An instance of `BucketRulesSnapshot` with an empty event mask.
     #[inline]
     pub fn empty(rules: Arc<R>) -> Self {
         Self { event_mask: 0, rules }
     }
 
+    /// Check if the snapshot has any subscribers for the specified event.
+    ///
+    /// # Arguments
+    /// * `event` - The event name to check for subscriptions.
+    ///
+    /// # Returns
+    /// `true` if there are subscribers for the event, `false` otherwise.
     #[inline]
     pub fn has_event(&self, event: &EventName) -> bool {
         (self.event_mask & event.mask()) != 0
     }
 
+    /// Check if the snapshot is empty (no subscribed events or rules).
+    ///
+    /// # Returns
+    /// `true` if the snapshot is empty, `false` otherwise.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.event_mask == 0 || self.rules.is_empty()
     }
 
-    /// \[debug\] Assert that `event_mask` is consistent with the event declared in `rules`.
+    /// [debug] Assert that `event_mask` is consistent with the event declared in `rules`.
     ///
     /// Constraints:
     /// - only runs in debug builds (release incurs no cost).

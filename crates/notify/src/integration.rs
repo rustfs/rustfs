@@ -350,8 +350,6 @@ impl NotificationSystem {
             .await;
 
         if config_result.is_ok() {
-            let target_id = TargetID::new(target_name.to_string(), target_type.to_string());
-
             // Remove from target list
             let target_list = self.notifier.target_list();
             let mut target_list_guard = target_list.write().await;

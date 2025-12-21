@@ -25,6 +25,8 @@ pub struct NotificationSystemSubscriberView {
 
 impl NotificationSystemSubscriberView {
     /// Creates a new NotificationSystemSubscriberView with an empty SubscriberIndex.
+    ///
+    /// Returns a new instance of NotificationSystemSubscriberView.
     pub fn new() -> Self {
         Self {
             index: SubscriberIndex::default(),
@@ -47,17 +49,24 @@ impl NotificationSystemSubscriberView {
     /// Builds and atomically replaces a bucket's subscription snapshot from the configuration.
     ///
     /// Core principle: masks and rules are calculated and stored together in the same update.
+    ///
+    /// # Arguments
+    /// * `bucket` - The name of the bucket to update.
+    /// * `cfg` - The bucket notification configuration to compile into a snapshot.
     pub fn apply_bucket_config(&self, bucket: &str, cfg: &BucketNotificationConfig) {
-        // \*It is recommended to merge compile into one function to ensure the same origin.
+        // *It is recommended to merge compile into one function to ensure the same origin.
         let snapshot: BucketRulesSnapshot<DynRulesContainer> = cfg.compile_snapshot();
 
-        // \*debug to prevent inconsistencies from being introduced when modifying the compile logic in the future.
+        // *debug to prevent inconsistencies from being introduced when modifying the compile logic in the future.
         snapshot.debug_assert_mask_consistent();
 
         self.index.store_snapshot(bucket, snapshot);
     }
 
     /// Clears a bucket's subscription snapshot.
+    ///
+    /// #Arguments
+    /// * `bucket` - The name of the bucket to clear.
     #[inline]
     pub fn clear_bucket(&self, bucket: &str) {
         self.index.clear_bucket(bucket);

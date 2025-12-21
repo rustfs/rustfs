@@ -38,6 +38,12 @@ impl fmt::Debug for SubscriberIndex {
 }
 
 impl SubscriberIndex {
+    /// Create a new SubscriberIndex.
+    ///
+    /// #Arguments
+    /// * `empty_rules` - An Arc to an empty rules container used for empty snapshots
+    ///
+    /// Returns a new instance of SubscriberIndex.
     pub fn new(empty_rules: Arc<DynRulesContainer>) -> Self {
         Self {
             inner: ShardedHashMap::new(64),
@@ -47,6 +53,11 @@ impl SubscriberIndex {
 
     /// Get the current snapshot of a bucket.
     /// If it does not exist, return empty snapshot.
+    ///
+    /// #Arguments
+    /// * `bucket` - The name of the bucket to load.
+    ///
+    /// Returns the snapshot reference for the specified bucket.
     pub fn load_snapshot(&self, bucket: &str) -> BucketSnapshotRef {
         match self.inner.get(&bucket.to_string()) {
             Some(cell) => cell.load_full(),
@@ -56,6 +67,13 @@ impl SubscriberIndex {
 
     /// Quickly determine whether the bucket has a subscription to an event.
     /// This judgment can be consistent with subsequent rule matching when reading the same snapshot.
+    ///
+    /// #Arguments
+    /// * `bucket` - The name of the bucket to check.
+    /// * `event` - The event name to check for subscriptions.
+    ///
+    /// Returns `true` if there are subscribers for the event, `false` otherwise.
+    #[inline]
     pub fn has_subscriber(&self, bucket: &str, event: &EventName) -> bool {
         let snap = self.load_snapshot(bucket);
         if snap.event_mask == 0 {
@@ -66,8 +84,12 @@ impl SubscriberIndex {
 
     /// Atomically update a bucket's snapshot (whole package replacement).
     ///
-    /// \- The caller first builds the complete `BucketRulesSnapshot` (including event\_mask and rules).
-    /// \- This method ensures that the read path will not observe intermediate states.
+    /// - The caller first builds the complete `BucketRulesSnapshot` (including event\_mask and rules).
+    /// - This method ensures that the read path will not observe intermediate states.
+    ///
+    /// #Arguments
+    /// * `bucket` - The name of the bucket to update.
+    /// * `new_snapshot` - The new snapshot to store for the bucket.
     pub fn store_snapshot(&self, bucket: &str, new_snapshot: BucketRulesSnapshot<DynRulesContainer>) {
         let key = bucket.to_string();
 
@@ -82,6 +104,9 @@ impl SubscriberIndex {
     }
 
     /// Delete the bucket's subscription view (make it empty).
+    ///
+    /// #Arguments
+    /// * `bucket` - The name of the bucket to clear.
     pub fn clear_bucket(&self, bucket: &str) {
         if let Some(cell) = self.inner.get(&bucket.to_string()) {
             cell.store(Arc::new(BucketRulesSnapshot::empty(self.empty_rules.clone())));
