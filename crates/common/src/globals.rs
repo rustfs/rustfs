@@ -24,9 +24,14 @@ pub static GLOBAL_RUSTFS_HOST: LazyLock<RwLock<String>> = LazyLock::new(|| RwLoc
 pub static GLOBAL_RUSTFS_PORT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("9000".to_string()));
 pub static GLOBAL_RUSTFS_ADDR: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
 pub static GLOBAL_CONN_MAP: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+pub static GLOBAL_ROOT_CERT: LazyLock<RwLock<Option<Vec<u8>>>> = LazyLock::new(|| RwLock::new(None));
 
 pub async fn set_global_addr(addr: &str) {
     *GLOBAL_RUSTFS_ADDR.write().await = addr.to_string();
+}
+
+pub async fn set_global_root_cert(cert: Vec<u8>) {
+    *GLOBAL_ROOT_CERT.write().await = Some(cert);
 }
 
 /// Evict a stale/dead connection from the global connection cache.
