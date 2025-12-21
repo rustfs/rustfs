@@ -101,19 +101,11 @@ jobs:
         uses: crate-ci/typos@master
 
   test-and-lint:
-    name: Test and Lint (${{ matrix.arch }})
+    name: Test and Lint
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubicloud-standard-4
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubicloud-standard-4
-    #          - arch: aarch64
-    #            runner: ubicloud-standard-4-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -122,7 +114,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-test-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          cache-shared-key: ci-test-${{ hashFiles('**/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -141,19 +133,11 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   e2e-tests:
-    name: End-to-End Tests (${{ matrix.arch }})
+    name: End-to-End Tests
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubicloud-standard-4
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubicloud-standard-4
-    #          - arch: aarch64
-    #            runner: ubicloud-standard-4-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
