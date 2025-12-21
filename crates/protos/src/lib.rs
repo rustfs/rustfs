@@ -19,12 +19,12 @@ use std::{error::Error, time::Duration};
 
 pub use generated::*;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::globals::{GLOBAL_CONN_MAP, evict_connection};
+use rustfs_common::globals::{GLOBAL_CONN_MAP, GLOBAL_ROOT_CERT, evict_connection};
 use tonic::{
     Request, Status,
     metadata::MetadataValue,
     service::interceptor::InterceptedService,
-    transport::{Channel, Endpoint},
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
 use tracing::{debug, warn};
 
@@ -56,7 +56,7 @@ const RPC_TIMEOUT_SECS: u64 = 30;
 async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {}", addr);
 
-    let connector = Endpoint::from_shared(addr.to_string())?
+    let mut connector = Endpoint::from_shared(addr.to_string())?
         // Fast connection timeout for dead peer detection
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         // TCP-level keepalive - OS will probe connection
@@ -69,6 +69,18 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         .keep_alive_while_idle(true)
         // Overall timeout for any RPC - fail fast on unresponsive peers
         .timeout(Duration::from_secs(RPC_TIMEOUT_SECS));
+
+    if addr.starts_with("https://") {
+        let root_cert = GLOBAL_ROOT_CERT.read().await;
+        if let Some(cert_pem) = root_cert.as_ref() {
+            let ca = Certificate::from_pem(cert_pem);
+            let tls = ClientTlsConfig::new().ca_certificate(ca);
+            connector = connector.tls_config(tls)?;
+            debug!("Configured TLS with custom root certificate for: {}", addr);
+        } else {
+            debug!("Using system root certificates for TLS: {}", addr);
+        }
+    }
 
     let channel = connector.connect().await?;
 

@@ -37,7 +37,8 @@ use rustfs_ahm::{
     Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
     scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
-use rustfs_common::globals::set_global_addr;
+use rustfs_common::globals::{set_global_addr, set_global_root_cert};
+use rustfs_config::RUSTFS_TLS_CERT;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use rustfs_ecstore::bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication};
 use rustfs_ecstore::config as ecconfig;
@@ -97,6 +98,67 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     // Parse the obtained parameters
     let opt = config::Opt::parse();
+
+    if let Some(tls_path) = &opt.tls_path {
+        let mut cert_data = Vec::new();
+
+        // Try rustfs_cert.pem
+        let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
+        if let Ok(data) = tokio::fs::read(&cert_path).await {
+            cert_data.extend(data);
+            cert_data.push(b'\n'); // Ensure separation
+            info!("Loaded certificate from {}", cert_path);
+        } else {
+            debug!("Certificate file not found: {}", cert_path);
+        }
+
+        // Try public.crt (common CA name)
+        let ca_path = format!("{}/public.crt", tls_path);
+        if let Ok(data) = tokio::fs::read(&ca_path).await {
+            cert_data.extend(data);
+            cert_data.push(b'\n');
+            info!("Loaded CA certificate from {}", ca_path);
+        }
+
+        // Try ca.crt (common CA name)
+        let ca_path2 = format!("{}/ca.crt", tls_path);
+        if let Ok(data) = tokio::fs::read(&ca_path2).await {
+            cert_data.extend(data);
+            cert_data.push(b'\n');
+            info!("Loaded CA certificate from {}", ca_path2);
+        }
+
+        // Attempt to load system root certificates to maintain trust for public CAs
+        // This is important when mixing self-signed internal certs with public external certs
+        let system_ca_paths = [
+            "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Alpine
+            "/etc/pki/tls/certs/ca-bundle.crt",   // Fedora/RHEL/CentOS
+            "/etc/ssl/ca-bundle.pem",             // OpenSUSE
+            "/etc/pki/tls/cacert.pem",            // OpenELEC
+        ];
+
+        let mut system_cert_loaded = false;
+        for path in system_ca_paths {
+            if tokio::fs::metadata(path).await.is_ok() {
+                if let Ok(data) = tokio::fs::read(path).await {
+                    cert_data.extend(data);
+                    cert_data.push(b'\n');
+                    info!("Loaded system root certificates from {}", path);
+                    system_cert_loaded = true;
+                    break; // Stop after finding the first valid bundle
+                }
+            }
+        }
+
+        if !system_cert_loaded {
+            debug!("Could not find system root certificates in common locations.");
+        }
+
+        if !cert_data.is_empty() {
+            set_global_root_cert(cert_data).await;
+            info!("Configured custom root certificates for inter-node communication");
+        }
+    }
 
     // Initialize the configuration
     init_license(opt.license.clone());
