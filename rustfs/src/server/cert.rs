@@ -29,10 +29,12 @@ pub(crate) async fn init_cert(tls_path: &String) {
     walk_dir(std::path::PathBuf::from(tls_path), RUSTFS_TLS_CERT, &mut cert_data).await;
 
     // Try public.crt (common CA name)
-    load_cert_file(&format!("{tls_path}/{RUSTFS_PUBLIC_CERT}"), &mut cert_data, "CA certificate").await;
+    let public_cert_path = std::path::Path::new(tls_path).join(RUSTFS_PUBLIC_CERT);
+    load_cert_file(public_cert_path.to_str().unwrap_or_default(), &mut cert_data, "CA certificate").await;
 
     // Try ca.crt (common CA name)
-    load_cert_file(&format!("{tls_path}/{RUSTFS_CA_CERT}"), &mut cert_data, "CA certificate").await;
+    let ca_cert_path = std::path::Path::new(tls_path).join(RUSTFS_CA_CERT);
+    load_cert_file(ca_cert_path.to_str().unwrap_or_default(), &mut cert_data, "CA certificate").await;
 
     // Attempt to load system root certificates to maintain trust for public CAs
     // This is important when mixing self-signed internal certs with public external certs
@@ -52,6 +54,7 @@ pub(crate) async fn init_cert(tls_path: &String) {
     for path in system_ca_paths {
         if load_cert_file(path, &mut cert_data, "system root certificates").await {
             system_cert_loaded = true;
+            info!("Loaded system root certificates from {}", path);
             break; // Stop after finding the first valid bundle
         }
     }
@@ -76,11 +79,11 @@ async fn load_cert_file(path: &str, cert_data: &mut Vec<u8>, desc: &str) -> bool
             info!("Loaded {} from {}", desc, path);
             true
         } else {
-            info!("Failed to read {} from {}", desc, path);
+            debug!("Failed to read {} from {}", desc, path);
             false
         }
     } else {
-        info!("{} file not found at {}", desc, path);
+        debug!("{} file not found at {}", desc, path);
         false
     }
 }
@@ -93,25 +96,60 @@ async fn load_cert_file(path: &str, cert_data: &mut Vec<u8>, desc: &str) -> bool
 /// - `cert_name`: The name of the certificate file to look for.
 /// - `cert_data`: A mutable vector to append loaded certificate data.
 async fn walk_dir(path: std::path::PathBuf, cert_name: &str, cert_data: &mut Vec<u8>) {
-    let mut stack = vec![path];
-
-    while let Some(curr) = stack.pop() {
-        if let Ok(mut rd) = tokio::fs::read_dir(&curr).await {
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                if let Ok(ft) = entry.file_type().await {
-                    let p = entry.path();
-                    if ft.is_file() {
-                        let fname = entry.file_name().to_string_lossy().to_string();
-                        if fname == cert_name {
-                            load_cert_file(&p.to_string_lossy(), cert_data, "certificate").await;
+    if let Ok(mut rd) = tokio::fs::read_dir(&path).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if let Ok(ft) = entry.file_type().await {
+                let p = entry.path();
+                if ft.is_file() {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    if fname == cert_name {
+                        load_cert_file(&p.to_string_lossy(), cert_data, "certificate").await;
+                    }
+                } else if ft.is_dir() {
+                    // Only check direct subdirectories, no deeper recursion
+                    if let Ok(mut sub_rd) = tokio::fs::read_dir(&p).await {
+                        while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
+                            if let Ok(sub_ft) = sub_entry.file_type().await {
+                                if sub_ft.is_file() {
+                                    let sub_fname = sub_entry.file_name().to_string_lossy().to_string();
+                                    if sub_fname == cert_name {
+                                        load_cert_file(&sub_entry.path().to_string_lossy(), cert_data, "certificate").await;
+                                    }
+                                }
+                                // Ignore subdirectories and symlinks in subdirs to limit to one level
+                            }
                         }
-                    } else if ft.is_dir() {
-                        stack.push(p);
+                    }
+                } else if ft.is_symlink() {
+                    // Follow symlink and treat target as file or directory, but limit to one level
+                    if let Ok(meta) = tokio::fs::metadata(&p).await {
+                        if meta.is_file() {
+                            let fname = entry.file_name().to_string_lossy().to_string();
+                            if fname == cert_name {
+                                load_cert_file(&p.to_string_lossy(), cert_data, "certificate").await;
+                            }
+                        } else if meta.is_dir() {
+                            // Treat as directory but only check its direct contents
+                            if let Ok(mut sub_rd) = tokio::fs::read_dir(&p).await {
+                                while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
+                                    if let Ok(sub_ft) = sub_entry.file_type().await {
+                                        if sub_ft.is_file() {
+                                            let sub_fname = sub_entry.file_name().to_string_lossy().to_string();
+                                            if sub_fname == cert_name {
+                                                load_cert_file(&sub_entry.path().to_string_lossy(), cert_data, "certificate")
+                                                    .await;
+                                            }
+                                        }
+                                        // Ignore deeper levels
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-        } else {
-            debug!("Certificate directory not found: {}", curr.display());
         }
+    } else {
+        debug!("Certificate directory not found: {}", path.display());
     }
 }

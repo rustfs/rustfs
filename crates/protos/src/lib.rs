@@ -15,11 +15,9 @@
 #[allow(unsafe_code)]
 mod generated;
 
-use std::{error::Error, time::Duration};
-
-pub use generated::*;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_common::globals::{GLOBAL_CONN_MAP, GLOBAL_ROOT_CERT, evict_connection};
+use std::{error::Error, time::Duration};
 use tonic::{
     Request, Status,
     metadata::MetadataValue,
@@ -27,6 +25,8 @@ use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
 use tracing::{debug, warn};
+
+pub use generated::*;
 
 // Default 100 MB
 pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
@@ -79,6 +79,12 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
             debug!("Configured TLS with custom root certificate for: {}", addr);
         } else {
             debug!("Using system root certificates for TLS: {}", addr);
+        }
+    } else {
+        // Custom root certificates are configured but will be ignored for non-HTTPS addresses.
+        let root_cert = GLOBAL_ROOT_CERT.read().await;
+        if root_cert.is_some() {
+            warn!("Custom root certificates are configured but not used because the address does not use HTTPS: {addr}");
         }
     }
 

@@ -98,11 +98,6 @@ async fn async_main() -> Result<()> {
     // Parse the obtained parameters
     let opt = config::Opt::parse();
 
-    // Initialize TLS if a certificate path is provided
-    if let Some(tls_path) = &opt.tls_path {
-        init_cert(tls_path).await
-    }
-
     // Initialize the configuration
     init_license(opt.license.clone());
 
@@ -129,6 +124,11 @@ async fn async_main() -> Result<()> {
 
     // Initialize performance profiling if enabled
     profiling::init_from_env().await;
+
+    // Initialize TLS if a certificate path is provided
+    if let Some(tls_path) = &opt.tls_path {
+        init_cert(tls_path).await
+    }
 
     // Run parameters
     match run(opt).await {

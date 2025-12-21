@@ -95,7 +95,7 @@ pub const RUSTFS_TLS_CERT: &str = "rustfs_cert.pem";
 /// Default value: public.crt
 pub const RUSTFS_PUBLIC_CERT: &str = "public.crt";
 
-/// ca.crt
+/// Default CA certificate filename for rustfs
 /// This is the default CA certificate filename for rustfs.
 /// It is used to store the CA certificate of the application.
 /// Default value: ca.crt
