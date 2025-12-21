@@ -27,7 +27,7 @@ env:
 
 jobs:
   build-helm-package:
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     # Only run on successful builds triggered by tag pushes (version format: x.y.z or x.y.z-suffix)
     if: |
       github.event.workflow_run.conclusion == 'success' && 
@@ -63,7 +63,7 @@ jobs:
           retention-days: 1
 
   publish-helm-package:
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     needs: [ build-helm-package ]
 
     steps:

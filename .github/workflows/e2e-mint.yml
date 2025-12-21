@@ -37,7 +37,7 @@ env:
 
 jobs:
   mint-single:
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     timeout-minutes: 40
     steps:
       - name: Checkout
@@ -114,7 +114,7 @@ jobs:
   mint-multi:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.run-multi == 'true'
     needs: mint-single
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     timeout-minutes: 60
     steps:
       - name: Checkout
