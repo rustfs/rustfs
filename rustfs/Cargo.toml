@@ -144,6 +144,7 @@ pprof = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
+serial_test = { workspace = true }
 
 [build-dependencies]
 http.workspace = true

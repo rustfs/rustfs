@@ -7081,6 +7081,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "serial_test",
  "shadow-rs",
  "socket2 0.6.1",
  "subtle",
