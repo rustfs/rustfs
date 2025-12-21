@@ -51,6 +51,18 @@ pub const ENV_NOTIFY_TARGET_STREAM_CONCURRENCY: &str = "RUSTFS_NOTIFY_TARGET_STR
 /// Adjust this value based on your system's capabilities and expected load.
 pub const DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY: usize = 20;
 
+/// Name of the environment variable that configures send concurrency.
+/// Controls how many send operations are processed in parallel by the notification system.
+/// Defaults to [`DEFAULT_NOTIFY_SEND_CONCURRENCY`] if not set.
+/// Example: `RUSTFS_NOTIFY_SEND_CONCURRENCY=64`.
+pub const ENV_NOTIFY_SEND_CONCURRENCY: &str = "RUSTFS_NOTIFY_SEND_CONCURRENCY";
+
+/// Default concurrency for send operations in the notification system
+/// This value is used if the environment variable `RUSTFS_NOTIFY_SEND_CONCURRENCY` is not set.
+/// It defines how many send operations can be processed in parallel by the notification system at any given time.
+/// Adjust this value based on your system's capabilities and expected load.
+pub const DEFAULT_NOTIFY_SEND_CONCURRENCY: usize = 64;
+
 #[allow(dead_code)]
 pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS];
 

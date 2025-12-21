@@ -60,8 +60,9 @@ impl TargetFactory for WebhookTargetFactory {
         let endpoint = config
             .lookup(WEBHOOK_ENDPOINT)
             .ok_or_else(|| TargetError::Configuration("Missing webhook endpoint".to_string()))?;
-        let endpoint_url = Url::parse(&endpoint)
-            .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {e} (value: '{endpoint}')")))?;
+        let parsed_endpoint = endpoint.trim();
+        let endpoint_url = Url::parse(parsed_endpoint)
+            .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {e} (value: '{parsed_endpoint}')")))?;
 
         let args = WebhookArgs {
             enable: true, // If we are here, it's already enabled.
