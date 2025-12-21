@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #[cfg(test)]
-#[allow(clippy::unsafe_op_in_unsafe_fn)]
+#[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
     use crate::config::Opt;
     use clap::Parser;
