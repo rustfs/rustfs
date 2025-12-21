@@ -55,20 +55,48 @@ impl PatternRules {
 
     /// Returns all TargetIDs that match the object name.
     ///
+    /// Performance optimization points:
+    /// 1) Small collections are serialized directly to avoid rayon scheduling/merging overhead
+    /// 2) When hitting, no longer temporarily allocate TargetIdSet for each rule, but directly extend
+    ///
     /// # arguments
     /// * `object_name` - The object name to match against the patterns.
     ///
     /// # returns
     /// A TargetIdSet containing all TargetIDs that match the object name.
     pub fn match_targets(&self, object_name: &str) -> TargetIdSet {
+        let n = self.rules.len();
+        if n == 0 {
+            return TargetIdSet::new();
+        }
+
+        // Experience Threshold: Serial is usually faster below this value (can be adjusted after benchmarking)
+        const PAR_THRESHOLD: usize = 128;
+
+        if n < PAR_THRESHOLD {
+            let mut out = TargetIdSet::new();
+            for (pattern_str, target_set) in self.rules.iter() {
+                if pattern::match_simple(pattern_str, object_name) {
+                    out.extend(target_set.iter().cloned());
+                }
+            }
+            return out;
+        }
+        // Parallel path: Each thread accumulates a local set and finally merges it to reduce frequent allocations
         self.rules
             .par_iter()
-            .filter_map(|(pattern_str, target_set)| {
+            // .filter_map(|(pattern_str, target_set)| {
+            //     if pattern::match_simple(pattern_str, object_name) {
+            //         Some(target_set.iter().cloned().collect::<TargetIdSet>())
+            //     } else {
+            //         None
+            //     }
+            // })
+            .fold(TargetIdSet::new, |mut local, (pattern_str, target_set)| {
                 if pattern::match_simple(pattern_str, object_name) {
-                    Some(target_set.iter().cloned().collect::<TargetIdSet>())
-                } else {
-                    None
+                    local.extend(target_set.iter().cloned());
                 }
+                local
             })
             .reduce(TargetIdSet::new, |mut acc, set| {
                 acc.extend(set);

@@ -120,21 +120,20 @@ impl RulesMap {
         }
 
         // // First try to directly match the event name
-        // if let Some(pattern_rules) = self.map.get(&event_name) {
+        // let pattern_rules = self.map.get(&event_name);
+        // if let Some(pattern_rules) = pattern_rules {
         //     let targets = pattern_rules.match_targets(object_key);
         //     if !targets.is_empty() {
         //         return targets;
         //     }
         // }
-        // Go's RulesMap[eventName] is directly retrieved, and if it does not exist, it is empty Rules.
-        // Rust's HashMap::get returns Option. If the event name does not exist, there is no rule.
-        // Compound events (such as ObjectCreatedAll) have been expanded as a single event when add_rule_config.
-        // Therefore, a single event name should be used when querying.
-        // If event_name itself is a single type, look it up directly.
-        // If event_name is a compound type, Go's logic is expanded when added.
-        // Here match_rules should receive events that may already be single.
-        // If the caller passes in a compound event, it should expand itself or handle this function first.
-        // Assume that event_name is already a specific event that can be used for searching.
+        // In Go, RulesMap[eventName] returns empty rules if the key doesn't exist.
+        // Rust's HashMap::get returns Option, so missing key means no rules.
+        // Compound events like ObjectCreatedAll are expanded into specific events during add_rule_config.
+        // Thus, queries should use specific event names.
+        // If event_name is compound, expansion happens at addition time.
+        // match_rules assumes event_name is already a specific event for lookup.
+        // Callers should expand compound events before calling this method.
         self.map
             .get(&event_name)
             .map_or_else(TargetIdSet::new, |pr| pr.match_targets(object_key))
@@ -157,6 +156,9 @@ impl RulesMap {
     }
 
     /// Returns a clone of internal rules for use in scenarios such as BucketNotificationConfig::validate.
+    ///
+    /// # Returns
+    /// A reference to the internal HashMap of EventName to PatternRules.
     pub fn inner(&self) -> &HashMap<EventName, PatternRules> {
         &self.map
     }
@@ -172,6 +174,10 @@ impl RulesMap {
     }
 
     /// Remove rules and optimize performance
+    ///
+    /// # Parameters
+    /// * `event_name` - The EventName from which to remove the rule.
+    /// * `pattern` - The pattern of the rule to be removed.
     #[allow(dead_code)]
     pub fn remove_rule(&mut self, event_name: &EventName, pattern: &str) {
         let mut remove_event = false;
@@ -190,7 +196,10 @@ impl RulesMap {
         self.recalculate_mask(); // Delay calculation mask
     }
 
-    /// Batch Delete Rules
+    /// Batch Delete Rules and Optimize Performance
+    ///
+    /// # Parameters
+    /// * `event_names` - A slice of EventNames to be removed.
     #[allow(dead_code)]
     pub fn remove_rules(&mut self, event_names: &[EventName]) {
         for event_name in event_names {
@@ -200,9 +209,24 @@ impl RulesMap {
     }
 
     /// Update rules and optimize performance
+    ///
+    /// # Parameters
+    /// * `event_name` - The EventName to update.
+    /// * `pattern` - The pattern of the rule to be updated.
+    /// * `target_id` - The TargetID to be added.
     #[allow(dead_code)]
     pub fn update_rule(&mut self, event_name: EventName, pattern: String, target_id: TargetID) {
         self.map.entry(event_name).or_default().add(pattern, target_id);
         self.total_events_mask |= event_name.mask(); // Update only the relevant bitmask
+    }
+
+    /// Iterate all EventName keys contained in this RulesMap.
+    ///
+    /// Used by snapshot compilation to compute bucket event_mask.
+    #[inline]
+    pub fn iter_events(&self) -> impl Iterator<Item = EventName> + '_ {
+        // `inner()` is already used by config.rs, so we reuse it here.
+        // If the key type is `EventName`, `.copied()` is the cheapest way to return values.
+        self.inner().keys().copied()
     }
 }

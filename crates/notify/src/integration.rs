@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::{
     Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
 };
@@ -104,6 +105,8 @@ pub struct NotificationSystem {
     concurrency_limiter: Arc<Semaphore>,
     /// Monitoring indicators
     metrics: Arc<NotificationMetrics>,
+    /// Subscriber view
+    subscriber_view: NotificationSystemSubscriberView,
 }
 
 impl NotificationSystem {
@@ -112,6 +115,7 @@ impl NotificationSystem {
         let concurrency_limiter =
             rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
         NotificationSystem {
+            subscriber_view: NotificationSystemSubscriberView::new(),
             notifier: Arc::new(EventNotifier::new()),
             registry: Arc::new(TargetRegistry::new()),
             config: Arc::new(RwLock::new(config)),
@@ -188,8 +192,11 @@ impl NotificationSystem {
     }
 
     /// Checks if there are active subscribers for the given bucket and event name.
-    pub async fn has_subscriber(&self, bucket: &str, event_name: &EventName) -> bool {
-        self.notifier.has_subscriber(bucket, event_name).await
+    pub async fn has_subscriber(&self, bucket: &str, event: &EventName) -> bool {
+        if !self.subscriber_view.has_subscriber(bucket, event) {
+            return false;
+        }
+        self.notifier.has_subscriber(bucket, event).await
     }
 
     async fn update_config_and_reload<F>(&self, mut modifier: F) -> Result<(), NotificationError>
@@ -282,8 +289,14 @@ impl NotificationSystem {
     }
 
     /// Removes all notification configurations for a bucket.
-    pub async fn remove_bucket_notification_config(&self, bucket_name: &str) {
-        self.notifier.remove_rules_map(bucket_name).await;
+    /// If the configuration is successfully removed, the entire notification system will be automatically reloaded.
+    ///
+    /// # Arguments
+    /// * `bucket` - The name of the bucket whose notification configuration is to be removed.
+    ///
+    pub async fn remove_bucket_notification_config(&self, bucket: &str) {
+        self.subscriber_view.clear_bucket(bucket);
+        self.notifier.remove_rules_map(bucket).await;
     }
 
     /// Removes a Target configuration.
@@ -412,10 +425,6 @@ impl NotificationSystem {
                     // let target_box = target.clone_dyn();
                     let target_arc = Arc::from(target.clone_dyn());
 
-                    // Add a reference to the monitoring metrics
-                    // let metrics = self.metrics.clone();
-                    // let semaphore = self.concurrency_limiter.clone();
-
                     // Encapsulated enhanced version of start_event_stream
                     let cancel_tx = self.enhanced_start_event_stream(
                         store_clone,
@@ -449,17 +458,18 @@ impl NotificationSystem {
     /// Loads the bucket notification configuration
     pub async fn load_bucket_notification_config(
         &self,
-        bucket_name: &str,
-        config: &BucketNotificationConfig,
+        bucket: &str,
+        cfg: &BucketNotificationConfig,
     ) -> Result<(), NotificationError> {
-        let arn_list = self.notifier.get_arn_list(&config.region).await;
+        self.subscriber_view.apply_bucket_config(bucket, cfg);
+        let arn_list = self.notifier.get_arn_list(&cfg.region).await;
         if arn_list.is_empty() {
             return Err(NotificationError::Configuration("No targets configured".to_string()));
         }
         info!("Available ARNs: {:?}", arn_list);
         // Validate the configuration against the available ARNs
-        if let Err(e) = config.validate(&config.region, &arn_list) {
-            debug!("Bucket notification config validation region:{} failed: {}", &config.region, e);
+        if let Err(e) = cfg.validate(&cfg.region, &arn_list) {
+            debug!("Bucket notification config validation region:{} failed: {}", &cfg.region, e);
             if !e.to_string().contains("ARN not found") {
                 return Err(NotificationError::BucketNotification(e.to_string()));
             } else {
@@ -467,9 +477,9 @@ impl NotificationSystem {
             }
         }
 
-        let rules_map = config.get_rules_map();
-        self.notifier.add_rules_map(bucket_name, rules_map.clone()).await;
-        info!("Loaded notification config for bucket: {}", bucket_name);
+        let rules_map = cfg.get_rules_map();
+        self.notifier.add_rules_map(bucket, rules_map.clone()).await;
+        info!("Loaded notification config for bucket: {}", bucket);
         Ok(())
     }
 
