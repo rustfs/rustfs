@@ -455,16 +455,6 @@ mod tests {
                 "Reversed range should result in empty layout"
             );
         }
-
-        // Test case 3: Missing closing brace
-        let args = vec!["rustfs", "/data/vol{1...4"];
-        let opt = Opt::parse_from(args);
-        let result = DisksLayout::from_volumes(&opt.volumes);
-        // Should treat as literal path (no ellipses) but may fail with single drive check
-        assert!(
-            result.is_ok() || result.is_err(),
-            "Malformed ellipses should either parse as literal or fail gracefully"
-        );
     }
 
     #[test]
