@@ -27,11 +27,10 @@ warn-%:
 	}
 
 # For checking dependencies use check-<dep-name> or warn-<dep-name>
-.PHONY: core-deps fmt-deps test-deps pre-commit-deps
+.PHONY: core-deps fmt-deps test-deps
 core-deps: check-cargo
 fmt-deps: check-rustfmt
 test-deps: warn-cargo-nextest
-pre-commit-deps: check-pre-commit
 
 # Code quality and formatting targets
 .PHONY: fmt
@@ -67,12 +66,13 @@ test: core-deps test-deps
 	cargo test --all --doc
 
 .PHONY: setup-hooks
-setup-hooks: pre-commit-deps
+setup-hooks:
 	@echo "🔧 Setting up git hooks..."
-	pre-commit install --all
+	chmod +x .git/hooks/pre-commit
+	@echo "✅ Git hooks setup complete!"
 
 .PHONY: pre-commit
-pre-commit: setup-hooks fmt clippy check test
+pre-commit: fmt clippy check test
 	@echo "✅ All pre-commit checks passed!"
 
 .PHONY: e2e-server
