@@ -7302,6 +7302,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "url",
  "urlencoding",
  "uuid",

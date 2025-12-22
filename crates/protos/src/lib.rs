@@ -33,7 +33,6 @@ pub type NodeServiceClientType = NodeServiceClient<
 
 pub use generated::*;
 
-
 // Default 100 MB
 pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 

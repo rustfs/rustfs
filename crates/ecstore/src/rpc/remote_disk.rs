@@ -119,6 +119,20 @@ impl RemoteDisk {
     async fn monitor_remote_disk_health(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
         let mut interval = time::interval(CHECK_EVERY);
 
+        // Perform basic connectivity check
+        if Self::perform_connectivity_check(&addr).await.is_err() && health.swap_ok_to_faulty() {
+            warn!("Remote disk health check failed for {}: marking as faulty", addr);
+
+            // Start recovery monitoring
+            let health_clone = Arc::clone(&health);
+            let addr_clone = addr.clone();
+            let cancel_clone = cancel_token.clone();
+
+            tokio::spawn(async move {
+                Self::monitor_remote_disk_recovery(addr_clone, health_clone, cancel_clone).await;
+            });
+        }
+
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
@@ -1321,8 +1335,23 @@ impl DiskAPI for RemoteDisk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
     use tokio::net::TcpListener;
+    use tracing::Level;
     use uuid::Uuid;
+
+    static INIT: Once = Once::new();
+
+    fn init_tracing(filter_level: Level) {
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_max_level(filter_level)
+                .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+                .with_thread_names(true)
+                .try_init();
+        });
+    }
 
     #[tokio::test]
     async fn test_remote_disk_creation() {
@@ -1432,6 +1461,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_disk_is_online_detects_missing_listener() {
+        init_tracing(Level::ERROR);
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let ip = addr.ip();
@@ -1450,10 +1481,14 @@ mod tests {
 
         let disk_option = DiskOption {
             cleanup: false,
-            health_check: false,
+            health_check: true,
         };
 
         let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+
+        // wait for health check connect timeout
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
         assert!(!remote_disk.is_online().await);
     }
 
