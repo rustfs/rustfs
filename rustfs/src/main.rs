@@ -27,7 +27,7 @@ mod version;
 // Ensure the correct path for parse_license is imported
 use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check};
 use crate::server::{
-    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use chrono::Datelike;
@@ -38,19 +38,19 @@ use rustfs_ahm::{
     scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
 use rustfs_common::globals::set_global_addr;
-use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
-use rustfs_ecstore::bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication};
-use rustfs_ecstore::config as ecconfig;
-use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
-use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
     StorageAPI,
+    bucket::metadata_sys::init_bucket_metadata_sys,
+    bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication},
+    config as ecconfig,
+    config::GLOBAL_CONFIG_SYS,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
+    store_api::BucketOptions,
     update_erasure_type,
 };
 use rustfs_iam::init_iam_sys;
@@ -124,6 +124,11 @@ async fn async_main() -> Result<()> {
 
     // Initialize performance profiling if enabled
     profiling::init_from_env().await;
+
+    // Initialize TLS if a certificate path is provided
+    if let Some(tls_path) = &opt.tls_path {
+        init_cert(tls_path).await
+    }
 
     // Run parameters
     match run(opt).await {

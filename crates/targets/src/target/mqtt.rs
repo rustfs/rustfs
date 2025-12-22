@@ -32,7 +32,6 @@ use std::{
 use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
-use urlencoding;
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const EVENT_LOOP_POLL_TIMEOUT: Duration = Duration::from_secs(10); // For initial connection check in task
@@ -258,8 +257,8 @@ where
             .as_ref()
             .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
 
-        let object_name = urlencoding::decode(&event.object_name)
-            .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
+        // Decode form-urlencoded object name
+        let object_name = crate::target::decode_object_name(&event.object_name)?;
 
         let key = format!("{}/{}", event.bucket_name, object_name);
 

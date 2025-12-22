@@ -83,7 +83,7 @@ jobs:
   # Build strategy check - determine build type based on trigger
   build-check:
     name: Build Strategy Check
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       build_type: ${{ steps.check.outputs.build_type }}
@@ -167,19 +167,19 @@ jobs:
       matrix:
         include:
           # Linux builds
-          - os: ubicloud-standard-4
+          - os: ubicloud-standard-2
             target: x86_64-unknown-linux-musl
             cross: false
             platform: linux
-          - os: ubicloud-standard-4
+          - os: ubicloud-standard-2
             target: aarch64-unknown-linux-musl
             cross: true
             platform: linux
-          - os: ubicloud-standard-4
+          - os: ubicloud-standard-2
             target: x86_64-unknown-linux-gnu
             cross: false
             platform: linux
-          - os: ubicloud-standard-4
+          - os: ubicloud-standard-2
             target: aarch64-unknown-linux-gnu
             cross: true
             platform: linux
@@ -532,7 +532,7 @@ jobs:
     name: Build Summary
     needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     steps:
       - name: Build completion summary
         shell: bash
@@ -584,7 +584,7 @@ jobs:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     permissions:
       contents: write
     outputs:
@@ -670,7 +670,7 @@ jobs:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     permissions:
       contents: write
       actions: read
@@ -751,7 +751,7 @@ jobs:
     name: Update Latest Version
     needs: [ build-check, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     steps:
       - name: Update latest.json
         env:
@@ -801,7 +801,7 @@ jobs:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     permissions:
       contents: write
     steps:

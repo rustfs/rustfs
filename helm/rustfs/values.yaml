@@ -11,7 +11,7 @@ image:
   # This sets the pull policy for images.
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "latest"
+  tag: "1.0.0-alpha.73"
 
 # This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
 imagePullSecrets: []
@@ -90,14 +90,18 @@ containerSecurityContext:
   runAsNonRoot: true
 
 service:
-  type: NodePort
-  ep_port: 9000
-  console_port: 9001
+  type: ClusterIP
+  endpoint:
+    port: 9000
+    nodePort: 32000
+  console:
+    port: 9001
+    nodePort: 32001
 
 # This block is for setting up the ingress for more information can be found here: https://kubernetes.io/docs/concepts/services-networking/ingress/
 ingress:
   enabled: true
-  className: "traefik" # Specify the classname, traefik or nginx. Different classname has different annotations for session sticky.
+  className: "nginx" # Specify the classname, traefik or nginx. Different classname has different annotations for session sticky.
   traefikAnnotations:
     traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
     traefik.ingress.kubernetes.io/service.sticky.cookie.httponly: "true"
@@ -110,20 +114,26 @@ ingress:
     nginx.ingress.kubernetes.io/session-cookie-hash: sha1
     nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
     nginx.ingress.kubernetes.io/session-cookie-name: rustfs
+  certManagerAnnotations:
+    {} # Specify cert manager issuer annotations,cert-manager.io/issuer or cert-manager.io/cluster-issuer.
+    # cert-manager.io/issuer: "letsencrypt-staging"
+  customAnnotations: # Specify custom annotations
+    {} # Customize annotations
   hosts:
-    - host: your.rustfs.com
+    - host: xmg.rustfs.com
       paths:
         - path: /
-          pathType: ImplementationSpecific
-  tls:
-    - secretName: rustfs-tls
-      hosts:
-        - your.rustfs.com
-
-tls:
-  enabled: false
-  crt: tls.crt
-  key: tls.key
+          pathType: Prefix
+  tls: 
+    enabled: false # Enable tls and access rustfs via https.
+    certManager:
+      enabled: false # Enable certmanager to generate certificate for rustfs, default false.
+      issuer:
+        name: letsencrypt-staging # Specify cert manager issuer name
+        kind: Issuer # Specify cert manager issuer kind, Issuer or ClusterIssuer.
+    secretName: secret-tls
+    crt: tls.crt
+    key: tls.key
 
 resources:
   # We usually recommend not to specify default resources and to leave this as a conscious

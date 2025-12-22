@@ -58,7 +58,7 @@ defaults:
 jobs:
   s3tests-single:
     if: github.event.inputs.test-mode == 'single'
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
@@ -212,7 +212,7 @@ jobs:
 
   s3tests-multi:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.test-mode == 'multi'
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v6

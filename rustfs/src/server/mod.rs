@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod audit;
+mod cert;
 mod compress;
 mod event;
 mod http;
@@ -22,6 +23,7 @@ mod runtime;
 mod service_state;
 
 pub(crate) use audit::{start_audit_system, stop_audit_system};
+pub(crate) use cert::init_cert;
 pub(crate) use event::{init_event_notifier, shutdown_event_notifier};
 pub(crate) use http::start_http_server;
 pub(crate) use runtime::get_tokio_runtime_builder;
