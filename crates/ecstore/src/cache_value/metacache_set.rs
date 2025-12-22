@@ -113,8 +113,6 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             }
 
             while need_fallback {
-                // 从fds中截取第一个disk
-
                 let disk_op = {
                     if fds_clone.is_empty() {
                         None
