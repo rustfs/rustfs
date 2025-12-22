@@ -58,6 +58,12 @@ impl AuditSystem {
     }
 
     /// Starts the audit system with the given configuration
+    ///
+    /// # Arguments
+    /// * `config` - The configuration to use for starting the audit system
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn start(&self, config: Config) -> AuditResult<()> {
         let state = self.state.write().await;
 
@@ -87,7 +93,7 @@ impl AuditSystem {
 
         // Create targets from configuration
         let mut registry = self.registry.lock().await;
-        match registry.create_targets_from_config(&config).await {
+        match registry.create_audit_targets_from_config(&config).await {
             Ok(targets) => {
                 if targets.is_empty() {
                     info!("No enabled audit targets found, keeping audit system stopped");
@@ -143,6 +149,9 @@ impl AuditSystem {
     }
 
     /// Pauses the audit system
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn pause(&self) -> AuditResult<()> {
         let mut state = self.state.write().await;
 
@@ -161,6 +170,9 @@ impl AuditSystem {
     }
 
     /// Resumes the audit system
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn resume(&self) -> AuditResult<()> {
         let mut state = self.state.write().await;
 
@@ -179,6 +191,9 @@ impl AuditSystem {
     }
 
     /// Stops the audit system and closes all targets
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn close(&self) -> AuditResult<()> {
         let mut state = self.state.write().await;
 
@@ -223,11 +238,20 @@ impl AuditSystem {
     }
 
     /// Checks if the audit system is running
+    ///
+    /// # Returns
+    /// * `bool` - True if running, false otherwise
     pub async fn is_running(&self) -> bool {
         matches!(*self.state.read().await, AuditSystemState::Running)
     }
 
     /// Dispatches an audit log entry to all active targets
+    ///
+    /// # Arguments
+    /// * `entry` - The audit log entry to dispatch
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn dispatch(&self, entry: Arc<AuditEntry>) -> AuditResult<()> {
         let start_time = std::time::Instant::now();
 
@@ -319,6 +343,13 @@ impl AuditSystem {
         Ok(())
     }
 
+    /// Dispatches a batch of audit log entries to all active targets
+    ///
+    /// # Arguments
+    /// * `entries` - A vector of audit log entries to dispatch
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn dispatch_batch(&self, entries: Vec<Arc<AuditEntry>>) -> AuditResult<()> {
         let start_time = std::time::Instant::now();
 
@@ -386,7 +417,13 @@ impl AuditSystem {
         Ok(())
     }
 
-    // New: Audit flow background tasks, based on send_from_store, including retries and exponential backoffs
+    /// Starts the audit stream processing for a target with batching and retry logic
+    /// # Arguments
+    /// * `store` - The store from which to read audit entries
+    /// * `target` - The target to which audit entries will be sent
+    ///
+    /// This function spawns a background task that continuously reads audit entries from the provided store
+    /// and attempts to send them to the specified target. It implements retry logic with exponential backoff
     fn start_audit_stream_with_batching(
         &self,
         store: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send>,
@@ -462,6 +499,12 @@ impl AuditSystem {
     }
 
     /// Enables a specific target
+    ///
+    /// # Arguments
+    /// * `target_id` - The ID of the target to enable
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn enable_target(&self, target_id: &str) -> AuditResult<()> {
         // This would require storing enabled/disabled state per target
         // For now, just check if target exists
@@ -475,6 +518,12 @@ impl AuditSystem {
     }
 
     /// Disables a specific target
+    ///
+    /// # Arguments
+    /// * `target_id` - The ID of the target to disable
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn disable_target(&self, target_id: &str) -> AuditResult<()> {
         // This would require storing enabled/disabled state per target
         // For now, just check if target exists
@@ -488,6 +537,12 @@ impl AuditSystem {
     }
 
     /// Removes a target from the system
+    ///
+    /// # Arguments
+    /// * `target_id` - The ID of the target to remove
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn remove_target(&self, target_id: &str) -> AuditResult<()> {
         let mut registry = self.registry.lock().await;
         if let Some(target) = registry.remove_target(target_id) {
@@ -502,6 +557,13 @@ impl AuditSystem {
     }
 
     /// Updates or inserts a target
+    ///
+    /// # Arguments
+    /// * `target_id` - The ID of the target to upsert
+    /// * `target` - The target instance to insert or update
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn upsert_target(&self, target_id: String, target: Box<dyn Target<AuditEntry> + Send + Sync>) -> AuditResult<()> {
         let mut registry = self.registry.lock().await;
 
@@ -523,18 +585,33 @@ impl AuditSystem {
     }
 
     /// Lists all targets
+    ///
+    /// # Returns
+    /// * `Vec<String>` - List of target IDs
     pub async fn list_targets(&self) -> Vec<String> {
         let registry = self.registry.lock().await;
         registry.list_targets()
     }
 
     /// Gets information about a specific target
+    ///
+    /// # Arguments
+    /// * `target_id` - The ID of the target to retrieve
+    ///
+    /// # Returns
+    /// * `Option<String>` - Target ID if found
     pub async fn get_target(&self, target_id: &str) -> Option<String> {
         let registry = self.registry.lock().await;
         registry.get_target(target_id).map(|target| target.id().to_string())
     }
 
     /// Reloads configuration and updates targets
+    ///
+    /// # Arguments
+    /// * `new_config` - The new configuration to load
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn reload_config(&self, new_config: Config) -> AuditResult<()> {
         info!("Reloading audit system configuration");
 
@@ -554,7 +631,7 @@ impl AuditSystem {
         }
 
         // Create new targets from updated configuration
-        match registry.create_targets_from_config(&new_config).await {
+        match registry.create_audit_targets_from_config(&new_config).await {
             Ok(targets) => {
                 info!(target_count = targets.len(), "Reloaded audit targets successfully");
 
@@ -594,16 +671,22 @@ impl AuditSystem {
     }
 
     /// Gets current audit system metrics
+    ///
+    /// # Returns
+    /// * `AuditMetricsReport` - Current metrics report
     pub async fn get_metrics(&self) -> observability::AuditMetricsReport {
         observability::get_metrics_report().await
     }
 
     /// Validates system performance against requirements
+    ///
+    /// # Returns
+    /// * `PerformanceValidation` - Performance validation results
     pub async fn validate_performance(&self) -> observability::PerformanceValidation {
         observability::validate_performance().await
     }
 
-    /// Resets all metrics
+    /// Resets all metrics to initial state
     pub async fn reset_metrics(&self) {
         observability::reset_metrics().await;
     }

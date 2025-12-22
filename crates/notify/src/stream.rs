@@ -13,18 +13,23 @@
 // limitations under the License.
 
 use crate::{Event, integration::NotificationMetrics};
-use rustfs_targets::StoreError;
-use rustfs_targets::Target;
-use rustfs_targets::TargetError;
-use rustfs_targets::store::{Key, Store};
-use rustfs_targets::target::EntityTarget;
+use rustfs_targets::{
+    StoreError, Target, TargetError,
+    store::{Key, Store},
+    target::EntityTarget,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-/// Streams events from the store to the target
+/// Streams events from the store to the target with retry logic
+///
+/// # Arguments
+/// - `store`: The event store
+/// - `target`: The target to send events to
+/// - `cancel_rx`: Receiver to listen for cancellation signals
 pub async fn stream_events(
     store: &mut (dyn Store<Event, Error = StoreError, Key = Key> + Send),
     target: &dyn Target<Event>,
@@ -67,6 +72,7 @@ pub async fn stream_events(
                 match target.send_from_store(key.clone()).await {
                     Ok(_) => {
                         info!("Successfully sent event for target: {}", target.name());
+                        // send_from_store deletes the event from store on success
                         success = true;
                     }
                     Err(e) => {
@@ -104,6 +110,13 @@ pub async fn stream_events(
 }
 
 /// Starts the event streaming process for a target
+///
+/// # Arguments
+/// - `store`: The event store
+/// - `target`: The target to send events to
+///
+/// # Returns
+/// A sender to signal cancellation of the event stream
 pub fn start_event_stream(
     mut store: Box<dyn Store<Event, Error = StoreError, Key = Key> + Send>,
     target: Arc<dyn Target<Event> + Send + Sync>,
@@ -119,6 +132,15 @@ pub fn start_event_stream(
 }
 
 /// Start event stream with batch processing
+///
+/// # Arguments
+/// - `store`: The event store
+/// - `target`: The target to send events to clients
+/// - `metrics`: Metrics for monitoring
+/// - `semaphore`: Semaphore to limit concurrency
+///
+/// # Returns
+/// A sender to signal cancellation of the event stream
 pub fn start_event_stream_with_batching(
     mut store: Box<dyn Store<EntityTarget<Event>, Error = StoreError, Key = Key> + Send>,
     target: Arc<dyn Target<Event> + Send + Sync>,
@@ -136,6 +158,16 @@ pub fn start_event_stream_with_batching(
 }
 
 /// Event stream processing with batch processing
+///
+/// # Arguments
+/// - `store`: The event store
+/// - `target`: The target to send events to clients
+/// - `cancel_rx`: Receiver to listen for cancellation signals
+/// - `metrics`: Metrics for monitoring
+/// - `semaphore`: Semaphore to limit concurrency
+///
+/// # Notes
+/// This function processes events in batches to improve efficiency.
 pub async fn stream_events_with_batching(
     store: &mut (dyn Store<EntityTarget<Event>, Error = StoreError, Key = Key> + Send),
     target: &dyn Target<Event>,
@@ -231,7 +263,17 @@ pub async fn stream_events_with_batching(
     }
 }
 
-/// Processing event batches
+/// Processing event batches for targets
+/// # Arguments
+/// - `batch`: The batch of events to process
+/// - `batch_keys`: The corresponding keys of the events in the batch
+/// - `target`: The target to send events to clients
+/// - `max_retries`: Maximum number of retries for sending an event
+/// - `base_delay`: Base delay duration for retries
+/// - `metrics`: Metrics for monitoring
+/// - `semaphore`: Semaphore to limit concurrency
+/// # Notes
+/// This function processes a batch of events, sending each event to the target with retry
 async fn process_batch(
     batch: &mut Vec<EntityTarget<Event>>,
     batch_keys: &mut Vec<Key>,
@@ -262,6 +304,7 @@ async fn process_batch(
 
         // Retry logic
         while retry_count < max_retries && !success {
+            // After sending successfully, the event in the storage is deleted synchronously.
             match target.send_from_store(key.clone()).await {
                 Ok(_) => {
                     info!("Successfully sent event for target: {}, Key: {}", target.name(), key.to_string());

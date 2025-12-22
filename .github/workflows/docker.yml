@@ -72,7 +72,7 @@ jobs:
   # Check if we should build Docker images
   build-check:
     name: Docker Build Check
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       should_push: ${{ steps.check.outputs.should_push }}
@@ -264,7 +264,7 @@ jobs:
     name: Build Docker Images
     needs: build-check
     if: needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -404,7 +404,7 @@ jobs:
     name: Docker Build Summary
     needs: [ build-check, build-docker ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Docker build completion summary
         run: |

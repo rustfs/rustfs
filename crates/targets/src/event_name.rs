@@ -353,7 +353,7 @@ mod tests {
         let deserialized = serde_json::from_str::<EventName>(invalid_str);
         assert!(deserialized.is_err(), "Deserialization should fail for invalid event name");
 
-        // empty string should be successful only serialization
+        // Serializing EventName::Everything produces an empty string, but deserializing an empty string should fail.
         let event_name = EventName::Everything;
         let serialized_str = "\"\"";
         let serialized = serde_json::to_string(&event_name);

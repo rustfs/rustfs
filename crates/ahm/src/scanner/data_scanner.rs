@@ -30,7 +30,7 @@ use rustfs_ecstore::{
     bucket::versioning::VersioningApi,
     bucket::versioning_sys::BucketVersioningSys,
     data_usage::{aggregate_local_snapshots, compute_bucket_usage, store_data_usage_in_backend},
-    disk::{Disk, DiskAPI, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions},
+    disk::{DiskAPI, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions},
     set_disk::SetDisks,
     store_api::ObjectInfo,
 };
@@ -1977,7 +1977,7 @@ impl Scanner {
                     } else {
                         // Apply lifecycle actions
                         if let Some(lifecycle_config) = &lifecycle_config {
-                            if let Disk::Local(_local_disk) = &**disk {
+                            if disk.is_local() {
                                 let vcfg = BucketVersioningSys::get(bucket).await.ok();
 
                                 let mut scanner_item = ScannerItem {

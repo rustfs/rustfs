@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#      http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -62,7 +62,6 @@ on:
 permissions:
   contents: read
 
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -70,8 +69,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  
-  CARGO_BUILD_JOBS: 4
+  CARGO_BUILD_JOBS: 2
 
 jobs:
 
@@ -80,7 +78,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    runs-on: ubuntu-latest 
+    runs-on: ubicloud-standard-2
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
@@ -95,8 +93,7 @@ jobs:
 
   typos:
     name: Typos
-
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -107,12 +104,9 @@ jobs:
     name: Test and Lint
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubicloud-standard-4
     timeout-minutes: 60
     steps:
-
-
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -120,17 +114,14 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-       
           cache-shared-key: ci-test-${{ hashFiles('**/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
       - name: Run tests
-
         run: |
           cargo nextest run --all --exclude e2e_test
           cargo test --all --doc
@@ -145,19 +136,16 @@ jobs:
     name: End-to-End Tests
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubicloud-standard-2
     timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-
       - name: Clean up previous test run
         run: |
           rm -rf /tmp/rustfs
           rm -f /tmp/rustfs.log
-          # 如果有 docker 容器残留，也建议清理
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -177,8 +165,8 @@ jobs:
       - name: Build debug binary
         run: |
           touch rustfs/build.rs
-          # 限制并发，防止 build --bins 导致 OOM
-          cargo build -p rustfs --bins --jobs 4
+          # Limit concurrency to prevent OOM
+          cargo build -p rustfs --bins --jobs 2
 
       - name: Run end-to-end tests
         run: |

@@ -20,6 +20,7 @@
 
 pub mod entity;
 pub mod error;
+pub mod factory;
 pub mod global;
 pub mod observability;
 pub mod registry;

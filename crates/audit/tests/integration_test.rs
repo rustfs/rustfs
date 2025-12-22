@@ -43,11 +43,11 @@ async fn test_config_parsing_webhook() {
     audit_webhook_section.insert("_".to_string(), default_kvs);
     config.0.insert("audit_webhook".to_string(), audit_webhook_section);
 
-    let mut registry = AuditRegistry::new();
+    let registry = AuditRegistry::new();
 
     // This should not fail even if server storage is not initialized
     // as it's an integration test
-    let result = registry.create_targets_from_config(&config).await;
+    let result = registry.create_audit_targets_from_config(&config).await;
 
     // We expect this to fail due to server storage not being initialized
     // but the parsing should work correctly

@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::{
     Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
 };
 use hashbrown::HashMap;
+use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::TargetID;
@@ -103,22 +105,22 @@ pub struct NotificationSystem {
     concurrency_limiter: Arc<Semaphore>,
     /// Monitoring indicators
     metrics: Arc<NotificationMetrics>,
+    /// Subscriber view
+    subscriber_view: NotificationSystemSubscriberView,
 }
 
 impl NotificationSystem {
     /// Creates a new NotificationSystem
     pub fn new(config: Config) -> Self {
+        let concurrency_limiter =
+            rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
         NotificationSystem {
+            subscriber_view: NotificationSystemSubscriberView::new(),
             notifier: Arc::new(EventNotifier::new()),
             registry: Arc::new(TargetRegistry::new()),
             config: Arc::new(RwLock::new(config)),
             stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
-            concurrency_limiter: Arc::new(Semaphore::new(
-                std::env::var("RUSTFS_TARGET_STREAM_CONCURRENCY")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(20),
-            )), // Limit the maximum number of concurrent processing events to 20
+            concurrency_limiter: Arc::new(Semaphore::new(concurrency_limiter)), // Limit the maximum number of concurrent processing events to 20
             metrics: Arc::new(NotificationMetrics::new()),
         }
     }
@@ -190,8 +192,11 @@ impl NotificationSystem {
     }
 
     /// Checks if there are active subscribers for the given bucket and event name.
-    pub async fn has_subscriber(&self, bucket: &str, event_name: &EventName) -> bool {
-        self.notifier.has_subscriber(bucket, event_name).await
+    pub async fn has_subscriber(&self, bucket: &str, event: &EventName) -> bool {
+        if !self.subscriber_view.has_subscriber(bucket, event) {
+            return false;
+        }
+        self.notifier.has_subscriber(bucket, event).await
     }
 
     async fn update_config_and_reload<F>(&self, mut modifier: F) -> Result<(), NotificationError>
@@ -214,6 +219,11 @@ impl NotificationSystem {
             return Ok(());
         }
 
+        // Save the modified configuration to storage
+        rustfs_ecstore::config::com::save_server_config(store, &new_config)
+            .await
+            .map_err(|e| NotificationError::SaveConfig(e.to_string()))?;
+
         info!("Configuration updated. Reloading system...");
         self.reload_config(new_config).await
     }
@@ -233,15 +243,18 @@ impl NotificationSystem {
     pub async fn remove_target(&self, target_id: &TargetID, target_type: &str) -> Result<(), NotificationError> {
         info!("Attempting to remove target: {}", target_id);
 
+        let ttype = target_type.to_lowercase();
+        let tname = target_id.name.to_lowercase();
+
         self.update_config_and_reload(|config| {
             let mut changed = false;
-            if let Some(targets_of_type) = config.0.get_mut(target_type) {
-                if targets_of_type.remove(&target_id.name).is_some() {
+            if let Some(targets_of_type) = config.0.get_mut(&ttype) {
+                if targets_of_type.remove(&tname).is_some() {
                     info!("Removed target {} from configuration", target_id);
                     changed = true;
                 }
                 if targets_of_type.is_empty() {
-                    config.0.remove(target_type);
+                    config.0.remove(&ttype);
                 }
             }
             if !changed {
@@ -266,20 +279,24 @@ impl NotificationSystem {
     /// If the target configuration is invalid, it returns Err(NotificationError::Configuration).
     pub async fn set_target_config(&self, target_type: &str, target_name: &str, kvs: KVS) -> Result<(), NotificationError> {
         info!("Setting config for target {} of type {}", target_name, target_type);
+        let ttype = target_type.to_lowercase();
+        let tname = target_name.to_lowercase();
         self.update_config_and_reload(|config| {
-            config
-                .0
-                .entry(target_type.to_string())
-                .or_default()
-                .insert(target_name.to_string(), kvs.clone());
+            config.0.entry(ttype.clone()).or_default().insert(tname.clone(), kvs.clone());
             true // The configuration is always modified
         })
         .await
     }
 
     /// Removes all notification configurations for a bucket.
-    pub async fn remove_bucket_notification_config(&self, bucket_name: &str) {
-        self.notifier.remove_rules_map(bucket_name).await;
+    /// If the configuration is successfully removed, the entire notification system will be automatically reloaded.
+    ///
+    /// # Arguments
+    /// * `bucket` - The name of the bucket whose notification configuration is to be removed.
+    ///
+    pub async fn remove_bucket_notification_config(&self, bucket: &str) {
+        self.subscriber_view.clear_bucket(bucket);
+        self.notifier.remove_rules_map(bucket).await;
     }
 
     /// Removes a Target configuration.
@@ -296,23 +313,50 @@ impl NotificationSystem {
     /// If the target configuration does not exist, it returns Ok(()) without making any changes.
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
         info!("Removing config for target {} of type {}", target_name, target_type);
-        self.update_config_and_reload(|config| {
-            let mut changed = false;
-            if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
-                if targets.remove(&target_name.to_lowercase()).is_some() {
-                    changed = true;
+
+        let ttype = target_type.to_lowercase();
+        let tname = target_name.to_lowercase();
+
+        let target_id = TargetID {
+            id: tname.clone(),
+            name: ttype.clone(),
+        };
+
+        // Deletion is prohibited if bucket rules refer to it
+        if self.notifier.is_target_bound_to_any_bucket(&target_id).await {
+            return Err(NotificationError::Configuration(format!(
+                "Target is still bound to bucket rules and deletion is prohibited: type={} name={}",
+                ttype, tname
+            )));
+        }
+
+        let config_result = self
+            .update_config_and_reload(|config| {
+                let mut changed = false;
+                if let Some(targets) = config.0.get_mut(&ttype) {
+                    if targets.remove(&tname).is_some() {
+                        changed = true;
+                    }
+                    if targets.is_empty() {
+                        config.0.remove(target_type);
+                    }
                 }
-                if targets.is_empty() {
-                    config.0.remove(target_type);
+                if !changed {
+                    info!("Target {} of type {} not found, no changes made.", target_name, target_type);
                 }
-            }
-            if !changed {
-                info!("Target {} of type {} not found, no changes made.", target_name, target_type);
-            }
-            debug!("Config after remove: {:?}", config);
-            changed
-        })
-        .await
+                debug!("Config after remove: {:?}", config);
+                changed
+            })
+            .await;
+
+        if config_result.is_ok() {
+            // Remove from target list
+            let target_list = self.notifier.target_list();
+            let mut target_list_guard = target_list.write().await;
+            let _ = target_list_guard.remove_target_only(&target_id).await;
+        }
+
+        config_result
     }
 
     /// Enhanced event stream startup function, including monitoring and concurrency control
@@ -342,6 +386,9 @@ impl NotificationSystem {
             info!("Stop event stream processing for target {}", target_id);
             let _ = cancel_tx.send(()).await;
         }
+
+        // Clear the target_list and ensure that reload is a replacement reconstruction (solve the target_list len unchanged/residual problem)
+        self.notifier.remove_all_bucket_targets().await;
 
         // Update the config
         self.update_config(new_config.clone()).await;
@@ -373,15 +420,16 @@ impl NotificationSystem {
 
                     // The storage of the cloned target and the target itself
                     let store_clone = store.boxed_clone();
-                    let target_box = target.clone_dyn();
-                    let target_arc = Arc::from(target_box);
-
-                    // Add a reference to the monitoring metrics
-                    let metrics = self.metrics.clone();
-                    let semaphore = self.concurrency_limiter.clone();
+                    // let target_box = target.clone_dyn();
+                    let target_arc = Arc::from(target.clone_dyn());
 
                     // Encapsulated enhanced version of start_event_stream
-                    let cancel_tx = self.enhanced_start_event_stream(store_clone, target_arc, metrics, semaphore);
+                    let cancel_tx = self.enhanced_start_event_stream(
+                        store_clone,
+                        target_arc,
+                        self.metrics.clone(),
+                        self.concurrency_limiter.clone(),
+                    );
 
                     // Start event stream processing and save cancel sender
                     // let cancel_tx = start_event_stream(store_clone, target_clone);
@@ -408,17 +456,18 @@ impl NotificationSystem {
     /// Loads the bucket notification configuration
     pub async fn load_bucket_notification_config(
         &self,
-        bucket_name: &str,
-        config: &BucketNotificationConfig,
+        bucket: &str,
+        cfg: &BucketNotificationConfig,
     ) -> Result<(), NotificationError> {
-        let arn_list = self.notifier.get_arn_list(&config.region).await;
+        self.subscriber_view.apply_bucket_config(bucket, cfg);
+        let arn_list = self.notifier.get_arn_list(&cfg.region).await;
         if arn_list.is_empty() {
             return Err(NotificationError::Configuration("No targets configured".to_string()));
         }
         info!("Available ARNs: {:?}", arn_list);
         // Validate the configuration against the available ARNs
-        if let Err(e) = config.validate(&config.region, &arn_list) {
-            debug!("Bucket notification config validation region:{} failed: {}", &config.region, e);
+        if let Err(e) = cfg.validate(&cfg.region, &arn_list) {
+            debug!("Bucket notification config validation region:{} failed: {}", &cfg.region, e);
             if !e.to_string().contains("ARN not found") {
                 return Err(NotificationError::BucketNotification(e.to_string()));
             } else {
@@ -426,9 +475,9 @@ impl NotificationSystem {
             }
         }
 
-        let rules_map = config.get_rules_map();
-        self.notifier.add_rules_map(bucket_name, rules_map.clone()).await;
-        info!("Loaded notification config for bucket: {}", bucket_name);
+        let rules_map = cfg.get_rules_map();
+        self.notifier.add_rules_map(bucket, rules_map.clone()).await;
+        info!("Loaded notification config for bucket: {}", bucket);
         Ok(())
     }
 

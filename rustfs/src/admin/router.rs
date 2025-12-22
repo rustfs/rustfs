@@ -101,7 +101,7 @@ where
             && headers
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .map(|ct| ct.split(';').next().unwrap_or("").trim())
+                .map(|ct| ct.split(';').next().unwrap_or("").trim().to_lowercase())
                 .map(|ct| ct == "application/x-www-form-urlencoded")
                 .unwrap_or(false)
         {

@@ -31,3 +31,6 @@ deploy/logs/*.log.*
 /s3-tests-local/
 /s3tests.conf
 /s3tests.conf.*
+*.events
+*.audit
+*.snappy

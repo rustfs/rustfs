@@ -14,6 +14,7 @@
 
 mod conditional_writes;
 mod get_deleted_object_test;
+mod head_deleted_object_versioning_test;
 mod lifecycle;
 mod lock;
 mod node_interact_test;

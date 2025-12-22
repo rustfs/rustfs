@@ -237,6 +237,7 @@ impl Default for CompressionConfig {
 /// The `tower-http::CompressionLayer` automatically handles:
 /// - Skipping responses with `Content-Encoding` header (already compressed)
 /// - Skipping responses with `Content-Range` header (Range requests)
+///
 /// These checks are performed before calling this predicate, so we don't need to check them here.
 ///
 /// # Extension Matching
