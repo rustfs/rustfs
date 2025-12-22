@@ -19,6 +19,3 @@ data:
   {{- else }}
   RUSTFS_VOLUMES: "/data"
   {{- end }}
-  {{- with .Values.config.rustfs.extraEnv }}
-  {{- toYaml . | nindent 2 }}
-  {{- end }}

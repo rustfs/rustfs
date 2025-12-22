@@ -28,7 +28,6 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.region | string | `"us-east-1"` |  |
 | config.rustfs.rust_log | string | `"debug"` |  |
 | config.rustfs.volumes | string | `""` |  |
-| config.rustfs.extraEnv | object | `{}` | Additional config variables. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
