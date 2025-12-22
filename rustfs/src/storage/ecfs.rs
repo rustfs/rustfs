@@ -121,6 +121,7 @@ use rustfs_utils::{
     },
     path::{is_dir_object, path_join_buf},
 };
+use rustfs_config;
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
@@ -2277,7 +2278,7 @@ impl S3 for FS {
             );
             Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
         } else {
-            let seekable_object_size_threshold = config::constants::object::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
 
             let should_provide_seek_support = response_content_length > 0
                 && response_content_length <= seekable_object_size_threshold as i64

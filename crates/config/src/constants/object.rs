@@ -167,10 +167,3 @@ pub const DEFAULT_OBJECT_CACHE_TTI_SECS: u64 = 120;
 ///
 /// Default is set to 5 hits.
 pub const DEFAULT_OBJECT_HOT_MIN_HITS_TO_EXTEND: usize = 5;
-
-/// Threshold for small object seek support in megabytes.
-///
-/// When an object is smaller than this size, rustfs will provide seek support.
-///
-/// Default is set to 10MB.
-pub const DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD: usize = 10 * 1024 * 1024;
