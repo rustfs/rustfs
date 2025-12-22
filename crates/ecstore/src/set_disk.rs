@@ -3072,7 +3072,7 @@ impl SetDisks {
                                 for (index, disk) in latest_disks.iter().enumerate() {
                                     if let Some(outdated_disk) = &out_dated_disks[index] {
                                         info!(disk_index = index, "Creating writer for outdated disk");
-                                        let writer = create_bitrot_writer(
+                                        let writer = match create_bitrot_writer(
                                             is_inline_buffer,
                                             Some(outdated_disk),
                                             RUSTFS_META_TMP_BUCKET,
@@ -3081,7 +3081,19 @@ impl SetDisks {
                                             erasure.shard_size(),
                                             HashAlgorithm::HighwayHash256,
                                         )
-                                        .await?;
+                                        .await
+                                        {
+                                            Ok(writer) => writer,
+                                            Err(err) => {
+                                                warn!(
+                                                    "create_bitrot_writer  disk {}, err {:?}, skipping operation",
+                                                    outdated_disk.to_string(),
+                                                    err
+                                                );
+                                                writers.push(None);
+                                                continue;
+                                            }
+                                        };
                                         writers.push(Some(writer));
                                     } else {
                                         info!(disk_index = index, "Skipping writer (disk not outdated)");
@@ -3901,7 +3913,7 @@ impl ObjectIO for SetDisks {
             if let Some(disk) = disk_op
                 && disk.is_online().await
             {
-                let writer = create_bitrot_writer(
+                let writer = match create_bitrot_writer(
                     is_inline_buffer,
                     Some(disk),
                     RUSTFS_META_TMP_BUCKET,
@@ -3910,29 +3922,16 @@ impl ObjectIO for SetDisks {
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,
                 )
-                .await?;
-
-                // let writer = if is_inline_buffer {
-                //     BitrotWriter::new(
-                //         Writer::from_cursor(Cursor::new(Vec::new())),
-                //         erasure.shard_size(),
-                //         HashAlgorithm::HighwayHash256,
-                //     )
-                // } else {
-                //     let f = match disk
-                //         .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_object, erasure.shard_file_size(data.content_length))
-                //         .await
-                //     {
-                //         Ok(f) => f,
-                //         Err(e) => {
-                //             errors.push(Some(e));
-                //             writers.push(None);
-                //             continue;
-                //         }
-                //     };
-
-                //     BitrotWriter::new(Writer::from_tokio_writer(f), erasure.shard_size(), HashAlgorithm::HighwayHash256)
-                // };
+                .await
+                {
+                    Ok(writer) => writer,
+                    Err(err) => {
+                        warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                        errors.push(Some(err));
+                        writers.push(None);
+                        continue;
+                    }
+                };
 
                 writers.push(Some(writer));
                 errors.push(None);
@@ -5173,7 +5172,7 @@ impl StorageAPI for SetDisks {
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
             if let Some(disk) = disk_op {
-                let writer = create_bitrot_writer(
+                let writer = match create_bitrot_writer(
                     false,
                     Some(disk),
                     RUSTFS_META_TMP_BUCKET,
@@ -5182,23 +5181,16 @@ impl StorageAPI for SetDisks {
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,
                 )
-                .await?;
-
-                // let writer = {
-                //     let f = match disk
-                //         .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, erasure.shard_file_size(data.content_length))
-                //         .await
-                //     {
-                //         Ok(f) => f,
-                //         Err(e) => {
-                //             errors.push(Some(e));
-                //             writers.push(None);
-                //             continue;
-                //         }
-                //     };
-
-                //     BitrotWriter::new(Writer::from_tokio_writer(f), erasure.shard_size(), HashAlgorithm::HighwayHash256)
-                // };
+                .await
+                {
+                    Ok(writer) => writer,
+                    Err(err) => {
+                        warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                        errors.push(Some(err));
+                        writers.push(None);
+                        continue;
+                    }
+                };
 
                 writers.push(Some(writer));
                 errors.push(None);
