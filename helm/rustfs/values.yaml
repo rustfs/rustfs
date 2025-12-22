@@ -124,7 +124,7 @@ ingress:
       paths:
         - path: /
           pathType: Prefix
-  tls: 
+  tls:
     enabled: false # Enable tls and access rustfs via https.
     certManager:
       enabled: false # Enable certmanager to generate certificate for rustfs, default false.

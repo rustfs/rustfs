@@ -115,9 +115,6 @@ spec:
               name: endpoint
             - containerPort: {{ .Values.service.console_port }}
               name: console
-          env:
-            - name: REPLICA_COUNT
-              value: {{ .Values.replicaCount | quote }}
           envFrom:
             - configMapRef:
                 name: {{ include "rustfs.fullname" . }}-config
