@@ -2443,6 +2443,13 @@ impl S3 for FS {
 
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
+        if info.delete_marker {
+            if opts.version_id.is_none() {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+            }
+            return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
+        }
+
         if let Some(match_etag) = if_none_match {
             if let Some(strong_etag) = match_etag.into_etag() {
                 if info
