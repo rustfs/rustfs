@@ -36,7 +36,7 @@ mkdir -p ./target/volume/test{1..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug,iam=info"
+    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug,iam=info,notify=info"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -90,30 +90,30 @@ export OTEL_INSTRUMENTATION_VERSION="0.1.1"
 export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
 export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
 
-# notify
-export RUSTFS_NOTIFY_WEBHOOK_ENABLE="on" # Whether to enable webhook notification
-export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # Webhook notification address
-export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
-
-export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook notification
-export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY="http://[::]:3020/webhook" # Webhook notification address
-export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/notify"
-
-export RUSTFS_NOTIFY_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook notification
-export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MASTER="http://[::]:3020/webhook" # Webhook notification address
-export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
-
-export RUSTFS_AUDIT_WEBHOOK_ENABLE="on" # Whether to enable webhook audit
-export RUSTFS_AUDIT_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # Webhook audit address
-export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/audit"
-
-export RUSTFS_AUDIT_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook audit
-export RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY="http://[::]:3020/webhook" # Webhook audit address
-export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/audit"
-
-export RUSTFS_AUDIT_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook audit
-export RUSTFS_AUDIT_WEBHOOK_ENDPOINT_MASTER="http://[::]:3020/webhook" # Webhook audit address
-export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/audit"
+## notify
+#export RUSTFS_NOTIFY_WEBHOOK_ENABLE="on" # Whether to enable webhook notification
+#export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://127.0.0.1:3020/webhook" # Webhook notification address
+#export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
+#
+#export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook notification
+#export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY="http://127.0.0.1:3020/webhook" # Webhook notification address
+#export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/notify"
+#
+#export RUSTFS_NOTIFY_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook notification
+#export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MASTER="http://127.0.0.1:3020/webhook" # Webhook notification address
+#export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
+#
+#export RUSTFS_AUDIT_WEBHOOK_ENABLE="on" # Whether to enable webhook audit
+#export RUSTFS_AUDIT_WEBHOOK_ENDPOINT="http://127.0.0.1:3020/webhook" # Webhook audit address
+#export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/audit"
+#
+#export RUSTFS_AUDIT_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook audit
+#export RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY="http://127.0.0.1:3020/webhook" # Webhook audit address
+#export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/audit"
+#
+#export RUSTFS_AUDIT_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook audit
+#export RUSTFS_AUDIT_WEBHOOK_ENDPOINT_MASTER="http://127.0.0.1:3020/webhook" # Webhook audit address
+#export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/audit"
 
 # export RUSTFS_POLICY_PLUGIN_URL="http://localhost:8181/v1/data/rustfs/authz/allow"  # The URL of the OPA system
 # export RUSTFS_POLICY_PLUGIN_AUTH_TOKEN="your-opa-token"  # The authentication token for the OPA system is optional
@@ -183,6 +183,9 @@ export RUSTFS_ENABLE_PROFILING=false
 # Heal configuration queue size
 export RUSTFS_HEAL_QUEUE_SIZE=10000
 
+# rustfs trust system CA certificates
+export RUSTFS_TRUST_SYSTEM_CA=true
+
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
@@ -212,4 +215,3 @@ fi
 #cargo run --profile release --bin rustfs
 # To run in debug mode, use the following line
 cargo run --bin rustfs
-

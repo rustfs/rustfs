@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use time::OffsetDateTime;
-use time::macros::offset;
 use tracing::warn;
 
 const ACCESS_KEY_MIN_LEN: usize = 3;
@@ -231,7 +230,7 @@ pub fn create_new_credentials_with_metadata(
     let expiration = {
         if let Some(v) = claims.get("exp") {
             if let Some(expiry) = v.as_i64() {
-                Some(OffsetDateTime::from_unix_timestamp(expiry)?.to_offset(offset!(+8)))
+                Some(OffsetDateTime::from_unix_timestamp(expiry)?)
             } else {
                 None
             }

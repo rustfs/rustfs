@@ -14,7 +14,7 @@
 
 use crate::config::{KV, KVS};
 use rustfs_config::{
-    COMMENT_KEY, DEFAULT_DIR, DEFAULT_LIMIT, ENABLE_KEY, EnableState, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD,
+    COMMENT_KEY, DEFAULT_LIMIT, ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD,
     MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN,
     WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
@@ -47,7 +47,7 @@ pub static DEFAULT_NOTIFY_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
         },
         KV {
             key: WEBHOOK_QUEUE_DIR.to_owned(),
-            value: DEFAULT_DIR.to_owned(),
+            value: EVENT_DEFAULT_DIR.to_owned(),
             hidden_if_empty: false,
         },
         KV {
@@ -114,7 +114,7 @@ pub static DEFAULT_NOTIFY_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
         },
         KV {
             key: MQTT_QUEUE_DIR.to_owned(),
-            value: DEFAULT_DIR.to_owned(),
+            value: EVENT_DEFAULT_DIR.to_owned(),
             hidden_if_empty: false,
         },
         KV {

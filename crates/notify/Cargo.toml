@@ -29,6 +29,8 @@ documentation = "https://docs.rs/rustfs-notify/latest/rustfs_notify/"
 rustfs-config = { workspace = true, features = ["notify", "constants"] }
 rustfs-ecstore = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-utils = { workspace = true }
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
