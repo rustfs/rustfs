@@ -26,6 +26,11 @@ use tonic::{
 };
 use tracing::{debug, warn};
 
+// Type alias for the complex client type
+pub type NodeServiceClientType = NodeServiceClient<
+    InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
+>;
+
 pub use generated::*;
 
 // Default 100 MB

@@ -265,7 +265,10 @@ pub async fn load_format_erasure(disk: &DiskStore, heal: bool) -> disk::error::R
         .map_err(|e| match e {
             DiskError::FileNotFound => DiskError::UnformattedDisk,
             DiskError::DiskNotFound => DiskError::UnformattedDisk,
-            _ => e,
+            _ => {
+                warn!("load_format_erasure err: {:?} {:?}", disk.to_string(), e);
+                e
+            }
         })?;
 
     let mut fm = FormatV3::try_from(data.as_ref())?;
@@ -312,17 +315,18 @@ async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<For
 }
 
 pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -> disk::error::Result<()> {
-    if disk.is_none() {
+    let Some(disk) = disk else {
         return Err(DiskError::DiskNotFound);
-    }
+    };
 
-    let format = format.as_ref().unwrap();
+    let Some(format) = format else {
+        return Err(DiskError::other("format is none"));
+    };
 
     let json_data = format.to_json()?;
 
     let tmpfile = Uuid::new_v4().to_string();
 
-    let disk = disk.as_ref().unwrap();
     disk.write_all(RUSTFS_META_BUCKET, tmpfile.as_str(), json_data.into_bytes().into())
         .await?;
 
