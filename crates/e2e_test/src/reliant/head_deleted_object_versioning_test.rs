@@ -23,7 +23,7 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::types::{VersioningConfiguration, BucketVersioningStatus};
+use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use bytes::Bytes;
 use serial_test::serial;
 use std::error::Error;
@@ -69,12 +69,13 @@ async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
     }
 
     // Enable versioning
-    client.put_bucket_versioning()
+    client
+        .put_bucket_versioning()
         .bucket(BUCKET)
         .versioning_configuration(
             VersioningConfiguration::builder()
                 .status(BucketVersioningStatus::Enabled)
-                .build()
+                .build(),
         )
         .send()
         .await?;
@@ -121,7 +122,9 @@ async fn test_head_deleted_object_versioning_returns_nosuchkey() -> Result<(), B
         SdkError::ServiceError(service_err) => {
             let s3_err = service_err.into_err();
             assert!(
-                s3_err.meta().code() == Some("NoSuchKey") || s3_err.meta().code() == Some("NotFound") || s3_err.meta().code() == Some("404"),
+                s3_err.meta().code() == Some("NoSuchKey")
+                    || s3_err.meta().code() == Some("NotFound")
+                    || s3_err.meta().code() == Some("404"),
                 "Error should be NoSuchKey or NotFound, got: {s3_err:?}"
             );
             info!("✅ HeadObject correctly returns NoSuchKey/NotFound");
