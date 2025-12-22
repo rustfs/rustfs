@@ -447,9 +447,7 @@ impl SetDisks {
                     return Err(DiskError::FileCorrupt);
                 }
 
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
                         .await
                 } else {
@@ -484,9 +482,7 @@ impl SetDisks {
                     continue;
                 }
 
-                if let Some(disk) = disks[i].as_ref()
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disks[i].as_ref() {
                     let fi = file_infos[i].clone();
                     let old_data_dir = data_dirs[i];
                     let disk = disk.clone();
@@ -575,9 +571,7 @@ impl SetDisks {
             let bucket = bucket.clone();
             let disk = disk.clone();
             tokio::spawn(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     (disk
                         .delete(
                             &bucket,
@@ -621,9 +615,7 @@ impl SetDisks {
                 let paths = paths.to_vec();
 
                 async move {
-                    if let Some(disk) = disk
-                        && disk.is_online().await
-                    {
+                    if let Some(disk) = disk {
                         disk.delete_paths(RUSTFS_META_MULTIPART_BUCKET, &paths).await
                     } else {
                         Err(DiskError::DiskNotFound)
@@ -769,9 +761,7 @@ impl SetDisks {
         let mut futures = Vec::with_capacity(disks.len());
         for (i, disk) in disks.iter().enumerate() {
             futures.push(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     disk.list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, part_path, -1)
                         .await
                 } else {
@@ -864,9 +854,7 @@ impl SetDisks {
             let dst_bucket = dst_bucket.clone();
             let dst_object = dst_object.clone();
             tokio::spawn(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     disk.rename_part(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
                         .await
                 } else {
@@ -957,9 +945,7 @@ impl SetDisks {
             let mut file_info = files[i].clone();
             file_info.erasure.index = i + 1;
             futures.push(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     disk.write_metadata(org_bucket, bucket, prefix, file_info).await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -1610,9 +1596,7 @@ impl SetDisks {
 
         for disk in disks.iter() {
             futures.push(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     disk.read_xl(bucket, object, read_data).await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -1738,9 +1722,7 @@ impl SetDisks {
         for disk in disks.iter() {
             let req = req.clone();
             futures.push(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     disk.read_multiple(req).await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -2043,9 +2025,7 @@ impl SetDisks {
 
         for disk in disks.iter() {
             futures.push(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     disk.delete(
                         bucket,
                         prefix,
@@ -2541,9 +2521,7 @@ impl SetDisks {
         for disk in disks.iter() {
             let fi = fi.clone();
             futures.push(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     disk.update_metadata(bucket, object, fi, opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -3391,9 +3369,6 @@ impl SetDisks {
         if dang_ling_object && !dry_run && remove {
             let mut futures = Vec::with_capacity(disks.len());
             for disk in disks.iter().flatten() {
-                if !disk.is_online().await {
-                    continue;
-                }
                 let disk = disk.clone();
                 let bucket = bucket.to_string();
                 let object = object.to_string();
@@ -3639,9 +3614,7 @@ impl SetDisks {
             let bucket = bucket.to_string();
             let prefix = prefix.to_string();
             futures.push(async move {
-                if let Some(disk) = disk_op
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk_op {
                     disk.delete(
                         &bucket,
                         &prefix,
@@ -4279,9 +4252,7 @@ impl StorageAPI for SetDisks {
 
         for disk in disks.iter() {
             futures.push(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     match disk
                         .delete_version(bucket, object, fi.clone(), force_del_marker, DeleteOptions::default())
                         .await
@@ -4453,9 +4424,7 @@ impl StorageAPI for SetDisks {
         for disk in disks.iter() {
             let vers = vers.clone();
             futures.push(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk {
                     disk.delete_versions(bucket, vers, DeleteOptions::default()).await
                 } else {
                     let mut errs = Vec::with_capacity(vers.len());
@@ -4961,9 +4930,7 @@ impl StorageAPI for SetDisks {
         }
 
         for disk in disks.iter() {
-            if let Some(disk) = disk
-                && disk.is_online().await
-            {
+            if let Some(disk) = disk {
                 continue;
             }
             let _ = self.add_partial(bucket, object, opts.version_id.as_ref().expect("err")).await;
@@ -5205,9 +5172,7 @@ impl StorageAPI for SetDisks {
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
-            if let Some(disk) = disk_op
-                && disk.is_online().await
-            {
+            if let Some(disk) = disk_op {
                 let writer = create_bitrot_writer(
                     false,
                     Some(disk),
@@ -6560,9 +6525,7 @@ async fn disks_with_all_parts(
             continue;
         }
 
-        let disk = if let Some(disk) = disk
-            && disk.is_online().await
-        {
+        let disk = if let Some(disk) = disk {
             disk
         } else {
             meta_errs[index] = Some(DiskError::DiskNotFound);
@@ -6627,9 +6590,7 @@ async fn disks_with_all_parts(
             continue;
         }
 
-        let disk = if let Some(disk) = disk
-            && disk.is_online().await
-        {
+        let disk = if let Some(disk) = disk {
             disk
         } else {
             continue;
@@ -6829,7 +6790,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                     healing: res.healing,
                     scanning: res.scanning,
 
-                    uuid: res.id.clone(),
+                    uuid: res.id.map_or("".to_string(), |id| id.to_string()),
                     major: res.major as u32,
                     minor: res.minor as u32,
                     model: None,

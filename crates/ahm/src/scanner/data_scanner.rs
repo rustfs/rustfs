@@ -525,9 +525,7 @@ impl Scanner {
         if let Some(pool) = ecstore.pools.first() {
             for set_disks in &pool.disk_set {
                 let (disks, _) = set_disks.get_online_disks_with_healing(false).await;
-                if let Some(disk) = disks.first()
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disks.first() {
                     let bucket_path = disk.path().join(bucket_name);
                     if bucket_path.exists() {
                         if let Ok(entries) = std::fs::read_dir(&bucket_path) {
@@ -1383,9 +1381,7 @@ impl Scanner {
             debug!("Checking pool {}, {} disks", pool_idx, pool_disks.len());
 
             for (disk_idx, disk_option) in pool_disks.iter().enumerate() {
-                if let Some(disk) = disk_option
-                    && disk.is_online().await
-                {
+                if let Some(disk) = disk_option {
                     total_disks_checked += 1;
                     debug!("Checking disk {} in pool {}: {}", disk_idx, pool_idx, disk.path().display());
 

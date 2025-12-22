@@ -536,7 +536,7 @@ pub struct DiskInfo {
     pub scanning: bool,
     pub endpoint: String,
     pub mount_path: String,
-    pub id: String,
+    pub id: Option<Uuid>,
     pub rotational: bool,
     pub metrics: DiskMetrics,
     pub error: String,

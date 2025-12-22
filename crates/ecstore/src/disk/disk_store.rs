@@ -541,7 +541,7 @@ impl DiskAPI for LocalDiskWrapper {
         let result = self.disk.disk_info(opts).await?;
 
         if let Some(current_disk_id) = *self.disk_id.read().await
-            && current_disk_id.to_string() != result.id
+            && Some(current_disk_id) != result.id
         {
             return Err(DiskError::DiskNotFound);
         };

@@ -175,7 +175,7 @@ impl LocalDisk {
         };
         let root_clone = root.clone();
         let update_fn: UpdateFn<DiskInfo> = Box::new(move || {
-            let disk_id = id.map_or("".to_string(), |id| id.to_string());
+            let disk_id = id.clone();
             let root = root_clone.clone();
             Box::pin(async move {
                 match get_disk_info(root.clone()).await {
@@ -190,7 +190,7 @@ impl LocalDisk {
                             minor: info.minor,
                             fs_type: info.fstype,
                             root_disk: root,
-                            id: disk_id.to_string(),
+                            id: disk_id.clone(),
                             ..Default::default()
                         };
                         // if root {
@@ -1346,7 +1346,7 @@ impl DiskAPI for LocalDisk {
         if format_info.file_info.is_some() && id.is_some() {
             // check last check time
             if let Some(last_check) = format_info.last_check {
-                if last_check.unix_timestamp() + 3 < OffsetDateTime::now_utc().unix_timestamp() {
+                if last_check.unix_timestamp() + 1 < OffsetDateTime::now_utc().unix_timestamp() {
                     return Ok(id);
                 }
             }
@@ -2442,6 +2442,10 @@ impl DiskAPI for LocalDisk {
         info.mount_path = self.path().to_str().unwrap().to_string();
         info.endpoint = self.endpoint.to_string();
         info.scanning = self.scanning.load(Ordering::SeqCst) == 1;
+
+        if info.id.is_none() {
+            info.id = self.get_disk_id().await?;
+        }
 
         Ok(info)
     }

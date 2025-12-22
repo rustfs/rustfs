@@ -38,7 +38,7 @@ use walkdir::WalkDir;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>)> = OnceLock::new();
 static INIT: Once = Once::new();
 
-fn init_tracing() {
+pub fn init_tracing() {
     INIT.call_once(|| {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
