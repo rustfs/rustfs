@@ -121,7 +121,6 @@ use rustfs_utils::{
     },
     path::{is_dir_object, path_join_buf},
 };
-use rustfs_config;
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
@@ -135,7 +134,10 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{io::{AsyncRead, AsyncSeek}, sync::mpsc};
+use tokio::{
+    io::{AsyncRead, AsyncSeek},
+    sync::mpsc,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -2284,13 +2286,13 @@ impl S3 for FS {
                 && response_content_length <= seekable_object_size_threshold as i64
                 && part_number.is_none()
                 && rs.is_none();
-            
+
             if should_provide_seek_support {
                 debug!(
                     "Reading small object into memory for seek support: key={} size={}",
                     cache_key, response_content_length
                 );
-                
+
                 // Read the stream into memory
                 let mut buf = Vec::with_capacity(response_content_length as usize);
                 match tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
@@ -2303,7 +2305,7 @@ impl S3 for FS {
                                 buf.len()
                             );
                         }
-                        
+
                         // Create seekable in-memory reader (similar to MinIO SDK's bytes.Reader)
                         let mem_reader = InMemoryAsyncReader::new(buf);
                         Some(StreamingBlob::wrap(bytes_stream(
