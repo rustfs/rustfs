@@ -177,4 +177,16 @@ storageclass:
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
 
+# Init container parameters.
+initStep:
+  image:
+    repository: busybox
+    pullPolicy: IfNotPresent
+    tag: "latest"
+  containerSecurityContext:
+    runAsUser: 0
+    runAsGroup: 0
+
+
+
 extraManifests: []
