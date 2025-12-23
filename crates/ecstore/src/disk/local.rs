@@ -69,22 +69,12 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FormatInfo {
     pub id: Option<Uuid>,
     pub data: Bytes,
     pub file_info: Option<Metadata>,
     pub last_check: Option<OffsetDateTime>,
-}
-
-impl FormatInfo {
-    pub fn last_check_valid(&self) -> bool {
-        let now = OffsetDateTime::now_utc();
-        self.file_info.is_some()
-            && self.id.is_some()
-            && self.last_check.is_some()
-            && (now.unix_timestamp() - self.last_check.unwrap().unix_timestamp() <= 1)
-    }
 }
 
 /// A helper enum to handle internal buffer types for writing data.
@@ -185,7 +175,7 @@ impl LocalDisk {
         };
         let root_clone = root.clone();
         let update_fn: UpdateFn<DiskInfo> = Box::new(move || {
-            let disk_id = id.map_or("".to_string(), |id| id.to_string());
+            let disk_id = id;
             let root = root_clone.clone();
             Box::pin(async move {
                 match get_disk_info(root.clone()).await {
@@ -200,7 +190,7 @@ impl LocalDisk {
                             minor: info.minor,
                             fs_type: info.fstype,
                             root_disk: root,
-                            id: disk_id.to_string(),
+                            id: disk_id,
                             ..Default::default()
                         };
                         // if root {
@@ -1295,7 +1285,7 @@ impl DiskAPI for LocalDisk {
     }
     #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
-        self.check_format_json().await.is_ok()
+        true
     }
 
     #[tracing::instrument(skip(self))]
@@ -1342,23 +1332,39 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
-        let mut format_info = self.format_info.write().await;
+        let format_info = {
+            let format_info = self.format_info.read().await;
+            format_info.clone()
+        };
 
         let id = format_info.id;
 
-        if format_info.last_check_valid() {
-            return Ok(id);
+        // if format_info.last_check_valid() {
+        //     return Ok(id);
+        // }
+
+        if format_info.file_info.is_some() && id.is_some() {
+            // check last check time
+            if let Some(last_check) = format_info.last_check {
+                if last_check.unix_timestamp() + 1 < OffsetDateTime::now_utc().unix_timestamp() {
+                    return Ok(id);
+                }
+            }
         }
 
         let file_meta = self.check_format_json().await?;
 
         if let Some(file_info) = &format_info.file_info {
             if super::fs::same_file(&file_meta, file_info) {
+                let mut format_info = self.format_info.write().await;
                 format_info.last_check = Some(OffsetDateTime::now_utc());
+                drop(format_info);
 
                 return Ok(id);
             }
         }
+
+        debug!("get_disk_id: read format.json");
 
         let b = fs::read(&self.format_path).await.map_err(to_unformatted_disk_error)?;
 
@@ -1375,20 +1381,19 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::InconsistentDisk);
         }
 
+        let mut format_info = self.format_info.write().await;
         format_info.id = Some(disk_id);
         format_info.file_info = Some(file_meta);
         format_info.data = b.into();
         format_info.last_check = Some(OffsetDateTime::now_utc());
+        drop(format_info);
 
         Ok(Some(disk_id))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
+    async fn set_disk_id(&self, _id: Option<Uuid>) -> Result<()> {
         // No setup is required locally
-        // TODO: add check_id_store
-        let mut format_info = self.format_info.write().await;
-        format_info.id = id;
         Ok(())
     }
 
@@ -2438,6 +2443,10 @@ impl DiskAPI for LocalDisk {
         info.endpoint = self.endpoint.to_string();
         info.scanning = self.scanning.load(Ordering::SeqCst) == 1;
 
+        if info.id.is_none() {
+            info.id = self.get_disk_id().await.unwrap_or(None);
+        }
+
         Ok(info)
     }
 }
@@ -2703,39 +2712,6 @@ mod test {
             assert!(LocalDisk::is_valid_volname("valid/name"));
             assert!(LocalDisk::is_valid_volname("valid:name"));
         }
-    }
-
-    #[tokio::test]
-    async fn test_format_info_last_check_valid() {
-        let now = OffsetDateTime::now_utc();
-
-        // Valid format info
-        let valid_format_info = FormatInfo {
-            id: Some(Uuid::new_v4()),
-            data: vec![1, 2, 3].into(),
-            file_info: Some(fs::metadata("../../../..").await.unwrap()),
-            last_check: Some(now),
-        };
-        assert!(valid_format_info.last_check_valid());
-
-        // Invalid format info (missing id)
-        let invalid_format_info = FormatInfo {
-            id: None,
-            data: vec![1, 2, 3].into(),
-            file_info: Some(fs::metadata("../../../..").await.unwrap()),
-            last_check: Some(now),
-        };
-        assert!(!invalid_format_info.last_check_valid());
-
-        // Invalid format info (old timestamp)
-        let old_time = OffsetDateTime::now_utc() - time::Duration::seconds(10);
-        let old_format_info = FormatInfo {
-            id: Some(Uuid::new_v4()),
-            data: vec![1, 2, 3].into(),
-            file_info: Some(fs::metadata("../../../..").await.unwrap()),
-            last_check: Some(old_time),
-        };
-        assert!(!old_format_info.last_check_valid());
     }
 
     #[tokio::test]

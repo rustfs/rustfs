@@ -69,7 +69,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CARGO_BUILD_JOBS: 8
+  CARGO_BUILD_JOBS: 2
 
 jobs:
 
@@ -78,7 +78,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
@@ -93,7 +93,7 @@ jobs:
 
   typos:
     name: Typos
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -136,7 +136,7 @@ jobs:
     name: End-to-End Tests
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -166,7 +166,7 @@ jobs:
         run: |
           touch rustfs/build.rs
           # Limit concurrency to prevent OOM
-          cargo build -p rustfs --bins --jobs 4
+          cargo build -p rustfs --bins --jobs 2
 
       - name: Run end-to-end tests
         run: |

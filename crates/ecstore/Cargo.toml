@@ -113,6 +113,7 @@ faster-hex = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
