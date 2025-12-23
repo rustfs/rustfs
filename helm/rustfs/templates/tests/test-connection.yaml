@@ -11,5 +11,5 @@ spec:
     - name: wget
       image: busybox
       command: ['wget']
-      args: ['-O', '/dev/null', '{{ include "rustfs.fullname" . }}-svc:{{ .Values.service.ep_port }}/health']
+      args: ['-O', '/dev/null', '{{ include "rustfs.fullname" . }}-svc:{{ .Values.service.endpoint.port }}/health']
   restartPolicy: Never
