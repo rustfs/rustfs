@@ -114,13 +114,10 @@ ingress:
     nginx.ingress.kubernetes.io/session-cookie-hash: sha1
     nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
     nginx.ingress.kubernetes.io/session-cookie-name: rustfs
-  certManagerAnnotations:
-    {} # Specify cert manager issuer annotations,cert-manager.io/issuer or cert-manager.io/cluster-issuer.
-    # cert-manager.io/issuer: "letsencrypt-staging"
   customAnnotations: # Specify custom annotations
     {} # Customize annotations
   hosts:
-    - host: xmg.rustfs.com
+    - host: example.rustfs.com
       paths:
         - path: /
           pathType: Prefix
@@ -128,9 +125,6 @@ ingress:
     enabled: false # Enable tls and access rustfs via https.
     certManager:
       enabled: false # Enable certmanager to generate certificate for rustfs, default false.
-      issuer:
-        name: letsencrypt-staging # Specify cert manager issuer name
-        kind: Issuer # Specify cert manager issuer kind, Issuer or ClusterIssuer.
     secretName: secret-tls
     crt: tls.crt
     key: tls.key
