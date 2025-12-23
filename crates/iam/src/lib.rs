@@ -33,7 +33,7 @@ static IAM_SYS: OnceLock<Arc<IamSys<ObjectStore>>> = OnceLock::new();
 #[instrument(skip(ecstore))]
 pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
     debug!("init iam system");
-    let s = IamCache::new(ObjectStore::new(ecstore).await).await;
+    let s = IamCache::new(ObjectStore::new(ecstore)).await;
 
     IAM_SYS.get_or_init(move || IamSys::new(s).into());
     Ok(())
