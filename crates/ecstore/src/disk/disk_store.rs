@@ -15,7 +15,8 @@
 use crate::disk::{
     CheckPartsResp, DeleteOptions, DiskAPI, DiskError, DiskInfo, DiskInfoOptions, DiskLocation, Endpoint, Error,
     FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, Result, UpdateMetadataOpts, VolumeInfo,
-    WalkDirOptions, local::LocalDisk,
+    WalkDirOptions,
+    local::{LocalDisk, ScanGuard},
 };
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
@@ -475,6 +476,15 @@ impl LocalDiskWrapper {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        self.track_disk_health(|| async { self.disk.read_metadata(volume, path).await }, Duration::ZERO)
+            .await
+    }
+
+    fn start_scan(&self) -> ScanGuard {
+        self.disk.start_scan()
+    }
+
     fn to_string(&self) -> String {
         self.disk.to_string()
     }
