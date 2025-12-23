@@ -40,7 +40,7 @@ env:
 jobs:
   security-audit:
     name: Security Audit
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -65,7 +65,7 @@ jobs:
 
   dependency-review:
     name: Dependency Review
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     if: github.event_name == 'pull_request'
     permissions:
       contents: read

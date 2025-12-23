@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod disk_store;
 pub mod endpoint;
 pub mod error;
 pub mod error_conv;
@@ -30,6 +31,7 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
+use crate::disk::disk_store::LocalDiskWrapper;
 use crate::rpc::RemoteDisk;
 use bytes::Bytes;
 use endpoint::Endpoint;
@@ -51,7 +53,7 @@ pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
 #[derive(Debug)]
 pub enum Disk {
-    Local(Box<LocalDisk>),
+    Local(Box<LocalDiskWrapper>),
     Remote(Box<RemoteDisk>),
 }
 
@@ -398,7 +400,7 @@ impl DiskAPI for Disk {
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
     if ep.is_local {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
-        Ok(Arc::new(Disk::Local(Box::new(s))))
+        Ok(Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(s), opt.health_check)))))
     } else {
         let remote_disk = RemoteDisk::new(ep, opt).await?;
         Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
@@ -534,7 +536,7 @@ pub struct DiskInfo {
     pub scanning: bool,
     pub endpoint: String,
     pub mount_path: String,
-    pub id: String,
+    pub id: Option<Uuid>,
     pub rotational: bool,
     pub metrics: DiskMetrics,
     pub error: String,
@@ -1015,7 +1017,7 @@ mod tests {
 
         let endpoint = Endpoint::try_from(test_dir).unwrap();
         let local_disk = LocalDisk::new(&endpoint, false).await.unwrap();
-        let disk = Disk::Local(Box::new(local_disk));
+        let disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
 
         // Test basic methods
         assert!(disk.is_local());

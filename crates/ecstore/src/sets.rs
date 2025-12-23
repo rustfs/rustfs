@@ -255,7 +255,7 @@ impl Sets {
         self.connect_disks().await;
 
         // TODO: config interval
-        let mut interval = tokio::time::interval(Duration::from_secs(15 * 3));
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
                _= interval.tick()=>{

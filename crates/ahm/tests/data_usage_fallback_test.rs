@@ -21,10 +21,11 @@ use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, GLOBAL_BucketMetad
 use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::{ObjectIO, PutObjReader, StorageAPI};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tracing::Level;
 
 /// Build a minimal single-node ECStore over a temp directory and populate objects.
 async fn create_store_with_objects(count: usize) -> (TempDir, std::sync::Arc<ECStore>) {
@@ -74,8 +75,22 @@ async fn create_store_with_objects(count: usize) -> (TempDir, std::sync::Arc<ECS
     (temp_dir, store)
 }
 
+static INIT: Once = Once::new();
+
+fn init_tracing(filter_level: Level) {
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_max_level(filter_level)
+            .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+            .with_thread_names(true)
+            .try_init();
+    });
+}
+
 #[tokio::test]
 async fn fallback_builds_full_counts_over_100_objects() {
+    init_tracing(Level::ERROR);
     let (_tmp, store) = create_store_with_objects(1000).await;
     let scanner = Scanner::new(None, None);
 
