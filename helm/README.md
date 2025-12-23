@@ -44,7 +44,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | imageRegistryCredentials.username | string | `""` | The username to pull rustfs image from private registry. |
 | ingress.className | string | `"traefik"` | Specify the ingress class, traefik or nginx. |
 | ingress.enabled | bool | `true` |  |
-| ingress.hosts[0].host | string | `"your.rustfs.com"` |  |
+| ingress.hosts[0].host | string | `"example.rustfs.com"` |  |
 | ingress.hosts[0].paths[0].path | string | `"/"` |  |
 | ingress.hosts[0].paths[0].pathType | string | `"ImplementationSpecific"` |  |
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/affinity" | string | `"cookie"` |  |
@@ -52,6 +52,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-hash" | string | `"sha1"` |  |
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-max-age" | string | `"3600"` |  |
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-name" | string | `"rustfs"` |  |
+| ingress.customAnnotations | dict | `{}` |Customize annotations.  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie" | string | `"true"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.httponly" | string | `"true"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.name" | string | `"rustfs"` |  |
@@ -59,8 +60,6 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.secure" | string | `"true"` |  |
 | ingress.tls.enabled | bool | `false` | Enable tls and access rustfs via https. |
 | ingress.tls.certManager.enabled | string | `false` | Enable cert manager support to generate certificate automatically. |
-| ingress.tls.certManager.issuer.name | string | `false` | The name of cert manager issuer. |
-| ingress.tls.certManager.issuer.kind | string | `false` | The kind of cert manager issuer, issuer or cluster-issuer. |
 | ingress.tls.crt | string | "" | The content of certificate file. |
 | ingress.tls.key | string | "" | The content of key file. |
 | livenessProbe.failureThreshold | int | `3` |  |
@@ -179,12 +178,12 @@ Check the ingress status
 ```
 kubectl -n rustfs get ing
 NAME     CLASS   HOSTS            ADDRESS         PORTS     AGE
-rustfs   nginx   your.rustfs.com   10.43.237.152   80, 443   29m
+rustfs   nginx   example.rustfs.com   10.43.237.152   80, 443   29m
 ```
 
-Access the rustfs cluster via `https://your.rustfs.com` with the default username and password `rustfsadmin`.
+Access the rustfs cluster via `https://example.rustfs.com` with the default username and password `rustfsadmin`.
 
-> Replace the `your.rustfs.com` with your own domain as well as the certificates.
+> Replace the `example.rustfs.com` with your own domain as well as the certificates.
 
 # TLS configuration
 
