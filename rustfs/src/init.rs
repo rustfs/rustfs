@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
-use crate::{admin, config};
+use crate::{admin, config, protocols};
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_notify::notifier_global;
@@ -125,6 +125,39 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
             }
         }
     }
+}
+
+/// Initialize FTPS system if enabled
+#[instrument(skip(opt, iam_adapter, ecstore_adapter))]
+pub(crate) async fn init_ftp_system(
+    opt: &config::Opt,
+    iam_adapter: crate::auth::IamAdapter,
+    ecstore_adapter: crate::storage::ecfs::EcStoreAdapter,
+) -> std::io::Result<()> {
+    if opt.ftp_enable {
+        info!("FTPS server is enabled, starting...");
+        let certs_file = opt.ftps_certs_file.as_deref();
+        let key_file = opt.ftps_key_file.as_deref();
+        protocols::adapter::ftps::start_ftps_server(&opt.ftp_address, certs_file, key_file, iam_adapter, ecstore_adapter).await?;
+        info!("FTPS server started successfully on {}", opt.ftp_address);
+    }
+    Ok(())
+}
+
+/// Initialize SFTP system if enabled
+#[instrument(skip(opt, iam_adapter, ecstore_adapter))]
+pub(crate) async fn init_sftp_system(
+    opt: &config::Opt,
+    iam_adapter: crate::auth::IamAdapter,
+    ecstore_adapter: crate::storage::ecfs::EcStoreAdapter,
+) -> std::io::Result<()> {
+    if opt.sftp_enable {
+        info!("SFTP server is enabled, starting...");
+        let host_key = opt.sftp_host_key.as_deref();
+        protocols::adapter::sftp::start_sftp_server(&opt.sftp_address, host_key, iam_adapter, ecstore_adapter).await?;
+        info!("SFTP server started successfully on {}", opt.sftp_address);
+    }
+    Ok(())
 }
 
 /// Initialize KMS system and configure if enabled

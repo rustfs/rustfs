@@ -19,13 +19,14 @@ mod error;
 mod init;
 mod license;
 mod profiling;
+mod protocols;
 mod server;
 mod storage;
 mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check};
+use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, init_ftp_system, init_sftp_system};
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
@@ -60,6 +61,7 @@ use std::io::{Error, Result};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
+use uuid;
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
@@ -245,6 +247,29 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_background_replication(store.clone()).await;
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
+
+    // Create session context using existing auth and storage modules
+    let fs = Arc::new(crate::storage::ecfs::FS { store: store.clone() });
+    let credentials = rustfs_ecstore::global::get_global_action_cred().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let auth = Arc::new(crate::auth::IAMAuth::new(
+        credentials.access_key.clone(),
+        credentials.secret_key.clone(),
+    ));
+
+    // Create session context
+    let session_context = crate::protocols::session::context::SessionContext::new(
+        auth,
+        fs,
+        uuid::Uuid::new_v4().to_string(),
+    );
+
+    // Initialize FTP system if enabled
+    // Note: In a real implementation, we would pass the session context to the protocol adapters
+    init_ftp_system(&opt, session_context.auth().clone(), session_context.fs().clone()).await?;
+
+    // Initialize SFTP system if enabled
+    // Note: In a real implementation, we would pass the session context to the protocol adapters
+    init_sftp_system(&opt, session_context.auth().clone(), session_context.fs().clone()).await?;
 
     // Initialize buffer profiling system
     init_buffer_profile_system(&opt);

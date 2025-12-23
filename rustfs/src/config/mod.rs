@@ -124,6 +124,34 @@ pub struct Opt {
     /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
     #[arg(long, default_value_t = String::from("GeneralPurpose"), env = "RUSTFS_BUFFER_PROFILE")]
     pub buffer_profile: String,
+
+    /// Enable FTPS server
+    #[arg(long, default_value_t = false, env = "RUSTFS_FTPS_ENABLE")]
+    pub ftp_enable: bool,
+
+    /// FTPS server bind address
+    #[arg(long, default_value_t = String::from("0.0.0.0:21"), env = "RUSTFS_FTPS_ADDRESS")]
+    pub ftp_address: String,
+
+    /// FTPS server certificate file path
+    #[arg(long, env = "RUSTFS_FTPS_CERTS_FILE")]
+    pub ftps_certs_file: Option<String>,
+
+    /// FTPS server private key file path
+    #[arg(long, env = "RUSTFS_FTPS_KEY_FILE")]
+    pub ftps_key_file: Option<String>,
+
+    /// Enable SFTP server
+    #[arg(long, default_value_t = false, env = "RUSTFS_SFTP_ENABLE")]
+    pub sftp_enable: bool,
+
+    /// SFTP server bind address
+    #[arg(long, default_value_t = String::from("0.0.0.0:22"), env = "RUSTFS_SFTP_ADDRESS")]
+    pub sftp_address: String,
+
+    /// SFTP server host key file path
+    #[arg(long, env = "RUSTFS_SFTP_HOST_KEY")]
+    pub sftp_host_key: Option<String>,
 }
 
 // lazy_static::lazy_static! {
