@@ -12,29 +12,26 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::{AuditEntry, AuditError, AuditResult};
-use futures::{StreamExt, stream::FuturesUnordered};
+use crate::{
+    AuditEntry, AuditError, AuditResult,
+    factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory},
+};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use hashbrown::{HashMap, HashSet};
-use rustfs_config::{
-    DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
-    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE,
-    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR,
-    WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL, audit::AUDIT_ROUTE_PREFIX,
-};
+use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, EnableState, audit::AUDIT_ROUTE_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
-use rustfs_targets::{
-    Target, TargetError,
-    target::{ChannelTargetType, TargetType, mqtt::MQTTArgs, webhook::WebhookArgs},
-};
+use rustfs_targets::{Target, TargetError, target::ChannelTargetType};
+use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{debug, error, info, warn};
-use url::Url;
 
 /// Registry for managing audit targets
 pub struct AuditRegistry {
     /// Storage for created targets
     targets: HashMap<String, Box<dyn Target<AuditEntry> + Send + Sync>>,
+    /// Factories for creating targets
+    factories: HashMap<String, Box<dyn TargetFactory>>,
 }
 
 impl Default for AuditRegistry {
@@ -46,162 +43,207 @@ impl Default for AuditRegistry {
 impl AuditRegistry {
     /// Creates a new AuditRegistry
     pub fn new() -> Self {
-        Self { targets: HashMap::new() }
+        let mut registry = AuditRegistry {
+            factories: HashMap::new(),
+            targets: HashMap::new(),
+        };
+
+        // Register built-in factories
+        registry.register(ChannelTargetType::Webhook.as_str(), Box::new(WebhookTargetFactory));
+        registry.register(ChannelTargetType::Mqtt.as_str(), Box::new(MQTTTargetFactory));
+
+        registry
     }
 
-    /// Creates all audit targets from system configuration and environment variables.
+    /// Registers a new factory for a target type
+    ///
+    /// # Arguments
+    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
+    /// * `factory` - The factory instance to create targets of this type.
+    pub fn register(&mut self, target_type: &str, factory: Box<dyn TargetFactory>) {
+        self.factories.insert(target_type.to_string(), factory);
+    }
+
+    /// Creates a target of the specified type with the given ID and configuration
+    ///
+    /// # Arguments
+    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
+    /// * `id` - The identifier for the target instance.
+    /// * `config` - The configuration key-value store for the target.
+    ///
+    /// # Returns
+    /// * `Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError>` - The created target or an error.
+    pub async fn create_target(
+        &self,
+        target_type: &str,
+        id: String,
+        config: &KVS,
+    ) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError> {
+        let factory = self
+            .factories
+            .get(target_type)
+            .ok_or_else(|| TargetError::Configuration(format!("Unknown target type: {target_type}")))?;
+
+        // Validate configuration before creating target
+        factory.validate_config(&id, config)?;
+
+        // Create target
+        factory.create_target(id, config).await
+    }
+
+    /// Creates all targets from a configuration
+    /// Create all notification targets from system configuration and environment variables.
     /// This method processes the creation of each target concurrently as follows:
-    /// 1. Iterate through supported target types (webhook, mqtt).
-    /// 2. For each type, resolve its configuration from file and environment variables.
+    /// 1. Iterate through all registered target types (e.g. webhooks, mqtt).
+    /// 2. For each type, resolve its configuration in the configuration file and environment variables.
     /// 3. Identify all target instance IDs that need to be created.
-    /// 4. Merge configurations with precedence: ENV > file instance > file default.
-    /// 5. Create async tasks for enabled instances.
-    /// 6. Execute tasks concurrently and collect successful targets.
-    /// 7. Persist successful configurations back to system storage.
-    pub async fn create_targets_from_config(
-        &mut self,
+    /// 4. Combine the default configuration, file configuration, and environment variable configuration for each instance.
+    /// 5. If the instance is enabled, create an asynchronous task for it to instantiate.
+    /// 6. Concurrency executes all creation tasks and collects results.
+    pub async fn create_audit_targets_from_config(
+        &self,
         config: &Config,
     ) -> AuditResult<Vec<Box<dyn Target<AuditEntry> + Send + Sync>>> {
         // Collect only environment variables with the relevant prefix to reduce memory usage
         let all_env: Vec<(String, String)> = std::env::vars().filter(|(key, _)| key.starts_with(ENV_PREFIX)).collect();
-
         // A collection of asynchronous tasks for concurrently executing target creation
         let mut tasks = FuturesUnordered::new();
-        // let final_config = config.clone();
-
+        // let final_config = config.clone(); // Clone a configuration for aggregating the final result
         // Record the defaults for each segment so that the segment can eventually be rebuilt
         let mut section_defaults: HashMap<String, KVS> = HashMap::new();
-
-        // Supported target types for audit
-        let target_types = vec![ChannelTargetType::Webhook.as_str(), ChannelTargetType::Mqtt.as_str()];
-
-        // 1. Traverse all target types and process them
-        for target_type in target_types {
-            let span = tracing::Span::current();
-            span.record("target_type", target_type);
-            info!(target_type = %target_type, "Starting audit target type processing");
+        // 1. Traverse all registered plants and process them by target type
+        for (target_type, factory) in &self.factories {
+            tracing::Span::current().record("target_type", target_type.as_str());
+            info!("Start working on target types...");
 
             // 2. Prepare the configuration source
+            // 2.1. Get the configuration segment in the file, e.g. 'audit_webhook'
             let section_name = format!("{AUDIT_ROUTE_PREFIX}{target_type}").to_lowercase();
             let file_configs = config.0.get(&section_name).cloned().unwrap_or_default();
+            // 2.2. Get the default configuration for that type
             let default_cfg = file_configs.get(DEFAULT_DELIMITER).cloned().unwrap_or_default();
-            debug!(?default_cfg, "Retrieved default configuration");
+            debug!(?default_cfg, "Get the default configuration");
 
             // Save defaults for eventual write back
             section_defaults.insert(section_name.clone(), default_cfg.clone());
 
-            // Get valid fields for the target type
-            let valid_fields = match target_type {
-                "webhook" => get_webhook_valid_fields(),
-                "mqtt" => get_mqtt_valid_fields(),
-                _ => {
-                    warn!(target_type = %target_type, "Unknown target type, skipping");
-                    continue;
-                }
-            };
-            debug!(?valid_fields, "Retrieved valid configuration fields");
+            // *** Optimization point 1: Get all legitimate fields of the current target type ***
+            let valid_fields = factory.get_valid_fields();
+            debug!(?valid_fields, "Get the legitimate configuration fields");
 
             // 3. Resolve instance IDs and configuration overrides from environment variables
             let mut instance_ids_from_env = HashSet::new();
-            let mut env_overrides: HashMap<String, HashMap<String, String>> = HashMap::new();
-
-            for (env_key, env_value) in &all_env {
-                let audit_prefix = format!("{ENV_PREFIX}{AUDIT_ROUTE_PREFIX}{target_type}").to_uppercase();
-                if !env_key.starts_with(&audit_prefix) {
-                    continue;
-                }
-
-                let suffix = &env_key[audit_prefix.len()..];
-                if suffix.is_empty() {
-                    continue;
-                }
-
-                // Parse field and instance from suffix (FIELD_INSTANCE or FIELD)
-                let (field_name, instance_id) = if let Some(last_underscore) = suffix.rfind('_') {
-                    let potential_field = &suffix[1..last_underscore]; // Skip leading _
-                    let potential_instance = &suffix[last_underscore + 1..];
-
-                    // Check if the part before the last underscore is a valid field
-                    if valid_fields.contains(&potential_field.to_lowercase()) {
-                        (potential_field.to_lowercase(), potential_instance.to_lowercase())
-                    } else {
-                        // Treat the entire suffix as field name with default instance
-                        (suffix[1..].to_lowercase(), DEFAULT_DELIMITER.to_string())
+            // 3.1. Instance discovery: Based on the '..._ENABLE_INSTANCEID' format
+            let enable_prefix =
+                format!("{ENV_PREFIX}{AUDIT_ROUTE_PREFIX}{target_type}{DEFAULT_DELIMITER}{ENABLE_KEY}{DEFAULT_DELIMITER}")
+                    .to_uppercase();
+            for (key, value) in &all_env {
+                if EnableState::from_str(value).ok().map(|s| s.is_enabled()).unwrap_or(false) {
+                    if let Some(id) = key.strip_prefix(&enable_prefix) {
+                        if !id.is_empty() {
+                            instance_ids_from_env.insert(id.to_lowercase());
+                        }
                     }
-                } else {
-                    // No underscore, treat as field with default instance
-                    (suffix[1..].to_lowercase(), DEFAULT_DELIMITER.to_string())
-                };
-
-                if valid_fields.contains(&field_name) {
-                    if instance_id != DEFAULT_DELIMITER {
-                        instance_ids_from_env.insert(instance_id.clone());
-                    }
-                    env_overrides
-                        .entry(instance_id)
-                        .or_default()
-                        .insert(field_name, env_value.clone());
-                } else {
-                    debug!(
-                        env_key = %env_key,
-                        field_name = %field_name,
-                        "Ignoring environment variable field not found in valid fields for target type {}",
-                        target_type
-                    );
                 }
             }
-            debug!(?env_overrides, "Completed environment variable analysis");
+
+            // 3.2. Parse all relevant environment variable configurations
+            // 3.2.1. Build environment variable prefixes such as 'RUSTFS_AUDIT_WEBHOOK_'
+            let env_prefix = format!("{ENV_PREFIX}{AUDIT_ROUTE_PREFIX}{target_type}{DEFAULT_DELIMITER}").to_uppercase();
+            // 3.2.2. 'env_overrides' is used to store configurations parsed from environment variables in the format: {instance id -> {field -> value}}
+            let mut env_overrides: HashMap<String, HashMap<String, String>> = HashMap::new();
+            for (key, value) in &all_env {
+                if let Some(rest) = key.strip_prefix(&env_prefix) {
+                    // Use rsplitn to split from the right side to properly extract the INSTANCE_ID at the end
+                    // Format: <FIELD_NAME>_<INSTANCE_ID> or <FIELD_NAME>
+                    let mut parts = rest.rsplitn(2, DEFAULT_DELIMITER);
+
+                    // The first part from the right is INSTANCE_ID
+                    let instance_id_part = parts.next().unwrap_or(DEFAULT_DELIMITER);
+                    // The remaining part is FIELD_NAME
+                    let field_name_part = parts.next();
+
+                    let (field_name, instance_id) = match field_name_part {
+                        // Case 1: The format is <FIELD_NAME>_<INSTANCE_ID>
+                        // e.g., rest = "ENDPOINT_PRIMARY" -> field_name="ENDPOINT", instance_id="PRIMARY"
+                        Some(field) => (field.to_lowercase(), instance_id_part.to_lowercase()),
+                        // Case 2: The format is <FIELD_NAME> (without INSTANCE_ID)
+                        // e.g., rest = "ENABLE" -> field_name="ENABLE", instance_id="" (Universal configuration `_ DEFAULT_DELIMITER`)
+                        None => (instance_id_part.to_lowercase(), DEFAULT_DELIMITER.to_string()),
+                    };
+
+                    // *** Optimization point 2: Verify whether the parsed field_name is legal ***
+                    if !field_name.is_empty() && valid_fields.contains(&field_name) {
+                        debug!(
+                            instance_id = %if instance_id.is_empty() { DEFAULT_DELIMITER } else { &instance_id },
+                            %field_name,
+                            %value,
+                            "Parsing to environment variables"
+                        );
+                        env_overrides
+                            .entry(instance_id)
+                            .or_default()
+                            .insert(field_name, value.clone());
+                    } else {
+                        // Ignore illegal field names
+                        warn!(
+                            field_name = %field_name,
+                            "Ignore environment variable fields, not found in the list of valid fields for target type {}",
+                            target_type
+                        );
+                    }
+                }
+            }
+            debug!(?env_overrides, "Complete the environment variable analysis");
 
             // 4. Determine all instance IDs that need to be processed
             let mut all_instance_ids: HashSet<String> =
                 file_configs.keys().filter(|k| *k != DEFAULT_DELIMITER).cloned().collect();
             all_instance_ids.extend(instance_ids_from_env);
-            debug!(?all_instance_ids, "Determined all instance IDs");
+            debug!(?all_instance_ids, "Determine all instance IDs");
 
             // 5. Merge configurations and create tasks for each instance
             for id in all_instance_ids {
-                // 5.1. Merge configuration, priority: Environment variables > File instance > File default
+                // 5.1. Merge configuration, priority: Environment variables > File instance configuration > File default configuration
                 let mut merged_config = default_cfg.clone();
-
-                // Apply file instance configuration if available
+                // Instance-specific configuration in application files
                 if let Some(file_instance_cfg) = file_configs.get(&id) {
                     merged_config.extend(file_instance_cfg.clone());
                 }
-
-                // Apply environment variable overrides
+                // Application instance-specific environment variable configuration
                 if let Some(env_instance_cfg) = env_overrides.get(&id) {
+                    // Convert HashMap<String, String> to KVS
                     let mut kvs_from_env = KVS::new();
                     for (k, v) in env_instance_cfg {
                         kvs_from_env.insert(k.clone(), v.clone());
                     }
                     merged_config.extend(kvs_from_env);
                 }
-                debug!(instance_id = %id, ?merged_config, "Completed configuration merge");
+                debug!(instance_id = %id, ?merged_config, "Complete configuration merge");
 
                 // 5.2. Check if the instance is enabled
                 let enabled = merged_config
                     .lookup(ENABLE_KEY)
-                    .map(|v| parse_enable_value(&v))
+                    .map(|v| {
+                        EnableState::from_str(v.as_str())
+                            .ok()
+                            .map(|s| s.is_enabled())
+                            .unwrap_or(false)
+                    })
                     .unwrap_or(false);
 
                 if enabled {
-                    info!(instance_id = %id, "Creating audit target");
-
-                    // Create task for concurrent execution
-                    let target_type_clone = target_type.to_string();
-                    let id_clone = id.clone();
-                    let merged_config_arc = Arc::new(merged_config.clone());
-                    let task = tokio::spawn(async move {
-                        let result = create_audit_target(&target_type_clone, &id_clone, &merged_config_arc).await;
-                        (target_type_clone, id_clone, result, merged_config_arc)
+                    info!(instance_id = %id, "Target is enabled, ready to create a task");
+                    // 5.3. Create asynchronous tasks for enabled instances
+                    let target_type_clone = target_type.clone();
+                    let tid = id.clone();
+                    let merged_config_arc = Arc::new(merged_config);
+                    tasks.push(async move {
+                        let result = factory.create_target(tid.clone(), &merged_config_arc).await;
+                        (target_type_clone, tid, result, Arc::clone(&merged_config_arc))
                     });
-
-                    tasks.push(task);
-
-                    // Update final config with successful instance
-                    // final_config.0.entry(section_name.clone()).or_default().insert(id, merged_config);
                 } else {
-                    info!(instance_id = %id, "Skipping disabled audit target, will be removed from final configuration");
+                    info!(instance_id = %id, "Skip the disabled target and will be removed from the final configuration");
                     // Remove disabled target from final configuration
                     // final_config.0.entry(section_name.clone()).or_default().remove(&id);
                 }
@@ -211,30 +253,28 @@ impl AuditRegistry {
         // 6. Concurrently execute all creation tasks and collect results
         let mut successful_targets = Vec::new();
         let mut successful_configs = Vec::new();
-        while let Some(task_result) = tasks.next().await {
-            match task_result {
-                Ok((target_type, id, result, kvs_arc)) => match result {
-                    Ok(target) => {
-                        info!(target_type = %target_type, instance_id = %id, "Created audit target successfully");
-                        successful_targets.push(target);
-                        successful_configs.push((target_type, id, kvs_arc));
-                    }
-                    Err(e) => {
-                        error!(target_type = %target_type, instance_id = %id, error = %e, "Failed to create audit target");
-                    }
-                },
+        while let Some((target_type, id, result, final_config)) = tasks.next().await {
+            match result {
+                Ok(target) => {
+                    info!(target_type = %target_type, instance_id = %id, "Create a target successfully");
+                    successful_targets.push(target);
+                    successful_configs.push((target_type, id, final_config));
+                }
                 Err(e) => {
-                    error!(error = %e, "Task execution failed");
+                    error!(target_type = %target_type, instance_id = %id, error = %e, "Failed to create a target");
                 }
             }
         }
 
-        // Rebuild in pieces based on "default items + successful instances" and overwrite writeback to ensure that deleted/disabled instances will not be "resurrected"
+        // 7. Aggregate new configuration and write back to system configuration
         if !successful_configs.is_empty() || !section_defaults.is_empty() {
-            info!("Prepare to rebuild and save target configurations to the system configuration...");
+            info!(
+                "Prepare to update {} successfully created target configurations to the system configuration...",
+                successful_configs.len()
+            );
 
-            // Aggregate successful instances into segments
             let mut successes_by_section: HashMap<String, HashMap<String, KVS>> = HashMap::new();
+
             for (target_type, id, kvs) in successful_configs {
                 let section_name = format!("{AUDIT_ROUTE_PREFIX}{target_type}").to_lowercase();
                 successes_by_section
@@ -244,76 +284,99 @@ impl AuditRegistry {
             }
 
             let mut new_config = config.clone();
-
             // Collection of segments that need to be processed: Collect all segments where default items exist or where successful instances exist
             let mut sections: HashSet<String> = HashSet::new();
             sections.extend(section_defaults.keys().cloned());
             sections.extend(successes_by_section.keys().cloned());
 
-            for section_name in sections {
+            for section in sections {
                 let mut section_map: std::collections::HashMap<String, KVS> = std::collections::HashMap::new();
-
-                // The default entry (if present) is written back to `_`
-                if let Some(default_cfg) = section_defaults.get(&section_name) {
-                    if !default_cfg.is_empty() {
-                        section_map.insert(DEFAULT_DELIMITER.to_string(), default_cfg.clone());
+                // Add default item
+                if let Some(default_kvs) = section_defaults.get(&section) {
+                    if !default_kvs.is_empty() {
+                        section_map.insert(DEFAULT_DELIMITER.to_string(), default_kvs.clone());
                     }
                 }
 
-                // Successful instance write back
-                if let Some(instances) = successes_by_section.get(&section_name) {
+                // Add successful instance item
+                if let Some(instances) = successes_by_section.get(&section) {
                     for (id, kvs) in instances {
                         section_map.insert(id.clone(), kvs.clone());
                     }
                 }
 
-                // Empty segments are removed and non-empty segments are replaced as a whole.
+                // Empty breaks are removed and non-empty breaks are replaced entirely.
                 if section_map.is_empty() {
-                    new_config.0.remove(&section_name);
+                    new_config.0.remove(&section);
                 } else {
-                    new_config.0.insert(section_name, section_map);
+                    new_config.0.insert(section, section_map);
                 }
             }
 
-            // 7. Save the new configuration to the system
-            let Some(store) = rustfs_ecstore::new_object_layer_fn() else {
+            let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
                 return Err(AuditError::StorageNotAvailable(
                     "Failed to save target configuration: server storage not initialized".to_string(),
                 ));
             };
 
             match rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
-                Ok(_) => info!("New audit configuration saved to system successfully"),
+                Ok(_) => {
+                    info!("The new configuration was saved to the system successfully.")
+                }
                 Err(e) => {
-                    error!(error = %e, "Failed to save new audit configuration");
+                    error!("Failed to save the new configuration: {}", e);
                     return Err(AuditError::SaveConfig(Box::new(e)));
                 }
             }
         }
+
+        info!(count = successful_targets.len(), "All target processing completed");
         Ok(successful_targets)
     }
 
     /// Adds a target to the registry
+    ///
+    /// # Arguments
+    /// * `id` - The identifier for the target.
+    /// * `target` - The target instance to be added.
     pub fn add_target(&mut self, id: String, target: Box<dyn Target<AuditEntry> + Send + Sync>) {
         self.targets.insert(id, target);
     }
 
     /// Removes a target from the registry
+    ///
+    /// # Arguments
+    /// * `id` - The identifier for the target to be removed.
+    ///
+    /// # Returns
+    /// * `Option<Box<dyn Target<AuditEntry> + Send + Sync>>` - The removed target if it existed.
     pub fn remove_target(&mut self, id: &str) -> Option<Box<dyn Target<AuditEntry> + Send + Sync>> {
         self.targets.remove(id)
     }
 
     /// Gets a target from the registry
+    ///
+    /// # Arguments
+    /// * `id` - The identifier for the target to be retrieved.
+    ///
+    /// # Returns
+    /// * `Option<&(dyn Target<AuditEntry> + Send + Sync)>` - The target if it exists.
     pub fn get_target(&self, id: &str) -> Option<&(dyn Target<AuditEntry> + Send + Sync)> {
         self.targets.get(id).map(|t| t.as_ref())
     }
 
     /// Lists all target IDs
+    ///
+    /// # Returns
+    /// * `Vec<String>` - A vector of all target IDs in the registry.
     pub fn list_targets(&self) -> Vec<String> {
         self.targets.keys().cloned().collect()
     }
 
     /// Closes all targets and clears the registry
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure.
     pub async fn close_all(&mut self) -> AuditResult<()> {
         let mut errors = Vec::new();
 
@@ -329,154 +392,5 @@ impl AuditRegistry {
         }
 
         Ok(())
-    }
-}
-
-/// Creates an audit target based on type and configuration
-async fn create_audit_target(
-    target_type: &str,
-    id: &str,
-    config: &KVS,
-) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError> {
-    match target_type {
-        val if val == ChannelTargetType::Webhook.as_str() => {
-            let args = parse_webhook_args(id, config)?;
-            let target = rustfs_targets::target::webhook::WebhookTarget::new(id.to_string(), args)?;
-            Ok(Box::new(target))
-        }
-        val if val == ChannelTargetType::Mqtt.as_str() => {
-            let args = parse_mqtt_args(id, config)?;
-            let target = rustfs_targets::target::mqtt::MQTTTarget::new(id.to_string(), args)?;
-            Ok(Box::new(target))
-        }
-        _ => Err(TargetError::Configuration(format!("Unknown target type: {target_type}"))),
-    }
-}
-
-/// Gets valid field names for webhook configuration
-fn get_webhook_valid_fields() -> HashSet<String> {
-    vec![
-        ENABLE_KEY.to_string(),
-        WEBHOOK_ENDPOINT.to_string(),
-        WEBHOOK_AUTH_TOKEN.to_string(),
-        WEBHOOK_CLIENT_CERT.to_string(),
-        WEBHOOK_CLIENT_KEY.to_string(),
-        WEBHOOK_BATCH_SIZE.to_string(),
-        WEBHOOK_QUEUE_LIMIT.to_string(),
-        WEBHOOK_QUEUE_DIR.to_string(),
-        WEBHOOK_MAX_RETRY.to_string(),
-        WEBHOOK_RETRY_INTERVAL.to_string(),
-        WEBHOOK_HTTP_TIMEOUT.to_string(),
-    ]
-    .into_iter()
-    .collect()
-}
-
-/// Gets valid field names for MQTT configuration
-fn get_mqtt_valid_fields() -> HashSet<String> {
-    vec![
-        ENABLE_KEY.to_string(),
-        MQTT_BROKER.to_string(),
-        MQTT_TOPIC.to_string(),
-        MQTT_USERNAME.to_string(),
-        MQTT_PASSWORD.to_string(),
-        MQTT_QOS.to_string(),
-        MQTT_KEEP_ALIVE_INTERVAL.to_string(),
-        MQTT_RECONNECT_INTERVAL.to_string(),
-        MQTT_QUEUE_DIR.to_string(),
-        MQTT_QUEUE_LIMIT.to_string(),
-    ]
-    .into_iter()
-    .collect()
-}
-
-/// Parses webhook arguments from KVS configuration
-fn parse_webhook_args(_id: &str, config: &KVS) -> Result<WebhookArgs, TargetError> {
-    let endpoint = config
-        .lookup(WEBHOOK_ENDPOINT)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| TargetError::Configuration("webhook endpoint is required".to_string()))?;
-
-    let endpoint_url =
-        Url::parse(&endpoint).map_err(|e| TargetError::Configuration(format!("invalid webhook endpoint URL: {e}")))?;
-
-    let args = WebhookArgs {
-        enable: true, // Already validated as enabled
-        endpoint: endpoint_url,
-        auth_token: config.lookup(WEBHOOK_AUTH_TOKEN).unwrap_or_default(),
-        queue_dir: config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or_default(),
-        queue_limit: config
-            .lookup(WEBHOOK_QUEUE_LIMIT)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100000),
-        client_cert: config.lookup(WEBHOOK_CLIENT_CERT).unwrap_or_default(),
-        client_key: config.lookup(WEBHOOK_CLIENT_KEY).unwrap_or_default(),
-        target_type: TargetType::AuditLog,
-    };
-
-    args.validate()?;
-    Ok(args)
-}
-
-/// Parses MQTT arguments from KVS configuration  
-fn parse_mqtt_args(_id: &str, config: &KVS) -> Result<MQTTArgs, TargetError> {
-    let broker = config
-        .lookup(MQTT_BROKER)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| TargetError::Configuration("MQTT broker is required".to_string()))?;
-
-    let broker_url = Url::parse(&broker).map_err(|e| TargetError::Configuration(format!("invalid MQTT broker URL: {e}")))?;
-
-    let topic = config
-        .lookup(MQTT_TOPIC)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| TargetError::Configuration("MQTT topic is required".to_string()))?;
-
-    let qos = config
-        .lookup(MQTT_QOS)
-        .and_then(|s| s.parse::<u8>().ok())
-        .and_then(|q| match q {
-            0 => Some(rumqttc::QoS::AtMostOnce),
-            1 => Some(rumqttc::QoS::AtLeastOnce),
-            2 => Some(rumqttc::QoS::ExactlyOnce),
-            _ => None,
-        })
-        .unwrap_or(rumqttc::QoS::AtLeastOnce);
-
-    let args = MQTTArgs {
-        enable: true, // Already validated as enabled
-        broker: broker_url,
-        topic,
-        qos,
-        username: config.lookup(MQTT_USERNAME).unwrap_or_default(),
-        password: config.lookup(MQTT_PASSWORD).unwrap_or_default(),
-        max_reconnect_interval: parse_duration(&config.lookup(MQTT_RECONNECT_INTERVAL).unwrap_or_else(|| "5s".to_string()))
-            .unwrap_or(Duration::from_secs(5)),
-        keep_alive: parse_duration(&config.lookup(MQTT_KEEP_ALIVE_INTERVAL).unwrap_or_else(|| "60s".to_string()))
-            .unwrap_or(Duration::from_secs(60)),
-        queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or_default(),
-        queue_limit: config.lookup(MQTT_QUEUE_LIMIT).and_then(|s| s.parse().ok()).unwrap_or(100000),
-        target_type: TargetType::AuditLog,
-    };
-
-    args.validate()?;
-    Ok(args)
-}
-
-/// Parses enable value from string
-fn parse_enable_value(value: &str) -> bool {
-    matches!(value.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
-}
-
-/// Parses duration from string (e.g., "3s", "5m")
-fn parse_duration(s: &str) -> Option<Duration> {
-    if let Some(stripped) = s.strip_suffix('s') {
-        stripped.parse::<u64>().ok().map(Duration::from_secs)
-    } else if let Some(stripped) = s.strip_suffix('m') {
-        stripped.parse::<u64>().ok().map(|m| Duration::from_secs(m * 60))
-    } else if let Some(stripped) = s.strip_suffix("ms") {
-        stripped.parse::<u64>().ok().map(Duration::from_millis)
-    } else {
-        s.parse::<u64>().ok().map(Duration::from_secs)
     }
 }

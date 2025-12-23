@@ -119,16 +119,26 @@ pub async fn start_http_server(
     // The listening address and port are obtained from the parameters
     let listener = {
         let mut server_addr = server_addr;
-        let mut socket = socket2::Socket::new(
+
+        // Try to create a socket for the address family; if that fails, fallback to IPv4.
+        let mut socket = match socket2::Socket::new(
             socket2::Domain::for_address(server_addr),
             socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
-        )?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to create socket for {:?}: {}, falling back to IPv4", server_addr, e);
+                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+                server_addr = ipv4_addr;
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?
+            }
+        };
 
+        // If address is IPv6 try to enable dual-stack; on failure, switch to IPv4 socket.
         if server_addr.is_ipv6() {
             if let Err(e) = socket.set_only_v6(false) {
-                warn!("Failed to set IPV6_V6ONLY=false, falling back to IPv4-only: {}", e);
-                // Fallback to a new IPv4 socket if setting dual-stack fails.
+                warn!("Failed to set IPV6_V6ONLY=false, attempting IPv4 fallback: {}", e);
                 let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
                 server_addr = ipv4_addr;
                 socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
@@ -140,8 +150,27 @@ pub async fn start_http_server(
         socket.set_reuse_address(true)?;
         // Set the socket to non-blocking before passing it to Tokio.
         socket.set_nonblocking(true)?;
-        socket.bind(&server_addr.into())?;
-        socket.listen(backlog)?;
+
+        // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
+        if let Err(bind_err) = socket.bind(&server_addr.into()) {
+            warn!("Failed to bind to {}: {}.", server_addr, bind_err);
+            if server_addr.is_ipv6() {
+                // Try IPv4 fallback
+                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+                server_addr = ipv4_addr;
+                socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+                socket.set_reuse_address(true)?;
+                socket.set_nonblocking(true)?;
+                socket.bind(&server_addr.into())?;
+                // [FIX] Ensure fallback socket is moved to listening state as well.
+                socket.listen(backlog)?;
+            } else {
+                return Err(bind_err);
+            }
+        } else {
+            // Listen on the socket when initial bind succeeded
+            socket.listen(backlog)?;
+        }
         TcpListener::from_std(socket.into())?
     };
 

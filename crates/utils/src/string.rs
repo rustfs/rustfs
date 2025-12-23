@@ -48,6 +48,14 @@ pub fn parse_bool(str: &str) -> Result<bool> {
     }
 }
 
+pub fn parse_bool_with_default(str: &str, default: bool) -> bool {
+    match str {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" | "on" | "ON" | "On" | "enabled" => true,
+        "0" | "f" | "F" | "false" | "FALSE" | "False" | "off" | "OFF" | "Off" | "disabled" => false,
+        _ => default,
+    }
+}
+
 /// Matches a simple pattern against a name using wildcards.
 ///
 /// # Arguments

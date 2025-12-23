@@ -110,20 +110,21 @@ async fn reset_webhook_count(Query(params): Query<ResetParams>, headers: HeaderM
 
     let reason = params.reason.unwrap_or_else(|| "Reason not provided".to_string());
     println!("Reset webhook count, reason: {reason}");
-
+    let time_now = chrono::offset::Utc::now().to_string();
     for header in headers {
         let (key, value) = header;
-        println!("Header: {key:?}: {value:?}");
+        println!("Header: {key:?}: {value:?}, time: {time_now}");
     }
 
     println!("Reset webhook count printed headers");
     // Reset the counter to 0
     WEBHOOK_COUNT.store(0, Ordering::SeqCst);
     println!("Webhook count has been reset to 0.");
+    let time_now = chrono::offset::Utc::now().to_string();
     Response::builder()
         .header("Foo", "Bar")
         .status(StatusCode::OK)
-        .body(format!("Webhook count reset successfully current_count:{current_count}"))
+        .body(format!("Webhook count reset successfully current_count:{current_count},time: {time_now}"))
         .unwrap()
 }
 
@@ -167,7 +168,11 @@ async fn receive_webhook(Json(payload): Json<Value>) -> StatusCode {
         serde_json::to_string_pretty(&payload).unwrap()
     );
     WEBHOOK_COUNT.fetch_add(1, Ordering::SeqCst);
-    println!("Total webhook requests received: {}", WEBHOOK_COUNT.load(Ordering::SeqCst));
+    println!(
+        "Total webhook requests received: {} , Time: {}",
+        WEBHOOK_COUNT.load(Ordering::SeqCst),
+        chrono::offset::Utc::now()
+    );
     StatusCode::OK
 }
 

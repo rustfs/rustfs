@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # RustFS Enhanced Security Deployment Script
 # This script demonstrates production-ready deployment with enhanced security features

@@ -1,4 +1,14 @@
 {{- if .Values.ingress.enabled -}}
+{{- $secretName := .Values.ingress.tls.secretName }}
+{{- $ingressAnnotations := dict }}
+{{- if eq .Values.ingress.className "nginx" }}
+  {{- $ingressAnnotations = merge $ingressAnnotations (.Values.ingress.nginxAnnotations | default dict) }}
+{{- else if eq .Values.ingress.className "" }}
+  {{- $ingressAnnotations = merge $ingressAnnotations (.Values.ingress.customAnnoations | default dict) }}
+{{- end }}
+{{- if .Values.ingress.tls.certManager.enabled }}
+  {{- $ingressAnnotations = merge $ingressAnnotations (.Values.ingress.certManagerAnnotations | default dict) }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -8,25 +18,21 @@ metadata:
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-  {{- if eq .Values.ingress.className "nginx" }}
-  {{- with .Values.ingress.nginxAnnotations }}
+  {{- with $ingressAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
-  {{- end }}
   {{- end }}
 spec:
   {{- with .Values.ingress.className }}
   ingressClassName: {{ . }}
   {{- end }}
-  {{- if .Values.tls.enabled }}
+  {{- if .Values.ingress.tls.enabled }}
   tls:
-    {{- range .Values.ingress.tls }}
     - hosts:
-        {{- range .hosts }}
-        - {{ . | quote }}
+        {{- range .Values.ingress.hosts }}
+        - {{ .host | quote }}
         {{- end }}
-      secretName: {{ .secretName }}
-    {{- end }}
+      secretName: {{ $secretName }}
   {{- end }}
   rules:
     {{- range .Values.ingress.hosts }}

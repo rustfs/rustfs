@@ -52,13 +52,17 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-hash" | string | `"sha1"` |  |
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-max-age" | string | `"3600"` |  |
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-name" | string | `"rustfs"` |  |
-| ingress.tls[0].hosts[0] | string | `"your.rustfs.com"` |  |
-| ingress.tls[0].secretName | string | `"rustfs-tls"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie" | string | `"true"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.httponly" | string | `"true"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.name" | string | `"rustfs"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.samesite" | string | `"none"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.secure" | string | `"true"` |  |
+| ingress.tls.enabled | bool | `false` | Enable tls and access rustfs via https. |
+| ingress.tls.certManager.enabled | string | `false` | Enable cert manager support to generate certificate automatically. |
+| ingress.tls.certManager.issuer.name | string | `false` | The name of cert manager issuer. |
+| ingress.tls.certManager.issuer.kind | string | `false` | The kind of cert manager issuer, issuer or cluster-issuer. |
+| ingress.tls.crt | string | "" | The content of certificate file. |
+| ingress.tls.key | string | "" | The content of key file. |
 | livenessProbe.failureThreshold | int | `3` |  |
 | livenessProbe.httpGet.path | string | `"/health"` |  |
 | livenessProbe.httpGet.port | string | `"endpoint"` |  |
@@ -100,9 +104,6 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | storageclass.dataStorageSize | string | `"256Mi"` | The storage size for data PVC. |
 | storageclass.logStorageSize | string | `"256Mi"` | The storage size for logs PVC. |
 | storageclass.name | string | `"local-path"` | The name for StorageClass. |
-| tls.crt | string | `"tls.crt"` |  |
-| tls.enabled | bool | `false` |  |
-| tls.key | string | `"tls.key"` |  |
 | tolerations | list | `[]` |  |
 
 ---

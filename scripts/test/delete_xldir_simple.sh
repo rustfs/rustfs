@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Simple version: Delete all directories ending with __XLDIR__ in the specified path
 

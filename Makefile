@@ -9,30 +9,53 @@ CONTAINER_NAME ?= rustfs-dev
 DOCKERFILE_PRODUCTION = Dockerfile
 DOCKERFILE_SOURCE = Dockerfile.source
 
+# Fatal check
+# Checks all required dependencies and exits with error if not found
+# (e.g., cargo, rustfmt)
+check-%:
+	@command -v $* >/dev/null 2>&1 || { \
+		echo >&2 "❌ '$*' is not installed."; \
+		exit 1; \
+	}
+
+# Warning-only check
+# Checks for optional dependencies and issues a warning if not found
+# (e.g., cargo-nextest for enhanced testing)
+warn-%:
+	@command -v $* >/dev/null 2>&1 || { \
+		echo >&2 "⚠️ '$*' is not installed."; \
+	}
+
+# For checking dependencies use check-<dep-name> or warn-<dep-name>
+.PHONY: core-deps fmt-deps test-deps
+core-deps: check-cargo
+fmt-deps: check-rustfmt
+test-deps: warn-cargo-nextest
+
 # Code quality and formatting targets
 .PHONY: fmt
-fmt:
+fmt: core-deps fmt-deps
 	@echo "🔧 Formatting code..."
 	cargo fmt --all
 
 .PHONY: fmt-check
-fmt-check:
+fmt-check: core-deps fmt-deps
 	@echo "📝 Checking code formatting..."
 	cargo fmt --all --check
 
 .PHONY: clippy
-clippy:
+clippy: core-deps
 	@echo "🔍 Running clippy checks..."
 	cargo clippy --fix --allow-dirty
 	cargo clippy --all-targets --all-features -- -D warnings
 
 .PHONY: check
-check:
+check: core-deps
 	@echo "🔨 Running compilation check..."
 	cargo check --all-targets
 
 .PHONY: test
-test:
+test: core-deps test-deps
 	@echo "🧪 Running tests..."
 	@if command -v cargo-nextest >/dev/null 2>&1; then \
 		cargo nextest run --all --exclude e2e_test; \
@@ -42,15 +65,15 @@ test:
 	fi
 	cargo test --all --doc
 
-.PHONY: pre-commit
-pre-commit: fmt clippy check test
-	@echo "✅ All pre-commit checks passed!"
-
 .PHONY: setup-hooks
 setup-hooks:
 	@echo "🔧 Setting up git hooks..."
 	chmod +x .git/hooks/pre-commit
 	@echo "✅ Git hooks setup complete!"
+
+.PHONY: pre-commit
+pre-commit: fmt clippy check test
+	@echo "✅ All pre-commit checks passed!"
 
 .PHONY: e2e-server
 e2e-server:
@@ -186,8 +209,6 @@ docker-dev-push:
 		--push \
 		.
 
-
-
 # Local production builds using direct buildx (alternative to docker-buildx.sh)
 .PHONY: docker-buildx-production-local
 docker-buildx-production-local:
@@ -246,8 +267,6 @@ dev-env-stop:
 
 .PHONY: dev-env-restart
 dev-env-restart: dev-env-stop dev-env-start
-
-
 
 # ========================================================================================
 # Build Utilities

@@ -1,4 +1,6 @@
-#!/bin/bash -e
+#!/usr/bin/env bash
+set -e
+
 # Copyright 2024 RustFS Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +36,7 @@ mkdir -p ./target/volume/test{1..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug,iam=info"
+    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug,iam=info,notify=info"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -181,6 +183,9 @@ export RUSTFS_ENABLE_PROFILING=false
 # Heal configuration queue size
 export RUSTFS_HEAL_QUEUE_SIZE=10000
 
+# rustfs trust system CA certificates
+export RUSTFS_TRUST_SYSTEM_CA=true
+
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
@@ -210,4 +215,3 @@ fi
 #cargo run --profile release --bin rustfs
 # To run in debug mode, use the following line
 cargo run --bin rustfs
-
