@@ -93,9 +93,11 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | secret.existingSecret | string | `""` | Use existing secret with a credentials. |
 | secret.rustfs.access_key | string | `"rustfsadmin"` | RustFS Access Key ID |
 | secret.rustfs.secret_key | string | `"rustfsadmin"` | RustFS Secret Key ID |
-| service.console_port | int | `9001` |  |
-| service.ep_port | int | `9000` |  |
 | service.type | string | `"NodePort"` |  |
+| service.console.nodePort | int | `32001` |  |
+| service.console.port | int | `9001` |  |
+| service.endpoint.nodePort | int | `32000` |  |
+| service.endpoint.port | int | `9000` |  |
 | serviceAccount.annotations | object | `{}` |  |
 | serviceAccount.automount | bool | `true` |  |
 | serviceAccount.create | bool | `true` |  |
