@@ -231,7 +231,7 @@ impl RemoteDisk {
     {
         // Check if disk is faulty
         if self.health.is_faulty() {
-            warn!("disk {} health is faulty, returning error", self.to_string());
+            warn!("remote disk {} health is faulty, returning error", self.to_string());
             return Err(DiskError::FaultyDisk);
         }
 

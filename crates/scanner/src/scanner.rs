@@ -22,7 +22,9 @@ use crate::{DataUsageInfo, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_config::{DEFAULT_DATA_SCANNER_START_DELAY_SECS, ENV_DATA_SCANNER_START_DELAY_SECS};
+use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
+use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::Error as EcstoreError;
 use rustfs_ecstore::global::is_erasure_sd;
 use rustfs_ecstore::store::ECStore;
@@ -123,6 +125,13 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
 
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
     // TODO: leader lock
+    let _guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
+        Ok(guard) => guard,
+        Err(e) => {
+            error!("run_data_scanner: other node is running, failed to acquire leader lock: {e}");
+            return Ok(());
+        }
+    };
 
     let mut cycle_info = CurrentCycle::default();
     let buf = read_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH)

@@ -73,6 +73,7 @@ use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
     RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
 };
+use rustfs_lock::FastLockGuard;
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
@@ -4075,6 +4076,14 @@ impl ObjectIO for SetDisks {
 
 #[async_trait::async_trait]
 impl StorageAPI for SetDisks {
+    #[tracing::instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
+        self.fast_lock_manager
+            .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+            .await
+            .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))
+    }
+
     #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
         unimplemented!()

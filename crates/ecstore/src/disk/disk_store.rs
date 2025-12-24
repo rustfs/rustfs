@@ -260,6 +260,7 @@ impl LocalDiskWrapper {
                     debug!("health check: performing health check");
                     if Self::perform_health_check(disk.clone(), &TEST_BUCKET, &TEST_OBJ, &TEST_DATA, true, CHECK_TIMEOUT_DURATION).await.is_err() && health.swap_ok_to_faulty() {
                         // Health check failed, disk is considered faulty
+                        warn!("health check: failed, disk is considered faulty");
 
                         health.increment_waiting(); // Balance the increment from failed operation
 
@@ -429,7 +430,7 @@ impl LocalDiskWrapper {
     {
         // Check if disk is faulty
         if self.health.is_faulty() {
-            warn!("disk {} health is faulty, returning error", self.to_string());
+            warn!("local disk {} health is faulty, returning error", self.to_string());
             return Err(DiskError::FaultyDisk);
         }
 

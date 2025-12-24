@@ -30,6 +30,7 @@ use rustfs_filemeta::{
     FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision, ReplicationState,
     ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
 };
+use rustfs_lock::FastLockGuard;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
@@ -1299,6 +1300,7 @@ pub trait ObjectIO: Send + Sync + Debug + 'static {
 #[allow(clippy::too_many_arguments)]
 pub trait StorageAPI: ObjectIO + Debug {
     // NewNSLock TODO:
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard>;
     // Shutdown TODO:
     // NSScanner TODO:
 

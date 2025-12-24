@@ -871,7 +871,7 @@ impl LocalDisk {
     }
 
     // write_all_private with check_path_length
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[tracing::instrument(level = "debug", skip(self, buf, sync, skip_parent))]
     pub async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: bool, skip_parent: &Path) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
         let file_path = volume_dir.join(Path::new(&path));
