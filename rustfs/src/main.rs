@@ -248,6 +248,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     while let Err(e) = GLOBAL_CONFIG_SYS.init(store.clone()).await {
         error!("GLOBAL_CONFIG_SYS.init failed {:?}", e);
+        // TODO: check error type
         retry_count += 1;
         if retry_count > 15 {
             return Err(Error::other("GLOBAL_CONFIG_SYS.init failed"));
