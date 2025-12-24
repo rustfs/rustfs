@@ -2,6 +2,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
+  annotations: {{ .Values.storageclass.annotations }}
   name: {{ include "rustfs.fullname" . }}-data
   labels:
     {{- toYaml .Values.commonLabels | nindent 4 }}
@@ -16,6 +17,7 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
+  annotations: {{ .Values.storageclass.annotations }}
   name: {{ include "rustfs.fullname" . }}-logs
   labels:
     {{- toYaml .Values.commonLabels | nindent 4 }}

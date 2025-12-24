@@ -176,6 +176,8 @@ storageclass:
   name: local-path
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
+  annotations:
+    helm.sh/resource-policy: keep
 
 # Init container parameters.
 initStep:
