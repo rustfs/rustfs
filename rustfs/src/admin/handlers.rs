@@ -72,7 +72,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 use tracing::{error, info, warn};
 use url::Host;
-// use url::UrlQuery;
 
 pub mod bucket_meta;
 pub mod event;

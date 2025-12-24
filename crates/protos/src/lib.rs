@@ -16,7 +16,7 @@
 mod generated;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::globals::{GLOBAL_CONN_MAP, GLOBAL_ROOT_CERT, evict_connection};
+use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_ROOT_CERT, evict_connection};
 use std::{error::Error, time::Duration};
 use tonic::{
     Request, Status,

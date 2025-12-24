@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_common::globals::set_global_root_cert;
+use rustfs_common::set_global_root_cert;
 use rustfs_config::{RUSTFS_CA_CERT, RUSTFS_PUBLIC_CERT, RUSTFS_TLS_CERT};
 use tracing::{debug, info};
 

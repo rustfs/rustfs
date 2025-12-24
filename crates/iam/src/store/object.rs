@@ -38,7 +38,7 @@ use std::sync::LazyLock;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam"));
 pub static IAM_CONFIG_USERS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/users/"));
@@ -341,6 +341,27 @@ impl ObjectStore {
         Ok(policies)
     }
 
+    /// Checks if the underlying ECStore is ready for metadata operations.
+    /// This prevents silent failures during the storage boot-up phase.
+    ///
+    /// Performs a lightweight probe by attempting to read a known configuration object.
+    /// If the object is not found, it indicates the storage metadata is not ready.
+    /// The upper-level caller should handle retries if needed.
+    async fn check_storage_readiness(&self) -> Result<()> {
+        // Probe path for a fixed object under the IAM root prefix.
+        // If it doesn't exist, the system bucket or metadata is not ready.
+        let probe_path = format!("{}/format.json", *IAM_CONFIG_PREFIX);
+
+        match read_config(self.object_api.clone(), &probe_path).await {
+            Ok(_) => Ok(()),
+            Err(rustfs_ecstore::error::StorageError::ConfigNotFound) => Err(Error::other(format!(
+                "Storage metadata not ready: probe object '{}' not found (expected IAM config to be initialized)",
+                probe_path
+            ))),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     // async fn load_policy(&self, name: &str) -> Result<PolicyDoc> {
     //     let mut policy = self
     //         .load_iam_config::<PolicyDoc>(&format!("config/iam/policies/{name}/policy.json"))
@@ -398,13 +419,50 @@ impl Store for ObjectStore {
 
         Ok(serde_json::from_slice(&data)?)
     }
+    /// Saves IAM configuration with a retry mechanism on failure.
+    ///
+    /// Attempts to save the IAM configuration up to 5 times if the storage layer is not ready,
+    /// using exponential backoff between attempts (starting at 200ms, doubling each retry).
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The IAM configuration item to save, must implement `Serialize` and `Send`.
+    /// * `path` - The path where the configuration will be saved.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - `Ok(())` on success, or an `Error` if all attempts fail.
     #[tracing::instrument(level = "debug", skip(self, item, path))]
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()> {
         let mut data = serde_json::to_vec(&item)?;
         data = Self::encrypt_data(&data)?;
 
-        save_config(self.object_api.clone(), path.as_ref(), data).await?;
-        Ok(())
+        let mut attempts = 0;
+        let max_attempts = 5;
+        let path_ref = path.as_ref();
+
+        loop {
+            match save_config(self.object_api.clone(), path_ref, data.clone()).await {
+                Ok(_) => {
+                    debug!("Successfully saved IAM config to {}", path_ref);
+                    return Ok(());
+                }
+                Err(e) if attempts < max_attempts => {
+                    attempts += 1;
+                    // Exponential backoff: 200ms, 400ms, 800ms...
+                    let wait_ms = 200 * (1 << attempts);
+                    warn!(
+                        "Storage layer not ready for IAM write (attempt {}/{}). Retrying in {}ms. Path: {}, Error: {:?}",
+                        attempts, max_attempts, wait_ms, path_ref, e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                }
+                Err(e) => {
+                    error!("Final failure saving IAM config to {}: {:?}", path_ref, e);
+                    return Err(e.into());
+                }
+            }
+        }
     }
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()> {
         delete_config(self.object_api.clone(), path.as_ref()).await?;
@@ -418,8 +476,16 @@ impl Store for ObjectStore {
         user_identity: UserIdentity,
         _ttl: Option<usize>,
     ) -> Result<()> {
-        self.save_iam_config(user_identity, get_user_identity_path(name, user_type))
-            .await
+        // Pre-check storage health
+        self.check_storage_readiness().await?;
+
+        let path = get_user_identity_path(name, user_type);
+        debug!("Saving IAM identity to path: {}", path);
+
+        self.save_iam_config(user_identity, path).await.map_err(|e| {
+            error!("ObjectStore save failure for {}: {:?}", name, e);
+            e
+        })
     }
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()> {
         self.delete_iam_config(get_user_identity_path(name, user_type))

@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
-use crate::{admin, config};
+use crate::{admin, config, version};
+use chrono::Datelike;
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_notify::notifier_global;
@@ -23,6 +24,21 @@ use std::env;
 use std::io::Error;
 use tracing::{debug, error, info, instrument, warn};
 
+#[instrument]
+pub(crate) fn print_server_info() {
+    let current_year = chrono::Utc::now().year();
+    // Use custom macros to print server information
+    info!("RustFS Object Storage Server");
+    info!("Copyright: 2024-{} RustFS, Inc", current_year);
+    info!("License: Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0");
+    info!("Version: {}", version::get_version());
+    info!("Docs: https://rustfs.com/docs/");
+}
+
+/// Initialize the asynchronous update check system.
+/// This function checks if update checking is enabled via
+/// environment variable or default configuration. If enabled,
+/// it spawns an asynchronous task to check for updates with a timeout.
 pub(crate) fn init_update_check() {
     let update_check_enable = env::var(ENV_UPDATE_CHECK)
         .unwrap_or_else(|_| DEFAULT_UPDATE_CHECK.to_string())
@@ -70,6 +86,12 @@ pub(crate) fn init_update_check() {
     });
 }
 
+/// Add existing bucket notification configurations to the global notifier system.
+/// This function retrieves notification configurations for each bucket
+/// and registers the corresponding event rules with the notifier system.
+///  It processes queue, topic, and lambda configurations and maps them to event rules.
+///  # Arguments
+/// * `buckets` - A vector of bucket names to process
 #[instrument(skip_all)]
 pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) {
     let region_opt = rustfs_ecstore::global::get_global_region();
@@ -128,6 +150,15 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
 }
 
 /// Initialize KMS system and configure if enabled
+///
+/// This function initializes the global KMS service manager. If KMS is enabled
+/// via command line options, it configures and starts the service accordingly.
+/// If not enabled, it attempts to load any persisted KMS configuration from
+/// cluster storage and starts the service if found.
+/// # Arguments
+/// * `opt` - The application configuration options
+///
+/// Returns `std::io::Result<()>` indicating success or failure
 #[instrument(skip(opt))]
 pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)

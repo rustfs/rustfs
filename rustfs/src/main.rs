@@ -25,19 +25,20 @@ mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check};
+use crate::init::{
+    add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
+};
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
-use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
 use rustfs_ahm::{
     Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
     scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
-use rustfs_common::globals::set_global_addr;
+use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_ecstore::{
     StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
@@ -68,25 +69,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-const LOGO: &str = r#"
-
-░█▀▄░█░█░█▀▀░▀█▀░█▀▀░█▀▀
-░█▀▄░█░█░▀▀█░░█░░█▀▀░▀▀█
-░▀░▀░▀▀▀░▀▀▀░░▀░░▀░░░▀▀▀
-
-"#;
-
-#[instrument]
-fn print_server_info() {
-    let current_year = chrono::Utc::now().year();
-    // Use custom macros to print server information
-    info!("RustFS Object Storage Server");
-    info!("Copyright: 2024-{} RustFS, Inc", current_year);
-    info!("License: Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0");
-    info!("Version: {}", version::get_version());
-    info!("Docs: https://rustfs.com/docs/");
-}
 
 fn main() -> Result<()> {
     let runtime = server::get_tokio_runtime_builder()
@@ -120,7 +102,7 @@ async fn async_main() -> Result<()> {
     }
 
     // print startup logo
-    info!("{}", LOGO);
+    info!("{}", server::LOGO);
 
     // Initialize performance profiling if enabled
     profiling::init_from_env().await;
@@ -143,6 +125,8 @@ async fn async_main() -> Result<()> {
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
+    // 1. Initialize global readiness tracker
+    let readiness = Arc::new(GlobalReadiness::new());
 
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
@@ -214,14 +198,14 @@ async fn run(opt: config::Opt) -> Result<()> {
     let s3_shutdown_tx = {
         let mut s3_opt = opt.clone();
         s3_opt.console_enable = false;
-        let s3_shutdown_tx = start_http_server(&s3_opt, state_manager.clone()).await?;
+        let s3_shutdown_tx = start_http_server(&s3_opt, state_manager.clone(), readiness.clone()).await?;
         Some(s3_shutdown_tx)
     };
 
     let console_shutdown_tx = if opt.console_enable && !opt.console_address.is_empty() {
         let mut console_opt = opt.clone();
         console_opt.address = console_opt.console_address.clone();
-        let console_shutdown_tx = start_http_server(&console_opt, state_manager.clone()).await?;
+        let console_shutdown_tx = start_http_server(&console_opt, state_manager.clone(), readiness.clone()).await?;
         Some(console_shutdown_tx)
     } else {
         None
@@ -236,6 +220,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     let ctx = CancellationToken::new();
 
     // init store
+    // 2. Start Storage Engine (ECStore)
     let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
         .await
         .inspect_err(|err| {
@@ -243,9 +228,9 @@ async fn run(opt: config::Opt) -> Result<()> {
         })?;
 
     ecconfig::init();
-    // config system configuration, wait for 1 second if failed
-    let mut retry_count = 0;
 
+    // // Initialize global configuration system
+    let mut retry_count = 0;
     while let Err(e) = GLOBAL_CONFIG_SYS.init(store.clone()).await {
         error!("GLOBAL_CONFIG_SYS.init failed {:?}", e);
         // TODO: check error type
@@ -255,8 +240,8 @@ async fn run(opt: config::Opt) -> Result<()> {
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
-
-    // init  replication_pool
+    readiness.mark_stage(SystemStage::StorageReady);
+    // init replication_pool
     init_background_replication(store.clone()).await;
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
@@ -289,7 +274,10 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
+    // 3. Initialize IAM System (Blocking load)
+    // This ensures data is in memory before moving forward
     init_iam_sys(store.clone()).await.map_err(Error::other)?;
+    readiness.mark_stage(SystemStage::IamReady);
 
     add_bucket_notification_configuration(buckets.clone()).await;
 
@@ -340,6 +328,15 @@ async fn run(opt: config::Opt) -> Result<()> {
     print_server_info();
 
     init_update_check();
+
+    println!(
+        "RustFS server started successfully at {}, current time: {}",
+        &server_address,
+        chrono::offset::Utc::now().to_string()
+    );
+    info!(target: "rustfs::main::run","server started successfully at {}", &server_address);
+    // 4. Mark as Full Ready now that critical components are warm
+    readiness.mark_stage(SystemStage::FullReady);
 
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
