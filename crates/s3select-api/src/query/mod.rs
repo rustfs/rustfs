@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 pub mod analyzer;
 pub mod ast;
-pub mod datasource;
 pub mod dispatcher;
 pub mod execution;
 pub mod function;
