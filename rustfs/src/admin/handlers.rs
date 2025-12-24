@@ -24,7 +24,7 @@ use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
-use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_HEAL_REQUEST_SIZE, };
+use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_HEAL_REQUEST_SIZE};
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
