@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::server::hybrid::HybridBody;
-use http::{Response, StatusCode};
+use bytes::Bytes;
+use http::{Request as HttpRequest, Response, StatusCode};
+use http_body::Body;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use rustfs_common::GlobalReadiness;
-use s3s::HttpRequest;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -63,71 +65,65 @@ pub struct ReadinessGateService<S> {
     readiness: Arc<GlobalReadiness>,
 }
 
-impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for ReadinessGateService<S>
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
+impl<S, B> Service<HttpRequest<Incoming>> for ReadinessGateService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S: Service<HttpRequest<Incoming>, Response = Response<B>> + Clone + Send + 'static,
     S::Future: Send + 'static,
-    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
-    RestBody: Default + Send + 'static,
-    GrpcBody: Send + 'static,
+    S::Error: Send + 'static,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError> + Send + 'static,
 {
-    type Response = Response<HybridBody<RestBody, GrpcBody>>;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Response = Response<BoxBody>;
+    type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
+        self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
-        let readiness = self.readiness.clone();
-
-        let path = req.uri().path();
-        // 1) Exact match: fixed probe/resource path
-        let is_exact_probe = matches!(
-            path,
-            crate::server::PROFILE_MEMORY_PATH
-                | crate::server::PROFILE_CPU_PATH
-                | crate::server::HEALTH_PREFIX
-                | crate::server::FAVICON_PATH
-        );
-
-        // 2) Prefix matching: the entire set of route prefixes (including their subpaths)
-        let is_prefix_probe = path.starts_with(crate::server::RUSTFS_ADMIN_PREFIX)
-            || path.starts_with(crate::server::CONSOLE_PREFIX)
-            || path.starts_with(crate::server::RPC_PREFIX)
-            || path.starts_with(crate::server::ADMIN_PREFIX);
-
-        let is_probe = is_exact_probe || is_prefix_probe;
-        // System is ready, forward to the actual S3/RPC handlers
-        if !is_probe && !readiness.is_ready() {
-            // let mut resps = Response::new(AxumBody::from(Body::from("system not ready")));
-            // // 503 + Retry-After, prompting the client to try again later
-            // *resps.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-            // resps
-            //     .headers_mut()
-            //     .insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("5"));
-            // // Clarify return types to avoid content sniffing
-            // resps
-            //     .headers_mut()
-            //     .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("text/plain; charset=utf-8"));
-            // // Have the upstream/agent not cache the "not ready" response
-            // resps
-            //     .headers_mut()
-            //     .insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
-            // return Ok(resps);
-            let resp = Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header(http::header::RETRY_AFTER, "5")
-                .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .header(http::header::CACHE_CONTROL, "no-store")
-                .body(HybridBody::Rest {
-                    rest_body: RestBody::default(),
-                })
-                .expect("failed to build not ready response");
-            return Box::pin(async move { Ok(resp) });
-        }
         let mut inner = self.inner.clone();
-        Box::pin(async move { inner.call(req).await.map_err(Into::into) })
+        let readiness = self.readiness.clone();
+        Box::pin(async move {
+            let path = req.uri().path();
+            // 1) Exact match: fixed probe/resource path
+            let is_exact_probe = matches!(
+                path,
+                crate::server::PROFILE_MEMORY_PATH
+                    | crate::server::PROFILE_CPU_PATH
+                    | crate::server::HEALTH_PREFIX
+                    | crate::server::FAVICON_PATH
+            );
+
+            // 2) Prefix matching: the entire set of route prefixes (including their subpaths)
+            let is_prefix_probe = path.starts_with(crate::server::RUSTFS_ADMIN_PREFIX)
+                || path.starts_with(crate::server::CONSOLE_PREFIX)
+                || path.starts_with(crate::server::RPC_PREFIX)
+                || path.starts_with(crate::server::ADMIN_PREFIX);
+
+            let is_probe = is_exact_probe || is_prefix_probe;
+            // System is ready, forward to the actual S3/RPC handlers
+            if !is_probe && !readiness.is_ready() {
+                let body: BoxBody = Full::new(Bytes::from_static(b"Service not ready"))
+                    .map_err(|e| -> BoxError { Box::new(e) })
+                    .boxed_unsync();
+
+                let resp = Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(http::header::RETRY_AFTER, "5")
+                    .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .header(http::header::CACHE_CONTROL, "no-store")
+                    .body(body)
+                    .expect("failed to build not ready response");
+                return Ok(resp);
+            }
+            let resp = inner.call(req).await?;
+            // Transparently converts any response body into a BoxBody, and then Trace/Cors/Compression continues to work
+            let (parts, body) = resp.into_parts();
+            let body: BoxBody = body.map_err(Into::into).boxed_unsync();
+            Ok(Response::from_parts(parts, body))
+        })
     }
 }

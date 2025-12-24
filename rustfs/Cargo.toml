@@ -72,6 +72,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
+http-body-util.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
