@@ -354,7 +354,7 @@ impl ObjectStore {
 
         match read_config(self.object_api.clone(), &probe_path).await {
             Ok(_) => Ok(()),
-            Err(e) if matches!(e, rustfs_ecstore::error::StorageError::ConfigNotFound) => Err(Error::other(format!(
+            Err(rustfs_ecstore::error::StorageError::ConfigNotFound) => Err(Error::other(format!(
                 "Storage metadata not ready: probe object '{}' not found (expected IAM config to be initialized)",
                 probe_path
             ))),
