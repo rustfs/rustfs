@@ -7337,7 +7337,6 @@ dependencies = [
 name = "rustfs-iam"
 version = "0.0.5"
 dependencies = [
- "anyhow",
  "arc-swap",
  "async-trait",
  "base64-simd",
