@@ -677,7 +677,8 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
-    let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
+    let token_str = std::env::var("RUSTFS_GRPC_AUTH_TOKEN").unwrap_or_else(|_| "rustfs rpc".to_string());
+    let token: MetadataValue<_> = token_str.parse().unwrap();
 
     match req.metadata().get("authorization") {
         Some(t) if token == t => Ok(req),

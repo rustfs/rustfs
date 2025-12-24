@@ -150,7 +150,8 @@ pub async fn node_service_time_out_client(
     >,
     Box<dyn Error>,
 > {
-    let token: MetadataValue<_> = "rustfs rpc".parse()?;
+    let token_str = std::env::var("RUSTFS_GRPC_AUTH_TOKEN").unwrap_or_else(|_| "rustfs rpc".to_string());
+    let token: MetadataValue<_> = token_str.parse()?;
 
     // Try to get cached channel
     let cached_channel = { GLOBAL_CONN_MAP.read().await.get(addr).cloned() };

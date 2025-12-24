@@ -60,8 +60,21 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::{
     fs::Metadata,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
+
+fn check_path_safety(path: &str) -> Result<()> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Err(DiskError::VolumeAccessDenied);
+    }
+    for component in p.components() {
+        if let Component::ParentDir = component {
+            return Err(DiskError::VolumeAccessDenied);
+        }
+    }
+    Ok(())
+}
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
@@ -855,6 +868,7 @@ impl LocalDisk {
 
     async fn write_all_meta(&self, volume: &str, path: &str, buf: &[u8], sync: bool) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
+        check_path_safety(path)?;
         let file_path = volume_dir.join(Path::new(&path));
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -885,6 +899,7 @@ impl LocalDisk {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: bool, skip_parent: &Path) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
+        check_path_safety(path)?;
         let file_path = volume_dir.join(Path::new(&path));
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -1426,6 +1441,7 @@ impl DiskAPI for LocalDisk {
             }
         }
 
+        check_path_safety(path)?;
         let file_path = volume_dir.join(Path::new(&path));
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
@@ -1676,9 +1692,11 @@ impl DiskAPI for LocalDisk {
             return Err(Error::from(DiskError::FileAccessDenied));
         }
 
+        check_path_safety(src_path)?;
         let src_file_path = src_volume_dir.join(Path::new(&src_path));
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
 
+        check_path_safety(dst_path)?;
         let dst_file_path = dst_volume_dir.join(Path::new(&dst_path));
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
@@ -1725,6 +1743,7 @@ impl DiskAPI for LocalDisk {
         }
 
         let volume_dir = self.get_bucket_path(volume)?;
+        check_path_safety(path)?;
         let file_path = volume_dir.join(Path::new(&path));
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
@@ -1752,6 +1771,7 @@ impl DiskAPI for LocalDisk {
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
+        check_path_safety(path)?;
         let file_path = volume_dir.join(Path::new(&path));
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
@@ -1771,6 +1791,7 @@ impl DiskAPI for LocalDisk {
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
+        check_path_safety(path)?;
         let file_path = volume_dir.join(Path::new(&path));
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
@@ -1788,6 +1809,7 @@ impl DiskAPI for LocalDisk {
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
+        check_path_safety(path)?;
         let file_path = volume_dir.join(Path::new(&path));
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
@@ -2166,6 +2188,7 @@ impl DiskAPI for LocalDisk {
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         if !fi.metadata.is_empty() {
             let volume_dir = self.get_bucket_path(volume)?;
+            check_path_safety(path)?;
             let file_path = volume_dir.join(Path::new(&path));
 
             check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -2279,6 +2302,7 @@ impl DiskAPI for LocalDisk {
 
         let volume_dir = self.get_bucket_path(volume)?;
 
+        check_path_safety(path)?;
         let file_path = volume_dir.join(Path::new(&path));
 
         check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -2786,5 +2810,24 @@ mod test {
         // On non-Windows systems, backslash is not a root path
         #[cfg(not(windows))]
         assert!(!is_root_path("\\"));
+    }
+}
+
+#[cfg(test)]
+mod tests_safety {
+    use super::*;
+
+    #[test]
+    fn test_check_path_safety() {
+        // Valid paths
+        assert!(check_path_safety("file.txt").is_ok());
+        assert!(check_path_safety("dir/file.txt").is_ok());
+        assert!(check_path_safety("dir/subdir/file.txt").is_ok());
+
+        // Invalid paths
+        assert!(check_path_safety("/etc/passwd").is_err()); // Absolute
+        assert!(check_path_safety("../etc/passwd").is_err()); // Parent dir
+        assert!(check_path_safety("dir/../file.txt").is_err()); // Parent dir inside
+        assert!(check_path_safety("..").is_err()); // Just parent
     }
 }
