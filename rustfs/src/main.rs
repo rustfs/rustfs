@@ -249,7 +249,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     while let Err(e) = GLOBAL_CONFIG_SYS.init(store.clone()).await {
         error!("GLOBAL_CONFIG_SYS.init failed {:?}", e);
         retry_count += 1;
-        if retry_count > 10 {
+        if retry_count > 15 {
             return Err(Error::other("GLOBAL_CONFIG_SYS.init failed"));
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
