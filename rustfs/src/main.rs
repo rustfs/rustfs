@@ -37,7 +37,7 @@ use rustfs_ahm::{
     Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
     scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
-use rustfs_common::globals::set_global_addr;
+use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_ecstore::{
     StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
@@ -143,6 +143,8 @@ async fn async_main() -> Result<()> {
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
+    // 1. Initialize global readiness tracker
+    let readiness = Arc::new(GlobalReadiness::new());
 
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
@@ -236,6 +238,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     let ctx = CancellationToken::new();
 
     // init store
+    // 2. Start Storage Engine (ECStore)
     let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
         .await
         .inspect_err(|err| {
@@ -243,6 +246,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         })?;
 
     ecconfig::init();
+    readiness.mark_stage(SystemStage::StorageReady);
     // config system configuration
     GLOBAL_CONFIG_SYS.init(store.clone()).await?;
 
@@ -279,7 +283,10 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
+    // 3. Initialize IAM System (Blocking load)
+    // This ensures data is in memory before moving forward
     init_iam_sys(store.clone()).await.map_err(Error::other)?;
+    readiness.mark_stage(SystemStage::IamReady);
 
     add_bucket_notification_configuration(buckets.clone()).await;
 
@@ -330,6 +337,15 @@ async fn run(opt: config::Opt) -> Result<()> {
     print_server_info();
 
     init_update_check();
+
+    println!(
+        "RustFS server started successfully at {}, current time: {}",
+        &server_address,
+        chrono::offset::Utc::now().to_string()
+    );
+    info!(target: "rustfs::main::run","server started successfully at {}", &server_address);
+    // 4. Mark as Full Ready now that critical components are warm
+    readiness.mark_stage(SystemStage::FullReady);
 
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;

@@ -40,7 +40,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_common::{
-    globals::GLOBAL_LOCAL_NODE_NAME,
+    GLOBAL_LOCAL_NODE_NAME,
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;

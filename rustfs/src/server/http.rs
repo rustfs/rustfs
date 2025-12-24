@@ -17,7 +17,7 @@ use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::{ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
+use crate::server::{ReadinessGateLayer, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -29,6 +29,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
+use rustfs_common::GlobalReadiness;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -112,6 +113,7 @@ fn get_cors_allowed_origins() -> String {
 pub async fn start_http_server(
     opt: &config::Opt,
     worker_state_manager: ServiceStateManager,
+    readiness: Arc<GlobalReadiness>,
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
@@ -208,7 +210,7 @@ pub async fn start_http_server(
         println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
     } else {
         info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
-        println!("RustFS API: {api_endpoints}  {localhost_endpoint}");
+        println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Start Time: {now_time}");
         if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
             warn!(
@@ -388,6 +390,7 @@ pub async fn start_http_server(
                 cors_layer: cors_layer.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
+                readiness: readiness.clone(),
             };
 
             process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.clone());
@@ -490,6 +493,7 @@ struct ConnectionContext {
     cors_layer: CorsLayer,
     compression_config: CompressionConfig,
     is_console: bool,
+    readiness: Arc<GlobalReadiness>,
 }
 
 /// Process a single incoming TCP connection.
@@ -513,6 +517,7 @@ fn process_connection(
             cors_layer,
             compression_config,
             is_console,
+            readiness,
         } = context;
 
         // Build services inside each connected task to avoid passing complex service types across tasks,
@@ -523,6 +528,9 @@ fn process_connection(
         let hybrid_service = ServiceBuilder::new()
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
+            // CRITICAL: Insert ReadinessGateLayer before business logic
+            // This stops requests from hitting IAMAuth or Storage if they are not ready.
+            .layer(ReadinessGateLayer::new(readiness))
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {

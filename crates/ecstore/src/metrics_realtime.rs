@@ -19,11 +19,7 @@ use crate::{
     // utils::os::get_drive_stats,
 };
 use chrono::Utc;
-use rustfs_common::{
-    globals::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR},
-    heal_channel::DriveState,
-    metrics::global_metrics,
-};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, metrics::global_metrics};
 use rustfs_madmin::metrics::{DiskIOStats, DiskMetric, RealtimeMetrics};
 use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};

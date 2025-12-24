@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result, is_err_config_not_found};
+use crate::error::{is_err_config_not_found, Error, Result};
 use crate::sys::get_claims_from_token_with_secret;
 use crate::{
     cache::{Cache, CacheEntity},
-    error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
-    store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
+    error::{is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user, Error as IamError},
+    store::{object::IAM_CONFIG_PREFIX, GroupInfo, MappedPolicy, Store, UserType},
     sys::{
-        MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED, STATUS_ENABLED,
-        UpdateServiceAccountOpts,
+        UpdateServiceAccountOpts, MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED,
+        STATUS_ENABLED,
     },
 };
 use futures::future::join_all;
@@ -28,10 +28,10 @@ use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
-    auth::{self, Credentials, UserIdentity, is_secret_key_valid, jwt_sign},
+    auth::{self, is_secret_key_valid, jwt_sign, Credentials, UserIdentity},
     format::Format,
     policy::{
-        EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
+        default::DEFAULT_POLICIES, iam_policy_claim_name_sa, Policy, PolicyDoc, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE,
     },
 };
 use rustfs_utils::path::path_join_buf;
@@ -40,8 +40,8 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicI64, Ordering},
+        Arc,
     },
     time::Duration,
 };
@@ -89,6 +89,12 @@ impl<T> IamCache<T>
 where
     T: Store,
 {
+    /// Create a new IAM system instance
+    /// # Arguments
+    /// * `api` - The storage backend implementing the Store trait
+    ///
+    /// # Returns
+    /// An Arc-wrapped instance of IamSystem
     pub(crate) async fn new(api: T) -> Arc<Self> {
         let (sender, receiver) = mpsc::channel::<i64>(100);
 
@@ -105,10 +111,20 @@ where
         sys
     }
 
+    /// Initialize the IAM system
     async fn init(self: Arc<Self>, receiver: Receiver<i64>) -> Result<()> {
+        // Ensure the IAM format file is persisted first
         self.clone().save_iam_formatter().await?;
-        self.clone().load().await?;
 
+        // Critical: Load all existing users/policies into memory cache
+        if let Err(e) = self.clone().load().await {
+            error!("IAM fail to load initial data: {:?}", e);
+            return Err(e);
+        }
+
+        info!("IAM System successfully initialized and marked as READY");
+
+        // Background ticker for synchronization
         // Check if environment variable is set
         let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK").is_ok();
 

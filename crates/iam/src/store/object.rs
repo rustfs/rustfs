@@ -38,7 +38,7 @@ use std::sync::LazyLock;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam"));
 pub static IAM_CONFIG_USERS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/users/"));
@@ -430,6 +430,40 @@ impl ObjectStore {
         Ok(policies)
     }
 
+    /// Internal helper to check if the underlying ECStore is ready for metadata operations.
+    /// This prevents silent failures during the storage boot-up phase.
+    async fn check_storage_readiness(&self) -> Result<()> {
+        // `ECStore` is not currently exposed `is_online()`, so use the "minimum feasible probe" to determine whether the metadata read path is available:
+        // 1) Try to read the next probe object in the IAM prefix
+        // 2) Map "Not ready/not initialized" to an explicit error to avoid silent failure at the upper level
+        //
+        // 1) Check whether the storage layer is ready first (avoid silent failure during startup/rebalancing)
+        // Note: Currently, there is no `is_online()` on `ECStore`, so the minimum feasible check is reused here:
+        // Determine whether a metadata read path is available by attempting to read the configuration under a known prefix.
+        //
+        // 2) Make sure that the system bucket `.rustfs.sys` is accessible:
+        // There is no direct "create bucket" API exposed to current file dependencies, so "readability detection" is used.
+        //
+        // 3) If you still need to wait for the loading to complete: the upper-level caller will implement retry/backoff (this method only returns clear errors).
+        //Lightweight detection: Read a fixed object under the IAM root prefix; if it does not exist, it is considered that the system bucket or metadata is not ready yet
+        //Select format.json because it is usually located in the root directory of config/iam/(adjusted based on the actual objects of the project).
+        let probe_path = format!("{}/format.json", *IAM_CONFIG_PREFIX);
+
+        match read_config(self.object_api.clone(), &probe_path).await {
+            Ok(_bytes) => Ok(()),
+            Err(e) => {
+                // Unify "not ready/not initialized" to errors recognizable by the business side
+                // -If the underlying layer is ConfigNotFound, it is more likely that the system bucket
+                // has not been initialized or the IAM root has not been written yet
+                if matches!(e, rustfs_ecstore::error::StorageError::ConfigNotFound) {
+                    Err(Error::other("Storage metadata not ready"))
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
+
     // async fn load_policy(&self, name: &str) -> Result<PolicyDoc> {
     //     let mut policy = self
     //         .load_iam_config::<PolicyDoc>(&format!("config/iam/policies/{name}/policy.json"))
@@ -479,13 +513,53 @@ impl Store for ObjectStore {
 
         Ok(serde_json::from_slice(&data)?)
     }
+    /// Save IAM config with retry mechanism on failure
+    /// This method will attempt to save the IAM configuration up to 5 times
+    /// if it encounters a storage layer not ready error, with exponential backoff
+    /// between attempts.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The IAM configuration item to be saved, which must implement Serialize and Send.
+    /// * `path` - The path where the IAM configuration will be saved.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - Returns Ok(()) if the save is successful, or an Error if it fails after all attempts.
     #[tracing::instrument(level = "debug", skip(self, item, path))]
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()> {
         let mut data = serde_json::to_vec(&item)?;
         data = Self::encrypt_data(&data)?;
 
-        save_config(self.object_api.clone(), path.as_ref(), data).await?;
-        Ok(())
+        // save_config(self.object_api.clone(), path.as_ref(), data).await?;
+        // Ok(())
+
+        let mut attempts = 0;
+        let max_attempts = 5;
+        let path_ref = path.as_ref();
+
+        loop {
+            match save_config(self.object_api.clone(), path_ref, data.clone()).await {
+                Ok(_) => {
+                    debug!("Successfully saved IAM config to {}", path_ref);
+                    return Ok(());
+                }
+                Err(e) if attempts < max_attempts => {
+                    attempts += 1;
+                    // Exponential backoff: 200ms, 400ms, 800ms...
+                    let wait_ms = 200 * (1 << attempts);
+                    warn!(
+                        "Storage layer not ready for IAM write (attempt {}/{}). Retrying in {}ms. Path: {}, Error: {:?}",
+                        attempts, max_attempts, wait_ms, path_ref, e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                }
+                Err(e) => {
+                    error!("Final failure saving IAM config to {}: {:?}", path_ref, e);
+                    return Err(e.into());
+                }
+            }
+        }
     }
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()> {
         delete_config(self.object_api.clone(), path.as_ref()).await?;
@@ -499,6 +573,17 @@ impl Store for ObjectStore {
         user_identity: UserIdentity,
         _ttl: Option<usize>,
     ) -> Result<()> {
+        // Pre-check storage health
+        self.check_storage_readiness().await?;
+
+        let path = get_user_identity_path(name, user_type);
+        debug!("Saving IAM identity to path: {}", path);
+
+        self.save_iam_config(user_identity, path).await.map_err(|e| {
+            error!("ObjectStore save failure for {}: {:?}", name, e);
+            e
+        })?;
+
         self.save_iam_config(user_identity, get_user_identity_path(name, user_type))
             .await
     }

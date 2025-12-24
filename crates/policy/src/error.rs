@@ -89,6 +89,7 @@ pub enum Error {
 
     #[error("invalid access_key")]
     InvalidAccessKey,
+
     #[error("action not allowed")]
     IAMActionNotAllowed,
 
@@ -106,6 +107,9 @@ pub enum Error {
 
     #[error("io error: {0}")]
     Io(std::io::Error),
+
+    #[error("system already initialized")]
+    IamSysAlreadyInitialized,
 }
 
 impl Error {
