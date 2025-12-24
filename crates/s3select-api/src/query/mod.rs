@@ -18,7 +18,6 @@ use s3s::dto::SelectObjectContentInput;
 
 pub mod analyzer;
 pub mod ast;
-pub mod datasource;
 pub mod dispatcher;
 pub mod execution;
 pub mod function;
