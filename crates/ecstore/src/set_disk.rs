@@ -6538,6 +6538,10 @@ async fn disks_with_all_parts(
         let corrupted = !meta.mod_time.eq(&latest_meta.mod_time) || !meta.data_dir.eq(&latest_meta.data_dir);
 
         if corrupted {
+            warn!(
+                "disks_with_all_partsv2: metadata is corrupted, object_name={}, index: {index}",
+                object_name
+            );
             meta_errs[index] = Some(DiskError::FileCorrupt);
             parts_metadata[index] = FileInfo::default();
             continue;
@@ -6545,6 +6549,10 @@ async fn disks_with_all_parts(
 
         if erasure_distribution_reliable {
             if !meta.is_valid() {
+                warn!(
+                    "disks_with_all_partsv2: metadata is not valid, object_name={}, index: {index}",
+                    object_name
+                );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
                 continue;
@@ -6555,6 +6563,10 @@ async fn disks_with_all_parts(
                 // Erasure distribution is not the same as onlineDisks
                 // attempt a fix if possible, assuming other entries
                 // might have the right erasure distribution.
+                warn!(
+                    "disks_with_all_partsv2: erasure distribution is not the same as onlineDisks, object_name={}, index: {index}",
+                    object_name
+                );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
                 continue;

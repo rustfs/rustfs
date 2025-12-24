@@ -17,6 +17,7 @@ use std::sync::Arc;
 use crate::data_usage::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
 use crate::metrics::CurrentCycle;
 use crate::metrics::global_metrics;
+use crate::scanner_folder::data_usage_update_dir_cycles;
 use crate::scanner_io::ScannerIO;
 use crate::{DataUsageInfo, ScannerError};
 use chrono::{DateTime, Utc};
@@ -33,8 +34,6 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-
-const DATA_USAGE_UPDATE_DIR_CYCLES: usize = 16;
 
 fn data_scanner_start_delay() -> Duration {
     let secs = rustfs_utils::get_env_u64(ENV_DATA_SCANNER_START_DELAY_SECS, DEFAULT_DATA_SCANNER_START_DELAY_SECS);
@@ -193,8 +192,8 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
                 cycle_info.current = 0;
                 cycle_info.cycle_completed.push(Utc::now());
 
-                if cycle_info.cycle_completed.len() >= DATA_USAGE_UPDATE_DIR_CYCLES {
-                    cycle_info.cycle_completed = cycle_info.cycle_completed.split_off(DATA_USAGE_UPDATE_DIR_CYCLES);
+                if cycle_info.cycle_completed.len() >= data_usage_update_dir_cycles() as usize {
+                    cycle_info.cycle_completed = cycle_info.cycle_completed.split_off(data_usage_update_dir_cycles() as usize);
                 }
 
                 global_metrics().set_cycle(Some(cycle_info.clone())).await;

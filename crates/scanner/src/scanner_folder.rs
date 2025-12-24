@@ -24,7 +24,6 @@ use crate::metrics::{UpdateCurrentPathFn, current_path_updater};
 use crate::scanner_io::ScannerIODisk as _;
 use rustfs_common::heal_channel::{HEAL_DELETE_DANGLING, HealChannelRequest, HealOpts, HealScanMode, send_heal_request};
 use rustfs_common::metrics::IlmAction;
-use rustfs_config::{DEFAULT_HEAL_OBJECT_SELECT_PROB, ENV_HEAL_OBJECT_SELECT_PROB};
 use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_rule;
@@ -54,13 +53,15 @@ use tracing::{debug, error, info, warn};
 
 // Constants from Go code
 const DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1);
-const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16;
+const DATA_USAGE_UPDATE_DIR_CYCLES: usize = 16;
 const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
 const DATA_SCANNER_COMPACT_AT_CHILDREN: usize = 10000;
 const DATA_SCANNER_COMPACT_AT_FOLDERS: usize = DATA_SCANNER_COMPACT_AT_CHILDREN / 4;
 const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
-fn heal_object_select_prob() -> u32 {
-    rustfs_utils::get_env_usize(ENV_HEAL_OBJECT_SELECT_PROB, DEFAULT_HEAL_OBJECT_SELECT_PROB as usize) as u32
+const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
+const ENV_DATA_USAGE_UPDATE_DIR_CYCLES: &str = "RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES";
+pub fn data_usage_update_dir_cycles() -> u32 {
+    rustfs_utils::get_env_usize(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, DATA_USAGE_UPDATE_DIR_CYCLES) as u32
 }
 
 /// Cached folder information for scanning
@@ -790,14 +791,14 @@ impl FolderScanner {
 
                 if !into.compacted && self.old_cache.is_compacted(&h) {
                     let next_cycle = self.old_cache.info.next_cycle as u32;
-                    if !h.mod_(next_cycle, DATA_USAGE_UPDATE_DIR_CYCLES) {
+                    if !h.mod_(next_cycle, data_usage_update_dir_cycles()) {
                         // Transfer and add as child...
                         self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
                         into.add_child(&h);
                         continue;
                     }
 
-                    folder_item.object_heal_prob_div = DATA_USAGE_UPDATE_DIR_CYCLES;
+                    folder_item.object_heal_prob_div = data_usage_update_dir_cycles();
                 }
 
                 (self.update_current_path)(&folder_item.name).await;
@@ -1133,7 +1134,7 @@ pub async fn scan_data_folder(
 
     // Create heal_object_select flag
     let heal_object_select = if is_erasure_mode && !cache.info.skip_healing {
-        heal_object_select_prob()
+        DEFAULT_HEAL_OBJECT_SELECT_PROB
     } else {
         0
     };
