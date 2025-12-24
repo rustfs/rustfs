@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
-use crate::{admin, config};
+use crate::{admin, config, version};
+use chrono::Datelike;
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_notify::notifier_global;
@@ -22,6 +23,17 @@ use s3s::s3_error;
 use std::env;
 use std::io::Error;
 use tracing::{debug, error, info, instrument, warn};
+
+#[instrument]
+pub(crate) fn print_server_info() {
+    let current_year = chrono::Utc::now().year();
+    // Use custom macros to print server information
+    info!("RustFS Object Storage Server");
+    info!("Copyright: 2024-{} RustFS, Inc", current_year);
+    info!("License: Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0");
+    info!("Version: {}", version::get_version());
+    info!("Docs: https://rustfs.com/docs/");
+}
 
 /// Initialize the asynchronous update check system.
 /// This function checks if update checking is enabled via

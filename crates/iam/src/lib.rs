@@ -13,13 +13,12 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use crate::store::Store;
 use manager::IamCache;
 use rustfs_ecstore::store::ECStore;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
-use tracing::{debug, error, info, instrument};
+use tracing::{error, info, instrument};
 
 pub mod cache;
 pub mod error;

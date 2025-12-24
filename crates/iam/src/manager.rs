@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{is_err_config_not_found, Error, Result};
+use crate::error::{Error, Result, is_err_config_not_found};
 use crate::sys::get_claims_from_token_with_secret;
 use crate::{
     cache::{Cache, CacheEntity},
-    error::{is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user, Error as IamError},
-    store::{object::IAM_CONFIG_PREFIX, GroupInfo, MappedPolicy, Store, UserType},
+    error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
+    store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
     sys::{
-        UpdateServiceAccountOpts, MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED,
-        STATUS_ENABLED,
+        MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED, STATUS_ENABLED,
+        UpdateServiceAccountOpts,
     },
 };
 use futures::future::join_all;
@@ -28,20 +28,21 @@ use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
-    auth::{self, is_secret_key_valid, jwt_sign, Credentials, UserIdentity},
+    auth::{self, Credentials, UserIdentity, is_secret_key_valid, jwt_sign},
     format::Format,
     policy::{
-        default::DEFAULT_POLICIES, iam_policy_claim_name_sa, Policy, PolicyDoc, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE,
+        EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
     },
 };
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::AtomicU8;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::Duration,
 };
@@ -76,9 +77,19 @@ fn get_iam_format_file_path() -> String {
     path_join_buf(&[&IAM_CONFIG_PREFIX, IAM_FORMAT_FILE])
 }
 
+#[repr(u8)]
+#[derive(Debug, PartialEq)]
+pub enum IamState {
+    Uninitialized = 0,
+    Loading = 1,
+    Ready = 2,
+    Error = 3,
+}
+
 pub struct IamCache<T> {
     pub cache: Cache,
     pub api: T,
+    pub state: Arc<AtomicU8>,
     pub loading: Arc<AtomicBool>,
     pub roles: HashMap<ARN, Vec<String>>,
     pub send_chan: Sender<i64>,
@@ -101,6 +112,7 @@ where
         let sys = Arc::new(Self {
             api,
             cache: Cache::default(),
+            state: Arc::new(AtomicU8::new(IamState::Uninitialized as u8)),
             loading: Arc::new(AtomicBool::new(false)),
             send_chan: sender,
             roles: HashMap::new(),
@@ -113,15 +125,17 @@ where
 
     /// Initialize the IAM system
     async fn init(self: Arc<Self>, receiver: Receiver<i64>) -> Result<()> {
+        self.state.store(IamState::Loading as u8, Ordering::SeqCst);
         // Ensure the IAM format file is persisted first
         self.clone().save_iam_formatter().await?;
 
         // Critical: Load all existing users/policies into memory cache
         if let Err(e) = self.clone().load().await {
+            self.state.store(IamState::Error as u8, Ordering::SeqCst);
             error!("IAM fail to load initial data: {:?}", e);
             return Err(e);
         }
-
+        self.state.store(IamState::Ready as u8, Ordering::SeqCst);
         info!("IAM System successfully initialized and marked as READY");
 
         // Background ticker for synchronization
@@ -166,6 +180,11 @@ where
         }
 
         Ok(())
+    }
+
+    /// Check if IAM system is ready
+    pub fn is_ready(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == IamState::Ready as u8
     }
 
     async fn _notify(&self) {

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::router::Operation;
 use http::StatusCode;
 use hyper::Uri;
 use matchit::Params;
@@ -19,8 +20,6 @@ use rustfs_ecstore::{GLOBAL_Endpoints, rpc::PeerRestClient};
 use rustfs_madmin::service_commands::ServiceTraceOpts;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use tracing::warn;
-
-use crate::admin::router::Operation;
 
 #[allow(dead_code)]
 fn extract_trace_options(uri: &Uri) -> S3Result<ServiceTraceOpts> {

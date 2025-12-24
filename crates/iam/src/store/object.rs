@@ -501,10 +501,7 @@ impl Store for ObjectStore {
         self.save_iam_config(user_identity, path).await.map_err(|e| {
             error!("ObjectStore save failure for {}: {:?}", name, e);
             e
-        })?;
-
-        self.save_iam_config(user_identity, get_user_identity_path(name, user_type))
-            .await
+        })
     }
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()> {
         self.delete_iam_config(get_user_identity_path(name, user_type))
