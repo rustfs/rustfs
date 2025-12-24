@@ -104,7 +104,6 @@ where
                 || path.starts_with(crate::server::ADMIN_PREFIX);
 
             let is_probe = is_exact_probe || is_prefix_probe;
-            // System is ready, forward to the actual S3/RPC handlers
             if !is_probe && !readiness.is_ready() {
                 let body: BoxBody = Full::new(Bytes::from_static(b"Service not ready"))
                     .map_err(|e| -> BoxError { Box::new(e) })
@@ -120,6 +119,7 @@ where
                 return Ok(resp);
             }
             let resp = inner.call(req).await?;
+            // System is ready, forward to the actual S3/RPC handlers
             // Transparently converts any response body into a BoxBody, and then Trace/Cors/Compression continues to work
             let (parts, body) = resp.into_parts();
             let body: BoxBody = body.map_err(Into::into).boxed_unsync();

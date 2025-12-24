@@ -130,10 +130,20 @@ where
         self.clone().save_iam_formatter().await?;
 
         // Critical: Load all existing users/policies into memory cache
-        if let Err(e) = self.clone().load().await {
-            self.state.store(IamState::Error as u8, Ordering::SeqCst);
-            error!("IAM fail to load initial data: {:?}", e);
-            return Err(e);
+        const MAX_RETRIES: usize = 3;
+        for attempt in 0..MAX_RETRIES {
+            if let Err(e) = self.clone().load().await {
+                if attempt == MAX_RETRIES - 1 {
+                    self.state.store(IamState::Error as u8, Ordering::SeqCst);
+                    error!("IAM fail to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
+                    return Err(e);
+                } else {
+                    warn!("IAM load failed, retrying... attempt {}", attempt + 1);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            } else {
+                break;
+            }
         }
         self.state.store(IamState::Ready as u8, Ordering::SeqCst);
         info!("IAM System successfully initialized and marked as READY");

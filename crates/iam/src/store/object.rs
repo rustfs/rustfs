@@ -341,37 +341,24 @@ impl ObjectStore {
         Ok(policies)
     }
 
-    /// Internal helper to check if the underlying ECStore is ready for metadata operations.
+    /// Checks if the underlying ECStore is ready for metadata operations.
     /// This prevents silent failures during the storage boot-up phase.
+    ///
+    /// Performs a lightweight probe by attempting to read a known configuration object.
+    /// If the object is not found, it indicates the storage metadata is not ready.
+    /// The upper-level caller should handle retries if needed.
     async fn check_storage_readiness(&self) -> Result<()> {
-        // `ECStore` is not currently exposed `is_online()`, so use the "minimum feasible probe" to determine whether the metadata read path is available:
-        // 1) Try to read the next probe object in the IAM prefix
-        // 2) Map "Not ready/not initialized" to an explicit error to avoid silent failure at the upper level
-        //
-        // 1) Check whether the storage layer is ready first (avoid silent failure during startup/rebalancing)
-        // Note: Currently, there is no `is_online()` on `ECStore`, so the minimum feasible check is reused here:
-        // Determine whether a metadata read path is available by attempting to read the configuration under a known prefix.
-        //
-        // 2) Make sure that the system bucket `.rustfs.sys` is accessible:
-        // There is no direct "create bucket" API exposed to current file dependencies, so "readability detection" is used.
-        //
-        // 3) If you still need to wait for the loading to complete: the upper-level caller will implement retry/backoff (this method only returns clear errors).
-        //Lightweight detection: Read a fixed object under the IAM root prefix; if it does not exist, it is considered that the system bucket or metadata is not ready yet
-        //Select format.json because it is usually located in the root directory of config/iam/(adjusted based on the actual objects of the project).
+        // Probe path for a fixed object under the IAM root prefix.
+        // If it doesn't exist, the system bucket or metadata is not ready.
         let probe_path = format!("{}/format.json", *IAM_CONFIG_PREFIX);
 
         match read_config(self.object_api.clone(), &probe_path).await {
-            Ok(_bytes) => Ok(()),
-            Err(e) => {
-                // Unify "not ready/not initialized" to errors recognizable by the business side
-                // -If the underlying layer is ConfigNotFound, it is more likely that the system bucket
-                // has not been initialized or the IAM root has not been written yet
-                if matches!(e, rustfs_ecstore::error::StorageError::ConfigNotFound) {
-                    Err(Error::other("Storage metadata not ready"))
-                } else {
-                    Err(e.into())
-                }
-            }
+            Ok(_) => Ok(()),
+            Err(e) if matches!(e, rustfs_ecstore::error::StorageError::ConfigNotFound) => Err(Error::other(format!(
+                "Storage metadata not ready: probe object '{}' not found (expected IAM config to be initialized)",
+                probe_path
+            ))),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -432,26 +419,23 @@ impl Store for ObjectStore {
 
         Ok(serde_json::from_slice(&data)?)
     }
-    /// Save IAM config with retry mechanism on failure
-    /// This method will attempt to save the IAM configuration up to 5 times
-    /// if it encounters a storage layer not ready error, with exponential backoff
-    /// between attempts.
+    /// Saves IAM configuration with a retry mechanism on failure.
+    ///
+    /// Attempts to save the IAM configuration up to 5 times if the storage layer is not ready,
+    /// using exponential backoff between attempts (starting at 200ms, doubling each retry).
     ///
     /// # Arguments
     ///
-    /// * `item` - The IAM configuration item to be saved, which must implement Serialize and Send.
-    /// * `path` - The path where the IAM configuration will be saved.
+    /// * `item` - The IAM configuration item to save, must implement `Serialize` and `Send`.
+    /// * `path` - The path where the configuration will be saved.
     ///
     /// # Returns
     ///
-    /// * `Result<()>` - Returns Ok(()) if the save is successful, or an Error if it fails after all attempts.
+    /// * `Result<()>` - `Ok(())` on success, or an `Error` if all attempts fail.
     #[tracing::instrument(level = "debug", skip(self, item, path))]
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()> {
         let mut data = serde_json::to_vec(&item)?;
         data = Self::encrypt_data(&data)?;
-
-        // save_config(self.object_api.clone(), path.as_ref(), data).await?;
-        // Ok(())
 
         let mut attempts = 0;
         let max_attempts = 5;

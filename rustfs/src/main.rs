@@ -229,11 +229,8 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     ecconfig::init();
 
-    // config system configuration
-    GLOBAL_CONFIG_SYS.init(store.clone()).await?;
-    // config system configuration, wait for 1 second if failed
+    // // Initialize global configuration system
     let mut retry_count = 0;
-
     while let Err(e) = GLOBAL_CONFIG_SYS.init(store.clone()).await {
         error!("GLOBAL_CONFIG_SYS.init failed {:?}", e);
         // TODO: check error type
@@ -244,7 +241,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
     readiness.mark_stage(SystemStage::StorageReady);
-    // init  replication_pool
+    // init replication_pool
     init_background_replication(store.clone()).await;
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;

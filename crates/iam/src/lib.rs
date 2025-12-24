@@ -62,8 +62,9 @@ pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
 pub fn get() -> Result<Arc<IamSys<ObjectStore>>> {
     let sys = IAM_SYS.get().map(Arc::clone).ok_or(Error::IamSysNotInitialized)?;
 
-    // Check internal readiness state to prevent "iam not init" errors
-    // during the split-second between OnceLock set and data load completion.
+    // Double-check the internal readiness state. The OnceLock is only set
+    // after initialization and data loading complete, so this is a defensive
+    // guard to ensure callers never operate on a partially initialized system.
     if !sys.is_ready() {
         return Err(Error::IamSysNotInitialized);
     }

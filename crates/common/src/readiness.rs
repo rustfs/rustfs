@@ -61,3 +61,76 @@ impl GlobalReadiness {
         self.status.load(Ordering::SeqCst) == SystemStage::FullReady as u8
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn test_initial_state() {
+        let readiness = GlobalReadiness::new();
+        assert!(!readiness.is_ready());
+        assert_eq!(readiness.status.load(Ordering::SeqCst), SystemStage::Booting as u8);
+    }
+
+    #[test]
+    fn test_mark_stage_progression() {
+        let readiness = GlobalReadiness::new();
+        readiness.mark_stage(SystemStage::StorageReady);
+        assert!(!readiness.is_ready());
+        assert_eq!(readiness.status.load(Ordering::SeqCst), SystemStage::StorageReady as u8);
+
+        readiness.mark_stage(SystemStage::IamReady);
+        assert!(!readiness.is_ready());
+        assert_eq!(readiness.status.load(Ordering::SeqCst), SystemStage::IamReady as u8);
+
+        readiness.mark_stage(SystemStage::FullReady);
+        assert!(readiness.is_ready());
+    }
+
+    #[test]
+    fn test_no_regression() {
+        let readiness = GlobalReadiness::new();
+        readiness.mark_stage(SystemStage::FullReady);
+        readiness.mark_stage(SystemStage::IamReady); // Should not regress
+        assert!(readiness.is_ready());
+    }
+
+    #[test]
+    fn test_concurrent_marking() {
+        let readiness = Arc::new(GlobalReadiness::new());
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let r = Arc::clone(&readiness);
+            handles.push(thread::spawn(move || {
+                r.mark_stage(SystemStage::StorageReady);
+                r.mark_stage(SystemStage::IamReady);
+                r.mark_stage(SystemStage::FullReady);
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(readiness.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_only_at_full_ready() {
+        let readiness = GlobalReadiness::new();
+        assert!(!readiness.is_ready());
+
+        readiness.mark_stage(SystemStage::StorageReady);
+        assert!(!readiness.is_ready());
+
+        readiness.mark_stage(SystemStage::IamReady);
+        assert!(!readiness.is_ready());
+
+        readiness.mark_stage(SystemStage::FullReady);
+        assert!(readiness.is_ready());
+    }
+}
