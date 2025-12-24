@@ -30,6 +30,12 @@ pub struct GlobalReadiness {
     status: AtomicU8,
 }
 
+impl Default for GlobalReadiness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GlobalReadiness {
     /// Create a new GlobalReadiness instance with initial status as Starting
     /// # Returns

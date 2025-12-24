@@ -134,7 +134,10 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{io::AsyncRead, sync::mpsc};
+use tokio::{
+    io::{AsyncRead, AsyncSeek},
+    sync::mpsc,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -395,6 +398,19 @@ impl AsyncRead for InMemoryAsyncReader {
         let bytes_read = std::io::Read::read(&mut self.cursor, unfilled)?;
         buf.advance(bytes_read);
         std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncSeek for InMemoryAsyncReader {
+    fn start_seek(mut self: std::pin::Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        // std::io::Cursor natively supports negative SeekCurrent offsets
+        // It will automatically handle validation and return an error if the final position would be negative
+        std::io::Seek::seek(&mut self.cursor, position)?;
+        Ok(())
+    }
+
+    fn poll_complete(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<u64>> {
+        std::task::Poll::Ready(Ok(self.cursor.position()))
     }
 }
 
@@ -2264,11 +2280,55 @@ impl S3 for FS {
             );
             Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
         } else {
-            // Standard streaming path for large objects or range/part requests
-            Some(StreamingBlob::wrap(bytes_stream(
-                ReaderStream::with_capacity(final_stream, optimal_buffer_size),
-                response_content_length as usize,
-            )))
+            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+
+            let should_provide_seek_support = response_content_length > 0
+                && response_content_length <= seekable_object_size_threshold as i64
+                && part_number.is_none()
+                && rs.is_none();
+
+            if should_provide_seek_support {
+                debug!(
+                    "Reading small object into memory for seek support: key={} size={}",
+                    cache_key, response_content_length
+                );
+
+                // Read the stream into memory
+                let mut buf = Vec::with_capacity(response_content_length as usize);
+                match tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                    Ok(_) => {
+                        // Verify we read the expected amount
+                        if buf.len() != response_content_length as usize {
+                            warn!(
+                                "Object size mismatch during seek support read: expected={} actual={}",
+                                response_content_length,
+                                buf.len()
+                            );
+                        }
+
+                        // Create seekable in-memory reader (similar to MinIO SDK's bytes.Reader)
+                        let mem_reader = InMemoryAsyncReader::new(buf);
+                        Some(StreamingBlob::wrap(bytes_stream(
+                            ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
+                            response_content_length as usize,
+                        )))
+                    }
+                    Err(e) => {
+                        error!("Failed to read object into memory for seek support: {}", e);
+                        // Fallback to streaming if read fails
+                        Some(StreamingBlob::wrap(bytes_stream(
+                            ReaderStream::with_capacity(final_stream, optimal_buffer_size),
+                            response_content_length as usize,
+                        )))
+                    }
+                }
+            } else {
+                // Standard streaming path for large objects or range/part requests
+                Some(StreamingBlob::wrap(bytes_stream(
+                    ReaderStream::with_capacity(final_stream, optimal_buffer_size),
+                    response_content_length as usize,
+                )))
+            }
         };
 
         // Extract SSE information from metadata for response

@@ -42,6 +42,7 @@ spec:
         {{- else }}
           {}
         {{- if .Values.affinity.podAntiAffinity.enabled }}
+        {{- end }}
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -51,7 +52,6 @@ spec:
                     values:
                       - {{ include "rustfs.name" . }}
               topologyKey: {{ .Values.affinity.podAntiAffinity.topologyKey }}
-        {{- end }}
         {{- end }}
       {{- end }}
       {{- if .Values.tolerations }}
@@ -68,11 +68,10 @@ spec:
       {{- end }}
       initContainers:
         - name: init-step
-          image: busybox
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: "{{ .Values.initStep.image.repository }}:{{ .Values.initStep.image.tag }}"
+          imagePullPolicy: {{ .Values.initStep.image.pullPolicy }}
           securityContext:
-            runAsUser: 0
-            runAsGroup: 0
+            {{- toYaml .Values.initStep.containerSecurityContext | nindent 12 }}
           env:
             - name: REPLICA_COUNT
               value: {{ .Values.replicaCount | quote }}
@@ -111,10 +110,10 @@ spec:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           {{- end }}
           ports:
-            - containerPort: {{ .Values.service.ep_port }}
-              name: endpoint
-            - containerPort: {{ .Values.service.console_port }}
-              name: console
+            - name: endpoint
+              containerPort: {{ .Values.service.endpoint.port }}
+            - name: console
+              containerPort: {{ .Values.service.console.port }}
           envFrom:
             - configMapRef:
                 name: {{ include "rustfs.fullname" . }}-config
