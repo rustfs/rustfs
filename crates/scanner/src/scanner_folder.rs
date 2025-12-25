@@ -53,15 +53,21 @@ use tracing::{debug, error, info, warn};
 
 // Constants from Go code
 const DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1);
-const DATA_USAGE_UPDATE_DIR_CYCLES: usize = 16;
+const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16;
 const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
 const DATA_SCANNER_COMPACT_AT_CHILDREN: usize = 10000;
 const DATA_SCANNER_COMPACT_AT_FOLDERS: usize = DATA_SCANNER_COMPACT_AT_CHILDREN / 4;
 const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
 const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
 const ENV_DATA_USAGE_UPDATE_DIR_CYCLES: &str = "RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES";
+const ENV_HEAL_OBJECT_SELECT_PROB: &str = "RUSTFS_HEAL_OBJECT_SELECT_PROB";
+
 pub fn data_usage_update_dir_cycles() -> u32 {
-    rustfs_utils::get_env_usize(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, DATA_USAGE_UPDATE_DIR_CYCLES) as u32
+    rustfs_utils::get_env_u32(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, DATA_USAGE_UPDATE_DIR_CYCLES)
+}
+
+pub fn heal_object_select_prob() -> u32 {
+    rustfs_utils::get_env_u32(ENV_HEAL_OBJECT_SELECT_PROB, DEFAULT_HEAL_OBJECT_SELECT_PROB)
 }
 
 /// Cached folder information for scanning
@@ -616,17 +622,17 @@ impl FolderScanner {
                     wait = Some(SystemTime::now());
                 }
 
-                // warn!(
-                //     "scan_folder: heal_enabled: {} next_cycle: {} heal_object_select: {} object_heal_prob_div: {} should_heal: {}",
-                //     this_hash.mod_alt(
-                //         self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
-                //         self.heal_object_select / folder.object_heal_prob_div
-                //     ),
-                //     self.old_cache.info.next_cycle,
-                //     self.heal_object_select,
-                //     folder.object_heal_prob_div,
-                //     self.should_heal().await,
-                // );
+                debug!(
+                    "scan_folder: heal_enabled: {} next_cycle: {} heal_object_select: {} object_heal_prob_div: {} should_heal: {}",
+                    this_hash.mod_alt(
+                        self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
+                        self.heal_object_select / folder.object_heal_prob_div
+                    ),
+                    self.old_cache.info.next_cycle,
+                    self.heal_object_select,
+                    folder.object_heal_prob_div,
+                    self.should_heal().await,
+                );
 
                 let heal_enabled = this_hash.mod_alt(
                     self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
@@ -1134,7 +1140,7 @@ pub async fn scan_data_folder(
 
     // Create heal_object_select flag
     let heal_object_select = if is_erasure_mode && !cache.info.skip_healing {
-        DEFAULT_HEAL_OBJECT_SELECT_PROB
+        heal_object_select_prob()
     } else {
         0
     };

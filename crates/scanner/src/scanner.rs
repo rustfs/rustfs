@@ -44,6 +44,9 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     let ctx_clone = ctx.clone();
     let storeapi_clone = storeapi.clone();
     tokio::spawn(async move {
+        let sleep_time = Duration::from_secs(rand::random::<u64>() % 5);
+        tokio::time::sleep(sleep_time).await;
+
         loop {
             if ctx_clone.is_cancelled() {
                 break;
