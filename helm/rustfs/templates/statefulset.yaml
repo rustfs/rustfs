@@ -87,7 +87,7 @@ spec:
                 mkdir -p /data
               fi
               mkdir -p {{ $logDir }}
-              chown -R 10001:10001 /data {{ $logDir }}
+              chown 10001:10001 /data {{ $logDir }}
           volumeMounts:
             {{- if eq (int .Values.replicaCount) 4 }}
             {{- range $i := until (int .Values.replicaCount) }}
