@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
+use tracing::debug;
 
 /// ReadinessGateLayer ensures that the system components (IAM, Storage)
 /// are fully initialized before allowing any request to proceed.
@@ -88,6 +89,7 @@ where
         let readiness = self.readiness.clone();
         Box::pin(async move {
             let path = req.uri().path();
+            debug!("ReadinessGateService: Received request for path: {}", path);
             // 1) Exact match: fixed probe/resource path
             let is_exact_probe = matches!(
                 path,
@@ -101,7 +103,8 @@ where
             let is_prefix_probe = path.starts_with(crate::server::RUSTFS_ADMIN_PREFIX)
                 || path.starts_with(crate::server::CONSOLE_PREFIX)
                 || path.starts_with(crate::server::RPC_PREFIX)
-                || path.starts_with(crate::server::ADMIN_PREFIX);
+                || path.starts_with(crate::server::ADMIN_PREFIX)
+                || path.starts_with(crate::server::TONIC_PREFIX);
 
             let is_probe = is_exact_probe || is_prefix_probe;
             if !is_probe && !readiness.is_ready() {
