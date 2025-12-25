@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Session management for RustFS
+//! Session management for protocol implementations
 //!
-//! This module provides session and request context management functionality,
-//! integrating with the existing auth and storage modules.
+//! This module provides session management for all protocol implementations.
+//! It ensures that all protocols use the same session management and context.
+//!
+//! MINIO CONSTRAINT: Session management MUST be protocol-agnostic and
+//! MUST NOT bypass S3 policy enforcement.
 
 pub mod context;
+pub mod principal;

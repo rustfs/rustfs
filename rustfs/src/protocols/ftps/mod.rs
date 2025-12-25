@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Protocol implementations for RustFS
+//! FTPS protocol implementation
 //!
-//! This module provides protocol implementations that integrate with the core
-//! RustFS storage system. All protocols follow the same security and access
-//! control constraints as the S3 API.
+//! This module provides the FTPS protocol implementation for RustFS.
+//! It uses libunftp as the FTP server implementation and integrates
+//! with the RustFS gateway for S3 operations.
+//!
+//! MINIO CONSTRAINT: All FTPS operations MUST go through the gateway
+//! and MUST follow exact S3 semantics.
 
-pub mod client;
-pub mod ftps;
-pub mod gateway;
-pub mod session;
-pub mod sftp;
+pub mod server;
+pub mod driver;

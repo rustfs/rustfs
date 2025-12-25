@@ -61,7 +61,6 @@ use std::io::{Error, Result};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
-use uuid;
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
@@ -248,28 +247,18 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
 
-    // Create session context using existing auth and storage modules
-    let fs = Arc::new(crate::storage::ecfs::FS { store: store.clone() });
-    let credentials = rustfs_ecstore::global::get_global_action_cred().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let auth = Arc::new(crate::auth::IAMAuth::new(
-        credentials.access_key.clone(),
-        credentials.secret_key.clone(),
-    ));
-
-    // Create session context
-    let session_context = crate::protocols::session::context::SessionContext::new(
-        auth,
-        fs,
-        uuid::Uuid::new_v4().to_string(),
-    );
+    // Create a shutdown channel for FTP/SFTP services
+    let (ftp_sftp_shutdown_tx, _) = tokio::sync::broadcast::channel(1);
 
     // Initialize FTP system if enabled
-    // Note: In a real implementation, we would pass the session context to the protocol adapters
-    init_ftp_system(&opt, session_context.auth().clone(), session_context.fs().clone()).await?;
+    init_ftp_system(&opt, ftp_sftp_shutdown_tx.clone())
+        .await
+        .map_err(Error::other)?;
 
     // Initialize SFTP system if enabled
-    // Note: In a real implementation, we would pass the session context to the protocol adapters
-    init_sftp_system(&opt, session_context.auth().clone(), session_context.fs().clone()).await?;
+    init_sftp_system(&opt, ftp_sftp_shutdown_tx.clone())
+        .await
+        .map_err(Error::other)?;
 
     // Initialize buffer profiling system
     init_buffer_profile_system(&opt);
@@ -357,11 +346,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ftp_sftp_shutdown_tx, ctx.clone()).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ftp_sftp_shutdown_tx, ctx.clone()).await;
         }
     }
 
@@ -374,6 +363,7 @@ async fn handle_shutdown(
     state_manager: &ServiceStateManager,
     s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    ftp_sftp_shutdown_tx: tokio::sync::broadcast::Sender<()>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -439,6 +429,9 @@ async fn handle_shutdown(
 
     // Wait for the worker thread to complete the cleaning work
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+
+    // Send shutdown signal to FTP/SFTP services
+    let _ = ftp_sftp_shutdown_tx.send(());
 
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);

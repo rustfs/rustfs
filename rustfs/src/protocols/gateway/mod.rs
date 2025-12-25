@@ -12,10 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Protocol adapters for RustFS
+//! Gateway module for protocol implementations
 //!
-//! This module provides protocol adapters for various network protocols
-//! including FTPS and SFTP.
+//! This module provides the gateway layer that translates protocol-specific operations
+//! into S3 actions, ensuring all protocols follow the same S3 semantics.
+//!
+//! MINIO CONSTRAINT: All protocol operations MUST be translated to S3 actions
+//! and MUST go through the same authorization and error handling paths.
 
-pub mod ftps;
-pub mod sftp;
+pub mod action;
+pub mod adapter;
+pub mod authorize;
+pub mod error;
+pub mod restrictions;

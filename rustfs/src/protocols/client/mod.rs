@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Protocol implementations for RustFS
+//! Unified S3 client for protocol implementations
 //!
-//! This module provides protocol implementations that integrate with the core
-//! RustFS storage system. All protocols follow the same security and access
-//! control constraints as the S3 API.
+//! This module provides a unified S3 client that can be used by all protocol
+//! implementations to access the storage system through S3 operations.
+//!
+//! MINIO CONSTRAINT: This client MUST only provide capabilities
+//! that match what an external S3 client can do.
 
-pub mod client;
-pub mod ftps;
-pub mod gateway;
-pub mod session;
-pub mod sftp;
+pub mod s3;

@@ -12,48 +12,89 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Session context for RustFS
+//! Session context for protocol implementations
 //!
-//! This module provides session context management functionality,
-//! integrating with the existing auth and storage modules.
+//! This module provides session context for all protocol implementations.
+//! It ensures that all protocols use the same session context and security boundaries.
+//!
+//! MINIO CONSTRAINT: Session context MUST be protocol-agnostic and
+//! MUST NOT provide capabilities beyond what external S3 clients can do.
 
-use std::sync::Arc;
-use crate::auth::IAMAuth;
-use crate::storage::ecfs::FS;
+use crate::protocols::session::principal::ProtocolPrincipal;
+use std::net::IpAddr;
 
-/// Session context for protocol adapters
+/// Protocol types
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Protocol {
+    Ftp,
+    Ftps,
+    Sftp,
+}
+
+/// Session context for protocol operations
+///
+/// MINIO CONSTRAINT: This context MUST contain all necessary information
+/// for authorization and auditing, but MUST NOT make security decisions
 #[derive(Debug, Clone)]
 pub struct SessionContext {
-    /// Authentication information
-    pub auth: Arc<IAMAuth>,
-    /// Storage filesystem access
-    pub fs: Arc<FS>,
-    /// Session identifier
-    pub session_id: String,
+    /// The protocol principal (authenticated user)
+    pub principal: ProtocolPrincipal,
+
+    /// The protocol type
+    pub protocol: Protocol,
+
+    /// The source IP address
+    pub source_ip: IpAddr,
+
+    /// The current working directory (if applicable)
+    pub working_dir: Option<String>,
 }
 
 impl SessionContext {
     /// Create a new session context
-    pub fn new(auth: Arc<IAMAuth>, fs: Arc<FS>, session_id: String) -> Self {
+    ///
+    /// MINIO CONSTRAINT: Must use the same authentication path as external clients
+    pub fn new(principal: ProtocolPrincipal, protocol: Protocol, source_ip: IpAddr) -> Self {
         Self {
-            auth,
-            fs,
-            session_id,
+            principal,
+            protocol,
+            source_ip,
+            working_dir: None,
         }
     }
 
-    /// Get authentication information
-    pub fn auth(&self) -> &Arc<IAMAuth> {
-        &self.auth
+    /// Set the working directory
+    pub fn set_working_dir(&mut self, dir: String) {
+        self.working_dir = Some(dir);
     }
 
-    /// Get filesystem access
-    pub fn fs(&self) -> &Arc<FS> {
-        &self.fs
+    /// Get the current working directory
+    pub fn working_dir(&self) -> Option<&str> {
+        self.working_dir.as_deref()
     }
 
-    /// Get session identifier
-    pub fn session_id(&self) -> &str {
-        &self.session_id
+    /// Get the access key for this session
+    pub fn access_key(&self) -> &str {
+        self.principal.access_key()
+    }
+
+    /// Resolve a path relative to the working directory
+    pub fn resolve_path(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            // Absolute path
+            path.to_string()
+        } else {
+            // Relative path
+            match self.working_dir() {
+                Some(cwd) => {
+                    if cwd.ends_with('/') {
+                        format!("{}{}", cwd, path)
+                    } else {
+                        format!("{}/{}", cwd, path)
+                    }
+                }
+                None => path.to_string(),
+            }
+        }
     }
 }

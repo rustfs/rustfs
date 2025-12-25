@@ -127,11 +127,11 @@ pub struct Opt {
 
     /// Enable FTPS server
     #[arg(long, default_value_t = false, env = "RUSTFS_FTPS_ENABLE")]
-    pub ftp_enable: bool,
+    pub ftps_enable: bool,
 
     /// FTPS server bind address
     #[arg(long, default_value_t = String::from("0.0.0.0:21"), env = "RUSTFS_FTPS_ADDRESS")]
-    pub ftp_address: String,
+    pub ftps_address: String,
 
     /// FTPS server certificate file path
     #[arg(long, env = "RUSTFS_FTPS_CERTS_FILE")]
