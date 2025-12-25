@@ -251,6 +251,8 @@ struct IoLoadMetrics {
     recent_waits: Vec<Duration>,
     /// Maximum samples to keep in the window
     max_samples: usize,
+    /// The earliest record index in the recent_waits vector
+    earliest_index: usize,
     /// Total wait time observed (for averaging)
     total_wait_ns: AtomicU64,
     /// Total number of observations
@@ -263,6 +265,7 @@ impl IoLoadMetrics {
         Self {
             recent_waits: Vec::with_capacity(max_samples),
             max_samples,
+            earliest_index: 0,
             total_wait_ns: AtomicU64::new(0),
             observation_count: AtomicU64::new(0),
         }
@@ -271,10 +274,12 @@ impl IoLoadMetrics {
     /// Record a new permit wait observation
     fn record(&mut self, wait: Duration) {
         // Add to recent waits (with eviction if full)
-        if self.recent_waits.len() >= self.max_samples {
-            self.recent_waits.remove(0);
+        if self.recent_waits.len() < self.max_samples {
+            self.recent_waits.push(wait);
+        } else {
+            self.recent_waits[self.earliest_index] = wait;
+            self.earliest_index = (self.earliest_index + 1) % self.max_samples;
         }
-        self.recent_waits.push(wait);
 
         // Update totals for overall statistics
         self.total_wait_ns.fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
