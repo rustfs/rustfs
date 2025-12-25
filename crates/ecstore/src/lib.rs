@@ -20,7 +20,6 @@ pub mod batch_processor;
 pub mod bitrot;
 pub mod bucket;
 pub mod cache_value;
-mod chunk_stream;
 pub mod compress;
 pub mod config;
 pub mod data_usage;

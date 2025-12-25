@@ -23,7 +23,7 @@ use crate::{
 };
 
 use crate::data_usage::load_data_usage_cache;
-use rustfs_common::{globals::GLOBAL_LOCAL_NODE_NAME, heal_channel::DriveState};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, heal_channel::DriveState};
 use rustfs_madmin::{
     BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, ServerProperties,
 };

@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
-use rustfs_common::{globals::GLOBAL_LOCAL_NODE_NAME, heal_channel::HealOpts};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, heal_channel::HealOpts};
 use rustfs_ecstore::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},

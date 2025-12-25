@@ -19,6 +19,8 @@ mod event;
 mod http;
 mod hybrid;
 mod layer;
+mod prefix;
+mod readiness;
 mod runtime;
 mod service_state;
 
@@ -26,6 +28,8 @@ pub(crate) use audit::{start_audit_system, stop_audit_system};
 pub(crate) use cert::init_cert;
 pub(crate) use event::{init_event_notifier, shutdown_event_notifier};
 pub(crate) use http::start_http_server;
+pub(crate) use prefix::*;
+pub(crate) use readiness::ReadinessGateLayer;
 pub(crate) use runtime::get_tokio_runtime_builder;
 pub(crate) use service_state::SHUTDOWN_TIMEOUT;
 pub(crate) use service_state::ServiceState;

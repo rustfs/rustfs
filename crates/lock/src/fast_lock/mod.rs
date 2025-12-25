@@ -37,9 +37,6 @@ pub mod shard;
 pub mod state;
 pub mod types;
 
-// #[cfg(test)]
-// pub mod benchmarks; // Temporarily disabled due to compilation issues
-
 // Re-export main types
 pub use disabled_manager::DisabledLockManager;
 pub use guard::FastLockGuard;

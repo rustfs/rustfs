@@ -109,6 +109,9 @@ pub enum Error {
 
     #[error("io error: {0}")]
     Io(std::io::Error),
+
+    #[error("system already initialized")]
+    IamSysAlreadyInitialized,
 }
 
 impl PartialEq for Error {
@@ -162,6 +165,7 @@ impl Clone for Error {
             Error::PolicyTooLarge => Error::PolicyTooLarge,
             Error::ConfigNotFound => Error::ConfigNotFound,
             Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
+            Error::IamSysAlreadyInitialized => Error::IamSysAlreadyInitialized,
         }
     }
 }
@@ -226,6 +230,7 @@ impl From<rustfs_policy::error::Error> for Error {
             rustfs_policy::error::Error::StringError(s) => Error::StringError(s),
             rustfs_policy::error::Error::CryptoError(e) => Error::CryptoError(e),
             rustfs_policy::error::Error::ErrCredMalformed => Error::ErrCredMalformed,
+            rustfs_policy::error::Error::IamSysAlreadyInitialized => Error::IamSysAlreadyInitialized,
         }
     }
 }

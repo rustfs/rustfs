@@ -174,7 +174,7 @@ nix run
 
 ### Accessing RustFS
 
-5.  **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console.
+5.  **Access the Console**: Open your web browser and navigate to `http://localhost:9001` to access the RustFS console.
       * Default credentials: `rustfsadmin` / `rustfsadmin`
 6.  **Create a Bucket**: Use the console to create a new bucket for your objects.
 7.  **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs/clients to interact with your RustFS instance.

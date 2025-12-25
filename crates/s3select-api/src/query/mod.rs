@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use s3s::dto::SelectObjectContentInput;
+use std::sync::Arc;
 
 pub mod analyzer;
 pub mod ast;
-pub mod datasource;
 pub mod dispatcher;
 pub mod execution;
 pub mod function;

@@ -67,6 +67,13 @@ pub struct IamSys<T> {
 }
 
 impl<T: Store> IamSys<T> {
+    /// Create a new IamSys instance with the given IamCache store
+    ///
+    /// # Arguments
+    /// * `store` - An Arc to the IamCache instance
+    ///
+    /// # Returns
+    /// A new instance of IamSys
     pub fn new(store: Arc<IamCache<T>>) -> Self {
         tokio::spawn(async move {
             match opa::lookup_config().await {
@@ -87,6 +94,11 @@ impl<T: Store> IamSys<T> {
             roles_map: HashMap::new(),
         }
     }
+
+    /// Check if the IamSys has a watcher configured
+    ///
+    /// # Returns
+    /// `true` if a watcher is configured, `false` otherwise
     pub fn has_watcher(&self) -> bool {
         self.store.api.has_watcher()
     }
@@ -858,6 +870,11 @@ impl<T: Store> IamSys<T> {
         }
 
         self.get_combined_policy(&policies).await.is_allowed(args).await
+    }
+
+    /// Check if the underlying store is ready
+    pub fn is_ready(&self) -> bool {
+        self.store.is_ready()
     }
 }
 

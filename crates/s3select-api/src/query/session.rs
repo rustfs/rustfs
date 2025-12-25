@@ -12,19 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
+use crate::query::Context;
+use crate::{QueryError, QueryResult, object_store::EcObjectStore};
 use datafusion::{
     execution::{SessionStateBuilder, context::SessionState, runtime_env::RuntimeEnvBuilder},
     parquet::data_type::AsBytes,
     prelude::SessionContext,
 };
 use object_store::{ObjectStore, memory::InMemory, path::Path};
+use std::sync::Arc;
 use tracing::error;
-
-use crate::{QueryError, QueryResult, object_store::EcObjectStore};
-
-use super::Context;
 
 #[derive(Clone)]
 pub struct SessionCtx {

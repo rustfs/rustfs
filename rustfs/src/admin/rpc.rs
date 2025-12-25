@@ -15,6 +15,7 @@
 use super::router::AdminOperation;
 use super::router::Operation;
 use super::router::S3Router;
+use crate::server::RPC_PREFIX;
 use futures::StreamExt;
 use http::StatusCode;
 use hyper::Method;
@@ -35,8 +36,6 @@ use serde_urlencoded::from_bytes;
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 use tracing::warn;
-
-pub const RPC_PREFIX: &str = "/rustfs/rpc";
 
 pub fn register_rpc_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
