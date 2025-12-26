@@ -17,9 +17,6 @@
 //! This module provides the FTPS protocol implementation for RustFS.
 //! It uses libunftp as the FTP server implementation and integrates
 //! with the RustFS gateway for S3 operations.
-//!
-//! MINIO CONSTRAINT: All FTPS operations MUST go through the gateway
-//! and MUST follow exact S3 semantics.
 
 pub mod server;
 pub mod driver;

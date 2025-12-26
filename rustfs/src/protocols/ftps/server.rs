@@ -30,9 +30,6 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 
 /// FTPS user implementation
-///
-/// This user type carries the principal information needed for
-/// authentication and authorization in the FTPS protocol.
 #[derive(Debug, Clone)]
 pub struct FtpsUser {
     /// Username for the FTP session
@@ -108,9 +105,6 @@ impl FtpsConfig {
 }
 
 /// FTPS server implementation
-///
-/// This server MUST only provide capabilities
-/// that match what an external S3 client can do.
 pub struct FtpsServer {
     /// Server configuration
     config: FtpsConfig,
@@ -123,8 +117,6 @@ impl FtpsServer {
     }
 
     /// Start the FTPS server
-    ///
-    /// MINIO CONSTRAINT: Must follow the same lifecycle management as other services
     pub async fn start(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<(), FtpsInitError> {
         info!("Starting FTPS server on {}", self.config.bind_addr);
 
@@ -193,16 +185,11 @@ impl FtpsServer {
 }
 
 /// FTPS authenticator implementation
-///
-/// MINIO CONSTRAINT: This authenticator MUST use the same authentication path
-/// as external S3 clients and MUST NOT bypass IAM system.
 #[derive(Debug, Default)]
 pub struct FtpsAuthenticator;
 
 impl FtpsAuthenticator {
     /// Create a new FTPS authenticator
-    ///
-    /// MINIO CONSTRAINT: Must use the same authentication path as external clients
     pub fn new() -> Self {
         Self
     }
@@ -211,8 +198,6 @@ impl FtpsAuthenticator {
 #[async_trait::async_trait]
 impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
     /// Authenticate FTP user
-    ///
-    /// MINIO CONSTRAINT: Must validate credentials through the same path as external clients
     async fn authenticate(&self, username: &str, creds: &libunftp::auth::Credentials) -> Result<FtpsUser, libunftp::auth::AuthenticationError> {
         use libunftp::auth::AuthenticationError;
         use rustfs_iam::get;

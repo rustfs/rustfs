@@ -13,12 +13,6 @@
 // limitations under the License.
 
 //! Session management for protocol implementations
-//!
-//! This module provides session management for all protocol implementations.
-//! It ensures that all protocols use the same session management and context.
-//!
-//! MINIO CONSTRAINT: Session management MUST be protocol-agnostic and
-//! MUST NOT bypass S3 policy enforcement.
 
 pub mod context;
 pub mod principal;

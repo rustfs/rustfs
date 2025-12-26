@@ -16,9 +16,6 @@
 //!
 //! This module provides the gateway layer that translates protocol-specific operations
 //! into S3 actions, ensuring all protocols follow the same S3 semantics.
-//!
-//! MINIO CONSTRAINT: All protocol operations MUST be translated to S3 actions
-//! and MUST go through the same authorization and error handling paths.
 
 pub mod action;
 pub mod adapter;

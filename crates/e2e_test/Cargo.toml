@@ -51,3 +51,11 @@ base64 = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 md5 = { workspace = true }
+
+ssh2 = "0.9"
+# FTP/FTPS 客户端
+suppaftp = { version = "5.3", features = ["async-std", "rustls"] }
+# 生成测试证书
+rcgen = "0.12"
+# 错误处理
+anyhow = "1.0"

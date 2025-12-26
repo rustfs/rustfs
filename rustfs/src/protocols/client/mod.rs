@@ -12,12 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Unified S3 client for protocol implementations
-//!
-//! This module provides a unified S3 client that can be used by all protocol
-//! implementations to access the storage system through S3 operations.
-//!
-//! MINIO CONSTRAINT: This client MUST only provide capabilities
-//! that match what an external S3 client can do.
-
 pub mod s3;

@@ -12,12 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Protocol implementations for RustFS
-//!
-//! This module provides protocol implementations that integrate with the core
-//! RustFS storage system. All protocols follow the same security and access
-//! control constraints as the S3 API.
-
 pub mod client;
 pub mod ftps;
 pub mod gateway;

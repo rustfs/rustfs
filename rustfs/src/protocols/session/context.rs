@@ -32,9 +32,6 @@ pub enum Protocol {
 }
 
 /// Session context for protocol operations
-///
-/// MINIO CONSTRAINT: This context MUST contain all necessary information
-/// for authorization and auditing, but MUST NOT make security decisions
 #[derive(Debug, Clone)]
 pub struct SessionContext {
     /// The protocol principal (authenticated user)
@@ -52,8 +49,6 @@ pub struct SessionContext {
 
 impl SessionContext {
     /// Create a new session context
-    ///
-    /// MINIO CONSTRAINT: Must use the same authentication path as external clients
     pub fn new(principal: ProtocolPrincipal, protocol: Protocol, source_ip: IpAddr) -> Self {
         Self {
             principal,

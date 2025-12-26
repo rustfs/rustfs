@@ -12,18 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Protocol unsupported features清单
-//!
-//! This module defines the features that are explicitly not supported
-//! by the FTP/SFTP implementations to ensure strict S3 compatibility.
-//!
-//! MINIO CONSTRAINT: Protocol implementations MUST NOT support features
-//! that cannot be mapped to exact S3 semantics.
-
 /// Unsupported FTP features list
-///
-/// MINIO CONSTRAINT: These FTP features are explicitly not supported
-/// to maintain strict S3 compatibility.
 pub const UNSUPPORTED_FTP_FEATURES: &[&str] = &[
     // Atomic rename operations (must be implemented via CopyObject+DeleteObject)
     "Atomic RNFR/RNTO rename",
@@ -49,9 +38,6 @@ pub const UNSUPPORTED_FTP_FEATURES: &[&str] = &[
 ];
 
 /// Unsupported SFTP features list
-///
-/// MINIO CONSTRAINT: These SFTP features are explicitly not supported
-/// to maintain strict S3 compatibility.
 pub const UNSUPPORTED_SFTP_FEATURES: &[&str] = &[
     // Native rename operations
     "SSH_FXP_RENAME atomic rename",
@@ -75,25 +61,16 @@ pub const UNSUPPORTED_SFTP_FEATURES: &[&str] = &[
 ];
 
 /// Check if an FTP feature is supported
-///
-/// MINIO CONSTRAINT: All protocol operations MUST be validated against
-/// supported features to ensure S3 compatibility.
 pub fn is_ftp_feature_supported(feature: &str) -> bool {
     !UNSUPPORTED_FTP_FEATURES.contains(&feature)
 }
 
 /// Check if an SFTP feature is supported
-///
-/// MINIO CONSTRAINT: All protocol operations MUST be validated against
-/// supported features to ensure S3 compatibility.
 pub fn is_sftp_feature_supported(feature: &str) -> bool {
     !UNSUPPORTED_SFTP_FEATURES.contains(&feature)
 }
 
 /// Get S3 equivalent operation for unsupported features
-///
-/// MINIO CONSTRAINT: When rejecting unsupported operations,
-/// MUST provide clear mapping to supported S3 alternatives.
 pub fn get_s3_equivalent_operation(unsupported_feature: &str) -> Option<&'static str> {
     match unsupported_feature {
         "Atomic RNFR/RNTO rename" | "SSH_FXP_RENAME atomic rename" | "Directory atomic rename" => {

@@ -16,9 +16,6 @@
 //!
 //! This module provides the FTPS driver that integrates with libunftp
 //! and translates FTP operations to S3 actions through the gateway.
-//!
-//! MINIO CONSTRAINT: This driver MUST only perform protocol parsing
-//! and delegate all operations to the gateway layer.
 
 use crate::protocols::client::s3::ProtocolS3Client;
 use crate::protocols::gateway::action::S3Action;
@@ -38,19 +35,14 @@ use tokio::io::{AsyncRead};
 use tracing::{debug, error, trace};
 
 /// FTPS storage driver implementation
-///
-/// MINIO CONSTRAINT: This driver MUST only perform protocol parsing
-/// and delegate all operations to the gateway layer.
 #[derive(Debug)]
 pub struct FtpsDriver {
-    /// Session context for this driver (optional, will be set per user)
+    /// Session context for this driver
     session_context: Option<SessionContext>,
 }
 
 impl FtpsDriver {
     /// Create a new FTPS driver
-    ///
-    /// MINIO CONSTRAINT: Must use the same authentication path as external clients
     pub fn new() -> Self {
         Self {
             session_context: None,
@@ -68,8 +60,6 @@ impl FtpsDriver {
     }
 
     /// Validate FTP feature support
-    ///
-    /// MINIO CONSTRAINT: Must reject unsupported FTP features
     fn validate_feature_support(&self, feature: &str) -> Result<()> {
         if !is_ftp_feature_supported(feature) {
             let error_msg = if let Some(s3_equivalent) = get_s3_equivalent_operation(feature) {
@@ -123,8 +113,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     type Metadata = FtpsMetadata;
 
     /// Get file metadata
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 HeadObject operation
     async fn metadata<P: AsRef<Path> + Send + Debug>(
         &self,
         user: &super::server::FtpsUser,
@@ -235,8 +223,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Get directory listing
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 ListObjects operation
     async fn list<P: AsRef<Path> + Send + Debug>(
         &self,
         user: &super::server::FtpsUser,
@@ -333,8 +319,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Get file
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 GetObject operation
     async fn get<P: AsRef<Path> + Send + Debug>(
         &self,
         user: &super::server::FtpsUser,
@@ -401,8 +385,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Put file
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 PutObject operation
     async fn put<P: AsRef<Path> + Send + Debug, R: AsyncRead + Send + Sync + Unpin + 'static>(
         &self,
         user: &super::server::FtpsUser,
@@ -474,8 +456,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Delete file
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 DeleteObject operation
     async fn del<P: AsRef<Path> + Send + Debug>(
         &self,
         user: &super::server::FtpsUser,
@@ -529,8 +509,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Create directory
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 PutObject operation with directory marker
     async fn mkd<P: AsRef<Path> + Send + Debug>(
         &self,
         user: &super::server::FtpsUser,
@@ -590,8 +568,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Rename file or directory
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 CopyObject + DeleteObject operations
     async fn rename<P: AsRef<Path> + Send + Debug>(
         &self,
         user: &super::server::FtpsUser,
@@ -695,8 +671,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Remove directory
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 DeleteObject operation for directory marker
     async fn rmd<P: AsRef<Path> + Send + Debug>(
         &self,
         user: &super::server::FtpsUser,
@@ -754,8 +728,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Change working directory
-    ///
-    /// MINIO CONSTRAINT: This is a no-op since S3 doesn't have directories
     async fn cwd<P: AsRef<Path> + Send + Debug>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         trace!("FTPS cwd request for path: {:?}", path);
 
@@ -787,8 +759,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
 }
 
 /// FTPS metadata implementation
-///
-/// MINIO CONSTRAINT: Must map S3 object metadata to FTP metadata
 #[derive(Debug, Clone)]
 pub struct FtpsMetadata {
     /// File size in bytes
@@ -822,7 +792,7 @@ impl Metadata for FtpsMetadata {
 
     /// Check if file is a symbolic link (stub implementation)
     ///
-    /// MINIO CONSTRAINT: S3 doesn't support symbolic links
+    /// S3 doesn't support symbolic links
     fn is_symlink(&self) -> bool {
         false
     }

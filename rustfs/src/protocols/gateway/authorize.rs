@@ -12,15 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Authorization for protocol gateway
-//!
-//! This module provides unified authorization for all protocol implementations.
-//! It ensures that all protocols use the same IAM system and policy enforcement
-//! as the S3 API.
-//!
-//! MINIO CONSTRAINT: All protocol access control MUST use the same authentication path
-//! as external clients and MUST NOT bypass S3 policy enforcement.
-
 use super::action::S3Action;
 use super::adapter::is_operation_supported;
 use crate::protocols::session::context::SessionContext;
@@ -29,8 +20,6 @@ use rustfs_policy::policy::Args;
 use std::collections::HashMap;
 
 /// Check if a principal is allowed to perform an S3 action
-///
-/// MINIO CONSTRAINT: Must use the same policy enforcement as external clients
 pub async fn is_authorized(session_context: &SessionContext, action: &S3Action, bucket: &str, object: Option<&str>) -> bool {
     let iam_sys = match get() {
         Ok(sys) => sys,
@@ -58,8 +47,6 @@ pub async fn is_authorized(session_context: &SessionContext, action: &S3Action, 
 }
 
 /// Unified authorization entry point for all protocols
-///
-/// MINIO CONSTRAINT: This is the single authorization entry point for all protocols
 pub async fn authorize_operation(
     session_context: &SessionContext,
     action: &S3Action,
@@ -67,7 +54,6 @@ pub async fn authorize_operation(
     object: Option<&str>,
 ) -> Result<(), AuthorizationError> {
     // First check if the operation is supported
-    // This is where protocol-specific limitations would be enforced
     if !is_operation_supported(session_context.protocol.clone(), action) {
         return Err(AuthorizationError::AccessDenied);
     }
@@ -81,8 +67,6 @@ pub async fn authorize_operation(
 }
 
 /// Authorization errors
-///
-/// MINIO CONSTRAINT: Must use S3-compatible error codes
 #[derive(Debug, thiserror::Error)]
 pub enum AuthorizationError {
     #[error("Access denied")]

@@ -165,7 +165,7 @@ impl RustFSTestEnvironment {
     }
 
     /// Find an available port for the test
-    async fn find_available_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn find_available_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();

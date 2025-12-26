@@ -65,9 +65,6 @@ struct SftpHandlerInner {
 }
 
 /// SFTP handler implementation
-///
-/// MINIO CONSTRAINT: This handler MUST only perform protocol parsing
-/// and delegate all operations to the gateway layer.
 #[derive(Debug, Clone)]
 pub struct SftpHandler {
     inner: Arc<RwLock<SftpHandlerInner>>,
@@ -75,8 +72,6 @@ pub struct SftpHandler {
 
 impl SftpHandler {
     /// Create a new SFTP handler
-    ///
-    /// MINIO CONSTRAINT: Must use the same authentication path as external clients
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(SftpHandlerInner {
@@ -88,8 +83,6 @@ impl SftpHandler {
     }
 
     /// Set session context
-    ///
-    /// MINIO CONSTRAINT: Must use the same authentication path as external clients
     pub fn set_session_context(&mut self, context: SftpSessionContext) {
         if let Ok(mut inner) = self.inner.write() {
             inner.session_context = Some(context);
@@ -99,8 +92,6 @@ impl SftpHandler {
     }
 
     /// Get session context
-    ///
-    /// MINIO CONSTRAINT: Must validate session before operations
     fn get_session_context(&self) -> Result<SftpSessionContext, StatusCode> {
         let inner = self.inner.read().map_err(|_| StatusCode::Failure)?;
         inner.session_context.clone().ok_or(StatusCode::PermissionDenied)
@@ -195,8 +186,6 @@ impl Handler for SftpHandler {
     }
 
     /// Handle version negotiation
-    ///
-    /// MINIO CONSTRAINT: Must support standard SFTP versions
     fn init(
         &mut self,
         version: u32,
@@ -209,8 +198,6 @@ impl Handler for SftpHandler {
     }
 
     /// Handle file open request
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 GetObject/PutObject operations
     fn open(
         &mut self,
         id: u32,
@@ -232,8 +219,6 @@ impl Handler for SftpHandler {
     }
 
     /// Handle file close request
-    ///
-    /// MINIO CONSTRAINT: Must properly clean up resources
     fn close(&mut self, id: u32, handle: String) -> impl Future<Output = Result<Status, Self::Error>> + Send {
         let this = self.clone();
         Box::pin(async move {
@@ -252,8 +237,6 @@ impl Handler for SftpHandler {
     }
 
     /// Handle file read request
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 GetObject operation
     fn read(
         &mut self,
         id: u32,
@@ -657,8 +640,6 @@ impl Handler for SftpHandler {
     }
 
     /// Handle file remove request
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 DeleteObject operation
     fn remove(
         &mut self,
         id: u32,
@@ -720,8 +701,6 @@ impl Handler for SftpHandler {
     }
 
     /// Handle directory creation request
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 PutObject operation with directory marker
     fn mkdir(&mut self, id: u32, path: String, attrs: FileAttributes) -> impl Future<Output = Result<Status, Self::Error>> + Send {
         let this = self.clone();
 
@@ -788,8 +767,6 @@ impl Handler for SftpHandler {
     }
 
     /// Handle directory removal request
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 DeleteObject operation for directory marker
     fn rmdir(&mut self, id: u32, path: String) -> impl Future<Output = Result<Status, Self::Error>> + Send {
         let this = self.clone();
 
@@ -852,8 +829,6 @@ impl Handler for SftpHandler {
     }
 
     /// Handle realpath request
-    ///
-    /// MINIO CONSTRAINT: Must return canonicalized path
     fn realpath(
         &mut self,
         id: u32,
@@ -874,8 +849,6 @@ impl Handler for SftpHandler {
     }
 
     /// Handle file stat request
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 HeadObject operation
     fn stat(
         &mut self,
         id: u32,
@@ -890,7 +863,7 @@ impl Handler for SftpHandler {
 
     /// Handle file rename request
     ///
-    /// MINIO CONSTRAINT: Must map to S3 CopyObject + DeleteObject operations
+    /// map to S3 CopyObject + DeleteObject operations
     fn rename(&mut self, id: u32, oldpath: String, newpath: String) -> impl Future<Output = Result<Status, Self::Error>> + Send {
         trace!("SFTP rename request from: {} to: {}", oldpath, newpath);
         let this = self.clone();
@@ -1000,7 +973,7 @@ impl Handler for SftpHandler {
 
     /// Handle read symbolic link request
     ///
-    /// MINIO CONSTRAINT: Symbolic links are not supported in S3
+    /// Symbolic links are not supported in S3
     fn readlink(
         &mut self,
         _id: u32,
@@ -1018,8 +991,6 @@ impl Handler for SftpHandler {
     }
 
     /// Handle symbolic link request
-    ///
-    /// MINIO CONSTRAINT: Symbolic links are not supported in S3
     fn symlink(
         &mut self,
         _id: u32,

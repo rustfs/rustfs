@@ -12,19 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! S3 actions for protocol gateway
-//!
-//! This module defines all S3 actions that can be performed through the gateway.
-//! All protocol operations must be mapped to these S3 actions.
-//!
-//! MINIO CONSTRAINT: This is the single source of truth for all S3 actions
-//! that can be performed through any protocol.
-
 use rustfs_policy::policy::action::S3Action as PolicyS3Action;
 
 /// S3 actions that can be performed through the gateway
-///
-/// MINIO CONSTRAINT: All protocol operations MUST be mapped to these actions
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum S3Action {
     // Bucket operations
@@ -47,7 +37,7 @@ pub enum S3Action {
     ListMultipartUploads,
     ListParts,
 
-    // ACL operations
+    // TODO :ACL operations
     GetBucketAcl,
     PutBucketAcl,
     GetObjectAcl,

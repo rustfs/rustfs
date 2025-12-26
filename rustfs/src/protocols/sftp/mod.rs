@@ -17,9 +17,6 @@
 //! This module provides the SFTP protocol implementation for RustFS.
 //! It uses russh and russh-sftp as the SFTP server implementation and integrates
 //! with the RustFS gateway for S3 operations.
-//!
-//! MINIO CONSTRAINT: All SFTP operations MUST go through the gateway
-//! and MUST follow exact S3 semantics.
 
 pub mod server;
 pub mod handler;

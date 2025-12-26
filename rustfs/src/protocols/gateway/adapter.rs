@@ -13,19 +13,11 @@
 // limitations under the License.
 
 //! Protocol to S3 action adapter
-//!
-//! This module provides functionality to translate protocol-specific operations
-//! into S3 actions, ensuring all protocols follow the same S3 semantics.
-//!
-//! MINIO CONSTRAINT: All protocol operations MUST be translated to S3 actions
-//! and MUST follow exact S3 semantics.
 
 use super::action::S3Action;
 use crate::protocols::session::context::Protocol;
 
 /// Translate FTP commands to S3 actions
-///
-/// MINIO CONSTRAINT: FTP operations MUST be mapped to equivalent S3 actions
 pub fn ftp_command_to_s3_action(command: &str, args: &[&str]) -> Option<S3Action> {
     match command.to_uppercase().as_str() {
         // File operations
@@ -51,8 +43,6 @@ pub fn ftp_command_to_s3_action(command: &str, args: &[&str]) -> Option<S3Action
 }
 
 /// Translate SFTP operations to S3 actions
-///
-/// MINIO CONSTRAINT: SFTP operations MUST be mapped to equivalent S3 actions
 pub fn sftp_operation_to_s3_action(operation: &str, path: &str) -> Option<S3Action> {
     match operation {
         // File operations
@@ -79,8 +69,6 @@ pub fn sftp_operation_to_s3_action(operation: &str, path: &str) -> Option<S3Acti
 }
 
 /// Check if an operation is supported for the given protocol
-///
-/// MINIO CONSTRAINT: Operations MUST be validated against protocol capabilities
 pub fn is_operation_supported(protocol: Protocol, action: &S3Action) -> bool {
     match protocol {
         Protocol::Ftp | Protocol::Ftps => {

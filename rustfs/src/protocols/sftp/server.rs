@@ -16,16 +16,11 @@
 //!
 //! This module provides the SFTP server implementation using russh.
 //! It integrates with the RustFS authentication and storage systems.
-//!
-//! MINIO CONSTRAINT: This server MUST only provide capabilities
-//! that match what an external S3 client can do.
 
 use crate::protocols::session::context::{SessionContext, Protocol as SessionProtocol};
-// 引入必要的 Trait 以确保编译器能识别 OsRng 的实现
 use rand::{RngCore, CryptoRng};
 use rand::rngs::OsRng;
 use russh::server::{Auth, Server as RusshServer, Session};
-// MethodSet is private, using the available authentication methods directly
 use russh::ChannelId;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -59,8 +54,6 @@ pub struct SftpServer {
 
 impl SftpServer {
     /// Create a new SFTP server
-    ///
-    /// MINIO CONSTRAINT: Must use the same capabilities as external S3 clients
     pub fn new(config: SftpConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Load SSH key pair
         let key_pair = if let Some(key_file) = &config.key_file {
@@ -68,8 +61,6 @@ impl SftpServer {
                 .map_err(|e| format!("Failed to load SSH key: {}", e))?
         } else {
             // Generate a temporary key for development
-            // 修复：显式实例化 OsRng::default() 并传入可变引用
-            // 注意：如果此处仍报错，请检查 Cargo.toml 中 rand 版本是否为 0.8+
             let mut rng = OsRng::default();
             russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)
                 .map_err(|e| format!("Failed to generate SSH key: {}", e))?
@@ -82,8 +73,6 @@ impl SftpServer {
     }
 
     /// Start the SFTP server
-    ///
-    /// MINIO CONSTRAINT: Must follow the same lifecycle management as other services
     pub async fn start(&self, shutdown_rx: broadcast::Receiver<()>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting SFTP server on {}", self.config.bind_addr);
 
