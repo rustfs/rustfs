@@ -26,9 +26,7 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::{
-        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
-    };
+    use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
     use serial_test::serial;
     use tracing::info;
 
@@ -77,12 +75,8 @@ mod tests {
         init_logging();
         info!("🧪 TEST: PutObject returns version_id with versioning enabled");
 
-        let mut env = RustFSTestEnvironment::new()
-            .await
-            .expect("Failed to create test environment");
-        env.start_rustfs_server(vec![])
-            .await
-            .expect("Failed to start RustFS");
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
         let client = create_s3_client(&env);
         let bucket = "test-put-version-id";
@@ -125,12 +119,8 @@ mod tests {
         init_logging();
         info!("🧪 TEST: CopyObject returns version_id with versioning enabled");
 
-        let mut env = RustFSTestEnvironment::new()
-            .await
-            .expect("Failed to create test environment");
-        env.start_rustfs_server(vec![])
-            .await
-            .expect("Failed to start RustFS");
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
         let client = create_s3_client(&env);
         let bucket = "test-copy-version-id";
@@ -184,12 +174,8 @@ mod tests {
         init_logging();
         info!("🧪 TEST: CompleteMultipartUpload returns version_id with versioning enabled");
 
-        let mut env = RustFSTestEnvironment::new()
-            .await
-            .expect("Failed to create test environment");
-        env.start_rustfs_server(vec![])
-            .await
-            .expect("Failed to start RustFS");
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
         let client = create_s3_client(&env);
         let bucket = "test-multipart-version-id";
@@ -225,14 +211,9 @@ mod tests {
 
         let etag = upload_part_result.e_tag().expect("No etag returned").to_string();
 
-        let completed_part = CompletedPart::builder()
-            .part_number(1)
-            .e_tag(etag)
-            .build();
+        let completed_part = CompletedPart::builder().part_number(1).e_tag(etag).build();
 
-        let completed_upload = CompletedMultipartUpload::builder()
-            .parts(completed_part)
-            .build();
+        let completed_upload = CompletedMultipartUpload::builder().parts(completed_part).build();
 
         info!("📤 Completing multipart upload");
         let complete_result = client
@@ -244,11 +225,7 @@ mod tests {
             .send()
             .await;
 
-        assert!(
-            complete_result.is_ok(),
-            "CompleteMultipartUpload failed: {:?}",
-            complete_result.err()
-        );
+        assert!(complete_result.is_ok(), "CompleteMultipartUpload failed: {:?}", complete_result.err());
         let output = complete_result.unwrap();
 
         info!("📥 CompleteMultipartUpload response - version_id: {:?}", output.version_id);
@@ -272,12 +249,8 @@ mod tests {
         init_logging();
         info!("🧪 TEST: PutObject behavior without versioning (no regression)");
 
-        let mut env = RustFSTestEnvironment::new()
-            .await
-            .expect("Failed to create test environment");
-        env.start_rustfs_server(vec![])
-            .await
-            .expect("Failed to start RustFS");
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
         let client = create_s3_client(&env);
         let bucket = "test-no-versioning";
@@ -312,12 +285,8 @@ mod tests {
         init_logging();
         info!("🧪 TEST: Basic S3 operations work correctly (no regression)");
 
-        let mut env = RustFSTestEnvironment::new()
-            .await
-            .expect("Failed to create test environment");
-        env.start_rustfs_server(vec![])
-            .await
-            .expect("Failed to start RustFS");
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
         let client = create_s3_client(&env);
         let bucket = "test-basic-operations";
@@ -358,10 +327,7 @@ mod tests {
         assert!(list_result.is_ok(), "LIST operation failed");
         let list_output = list_result.unwrap();
         let objects = list_output.contents();
-        assert!(
-            objects.iter().any(|obj| obj.key() == Some(key)),
-            "Object not found in LIST"
-        );
+        assert!(objects.iter().any(|obj| obj.key() == Some(key)), "Object not found in LIST");
 
         // Test DELETE
         info!("🗑️  Testing DELETE operation");
@@ -386,12 +352,8 @@ mod tests {
         init_logging();
         info!("🧪 TEST: Veeam VBR backup workflow simulation (Issue #1066)");
 
-        let mut env = RustFSTestEnvironment::new()
-            .await
-            .expect("Failed to create test environment");
-        env.start_rustfs_server(vec![])
-            .await
-            .expect("Failed to start RustFS");
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
 
         let client = create_s3_client(&env);
         let bucket = "veeam-backup-test";
@@ -421,11 +383,7 @@ mod tests {
             let output = put_result.unwrap();
 
             info!("📥 Response version_id: {:?}", output.version_id);
-            assert!(
-                output.version_id.is_some(),
-                "❌ FAILED: Veeam expects version_id for path: {}",
-                path
-            );
+            assert!(output.version_id.is_some(), "❌ FAILED: Veeam expects version_id for path: {}", path);
             assert!(
                 !output.version_id.as_ref().unwrap().is_empty(),
                 "❌ FAILED: version_id should not be empty for path: {}",
