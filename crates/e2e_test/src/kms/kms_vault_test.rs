@@ -461,3 +461,129 @@ async fn test_vault_kms_key_crud(
     info!("Vault KMS key CRUD operations completed successfully");
     Ok(())
 }
+
+/// Test uploading a large file (triggering multipart) with checksums using Vault KMS.
+/// This reproduces issue #1233 where decrypt was not implemented.
+#[tokio::test]
+#[serial]
+async fn test_vault_large_file_upload_with_checksum() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    info!("Starting Vault KMS Large File Upload Test (Issue #1233)");
+
+    let context = VaultKmsTestContext::new().await?;
+    let s3_client = context.s3_client();
+
+    context
+        .base_env()
+        .create_test_bucket(TEST_BUCKET)
+        .await
+        .expect("Failed to create test bucket");
+
+    // Enable default encryption on the bucket to ensure KMS is used
+    let _ = s3_client
+        .put_bucket_encryption()
+        .bucket(TEST_BUCKET)
+        .server_side_encryption_configuration(
+            aws_sdk_s3::types::ServerSideEncryptionConfiguration::builder()
+                .rules(
+                    aws_sdk_s3::types::ServerSideEncryptionRule::builder()
+                        .apply_server_side_encryption_by_default(
+                            aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
+                                .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::Aes256)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await?;
+
+    // Create a 17MB file (just over the default multipart threshold if it were lower,
+    // but here we force multipart or just rely on size.
+    // The issue report said 17MB triggers it.
+    let size = 17 * 1024 * 1024;
+    let data = vec![0u8; size];
+    let key = "large-file-17mb";
+
+    info!("Uploading 17MB file with checksum...");
+
+    // We use high-level upload_part or just put_object if the client handles it.
+    // However, to strictly reproduce "multipart upload", we should use multipart API explicitly
+    // or rely on the client's auto-multipart. aws-sdk-s3 doesn't auto-multipart on put_object.
+    // But the issue mentioned `mc cp` which does.
+    // Here we will manually do a multipart upload to ensure we hit the code path.
+
+    let create_multipart = s3_client
+        .create_multipart_upload()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+        .send()
+        .await?;
+
+    let upload_id = create_multipart.upload_id().unwrap();
+
+    // Upload part 1 (10MB)
+    let part1_data = &data[0..10 * 1024 * 1024];
+    let part1 = s3_client
+        .upload_part()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(aws_sdk_s3::primitives::ByteStream::from(part1_data.to_vec()))
+        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+        .send()
+        .await?;
+
+    // Upload part 2 (7MB)
+    let part2_data = &data[10 * 1024 * 1024..];
+    let part2 = s3_client
+        .upload_part()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(2)
+        .body(aws_sdk_s3::primitives::ByteStream::from(part2_data.to_vec()))
+        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+        .send()
+        .await?;
+
+    // Complete multipart
+    s3_client
+        .complete_multipart_upload()
+        .bucket(TEST_BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part1.e_tag().unwrap())
+                        .checksum_sha256(part1.checksum_sha256().unwrap())
+                        .build(),
+                )
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(2)
+                        .e_tag(part2.e_tag().unwrap())
+                        .checksum_sha256(part2.checksum_sha256().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await?;
+
+    info!("✅ Successfully uploaded 17MB file with checksums using Vault KMS");
+
+    // Verify download
+    let get = s3_client.get_object().bucket(TEST_BUCKET).key(key).send().await?;
+    let downloaded_data = get.body.collect().await?.into_bytes();
+    assert_eq!(downloaded_data.len(), size);
+
+    Ok(())
+}

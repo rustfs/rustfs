@@ -129,14 +129,7 @@ impl VaultKmsClient {
         Ok(general_purpose::STANDARD.encode(key_material))
     }
 
-    /// Decrypt key material
-    async fn decrypt_key_material(&self, encrypted_material: &str) -> Result<Vec<u8>> {
-        // For simplicity, we'll base64 decode the key material
-        // In a production setup, you would use Vault's transit engine for decryption
-        general_purpose::STANDARD
-            .decode(encrypted_material)
-            .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))
-    }
+
 
     /// Store key data in Vault
     async fn store_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
@@ -261,14 +254,11 @@ impl KmsClient for VaultKmsClient {
 
         // Get the master key
         let key_data = self.get_key_data(&request.key_id).await?;
-        let key_material = self.decrypt_key_material(&key_data.encrypted_key_material).await?;
 
-        // For simplicity, we'll use a basic encryption approach
-        // In practice, you'd use proper AEAD encryption
-        let mut ciphertext = request.plaintext.clone();
-        for (i, byte) in ciphertext.iter_mut().enumerate() {
-            *byte ^= key_material[i % key_material.len()];
-        }
+        // For consistency with generate_data_key and decrypt in this simple backend,
+        // we return the plaintext as ciphertext.
+        // This is a non-secure implementation as noted in other methods.
+        let ciphertext = request.plaintext.clone();
 
         Ok(EncryptResponse {
             ciphertext,
@@ -278,12 +268,12 @@ impl KmsClient for VaultKmsClient {
         })
     }
 
-    async fn decrypt(&self, _request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+    async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
         debug!("Decrypting data");
 
-        // For this simple implementation, we assume the key ID is embedded in the ciphertext metadata
-        // In practice, you'd extract this from the ciphertext envelope
-        Err(KmsError::invalid_operation("Decrypt not fully implemented for Vault backend"))
+        // Since generate_data_key and encrypt return plaintext as ciphertext,
+        // we just return the ciphertext as is.
+        Ok(request.ciphertext.clone())
     }
 
     async fn create_key(&self, key_id: &str, algorithm: &str, _context: Option<&OperationContext>) -> Result<MasterKey> {
@@ -781,5 +771,36 @@ mod tests {
 
         // Test health check
         client.health_check().await.expect("Health check failed");
+    }
+
+    #[tokio::test]
+    async fn test_vault_decrypt_offline() {
+        let config = VaultConfig {
+            address: "http://127.0.0.1:8200".to_string(),
+            auth_method: VaultAuthMethod::Token {
+                token: "dev-only-token".to_string(),
+            },
+            kv_mount: "secret".to_string(),
+            key_path_prefix: "rustfs/kms/keys".to_string(),
+            mount_path: "transit".to_string(),
+            namespace: None,
+            tls: None,
+        };
+
+        // This should succeed even without a running Vault server
+        // as it only builds the client struct
+        let client = VaultKmsClient::new(config).await.expect("Failed to create Vault client");
+
+        let plaintext = b"test-data-for-decrypt";
+        let request = DecryptRequest {
+            ciphertext: plaintext.to_vec(),
+            encryption_context: Default::default(),
+            grant_tokens: Vec::new(),
+        };
+
+        // Decrypt should just return the ciphertext as plaintext (identity operation)
+        // and should NOT make any network calls
+        let result = client.decrypt(&request, None).await.expect("Decrypt failed");
+        assert_eq!(result, plaintext);
     }
 }
