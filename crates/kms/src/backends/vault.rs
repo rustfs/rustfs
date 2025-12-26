@@ -129,8 +129,6 @@ impl VaultKmsClient {
         Ok(general_purpose::STANDARD.encode(key_material))
     }
 
-
-
     /// Store key data in Vault
     async fn store_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
         let path = self.key_path(key_id);
