@@ -83,6 +83,7 @@ use rustfs_ecstore::{
         StorageAPI,
         // RESERVED_METADATA_PREFIX,
     },
+    store_utils::extract_user_defined_metadata_keys,
 };
 use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
 use rustfs_filemeta::{ObjectPartInfo, RestoreStatusOps};
@@ -813,6 +814,8 @@ impl S3 for FS {
             sse_customer_algorithm,
             sse_customer_key,
             sse_customer_key_md5,
+            metadata_directive,
+            metadata,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -1001,7 +1004,6 @@ impl S3 for FS {
         src_info.put_object_reader = Some(PutObjReader::new(reader));
 
         // check quota
-        // TODO: src metadata
 
         for (k, v) in compress_metadata {
             src_info.user_defined.insert(k, v);
@@ -1020,7 +1022,15 @@ impl S3 for FS {
                 .insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
         }
 
-        // TODO: src tags
+        if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
+            let src_user_defined = extract_user_defined_metadata_keys(&src_info.user_defined);
+            src_user_defined.keys().for_each(|k| {
+                src_info.user_defined.remove(k);
+            });
+            if let Some(metadata) = metadata {
+                src_info.user_defined.extend(metadata);
+            }
+        }
 
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
