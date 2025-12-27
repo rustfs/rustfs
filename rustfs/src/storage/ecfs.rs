@@ -2806,6 +2806,29 @@ impl S3 for FS {
         }
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
+        if matches!(delimiter.as_deref(), Some("/")) {
+            if let Some(query) = req.uri.query() {
+                let has_allow_unordered = query.split('&').any(|param| {
+                    if let Some((key, value)) = param.split_once('=') {
+                        let decoded_key = urlencoding::decode(key).unwrap_or_else(|_| key.into());
+                        let decoded_value = urlencoding::decode(value).unwrap_or_else(|_| value.into());
+                        decoded_key.trim() == "allow-unordered"
+                            && decoded_value.trim() == "true"
+                    } else {
+                        false
+                    }
+                });
+
+                if has_allow_unordered {
+                    println!("has_allow_unordered");
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "allow-unordered cannot be used with delimiter".to_string(),
+                    ));
+                }
+            }
+        }
+
         let start_after = start_after.filter(|v| !v.is_empty());
 
         let continuation_token = continuation_token.filter(|v| !v.is_empty());
