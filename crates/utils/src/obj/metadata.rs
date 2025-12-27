@@ -32,7 +32,7 @@ use std::collections::HashMap;
 ///
 /// # Returns
 /// A new HashMap containing only user-defined metadata entries. Keys that use
-/// /// the user-metadata prefix (for example `x-amz-meta-`) are returned with that
+/// the user-metadata prefix (for example `x-amz-meta-`) are returned with that
 /// prefix stripped.
 ///
 /// Note: The keys in the returned map may therefore differ from the keys in
