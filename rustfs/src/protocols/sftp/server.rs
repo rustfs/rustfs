@@ -12,58 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! SFTP server implementation
-//!
-//! This module provides the SFTP server implementation using russh.
-//! It integrates with the RustFS authentication and storage systems.
-
+use crate::protocols::sftp::handler::SftpHandler;
 use crate::protocols::session::context::{SessionContext, Protocol as SessionProtocol};
-use rand::{RngCore, CryptoRng};
-use rand::rngs::OsRng;
-use russh::server::{Auth, Server as RusshServer, Session};
-use russh::ChannelId;
+use crate::protocols::session::principal::ProtocolPrincipal;
+use russh::{ChannelId};
+use russh::server::{Auth, Handler, Server as RusshServer, Session};
+use russh::keys::PrivateKey;
+use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::broadcast;
-use tracing::{debug, error, info};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+
+// Define a common error type for the server handler
+type ServerError = Box<dyn std::error::Error + Send + Sync>;
 
 /// SFTP server configuration
 #[derive(Debug, Clone)]
 pub struct SftpConfig {
-    /// Server bind address
     pub bind_addr: SocketAddr,
-    /// Whether to require key-based authentication
     pub require_key_auth: bool,
-    /// Certificate file path
     pub cert_file: Option<String>,
-    /// Private key file path
     pub key_file: Option<String>,
 }
 
-/// SFTP server implementation
-///
-/// MINIO CONSTRAINT: This server MUST only provide capabilities
-/// that match what an external S3 client can do.
+/// The main Server entry point
 #[derive(Clone)]
 pub struct SftpServer {
-    /// Server configuration
     config: SftpConfig,
-    /// SSH key pair
-    key_pair: Arc<russh::keys::PrivateKey>,
+    key_pair: Arc<PrivateKey>,
 }
 
 impl SftpServer {
-    /// Create a new SFTP server
-    pub fn new(config: SftpConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Load SSH key pair
+    pub fn new(config: SftpConfig) -> Result<Self, ServerError> {
+        // Load or generate key
         let key_pair = if let Some(key_file) = &config.key_file {
-            russh::keys::load_secret_key(key_file, None)
-                .map_err(|e| format!("Failed to load SSH key: {}", e))?
+            let path = std::path::Path::new(key_file);
+            russh::keys::load_secret_key(path, None)?
         } else {
-            // Generate a temporary key for development
-            let mut rng = OsRng::default();
-            russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)
-                .map_err(|e| format!("Failed to generate SSH key: {}", e))?
+            warn!("No host key provided for SFTP, generating random key.");
+            let mut rng = rand::rngs::OsRng;
+            PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)?
         };
 
         Ok(Self {
@@ -72,256 +62,261 @@ impl SftpServer {
         })
     }
 
-    /// Start the SFTP server
-    pub async fn start(&self, shutdown_rx: broadcast::Receiver<()>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start(&self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) -> Result<(), ServerError> {
         info!("Starting SFTP server on {}", self.config.bind_addr);
 
         let config = Arc::new(self.make_ssh_config());
-        let mut shutdown_rx = shutdown_rx;
+        let socket = tokio::net::TcpListener::bind(&self.config.bind_addr).await?;
+        let server_stub = self.clone();
 
-        // Clone self for use in async block
-        let server_clone = self.clone();
-
-        // Start server in background task
-        let server_handle = tokio::spawn(async move {
-            let socket = match tokio::net::TcpListener::bind(&server_clone.config.bind_addr).await {
-                Ok(socket) => socket,
-                Err(e) => {
-                    error!("Failed to bind to {}: {}", server_clone.config.bind_addr, e);
-                    return;
-                }
-            };
-
-            loop {
-                let (stream, addr) = match socket.accept().await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        error!("Failed to accept connection: {}", e);
-                        continue;
-                    }
-                };
-
-                let config = config.clone();
-                let mut server_instance = server_clone.clone();
-
-                tokio::spawn(async move {
-                    if let Err(e) = server_instance.handle_connection(stream, config).await {
-                        error!("Error handling connection from {}: {}", addr, e);
-                    }
-                });
-            }
-        });
-
-        // Wait for either server completion or shutdown signal
-        tokio::select! {
-            result = server_handle => {
-                match result {
-                    Ok(()) => {
-                        info!("SFTP server stopped normally");
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("SFTP server task error: {}", e);
-                        Err(Box::new(e))
+        loop {
+            tokio::select! {
+                accept_res = socket.accept() => {
+                    match accept_res {
+                        Ok((stream, addr)) => {
+                            let config = config.clone();
+                            tokio::spawn(async move {
+                                let handler = SftpConnectionHandler::new(addr);
+                                if let Err(e) = russh::server::run_stream(config, stream, handler).await {
+                                    debug!("SFTP session closed from {}: {}", addr, e);
+                                }
+                            });
+                        }
+                        Err(e) => error!("Failed to accept SFTP connection: {}", e),
                     }
                 }
-            }
-            _ = shutdown_rx.recv() => {
-                info!("SFTP server shutdown requested");
-                Ok(())
+                _ = shutdown_rx.recv() => {
+                    info!("SFTP server shutting down");
+                    break;
+                }
             }
         }
-    }
-
-    /// Handle incoming connection
-    async fn handle_connection(
-        &mut self,
-        stream: tokio::net::TcpStream,
-        config: Arc<russh::server::Config>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let session = russh::server::run_stream(config, stream, self.new_client(None)).await
-            .map_err(|e| format!("Failed to run SSH session: {}", e))?;
-
-        session.await
-            .map_err(|e| format!("SSH session error: {}", e))?;
-
         Ok(())
     }
 
-    /// Create SSH configuration
     fn make_ssh_config(&self) -> russh::server::Config {
         let mut config = russh::server::Config::default();
         config.keys.push(self.key_pair.as_ref().clone());
+        // config.connection_timeout removed as it's not a direct field in recent russh Config
+        // or requires specific Duration type handling not standard in Config struct init.
+        // Default keep-alive settings are usually sufficient.
         config
     }
 
-    /// Get server configuration
     pub fn config(&self) -> &SftpConfig {
         &self.config
     }
 }
 
-/// SFTP session handler
-// 修改：添加 pub 关键字，使其成为公共类型，以满足 trait 接口要求
-#[derive(Clone)]
-pub struct SftpHandlerImpl {
-    // Authentication state
-    authenticated: bool,
-    // User identity
-    user_identity: Option<rustfs_policy::auth::UserIdentity>,
-    // Session context
-    session_context: Option<SessionContext>,
+// Implement the factory trait for russh
+impl RusshServer for SftpServer {
+    type Handler = SftpConnectionHandler;
+
+    fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
+        let addr = peer_addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+        SftpConnectionHandler::new(addr)
+    }
 }
 
-impl SftpHandlerImpl {
-    /// Create a new SFTP handler
-    fn new() -> Self {
+/// Shared state for a single SSH connection
+struct ConnectionState {
+    client_ip: SocketAddr,
+    identity: Option<rustfs_policy::auth::UserIdentity>,
+    /// Map ChannelId to a sender. When we receive SSH data, we send it into this channel,
+    /// which pipes it to the SFTP subsystem.
+    sftp_channels: HashMap<ChannelId, mpsc::UnboundedSender<Vec<u8>>>,
+}
+
+/// The Handler for a single SSH connection
+#[derive(Clone)]
+pub struct SftpConnectionHandler {
+    state: Arc<Mutex<ConnectionState>>,
+}
+
+impl SftpConnectionHandler {
+    fn new(client_ip: SocketAddr) -> Self {
         Self {
-            authenticated: false,
-            user_identity: None,
-            session_context: None,
+            state: Arc::new(Mutex::new(ConnectionState {
+                client_ip,
+                identity: None,
+                sftp_channels: HashMap::new(),
+            })),
         }
     }
 }
 
-impl russh::server::Server for SftpServer {
-    type Handler = SftpHandlerImpl;
+impl Handler for SftpConnectionHandler {
+    type Error = ServerError;
 
-    fn new_client(&mut self, _peer_addr: Option<std::net::SocketAddr>) -> Self::Handler {
-        SftpHandlerImpl::new()
-    }
-}
-
-#[async_trait::async_trait]
-impl russh::server::Handler for SftpHandlerImpl {
-    type Error = Box<dyn std::error::Error + Send + Sync>;
-
-    /// Handle authentication request
     fn auth_password(&mut self, user: &str, password: &str) -> impl Future<Output = Result<Auth, Self::Error>> + Send {
         let user = user.to_string();
         let password = password.to_string();
-        let mut self_clone = self.clone();
+        let state = self.state.clone();
 
-        Box::pin(async move {
+        async move {
             use rustfs_iam::get;
             use rustfs_policy::auth::Credentials as S3Credentials;
 
-            debug!("SFTP password authentication request for user: {}", user);
+            debug!("SFTP password auth request: {}", user);
 
-            // Get IAM system
-            let iam_sys = get().map_err(|e| {
-                error!("Failed to get IAM system: {}", e);
-                libunftp::auth::AuthenticationError::ImplPropagated("IAM system not available".to_string(), Some(Box::new(e)))
-            })?;
+            let iam_sys = get().map_err(|e| format!("IAM system unavailable: {}", e))?;
 
-            // Create S3 credentials from SFTP credentials
+            // Prepare S3 Credentials check
             let s3_creds = S3Credentials {
-                access_key: user.to_string(),
-                secret_key: password.to_string(),
-                session_token: String::new(),
-                expiration: None,
-                status: String::new(),
-                parent_user: String::new(),
-                groups: None,
-                claims: None,
-                name: None,
-                description: None,
+                access_key: user.clone(),
+                secret_key: password.clone(),
+                // Fill defaults
+                session_token: String::new(), expiration: None, status: String::new(),
+                parent_user: String::new(), groups: None, claims: None, name: None, description: None,
             };
 
-            // Validate credentials through IAM system
-            let (user_identity, is_valid) = iam_sys.check_key(&s3_creds.access_key).await.map_err(|e| {
-                error!("Failed to check key in IAM system: {}", e);
-                libunftp::auth::AuthenticationError::ImplPropagated("Authentication failed".to_string(), Some(Box::new(e)))
-            })?;
+            let (user_identity, is_valid) = iam_sys.check_key(&s3_creds.access_key).await
+                .map_err(|e| format!("IAM check failed: {}", e))?;
 
             if !is_valid {
-                error!("Invalid credentials for user: {}", user);
-                return Ok(Auth::Reject {
-                    proceed_with_methods: None,
-                    partial_success: false,
-                });
+                warn!("Invalid AccessKey: {}", user);
+                return Ok(Auth::Reject { proceed_with_methods: None, partial_success: false });
             }
 
-            // Verify the secret key matches
             if let Some(identity) = user_identity {
-                if !identity.credentials.secret_key.eq(&s3_creds.secret_key) {
-                    error!("Invalid secret key for user: {}", user);
-                    return Ok(Auth::Reject {
-                        proceed_with_methods: None,
-                        partial_success: false,
-                    });
+                if identity.credentials.secret_key != s3_creds.secret_key {
+                    warn!("Invalid SecretKey for user: {}", user);
+                    return Ok(Auth::Reject { proceed_with_methods: None, partial_success: false });
                 }
 
-                // Create session context
-                let session_context = SessionContext::new(
-                    crate::protocols::session::principal::ProtocolPrincipal::new(std::sync::Arc::new(identity.clone())),
-                    SessionProtocol::Sftp,
-                    "127.0.0.1".parse().unwrap(), // This should be the actual client IP
-                );
-
-                // Note: We can't modify self directly in the async block, so we'll need to handle this differently
-                debug!("Successfully authenticated user: {}", user);
+                // SUCCESS: Update shared state
+                {
+                    let mut guard = state.lock().unwrap();
+                    guard.identity = Some(identity);
+                }
+                debug!("User {} authenticated successfully via Password", user);
                 Ok(Auth::Accept)
             } else {
-                error!("User identity not found for user: {}", user);
-                Ok(Auth::Reject {
-                    proceed_with_methods: None,
-                    partial_success: false,
-                })
+                Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
             }
-        })
+        }
     }
 
-    /// Handle public key authentication request
-    fn auth_publickey(
-        &mut self,
-        user: &str,
-        public_key: &russh::keys::PublicKey,
-    ) -> impl Future<Output = Result<Auth, Self::Error>> + Send {
+    fn auth_publickey(&mut self, user: &str, _key: &russh::keys::PublicKey) -> impl Future<Output = Result<Auth, Self::Error>> + Send {
         let user = user.to_string();
-
-        Box::pin(async move {
-            debug!("SFTP public key authentication request for user: {}", user);
-
-            // For now, we'll reject public key authentication
-            // In a real implementation, this would check against stored public keys
-            Ok(Auth::Reject {
-                proceed_with_methods: None,
-                partial_success: false,
-            })
-        })
+        async move {
+            debug!("SFTP public key auth not yet implemented for user: {}", user);
+            Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+        }
     }
 
-    /// Handle channel open request
-    fn channel_open_session(&mut self, channel: russh::Channel<russh::server::Msg>, session: &mut Session) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        Box::pin(async move {
-            // Note: We can't access self.authenticated in async block, so we'll assume it's authenticated
-            // In a real implementation, this would need to be handled differently
-            debug!("SFTP session channel opened for channel: {:?}", channel);
-            Ok(true)
-        })
+    fn channel_open_session(&mut self, _channel: russh::Channel<russh::server::Msg>, _session: &mut Session) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        async move { Ok(true) }
     }
 
-    /// Handle subsystem request
-    fn subsystem_request(
-        &mut self,
-        channel: ChannelId,
-        name: &str,
-        session: &mut Session,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    /// VITAL: This maps the SSH subsystem request "sftp" to the actual russh-sftp handler
+    fn subsystem_request(&mut self, channel_id: ChannelId, name: &str, session: &mut Session) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let name = name.to_string();
+        let state = self.state.clone();
+        let session_handle = session.handle();
 
-        Box::pin(async move {
-            // Note: We can't access self fields in async block, so we'll assume it's authenticated
-            // In a real implementation, this would need to be handled differently
-
+        async move {
             if name == "sftp" {
-                debug!("SFTP subsystem requested for channel: {:?}", channel);
-                // In a real implementation, this would start the SFTP subsystem
-                // For now, we just acknowledge the request
-            }
+                let (identity, client_ip) = {
+                    let guard = state.lock().unwrap();
+                    if let Some(id) = &guard.identity {
+                        (id.clone(), guard.client_ip)
+                    } else {
+                        error!("SFTP subsystem requested but user not authenticated");
+                        return Ok(());
+                    }
+                };
 
+                debug!("Initializing SFTP subsystem for user: {} (Channel: {:?})", identity.credentials.access_key, channel_id);
+
+                // Create SessionContext
+                let context = SessionContext::new(
+                    ProtocolPrincipal::new(Arc::new(identity)),
+                    SessionProtocol::Sftp,
+                    client_ip.ip(),
+                );
+
+                // Create a Duplex Stream to bridge SSH and SFTP
+                // russh (client_pipe) <==> russh-sftp (server_pipe)
+                let (client_pipe, server_pipe) = tokio::io::duplex(65536);
+                let (mut client_read, mut client_write) = tokio::io::split(client_pipe);
+
+                // 1. Setup channel to feed data FROM ssh TO sftp
+                let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                {
+                    let mut guard = state.lock().unwrap();
+                    guard.sftp_channels.insert(channel_id, tx);
+                }
+
+                // Task: Pump data from mpsc -> SFTP input
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    while let Some(data) = rx.recv().await {
+                        if let Err(e) = client_write.write_all(&data).await {
+                            error!("Failed to write to SFTP pipe: {}", e);
+                            break;
+                        }
+                    }
+                });
+
+                // 2. Run the SFTP Protocol Server
+                let sftp_handler = SftpHandler::new(context);
+                tokio::spawn(async move {
+                    // 修复：russh_sftp::server::run 返回 ()，而不是 Result。
+                    // 它会一直运行直到流结束（客户端断开连接）。
+                    russh_sftp::server::run(server_pipe, sftp_handler).await;
+
+                    // 当 run 完成时，意味着会话结束
+                    debug!("SFTP protocol loop ended (connection closed)");
+                });
+
+                // 3. Task: Pump data FROM SFTP output TO ssh client
+                let session_handle = session_handle.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = vec![0u8; 32 * 1024];
+                    loop {
+                        match client_read.read(&mut buf).await {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                // Send back to SSH client
+                                // FIX: Convert Vec<u8> to CryptoVec via .into()
+                                let data: Vec<u8> = buf[..n].to_vec();
+                                if let Err(_) = session_handle.data(channel_id, data.into()).await {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Error reading from SFTP output pipe: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    let _ = session_handle.close(channel_id).await;
+                });
+            }
             Ok(())
-        })
+        }
+    }
+
+    /// Handle incoming data from SSH client
+    fn data(&mut self, channel_id: ChannelId, data: &[u8], _session: &mut Session) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let state = self.state.clone();
+        let data = data.to_vec();
+
+        async move {
+            let sender = {
+                let guard = state.lock().unwrap();
+                guard.sftp_channels.get(&channel_id).cloned()
+            };
+
+            if let Some(tx) = sender {
+                // Send data to the pumping task
+                if let Err(_) = tx.send(data) {
+                    // Channel closed, ignore
+                }
+            }
+            Ok(())
+        }
     }
 }

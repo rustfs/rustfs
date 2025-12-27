@@ -54,8 +54,9 @@ md5 = { workspace = true }
 
 ssh2 = "0.9"
 # FTP/FTPS 客户端
-suppaftp = { version = "5.3", features = ["async-std", "rustls"] }
+suppaftp = { version = "5.3", features = ["async-std", "rustls", "native-tls"] }
 # 生成测试证书
 rcgen = "0.12"
+anyhow = "1.0.100"
+native-tls = "0.2.14"
 # 错误处理
-anyhow = "1.0"

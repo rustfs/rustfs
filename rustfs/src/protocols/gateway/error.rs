@@ -12,85 +12,67 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::S3Error;
-
-/// S3 error codes
-#[derive(Debug, thiserror::Error)]
-pub enum S3ErrorCode {
-    #[error("AccessDenied")]
-    AccessDenied,
-    #[error("NoSuchKey")]
-    NoSuchKey,
-    #[error("NoSuchBucket")]
-    NoSuchBucket,
-    #[error("BucketNotEmpty")]
-    BucketNotEmpty,
-    #[error("BucketAlreadyExists")]
-    BucketAlreadyExists,
-    #[error("InvalidBucketName")]
-    InvalidBucketName,
-    #[error("InvalidObjectName")]
-    InvalidObjectName,
-    #[error("InvalidRequest")]
-    InvalidRequest,
-    #[error("InternalError")]
-    InternalError,
+// FTP error code constants
+pub mod ftp_errors {
+    pub const FILE_NOT_FOUND: &str = "550 File not found";
+    pub const DIRECTORY_NOT_FOUND: &str = "550 Directory not found";
+    pub const PERMISSION_DENIED: &str = "550 Permission denied";
+    pub const DIRECTORY_NOT_EMPTY: &str = "550 Directory not empty";
+    pub const DIRECTORY_ALREADY_EXISTS: &str = "550 Directory already exists";
+    pub const INVALID_DIRECTORY_NAME: &str = "553 Invalid directory name";
+    pub const INVALID_FILE_NAME: &str = "553 Invalid file name";
+    pub const INVALID_REQUEST: &str = "501 Invalid request";
+    pub const INTERNAL_SERVER_ERROR: &str = "421 Internal server error";
 }
 
-impl S3ErrorCode {
-    /// Convert to S3Error
-    pub fn to_s3_error(&self) -> S3Error {
-        match self {
-            S3ErrorCode::AccessDenied => S3Error::new(s3s::S3ErrorCode::AccessDenied),
-            S3ErrorCode::NoSuchKey => S3Error::new(s3s::S3ErrorCode::NoSuchKey),
-            S3ErrorCode::NoSuchBucket => S3Error::new(s3s::S3ErrorCode::NoSuchBucket),
-            S3ErrorCode::BucketNotEmpty => S3Error::new(s3s::S3ErrorCode::BucketNotEmpty),
-            S3ErrorCode::BucketAlreadyExists => S3Error::new(s3s::S3ErrorCode::BucketAlreadyExists),
-            S3ErrorCode::InvalidBucketName => S3Error::new(s3s::S3ErrorCode::InvalidBucketName),
-            S3ErrorCode::InvalidObjectName => S3Error::new(s3s::S3ErrorCode::InvalidObjectState),
-            S3ErrorCode::InvalidRequest => S3Error::new(s3s::S3ErrorCode::InvalidRequest),
-            S3ErrorCode::InternalError => S3Error::new(s3s::S3ErrorCode::InternalError),
-        }
-    }
-
-    /// Convert protocol errors to S3 errors
-    pub fn from_protocol_error(protocol: &str, error: &str) -> Self {
-        match (protocol, error) {
-            // FTP errors
-            ("ftp", "550") => S3ErrorCode::NoSuchKey, // File not found
-            ("ftp", "550 Permission denied") => S3ErrorCode::AccessDenied,
-            ("ftp", "550 Directory not empty") => S3ErrorCode::BucketNotEmpty,
-            ("ftp", "550 File exists") => S3ErrorCode::BucketAlreadyExists,
-
-            // SFTP errors
-            ("sftp", "NoSuchFile") => S3ErrorCode::NoSuchKey,
-            ("sftp", "PermissionDenied") => S3ErrorCode::AccessDenied,
-            ("sftp", "Failure") => S3ErrorCode::InternalError,
-
-            // Default
-            _ => S3ErrorCode::InternalError,
-        }
+// FTP error messages mapping
+pub fn map_s3_error_to_ftp_string(s3_error: &s3s::S3Error) -> String {
+    match s3_error.code() {
+        s3s::S3ErrorCode::NoSuchKey => ftp_errors::FILE_NOT_FOUND.to_string(),
+        s3s::S3ErrorCode::NoSuchBucket => ftp_errors::DIRECTORY_NOT_FOUND.to_string(),
+        s3s::S3ErrorCode::AccessDenied => ftp_errors::PERMISSION_DENIED.to_string(),
+        s3s::S3ErrorCode::BucketNotEmpty => ftp_errors::DIRECTORY_NOT_EMPTY.to_string(),
+        s3s::S3ErrorCode::BucketAlreadyExists => ftp_errors::DIRECTORY_ALREADY_EXISTS.to_string(),
+        s3s::S3ErrorCode::InvalidBucketName => ftp_errors::INVALID_DIRECTORY_NAME.to_string(),
+        s3s::S3ErrorCode::InvalidObjectState => ftp_errors::INVALID_FILE_NAME.to_string(),
+        s3s::S3ErrorCode::InvalidRequest => ftp_errors::INVALID_REQUEST.to_string(),
+        s3s::S3ErrorCode::InternalError => ftp_errors::INTERNAL_SERVER_ERROR.to_string(),
+        _ => ftp_errors::INTERNAL_SERVER_ERROR.to_string(),
     }
 }
 
-/// Map S3 errors to protocol-specific errors
-pub fn map_s3_error_to_protocol(protocol: &str, s3_error: &S3ErrorCode) -> String {
-    match (protocol, s3_error) {
-        // FTP error codes
-        ("ftp", S3ErrorCode::NoSuchKey) => "550 File not found".to_string(),
-        ("ftp", S3ErrorCode::AccessDenied) => "550 Permission denied".to_string(),
-        ("ftp", S3ErrorCode::NoSuchBucket) => "550 Directory not found".to_string(),
-        ("ftp", S3ErrorCode::BucketNotEmpty) => "550 Directory not empty".to_string(),
-        ("ftp", S3ErrorCode::BucketAlreadyExists) => "550 Directory already exists".to_string(),
+/// Map S3Error to FTPS libunftp Error
+pub fn map_s3_error_to_ftps(s3_error: &s3s::S3Error) -> libunftp::storage::Error {
+    use libunftp::storage::{Error, ErrorKind};
 
-        // SFTP error codes
-        ("sftp", S3ErrorCode::NoSuchKey) => "NoSuchFile".to_string(),
-        ("sftp", S3ErrorCode::AccessDenied) => "PermissionDenied".to_string(),
-        ("sftp", S3ErrorCode::NoSuchBucket) => "NoSuchFile".to_string(), // Directory not found
-        ("sftp", S3ErrorCode::BucketNotEmpty) => "Failure".to_string(), // Directory not empty
-        ("sftp", S3ErrorCode::BucketAlreadyExists) => "Failure".to_string(), // Directory exists
+    match s3_error.code() {
+        s3s::S3ErrorCode::NoSuchKey | s3s::S3ErrorCode::NoSuchBucket => {
+            Error::new(ErrorKind::PermanentFileNotAvailable, map_s3_error_to_ftp_string(s3_error))
+        },
+        s3s::S3ErrorCode::AccessDenied => {
+            Error::new(ErrorKind::PermissionDenied, map_s3_error_to_ftp_string(s3_error))
+        },
+        s3s::S3ErrorCode::InvalidRequest | s3s::S3ErrorCode::InvalidBucketName | s3s::S3ErrorCode::InvalidObjectState => {
+            Error::new(ErrorKind::PermanentFileNotAvailable, map_s3_error_to_ftp_string(s3_error))
+        },
+        _ => Error::new(ErrorKind::PermanentFileNotAvailable, map_s3_error_to_ftp_string(s3_error)),
+    }
+}
 
-        // Default
-        (_, _) => "Failure".to_string(),
+/// Map S3Error directly to SFTP StatusCode
+pub fn map_s3_error_to_sftp_status(s3_error: &s3s::S3Error) -> russh_sftp::protocol::StatusCode {
+    use russh_sftp::protocol::StatusCode;
+
+    match s3_error.code() {
+        s3s::S3ErrorCode::NoSuchKey => StatusCode::NoSuchFile,      // SSH_FX_NO_SUCH_FILE (2)
+        s3s::S3ErrorCode::NoSuchBucket => StatusCode::NoSuchFile,  // SSH_FX_NO_SUCH_FILE (2)
+        s3s::S3ErrorCode::AccessDenied => StatusCode::PermissionDenied,   // SSH_FX_PERMISSION_DENIED (3)
+        s3s::S3ErrorCode::BucketNotEmpty => StatusCode::Failure, // SSH_FX_DIR_NOT_EMPTY (21)
+        s3s::S3ErrorCode::BucketAlreadyExists => StatusCode::Failure, // SSH_FX_FILE_ALREADY_EXISTS (17)
+        s3s::S3ErrorCode::InvalidBucketName => StatusCode::Failure, // SSH_FX_INVALID_FILENAME (22)
+        s3s::S3ErrorCode::InvalidObjectState => StatusCode::Failure, // SSH_FX_INVALID_FILENAME (22)
+        s3s::S3ErrorCode::InvalidRequest => StatusCode::OpUnsupported,  // SSH_FX_OP_UNSUPPORTED (5)
+        s3s::S3ErrorCode::InternalError => StatusCode::Failure,  // SSH_FX_FAILURE (4)
+        _ => StatusCode::Failure,  // SSH_FX_FAILURE as default
     }
 }

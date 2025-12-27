@@ -21,7 +21,7 @@ use crate::protocols::client::s3::ProtocolS3Client;
 use crate::protocols::gateway::action::S3Action;
 use crate::protocols::gateway::adapter::{is_operation_supported};
 use crate::protocols::gateway::authorize::authorize_operation;
-use crate::protocols::gateway::error::{map_s3_error_to_protocol, S3ErrorCode};
+use crate::protocols::gateway::error::map_s3_error_to_ftps;
 use crate::protocols::gateway::restrictions::{get_s3_equivalent_operation, is_ftp_feature_supported};
 use crate::protocols::session::context::SessionContext;
 use async_trait::async_trait;
@@ -174,9 +174,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
                 }
                 Err(e) => {
                     error!("Failed to get object metadata: {}", e);
-                    let s3_error = S3ErrorCode::from_protocol_error("ftp", &e.to_string());
-                    let protocol_error = map_s3_error_to_protocol("ftp", &s3_error);
-                    Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
+                    Err(map_s3_error_to_ftps(&e))
                 }
             }
         } else {
@@ -214,9 +212,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
                 }
                 Err(e) => {
                     error!("Failed to get bucket metadata: {}", e);
-                    let s3_error = S3ErrorCode::from_protocol_error("ftp", &e.to_string());
-                    let protocol_error = map_s3_error_to_protocol("ftp", &s3_error);
-                    Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
+                    Err(map_s3_error_to_ftps(&e))
                 }
             }
         }
@@ -311,8 +307,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
             }
             Err(e) => {
                 error!("Failed to list objects: {}", e);
-                let s3_error = S3ErrorCode::from_protocol_error("ftp", &e.to_string());
-                let protocol_error = map_s3_error_to_protocol("ftp", &s3_error);
+                let protocol_error = map_s3_error_to_ftps(&e);
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
             }
         }
@@ -377,8 +372,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
             }
             Err(e) => {
                 error!("Failed to get object: {}", e);
-                let s3_error = S3ErrorCode::from_protocol_error("ftp", &e.to_string());
-                let protocol_error = map_s3_error_to_protocol("ftp", &s3_error);
+                let protocol_error = map_s3_error_to_ftps(&e);
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
             }
         }
@@ -448,8 +442,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
             }
             Err(e) => {
                 error!("Failed to put object: {}", e);
-                let s3_error = S3ErrorCode::from_protocol_error("ftp", &e.to_string());
-                let protocol_error = map_s3_error_to_protocol("ftp", &s3_error);
+                let protocol_error = map_s3_error_to_ftps(&e);
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
             }
         }
@@ -501,8 +494,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
             }
             Err(e) => {
                 error!("Failed to delete object: {}", e);
-                let s3_error = S3ErrorCode::from_protocol_error("ftp", &e.to_string());
-                let protocol_error = map_s3_error_to_protocol("ftp", &s3_error);
+                let protocol_error = map_s3_error_to_ftps(&e);
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
             }
         }
@@ -560,8 +552,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
             }
             Err(e) => {
                 error!("Failed to create directory marker: {}", e);
-                let s3_error = S3ErrorCode::from_protocol_error("ftp", &e.to_string());
-                let protocol_error = map_s3_error_to_protocol("ftp", &s3_error);
+                let protocol_error = map_s3_error_to_ftps(&e);
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
             }
         }
@@ -655,16 +646,14 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
                     }
                     Err(e) => {
                         error!("Failed to delete original object after copy: {}", e);
-                        let s3_error = S3ErrorCode::from_protocol_error("ftp", &e.to_string());
-                        let protocol_error = map_s3_error_to_protocol("ftp", &s3_error);
+                        let protocol_error = map_s3_error_to_ftps(&e);
                         Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
                     }
                 }
             }
             Err(e) => {
                 error!("Failed to copy object for rename: {}", e);
-                let s3_error = S3ErrorCode::from_protocol_error("ftp", &e.to_string());
-                let protocol_error = map_s3_error_to_protocol("ftp", &s3_error);
+                let protocol_error = map_s3_error_to_ftps(&e);
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
             }
         }
@@ -720,8 +709,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
             }
             Err(e) => {
                 error!("Failed to remove directory marker: {}", e);
-                let s3_error = S3ErrorCode::from_protocol_error("ftp", &e.to_string());
-                let protocol_error = map_s3_error_to_protocol("ftp", &s3_error);
+                let protocol_error = map_s3_error_to_ftps(&e);
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
             }
         }

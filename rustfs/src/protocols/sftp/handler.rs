@@ -14,170 +14,141 @@
 
 use crate::protocols::client::s3::ProtocolS3Client;
 use crate::protocols::gateway::action::S3Action;
-use crate::protocols::gateway::adapter::is_operation_supported;
 use crate::protocols::gateway::authorize::authorize_operation;
-use crate::protocols::gateway::error::{map_s3_error_to_protocol, S3ErrorCode};
-use crate::protocols::gateway::restrictions::{get_s3_equivalent_operation, is_sftp_feature_supported};
+use crate::protocols::gateway::error::{map_s3_error_to_sftp_status};
 use crate::protocols::session::context::SessionContext;
-use async_trait::async_trait;
-use russh_sftp::protocol::{
-    Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version,
-};
+use crate::storage::ecfs::FS;
+use futures::TryStreamExt;
+use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version};
 use russh_sftp::server::Handler;
-use s3s::dto::{GetObjectInput, PutObjectInput};
-use s3s::dto::StreamingBlob;
+use s3s::dto::{CopyObjectInput, DeleteObjectInput, GetObjectInput, PutObjectInput, StreamingBlob};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, RwLock};
-use futures_util::TryStreamExt;
-// Used for shared state across async boundaries
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use tokio::fs::{File as TokioFile, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::RwLock;
 use tracing::{debug, error, trace, warn};
+use uuid::Uuid;
 
-/// SFTP session handle
-#[derive(Debug, Clone)]
-struct SftpHandle {
-    /// Handle ID
-    id: u32,
-    /// File path
-    path: String,
-    /// File attributes
-    attrs: FileAttributes,
-    /// Current position for read/write operations
-    position: u64,
-}
-
-/// SFTP session context
-#[derive(Debug, Clone)]
-pub struct SftpSessionContext {
-    /// Session context for this SFTP session
-    pub session_context: SessionContext,
-}
-
-/// Internal state for SftpHandler to allow shared access via Arc/RwLock
+/// State associated with an open file handle
 #[derive(Debug)]
-struct SftpHandlerInner {
-    /// Session context
-    session_context: Option<SftpSessionContext>,
-    /// Active file handles
-    handles: HashMap<String, SftpHandle>,
-    /// Next handle ID
-    next_handle_id: u32,
+enum HandleState {
+    Read {
+        path: String,
+        bucket: String,
+        key: String,
+    },
+    Write {
+        path: String,
+        bucket: String,
+        key: String,
+        temp_file_path: PathBuf,
+        file_handle: Option<TokioFile>,
+    },
+    Dir {
+        path: String,
+        files: Vec<File>,
+        offset: usize,
+    },
 }
 
-/// SFTP handler implementation
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SftpHandler {
-    inner: Arc<RwLock<SftpHandlerInner>>,
+    session_context: SessionContext,
+    handles: Arc<RwLock<HashMap<String, HandleState>>>,
+    next_handle_id: Arc<AtomicU32>,
+    temp_dir: PathBuf,
 }
 
 impl SftpHandler {
-    /// Create a new SFTP handler
-    pub fn new() -> Self {
+    pub fn new(session_context: SessionContext) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(SftpHandlerInner {
-                session_context: None,
-                handles: HashMap::new(),
-                next_handle_id: 1,
-            })),
+            session_context,
+            handles: Arc::new(RwLock::new(HashMap::new())),
+            next_handle_id: Arc::new(AtomicU32::new(1)),
+            temp_dir: std::env::temp_dir(),
         }
     }
 
-    /// Set session context
-    pub fn set_session_context(&mut self, context: SftpSessionContext) {
-        if let Ok(mut inner) = self.inner.write() {
-            inner.session_context = Some(context);
-        } else {
-            error!("Failed to acquire write lock for setting session context");
-        }
-    }
-
-    /// Get session context
-    fn get_session_context(&self) -> Result<SftpSessionContext, StatusCode> {
-        let inner = self.inner.read().map_err(|_| StatusCode::Failure)?;
-        inner.session_context.clone().ok_or(StatusCode::PermissionDenied)
-    }
-
-    /// Create ProtocolS3Client for current session
-    ///
-    /// MINIO CONSTRAINT: Must use the same capabilities as external S3 clients
     fn create_s3_client(&self) -> Result<ProtocolS3Client, StatusCode> {
-        let context = self.get_session_context()?;
-        let fs = crate::storage::ecfs::FS {};
-        let s3_client = ProtocolS3Client::new(fs, context.session_context.access_key().to_string());
-        Ok(s3_client)
+        let fs = FS::new();
+        let client = ProtocolS3Client::new(
+            fs,
+            self.session_context.access_key().to_string(),
+        );
+        Ok(client)
     }
 
-    /// Validate SFTP feature support
-    ///
-    /// MINIO CONSTRAINT: Must reject unsupported SFTP features
-    fn validate_feature_support(&self, feature: &str) -> Result<(), StatusCode> {
-        if !is_sftp_feature_supported(feature) {
-            let error_msg = if let Some(s3_equivalent) = get_s3_equivalent_operation(feature) {
-                format!("Unsupported SFTP feature: {}. S3 equivalent: {}", feature, s3_equivalent)
-            } else {
-                format!("Unsupported SFTP feature: {}", feature)
-            };
-            error!("{}", error_msg);
-            return Err(StatusCode::Failure);
-        }
-        Ok(())
-    }
-
-    /// Get bucket and key from path
     fn parse_path(&self, path: &str) -> Result<(String, Option<String>), StatusCode> {
+        if path.contains("..") {
+            return Err(StatusCode::PermissionDenied);
+        }
         let path = path.trim_start_matches('/');
-        if path.is_empty() {
+        if path.is_empty() || path == "." {
             return Err(StatusCode::NoSuchFile);
         }
-
-        let parts: Vec<&str> = path.split('/').collect();
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
         let bucket = parts[0].to_string();
-
-        if parts.len() == 1 {
-            // Only bucket specified
+        if parts.len() == 1 || parts[1].is_empty() {
             Ok((bucket, None))
         } else {
-            // Bucket and object key
-            let key = parts[1..].join("/");
-            Ok((bucket, Some(key)))
+            Ok((bucket, Some(parts[1].to_string())))
         }
     }
 
-    /// Create a new handle for a file
-    fn create_handle(&self, path: String, attrs: FileAttributes) -> Result<String, StatusCode> {
-        let mut inner = self.inner.write().map_err(|_| StatusCode::Failure)?;
-
-        let handle_id = inner.next_handle_id;
-        inner.next_handle_id += 1;
-
-        let handle_name = format!("handle_{}", handle_id);
-
-        let sftp_handle = SftpHandle {
-            id: handle_id,
-            path,
-            attrs,
-            position: 0,
-        };
-
-        inner.handles.insert(handle_name.clone(), sftp_handle);
-        Ok(handle_name)
+    fn generate_handle_id(&self) -> String {
+        let id = self.next_handle_id.fetch_add(1, Ordering::Relaxed);
+        format!("handle_{}", id)
     }
 
-    /// Get handle path by name (cloned to release lock)
-    fn get_handle_info(&self, handle: &str) -> Option<(String, u64)> {
-        let inner = self.inner.read().ok()?;
-        inner.handles.get(handle).map(|h| (h.path.clone(), h.position))
+    async fn cleanup_state(&self, state: HandleState) {
+        if let HandleState::Write { temp_file_path, .. } = state {
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+        }
     }
 
-    /// Remove handle by name
-    fn remove_handle(&self, handle: &str) {
-        if let Ok(mut inner) = self.inner.write() {
-            inner.handles.remove(handle);
+    async fn do_stat(&self, path: String) -> Result<FileAttributes, StatusCode> {
+        let (bucket, key_opt) = self.parse_path(&path)?;
+
+        let action = S3Action::HeadObject;
+        authorize_operation(&self.session_context, &action, &bucket, key_opt.as_deref())
+            .await.map_err(|_| StatusCode::PermissionDenied)?;
+
+        let s3_client = self.create_s3_client()?;
+
+        if let Some(key) = key_opt {
+            let input = s3s::dto::HeadObjectInput { bucket, key, ..Default::default() };
+            match s3_client.head_object(input).await {
+                Ok(out) => {
+                    let mut attrs = FileAttributes::default();
+                    attrs.size = Some(out.content_length.unwrap_or(0) as u64);
+                    if let Some(lm) = out.last_modified {
+                        let dt = time::OffsetDateTime::from(lm);
+                        attrs.mtime = Some(dt.unix_timestamp() as u32);
+                    }
+                    attrs.permissions = Some(0o644);
+                    Ok(attrs)
+                },
+                Err(_) => Err(StatusCode::NoSuchFile),
+            }
+        } else {
+            let input = s3s::dto::HeadBucketInput { bucket, ..Default::default() };
+            match s3_client.head_bucket(input).await {
+                Ok(_) => {
+                    let mut attrs = FileAttributes::default();
+                    attrs.set_dir(true);
+                    attrs.permissions = Some(0o755);
+                    Ok(attrs)
+                },
+                Err(_) => Err(StatusCode::NoSuchFile),
+            }
         }
     }
 }
 
-#[async_trait]
 impl Handler for SftpHandler {
     type Error = StatusCode;
 
@@ -185,58 +156,149 @@ impl Handler for SftpHandler {
         StatusCode::OpUnsupported
     }
 
-    /// Handle version negotiation
     fn init(
         &mut self,
         version: u32,
         _extensions: HashMap<String, String>,
     ) -> impl Future<Output = Result<Version, Self::Error>> + Send {
-        trace!("SFTP init request with version: {}", version);
         async move {
+            trace!("SFTP Init version: {}", version);
             Ok(Version::new())
         }
     }
 
-    /// Handle file open request
     fn open(
         &mut self,
         id: u32,
         filename: String,
-        flags: OpenFlags,
-        attrs: FileAttributes,
+        pflags: OpenFlags,
+        _attrs: FileAttributes,
     ) -> impl Future<Output = Result<Handle, Self::Error>> + Send {
-        // Clone self to move into async block
         let this = self.clone();
 
-        Box::pin(async move {
-            trace!("SFTP open request for file: {} with flags: {:?}, attrs: {:?}", filename, flags, attrs);
+        async move {
+            debug!("SFTP Open: {} (flags: {:?})", filename, pflags);
 
-            // We store the handle in our map
-            let handle_name = this.create_handle(filename.clone(), attrs)?;
+            let (bucket, key_opt) = this.parse_path(&filename)?;
+            let key = key_opt.ok_or(StatusCode::PermissionDenied)?;
 
-            Ok(Handle { id, handle: handle_name })
-        })
+            let handle_id = this.generate_handle_id();
+            let state;
+
+            if pflags.contains(OpenFlags::WRITE) || pflags.contains(OpenFlags::CREATE) || pflags.contains(OpenFlags::TRUNCATE) {
+                let action = S3Action::PutObject;
+                authorize_operation(&this.session_context, &action, &bucket, Some(&key))
+                    .await
+                    .map_err(|_| StatusCode::PermissionDenied)?;
+
+                if pflags.contains(OpenFlags::APPEND) {
+                    return Err(StatusCode::OpUnsupported);
+                }
+
+                let temp_filename = format!("rustfs-sftp-{}.tmp", Uuid::new_v4());
+                let temp_path = this.temp_dir.join(temp_filename);
+
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&temp_path)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to create temp file: {}", e);
+                        StatusCode::Failure
+                    })?;
+
+                state = HandleState::Write {
+                    path: filename.clone(),
+                    bucket,
+                    key,
+                    temp_file_path: temp_path,
+                    file_handle: Some(file),
+                };
+            } else {
+                let action = S3Action::GetObject;
+                authorize_operation(&this.session_context, &action, &bucket, Some(&key))
+                    .await
+                    .map_err(|_| StatusCode::PermissionDenied)?;
+
+                state = HandleState::Read {
+                    path: filename.clone(),
+                    bucket,
+                    key,
+                };
+            }
+
+            this.handles.write().await.insert(handle_id.clone(), state);
+            Ok(Handle { id, handle: handle_id })
+        }
     }
 
-    /// Handle file close request
-    fn close(&mut self, id: u32, handle: String) -> impl Future<Output = Result<Status, Self::Error>> + Send {
+    fn close(
+        &mut self,
+        id: u32,
+        handle: String,
+    ) -> impl Future<Output = Result<Status, Self::Error>> + Send {
         let this = self.clone();
-        Box::pin(async move {
-            trace!("SFTP close request for handle: {}", handle);
+        async move {
+            let state = this.handles.write().await.remove(&handle);
 
-            this.remove_handle(&handle);
-            debug!("Successfully closed handle: {}", handle);
+            match state {
+                Some(HandleState::Write { bucket, key, temp_file_path, mut file_handle, .. }) => {
+                    let mut file = file_handle.take().ok_or(StatusCode::Failure)?;
 
-            Ok(Status {
-                id,
-                status_code: StatusCode::Ok,
-                error_message: "Success".to_string(),
-                language_tag: "en".to_string(),
-            })
-        })
+                    if let Err(e) = file.flush().await {
+                        error!("Flush to disk failed: {}", e);
+                        let _ = tokio::fs::remove_file(&temp_file_path).await;
+                        return Err(StatusCode::Failure);
+                    }
+
+                    if let Err(e) = file.seek(std::io::SeekFrom::Start(0)).await {
+                        error!("Seek temp file failed: {}", e);
+                        let _ = tokio::fs::remove_file(&temp_file_path).await;
+                        return Err(StatusCode::Failure);
+                    }
+
+                    let s3_client = match this.create_s3_client() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tokio::fs::remove_file(&temp_file_path).await;
+                            return Err(e);
+                        }
+                    };
+
+                    let stream = tokio_util::io::ReaderStream::new(file);
+                    let body = StreamingBlob::wrap(stream);
+
+                    let input = PutObjectInput {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        body: Some(body),
+                        ..Default::default()
+                    };
+
+                    let result = match s3_client.put_object(input).await {
+                        Ok(_) => Status { id, status_code: StatusCode::Ok, error_message: "Success".into(), language_tag: "en".into() },
+                        Err(e) => {
+                            error!("S3 PutObject failed: {}", e);
+                            let status_code = map_s3_error_to_sftp_status(&e);
+                            return Err(status_code);
+                        }
+                    };
+
+                    let _ = tokio::fs::remove_file(&temp_file_path).await;
+                    Ok(result)
+                }
+                Some(state) => {
+                    this.cleanup_state(state).await;
+                    Ok(Status { id, status_code: StatusCode::Ok, error_message: "Success".into(), language_tag: "en".into() })
+                }
+                None => Err(StatusCode::NoSuchFile),
+            }
+        }
     }
 
-    /// Handle file read request
     fn read(
         &mut self,
         id: u32,
@@ -245,72 +307,45 @@ impl Handler for SftpHandler {
         len: u32,
     ) -> impl Future<Output = Result<Data, Self::Error>> + Send {
         let this = self.clone();
-        Box::pin(async move {
-            trace!("SFTP read request for handle: {} at offset: {} len: {}", handle, offset, len);
+        async move {
+            let (bucket, key) = {
+                let guard = this.handles.read().await;
+                match guard.get(&handle) {
+                    Some(HandleState::Read { bucket, key, .. }) => (bucket.clone(), key.clone()),
+                    Some(_) => return Err(StatusCode::OpUnsupported),
+                    None => return Err(StatusCode::NoSuchFile),
+                }
+            };
 
-            let (path, _) = this.get_handle_info(&handle).ok_or(StatusCode::NoSuchFile)?;
-
-            let (bucket, key) = this.parse_path(&path)?;
-            let object_key = key.ok_or(StatusCode::NoSuchFile)?;
-
-            let action = S3Action::GetObject;
-            if !is_operation_supported(crate::protocols::session::context::Protocol::Sftp, &action) {
-                return Err(StatusCode::OpUnsupported);
-            }
-
-            // Authorize
-            let context = this.get_session_context()?;
-            authorize_operation(
-                &context.session_context,
-                &action,
-                &bucket,
-                Some(&object_key),
-            ).await.map_err(|_| StatusCode::PermissionDenied)?;
-
-            // Construct S3 request with Range header
+            let range_end = offset + (len as u64) - 1;
             let mut builder = GetObjectInput::builder();
             builder.set_bucket(bucket);
-            builder.set_key(object_key);
-
-            // S3 Range is inclusive. e.g. bytes=0-9 gets 10 bytes.
-            let range_end = offset + (len as u64) - 1;
-            let range_str = format!("bytes={}-{}", offset, range_end);
-
-            if let Ok(range) = s3s::dto::Range::parse(&range_str) {
-                builder.set_range(Option::from(range));
+            builder.set_key(key);
+            if let Ok(range) = s3s::dto::Range::parse(&format!("bytes={}-{}", offset, range_end)) {
+                builder.set_range(Some(range));
             }
 
-            let input = builder.build().map_err(|_| StatusCode::Failure)?;
             let s3_client = this.create_s3_client()?;
+            let input = builder.build().map_err(|_| StatusCode::Failure)?;
 
             match s3_client.get_object(input).await {
                 Ok(output) => {
-                    let mut data_vec = Vec::new();
+                    let mut data = Vec::with_capacity(len as usize);
                     if let Some(body) = output.body {
-                        use tokio::io::AsyncReadExt;
-                        // Convert the S3 stream to an async reader
                         let stream = body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
                         let mut reader = tokio_util::io::StreamReader::new(stream);
-                        // Read into vector
-                        reader.read_to_end(&mut data_vec).await.map_err(|_| StatusCode::Failure)?;
+                        let _ = reader.read_to_end(&mut data).await;
                     }
-
-                    Ok(Data {
-                        id,
-                        data: data_vec,
-                    })
+                    Ok(Data { id, data })
                 }
                 Err(e) => {
-                    error!("Failed to read object: {}", e);
-                    Err(StatusCode::Failure)
+                    debug!("S3 Read failed: {}", e);
+                    Ok(Data { id, data: Vec::new() })
                 }
             }
-        })
+        }
     }
 
-    /// Handle file write request
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 PutObject operation
     fn write(
         &mut self,
         id: u32,
@@ -319,787 +354,339 @@ impl Handler for SftpHandler {
         data: Vec<u8>,
     ) -> impl Future<Output = Result<Status, Self::Error>> + Send {
         let this = self.clone();
+        async move {
+            let mut guard = this.handles.write().await;
 
-        Box::pin(async move {
-            trace!("SFTP write request for handle: {} at offset: {} with {} bytes", handle, offset, data.len());
-
-            let (path, current_pos) = this.get_handle_info(&handle).ok_or(StatusCode::NoSuchFile)?;
-
-            let (bucket, key) = this.parse_path(&path)?;
-
-            if key.is_none() {
-                return Err(StatusCode::NoSuchFile);
-            }
-
-            let object_key = key.unwrap();
-
-            // Check for append operation (not supported fully without multipart, rejecting complex appends)
-            if offset != current_pos && offset != 0 {
-                this.validate_feature_support("SSH_FXP_OPEN random write / append")?;
-            }
-
-            let action = S3Action::PutObject;
-            if !is_operation_supported(crate::protocols::session::context::Protocol::Sftp, &action) {
-                return Err(StatusCode::OpUnsupported);
-            }
-
-            // Authorize the operation
-            let context = this.get_session_context()?;
-
-            debug!(
-                "SFTP operation authorized: user={}, action={}, bucket={}, object={}, source_ip={}",
-                context.session_context.access_key(),
-                action.as_str(),
-                bucket,
-                object_key,
-                context.session_context.source_ip
-            );
-
-            authorize_operation(
-                &context.session_context,
-                &action,
-                &bucket,
-                Some(&object_key),
-            ).await.map_err(|_| StatusCode::PermissionDenied)?;
-
-            let data_len = data.len();
-            // Convert Vec<u8> to StreamingBlob
-            let blob = StreamingBlob::from(s3s::Body::from(data));
-
-            let input = PutObjectInput {
-                bucket,
-                key: object_key,
-                body: Some(blob),
-                ..Default::default()
-            };
-
-            let s3_client = this.create_s3_client()?;
-            match s3_client.put_object(input).await {
-                Ok(_) => {
-                    debug!("Successfully wrote {} bytes to file", data_len);
-                    // Update position in handle
-                    if let Ok(mut inner) = this.inner.write() {
-                        if let Some(h) = inner.handles.get_mut(&handle) {
-                            h.position += data_len as u64;
-                        }
+            if let Some(HandleState::Write { file_handle, .. }) = guard.get_mut(&handle) {
+                if let Some(file) = file_handle {
+                    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                        error!("File seek failed: {}", e);
+                        return Err(StatusCode::Failure);
                     }
 
-                    Ok(Status {
-                        id,
-                        status_code: StatusCode::Ok,
-                        error_message: "Success".to_string(),
-                        language_tag: "en".to_string(),
-                    })
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    error!("Failed to put object: {}", err_msg);
-                    let s3_error = S3ErrorCode::from_protocol_error("sftp", &err_msg);
-                    let protocol_error = map_s3_error_to_protocol("sftp", &s3_error);
-                    warn!("Protocol mapped error: {}", protocol_error);
+                    if let Err(e) = file.write_all(&data).await {
+                        error!("File write failed: {}", e);
+                        return Err(StatusCode::Failure);
+                    }
+
+                    Ok(Status { id, status_code: StatusCode::Ok, error_message: "Success".into(), language_tag: "en".into() })
+                } else {
                     Err(StatusCode::Failure)
                 }
+            } else {
+                Err(StatusCode::NoSuchFile)
             }
-        })
+        }
     }
 
-    /// Handle lstat request (stat without following symlinks)
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 HeadObject operation
     fn lstat(
         &mut self,
         id: u32,
         path: String,
     ) -> impl Future<Output = Result<Attrs, Self::Error>> + Send {
-        trace!("SFTP lstat request for path: {}", path);
-        // Delegate to stat logic via self clone
         let this = self.clone();
-        Box::pin(async move {
-            this.stat_logic(id, path).await
-        })
+        async move {
+            let attrs = this.do_stat(path).await?;
+            Ok(Attrs { id, attrs })
+        }
     }
 
-    /// Handle fstat request (stat by handle)
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 HeadObject operation
     fn fstat(
         &mut self,
         id: u32,
         handle: String,
     ) -> impl Future<Output = Result<Attrs, Self::Error>> + Send {
-        trace!("SFTP fstat request for handle: {}", handle);
         let this = self.clone();
-        Box::pin(async move {
-            let (path, _) = this.get_handle_info(&handle).ok_or(StatusCode::NoSuchFile)?;
-            this.stat_logic(id, path).await
-        })
+        async move {
+            let path = {
+                let guard = this.handles.read().await;
+                match guard.get(&handle) {
+                    Some(HandleState::Read { path, .. }) => path.clone(),
+                    Some(HandleState::Write { path, .. }) => path.clone(),
+                    Some(HandleState::Dir { path, .. }) => path.clone(),
+                    None => return Err(StatusCode::NoSuchFile),
+                }
+            };
+            let attrs = this.do_stat(path).await?;
+            Ok(Attrs { id, attrs })
+        }
     }
 
-    /// Handle setstat request (set file attributes)
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 operations for supported attributes
-    fn setstat(
-        &mut self,
-        id: u32,
-        path: String,
-        _attrs: FileAttributes,
-    ) -> impl Future<Output = Result<Status, Self::Error>> + Send {
-        trace!("SFTP setstat request for path: {}", path);
-        let this = self.clone();
-
-        Box::pin(async move {
-            // Validate feature support
-            this.validate_feature_support("SSH_FXP_SETSTAT operation")?;
-
-            // S3 has limited support for file attributes
-            // We'll return success for now
-            Ok(Status {
-                id,
-                status_code: StatusCode::Ok,
-                error_message: "Success".to_string(),
-                language_tag: "en".to_string(),
-            })
-        })
-    }
-
-    /// Handle fsetstat request (set file attributes by handle)
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 operations for supported attributes
-    fn fsetstat(
-        &mut self,
-        id: u32,
-        handle: String,
-        attrs: FileAttributes,
-    ) -> impl Future<Output = Result<Status, Self::Error>> + Send {
-        trace!("SFTP fsetstat request for handle: {}", handle);
-        let this = self.clone();
-        Box::pin(async move {
-            let (path, _) = this.get_handle_info(&handle).ok_or(StatusCode::NoSuchFile)?;
-            // Reuse setstat logic via recursion (since we are in async block, we can't call self.setstat easily without creating new future)
-            // Simulating the call:
-            this.validate_feature_support("SSH_FXP_SETSTAT operation")?;
-            debug!("Ignored setstat attributes for {}: {:?}", path, attrs);
-
-            Ok(Status {
-                id,
-                status_code: StatusCode::Ok,
-                error_message: "Success".to_string(),
-                language_tag: "en".to_string(),
-            })
-        })
-    }
-
-    /// Handle directory open request
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 ListObjects operation
     fn opendir(
         &mut self,
         id: u32,
         path: String,
     ) -> impl Future<Output = Result<Handle, Self::Error>> + Send {
-        trace!("SFTP opendir request for path: {}", path);
         let this = self.clone();
+        async move {
+            debug!("SFTP Opendir: {}", path);
+            let (bucket, key_prefix) = this.parse_path(&path)?;
 
-        Box::pin(async move {
-            // We use the path as the handle for directory listing simplicity here,
-            // but wrapped in our handle tracking
-            let mut attrs = FileAttributes::default();
-            attrs.set_dir(true);
-            let handle_name = this.create_handle(path, attrs)?;
+            let action = S3Action::ListBucket;
+            authorize_operation(&this.session_context, &action, &bucket, key_prefix.as_deref())
+                .await
+                .map_err(|_| StatusCode::PermissionDenied)?;
 
-            Ok(Handle {
-                id,
-                handle: handle_name,
-            })
-        })
+            let mut builder = s3s::dto::ListObjectsV2Input::builder();
+            builder.set_bucket(bucket);
+
+            let prefix = if let Some(p) = key_prefix {
+                if p.ends_with('/') { p } else { format!("{}/", p) }
+            } else {
+                String::new()
+            };
+
+            if !prefix.is_empty() {
+                builder.set_prefix(Some(prefix));
+            }
+            builder.set_delimiter(Some("/".to_string()));
+
+            let s3_client = this.create_s3_client()?;
+            let input = builder.build().map_err(|_| StatusCode::Failure)?;
+
+            let mut files = Vec::new();
+            match s3_client.list_objects_v2(input).await {
+                Ok(output) => {
+                    if let Some(prefixes) = output.common_prefixes {
+                        for p in prefixes {
+                            if let Some(prefix_str) = p.prefix {
+                                let name = prefix_str.trim_end_matches('/').split('/').last().unwrap_or("").to_string();
+                                if !name.is_empty() {
+                                    let mut attrs = FileAttributes::default();
+                                    attrs.set_dir(true);
+                                    attrs.permissions = Some(0o755);
+                                    files.push(File {
+                                        filename: name.clone(),
+                                        longname: format!("drwxr-xr-x 1 rustfs rustfs 0 Jan 1 1970 {}", name),
+                                        attrs,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if let Some(contents) = output.contents {
+                        for obj in contents {
+                            if let Some(key) = obj.key {
+                                if key.ends_with('/') { continue; }
+                                let name = key.split('/').last().unwrap_or("").to_string();
+                                let size = obj.size.unwrap_or(0) as u64;
+                                let mut attrs = FileAttributes::default();
+                                attrs.size = Some(size);
+                                attrs.permissions = Some(0o644);
+                                if let Some(lm) = obj.last_modified {
+                                    // 修复私有字段访问，使用 From
+                                    let dt = time::OffsetDateTime::from(lm);
+                                    attrs.mtime = Some(dt.unix_timestamp() as u32);
+                                }
+                                files.push(File {
+                                    filename: name.clone(),
+                                    longname: format!("-rw-r--r-- 1 rustfs rustfs {} Jan 1 1970 {}", size, name),
+                                    attrs,
+                                });
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("S3 List failed: {}", e);
+                    return Err(StatusCode::Failure);
+                }
+            }
+
+            let handle_id = this.generate_handle_id();
+            this.handles.write().await.insert(handle_id.clone(), HandleState::Dir {
+                path,
+                files,
+                offset: 0
+            });
+
+            Ok(Handle { id, handle: handle_id })
+        }
     }
 
-    /// Handle directory list request
-    ///
-    /// MINIO CONSTRAINT: Must map to S3 ListObjects operation
     fn readdir(
         &mut self,
         id: u32,
         handle: String,
     ) -> impl Future<Output = Result<Name, Self::Error>> + Send {
-        trace!("SFTP readdir request for handle: {}", handle);
         let this = self.clone();
+        async move {
+            let mut guard = this.handles.write().await;
 
-        Box::pin(async move {
-            let (path, _) = this.get_handle_info(&handle).ok_or(StatusCode::NoSuchFile)?;
-
-            let (bucket, prefix) = match this.parse_path(&path) {
-                Ok(result) => result,
-                Err(_) => return Err(StatusCode::NoSuchFile),
-            };
-
-            // Validate feature support
-            this.validate_feature_support("SSH_FXP_READDIR operation")?;
-
-            let action = S3Action::ListBucket;
-            if !is_operation_supported(crate::protocols::session::context::Protocol::Sftp, &action) {
-                return Err(StatusCode::OpUnsupported);
-            }
-
-            // Authorize the operation
-            let context = this.get_session_context()?;
-
-            debug!(
-                "SFTP operation authorized: user={}, action={}, bucket={}, object={:?}, source_ip={}",
-                context.session_context.access_key(),
-                action.as_str(),
-                bucket,
-                prefix.as_deref(),
-                context.session_context.source_ip
-            );
-
-            authorize_operation(
-                &context.session_context,
-                &action,
-                &bucket,
-                prefix.as_deref(),
-            ).await.map_err(|_| StatusCode::PermissionDenied)?;
-
-            // List objects with prefix
-            let mut builder = s3s::dto::ListObjectsV2Input::builder();
-            builder.set_bucket(bucket.clone());
-            if let Some(p) = prefix.clone() {
-                builder.set_prefix(Option::from(p));
-            }
-            builder.set_delimiter(Some("/".to_string()));
-
-            let input = builder.build().map_err(|_| StatusCode::Failure)?;
-
-            let s3_client = this.create_s3_client()?;
-            match s3_client.list_objects_v2(input).await {
-                Ok(output) => {
-                    let mut names = Vec::new();
-
-                    // Add directories (common prefixes)
-                    if let Some(common_prefixes) = output.common_prefixes {
-                        for prefix_entry in common_prefixes {
-                            if let Some(key) = prefix_entry.prefix {
-                                let dir_name = if let Some(p) = &prefix {
-                                    key.trim_start_matches(p).trim_end_matches('/').to_string()
-                                } else {
-                                    key.trim_end_matches('/').to_string()
-                                };
-
-                                // Skip empty names
-                                if dir_name.is_empty() { continue; }
-
-                                names.push(File {
-                                    filename: dir_name,
-                                    longname: String::new(),
-                                    attrs: {
-                                        let mut attrs = FileAttributes::default();
-                                        attrs.set_dir(true);
-                                        attrs
-                                    },
-                                });
-                            }
-                        }
-                    }
-
-                    // Add files (objects)
-                    if let Some(contents) = output.contents {
-                        for object in contents {
-                            if let Some(key) = object.key {
-                                let file_name = if let Some(p) = &prefix {
-                                    key.trim_start_matches(p).to_string()
-                                } else {
-                                    key.clone()
-                                };
-
-                                // Skip empty names or exact matches to prefix (if prefix is a dir)
-                                if file_name.is_empty() || file_name == "/" { continue; }
-
-                                names.push(File {
-                                    filename: file_name,
-                                    longname: String::new(),
-                                    attrs: FileAttributes {
-                                        size: object.size.map(|s| s as u64),
-                                        ..Default::default()
-                                    },
-                                });
-                            }
-                        }
-                    }
-
-                    Ok(Name {
-                        id,
-                        files: names,
-                    })
+            if let Some(HandleState::Dir { files, offset, .. }) = guard.get_mut(&handle) {
+                if *offset >= files.len() {
+                    return Ok(Name { id, files: Vec::new() });
                 }
-                Err(e) => {
-                    error!("Failed to list objects: {}", e);
-                    Err(StatusCode::Failure)
-                }
+                let chunk = files[*offset..].to_vec();
+                *offset = files.len();
+                Ok(Name { id, files: chunk })
+            } else {
+                Err(StatusCode::NoSuchFile)
             }
-        })
+        }
     }
 
-    /// Handle file remove request
     fn remove(
         &mut self,
         id: u32,
-        path: String,
+        filename: String,
     ) -> impl Future<Output = Result<Status, Self::Error>> + Send {
-        trace!("SFTP remove request for path: {}", path);
         let this = self.clone();
-
-        Box::pin(async move {
-            let (bucket, key) = this.parse_path(&path)?;
-
-            if key.is_none() {
-                return Err(StatusCode::Failure);
-            }
-
-            let object_key = key.unwrap();
+        async move {
+            let (bucket, key_opt) = this.parse_path(&filename)?;
+            let key = key_opt.ok_or(StatusCode::NoSuchFile)?;
 
             let action = S3Action::DeleteObject;
-            if !is_operation_supported(crate::protocols::session::context::Protocol::Sftp, &action) {
-                return Err(StatusCode::OpUnsupported);
-            }
+            authorize_operation(&this.session_context, &action, &bucket, Some(&key))
+                .await
+                .map_err(|_| StatusCode::PermissionDenied)?;
 
-            // Authorize the operation
-            let context = this.get_session_context()?;
-
-            authorize_operation(
-                &context.session_context,
-                &action,
-                &bucket,
-                Some(&object_key),
-            ).await.map_err(|_| StatusCode::PermissionDenied)?;
-
-            let mut builder = s3s::dto::DeleteObjectInput::builder();
-            builder.set_bucket(bucket);
-            builder.set_key(object_key);
-            let input = builder.build().map_err(|_| StatusCode::Failure)?;
-
-            let s3_client = this.create_s3_client()?;
-            match s3_client.delete_object(input).await {
-                Ok(_) => {
-                    debug!("Successfully removed file: {}", path);
-                    Ok(Status {
-                        id,
-                        status_code: StatusCode::Ok,
-                        error_message: "Success".to_string(),
-                        language_tag: "en".to_string(),
-                    })
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    error!("Failed to delete object: {}", err_msg);
-                    let s3_error = S3ErrorCode::from_protocol_error("sftp", &err_msg);
-                    let protocol_error = map_s3_error_to_protocol("sftp", &s3_error);
-                    warn!("Protocol mapped error: {}", protocol_error);
-                    Err(StatusCode::Failure)
-                }
-            }
-        })
-    }
-
-    /// Handle directory creation request
-    fn mkdir(&mut self, id: u32, path: String, attrs: FileAttributes) -> impl Future<Output = Result<Status, Self::Error>> + Send {
-        let this = self.clone();
-
-        Box::pin(async move {
-            trace!("SFTP mkdir request for path: {} with attrs: {:?}", path, attrs);
-
-            let (bucket, key) = this.parse_path(&path)?;
-
-            let dir_key = if let Some(k) = key {
-                if k.ends_with('/') {
-                    k
-                } else {
-                    format!("{}/", k)
-                }
-            } else {
-                return Err(StatusCode::Failure);
-            };
-
-            let action = S3Action::PutObject;
-            if !is_operation_supported(crate::protocols::session::context::Protocol::Sftp, &action) {
-                return Err(StatusCode::OpUnsupported);
-            }
-
-            // Authorize the operation
-            let context = this.get_session_context()?;
-            authorize_operation(
-                &context.session_context,
-                &action,
-                &bucket,
-                Some(&dir_key),
-            ).await.map_err(|_| StatusCode::PermissionDenied)?;
-
-            // Create directory marker object
-            let blob = StreamingBlob::from(s3s::Body::from(Vec::new()));
-
-            let input = PutObjectInput {
+            let input = DeleteObjectInput {
                 bucket,
-                key: dir_key,
-                body: Some(blob),
+                key,
                 ..Default::default()
             };
 
             let s3_client = this.create_s3_client()?;
-            match s3_client.put_object(input).await {
-                Ok(_) => {
-                    debug!("Successfully created directory: {}", path);
-                    Ok(Status {
-                        id,
-                        status_code: StatusCode::Ok,
-                        error_message: "Success".to_string(),
-                        language_tag: "en".to_string(),
-                    })
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    error!("Failed to create directory marker: {}", err_msg);
-                    let s3_error = S3ErrorCode::from_protocol_error("sftp", &err_msg);
-                    let protocol_error = map_s3_error_to_protocol("sftp", &s3_error);
-                    warn!("Protocol mapped error: {}", protocol_error);
-                    Err(StatusCode::Failure)
-                }
-            }
-        })
+            s3_client.delete_object(input).await.map_err(|e| {
+                error!("Remove failed: {}", e);
+                StatusCode::Failure
+            })?;
+
+            Ok(Status { id, status_code: StatusCode::Ok, error_message: "Success".into(), language_tag: "en".into() })
+        }
     }
 
-    /// Handle directory removal request
-    fn rmdir(&mut self, id: u32, path: String) -> impl Future<Output = Result<Status, Self::Error>> + Send {
+    fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> impl Future<Output = Result<Status, Self::Error>> + Send {
         let this = self.clone();
+        async move {
+            let (bucket, key_opt) = this.parse_path(&path)?;
+            let key = key_opt.ok_or(StatusCode::Failure)?;
+            let dir_key = if key.ends_with('/') { key } else { format!("{}/", key) };
 
-        Box::pin(async move {
-            trace!("SFTP rmdir request for path: {}", path);
+            let action = S3Action::PutObject;
+            authorize_operation(&this.session_context, &action, &bucket, Some(&dir_key))
+                .await
+                .map_err(|_| StatusCode::PermissionDenied)?;
 
-            let (bucket, key) = this.parse_path(&path)?;
-
-            let dir_key = if let Some(k) = key {
-                if k.ends_with('/') {
-                    k
-                } else {
-                    format!("{}/", k)
-                }
-            } else {
-                return Err(StatusCode::Failure);
+            let empty_stream = futures::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
+            let body = StreamingBlob::wrap(empty_stream);
+            let input = PutObjectInput {
+                bucket,
+                key: dir_key,
+                body: Some(body),
+                ..Default::default()
             };
 
-            let action = S3Action::DeleteObject;
-            if !is_operation_supported(crate::protocols::session::context::Protocol::Sftp, &action) {
-                return Err(StatusCode::OpUnsupported);
-            }
-
-            // Authorize the operation
-            let context = this.get_session_context()?;
-
-            authorize_operation(
-                &context.session_context,
-                &action,
-                &bucket,
-                Some(&dir_key),
-            ).await.map_err(|_| StatusCode::PermissionDenied)?;
-
-            let mut builder = s3s::dto::DeleteObjectInput::builder();
-            builder.set_bucket(bucket);
-            builder.set_key(dir_key);
-            let input = builder.build().map_err(|_| StatusCode::Failure)?;
-
             let s3_client = this.create_s3_client()?;
-            match s3_client.delete_object(input).await {
-                Ok(_) => {
-                    debug!("Successfully removed directory: {}", path);
-                    Ok(Status {
-                        id,
-                        status_code: StatusCode::Ok,
-                        error_message: "Success".to_string(),
-                        language_tag: "en".to_string(),
-                    })
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    error!("Failed to remove directory marker: {}", err_msg);
-                    let s3_error = S3ErrorCode::from_protocol_error("sftp", &err_msg);
-                    let protocol_error = map_s3_error_to_protocol("sftp", &s3_error);
-                    warn!("Protocol mapped error: {}", protocol_error);
-                    Err(StatusCode::Failure)
-                }
-            }
-        })
+            s3_client.put_object(input).await.map_err(|e| {
+                error!("Mkdir failed: {}", e);
+                StatusCode::Failure
+            })?;
+
+            Ok(Status { id, status_code: StatusCode::Ok, error_message: "Success".into(), language_tag: "en".into() })
+        }
     }
 
-    /// Handle realpath request
+    fn rmdir(
+        &mut self,
+        id: u32,
+        path: String,
+    ) -> impl Future<Output = Result<Status, Self::Error>> + Send {
+        self.remove(id, path)
+    }
+
     fn realpath(
         &mut self,
         id: u32,
         path: String,
     ) -> impl Future<Output = Result<Name, Self::Error>> + Send {
-        trace!("SFTP realpath request for path: {}", path);
         async move {
-            // For simplicity, we'll just return the path as-is
+            let normalized = if path.starts_with('/') { path } else { format!("/{}", path) };
             Ok(Name {
                 id,
                 files: vec![File {
-                    filename: path,
-                    longname: String::new(),
+                    filename: normalized.clone(),
+                    longname: normalized,
                     attrs: FileAttributes::default(),
                 }],
             })
         }
     }
 
-    /// Handle file stat request
     fn stat(
         &mut self,
         id: u32,
         path: String,
     ) -> impl Future<Output = Result<Attrs, Self::Error>> + Send {
-        trace!("SFTP stat request for path: {}", path);
         let this = self.clone();
-        Box::pin(async move {
-            this.stat_logic(id, path).await
-        })
+        async move {
+            let attrs = this.do_stat(path).await?;
+            Ok(Attrs { id, attrs })
+        }
     }
 
-    /// Handle file rename request
-    ///
-    /// map to S3 CopyObject + DeleteObject operations
-    fn rename(&mut self, id: u32, oldpath: String, newpath: String) -> impl Future<Output = Result<Status, Self::Error>> + Send {
-        trace!("SFTP rename request from: {} to: {}", oldpath, newpath);
+    fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> impl Future<Output = Result<Status, Self::Error>> + Send {
         let this = self.clone();
+        async move {
+            debug!("SFTP Rename: {} -> {}", oldpath, newpath);
 
-        Box::pin(async move {
-            // Validate feature support
-            this.validate_feature_support("SSH_FXP_RENAME atomic rename")?;
+            let (src_bucket, src_key_opt) = this.parse_path(&oldpath)?;
+            let (dst_bucket, dst_key_opt) = this.parse_path(&newpath)?;
 
-            let (from_bucket, from_key) = this.parse_path(&oldpath)?;
-            let (to_bucket, to_key) = this.parse_path(&newpath)?;
+            let src_key = src_key_opt.ok_or(StatusCode::Failure)?;
+            let dst_key = dst_key_opt.ok_or(StatusCode::Failure)?;
 
-            if from_key.is_none() || to_key.is_none() {
+            authorize_operation(&this.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
+                .await.map_err(|_| StatusCode::PermissionDenied)?;
+
+            authorize_operation(&this.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
+                .await.map_err(|_| StatusCode::PermissionDenied)?;
+
+            let s3_client = this.create_s3_client()?;
+
+            // 使用 clone() 避免变量所有权移交后无法使用，并修正类型为 Box<str>
+            let copy_source = s3s::dto::CopySource::Bucket {
+                bucket: src_bucket.clone().into_boxed_str(),
+                key: src_key.clone().into_boxed_str(),
+                version_id: None,
+            };
+
+            // 使用 Builder 模式构建
+            let copy_input = CopyObjectInput::builder()
+                .bucket(dst_bucket)
+                .key(dst_key)
+                .copy_source(copy_source)
+                .build()
+                .map_err(|_| StatusCode::Failure)?;
+
+            if let Err(e) = s3_client.copy_object(copy_input).await {
+                error!("Rename(Copy) failed: {}", e);
                 return Err(StatusCode::Failure);
             }
 
-            let from_object_key = from_key.unwrap();
-            let to_object_key = to_key.unwrap();
-
-            // Check if this is a cross-bucket operation (not supported)
-            if from_bucket != to_bucket {
-                return Err(StatusCode::OpUnsupported);
-            }
-
-            // CopyObject operation
-            let copy_action = S3Action::CopyObject;
-            if !is_operation_supported(crate::protocols::session::context::Protocol::Sftp, &copy_action) {
-                return Err(StatusCode::OpUnsupported);
-            }
-
-            // Authorize the copy operation
-            let context = this.get_session_context()?;
-            authorize_operation(
-                &context.session_context,
-                &copy_action,
-                &to_bucket,
-                Some(&to_object_key),
-            ).await.map_err(|_| StatusCode::PermissionDenied)?;
-
-            let mut copy_builder = s3s::dto::CopyObjectInput::builder();
-            copy_builder.set_bucket(to_bucket.clone());
-            copy_builder.set_copy_source(s3s::dto::CopySource::Bucket {
-                bucket: Box::from(from_bucket.clone()),
-                key: Box::from(from_object_key.clone()),
-                version_id: None,
-            });
-            copy_builder.set_key(to_object_key.clone());
-
-            let copy_input = copy_builder.build().map_err(|_| StatusCode::Failure)?;
-
-            let s3_client = this.create_s3_client()?;
-            match s3_client.copy_object(copy_input).await {
-                Ok(_) => {
-                    debug!("Successfully copied object for rename");
-
-                    // Delete original object
-                    let delete_action = S3Action::DeleteObject;
-                    if !is_operation_supported(crate::protocols::session::context::Protocol::Sftp, &delete_action) {
-                        // Note: We are in a partial state here (Copy succeeded, Delete failed/unsupported)
-                        return Err(StatusCode::OpUnsupported);
-                    }
-
-                    // Authorize the delete operation
-                    // We need to fetch context again or reuse
-                    authorize_operation(
-                        &context.session_context,
-                        &delete_action,
-                        &from_bucket,
-                        Some(&from_object_key),
-                    ).await.map_err(|_| StatusCode::PermissionDenied)?;
-
-                    let mut del_builder = s3s::dto::DeleteObjectInput::builder();
-                    del_builder.set_bucket(from_bucket);
-                    del_builder.set_key(from_object_key);
-                    let delete_input = del_builder.build().map_err(|_| StatusCode::Failure)?;
-
-                    match s3_client.delete_object(delete_input).await {
-                        Ok(_) => {
-                            debug!("Successfully deleted original object after rename");
-                            Ok(Status {
-                                id,
-                                status_code: StatusCode::Ok,
-                                error_message: "Success".to_string(),
-                                language_tag: "en".to_string(),
-                            })
-                        }
-                        Err(e) => {
-                            let err_msg = e.to_string();
-                            error!("Failed to delete original object after copy: {}", err_msg);
-                            let s3_error = S3ErrorCode::from_protocol_error("sftp", &err_msg);
-                            let protocol_error = map_s3_error_to_protocol("sftp", &s3_error);
-                            warn!("Protocol error: {}", protocol_error);
-                            Err(StatusCode::Failure)
-                        }
-                    }
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    error!("Failed to copy object for rename: {}", err_msg);
-                    let s3_error = S3ErrorCode::from_protocol_error("sftp", &err_msg);
-                    let protocol_error = map_s3_error_to_protocol("sftp", &s3_error);
-                    warn!("Protocol error: {}", protocol_error);
-                    Err(StatusCode::Failure)
-                }
-            }
-        })
-    }
-
-    /// Handle read symbolic link request
-    ///
-    /// Symbolic links are not supported in S3
-    fn readlink(
-        &mut self,
-        _id: u32,
-        path: String,
-    ) -> impl Future<Output = Result<Name, Self::Error>> + Send {
-        trace!("SFTP readlink request for path: {}", path);
-        let this = self.clone();
-
-        Box::pin(async move {
-            // Validate feature support
-            this.validate_feature_support("SSH_FXP_READLINK operation")?;
-            // S3 doesn't support symbolic links
-            Err(StatusCode::OpUnsupported)
-        })
-    }
-
-    /// Handle symbolic link request
-    fn symlink(
-        &mut self,
-        _id: u32,
-        linkpath: String,
-        targetpath: String,
-    ) -> impl Future<Output = Result<Status, Self::Error>> + Send {
-        trace!("SFTP symlink request from: {} to: {}", linkpath, targetpath);
-        let this = self.clone();
-
-        Box::pin(async move {
-            // Validate feature support
-            this.validate_feature_support("SSH_FXP_SYMLINK operation")?;
-            // S3 doesn't support symbolic links
-            Err(StatusCode::OpUnsupported)
-        })
-    }
-
-    /// Handle extended request
-    ///
-    /// MINIO CONSTRAINT: Must handle SFTP extensions appropriately
-    fn extended(
-        &mut self,
-        _id: u32,
-        request: String,
-        _data: Vec<u8>,
-    ) -> impl Future<Output = Result<Packet, Self::Error>> + Send {
-        trace!("SFTP extended request: {}", request);
-        async move {
-            // S3 doesn't support SFTP extensions, return unsupported operation
-            Err(StatusCode::OpUnsupported)
-        }
-    }
-}
-
-// Private helper methods for SftpHandler to reuse logic
-impl SftpHandler {
-    /// Internal logic for stat operations
-    async fn stat_logic(&self, id: u32, path: String) -> Result<Attrs, StatusCode> {
-        let (bucket, key) = self.parse_path(&path)?;
-
-        if let Some(object_key) = key {
-            // Object stat request
-            let action = S3Action::HeadObject;
-            if !is_operation_supported(crate::protocols::session::context::Protocol::Sftp, &action) {
-                return Err(StatusCode::OpUnsupported);
-            }
-
-            // Authorize the operation
-            let context = self.get_session_context()?;
-            authorize_operation(
-                &context.session_context,
-                &action,
-                &bucket,
-                Some(&object_key),
-            ).await.map_err(|_| StatusCode::PermissionDenied)?;
-
-            let input = s3s::dto::HeadObjectInput {
-                bucket: bucket.clone(),
-                key: object_key.clone(),
+            let delete_input = DeleteObjectInput {
+                bucket: src_bucket,
+                key: src_key,
                 ..Default::default()
             };
 
-            let s3_client = self.create_s3_client()?;
-            match s3_client.head_object(input).await {
-                Ok(output) => {
-                    let attrs = FileAttributes {
-                        size: Some(output.content_length.unwrap_or(0) as u64),
-                        ..Default::default()
-                    };
-                    Ok(Attrs { id, attrs })
-                }
-                Err(e) => {
-                    error!("Failed to get object metadata: {}", e);
-                    Err(StatusCode::NoSuchFile)
-                }
-            }
-        } else {
-            // Directory stat request (bucket)
-            let action = S3Action::HeadBucket;
-            if !is_operation_supported(crate::protocols::session::context::Protocol::Sftp, &action) {
-                return Err(StatusCode::OpUnsupported);
+            if let Err(e) = s3_client.delete_object(delete_input).await {
+                error!("Rename(DeleteOld) failed: {}", e);
+                warn!("Orphaned file after rename");
             }
 
-            // Authorize the operation
-            let context = self.get_session_context()?;
-            authorize_operation(
-                &context.session_context,
-                &action,
-                &bucket,
-                None,
-            ).await.map_err(|_| StatusCode::PermissionDenied)?;
-
-            let input = s3s::dto::HeadBucketInput {
-                bucket: bucket.clone(),
-                expected_bucket_owner: None,
-            };
-
-            let s3_client = self.create_s3_client()?;
-            match s3_client.head_bucket(input).await {
-                Ok(_) => {
-                    let mut attrs = FileAttributes::default();
-                    attrs.set_dir(true);
-                    Ok(Attrs { id, attrs })
-                }
-                Err(e) => {
-                    error!("Failed to get bucket metadata: {}", e);
-                    Err(StatusCode::NoSuchFile)
-                }
-            }
+            Ok(Status { id, status_code: StatusCode::Ok, error_message: "Success".into(), language_tag: "en".into() })
         }
     }
 }
