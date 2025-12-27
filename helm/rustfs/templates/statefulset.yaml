@@ -41,8 +41,8 @@ spec:
           {{- toYaml .Values.affinity.nodeAffinity | nindent 10 }}
         {{- else }}
           {}
-        {{- if .Values.affinity.podAntiAffinity.enabled }}
         {{- end }}
+        {{- if .Values.affinity.podAntiAffinity.enabled }}
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
