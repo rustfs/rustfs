@@ -2830,7 +2830,6 @@ impl S3 for FS {
                 });
 
                 if has_allow_unordered {
-                    println!("has_allow_unordered");
                     return Err(S3Error::with_message(
                         S3ErrorCode::InvalidArgument,
                         "allow-unordered cannot be used with delimiter".to_string(),
