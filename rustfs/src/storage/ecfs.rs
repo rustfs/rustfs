@@ -83,7 +83,6 @@ use rustfs_ecstore::{
         StorageAPI,
         // RESERVED_METADATA_PREFIX,
     },
-    store_utils::extract_user_defined_metadata_keys,
 };
 use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
 use rustfs_filemeta::{ObjectPartInfo, RestoreStatusOps};
@@ -120,6 +119,7 @@ use rustfs_utils::{
             RESERVED_METADATA_PREFIX_LOWER,
         },
     },
+    obj::extract_user_defined_metadata,
     path::{is_dir_object, path_join_buf},
 };
 use rustfs_zip::CompressionFormat;
@@ -1023,7 +1023,7 @@ impl S3 for FS {
         }
 
         if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
-            let src_user_defined = extract_user_defined_metadata_keys(&src_info.user_defined);
+            let src_user_defined = extract_user_defined_metadata(&src_info.user_defined);
             src_user_defined.keys().for_each(|k| {
                 src_info.user_defined.remove(k);
             });
