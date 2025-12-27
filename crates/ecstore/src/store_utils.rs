@@ -54,7 +54,15 @@ pub fn clean_metadata_keys(metadata: &mut HashMap<String, String>, key_names: &[
 /// * `metadata` - The complete metadata HashMap from ObjectInfo.user_defined
 ///
 /// # Returns
-/// A new HashMap containing only user-defined metadata keys
+/// A new HashMap containing only user-defined metadata entries. Keys that use
+/// /// the user-metadata prefix (for example `x-amz-meta-`) are returned with that
+/// prefix stripped.
+///
+/// Note: The keys in the returned map may therefore differ from the keys in
+/// the input `metadata` map and cannot be used directly to remove entries
+/// from `metadata`. If you need to identify which original keys to remove,
+/// consider using an in-place filtering approach or returning the original
+/// keys instead.
 ///
 /// # Example
 /// ```
@@ -119,7 +127,7 @@ pub fn extract_user_defined_metadata_keys(metadata: &HashMap<String, String>) ->
         }
 
         // Skip other x-amz-* headers
-        if key.starts_with("x-amz-") {
+        if lower_key.starts_with("x-amz-") {
             continue;
         }
 
