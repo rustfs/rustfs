@@ -30,7 +30,7 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use rustfs_common::GlobalReadiness;
-use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_config::{MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
@@ -212,10 +212,13 @@ pub async fn start_http_server(
         info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Start Time: {now_time}");
-        if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
+        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&opt.access_key)
+            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&opt.secret_key)
+        {
             warn!(
                 "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
-                DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
+                rustfs_credentials::DEFAULT_ACCESS_KEY,
+                rustfs_credentials::DEFAULT_SECRET_KEY
             );
         }
         info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
@@ -685,14 +688,7 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
-    let token_str = rustfs_utils::get_env_opt_str(rustfs_config::ENV_GRPC_AUTH_TOKEN).unwrap_or_else(|| {
-        warn!(
-            "Environment variable RUSTFS_GRPC_AUTH_TOKEN is not set; \
-             falling back to insecure default token. \
-             Configure a strong, random token to secure gRPC access."
-        );
-        rustfs_credentials::get_global_secret_key_opt().unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string())
-    });
+    let token_str = rustfs_credentials::get_grpc_token();
 
     let token: MetadataValue<_> = token_str.parse().map_err(|e| {
         error!("Failed to parse RUSTFS_GRPC_AUTH_TOKEN into gRPC metadata value: {}", e);

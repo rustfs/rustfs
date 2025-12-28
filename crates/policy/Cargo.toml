@@ -39,7 +39,6 @@ thiserror.workspace = true
 strum = { workspace = true, features = ["derive"] }
 rustfs-crypto = { workspace = true }
 ipnetwork = { workspace = true, features = ["serde"] }
-rand.workspace = true
 base64-simd = { workspace = true }
 jsonwebtoken = { workspace = true }
 regex = { workspace = true }

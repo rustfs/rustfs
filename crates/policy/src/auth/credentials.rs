@@ -292,9 +292,9 @@ impl TryFrom<CredentialsBuilder> for Credentials {
                 return Err(Error::other("session policy is too large"));
             }
             claim["sessionPolicy"] = json!(base64_simd::STANDARD.encode_to_string(&policy_buf));
-            claim["sa-policy"] = json!("embedded-policy");
+            claim[rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA] = json!(rustfs_credentials::EMBEDDED_POLICY_TYPE);
         } else {
-            claim["sa-policy"] = json!("inherited-policy");
+            claim[rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA] = json!(rustfs_credentials::INHERITED_POLICY_TYPE);
         }
 
         if let Some(Value::Object(obj)) = value.claims {

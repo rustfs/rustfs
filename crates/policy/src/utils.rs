@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
-use rand::{Rng, RngCore};
 use serde::{Serialize, de::DeserializeOwned};
 
 pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> std::result::Result<String, jsonwebtoken::errors::Error> {

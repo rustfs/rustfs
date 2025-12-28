@@ -258,7 +258,7 @@ pub fn get_policies_from_claims(claims: &HashMap<String, Value>, policy_claim_na
 }
 
 pub fn iam_policy_claim_name_sa() -> String {
-    "sa-policy".to_string()
+    rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string()
 }
 
 pub mod default {

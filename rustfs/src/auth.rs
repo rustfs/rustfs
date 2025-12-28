@@ -665,7 +665,7 @@ mod tests {
 
     fn create_service_account_credentials() -> Credentials {
         let mut claims = HashMap::new();
-        claims.insert("sa-policy".to_string(), json!("test-policy"));
+        claims.insert(rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string(), json!("test-policy"));
 
         Credentials {
             access_key: "service-access-key".to_string(),

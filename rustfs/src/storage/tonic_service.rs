@@ -3690,7 +3690,7 @@ mod tests {
         // Serialize a valid MetricType
         let metric_type = MetricType::DISK;
         let metric_type_bytes = rmp_serde::to_vec(&metric_type).unwrap();
-        
+
         let request = Request::new(GetMetricsRequest {
             metric_type: Bytes::from(metric_type_bytes),
             opts: Bytes::from(vec![0x00u8, 0x01u8]), // Invalid rmp data

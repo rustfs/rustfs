@@ -12,19 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{DEFAULT_SECRET_KEY, ENV_GRPC_AUTH_TOKEN, IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
 use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::env;
 use std::io::Error;
 use std::sync::OnceLock;
 use time::OffsetDateTime;
 
-const IAM_POLICY_CLAIM_NAME_SA: &str = "sa-policy";
-const INHERITED_POLICY_TYPE: &str = "inherited-policy";
-
 /// Global active credentials
 static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
+
+/// Global gRPC authentication token
+static GLOBAL_GRPC_AUTH_TOKEN: OnceLock<String> = OnceLock::new();
 
 /// Initialize the global action credentials
 ///
@@ -183,6 +185,34 @@ pub fn gen_secret_key(length: usize) -> std::io::Result<String> {
     Ok(key_str)
 }
 
+/// Get the gRPC authentication token from environment variable
+///
+/// # Returns
+/// * `String` - The gRPC authentication token
+///
+pub fn get_grpc_token() -> String {
+    GLOBAL_GRPC_AUTH_TOKEN
+        .get_or_init(|| {
+            env::var(ENV_GRPC_AUTH_TOKEN)
+                .unwrap_or_else(|_| get_global_secret_key_opt().unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string()))
+        })
+        .clone()
+}
+
+/// Credentials structure
+///
+/// Fields:
+/// - access_key: Access key string
+/// - secret_key: Secret key string
+/// - session_token: Session token string
+/// - expiration: Optional expiration time as OffsetDateTime
+/// - status: Status string (e.g., "active", "off")
+/// - parent_user: Parent user string
+/// - groups: Optional list of groups
+/// - claims: Optional map of claims
+/// - name: Optional name string
+/// - description: Optional description string
+///
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Credentials {
     pub access_key: String,
@@ -248,6 +278,7 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
     use time::Duration;
 
     #[test]
