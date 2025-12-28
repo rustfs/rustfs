@@ -513,18 +513,23 @@ fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
 /// hierarchical directory traversal (delimited listing). This validation ensures
 /// conflicting parameters are caught before processing the request.
 fn validate_list_object_unordered_with_delimiter(delimiter: Option<&Delimiter>, query_string: Option<&str>) -> S3Result<()> {
-    if delimiter.is_some() {
-        if let Some(query) = query_string {
-            if let Ok(params) = from_bytes::<ListObjectUnorderedQuery>(query.as_bytes()) {
-                if params.allow_unordered.as_deref() == Some("true") {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidArgument,
-                        "The allow-unordered parameter cannot be used when delimiter is specified.".to_string(),
-                    ));
-                }
-            }
+    if delimiter.is_none() {
+        return Ok(());
+    }
+
+    let Some(query) = query_string else {
+        return Ok(());
+    };
+
+    if let Ok(params) = from_bytes::<ListObjectUnorderedQuery>(query.as_bytes()) {
+        if params.allow_unordered.as_deref() == Some("true") {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "The allow-unordered parameter cannot be used when delimiter is specified.".to_string(),
+            ));
         }
     }
+
     Ok(())
 }
 
