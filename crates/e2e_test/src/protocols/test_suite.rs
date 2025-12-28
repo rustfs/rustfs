@@ -70,15 +70,16 @@ impl ProtocolTestSuite {
         match result {
             Ok(Ok(_)) => anyhow::bail!("Expected authentication error but operation succeeded"),
             Ok(Err(e)) => {
-                if e.to_string().contains("authentication") ||
-                   e.to_string().contains("login") ||
-                   e.to_string().contains("credentials") ||
-                   e.to_string().contains("permission") {
+                if e.to_string().contains("authentication")
+                    || e.to_string().contains("login")
+                    || e.to_string().contains("credentials")
+                    || e.to_string().contains("permission")
+                {
                     Ok(())
                 } else {
                     anyhow::bail!("Expected authentication error but got: {}", e);
                 }
-            },
+            }
             Err(_) => anyhow::bail!("Test timed out waiting for authentication error"),
         }
     }
@@ -93,15 +94,16 @@ impl ProtocolTestSuite {
         match result {
             Ok(Ok(_)) => anyhow::bail!("Expected permission error but operation succeeded"),
             Ok(Err(e)) => {
-                if e.to_string().contains("permission") ||
-                   e.to_string().contains("denied") ||
-                   e.to_string().contains("access") ||
-                   e.to_string().contains("unauthorized") {
+                if e.to_string().contains("permission")
+                    || e.to_string().contains("denied")
+                    || e.to_string().contains("access")
+                    || e.to_string().contains("unauthorized")
+                {
                     Ok(())
                 } else {
                     anyhow::bail!("Expected permission error but got: {}", e);
                 }
-            },
+            }
             Err(_) => anyhow::bail!("Test timed out waiting for permission error"),
         }
     }
@@ -120,12 +122,14 @@ impl ProtocolTestSuite {
                    e.to_string().contains("no such") ||
                    e.to_string().contains("doesn't exist") ||
                    e.to_string().contains("550") || // FTP error code
-                   e.to_string().contains("NoSuchFile") { // SFTP error
+                   e.to_string().contains("NoSuchFile")
+                {
+                    // SFTP error
                     Ok(())
                 } else {
                     anyhow::bail!("Expected not found error but got: {}", e);
                 }
-            },
+            }
             Err(_) => anyhow::bail!("Test timed out waiting for not found error"),
         }
     }
@@ -146,7 +150,7 @@ impl ProtocolTestSuite {
                     if attempt < self.config.max_retries {
                         tokio::time::sleep(Duration::from_millis(1000 * attempt as u64)).await;
                     }
-                },
+                }
                 Err(_) => {
                     last_error = Some(anyhow::anyhow!("Test timed out on attempt {}", attempt));
                     if attempt < self.config.max_retries {

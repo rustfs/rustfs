@@ -21,6 +21,7 @@ pub enum S3Action {
     CreateBucket,
     DeleteBucket,
     ListBucket,
+    ListBuckets,
     HeadBucket,
 
     // Object operations
@@ -53,6 +54,7 @@ impl From<S3Action> for PolicyS3Action {
             S3Action::CreateBucket => PolicyS3Action::CreateBucketAction,
             S3Action::DeleteBucket => PolicyS3Action::DeleteBucketAction,
             S3Action::ListBucket => PolicyS3Action::ListBucketAction,
+            S3Action::ListBuckets => PolicyS3Action::ListAllMyBucketsAction,
             S3Action::HeadBucket => PolicyS3Action::HeadBucketAction,
             S3Action::GetObject => PolicyS3Action::GetObjectAction,
             S3Action::PutObject => PolicyS3Action::PutObjectAction,
@@ -86,6 +88,7 @@ impl S3Action {
             S3Action::CreateBucket => "s3:CreateBucket",
             S3Action::DeleteBucket => "s3:DeleteBucket",
             S3Action::ListBucket => "s3:ListBucket",
+            S3Action::ListBuckets => "s3:ListAllMyBuckets",
             S3Action::HeadBucket => "s3:ListBucket",
             S3Action::GetObject => "s3:GetObject",
             S3Action::PutObject => "s3:PutObject",

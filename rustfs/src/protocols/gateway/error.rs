@@ -48,13 +48,11 @@ pub fn map_s3_error_to_ftps(s3_error: &s3s::S3Error) -> libunftp::storage::Error
     match s3_error.code() {
         s3s::S3ErrorCode::NoSuchKey | s3s::S3ErrorCode::NoSuchBucket => {
             Error::new(ErrorKind::PermanentFileNotAvailable, map_s3_error_to_ftp_string(s3_error))
-        },
-        s3s::S3ErrorCode::AccessDenied => {
-            Error::new(ErrorKind::PermissionDenied, map_s3_error_to_ftp_string(s3_error))
-        },
+        }
+        s3s::S3ErrorCode::AccessDenied => Error::new(ErrorKind::PermissionDenied, map_s3_error_to_ftp_string(s3_error)),
         s3s::S3ErrorCode::InvalidRequest | s3s::S3ErrorCode::InvalidBucketName | s3s::S3ErrorCode::InvalidObjectState => {
             Error::new(ErrorKind::PermanentFileNotAvailable, map_s3_error_to_ftp_string(s3_error))
-        },
+        }
         _ => Error::new(ErrorKind::PermanentFileNotAvailable, map_s3_error_to_ftp_string(s3_error)),
     }
 }
@@ -64,15 +62,15 @@ pub fn map_s3_error_to_sftp_status(s3_error: &s3s::S3Error) -> russh_sftp::proto
     use russh_sftp::protocol::StatusCode;
 
     match s3_error.code() {
-        s3s::S3ErrorCode::NoSuchKey => StatusCode::NoSuchFile,      // SSH_FX_NO_SUCH_FILE (2)
-        s3s::S3ErrorCode::NoSuchBucket => StatusCode::NoSuchFile,  // SSH_FX_NO_SUCH_FILE (2)
-        s3s::S3ErrorCode::AccessDenied => StatusCode::PermissionDenied,   // SSH_FX_PERMISSION_DENIED (3)
+        s3s::S3ErrorCode::NoSuchKey => StatusCode::NoSuchFile, // SSH_FX_NO_SUCH_FILE (2)
+        s3s::S3ErrorCode::NoSuchBucket => StatusCode::NoSuchFile, // SSH_FX_NO_SUCH_FILE (2)
+        s3s::S3ErrorCode::AccessDenied => StatusCode::PermissionDenied, // SSH_FX_PERMISSION_DENIED (3)
         s3s::S3ErrorCode::BucketNotEmpty => StatusCode::Failure, // SSH_FX_DIR_NOT_EMPTY (21)
         s3s::S3ErrorCode::BucketAlreadyExists => StatusCode::Failure, // SSH_FX_FILE_ALREADY_EXISTS (17)
         s3s::S3ErrorCode::InvalidBucketName => StatusCode::Failure, // SSH_FX_INVALID_FILENAME (22)
         s3s::S3ErrorCode::InvalidObjectState => StatusCode::Failure, // SSH_FX_INVALID_FILENAME (22)
-        s3s::S3ErrorCode::InvalidRequest => StatusCode::OpUnsupported,  // SSH_FX_OP_UNSUPPORTED (5)
-        s3s::S3ErrorCode::InternalError => StatusCode::Failure,  // SSH_FX_FAILURE (4)
-        _ => StatusCode::Failure,  // SSH_FX_FAILURE as default
+        s3s::S3ErrorCode::InvalidRequest => StatusCode::OpUnsupported, // SSH_FX_OP_UNSUPPORTED (5)
+        s3s::S3ErrorCode::InternalError => StatusCode::Failure, // SSH_FX_FAILURE (4)
+        _ => StatusCode::Failure,                              // SSH_FX_FAILURE as default
     }
 }

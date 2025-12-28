@@ -16,11 +16,10 @@ use crate::protocols::ftps::driver::FtpsDriver;
 use crate::protocols::session::context::{Protocol as SessionProtocol, SessionContext};
 use crate::protocols::session::principal::ProtocolPrincipal;
 use libunftp::{
+    ServerError,
     auth::{AuthenticationError, UserDetail},
     options::FtpsRequired,
-    ServerError,
 };
-use rustfs_policy::auth::UserIdentity;
 use std::fmt::{Debug, Display, Formatter};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -36,28 +35,23 @@ pub struct FtpsUser {
     pub username: String,
     /// User's display name
     pub name: Option<String>,
-    /// Protocol principal containing user identity and credentials
-    pub principal: Arc<UserIdentity>,
     /// Session context for this user
     pub session_context: SessionContext,
 }
 
 impl UserDetail for FtpsUser {
-    fn account_enabled(&self) -> bool {
-        self.principal.credentials.status == "enabled"
-    }
-
     fn home(&self) -> Option<&Path> {
-        // RustFS uses a flat bucket structure or virtual paths,
-        // so we don't restrict to a specific OS-level home directory here.
-        // The Gateway layer handles S3 bucket access control.
-        None
+        // Return the root path ("/") for all users to access all buckets
+        Some(Path::new("/"))
     }
 }
 
 impl Display for FtpsUser {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FtpsUser({})", self.username)
+        match &self.name {
+            Some(display_name) => write!(f, "FtpsUser({} - {})", self.username, display_name),
+            None => write!(f, "FtpsUser({})", self.username),
+        }
     }
 }
 
@@ -72,9 +66,6 @@ pub enum FtpsInitError {
 
     #[error("invalid FTPS configuration: {0}")]
     InvalidConfig(String),
-
-    #[error("TLS initialization failed: {0}")]
-    TlsInit(String),
 }
 
 /// FTPS server configuration
@@ -105,19 +96,13 @@ impl FtpsConfig {
 
         if let Some(path) = &self.cert_file {
             if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-                return Err(FtpsInitError::InvalidConfig(format!(
-                    "Certificate file not found: {}",
-                    path
-                )));
+                return Err(FtpsInitError::InvalidConfig(format!("Certificate file not found: {}", path)));
             }
         }
 
         if let Some(path) = &self.key_file {
             if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-                return Err(FtpsInitError::InvalidConfig(format!(
-                    "Key file not found: {}",
-                    path
-                )));
+                return Err(FtpsInitError::InvalidConfig(format!("Key file not found: {}", path)));
             }
         }
 
@@ -141,24 +126,20 @@ impl FtpsConfig {
                     )));
                 }
 
-                let start = parts[0].parse::<u16>().map_err(|e| {
-                    FtpsInitError::InvalidConfig(format!("Invalid start port: {}", e))
-                })?;
-                let end = parts[1].parse::<u16>().map_err(|e| {
-                    FtpsInitError::InvalidConfig(format!("Invalid end port: {}", e))
-                })?;
+                let start = parts[0]
+                    .parse::<u16>()
+                    .map_err(|e| FtpsInitError::InvalidConfig(format!("Invalid start port: {}", e)))?;
+                let end = parts[1]
+                    .parse::<u16>()
+                    .map_err(|e| FtpsInitError::InvalidConfig(format!("Invalid end port: {}", e)))?;
 
                 if start > end {
-                    return Err(FtpsInitError::InvalidConfig(
-                        "Start port cannot be greater than end port".to_string(),
-                    ));
+                    return Err(FtpsInitError::InvalidConfig("Start port cannot be greater than end port".to_string()));
                 }
 
                 Ok(start..=end)
             }
-            None => Err(FtpsInitError::InvalidConfig(
-                "No passive ports configured".to_string(),
-            )),
+            None => Err(FtpsInitError::InvalidConfig("No passive ports configured".to_string())),
         }
     }
 }
@@ -180,17 +161,11 @@ impl FtpsServer {
     ///
     /// This method binds the listener first to ensure the port is available,
     /// then spawns the server loop in a background task.
-    pub async fn start(
-        &self,
-        mut shutdown_rx: broadcast::Receiver<()>,
-    ) -> Result<(), FtpsInitError> {
+    pub async fn start(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<(), FtpsInitError> {
         info!("Initializing FTPS server on {}", self.config.bind_addr);
 
-        // 1. Configure the server builder
-        let mut server_builder = libunftp::ServerBuilder::with_authenticator(
-            Box::new(|| FtpsDriver::new()),
-            Arc::new(FtpsAuthenticator::new()),
-        );
+        let mut server_builder =
+            libunftp::ServerBuilder::with_authenticator(Box::new(|| FtpsDriver::new()), Arc::new(FtpsAuthenticator::new()));
 
         // Configure passive ports
         if self.config.passive_ports.is_some() {
@@ -207,22 +182,16 @@ impl FtpsServer {
 
                 if self.config.ftps_required {
                     info!("FTPS is explicitly required for all connections");
-                    server_builder =
-                        server_builder.ftps_required(FtpsRequired::All, FtpsRequired::All);
+                    server_builder = server_builder.ftps_required(FtpsRequired::All, FtpsRequired::All);
                 }
             }
         } else if self.config.ftps_required {
-            return Err(FtpsInitError::InvalidConfig(
-                "FTPS required but certificates not provided".into(),
-            ));
+            return Err(FtpsInitError::InvalidConfig("FTPS required but certificates not provided".into()));
         }
 
         // Build the server instance
-        let server = server_builder
-            .build()
-            .map_err(|e| FtpsInitError::Server(e))?;
+        let server = server_builder.build().map_err(|e| FtpsInitError::Server(e))?;
 
-        // 2. Start server in background task
         // libunftp's listen() binds to the address and runs the loop
         let bind_addr = self.config.bind_addr.to_string();
         let server_handle = tokio::spawn(async move {
@@ -233,7 +202,7 @@ impl FtpsServer {
             Ok(())
         });
 
-        // 3. Wait for shutdown signal or server failure
+        // Wait for shutdown signal or server failure
         tokio::select! {
             result = server_handle => {
                 match result {
@@ -280,26 +249,19 @@ impl FtpsAuthenticator {
 #[async_trait::async_trait]
 impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
     /// Authenticate FTP user against RustFS IAM system
-    async fn authenticate(
-        &self,
-        username: &str,
-        creds: &libunftp::auth::Credentials,
-    ) -> Result<FtpsUser, AuthenticationError> {
+    async fn authenticate(&self, username: &str, creds: &libunftp::auth::Credentials) -> Result<FtpsUser, AuthenticationError> {
         use rustfs_iam::get;
         use rustfs_policy::auth::Credentials as S3Credentials;
 
         debug!("FTPS authentication attempt for user: {}", username);
 
-        // 1. Access IAM system
+        // Access IAM system
         let iam_sys = get().map_err(|e| {
             error!("IAM system unavailable during FTPS auth: {}", e);
-            AuthenticationError::ImplPropagated(
-                "Internal authentication service unavailable".to_string(),
-                Some(Box::new(e)),
-            )
+            AuthenticationError::ImplPropagated("Internal authentication service unavailable".to_string(), Some(Box::new(e)))
         })?;
 
-        // 2. Map FTP credentials to S3 Credentials structure
+        // Map FTP credentials to S3 Credentials structure
         // Note: FTP PASSWORD is treated as S3 SECRET KEY
         let s3_creds = S3Credentials {
             access_key: username.to_string(),
@@ -318,10 +280,7 @@ impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
         // 3. Validate Access Key (User existence)
         let (user_identity, is_valid) = iam_sys.check_key(&s3_creds.access_key).await.map_err(|e| {
             error!("IAM check_key failed for {}: {}", username, e);
-            AuthenticationError::ImplPropagated(
-                "Authentication verification failed".to_string(),
-                Some(Box::new(e)),
-            )
+            AuthenticationError::ImplPropagated("Authentication verification failed".to_string(), Some(Box::new(e)))
         })?;
 
         if !is_valid {
@@ -348,16 +307,12 @@ impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
         // TODO: Investigate wrapping the authenticator or using Proxy Protocol metadata if available in future libunftp versions.
         let source_ip: IpAddr = "0.0.0.0".parse().unwrap();
 
-        let session_context = SessionContext::new(
-            ProtocolPrincipal::new(Arc::new(identity.clone())),
-            SessionProtocol::Ftps,
-            source_ip,
-        );
+        let session_context =
+            SessionContext::new(ProtocolPrincipal::new(Arc::new(identity.clone())), SessionProtocol::Ftps, source_ip);
 
         let ftps_user = FtpsUser {
             username: username.to_string(),
             name: identity.credentials.name.clone(),
-            principal: Arc::new(identity),
             session_context,
         };
 

@@ -26,7 +26,6 @@ use std::net::IpAddr;
 /// Protocol types
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Protocol {
-    Ftp,
     Ftps,
     Sftp,
 }
@@ -42,9 +41,6 @@ pub struct SessionContext {
 
     /// The source IP address
     pub source_ip: IpAddr,
-
-    /// The current working directory (if applicable)
-    pub working_dir: Option<String>,
 }
 
 impl SessionContext {
@@ -54,42 +50,11 @@ impl SessionContext {
             principal,
             protocol,
             source_ip,
-            working_dir: None,
         }
-    }
-
-    /// Set the working directory
-    pub fn set_working_dir(&mut self, dir: String) {
-        self.working_dir = Some(dir);
-    }
-
-    /// Get the current working directory
-    pub fn working_dir(&self) -> Option<&str> {
-        self.working_dir.as_deref()
     }
 
     /// Get the access key for this session
     pub fn access_key(&self) -> &str {
         self.principal.access_key()
-    }
-
-    /// Resolve a path relative to the working directory
-    pub fn resolve_path(&self, path: &str) -> String {
-        if path.starts_with('/') {
-            // Absolute path
-            path.to_string()
-        } else {
-            // Relative path
-            match self.working_dir() {
-                Some(cwd) => {
-                    if cwd.ends_with('/') {
-                        format!("{}{}", cwd, path)
-                    } else {
-                        format!("{}/{}", cwd, path)
-                    }
-                }
-                None => path.to_string(),
-            }
-        }
     }
 }

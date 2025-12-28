@@ -127,7 +127,6 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
     }
 }
 
-
 /// Initialize KMS system and configure if enabled
 #[instrument(skip(opt))]
 pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
@@ -349,7 +348,7 @@ pub async fn init_ftp_system(
 /// as other services and MUST integrate with the global shutdown system.
 #[instrument(skip_all)]
 pub async fn init_sftp_system(
-    opt: &crate::config::Opt,
+    opt: &config::Opt,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::protocols::sftp::server::{SftpConfig, SftpServer};

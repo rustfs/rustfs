@@ -34,8 +34,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 // Common constants for all E2E tests
-pub const DEFAULT_ACCESS_KEY: &str = "minioadmin";
-pub const DEFAULT_SECRET_KEY: &str = "minioadmin";
+pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
+pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 pub fn workspace_root() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

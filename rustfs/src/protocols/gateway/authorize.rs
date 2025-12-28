@@ -18,32 +18,52 @@ use crate::protocols::session::context::SessionContext;
 use rustfs_iam::get;
 use rustfs_policy::policy::Args;
 use std::collections::HashMap;
+use tracing::{debug, error};
 
 /// Check if a principal is allowed to perform an S3 action
 pub async fn is_authorized(session_context: &SessionContext, action: &S3Action, bucket: &str, object: Option<&str>) -> bool {
     let iam_sys = match get() {
         Ok(sys) => sys,
-        Err(_) => return false,
+        Err(e) => {
+            error!("IAM system unavailable: {}", e);
+            return false;
+        }
     };
 
     // Create policy arguments
     let mut claims = HashMap::new();
-    claims.insert("principal".to_string(), serde_json::Value::String(session_context.principal.access_key().to_string()));
+    claims.insert(
+        "principal".to_string(),
+        serde_json::Value::String(session_context.principal.access_key().to_string()),
+    );
 
     let policy_action: rustfs_policy::policy::action::Action = action.clone().into();
+
+    // Check if user is the owner (admin)
+    let is_owner = if let Some(global_cred) = rustfs_ecstore::global::get_global_action_cred() {
+        session_context.principal.access_key() == global_cred.access_key
+    } else {
+        false
+    };
+
     let args = Args {
         account: session_context.principal.access_key(),
         groups: &session_context.principal.user_identity.credentials.groups,
         action: policy_action,
         bucket,
         conditions: &HashMap::new(),
-        is_owner: false,
+        is_owner,
         object: object.unwrap_or(""),
         claims: &claims,
         deny_only: false,
     };
 
-    iam_sys.is_allowed(&args).await
+    debug!("FTPS AUTH - Checking authorization: account={}, action={:?}, bucket='{}', object={:?}",
+           args.account, args.action, args.bucket, args.object);
+
+    let allowed = iam_sys.is_allowed(&args).await;
+    debug!("FTPS AUTH - Authorization result: {}", allowed);
+    allowed
 }
 
 /// Unified authorization entry point for all protocols
@@ -71,6 +91,4 @@ pub async fn authorize_operation(
 pub enum AuthorizationError {
     #[error("Access denied")]
     AccessDenied,
-    #[error("Invalid principal")]
-    InvalidPrincipal,
 }

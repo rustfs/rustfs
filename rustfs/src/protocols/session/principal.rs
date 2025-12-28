@@ -28,14 +28,9 @@ impl ProtocolPrincipal {
         Self { user_identity }
     }
 
-    /// Get the access key for this principal 
+    /// Get the access key for this principal
     /// TODO: sts，account service needed？ is allowed method resolve this
     pub fn access_key(&self) -> &str {
         &self.user_identity.credentials.access_key
-    }
-
-    /// Get the secret key for this principal
-    pub fn secret_key(&self) -> &str {
-        &self.user_identity.credentials.secret_key
     }
 }

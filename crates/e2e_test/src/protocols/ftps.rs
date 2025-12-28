@@ -1,19 +1,21 @@
-use crate::common::{RustFSTestEnvironment, DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
+use crate::common::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RustFSTestEnvironment};
 use crate::protocols::test_suite::{ProtocolTestSuite, TestDataFactory, wait_for_port_ready};
 use anyhow::Result;
 use rcgen::generate_simple_self_signed;
 use std::io::Cursor;
 use std::path::PathBuf;
 // 引入 suppaftp 的 native_tls 适配器
+use suppaftp::NativeTlsConnector;
 use suppaftp::native_tls::TlsConnector;
-use suppaftp::{NativeTlsConnector};
 use tracing::info;
 
 #[tokio::test]
 async fn test_ftps_explicit_tls_full_lifecycle() -> Result<()> {
     let mut test_suite = create_ftps_test_suite().await?;
 
-    let ftps_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let ftps_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let ftps_address = format!("127.0.0.1:{}", ftps_port);
 
     let cert_data = generate_ftps_certificate(&test_suite.env()).await?;
@@ -29,7 +31,11 @@ async fn test_ftps_explicit_tls_full_lifecycle() -> Result<()> {
         "--ftps-passive-ports",
         "50000-50010",
     ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(ftps_port, 30).await?;
 
@@ -44,7 +50,9 @@ async fn test_ftps_explicit_tls_full_lifecycle() -> Result<()> {
 async fn test_ftps_authentication_errors() -> Result<()> {
     let mut test_suite = create_ftps_test_suite().await?;
 
-    let ftps_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let ftps_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let ftps_address = format!("127.0.0.1:{}", ftps_port);
 
     let cert_data = generate_ftps_certificate(&test_suite.env()).await?;
@@ -60,22 +68,28 @@ async fn test_ftps_authentication_errors() -> Result<()> {
         "--ftps-passive-ports",
         "50000-50010",
     ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(ftps_port, 30).await?;
 
     // Test 1: Invalid username
-    test_suite.test_authentication_errors::<String, _, _>(|_env| {
-        let ftps_addr = ftps_address.clone();
-        async move {
-            let mut ftp_stream = suppaftp::FtpStream::connect(&ftps_addr)?;
-        let auth_result = ftp_stream.login("invalid_user", DEFAULT_SECRET_KEY);
-        if auth_result.is_ok() {
-            anyhow::bail!("Login should have failed");
-        }
-        Ok("test".to_string())
-    }
-    }).await?;
+    test_suite
+        .test_authentication_errors::<String, _, _>(|_env| {
+            let ftps_addr = ftps_address.clone();
+            async move {
+                let mut ftp_stream = suppaftp::FtpStream::connect(&ftps_addr)?;
+                let auth_result = ftp_stream.login("invalid_user", DEFAULT_SECRET_KEY);
+                if auth_result.is_ok() {
+                    anyhow::bail!("Login should have failed");
+                }
+                Ok("test".to_string())
+            }
+        })
+        .await?;
 
     Ok(())
 }
@@ -84,7 +98,9 @@ async fn test_ftps_authentication_errors() -> Result<()> {
 async fn test_ftps_file_not_found_errors() -> Result<()> {
     let mut test_suite = create_ftps_test_suite().await?;
 
-    let ftps_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let ftps_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let ftps_address = format!("127.0.0.1:{}", ftps_port);
 
     let cert_data = generate_ftps_certificate(&test_suite.env()).await?;
@@ -100,50 +116,60 @@ async fn test_ftps_file_not_found_errors() -> Result<()> {
         "--ftps-passive-ports",
         "50000-50010",
     ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(ftps_port, 30).await?;
 
     let mut ftp_stream = create_ftps_connection(&ftps_address).await?;
 
     // Test downloading non-existent file
-    test_suite.test_not_found_errors::<String, _, _>(|_env| {
-        let ftps_addr = ftps_address.clone();
-        async move {
-            let mut ftp_stream = create_ftps_connection(&ftps_addr).await?;
-        let result = ftp_stream.retr_as_buffer("non_existent_file.txt");
-        if result.is_ok() {
-            anyhow::bail!("Download should have failed");
-        }
-        Ok("download_failed".to_string())
-    }
-    }).await?;
+    test_suite
+        .test_not_found_errors::<String, _, _>(|_env| {
+            let ftps_addr = ftps_address.clone();
+            async move {
+                let mut ftp_stream = create_ftps_connection(&ftps_addr).await?;
+                let result = ftp_stream.retr_as_buffer("non_existent_file.txt");
+                if result.is_ok() {
+                    anyhow::bail!("Download should have failed");
+                }
+                Ok("download_failed".to_string())
+            }
+        })
+        .await?;
 
     // Test deleting non-existent file
-    test_suite.test_not_found_errors::<String, _, _>(|_env| {
-        let ftps_addr = ftps_address.clone();
-        async move {
-            let mut ftp_stream = create_ftps_connection(&ftps_addr).await?;
-        let result = ftp_stream.rm("non_existent_file.txt");
-        if result.is_ok() {
-            anyhow::bail!("Delete should have failed");
-        }
-        Ok("delete_failed".to_string())
-    }
-    }).await?;
+    test_suite
+        .test_not_found_errors::<String, _, _>(|_env| {
+            let ftps_addr = ftps_address.clone();
+            async move {
+                let mut ftp_stream = create_ftps_connection(&ftps_addr).await?;
+                let result = ftp_stream.rm("non_existent_file.txt");
+                if result.is_ok() {
+                    anyhow::bail!("Delete should have failed");
+                }
+                Ok("delete_failed".to_string())
+            }
+        })
+        .await?;
 
     // Test removing non-existent directory
-    test_suite.test_not_found_errors::<String, _, _>(|_env| {
-        let ftps_addr = ftps_address.clone();
-        async move {
-            let mut ftp_stream = create_ftps_connection(&ftps_addr).await?;
-        let result = ftp_stream.rmdir("non_existent_dir");
-        if result.is_ok() {
-            anyhow::bail!("Rmdir should have failed");
-        }
-        Ok("rmdir_failed".to_string())
-    }
-    }).await?;
+    test_suite
+        .test_not_found_errors::<String, _, _>(|_env| {
+            let ftps_addr = ftps_address.clone();
+            async move {
+                let mut ftp_stream = create_ftps_connection(&ftps_addr).await?;
+                let result = ftp_stream.rmdir("non_existent_dir");
+                if result.is_ok() {
+                    anyhow::bail!("Rmdir should have failed");
+                }
+                Ok("rmdir_failed".to_string())
+            }
+        })
+        .await?;
 
     ftp_stream.quit()?;
     Ok(())
@@ -153,7 +179,9 @@ async fn test_ftps_file_not_found_errors() -> Result<()> {
 async fn test_ftps_special_characters() -> Result<()> {
     let mut test_suite = create_ftps_test_suite().await?;
 
-    let ftps_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let ftps_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let ftps_address = format!("127.0.0.1:{}", ftps_port);
 
     let cert_data = generate_ftps_certificate(test_suite.env()).await?;
@@ -169,7 +197,11 @@ async fn test_ftps_special_characters() -> Result<()> {
         "--ftps-passive-ports",
         "50000-50010",
     ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(ftps_port, 30).await?;
 
@@ -178,7 +210,8 @@ async fn test_ftps_special_characters() -> Result<()> {
     let special_names = TestDataFactory::create_special_char_names();
     let test_content = "Test content with special characters: 中文测试";
 
-    for filename in special_names.iter().take(5) { // Test first 5 names
+    for filename in special_names.iter().take(5) {
+        // Test first 5 names
         info!("Testing special filename: {}", filename);
 
         // Upload
@@ -200,7 +233,9 @@ async fn test_ftps_special_characters() -> Result<()> {
 async fn test_ftps_large_file() -> Result<()> {
     let mut test_suite = create_ftps_test_suite().await?;
 
-    let ftps_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let ftps_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let ftps_address = format!("127.0.0.1:{}", ftps_port);
 
     let cert_data = generate_ftps_certificate(test_suite.env()).await?;
@@ -216,7 +251,11 @@ async fn test_ftps_large_file() -> Result<()> {
         "--ftps-passive-ports",
         "50000-50010",
     ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(ftps_port, 30).await?;
 
@@ -246,7 +285,9 @@ async fn test_ftps_large_file() -> Result<()> {
 async fn test_ftps_directory_operations() -> Result<()> {
     let mut test_suite = create_ftps_test_suite().await?;
 
-    let ftps_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let ftps_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let ftps_address = format!("127.0.0.1:{}", ftps_port);
 
     let cert_data = generate_ftps_certificate(test_suite.env()).await?;
@@ -262,7 +303,11 @@ async fn test_ftps_directory_operations() -> Result<()> {
         "--ftps-passive-ports",
         "50000-50010",
     ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(ftps_port, 30).await?;
 
@@ -315,8 +360,8 @@ async fn create_ftps_test_suite() -> Result<ProtocolTestSuite> {
 
 async fn generate_ftps_certificate(env: &RustFSTestEnvironment) -> Result<FtpsCertData> {
     let cert = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
-    let cert_pem = cert.serialize_pem()?;
-    let key_pem = cert.serialize_private_key_pem();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
 
     let cert_path = PathBuf::from(&env.temp_dir).join("ftps.crt");
     let key_path = PathBuf::from(&env.temp_dir).join("ftps.key");

@@ -17,13 +17,11 @@
 use super::action::S3Action;
 use crate::protocols::session::context::Protocol;
 
-
-
 /// Check if an operation is supported for the given protocol
 pub fn is_operation_supported(protocol: Protocol, action: &S3Action) -> bool {
     match protocol {
-        Protocol::Ftp | Protocol::Ftps => {
-            // FTP/FTPS limitations - no native append support
+        Protocol::Ftps => {
+            // FTPS limitations - no native append support
             match action {
                 S3Action::PutObject => true, // STOR and APPE both map to PutObject
                 _ => true,
@@ -35,4 +33,3 @@ pub fn is_operation_supported(protocol: Protocol, action: &S3Action) -> bool {
         }
     }
 }
-

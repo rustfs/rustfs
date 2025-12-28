@@ -19,44 +19,32 @@
 
 use crate::protocols::client::s3::ProtocolS3Client;
 use crate::protocols::gateway::action::S3Action;
-use crate::protocols::gateway::adapter::{is_operation_supported};
+use crate::protocols::gateway::adapter::is_operation_supported;
 use crate::protocols::gateway::authorize::authorize_operation;
 use crate::protocols::gateway::error::map_s3_error_to_ftps;
 use crate::protocols::gateway::restrictions::{get_s3_equivalent_operation, is_ftp_feature_supported};
 use crate::protocols::session::context::SessionContext;
 use async_trait::async_trait;
+use futures::stream;
 use futures_util::TryStreamExt;
 use libunftp::storage::{Error, ErrorKind, Fileinfo, Metadata, Result, StorageBackend};
 use s3s::dto::StreamingBlob;
 use s3s::dto::{GetObjectInput, PutObjectInput};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncRead};
+use tokio::io::AsyncRead;
+use tokio_stream::Stream;
 use tracing::{debug, error, trace};
 
 /// FTPS storage driver implementation
 #[derive(Debug)]
 pub struct FtpsDriver {
-    /// Session context for this driver
-    session_context: Option<SessionContext>,
 }
 
 impl FtpsDriver {
     /// Create a new FTPS driver
     pub fn new() -> Self {
-        Self {
-            session_context: None,
-        }
-    }
-
-    /// Set session context for this driver
-    pub fn set_session_context(&mut self, session_context: SessionContext) {
-        self.session_context = Some(session_context);
-    }
-
-    /// Get session context reference
-    pub fn session_context(&self) -> Option<&SessionContext> {
-        self.session_context.as_ref()
+        Self { }
     }
 
     /// Validate FTP feature support
@@ -80,29 +68,151 @@ impl FtpsDriver {
 
     /// Create ProtocolS3Client for the given user
     fn create_s3_client_for_user(&self, user: &super::server::FtpsUser) -> Result<ProtocolS3Client> {
-        let session_context = self.get_session_context_from_user(user)?;
+        let session_context = &user.session_context;
         let fs = crate::storage::ecfs::FS {};
 
         let s3_client = ProtocolS3Client::new(fs, session_context.access_key().to_string());
         Ok(s3_client)
     }
 
+    
+    /// List all buckets (for root path)
+    async fn list_buckets(&self, user: &super::server::FtpsUser, session_context: &SessionContext) -> Result<Vec<Fileinfo<PathBuf, FtpsMetadata>>> {
+        debug!("FTPS LIST - listing all buckets for root path");
+
+        let s3_client = self.create_s3_client_for_user(user)?;
+
+        let action = S3Action::ListBuckets;
+        if !is_operation_supported(crate::protocols::session::context::Protocol::Ftps, &action) {
+            error!("FTPS LIST - ListBuckets operation not supported for FTPS protocol");
+            return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Operation not supported"));
+        }
+
+        // Authorize the operation
+        debug!("FTPS LIST - authorizing ListBuckets operation with empty bucket");
+        match authorize_operation(session_context, &action, "", None).await {
+            Ok(_) => debug!("FTPS LIST - ListBuckets authorization successful"),
+            Err(e) => {
+                error!("FTPS LIST - ListBuckets authorization failed: {}", e);
+                return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"));
+            }
+        }
+
+        let mut list_result = Vec::new();
+
+        // List all buckets
+        let input = s3s::dto::ListBucketsInput::builder()
+            .build()
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build ListBucketsInput"))?;
+
+        // Get the real secret key from the authenticated user
+        let secret_key = &session_context.principal.user_identity.credentials.secret_key;
+        debug!("FTPS LIST - calling S3 list_buckets with access_key: {}", session_context.principal.access_key());
+
+        match s3_client.list_buckets(input, secret_key).await {
+            Ok(output) => {
+                debug!("FTPS LIST - S3 list_buckets succeeded, buckets count: {:?}",
+                       output.buckets.as_ref().map(|b| b.len()).unwrap_or(0));
+                if let Some(buckets) = output.buckets {
+                    for bucket in buckets {
+                        if let Some(ref bucket_name) = bucket.name {
+                            debug!("FTPS LIST - found bucket: '{}'", bucket_name);
+
+                            let metadata = FtpsMetadata {
+                                size: 0,
+                                is_directory: true,
+                                modification_time: bucket
+                                    .creation_date
+                                    .map(|t| {
+                                        let offset_datetime: time::OffsetDateTime = t.into();
+                                        offset_datetime.unix_timestamp() as u64
+                                    })
+                                    .unwrap_or(0),
+                            };
+
+                            list_result.push(Fileinfo {
+                                path: PathBuf::from(bucket_name),
+                                metadata,
+                            });
+                        }
+                    }
+                }
+
+                debug!("FTPS LIST - successfully listed {} buckets", list_result.len());
+                Ok(list_result)
+            }
+            Err(e) => {
+                error!("FTPS LIST - Failed to list buckets: {}", e);
+                debug!("FTPS LIST - S3 list_buckets failed, error: {:?}", e);
+                let protocol_error = map_s3_error_to_ftps(&e);
+                Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
+            }
+        }
+    }
+
+    /// Create bucket
+    async fn create_bucket(&self, user: &super::server::FtpsUser, session_context: &SessionContext, bucket: &str) -> Result<()> {
+        debug!("FTPS CREATE_BUCKET - bucket: '{}'", bucket);
+
+        let s3_client = self.create_s3_client_for_user(user)?;
+
+        let action = S3Action::CreateBucket;
+        if !is_operation_supported(crate::protocols::session::context::Protocol::Ftps, &action) {
+            error!("FTPS CREATE_BUCKET - operation not supported for FTPS protocol");
+            return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Operation not supported"));
+        }
+
+        // Authorize the operation
+        debug!("FTPS CREATE_BUCKET - authorizing bucket creation");
+        match authorize_operation(session_context, &action, bucket, None).await {
+            Ok(_) => debug!("FTPS CREATE_BUCKET - authorization successful"),
+            Err(e) => {
+                error!("FTPS CREATE_BUCKET - authorization failed: {}", e);
+                return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"));
+            }
+        }
+
+        // Create bucket
+        let mut input_builder = s3s::dto::CreateBucketInput::builder();
+        input_builder.set_bucket(bucket.to_string());
+        let input = input_builder
+            .build()
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build CreateBucketInput"))?;
+
+        match s3_client.create_bucket(input).await {
+            Ok(_) => {
+                debug!("FTPS CREATE_BUCKET - successfully created bucket: '{}'", bucket);
+                Ok(())
+            }
+            Err(e) => {
+                error!("FTPS CREATE_BUCKET - failed to create bucket: '{}', error: {}", bucket, e);
+                let protocol_error = map_s3_error_to_ftps(&e);
+                Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
+            }
+        }
+    }
+
     /// Get bucket and key from path
     fn parse_path(&self, path: &str) -> Result<(String, Option<String>)> {
+        debug!("FTPS parse_path - input: '{}'", path);
         let path = path.trim_start_matches('/');
         if path.is_empty() {
+            error!("FTPS parse_path - empty path after trimming");
             return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Invalid path"));
         }
 
         let parts: Vec<&str> = path.split('/').collect();
         let bucket = parts[0].to_string();
+        debug!("FTPS parse_path - bucket: '{}', parts count: {}", bucket, parts.len());
 
         if parts.len() == 1 {
             // Only bucket specified
+            debug!("FTPS parse_path - only bucket specified: '{}'", bucket);
             Ok((bucket, None))
         } else {
             // Bucket and object key
             let key = parts[1..].join("/");
+            debug!("FTPS parse_path - bucket: '{}', key: '{}'", bucket, key);
             Ok((bucket, Some(key)))
         }
     }
@@ -113,11 +223,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     type Metadata = FtpsMetadata;
 
     /// Get file metadata
-    async fn metadata<P: AsRef<Path> + Send + Debug>(
-        &self,
-        user: &super::server::FtpsUser,
-        path: P,
-    ) -> Result<Self::Metadata> {
+    async fn metadata<P: AsRef<Path> + Send + Debug>(&self, user: &super::server::FtpsUser, path: P) -> Result<Self::Metadata> {
         trace!("FTPS metadata request for path: {:?}", path);
 
         let s3_client = self.create_s3_client_for_user(user)?;
@@ -132,33 +238,27 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
                 return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Operation not supported"));
             }
 
-
             // Authorize the operation
-            if let Some(session_context) = self.session_context() {
-                // Log the operation for audit purposes
-                debug!(
-                    "FTPS operation authorized: user={}, action={}, bucket={}, object={}, source_ip={}",
-                    session_context.access_key(),
-                    action.as_str(),
-                    bucket,
-                    object_key,
-                    session_context.source_ip
-                );
+            let session_context = self.get_session_context_from_user(user)?;
+            // Log the operation for audit purposes
+            debug!(
+                "FTPS operation authorized: user={}, action={}, bucket={}, object={}, source_ip={}",
+                session_context.access_key(),
+                action.as_str(),
+                bucket,
+                object_key,
+                session_context.source_ip
+            );
 
-                authorize_operation(
-                    session_context,
-                    &action,
-                    &bucket,
-                    Some(&object_key),
-                ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
-            } else {
-                return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "No session context"));
-            }
+            authorize_operation(&session_context, &action, &bucket, Some(&object_key))
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
             let mut builder = s3s::dto::HeadObjectInput::builder();
             builder.set_bucket(bucket.clone());
             builder.set_key(object_key.clone());
-            let input = builder.build()
+            let input = builder
+                .build()
                 .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build HeadObjectInput"))?;
 
             match s3_client.head_object(input).await {
@@ -166,9 +266,13 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
                     let metadata = FtpsMetadata {
                         size: output.content_length.unwrap_or(0) as u64,
                         is_directory: false,
-                        modification_time: output.last_modified.map(|t| { let offset_datetime: time::OffsetDateTime = t.into();
-                            offset_datetime.unix_timestamp() as u64
-                        }).unwrap_or(0),
+                        modification_time: output
+                            .last_modified
+                            .map(|t| {
+                                let offset_datetime: time::OffsetDateTime = t.into();
+                                offset_datetime.unix_timestamp() as u64
+                            })
+                            .unwrap_or(0),
                     };
                     Ok(metadata)
                 }
@@ -185,20 +289,15 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
             }
 
             // Authorize the operation
-            if let Some(session_context) = self.session_context() {
-                authorize_operation(
-                    session_context,
-                    &action,
-                    &bucket,
-                    None,
-                ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
-            } else {
-                return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "No session context"));
-            }
+            let session_context = self.get_session_context_from_user(user)?;
+            authorize_operation(&session_context, &action, &bucket, None)
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
             let mut builder = s3s::dto::HeadBucketInput::builder();
             builder.set_bucket(bucket.clone());
-            let input = builder.build()
+            let input = builder
+                .build()
                 .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build HeadBucketInput"))?;
 
             match s3_client.head_bucket(input).await {
@@ -224,13 +323,23 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         user: &super::server::FtpsUser,
         path: P,
     ) -> Result<Vec<Fileinfo<PathBuf, Self::Metadata>>> {
-        trace!("FTPS list request for path: {:?}", path);
+        let path_debug = format!("{:?}", path);
+        debug!("FTPS LIST request - user: {}, path: {}", user.username, path_debug);
 
         let s3_client = self.create_s3_client_for_user(user)?;
         let session_context = self.get_session_context_from_user(user)?;
 
         let path_str = path.as_ref().to_string_lossy();
+        debug!("FTPS LIST - parsing path: '{}'", path_str);
+
+        // Check if this is root path listing
+        if path_str == "/" {
+            debug!("FTPS LIST - root path listing, using ListBuckets");
+            return self.list_buckets(user, &session_context).await;
+        }
+
         let (bucket, prefix) = self.parse_path(&path_str)?;
+        debug!("FTPS LIST - parsed bucket: '{}', prefix: {:?}", bucket, prefix);
 
         // Validate feature support
         self.validate_feature_support("LIST command")?;
@@ -241,12 +350,14 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         }
 
         // Authorize the operation
-        authorize_operation(
-            &session_context,
-            &action,
-            &bucket,
-            prefix.as_deref(),
-        ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+        debug!("FTPS LIST - authorizing operation for bucket: '{}', prefix: {:?}", bucket, prefix);
+        match authorize_operation(&session_context, &action, &bucket, prefix.as_deref()).await {
+            Ok(_) => debug!("FTPS LIST - authorization successful"),
+            Err(e) => {
+                error!("FTPS LIST - authorization failed: {}", e);
+                return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"));
+            }
+        }
 
         let mut list_result = Vec::new();
 
@@ -255,7 +366,8 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         builder.set_bucket(bucket.clone());
         builder.set_prefix(prefix.clone());
         builder.set_delimiter(Option::from("/".to_string()));
-        let input = builder.build()
+        let input = builder
+            .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build ListObjectsV2Input"))?;
 
         match s3_client.list_objects_v2(input).await {
@@ -289,10 +401,13 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
                             let metadata = FtpsMetadata {
                                 size: object.size.unwrap_or(0) as u64,
                                 is_directory: false,
-                                modification_time: object.last_modified.map(|t| {
-                                    let offset_datetime: time::OffsetDateTime = t.into();
-                                    offset_datetime.unix_timestamp() as u64
-                                }).unwrap_or(0),
+                                modification_time: object
+                                    .last_modified
+                                    .map(|t| {
+                                        let offset_datetime: time::OffsetDateTime = t.into();
+                                        offset_datetime.unix_timestamp() as u64
+                                    })
+                                    .unwrap_or(0),
                             };
 
                             list_result.push(Fileinfo {
@@ -340,22 +455,22 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         }
 
         // Authorize the operation
-        authorize_operation(
-            &session_context,
-            &action,
-            &bucket,
-            Some(&object_key),
-        ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+        authorize_operation(&session_context, &action, &bucket, Some(&object_key))
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         let mut builder = GetObjectInput::builder();
         builder.set_bucket(bucket);
         builder.set_key(object_key);
-        let mut input = builder.build()
+        let mut input = builder
+            .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build GetObjectInput"))?;
 
         if start_pos > 0 {
-            input.range = Some(s3s::dto::Range::parse(&format!("bytes={}-", start_pos))
-                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Invalid range format"))?);
+            input.range = Some(
+                s3s::dto::Range::parse(&format!("bytes={}-", start_pos))
+                    .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Invalid range format"))?,
+            );
         }
 
         match s3_client.get_object(input).await {
@@ -411,37 +526,49 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         }
 
         // Authorize the operation
-        authorize_operation(
-            &session_context,
-            &action,
-            &bucket,
-            Some(&object_key),
-        ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+        authorize_operation(&session_context, &action, &bucket, Some(&object_key))
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         // Convert AsyncRead to bytes
         let bytes_vec = {
             let mut buffer = Vec::new();
             let mut reader = input;
-            tokio::io::copy(&mut reader, &mut buffer).await
+            tokio::io::copy(&mut reader, &mut buffer)
+                .await
                 .map_err(|e| Error::new(ErrorKind::TransientFileNotAvailable, e.to_string()))?;
             buffer
         };
 
+        let file_size = bytes_vec.len();
+        debug!("FTPS put - read {} bytes from input", file_size);
+
         let mut put_builder = PutObjectInput::builder();
         put_builder.set_bucket(bucket.clone());
         put_builder.set_key(object_key.clone());
-        put_builder.set_body(Some(StreamingBlob::from(s3s::Body::from(bytes_vec.clone()))));
-        let put_input = put_builder.build()
+        put_builder.set_content_length(Some(file_size as i64));  // 设置content_length！
+        // Create StreamingBlob with known size
+        let data_bytes = bytes::Bytes::from(bytes_vec);
+        let stream = stream::once(async move { Ok::<bytes::Bytes, std::io::Error>(data_bytes) });
+        let streaming_blob = StreamingBlob::wrap(stream);
+        debug!("FTPS put - StreamingBlob created, size hint: {:?}", streaming_blob.size_hint());
+        debug!("FTPS put - actual data size: {} bytes", file_size);
+        put_builder.set_body(Some(streaming_blob));
+        let put_input = put_builder
+            .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build PutObjectInput"))?;
 
+        debug!("FTPS put - calling S3 put_object with bucket: '{}', key: '{}', size: {} bytes", bucket, object_key, file_size);
+        debug!("FTPS put - PutObjectInput body size hint: {:?}", put_input.body.as_ref().map(|b| b.size_hint()));
         match s3_client.put_object(put_input).await {
             Ok(output) => {
                 debug!("Successfully put object: {:?}", output);
                 // Return the size of the uploaded object
-                Ok(bytes_vec.len() as u64)
+                Ok(file_size as u64)
             }
             Err(e) => {
                 error!("Failed to put object: {}", e);
+                error!("FTPS put - S3 error details: {:?}", e);
                 let protocol_error = map_s3_error_to_ftps(&e);
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
             }
@@ -449,11 +576,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Delete file
-    async fn del<P: AsRef<Path> + Send + Debug>(
-        &self,
-        user: &super::server::FtpsUser,
-        path: P,
-    ) -> Result<()> {
+    async fn del<P: AsRef<Path> + Send + Debug>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         trace!("FTPS delete request for path: {:?}", path);
 
         let s3_client = self.create_s3_client_for_user(user)?;
@@ -474,17 +597,15 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         }
 
         // Authorize the operation
-        authorize_operation(
-            &session_context,
-            &action,
-            &bucket,
-            Some(&object_key),
-        ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+        authorize_operation(&session_context, &action, &bucket, Some(&object_key))
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         let mut builder = s3s::dto::DeleteObjectInput::builder();
         builder.set_bucket(bucket);
         builder.set_key(object_key);
-        let input = builder.build()
+        let input = builder
+            .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build DeleteObjectInput"))?;
 
         match s3_client.delete_object(input).await {
@@ -501,27 +622,25 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Create directory
-    async fn mkd<P: AsRef<Path> + Send + Debug>(
-        &self,
-        user: &super::server::FtpsUser,
-        path: P,
-    ) -> Result<()> {
-        trace!("FTPS mkdir request for path: {:?}", path);
+    async fn mkd<P: AsRef<Path> + Send + Debug>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
+        let path_debug = format!("{:?}", path);
+        debug!("FTPS MKDIR request - user: {}, path: {}", user.username, path_debug);
 
         let s3_client = self.create_s3_client_for_user(user)?;
         let session_context = self.get_session_context_from_user(user)?;
 
         let path_str = path.as_ref().to_string_lossy();
+        debug!("FTPS MKDIR - parsing path: '{}'", path_str);
         let (bucket, key) = self.parse_path(&path_str)?;
+        debug!("FTPS MKDIR - parsed bucket: '{}', key: {:?}", bucket, key);
 
         let dir_key = if let Some(k) = key {
-            if k.ends_with('/') {
-                k
-            } else {
-                format!("{}/", k)
-            }
+            // Creating directory inside bucket
+            if k.ends_with('/') { k } else { format!("{}/", k) }
         } else {
-            return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot create bucket"));
+            // Creating bucket - use CreateBucket action instead of PutObject
+            debug!("FTPS MKDIR - Creating bucket: '{}'", bucket);
+            return self.create_bucket(user, &session_context, &bucket).await;
         };
 
         let action = S3Action::PutObject;
@@ -530,19 +649,17 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         }
 
         // Authorize the operation
-        authorize_operation(
-            &session_context,
-            &action,
-            &bucket,
-            Some(&dir_key),
-        ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+        authorize_operation(&session_context, &action, &bucket, Some(&dir_key))
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         // Create directory marker object
         let mut input_builder = PutObjectInput::builder();
         input_builder.set_bucket(bucket);
         input_builder.set_key(dir_key);
         input_builder.set_body(Some(StreamingBlob::from(s3s::Body::from(Vec::new()))));
-        let input = input_builder.build()
+        let input = input_builder
+            .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build PutObjectInput"))?;
 
         match s3_client.put_object(input).await {
@@ -559,12 +676,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Rename file or directory
-    async fn rename<P: AsRef<Path> + Send + Debug>(
-        &self,
-        user: &super::server::FtpsUser,
-        from: P,
-        to: P,
-    ) -> Result<()> {
+    async fn rename<P: AsRef<Path> + Send + Debug>(&self, user: &super::server::FtpsUser, from: P, to: P) -> Result<()> {
         trace!("FTPS rename request from: {:?} to: {:?}", from, to);
 
         let s3_client = self.create_s3_client_for_user(user)?;
@@ -598,12 +710,9 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         }
 
         // Authorize the copy operation
-        authorize_operation(
-            &session_context,
-            &copy_action,
-            &to_bucket,
-            Some(&to_object_key),
-        ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+        authorize_operation(&session_context, &copy_action, &to_bucket, Some(&to_object_key))
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         let mut copy_builder = s3s::dto::CopyObjectInput::builder();
         copy_builder.set_bucket(to_bucket.clone());
@@ -613,7 +722,8 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
             version_id: None,
         });
         copy_builder.set_key(to_object_key.clone());
-        let copy_input = copy_builder.build()
+        let copy_input = copy_builder
+            .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build CopyObjectInput"))?;
 
         match s3_client.copy_object(copy_input).await {
@@ -626,17 +736,15 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
                 }
 
                 // Authorize the delete operation
-                authorize_operation(
-                    &session_context,
-                    &delete_action,
-                    &from_bucket,
-                    Some(&from_object_key),
-                ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+                authorize_operation(&session_context, &delete_action, &from_bucket, Some(&from_object_key))
+                    .await
+                    .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
                 let mut builder = s3s::dto::DeleteObjectInput::builder();
                 builder.set_bucket(from_bucket.to_string());
                 builder.set_key(from_object_key);
-                let delete_input = builder.build()
+                let delete_input = builder
+                    .build()
                     .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build DeleteObjectInput"))?;
 
                 match s3_client.delete_object(delete_input).await {
@@ -660,11 +768,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
     }
 
     /// Remove directory
-    async fn rmd<P: AsRef<Path> + Send + Debug>(
-        &self,
-        user: &super::server::FtpsUser,
-        path: P,
-    ) -> Result<()> {
+    async fn rmd<P: AsRef<Path> + Send + Debug>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         trace!("FTPS rmdir request for path: {:?}", path);
 
         let s3_client = self.create_s3_client_for_user(user)?;
@@ -674,11 +778,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         let (bucket, key) = self.parse_path(&path_str)?;
 
         let dir_key = if let Some(k) = key {
-            if k.ends_with('/') {
-                k
-            } else {
-                format!("{}/", k)
-            }
+            if k.ends_with('/') { k } else { format!("{}/", k) }
         } else {
             return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot remove bucket"));
         };
@@ -689,17 +789,15 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         }
 
         // Authorize the operation
-        authorize_operation(
-            &session_context,
-            &action,
-            &bucket,
-            Some(&dir_key),
-        ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+        authorize_operation(&session_context, &action, &bucket, Some(&dir_key))
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         let mut builder = s3s::dto::DeleteObjectInput::builder();
         builder.set_bucket(bucket);
         builder.set_key(dir_key);
-        let input = builder.build()
+        let input = builder
+            .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build DeleteObjectInput"))?;
 
         match s3_client.delete_object(input).await {
@@ -717,32 +815,60 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
 
     /// Change working directory
     async fn cwd<P: AsRef<Path> + Send + Debug>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
-        trace!("FTPS cwd request for path: {:?}", path);
+        debug!("FTPS cwd request for path: {:?}", path);
 
         let session_context = self.get_session_context_from_user(user)?;
-
         let path_str = path.as_ref().to_string_lossy();
+
+        // Handle special cases
+        if path_str == "/" {
+            // cd to root directory - always allowed
+            debug!("FTPS cwd - changing to root directory");
+            return Ok(());
+        }
+
+        if path_str == ".." {
+            // cd .. from root directory should fail
+            error!("FTPS cwd - cannot go above root directory");
+            return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot go above root directory"));
+        }
+
+        // Parse the path
         let (bucket, _key) = self.parse_path(&path_str)?;
+        debug!("FTPS cwd - parsed bucket: '{}', key: {:?}", bucket, _key);
 
         // Validate feature support
         self.validate_feature_support("CWD command")?;
 
-        // For S3, changing directory is a no-op since there are no real directories
-        // We just need to verify that the bucket exists and the user has access to it
-        let action = S3Action::ListBucket;
+        // Verify that the bucket exists by trying to list it
+        let s3_client = self.create_s3_client_for_user(user)?;
+        let action = S3Action::HeadBucket;
         if !is_operation_supported(crate::protocols::session::context::Protocol::Ftps, &action) {
             return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Operation not supported"));
         }
 
-        // Authorize the operation
-        authorize_operation(
-            &session_context,
-            &action,
-            &bucket,
-            None,
-        ).await.map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+        // Authorize the operation first
+        authorize_operation(&session_context, &action, &bucket, None)
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
-        Ok(())
+        // Check if bucket actually exists
+        let mut builder = s3s::dto::HeadBucketInput::builder();
+        builder.set_bucket(bucket.clone());
+        let input = builder
+            .build()
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build HeadBucketInput"))?;
+
+        match s3_client.head_bucket(input).await {
+            Ok(_) => {
+                debug!("FTPS cwd - bucket '{}' exists and is accessible", bucket);
+                Ok(())
+            }
+            Err(e) => {
+                error!("FTPS cwd - bucket '{}' does not exist or access denied: {}", bucket, e);
+                Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Directory not found"))
+            }
+        }
     }
 }
 
@@ -804,5 +930,4 @@ impl Metadata for FtpsMetadata {
     fn links(&self) -> u64 {
         1
     }
-
 }

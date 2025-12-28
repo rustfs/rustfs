@@ -18,5 +18,5 @@
 //! It uses russh and russh-sftp as the SFTP server implementation and integrates
 //! with the RustFS gateway for S3 operations.
 
-pub mod server;
 pub mod handler;
+pub mod server;

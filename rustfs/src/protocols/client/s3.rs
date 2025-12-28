@@ -14,8 +14,10 @@
 
 use crate::storage::ecfs::FS;
 use http::{HeaderMap, Method};
+use rustfs_policy::auth;
 use s3s::dto::*;
-use s3s::{S3Request, S3Result, S3};
+use s3s::{S3, S3Request, S3Result};
+use tokio_stream::Stream;
 use tracing::trace;
 
 /// S3 client for internal protocol use
@@ -34,7 +36,7 @@ impl ProtocolS3Client {
 
     /// Get object - maps to S3 GetObject
     pub async fn get_object(&self, input: GetObjectInput) -> S3Result<GetObjectOutput> {
-        trace!("Protocol S3 client GetObject request: bucket={}, key={:?}", input.bucket, input.key);
+        trace!("Protocol S3 client GetObject request: bucket={}, key={:?}, access_key={}", input.bucket, input.key, self.access_key);
         // Go through standard S3 API path
         let uri: http::Uri = format!("/{}{}", input.bucket, input.key.as_str()).parse().unwrap_or_default();
         let req = S3Request {
@@ -54,13 +56,25 @@ impl ProtocolS3Client {
 
     /// Put object - maps to S3 PutObject
     pub async fn put_object(&self, input: PutObjectInput) -> S3Result<PutObjectOutput> {
-        trace!("Protocol S3 client PutObject request: bucket={}, key={:?}", input.bucket, input.key);
+        trace!("Protocol S3 client PutObject request: bucket={}, key={:?}, access_key={}", input.bucket, input.key, self.access_key);
         let uri: http::Uri = format!("/{}{}", input.bucket, input.key.as_str()).parse().unwrap_or_default();
+
+        // Set required headers for put operation
+        let mut headers = HeaderMap::default();
+        if let Some(ref body) = input.body {
+            let (lower, upper) = body.size_hint();
+            if let Some(len) = upper {
+                headers.insert("content-length", len.to_string().parse().unwrap());
+            } else if lower > 0 {
+                headers.insert("content-length", lower.to_string().parse().unwrap());
+            }
+        }
+
         let req = S3Request {
             input,
             method: Method::PUT,
             uri,
-            headers: HeaderMap::default(),
+            headers,
             extensions: http::Extensions::default(),
             credentials: None,
             region: None,
@@ -73,7 +87,7 @@ impl ProtocolS3Client {
 
     /// Delete object - maps to S3 DeleteObject
     pub async fn delete_object(&self, input: DeleteObjectInput) -> S3Result<DeleteObjectOutput> {
-        trace!("Protocol S3 client DeleteObject request: bucket={}, key={:?}", input.bucket, input.key);
+        trace!("Protocol S3 client DeleteObject request: bucket={}, key={:?}, access_key={}", input.bucket, input.key, self.access_key);
         let uri: http::Uri = format!("/{}{}", input.bucket, input.key.as_str()).parse().unwrap_or_default();
         let req = S3Request {
             input,
@@ -92,7 +106,7 @@ impl ProtocolS3Client {
 
     /// Head object - maps to S3 HeadObject
     pub async fn head_object(&self, input: HeadObjectInput) -> S3Result<HeadObjectOutput> {
-        trace!("Protocol S3 client HeadObject request: bucket={}, key={:?}", input.bucket, input.key);
+        trace!("Protocol S3 client HeadObject request: bucket={}, key={:?}, access_key={}", input.bucket, input.key, self.access_key);
         let uri: http::Uri = format!("/{}{}", input.bucket, input.key.as_str()).parse().unwrap_or_default();
         let req = S3Request {
             input,
@@ -111,7 +125,7 @@ impl ProtocolS3Client {
 
     /// Head bucket - maps to S3 HeadBucket
     pub async fn head_bucket(&self, input: HeadBucketInput) -> S3Result<HeadBucketOutput> {
-        trace!("Protocol S3 client HeadBucket request: bucket={}", input.bucket);
+        trace!("Protocol S3 client HeadBucket request: bucket={}, access_key={}", input.bucket, self.access_key);
         let uri: http::Uri = format!("/{}", input.bucket).parse().unwrap_or_default();
         let req = S3Request {
             input,
@@ -130,7 +144,7 @@ impl ProtocolS3Client {
 
     /// List objects v2 - maps to S3 ListObjectsV2
     pub async fn list_objects_v2(&self, input: ListObjectsV2Input) -> S3Result<ListObjectsV2Output> {
-        trace!("Protocol S3 client ListObjectsV2 request: bucket={}", input.bucket);
+        trace!("Protocol S3 client ListObjectsV2 request: bucket={}, access_key={}", input.bucket, self.access_key);
         let uri: http::Uri = format!("/{}?list-type=2", input.bucket).parse().unwrap_or_default();
         let req = S3Request {
             input,
@@ -149,7 +163,7 @@ impl ProtocolS3Client {
 
     /// Copy object - maps to S3 CopyObject
     pub async fn copy_object(&self, input: CopyObjectInput) -> S3Result<CopyObjectOutput> {
-        trace!("Protocol S3 client CopyObject request: bucket={}, key={:?}", input.bucket, input.key);
+        trace!("Protocol S3 client CopyObject request: bucket={}, key={:?}, access_key={}", input.bucket, input.key, self.access_key);
         let uri: http::Uri = format!("/{}{}", input.bucket, input.key.as_str()).parse().unwrap_or_default();
         let req = S3Request {
             input,
@@ -166,8 +180,78 @@ impl ProtocolS3Client {
         Ok(resp.output)
     }
 
-    /// Get the access key for this client
-    pub fn access_key(&self) -> &str {
-        &self.access_key
+    /// List buckets - maps to S3 ListBuckets
+    /// Note: This requires credentials and ReqInfo because list_buckets performs credential validation
+    pub async fn list_buckets(&self, input: ListBucketsInput, secret_key: &str) -> S3Result<ListBucketsOutput> {
+        trace!("Protocol S3 client ListBuckets request: access_key={}", self.access_key);
+
+        // Create proper credentials with the real secret key from authentication
+        let credentials = Some(s3s::auth::Credentials {
+            access_key: self.access_key.clone(),
+            secret_key: secret_key.to_string().into(),
+        });
+
+        // Check if user is the owner (admin)
+        let is_owner = if let Some(global_cred) = rustfs_ecstore::global::get_global_action_cred() {
+            self.access_key == global_cred.access_key
+        } else {
+            false
+        };
+
+        // Create ReqInfo for authorization (required by list_buckets)
+        let mut extensions = http::Extensions::default();
+        extensions.insert(crate::storage::access::ReqInfo {
+            cred: Some(auth::Credentials {
+                access_key: self.access_key.clone(),
+                secret_key: secret_key.to_string().into(),
+                session_token: String::new(),
+                expiration: None,
+                status: String::new(),
+                parent_user: String::new(),
+                groups: None,
+                claims: None,
+                name: None,
+                description: None,
+            }),
+            is_owner,
+            bucket: None,
+            object: None,
+            version_id: None,
+            region: None,
+        });
+
+        let req = S3Request {
+            input,
+            method: Method::GET,
+            uri: http::Uri::from_static("/"),
+            headers: HeaderMap::default(),
+            extensions,
+            credentials,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let resp = self.fs.list_buckets(req).await?;
+        Ok(resp.output)
+    }
+
+    /// Create bucket - maps to S3 CreateBucket
+    pub async fn create_bucket(&self, input: CreateBucketInput) -> S3Result<CreateBucketOutput> {
+        trace!("Protocol S3 client CreateBucket request: bucket={:?}, access_key={}", input.bucket, self.access_key);
+        let bucket_str = input.bucket.as_str();
+        let uri: http::Uri = format!("/{}", bucket_str).parse().unwrap_or_default();
+        let req = S3Request {
+            input,
+            method: Method::PUT,
+            uri,
+            headers: HeaderMap::default(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let resp = self.fs.create_bucket(req).await?;
+        Ok(resp.output)
     }
 }

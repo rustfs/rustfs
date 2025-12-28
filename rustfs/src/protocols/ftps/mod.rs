@@ -18,5 +18,5 @@
 //! It uses libunftp as the FTP server implementation and integrates
 //! with the RustFS gateway for S3 operations.
 
-pub mod server;
 pub mod driver;
+pub mod server;

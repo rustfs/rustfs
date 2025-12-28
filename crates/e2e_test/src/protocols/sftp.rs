@@ -1,4 +1,4 @@
-use crate::common::{RustFSTestEnvironment, DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
+use crate::common::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RustFSTestEnvironment};
 use crate::protocols::test_suite::{ProtocolTestSuite, TestDataFactory, wait_for_port_ready};
 use anyhow::Result;
 use ssh2::Session;
@@ -11,15 +11,17 @@ use tracing::info;
 async fn test_sftp_full_lifecycle() -> Result<()> {
     let mut test_suite = create_sftp_test_suite().await?;
 
-    let sftp_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let sftp_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let sftp_address = format!("127.0.0.1:{}", sftp_port);
 
-    let extra_args = vec![
-        "--sftp-enable",
-        "--sftp-address",
-        &sftp_address,
-    ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let extra_args = vec!["--sftp-enable", "--sftp-address", &sftp_address];
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(sftp_port, 30).await?;
 
@@ -27,75 +29,83 @@ async fn test_sftp_full_lifecycle() -> Result<()> {
 
     test_sftp_file_operations(&sftp).await?;
 
-        Ok(())
+    Ok(())
 }
 
 #[tokio::test]
 async fn test_sftp_authentication_errors() -> Result<()> {
     let mut test_suite = create_sftp_test_suite().await?;
 
-    let sftp_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let sftp_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let sftp_address = format!("127.0.0.1:{}", sftp_port);
 
-    let extra_args = vec![
-        "--sftp-enable",
-        "--sftp-address",
-        &sftp_address,
-    ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let extra_args = vec!["--sftp-enable", "--sftp-address", &sftp_address];
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(sftp_port, 30).await?;
 
     // Test 1: Invalid username
-    test_suite.test_authentication_errors::<String, _, _>(|_env| {
-        let sftp_addr = sftp_address.clone();
-        async move {
-            let tcp = TcpStream::connect(&sftp_addr)?;
-        let mut sess = Session::new()?;
-        sess.set_tcp_stream(tcp);
-        sess.handshake()?;
+    test_suite
+        .test_authentication_errors::<String, _, _>(|_env| {
+            let sftp_addr = sftp_address.clone();
+            async move {
+                let tcp = TcpStream::connect(&sftp_addr)?;
+                let mut sess = Session::new()?;
+                sess.set_tcp_stream(tcp);
+                sess.handshake()?;
 
-        let auth_result = sess.userauth_password("invalid_user", DEFAULT_SECRET_KEY);
-        if auth_result.is_ok() {
-            anyhow::bail!("Authentication should have failed");
-        }
-        Ok("auth_failed".to_string())
-    }
-    }).await?;
+                let auth_result = sess.userauth_password("invalid_user", DEFAULT_SECRET_KEY);
+                if auth_result.is_ok() {
+                    anyhow::bail!("Authentication should have failed");
+                }
+                Ok("auth_failed".to_string())
+            }
+        })
+        .await?;
 
     // Test 2: Invalid password
-    test_suite.test_authentication_errors::<String, _, _>(|_env| {
-        let sftp_addr = sftp_address.clone();
-        async move {
-            let tcp = TcpStream::connect(&sftp_addr)?;
-        let mut sess = Session::new()?;
-        sess.set_tcp_stream(tcp);
-        sess.handshake()?;
+    test_suite
+        .test_authentication_errors::<String, _, _>(|_env| {
+            let sftp_addr = sftp_address.clone();
+            async move {
+                let tcp = TcpStream::connect(&sftp_addr)?;
+                let mut sess = Session::new()?;
+                sess.set_tcp_stream(tcp);
+                sess.handshake()?;
 
-        let auth_result = sess.userauth_password(DEFAULT_ACCESS_KEY, "invalid_password");
-        if auth_result.is_ok() {
-            anyhow::bail!("Authentication should have failed");
-        }
-        Ok("auth_failed".to_string())
-    }
-    }).await?;
+                let auth_result = sess.userauth_password(DEFAULT_ACCESS_KEY, "invalid_password");
+                if auth_result.is_ok() {
+                    anyhow::bail!("Authentication should have failed");
+                }
+                Ok("auth_failed".to_string())
+            }
+        })
+        .await?;
 
     // Test 3: Both invalid
-    test_suite.test_authentication_errors::<String, _, _>(|_env| {
-        let sftp_addr = sftp_address.clone();
-        async move {
-            let tcp = TcpStream::connect(&sftp_addr)?;
-        let mut sess = Session::new()?;
-        sess.set_tcp_stream(tcp);
-        sess.handshake()?;
+    test_suite
+        .test_authentication_errors::<String, _, _>(|_env| {
+            let sftp_addr = sftp_address.clone();
+            async move {
+                let tcp = TcpStream::connect(&sftp_addr)?;
+                let mut sess = Session::new()?;
+                sess.set_tcp_stream(tcp);
+                sess.handshake()?;
 
-        let auth_result = sess.userauth_password("invalid_user", "invalid_password");
-        if auth_result.is_ok() {
-            anyhow::bail!("Authentication should have failed");
-        }
-        Ok("auth_failed".to_string())
-    }
-    }).await?;
+                let auth_result = sess.userauth_password("invalid_user", "invalid_password");
+                if auth_result.is_ok() {
+                    anyhow::bail!("Authentication should have failed");
+                }
+                Ok("auth_failed".to_string())
+            }
+        })
+        .await?;
 
     Ok(())
 }
@@ -104,75 +114,85 @@ async fn test_sftp_authentication_errors() -> Result<()> {
 async fn test_sftp_file_not_found_errors() -> Result<()> {
     let mut test_suite = create_sftp_test_suite().await?;
 
-    let sftp_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let sftp_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let sftp_address = format!("127.0.0.1:{}", sftp_port);
 
-    let extra_args = vec![
-        "--sftp-enable",
-        "--sftp-address",
-        &sftp_address,
-    ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let extra_args = vec!["--sftp-enable", "--sftp-address", &sftp_address];
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(sftp_port, 30).await?;
 
     let (_session, sftp) = create_sftp_connection(&sftp_address).await?;
 
     // Test reading non-existent file
-    test_suite.test_not_found_errors::<String, _, _>(|_env| {
-        let sftp_addr = sftp_address.clone();
-        async move {
-            let (_session, sftp) = create_sftp_connection(&sftp_addr).await?;
-        let result = sftp.open(Path::new("non_existent_file.txt"));
-        if result.is_ok() {
-            anyhow::bail!("Read should have failed");
-        }
-        Ok("read_failed".to_string())
-    }
-    }).await?;
+    test_suite
+        .test_not_found_errors::<String, _, _>(|_env| {
+            let sftp_addr = sftp_address.clone();
+            async move {
+                let (_session, sftp) = create_sftp_connection(&sftp_addr).await?;
+                let result = sftp.open(Path::new("non_existent_file.txt"));
+                if result.is_ok() {
+                    anyhow::bail!("Read should have failed");
+                }
+                Ok("read_failed".to_string())
+            }
+        })
+        .await?;
 
     // Test removing non-existent file
-    test_suite.test_not_found_errors::<String, _, _>(|_env| {
-        let sftp_addr = sftp_address.clone();
-        async move {
-            let (_session, sftp) = create_sftp_connection(&sftp_addr).await?;
-        let result = sftp.unlink(Path::new("non_existent_file.txt"));
-        if result.is_ok() {
-            anyhow::bail!("Unlink should have failed");
-        }
-        Ok("unlink_failed".to_string())
-    }
-    }).await?;
+    test_suite
+        .test_not_found_errors::<String, _, _>(|_env| {
+            let sftp_addr = sftp_address.clone();
+            async move {
+                let (_session, sftp) = create_sftp_connection(&sftp_addr).await?;
+                let result = sftp.unlink(Path::new("non_existent_file.txt"));
+                if result.is_ok() {
+                    anyhow::bail!("Unlink should have failed");
+                }
+                Ok("unlink_failed".to_string())
+            }
+        })
+        .await?;
 
     // Test removing non-existent directory
-    test_suite.test_not_found_errors::<String, _, _>(|_env| {
-        let sftp_addr = sftp_address.clone();
-        async move {
-            let (_session, sftp) = create_sftp_connection(&sftp_addr).await?;
-        let result = sftp.rmdir(Path::new("non_existent_dir"));
-        if result.is_ok() {
-            anyhow::bail!("Rmdir should have failed");
-        }
-        Ok("rmdir_failed".to_string())
-    }
-    }).await?;
+    test_suite
+        .test_not_found_errors::<String, _, _>(|_env| {
+            let sftp_addr = sftp_address.clone();
+            async move {
+                let (_session, sftp) = create_sftp_connection(&sftp_addr).await?;
+                let result = sftp.rmdir(Path::new("non_existent_dir"));
+                if result.is_ok() {
+                    anyhow::bail!("Rmdir should have failed");
+                }
+                Ok("rmdir_failed".to_string())
+            }
+        })
+        .await?;
 
-        Ok(())
+    Ok(())
 }
 
 #[tokio::test]
 async fn test_sftp_special_characters() -> Result<()> {
     let mut test_suite = create_sftp_test_suite().await?;
 
-    let sftp_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let sftp_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let sftp_address = format!("127.0.0.1:{}", sftp_port);
 
-    let extra_args = vec![
-        "--sftp-enable",
-        "--sftp-address",
-        &sftp_address,
-    ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let extra_args = vec!["--sftp-enable", "--sftp-address", &sftp_address];
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(sftp_port, 30).await?;
 
@@ -181,7 +201,8 @@ async fn test_sftp_special_characters() -> Result<()> {
     let special_names = TestDataFactory::create_special_char_names();
     let test_content = "Test content with special characters: 中文测试";
 
-    for filename in special_names.iter().take(5) { // Test first 5 names
+    for filename in special_names.iter().take(5) {
+        // Test first 5 names
         info!("Testing special filename: {}", filename);
 
         // Upload
@@ -204,22 +225,24 @@ async fn test_sftp_special_characters() -> Result<()> {
         sftp.unlink(Path::new(filename))?;
     }
 
-        Ok(())
+    Ok(())
 }
 
 #[tokio::test]
 async fn test_sftp_large_file() -> Result<()> {
     let mut test_suite = create_sftp_test_suite().await?;
 
-    let sftp_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let sftp_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let sftp_address = format!("127.0.0.1:{}", sftp_port);
 
-    let extra_args = vec![
-        "--sftp-enable",
-        "--sftp-address",
-        &sftp_address,
-    ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let extra_args = vec!["--sftp-enable", "--sftp-address", &sftp_address];
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(sftp_port, 30).await?;
 
@@ -250,22 +273,24 @@ async fn test_sftp_large_file() -> Result<()> {
     assert_eq!(large_data, downloaded_data, "Large file content mismatch");
 
     sftp.unlink(Path::new(filename))?;
-        Ok(())
+    Ok(())
 }
 
 #[tokio::test]
 async fn test_sftp_directory_operations() -> Result<()> {
     let mut test_suite = create_sftp_test_suite().await?;
 
-    let sftp_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let sftp_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let sftp_address = format!("127.0.0.1:{}", sftp_port);
 
-    let extra_args = vec![
-        "--sftp-enable",
-        "--sftp-address",
-        &sftp_address,
-    ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let extra_args = vec!["--sftp-enable", "--sftp-address", &sftp_address];
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(sftp_port, 30).await?;
 
@@ -306,22 +331,24 @@ async fn test_sftp_directory_operations() -> Result<()> {
         sftp.rmdir(Path::new(dir_path))?;
     }
 
-        Ok(())
+    Ok(())
 }
 
 #[tokio::test]
 async fn test_sftp_rename_operations() -> Result<()> {
     let mut test_suite = create_sftp_test_suite().await?;
 
-    let sftp_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let sftp_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let sftp_address = format!("127.0.0.1:{}", sftp_port);
 
-    let extra_args = vec![
-        "--sftp-enable",
-        "--sftp-address",
-        &sftp_address,
-    ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let extra_args = vec!["--sftp-enable", "--sftp-address", &sftp_address];
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(sftp_port, 30).await?;
 
@@ -352,17 +379,19 @@ async fn test_sftp_rename_operations() -> Result<()> {
     }
 
     // Verify original file no longer exists
-    test_suite.test_not_found_errors::<String, _, _>(|_env| {
-        let sftp_addr = sftp_address.clone();
-        async move {
-            let (_session, sftp) = create_sftp_connection(&sftp_addr).await?;
-        let result = sftp.open(Path::new(original_file));
-        if result.is_ok() {
-            anyhow::bail!("Read should have failed");
-        }
-        Ok("read_failed".to_string())
-    }
-    }).await?;
+    test_suite
+        .test_not_found_errors::<String, _, _>(|_env| {
+            let sftp_addr = sftp_address.clone();
+            async move {
+                let (_session, sftp) = create_sftp_connection(&sftp_addr).await?;
+                let result = sftp.open(Path::new(original_file));
+                if result.is_ok() {
+                    anyhow::bail!("Read should have failed");
+                }
+                Ok("read_failed".to_string())
+            }
+        })
+        .await?;
 
     // Cleanup
     sftp.unlink(Path::new(renamed_file))?;
@@ -373,15 +402,17 @@ async fn test_sftp_rename_operations() -> Result<()> {
 async fn test_sftp_file_attributes() -> Result<()> {
     let mut test_suite = create_sftp_test_suite().await?;
 
-    let sftp_port = RustFSTestEnvironment::find_available_port().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let sftp_port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let sftp_address = format!("127.0.0.1:{}", sftp_port);
 
-    let extra_args = vec![
-        "--sftp-enable",
-        "--sftp-address",
-        &sftp_address,
-    ];
-    test_suite.env_mut().start_rustfs_server(extra_args).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let extra_args = vec!["--sftp-enable", "--sftp-address", &sftp_address];
+    test_suite
+        .env_mut()
+        .start_rustfs_server(extra_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     wait_for_port_ready(sftp_port, 30).await?;
 
@@ -413,7 +444,7 @@ async fn test_sftp_file_attributes() -> Result<()> {
     // Cleanup
     sftp.unlink(Path::new(filename))?;
     sftp.rmdir(Path::new(dir_name))?;
-        Ok(())
+    Ok(())
 }
 
 // Helper functions

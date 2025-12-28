@@ -26,7 +26,10 @@ mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, init_ftp_system, init_sftp_system};
+use crate::init::{
+    add_bucket_notification_configuration, init_buffer_profile_system, init_ftp_system, init_kms_system, init_sftp_system,
+    init_update_check,
+};
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
