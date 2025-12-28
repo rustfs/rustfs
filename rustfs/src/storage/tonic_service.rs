@@ -3683,4 +3683,20 @@ mod tests {
         assert!(!response.success);
         assert!(response.error_info.is_some());
     }
+
+    #[tokio::test]
+    async fn test_get_metrics_invalid_opts() {
+        let service = create_test_node_service();
+        // Serialize a valid MetricType
+        let metric_type = MetricType::DISK;
+        let metric_type_bytes = rmp_serde::to_vec(&metric_type).unwrap();
+        
+        let request = Request::new(GetMetricsRequest {
+            metric_type: Bytes::from(metric_type_bytes),
+            opts: Bytes::from(vec![0x00u8, 0x01u8]), // Invalid rmp data
+        });
+        let response = service.get_metrics(request).await.unwrap().into_inner();
+        assert!(!response.success);
+        assert!(response.error_info.is_some());
+    }
 }
