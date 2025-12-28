@@ -44,6 +44,7 @@ rustfs-appauth = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
+rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-filemeta.workspace = true
 rustfs-iam = { workspace = true }

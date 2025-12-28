@@ -82,7 +82,8 @@ pub use sys::user_agent::*;
 #[cfg(feature = "notify")]
 pub use notify::*;
 
+#[cfg(feature = "obj")]
+pub mod obj;
+
 mod envs;
 pub use envs::*;
-
-pub mod obj;

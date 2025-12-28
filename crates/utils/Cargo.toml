@@ -93,4 +93,5 @@ os = ["dep:nix", "dep:tempfile", "winapi"]  # operating system utilities
 integration = []  # integration test features
 sys = ["dep:sysinfo"]  # system information features
 http = ["dep:convert_case", "dep:http", "dep:regex"]
-full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "sys", "notify", "http"]  # all features
+obj = ["http"] # object storage features
+full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "sys", "notify", "http", "obj"]  # all features

@@ -7061,6 +7061,7 @@ dependencies = [
  "rustfs-audit",
  "rustfs-common",
  "rustfs-config",
+ "rustfs-credentials",
  "rustfs-ecstore",
  "rustfs-filemeta",
  "rustfs-iam",
@@ -7211,6 +7212,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-credentials"
+version = "0.0.5"
+dependencies = [
+ "rustfs-utils",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
 name = "rustfs-crypto"
 version = "0.0.5"
 dependencies = [
@@ -7276,6 +7287,7 @@ dependencies = [
  "rustfs-checksums",
  "rustfs-common",
  "rustfs-config",
+ "rustfs-credentials",
  "rustfs-filemeta",
  "rustfs-lock",
  "rustfs-madmin",
@@ -7318,7 +7330,6 @@ dependencies = [
  "bytes",
  "crc-fast",
  "criterion",
- "lazy_static",
  "regex",
  "rmp",
  "rmp-serde",
@@ -7344,6 +7355,7 @@ dependencies = [
  "jsonwebtoken",
  "pollster",
  "rand 0.10.0-rc.5",
+ "rustfs-credentials",
  "rustfs-crypto",
  "rustfs-ecstore",
  "rustfs-madmin",
@@ -7509,6 +7521,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rustfs-config",
+ "rustfs-credentials",
  "rustfs-crypto",
  "serde",
  "serde_json",
@@ -7528,6 +7541,8 @@ dependencies = [
  "flatbuffers",
  "prost 0.14.1",
  "rustfs-common",
+ "rustfs-config",
+ "rustfs-credentials",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

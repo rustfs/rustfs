@@ -147,7 +147,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     );
 
     // Set up AK and SK
-    rustfs_ecstore::global::init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
+    // rustfs_ecstore::global::init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
+    rustfs_credentials::init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
 
     set_global_rustfs_port(server_port);
 

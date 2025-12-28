@@ -34,6 +34,8 @@ path = "src/main.rs"
 
 [dependencies]
 rustfs-common.workspace = true
+rustfs-config = { workspace = true, features = ["constants"] }
+rustfs-credentials = { workspace = true }
 flatbuffers = { workspace = true }
 prost = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }

@@ -34,12 +34,19 @@ workspace = true
 default = []
 
 [dependencies]
+rustfs-filemeta.workspace = true
+rustfs-utils = { workspace = true, features = ["full"] }
+rustfs-rio.workspace = true
+rustfs-signer.workspace = true
+rustfs-checksums.workspace = true
 rustfs-config = { workspace = true, features = ["constants", "notify", "audit"] }
+rustfs-credentials = { workspace = true }
+rustfs-common.workspace = true
+rustfs-policy.workspace = true
+rustfs-protos.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 byteorder = { workspace = true }
-rustfs-common.workspace = true
-rustfs-policy.workspace = true
 chrono.workspace = true
 glob = { workspace = true }
 thiserror.workspace = true
@@ -60,7 +67,6 @@ lazy_static.workspace = true
 rustfs-lock.workspace = true
 regex = { workspace = true }
 path-absolutize = { workspace = true }
-rustfs-protos.workspace = true
 rmp.workspace = true
 rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
@@ -91,11 +97,6 @@ aws-sdk-s3 = { workspace = true }
 urlencoding = { workspace = true }
 smallvec = { workspace = true }
 shadow-rs.workspace = true
-rustfs-filemeta.workspace = true
-rustfs-utils = { workspace = true, features = ["full"] }
-rustfs-rio.workspace = true
-rustfs-signer.workspace = true
-rustfs-checksums.workspace = true
 async-recursion.workspace = true
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }

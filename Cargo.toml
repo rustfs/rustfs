@@ -19,6 +19,7 @@ members = [
     "crates/audit", # Audit target management system with multi-target fan-out
     "crates/common", # Shared utilities and data structures
     "crates/config", # Configuration management
+    "crates/credentials", # Credential management system
     "crates/crypto", # Cryptography and security features
     "crates/ecstore", # Erasure coding storage implementation
     "crates/e2e_test", # End-to-end test suite
@@ -71,6 +72,7 @@ rustfs-audit = { path = "crates/audit", version = "0.0.5" }
 rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }
 rustfs-config = { path = "./crates/config", version = "0.0.5" }
+rustfs-credentials = { path = "crates/credentials", version = "0.0.5" }
 rustfs-crypto = { path = "crates/crypto", version = "0.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "0.0.5" }
 rustfs-filemeta = { path = "crates/filemeta", version = "0.0.5" }
@@ -275,8 +277,6 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profilin
 jemalloc_pprof = { version = "0.8.1", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
-
-
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rustfs-mcp"]

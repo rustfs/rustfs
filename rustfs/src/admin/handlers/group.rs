@@ -19,7 +19,7 @@ use crate::{
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
 use rustfs_madmin::GroupAddRemove;
 use rustfs_policy::policy::action::{Action, AdminAction};

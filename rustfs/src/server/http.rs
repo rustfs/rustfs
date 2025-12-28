@@ -685,7 +685,19 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
-    let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
+    let token_str = rustfs_utils::get_env_opt_str(rustfs_config::ENV_GRPC_AUTH_TOKEN).unwrap_or_else(|| {
+        warn!(
+            "Environment variable RUSTFS_GRPC_AUTH_TOKEN is not set; \
+             falling back to insecure default token. \
+             Configure a strong, random token to secure gRPC access."
+        );
+        rustfs_credentials::get_global_secret_key_opt().unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string())
+    });
+
+    let token: MetadataValue<_> = token_str.parse().map_err(|e| {
+        error!("Failed to parse RUSTFS_GRPC_AUTH_TOKEN into gRPC metadata value: {}", e);
+        Status::internal("Invalid auth token configuration")
+    })?;
 
     match req.metadata().get("authorization") {
         Some(t) if token == t => Ok(req),

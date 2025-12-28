@@ -16,15 +16,15 @@
 mod generated;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_ROOT_CERT, evict_connection};
-use std::{error::Error, time::Duration};
+use rustfs_common::{evict_connection, GLOBAL_CONN_MAP, GLOBAL_ROOT_CERT};
+use std::{env, error::Error, time::Duration};
 use tonic::{
-    Request, Status,
-    metadata::MetadataValue,
-    service::interceptor::InterceptedService,
+    metadata::MetadataValue, service::interceptor::InterceptedService,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
+    Request,
+    Status,
 };
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 // Type alias for the complex client type
 pub type NodeServiceClientType = NodeServiceClient<
@@ -32,6 +32,7 @@ pub type NodeServiceClientType = NodeServiceClient<
 >;
 
 pub use generated::*;
+use rustfs_config::DEFAULT_SECRET_KEY;
 
 // Default 100 MB
 pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
@@ -150,7 +151,27 @@ pub async fn node_service_time_out_client(
     >,
     Box<dyn Error>,
 > {
-    let token: MetadataValue<_> = "rustfs rpc".parse()?;
+    debug!("Obtaining gRPC client for NodeService at: {}", addr);
+    let token_str = env::var(rustfs_config::ENV_GRPC_AUTH_TOKEN).unwrap_or_else(|e| {
+        error!(
+            "Environment variable RUSTFS_GRPC_AUTH_TOKEN is not set; \
+             falling back to insecure default token. \
+             Configure a strong, random token to secure gRPC access. error:{:?}",
+            e
+        );
+        rustfs_credentials::get_global_secret_key_opt().unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string())
+    });
+
+    let token: MetadataValue<_> = token_str.parse().map_err(|e| {
+        error!(
+            "Failed to parse gRPC auth token into MetadataValue: {:?}; env={} token_len={} token_prefix={}",
+            e,
+            rustfs_config::ENV_GRPC_AUTH_TOKEN,
+            token_str.len(),
+            token_str.chars().take(6).collect::<String>(),
+        );
+        e
+    })?;
 
     // Try to get cached channel
     let cached_channel = { GLOBAL_CONN_MAP.read().await.get(addr).cloned() };

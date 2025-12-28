@@ -93,12 +93,9 @@ use rustfs_kms::{
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
 use rustfs_notify::{EventArgsBuilder, notifier_global};
-use rustfs_policy::{
-    auth,
-    policy::{
-        action::{Action, S3Action},
-        {BucketPolicy, BucketPolicyArgs, Validator},
-    },
+use rustfs_policy::policy::{
+    action::{Action, S3Action},
+    {BucketPolicy, BucketPolicyArgs, Validator},
 };
 use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, EtagReader, HardLimitReader, HashReader, Reader, WarpReader};
 use rustfs_s3select_api::{
@@ -4692,7 +4689,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let conditions = get_condition_values(&req.headers, &auth::Credentials::default(), None, None);
+        let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None);
 
         let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
