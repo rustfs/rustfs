@@ -16,13 +16,13 @@
 mod generated;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{evict_connection, GLOBAL_CONN_MAP, GLOBAL_ROOT_CERT};
+use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_ROOT_CERT, evict_connection};
 use std::{env, error::Error, time::Duration};
 use tonic::{
-    metadata::MetadataValue, service::interceptor::InterceptedService,
+    Request, Status,
+    metadata::MetadataValue,
+    service::interceptor::InterceptedService,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
-    Request,
-    Status,
 };
 use tracing::{debug, error, warn};
 
