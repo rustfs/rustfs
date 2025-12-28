@@ -311,7 +311,7 @@ impl TryFrom<CredentialsBuilder> for Credentials {
         }
 
         if value.secret_key.is_empty() {
-            value.access_key = rustfs_credentials::gen_secret_key(40)?;
+            value.secret_key = rustfs_credentials::gen_secret_key(40)?;
         }
 
         claim["accessKey"] = json!(&value.access_key);

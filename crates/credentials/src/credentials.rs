@@ -52,10 +52,6 @@ pub fn init_global_action_credentials(ak: Option<String>, sk: Option<String>) ->
     };
 
     GLOBAL_ACTIVE_CRED.set(cred).map_err(|e| {
-        eprintln!(
-            "GLOBAL_ACTIVE_CRED has already been initialized, ignoring set: access_key={}",
-            e.access_key
-        );
         Box::new(Credentials {
             access_key: e.access_key.clone(),
             ..Default::default()
