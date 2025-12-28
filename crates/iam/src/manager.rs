@@ -24,15 +24,13 @@ use crate::{
     },
 };
 use futures::future::join_all;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
-    auth::{self, Credentials, UserIdentity, is_secret_key_valid, jwt_sign},
+    auth::{self, UserIdentity, is_secret_key_valid, jwt_sign},
     format::Format,
-    policy::{
-        EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
-    },
+    policy::{Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa},
 };
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};

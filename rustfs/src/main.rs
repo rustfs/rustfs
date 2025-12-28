@@ -39,6 +39,7 @@ use rustfs_ahm::{
     scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
+use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::{
     StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
@@ -147,7 +148,16 @@ async fn run(opt: config::Opt) -> Result<()> {
     );
 
     // Set up AK and SK
-    rustfs_ecstore::global::init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
+    match init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone())) {
+        Ok(_) => {
+            info!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
+        }
+        Err(e) => {
+            let msg = format!("init_global_action_credentials failed: {e:?}");
+            error!("{msg}");
+            return Err(Error::other(msg));
+        }
+    };
 
     set_global_rustfs_port(server_port);
 

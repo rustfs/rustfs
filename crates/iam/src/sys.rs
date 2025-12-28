@@ -24,19 +24,18 @@ use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
 use crate::utils::extract_claims;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;
 use rustfs_policy::arn::ARN;
-use rustfs_policy::auth::Credentials;
 use rustfs_policy::auth::{
     ACCOUNT_ON, UserIdentity, contains_reserved_chars, create_new_credentials_with_metadata, generate_credentials,
     is_access_key_valid, is_secret_key_valid,
 };
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
-use rustfs_policy::policy::{EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, iam_policy_claim_name_sa};
+use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa};
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;

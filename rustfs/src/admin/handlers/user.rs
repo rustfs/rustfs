@@ -19,7 +19,7 @@ use crate::{
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
     sys::NewServiceAccountOpts,

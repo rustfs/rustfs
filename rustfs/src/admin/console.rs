@@ -23,7 +23,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use axum_extra::extract::Host;
 use axum_server::tls_rustls::RustlsConfig;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use mime_guess::from_path;
@@ -264,21 +263,27 @@ async fn version_handler() -> impl IntoResponse {
 ///
 /// # Arguments:
 /// - `uri`: The request URI.
-/// - `Host(host)`: The host extracted from the request.
 /// - `headers`: The request headers.
 ///
 /// # Returns:
 /// - 200 OK with JSON body containing the console configuration if initialized.
 /// - 500 Internal Server Error if configuration is not initialized.
-#[instrument(fields(host))]
-async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
+#[instrument(fields(uri))]
+async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme
     let scheme = headers
         .get(HeaderName::from_static("x-forwarded-proto"))
         .and_then(|value| value.to_str().ok())
         .unwrap_or_else(|| uri.scheme().map(|s| s.as_str()).unwrap_or("http"));
 
-    let raw_host = uri.host().unwrap_or(host.as_str());
+    // Prefer URI host, fallback to `Host` header
+    let header_host = headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    let raw_host = uri.host().unwrap_or(header_host);
+
     let host_for_url = if let Ok(socket_addr) = raw_host.parse::<SocketAddr>() {
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.

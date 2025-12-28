@@ -20,6 +20,7 @@ use crate::{
     manager::{extract_jwt_claims, get_default_policyes},
 };
 use futures::future::join_all;
+use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::store_api::{ObjectInfoOrErr, WalkOptions};
 use rustfs_ecstore::{
@@ -27,7 +28,6 @@ use rustfs_ecstore::{
         RUSTFS_CONFIG_PREFIX,
         com::{delete_config, read_config, read_config_with_metadata, save_config},
     },
-    global::get_global_action_cred,
     store::ECStore,
     store_api::{ObjectInfo, ObjectOptions},
 };

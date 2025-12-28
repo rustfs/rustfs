@@ -19,7 +19,7 @@ use http::HeaderMap;
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
 use rustfs_madmin::{

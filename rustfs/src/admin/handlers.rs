@@ -25,6 +25,7 @@ use hyper::StatusCode;
 use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_HEAL_REQUEST_SIZE};
+use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
@@ -35,7 +36,6 @@ use rustfs_ecstore::data_usage::{
     aggregate_local_snapshots, compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend,
 };
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_ecstore::new_object_layer_fn;

@@ -19,6 +19,7 @@ use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -773,9 +774,7 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref REPL_STATUS_REGEX: Regex = Regex::new(r"([^=].*?)=([^,].*?);").unwrap();
-}
+static REPL_STATUS_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([^=].*?)=([^,].*?);").unwrap());
 
 impl ReplicateObjectInfo {
     /// Returns replication status of a target

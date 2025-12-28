@@ -19,6 +19,7 @@ members = [
     "crates/audit", # Audit target management system with multi-target fan-out
     "crates/common", # Shared utilities and data structures
     "crates/config", # Configuration management
+    "crates/credentials", # Credential management system
     "crates/crypto", # Cryptography and security features
     "crates/ecstore", # Erasure coding storage implementation
     "crates/e2e_test", # End-to-end test suite
@@ -71,6 +72,7 @@ rustfs-audit = { path = "crates/audit", version = "0.0.5" }
 rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }
 rustfs-config = { path = "./crates/config", version = "0.0.5" }
+rustfs-credentials = { path = "crates/credentials", version = "0.0.5" }
 rustfs-crypto = { path = "crates/crypto", version = "0.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "0.0.5" }
 rustfs-filemeta = { path = "crates/filemeta", version = "0.0.5" }
@@ -98,7 +100,7 @@ async-compression = { version = "0.4.19" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
 axum = "0.8.8"
-axum-extra = "0.12.3"
+axum-extra = "0.12.5"
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"], default-features = false }
 futures = "0.3.31"
 futures-core = "0.3.31"
@@ -135,9 +137,9 @@ rmcp = { version = "0.12.0" }
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.147", features = ["raw_value"] }
+serde_json = { version = "1.0.148", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
-schemars = "1.1.0"
+schemars = "1.2.0"
 
 # Cryptography and Security
 aes-gcm = { version = "0.11.0-rc.2", features = ["rand_core"] }
@@ -200,7 +202,7 @@ libc = "0.2.178"
 libsystemd = "0.7.2"
 local-ip-address = "0.6.8"
 lz4 = "1.28.1"
-matchit = "0.9.0"
+matchit = "0.9.1"
 md-5 = "0.11.0-rc.3"
 md5 = "0.8.0"
 mime_guess = "2.0.5"
@@ -275,8 +277,6 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profilin
 jemalloc_pprof = { version = "0.8.1", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
-
-
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rustfs-mcp"]

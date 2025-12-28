@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rand::{Rng, RngCore};
 use regex::Regex;
 use std::io::{Error, Result};
 use std::sync::LazyLock;
@@ -486,81 +485,6 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
     }
 
     Ok(ret)
-}
-
-/// Generates a random access key of the specified length.
-///
-/// # Arguments
-/// * `length` - The length of the access key to generate
-///
-/// # Returns
-/// * `Result<String>` - A result containing the generated access key or an error if the length is too short
-///
-/// # Errors
-/// This function will return an error if the specified length is less than 3.
-///
-/// Examples
-/// ```no_run
-/// use rustfs_utils::string::gen_access_key;
-///
-/// let access_key = gen_access_key(16).unwrap();
-/// println!("Generated access key: {}", access_key);
-/// ```
-///
-pub fn gen_access_key(length: usize) -> Result<String> {
-    const ALPHA_NUMERIC_TABLE: [char; 36] = [
-        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
-        'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
-    ];
-
-    if length < 3 {
-        return Err(Error::other("access key length is too short"));
-    }
-
-    let mut result = String::with_capacity(length);
-    let mut rng = rand::rng();
-
-    for _ in 0..length {
-        result.push(ALPHA_NUMERIC_TABLE[rng.random_range(0..ALPHA_NUMERIC_TABLE.len())]);
-    }
-
-    Ok(result)
-}
-
-/// Generates a random secret key of the specified length.
-///
-/// # Arguments
-/// * `length` - The length of the secret key to generate
-///
-/// # Returns
-/// * `Result<String>` - A result containing the generated secret key or an error if the length is too short
-///
-/// # Errors
-/// This function will return an error if the specified length is less than 8.
-///
-/// # Examples
-/// ```no_run
-/// use rustfs_utils::string::gen_secret_key;
-///
-/// let secret_key = gen_secret_key(32).unwrap();
-/// println!("Generated secret key: {}", secret_key);
-/// ```
-///
-pub fn gen_secret_key(length: usize) -> Result<String> {
-    use base64_simd::URL_SAFE_NO_PAD;
-
-    if length < 8 {
-        return Err(Error::other("secret key length is too short"));
-    }
-    let mut rng = rand::rng();
-
-    let mut key = vec![0u8; URL_SAFE_NO_PAD.estimated_decoded_length(length)];
-    rng.fill_bytes(&mut key);
-
-    let encoded = URL_SAFE_NO_PAD.encode_to_string(&key);
-    let key_str = encoded.replace("/", "+");
-
-    Ok(key_str)
 }
 
 /// Tests whether the string s begins with prefix ignoring case

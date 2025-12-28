@@ -14,9 +14,9 @@
 
 use crate::auth::get_condition_values;
 use http::HeaderMap;
+use rustfs_credentials::Credentials;
 use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::sys::IamSys;
-use rustfs_policy::auth;
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::action::Action;
 use s3s::S3Result;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 pub async fn validate_admin_request(
     headers: &HeaderMap,
-    cred: &auth::Credentials,
+    cred: &Credentials,
     is_owner: bool,
     deny_only: bool,
     actions: Vec<Action>,
@@ -49,7 +49,7 @@ pub async fn validate_admin_request(
 async fn check_admin_request_auth(
     iam_store: Arc<IamSys<ObjectStore>>,
     headers: &HeaderMap,
-    cred: &auth::Credentials,
+    cred: &Credentials,
     is_owner: bool,
     deny_only: bool,
     action: Action,
