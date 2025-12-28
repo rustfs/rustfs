@@ -19,6 +19,6 @@ warn-%:
 
 # For checking dependencies use check-<dep-name> or warn-<dep-name>
 .PHONY: core-deps fmt-deps test-deps
-core-deps: check-cargo ## Check core cependencies
+core-deps: check-cargo ## Check core dependencies
 fmt-deps: check-rustfmt ## Check lint and formatting dependencies
 test-deps: warn-cargo-nextest ## Check tests dependencies

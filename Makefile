@@ -13,19 +13,21 @@
 .EXPORT_ALL_VARIABLES:
 .ONESHELL:
 .SILENT:
-MAKEFLAGS += "-j$(NUM_CORES) -l$(NUM_CORES)"
+
+NUM_CORES := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+MAKEFLAGS += -j$(NUM_CORES) -l$(NUM_CORES)
 MAKEFLAGS += --silent
+
 SHELL:= /bin/bash
 .SHELLFLAGS = -eu -o pipefail -c
 
 DOCKER_CLI ?= docker
 IMAGE_NAME ?= rustfs:v1.0.0
 CONTAINER_NAME ?= rustfs-dev
-
 # Docker build configurations
 DOCKERFILE_PRODUCTION = Dockerfile
 DOCKERFILE_SOURCE = Dockerfile.source
-
 BUILD_OS ?= rockylinux9.3
 
 # Makefile colors config

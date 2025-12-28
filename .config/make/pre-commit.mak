@@ -7,5 +7,5 @@ setup-hooks: ## Set up git hooks
 	@echo "✅ Git hooks setup complete!"
 
 .PHONY: pre-commit
-pre-commit: fmt clippy check test ## Run pre-commit checks
+pre-commit: fmt clippy-check compilation-check test ## Run pre-commit checks
 	@echo "✅ All pre-commit checks passed!"

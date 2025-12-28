@@ -36,21 +36,20 @@ build-gnu-arm64: ## Build aarch64 GNU version
 
 
 .PHONY: build-cross-all
-build-cross-all: ## Build binaries for all architectures
+build-cross-all: core-deps ## Build binaries for all architectures
 	@echo "🔧 Building all target architectures..."
 	@echo "💡 On macOS/Windows, use 'make docker-dev' for reliable multi-arch builds"
 	@echo "🔨 Generating protobuf code..."
 	cargo run --bin gproto || true
-	@echo "🔨 Building x86_64-unknown-linux-gnu..."
-	./build-rustfs.sh
 
-.PHONY: build-all-architectures
-build-all-architectures: core-deps ## Build All architectures
-	@echo "🔨 Running compilatio--platform x86_64-unknown-linux-gnu
-	@echo "🔨 Building aarch64-unknown-linux-gnu..."
-	./build-rustfs.sh --platform aarch64-unknown-linux-gnu
-	@echo "🔨 Building x86_64-unknown-linux-musl..."
+	@echo "🔨 Building rustfs for x86_64-unknown-linux-musl..."
 	./build-rustfs.sh --platform x86_64-unknown-linux-musl
-	@echo "🔨 Building aarch64-unknown-linux-musl..."
+
+	@echo "🔨 Building rustfs for x86_64-unknown-linux-gnu..."
+	./build-rustfs.sh --platform x86_64-unknown-linux-gnu
+
+	@echo "🔨 Building rustfs for aarch64-unknown-linux-musl..."
 	./build-rustfs.sh --platform aarch64-unknown-linux-musl
-	@echo "✅ All architectures built successfully!"
+
+	@echo "🔨 Building rustfs for aarch64-unknown-linux-gnu..."
+	./build-rustfs.sh --platform aarch64-unknown-linux-gnu
