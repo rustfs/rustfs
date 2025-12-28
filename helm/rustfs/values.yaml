@@ -187,4 +187,14 @@ initStep:
     runAsUser: 0
     runAsGroup: 0
 
+pdb:
+  create: false
+  # Minimum number/percentage of pods that should remain scheduled
+  minAvailable: ""
+  # Maximum number/percentage of pods that may be made unavailable
+  maxUnavailable: 1
+
+# Whether information about services should be injected into pod's environment variable
+enableServiceLinks: false
+
 extraManifests: []
