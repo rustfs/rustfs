@@ -35,6 +35,10 @@ static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
 /// # Returns
 /// * `Result<(), Box<Credentials>>` - Ok if successful, Err with existing credentials if already initialized
 ///
+/// # Panics
+/// This function panics if automatic credential generation fails when `ak` or `sk`
+/// are `None`, for example if the random number generator fails while calling
+/// `gen_access_key` or `gen_secret_key`.
 pub fn init_global_action_credentials(ak: Option<String>, sk: Option<String>) -> Result<(), Box<Credentials>> {
     let ak = ak.unwrap_or_else(|| gen_access_key(20).expect("Failed to generate access key"));
     let sk = sk.unwrap_or_else(|| gen_secret_key(32).expect("Failed to generate secret key"));
@@ -47,7 +51,7 @@ pub fn init_global_action_credentials(ak: Option<String>, sk: Option<String>) ->
 
     GLOBAL_ACTIVE_CRED.set(cred).map_err(|e| {
         eprintln!(
-            "GLOBAL_ACTIVE_CRED has already been initialized, ignoring set\\: access_key\\={}",
+            "GLOBAL_ACTIVE_CRED has already been initialized, ignoring set: access_key={}",
             e.access_key
         );
         Box::new(Credentials {

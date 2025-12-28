@@ -543,7 +543,7 @@ pub(crate) fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
 ///
 /// # Returns
 /// * `bool` - True if request has AWS PreSign Version '2', false otherwise
-pub(crate) fn is_request_presigned_signature_v2(header: &HeaderMap) -> bool {
+fn is_request_presigned_signature_v2(header: &HeaderMap) -> bool {
     if let Some(access_key) = header.get(AMZ_ACCESS_KEY_ID) {
         return !access_key.to_str().unwrap_or("").is_empty();
     }

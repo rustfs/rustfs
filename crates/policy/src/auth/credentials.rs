@@ -76,8 +76,8 @@ pub fn is_secret_key_valid(secret_key: &str) -> bool {
 /// * `Err(Error)` - if an error occurs during generation.
 ///
 pub fn generate_credentials() -> Result<(String, String)> {
-    let ak = utils::gen_access_key(20)?;
-    let sk = utils::gen_secret_key(40)?;
+    let ak = rustfs_credentials::gen_access_key(20)?;
+    let sk = rustfs_credentials::gen_secret_key(40)?;
     Ok((ak, sk))
 }
 
@@ -307,11 +307,11 @@ impl TryFrom<CredentialsBuilder> for Credentials {
         }
 
         if value.access_key.is_empty() {
-            value.access_key = utils::gen_access_key(20)?;
+            value.access_key = rustfs_credentials::gen_access_key(20)?;
         }
 
         if value.secret_key.is_empty() {
-            value.access_key = utils::gen_secret_key(40)?;
+            value.access_key = rustfs_credentials::gen_secret_key(40)?;
         }
 
         claim["accessKey"] = json!(&value.access_key);
