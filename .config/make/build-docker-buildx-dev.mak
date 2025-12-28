@@ -1,7 +1,7 @@
 ## —— Development/Source builds using direct buildx commands ---------------------------------------
 
 .PHONY: docker-dev
-docker-dev: ## Build multi-architecture development Docker images
+docker-dev: ## Build dev multi-arch image (cannot load locally)
 	@echo "🏗️ Building multi-architecture development Docker images with buildx..."
 	@echo "💡 This builds from source code and is intended for local development and testing"
 	@echo "⚠️  Multi-arch images cannot be loaded locally, use docker-dev-push to push to registry"
@@ -12,8 +12,19 @@ docker-dev: ## Build multi-architecture development Docker images
 		--tag rustfs:dev-latest \
 		.
 
+.PHONY: docker-dev-local
+docker-dev-local: ## Build dev single-arch image (local load)
+	@echo "🏗️ Building single-architecture development Docker image for local use..."
+	@echo "💡 This builds from source code for the current platform and loads locally"
+	$(DOCKER_CLI) buildx build \
+		--file $(DOCKERFILE_SOURCE) \
+		--tag rustfs:source-latest \
+		--tag rustfs:dev-latest \
+		--load \
+		.
+
 .PHONY: docker-dev-push
-docker-dev-push: ## Build and push multi-architecture development Docker images
+docker-dev-push: ## Build and push multi-arch development image # e.g (make docker-dev-push REGISTRY=xxx)
 	@if [ -z "$(REGISTRY)" ]; then \
 		echo "❌ Error: Please specify registry, example: make docker-dev-push REGISTRY=ghcr.io/username"; \
 		exit 1; \
@@ -28,19 +39,8 @@ docker-dev-push: ## Build and push multi-architecture development Docker images
 		--push \
 		.
 
-.PHONY: docker-dev-local
-docker-dev-local: ## Build single-architecture development Docker image for local use
-	@echo "🏗️ Building single-architecture development Docker image for local use..."
-	@echo "💡 This builds from source code for the current platform and loads locally"
-	$(DOCKER_CLI) buildx build \
-		--file $(DOCKERFILE_SOURCE) \
-		--tag rustfs:source-latest \
-		--tag rustfs:dev-latest \
-		--load \
-		.
-
 .PHONY: dev-env-start
-dev-env-start: ## Start development docker environment (docker)
+dev-env-start: ## Start development container environment
 	@echo "🚀 Starting development environment..."
 	$(DOCKER_CLI) buildx build \
 		--file $(DOCKERFILE_SOURCE) \
@@ -55,10 +55,10 @@ dev-env-start: ## Start development docker environment (docker)
 		-it rustfs:dev
 
 .PHONY: dev-env-stop
-dev-env-stop: ## Stop development environment (docker)
+dev-env-stop: ## Stop development container environment
 	@echo "🛑 Stopping development environment..."
 	$(DOCKER_CLI) stop $(CONTAINER_NAME) 2>/dev/null || true
 	$(DOCKER_CLI) rm $(CONTAINER_NAME) 2>/dev/null || true
 
 .PHONY: dev-env-restart
-dev-env-restart: dev-env-stop dev-env-start ## Restart development environment (docker)
+dev-env-restart: dev-env-stop dev-env-start ## Restart development container environment

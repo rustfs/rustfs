@@ -3,8 +3,7 @@
 # https://code.visualstudio.com/docs/remote/containers
 ###########
 
-.PHONY: all SHELL
-all:
+.PHONY: SHELL
 
 # Makefile global config
 # Use config.mak to override any of the following variables.
@@ -52,6 +51,26 @@ How to use me:
 
 	# To run and execute a target
 	${bold}make ${cyan}<target>${reset}
+
+	💡 For more help use 'make help', 'make help-build' or 'make help-docker'
+
+	🦀 RustFS Makefile Help:
+
+	📋 Main Command Categories:
+	 	make help-build                          # Show build-related help
+	 	make help-docker                         # Show Docker-related help
+
+	🔧 Code Quality:
+		make fmt                                 # Format code
+		make clippy                              # Run clippy checks
+		make test                                # Run tests
+		make pre-commit                          # Run all pre-commit checks
+
+	🚀 Quick Start:
+		make build                               # Build RustFS binary
+		make docker-dev-local                    # Build development Docker image (local)
+		make dev-env-start                       # Start development environment
+
 
 endef
 export HEADER
