@@ -1075,9 +1075,10 @@ impl S3 for FS {
         let dest_bucket = bucket.clone();
         let dest_key = key.clone();
         let dest_version = oi.version_id.map(|v| v.to_string());
+        let dest_version_clone = dest_version.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&dest_bucket, &dest_key, dest_version.as_deref())
+                .invalidate_cache_versioned(&dest_bucket, &dest_key, dest_version_clone.as_deref())
                 .await;
         });
 
@@ -1095,6 +1096,7 @@ impl S3 for FS {
             ssekms_key_id: effective_kms_key_id,
             sse_customer_algorithm,
             sse_customer_key_md5,
+            version_id: dest_version,
             ..Default::default()
         };
 
@@ -3398,9 +3400,10 @@ impl S3 for FS {
             helper = helper.version_id(version_id.clone());
         }
 
+        let put_version_clone = put_version.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&put_bucket, &put_key, put_version.as_deref())
+                .invalidate_cache_versioned(&put_bucket, &put_key, put_version_clone.as_deref())
                 .await;
         });
 
@@ -3459,6 +3462,7 @@ impl S3 for FS {
             checksum_sha1,
             checksum_sha256,
             checksum_crc64nvme,
+            version_id: put_version,
             ..Default::default()
         };
 
@@ -4323,9 +4327,10 @@ impl S3 for FS {
         let mpu_bucket = bucket.clone();
         let mpu_key = key.clone();
         let mpu_version = obj_info.version_id.map(|v| v.to_string());
+        let mpu_version_clone = mpu_version.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version.as_deref())
+                .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
                 .await;
         });
 
@@ -4375,6 +4380,7 @@ impl S3 for FS {
             checksum_sha256: checksum_sha256.clone(),
             checksum_crc64nvme: checksum_crc64nvme.clone(),
             checksum_type: checksum_type.clone(),
+            version_id: mpu_version,
             ..Default::default()
         };
         info!(
