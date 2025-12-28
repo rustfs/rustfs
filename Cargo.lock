@@ -7215,7 +7215,8 @@ dependencies = [
 name = "rustfs-credentials"
 version = "0.0.5"
 dependencies = [
- "rustfs-utils",
+ "base64-simd",
+ "rand 0.10.0-rc.5",
  "serde",
  "serde_json",
  "time",
