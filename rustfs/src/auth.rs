@@ -14,11 +14,10 @@
 
 use http::HeaderMap;
 use http::Uri;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::{Credentials, get_global_action_cred};
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::SESSION_POLICY_NAME;
 use rustfs_iam::sys::get_claims_from_token_with_secret;
-use rustfs_policy::auth;
 use rustfs_utils::http::ip::get_source_ip_raw;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
@@ -129,7 +128,7 @@ impl S3Auth for IAMAuth {
 }
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
-pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(auth::Credentials, bool)> {
+pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(Credentials, bool)> {
     let Some(mut cred) = get_global_action_cred() else {
         return Err(S3Error::with_message(
             S3ErrorCode::InternalError,
@@ -187,7 +186,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     Ok((cred, owner))
 }
 
-pub fn check_claims_from_token(token: &str, cred: &auth::Credentials) -> S3Result<HashMap<String, Value>> {
+pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<HashMap<String, Value>> {
     if !token.is_empty() && cred.access_key.is_empty() {
         return Err(s3_error!(InvalidRequest, "no access key"));
     }
@@ -235,9 +234,20 @@ pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str
         .or_else(|| get_query_param(uri.query().unwrap_or_default(), "x-amz-security-token"))
 }
 
+/// Get condition values for policy evaluation
+///
+/// # Arguments
+/// * `header` - HTTP headers of the request
+/// * `cred` - User credentials
+/// * `version_id` - Optional version ID of the object
+/// * `region` - Optional region/location constraint
+///
+/// # Returns
+/// * `HashMap<String, Vec<String>>` - Condition values for policy evaluation
+///
 pub fn get_condition_values(
     header: &HeaderMap,
-    cred: &auth::Credentials,
+    cred: &Credentials,
     version_id: Option<&str>,
     region: Option<&str>,
 ) -> HashMap<String, Vec<String>> {
@@ -403,7 +413,14 @@ pub fn get_condition_values(
     args
 }
 
-// Get request authentication type
+/// Get request authentication type
+///
+/// # Arguments
+/// * `header` - HTTP headers of the request
+///
+/// # Returns
+/// * `AuthType` - The determined authentication type
+///
 pub fn get_request_auth_type(header: &HeaderMap) -> AuthType {
     if is_request_signature_v2(header) {
         AuthType::SignedV2
@@ -432,7 +449,14 @@ pub fn get_request_auth_type(header: &HeaderMap) -> AuthType {
     }
 }
 
-// Helper function to determine auth type and signature version
+/// Helper function to determine auth type and signature version
+///
+/// # Arguments
+/// * `header` - HTTP headers of the request
+///
+/// # Returns
+/// * `(String, String)` - Tuple of auth type and signature version
+///
 fn determine_auth_type_and_version(header: &HeaderMap) -> (String, String) {
     match get_request_auth_type(header) {
         AuthType::JWT => ("JWT".to_string(), String::new()),
@@ -450,7 +474,13 @@ fn determine_auth_type_and_version(header: &HeaderMap) -> (String, String) {
     }
 }
 
-// Verify if request has JWT
+/// Verify if request has JWT
+///
+/// # Arguments
+/// * `header` - HTTP headers of the request
+///
+/// # Returns
+/// * `bool` - True if request has JWT, false otherwise
 fn is_request_jwt(header: &HeaderMap) -> bool {
     if let Some(auth) = header.get("authorization") {
         if let Ok(auth_str) = auth.to_str() {
@@ -460,7 +490,13 @@ fn is_request_jwt(header: &HeaderMap) -> bool {
     false
 }
 
-// Verify if request has AWS Signature Version '4'
+/// Verify if request has AWS Signature Version '4'
+///
+/// # Arguments
+/// * `header` - HTTP headers of the request
+///
+/// # Returns
+/// * `bool` - True if request has AWS Signature Version '4', false otherwise
 fn is_request_signature_v4(header: &HeaderMap) -> bool {
     if let Some(auth) = header.get("authorization") {
         if let Ok(auth_str) = auth.to_str() {
@@ -470,7 +506,13 @@ fn is_request_signature_v4(header: &HeaderMap) -> bool {
     false
 }
 
-// Verify if request has AWS Signature Version '2'
+/// Verify if request has AWS Signature Version '2'
+///
+/// # Arguments
+/// * `header` - HTTP headers of the request
+///
+/// # Returns
+/// * `bool` - True if request has AWS Signature Version '2', false otherwise
 fn is_request_signature_v2(header: &HeaderMap) -> bool {
     if let Some(auth) = header.get("authorization") {
         if let Ok(auth_str) = auth.to_str() {
@@ -480,7 +522,13 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
     false
 }
 
-// Verify if request has AWS PreSign Version '4'
+/// Verify if request has AWS PreSign Version '4'
+///
+/// # Arguments
+/// * `header` - HTTP headers of the request
+///
+/// # Returns
+/// * `bool` - True if request has AWS PreSign Version '4', false otherwise
 pub(crate) fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
     if let Some(credential) = header.get(AMZ_CREDENTIAL) {
         return !credential.to_str().unwrap_or("").is_empty();
@@ -488,7 +536,13 @@ pub(crate) fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
     false
 }
 
-// Verify request has AWS PreSign Version '2'
+/// Verify request has AWS PreSign Version '2'
+///
+/// # Arguments
+/// * `header` - HTTP headers of the request
+///
+/// # Returns
+/// * `bool` - True if request has AWS PreSign Version '2', false otherwise
 fn is_request_presigned_signature_v2(header: &HeaderMap) -> bool {
     if let Some(access_key) = header.get(AMZ_ACCESS_KEY_ID) {
         return !access_key.to_str().unwrap_or("").is_empty();
@@ -496,7 +550,13 @@ fn is_request_presigned_signature_v2(header: &HeaderMap) -> bool {
     false
 }
 
-// Verify if request has AWS Post policy Signature Version '4'
+/// Verify if request has AWS Post policy Signature Version '4'
+///
+/// # Arguments
+/// * `header` - HTTP headers of the request
+///
+/// # Returns
+/// * `bool` - True if request has AWS Post policy Signature Version '4', false otherwise
 fn is_request_post_policy_signature_v4(header: &HeaderMap) -> bool {
     if let Some(content_type) = header.get("content-type") {
         if let Ok(ct) = content_type.to_str() {
@@ -506,7 +566,7 @@ fn is_request_post_policy_signature_v4(header: &HeaderMap) -> bool {
     false
 }
 
-// Verify if the request has AWS Streaming Signature Version '4'
+/// Verify if the request has AWS Streaming Signature Version '4'
 fn is_request_sign_streaming_v4(header: &HeaderMap) -> bool {
     if let Some(content_sha256) = header.get("x-amz-content-sha256") {
         if let Ok(sha256_str) = content_sha256.to_str() {
@@ -567,7 +627,7 @@ pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> 
 mod tests {
     use super::*;
     use http::{HeaderMap, HeaderValue, Uri};
-    use rustfs_policy::auth::Credentials;
+    use rustfs_credentials::Credentials;
     use s3s::auth::SecretKey;
     use serde_json::json;
     use std::collections::HashMap;
@@ -605,7 +665,7 @@ mod tests {
 
     fn create_service_account_credentials() -> Credentials {
         let mut claims = HashMap::new();
-        claims.insert("sa-policy".to_string(), json!("test-policy"));
+        claims.insert(rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string(), json!("test-policy"));
 
         Credentials {
             access_key: "service-access-key".to_string(),

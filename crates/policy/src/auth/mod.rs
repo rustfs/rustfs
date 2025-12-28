@@ -14,8 +14,9 @@
 
 mod credentials;
 
-pub use credentials::Credentials;
 pub use credentials::*;
+
+use rustfs_credentials::Credentials;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -27,6 +28,13 @@ pub struct UserIdentity {
 }
 
 impl UserIdentity {
+    /// Create a new UserIdentity
+    ///
+    /// # Arguments
+    /// * `credentials` - Credentials object
+    ///
+    /// # Returns
+    /// * UserIdentity
     pub fn new(credentials: Credentials) -> Self {
         UserIdentity {
             version: 1,

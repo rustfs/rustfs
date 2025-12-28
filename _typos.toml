@@ -36,6 +36,7 @@ clen = "clen"
 datas = "datas"
 bre = "bre"
 abd = "abd"
+mak = "mak"
 
 [files]
 extend-exclude = []

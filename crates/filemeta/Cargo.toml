@@ -35,12 +35,11 @@ uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
 tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 xxhash-rust = { workspace = true, features = ["xxh64"] }
 bytes.workspace = true
-rustfs-utils = { workspace = true, features = ["hash","http"] }
+rustfs-utils = { workspace = true, features = ["hash", "http"] }
 byteorder = { workspace = true }
 tracing.workspace = true
 thiserror.workspace = true
 s3s.workspace = true
-lazy_static.workspace = true
 regex.workspace = true
 
 [dev-dependencies]

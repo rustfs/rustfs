@@ -17,7 +17,6 @@ use crate::auth::{check_key_valid, get_condition_values, get_session_token};
 use crate::license::license_check;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
 use rustfs_iam::error::Error as IamError;
-use rustfs_policy::auth;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_policy::policy::{Args, BucketPolicyArgs};
 use s3s::access::{S3Access, S3AccessContext};
@@ -27,7 +26,7 @@ use std::collections::HashMap;
 #[allow(dead_code)]
 #[derive(Default, Clone)]
 pub(crate) struct ReqInfo {
-    pub cred: Option<auth::Credentials>,
+    pub cred: Option<rustfs_credentials::Credentials>,
     pub is_owner: bool,
     pub bucket: Option<String>,
     pub object: Option<String>,
@@ -107,7 +106,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     } else {
         let conditions = get_condition_values(
             &req.headers,
-            &auth::Credentials::default(),
+            &rustfs_credentials::Credentials::default(),
             req_info.version_id.as_deref(),
             req.region.as_deref(),
         );

@@ -24,7 +24,7 @@ use tonic::{
     service::interceptor::InterceptedService,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 // Type alias for the complex client type
 pub type NodeServiceClientType = NodeServiceClient<
@@ -150,7 +150,18 @@ pub async fn node_service_time_out_client(
     >,
     Box<dyn Error>,
 > {
-    let token: MetadataValue<_> = "rustfs rpc".parse()?;
+    debug!("Obtaining gRPC client for NodeService at: {}", addr);
+    let token_str = rustfs_credentials::get_grpc_token();
+    let token: MetadataValue<_> = token_str.parse().map_err(|e| {
+        error!(
+            "Failed to parse gRPC auth token into MetadataValue: {:?}; env={} token_len={} token_prefix={}",
+            e,
+            rustfs_credentials::ENV_GRPC_AUTH_TOKEN,
+            token_str.len(),
+            token_str.chars().take(2).collect::<String>(),
+        );
+        e
+    })?;
 
     // Try to get cached channel
     let cached_channel = { GLOBAL_CONN_MAP.read().await.get(addr).cloned() };
