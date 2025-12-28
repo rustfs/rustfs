@@ -125,6 +125,7 @@ use rustfs_utils::{
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use serde_urlencoded::from_bytes;
 use std::convert::Infallible;
 use std::ops::Add;
 use std::{
@@ -377,6 +378,12 @@ fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
     nonce
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct ListObjectUnorderedQuery {
+    #[serde(rename = "allow-unordered")]
+    allow_unordered: Option<String>,
+}
+
 struct InMemoryAsyncReader {
     cursor: std::io::Cursor<Vec<u8>>,
 }
@@ -490,6 +497,37 @@ fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
     // Log debug info for keys with special characters to help diagnose encoding issues
     if key.contains([' ', '+', '%']) {
         debug!("{} object with special characters in key: {:?}", operation, key);
+    }
+
+    Ok(())
+}
+
+/// Validate that 'allow-unordered' parameter is not used with a delimiter
+///
+/// This function:
+/// 1. Checks if a delimiter is specified in the ListObjects request
+/// 2. Parses the query string to check for the 'allow-unordered' parameter
+/// 3. Rejects the request if both 'delimiter' and 'allow-unordered=true' are present
+///
+/// According to S3 compatibility requirements, unordered listing cannot be combined with
+/// hierarchical directory traversal (delimited listing). This validation ensures
+/// conflicting parameters are caught before processing the request.
+fn validate_list_object_unordered_with_delimiter(delimiter: Option<&Delimiter>, query_string: Option<&str>) -> S3Result<()> {
+    if delimiter.is_none() {
+        return Ok(());
+    }
+
+    let Some(query) = query_string else {
+        return Ok(());
+    };
+
+    if let Ok(params) = from_bytes::<ListObjectUnorderedQuery>(query.as_bytes()) {
+        if params.allow_unordered.as_deref() == Some("true") {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "The allow-unordered parameter cannot be used when delimiter is specified.".to_string(),
+            ));
+        }
     }
 
     Ok(())
@@ -2818,6 +2856,9 @@ impl S3 for FS {
         }
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
+
+        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
+
         let start_after = start_after.filter(|v| !v.is_empty());
 
         let continuation_token = continuation_token.filter(|v| !v.is_empty());
@@ -6113,6 +6154,29 @@ mod tests {
         assert_eq!(get_buffer_size_opt_in(-1), MI_B);
 
         set_buffer_profile_enabled(false);
+    }
+
+    #[test]
+    fn test_validate_list_object_unordered_with_delimiter() {
+        // [1] Normal case: No delimiter specified.
+        assert!(validate_list_object_unordered_with_delimiter(None, Some("allow-unordered=true")).is_ok());
+
+        let delim_str = "/".to_string();
+        let delimiter_some: Option<&Delimiter> = Some(&delim_str);
+        // [2] Normal case: Delimiter is present, but 'allow-unordered' is explicitly set to false.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, Some("allow-unordered=false")).is_ok());
+
+        let query_conflict = Some("allow-unordered=true");
+        // [3] Conflict case: Both delimiter and 'allow-unordered=true' are present.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, query_conflict).is_err());
+
+        let complex_query = Some("allow-unordered=true&abc=123");
+        // [4] Complex query: The validation should still trigger if 'allow-unordered=true' is part of a multi-parameter query.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query).is_err());
+
+        let complex_query_without_unordered = Some("abc=123&queryType=test");
+        // [5] Multi-parameter query without conflict: If other parameters exist but 'allow-unordered' is missing,
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query_without_unordered).is_ok());
     }
 
     // Note: S3Request structure is complex and requires many fields.
