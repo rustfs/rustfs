@@ -35,3 +35,27 @@ pub const ENV_TRUST_SYSTEM_CA: &str = "RUSTFS_TRUST_SYSTEM_CA";
 /// By default, RustFS does not trust system CA certificates.
 /// To change this behavior, set the environment variable RUSTFS_TRUST_SYSTEM_CA=1
 pub const DEFAULT_TRUST_SYSTEM_CA: bool = false;
+
+/// Default filename for client CA certificate
+/// client_ca.crt（client mTLS Verify the server）
+pub const RUSTFS_CLIENT_CA_CERT_FILENAME: &str = "client_ca.crt";
+
+/// Default filename for client certificate
+/// client_cert.pem
+pub const RUSTFS_CLIENT_CERT_FILENAME: &str = "client_cert.pem";
+
+/// Default filename for client private key
+/// client_key.pem
+pub const RUSTFS_CLIENT_KEY_FILENAME: &str = "client_key.pem";
+
+/// RUSTFS_SERVER_MTLS_ENABLE
+/// Environment variable to enable server mTLS
+/// When set to "1", RustFS server will require client certificates for authentication.
+/// By default, this is disabled.
+/// To enable, set the environment variable RUSTFS_SERVER_MTLS_ENABLE=1
+pub const ENV_SERVER_MTLS_ENABLE: &str = "RUSTFS_SERVER_MTLS_ENABLE";
+
+/// Default value for enabling server mTLS
+/// By default, RustFS server mTLS is disabled.
+/// To change this behavior, set the environment variable RUSTFS_SERVER_MTLS_ENABLE=1
+pub const DEFAULT_SERVER_MTLS_ENABLE: bool = false;

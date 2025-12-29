@@ -132,6 +132,21 @@ pub enum BucketLookupType {
     BucketLookupPath,
 }
 
+fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
+    let tp = std::env::var("RUSTFS_TLS_PATH").ok()?;
+    let ca = std::path::Path::new(&tp).join("ca.crt");
+    if !ca.exists() {
+        return None;
+    }
+
+    let der_list = rustfs_utils::load_cert_bundle_der_bytes(ca.to_str().unwrap_or_default()).ok()?;
+    let mut store = rustls::RootCertStore::empty();
+    for der in der_list {
+        let _ = store.add(der.into());
+    }
+    Some(store)
+}
+
 impl TransitionClient {
     pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let clnt = Self::private_new(endpoint, opts, tier_type).await?;
@@ -149,7 +164,14 @@ impl TransitionClient {
 
         let scheme = endpoint_url.scheme();
         let client;
-        let tls = rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth();
+        let tls = if let Some(store) = load_root_store_from_tls_path() {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(store)
+                .with_no_client_auth()
+        } else {
+            rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth()
+        };
+
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
             .https_or_http()
