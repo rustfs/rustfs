@@ -26,6 +26,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      enableServiceLinks: {{ .Values.enableServiceLinks }}
       {{- with include "chart.imagePullSecrets" . }}
       imagePullSecrets:
         {{- . | nindent 8 }}

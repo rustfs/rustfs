@@ -31,6 +31,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
+| enableServiceLinks | bool | `false` |  |
 | extraManifests | list | `[]` | List of additional k8s manifests. |
 | fullnameOverride | string | `""` |  |
 | image.pullPolicy | string | `"IfNotPresent"` |  |
@@ -73,6 +74,9 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | mode.standalone.enabled | bool | `false` | RustFS standalone mode support, namely one pod one pvc.  |
 | nameOverride | string | `""` |  |
 | nodeSelector | object | `{}` |  |
+| pdb.create | bool | `false` | Enable/disable a Pod Disruption Budget creation |
+| pdb.maxUnavailable | string | `1` |  |
+| pdb.minAvailable | string | `""` |  |
 | podAnnotations | object | `{}` |  |
 | podLabels | object | `{}` |  |
 | podSecurityContext.fsGroup | int | `10001` |  |
