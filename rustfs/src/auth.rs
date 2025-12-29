@@ -114,10 +114,21 @@ impl S3Auth for IAMAuth {
         }
 
         if let Ok(iam_store) = rustfs_iam::get() {
-            if let Some(id) = iam_store.get_user(access_key).await {
-                return Ok(SecretKey::from(id.credentials.secret_key.clone()));
-            } else {
-                tracing::warn!("get_user failed: no such user, access_key: {access_key}");
+            // Use check_key instead of get_user to ensure user is loaded from disk if not in cache
+            // This is important for newly created users that may not be in cache yet.
+            // check_key will automatically attempt to load the user from disk if not found in cache.
+            match iam_store.check_key(access_key).await {
+                Ok((Some(id), _valid)) => {
+                    // Return secret key for signature verification regardless of user status.
+                    // Authorization will be checked separately in the authorization phase.
+                    return Ok(SecretKey::from(id.credentials.secret_key.clone()));
+                }
+                Ok((None, _)) => {
+                    tracing::warn!("get_secret_key failed: no such user, access_key: {access_key}");
+                }
+                Err(e) => {
+                    tracing::warn!("get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}");
+                }
             }
         } else {
             tracing::warn!("get_secret_key failed: iam not initialized, access_key: {access_key}");
