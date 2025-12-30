@@ -19,6 +19,9 @@ TLS_DIR/
   # Optional: outbound mTLS client identity for MNMD
   client_cert.pem     # client certificate chain (PEM)
   client_key.pem      # client private key (PEM)
+
+  # Optional: server-side mTLS (inbound client certificate verification)
+  client_ca.crt       # PEM bundle of CA certificates to verify client certificates
 ```
 
 ## Environment variables
@@ -39,6 +42,19 @@ TLS_DIR/
 
 If both files exist, RustFS enables outbound mTLS. If either is missing, RustFS proceeds
 with server-only TLS.
+
+### Server-side mTLS (inbound client certificate verification)
+
+- `RUSTFS_SERVER_MTLS_ENABLE` (default: `false`): When `true`, the RustFS server requires
+  clients to present valid certificates signed by a trusted CA for authentication.
+
+When enabled, RustFS loads client CA certificates from:
+1. `${RUSTFS_TLS_PATH}/client_ca.crt` (preferred)
+2. `${RUSTFS_TLS_PATH}/ca.crt` (fallback if `client_ca.crt` does not exist)
+
+**Important**: Server mTLS is disabled by default. When enabled but no valid CA bundle is
+found, RustFS will fail to start with a clear error message. This ensures that server mTLS
+cannot be accidentally enabled without proper client CA configuration.
 
 ## Failure mode for HTTPS without roots
 
