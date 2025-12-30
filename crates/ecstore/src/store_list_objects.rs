@@ -387,7 +387,12 @@ impl ECStore {
         }
 
         let version_marker = if let Some(marker) = version_marker {
-            Some(Uuid::parse_str(&marker)?)
+            // "null" is used for non-versioned objects in AWS S3 API
+            if marker == "null" {
+                None
+            } else {
+                Some(Uuid::parse_str(&marker)?)
+            }
         } else {
             None
         };
@@ -445,7 +450,13 @@ impl ECStore {
             if is_truncated {
                 get_objects
                     .last()
-                    .map(|last| (Some(last.name.clone()), last.version_id.map(|v| v.to_string())))
+                    .map(|last| {
+                        (
+                            Some(last.name.clone()),
+                            // AWS S3 API returns "null" for non-versioned objects
+                            Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+                        )
+                    })
                     .unwrap_or_default()
             } else {
                 (None, None)
