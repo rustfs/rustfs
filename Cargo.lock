@@ -3388,7 +3388,6 @@ dependencies = [
  "chrono",
  "flatbuffers",
  "futures",
- "log",
  "md5 0.8.0",
  "native-tls",
  "rand 0.10.0-rc.5",

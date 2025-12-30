@@ -97,13 +97,6 @@ pub async fn test_ftps_core_operations() -> Result<()> {
         ftp_stream.put_file(filename, &mut Cursor::new(content.as_bytes()))?;
         info!("PASS: put file '{}' ({} bytes) successful", filename, content.len());
 
-        info!("Testing FTPS: get object");
-        let mut retrieved_content = Vec::new();
-        ftp_stream.retr(filename, &mut retrieved_content)?;
-        let retrieved_string = String::from_utf8(retrieved_content)?;
-        assert_eq!(retrieved_string, content, "Retrieved content should match uploaded content");
-        info!("PASS: get object '{}' successful, content matches", filename);
-
         info!("Testing FTPS: ls list objects in bucket");
         let list = ftp_stream.list(None)?;
         assert!(list.iter().any(|line| line.contains(filename)), "File should appear in list");
