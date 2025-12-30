@@ -133,8 +133,8 @@ pub enum BucketLookupType {
 }
 
 fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
-    // Prefer the documented RUSTFS_TLS_PATH variable, but fall back to
-    // the older RUSTFS_TLS_PATH name for backward compatibility.
+    // Load the root certificate bundle from the path specified by the
+    // RUSTFS_TLS_PATH environment variable.
     let tp = std::env::var("RUSTFS_TLS_PATH").ok()?;
     let ca = std::path::Path::new(&tp).join(rustfs_config::RUSTFS_CA_CERT);
     if !ca.exists() {

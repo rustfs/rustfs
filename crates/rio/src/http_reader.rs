@@ -41,8 +41,8 @@ fn tls_path() -> Option<&'static std::path::PathBuf> {
 }
 
 /// Load CA root certificates from the RUSTFS_TLS_PATH directory.
-/// The CA certificates should be in DER format and stored in the file
-/// specified by RUSTFS_CA_CERT constant.
+/// The CA certificates should be in PEM format and stored in the file
+/// specified by the RUSTFS_CA_CERT constant.
 /// If the file does not exist or cannot be read, return the builder unchanged.
 fn load_ca_roots_from_tls_path(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     let Some(tp) = tls_path() else {

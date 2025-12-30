@@ -14,7 +14,7 @@ services:
       - MNMD_TLS_CLIENT_CA=/tls/ca.crt
 
   rustfs:
-    image: ghcr.io/rustfs/rustfs:fix-mnmd-mtls
+    image: ghcr.io/rustfs/rustfs:latest
     container_name: rustfs
     depends_on:
       - mnmd
