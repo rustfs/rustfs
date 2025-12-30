@@ -299,7 +299,7 @@ pub fn get_condition_values(
         .unwrap_or(false);
 
     // Get remote address from header or use default
-    let remote_addr_s = remote_addr.map(|a| a.ip().to_string()).unwrap_or_else(|| "".to_string());
+    let remote_addr_s = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
 
     let mut args = HashMap::new();
 
