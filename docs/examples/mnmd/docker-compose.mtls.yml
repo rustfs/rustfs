@@ -1,0 +1,32 @@
+services:
+  mnmd:
+    image: ghcr.io/your-org/mnmd:latest
+    container_name: mnmd
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./tls:/tls:ro
+    environment:
+      # Example mnmd settings (adapt to your image)
+      - MNMD_LISTEN_ADDR=0.0.0.0:8443
+      - MNMD_TLS_CERT=/tls/server_cert.pem
+      - MNMD_TLS_KEY=/tls/server_key.pem
+      - MNMD_TLS_CLIENT_CA=/tls/ca.crt
+
+  rustfs:
+    image: ghcr.io/rustfs/rustfs:latest
+    container_name: rustfs
+    depends_on:
+      - mnmd
+    environment:
+      - RUSTFS_TLS_PATH=/tls
+      - RUSTFS_TRUST_SYSTEM_CA=false
+      - RUSTFS_TRUST_LEAF_CERT_AS_CA=false
+      # Enable outbound mTLS (client identity) for MNMD
+      - RUSTFS_MTLS_CLIENT_CERT=/tls/client_cert.pem
+      - RUSTFS_MTLS_CLIENT_KEY=/tls/client_key.pem
+      # MNMD address configured to https
+      - RUSTFS_MNMD_ADDR=https://mnmd:8443
+      - RUSTFS_MNMD_DOMAIN=mnmd
+    volumes:
+      - ./tls:/tls:ro

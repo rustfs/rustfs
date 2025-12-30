@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::get_env_bool;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
+use rustls::RootCertStore;
+use rustls::server::danger::ClientCertVerifier;
+use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls_pemfile::{certs, private_key};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -46,6 +49,79 @@ pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
         return Err(certs_error(format!("No valid certificate was found in the certificate file {filename}")));
     }
     Ok(certs)
+}
+
+/// Load a PEM certificate bundle and return each certificate as DER bytes.
+///
+/// This is a low-level helper intended for TLS clients (reqwest/hyper-rustls) that
+/// need to add root certificates one-by-one.
+///
+/// - Input: a PEM file that may contain multiple cert blocks.
+/// - Output: Vec of DER-encoded cert bytes, one per cert.
+///
+/// NOTE: This intentionally returns raw bytes to avoid forcing downstream crates
+/// to depend on rustls types.
+pub fn load_cert_bundle_der_bytes(path: &str) -> io::Result<Vec<Vec<u8>>> {
+    let pem = fs::read(path)?;
+    let mut reader = io::BufReader::new(&pem[..]);
+
+    let certs = certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| certs_error(format!("Failed to parse PEM certs from {path}: {e}")))?;
+
+    Ok(certs.into_iter().map(|c| c.to_vec()).collect())
+}
+
+/// Builds a WebPkiClientVerifier for mTLS if enabled via environment variable.
+///
+/// # Arguments
+/// * `tls_path` - Directory containing client CA certificates
+///
+/// # Returns
+/// * `Ok(Some(verifier))` if mTLS is enabled and CA certs are found
+/// * `Ok(None)` if mTLS is disabled
+/// * `Err` if mTLS is enabled but configuration is invalid
+pub fn build_webpki_client_verifier(tls_path: &str) -> io::Result<Option<Arc<dyn ClientCertVerifier>>> {
+    if !get_env_bool(rustfs_config::ENV_SERVER_MTLS_ENABLE, rustfs_config::DEFAULT_SERVER_MTLS_ENABLE) {
+        return Ok(None);
+    }
+
+    let ca_path = mtls_ca_bundle_path(tls_path).ok_or_else(|| {
+        Error::other(format!(
+            "RUSTFS_SERVER_MTLS_ENABLE=true but missing {}/client_ca.crt (or fallback {}/ca.crt)",
+            tls_path, tls_path
+        ))
+    })?;
+
+    let der_list = load_cert_bundle_der_bytes(ca_path.to_str().unwrap_or_default())?;
+
+    let mut store = RootCertStore::empty();
+    for der in der_list {
+        store
+            .add(der.into())
+            .map_err(|e| Error::other(format!("Invalid client CA cert: {e}")))?;
+    }
+
+    let verifier = WebPkiClientVerifier::builder(Arc::new(store))
+        .build()
+        .map_err(|e| Error::other(format!("Build client cert verifier failed: {e}")))?;
+
+    Ok(Some(verifier))
+}
+
+/// Locate the mTLS client CA bundle in the specified TLS path
+fn mtls_ca_bundle_path(tls_path: &str) -> Option<std::path::PathBuf> {
+    use std::path::Path;
+
+    let p1 = Path::new(tls_path).join(rustfs_config::RUSTFS_CLIENT_CA_CERT_FILENAME);
+    if p1.exists() {
+        return Some(p1);
+    }
+    let p2 = Path::new(tls_path).join(rustfs_config::RUSTFS_CA_CERT);
+    if p2.exists() {
+        return Some(p2);
+    }
+    None
 }
 
 /// Load private key from file.

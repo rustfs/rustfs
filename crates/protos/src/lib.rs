@@ -16,7 +16,7 @@
 mod generated;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_ROOT_CERT, evict_connection};
+use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evict_connection};
 use std::{error::Error, time::Duration};
 use tonic::{
     Request, Status,
@@ -83,6 +83,11 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 
     let root_cert = GLOBAL_ROOT_CERT.read().await;
     if addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        if root_cert.is_none() {
+            debug!("No custom root certificate configured; using system roots for TLS: {}", addr);
+            // If no custom root cert is configured, try to use system roots.
+            connector = connector.tls_config(ClientTlsConfig::new())?;
+        }
         if let Some(cert_pem) = root_cert.as_ref() {
             let ca = Certificate::from_pem(cert_pem);
             // Derive the hostname from the HTTPS URL for TLS hostname verification.
@@ -95,7 +100,13 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
                 .next()
                 .unwrap_or("");
             let tls = if !domain.is_empty() {
-                ClientTlsConfig::new().ca_certificate(ca).domain_name(domain)
+                let mut cfg = ClientTlsConfig::new().ca_certificate(ca).domain_name(domain);
+                let mtls_identity = GLOBAL_MTLS_IDENTITY.read().await;
+                if let Some(id) = mtls_identity.as_ref() {
+                    let identity = tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone());
+                    cfg = cfg.identity(identity);
+                }
+                cfg
             } else {
                 // Fallback: configure TLS without explicit domain if parsing fails.
                 ClientTlsConfig::new().ca_certificate(ca)
@@ -103,12 +114,9 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
             connector = connector.tls_config(tls)?;
             debug!("Configured TLS with custom root certificate for: {}", addr);
         } else {
-            debug!("Using system root certificates for TLS: {}", addr);
-        }
-    } else {
-        // Custom root certificates are configured but will be ignored for non-HTTPS addresses.
-        if root_cert.is_some() {
-            warn!("Custom root certificates are configured but not used because the address does not use HTTPS: {addr}");
+            return Err(std::io::Error::other(
+                "HTTPS requested but no trusted roots are configured. Provide tls/ca.crt (or enable system roots via RUSTFS_TRUST_SYSTEM_CA=true)."
+            ).into());
         }
     }
 

@@ -95,7 +95,9 @@ async fn async_main() -> Result<()> {
 
     // Store in global storage
     match set_global_guard(guard).map_err(Error::other) {
-        Ok(_) => (),
+        Ok(_) => {
+            info!(target: "rustfs::main", "Global observability guard set successfully.");
+        }
         Err(e) => {
             error!("Failed to set global observability guard: {}", e);
             return Err(e);
@@ -110,7 +112,15 @@ async fn async_main() -> Result<()> {
 
     // Initialize TLS if a certificate path is provided
     if let Some(tls_path) = &opt.tls_path {
-        init_cert(tls_path).await
+        match init_cert(tls_path).await {
+            Ok(_) => {
+                info!(target: "rustfs::main", "TLS initialized successfully with certs from {}", tls_path);
+            }
+            Err(e) => {
+                error!("Failed to initialize TLS from {}: {}", tls_path, e);
+                return Err(Error::other(e));
+            }
+        }
     }
 
     // Run parameters

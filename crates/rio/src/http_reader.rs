@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt as _};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use std::error::Error as _;
 use std::io::{self, Error};
 use std::ops::Not as _;
@@ -26,21 +27,88 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::io::StreamReader;
+use tracing::error;
 
-use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
+/// Get the TLS path from the RUSTFS_TLS_PATH environment variable.
+/// If the variable is not set, return None.
+fn tls_path() -> Option<&'static std::path::PathBuf> {
+    static TLS_PATH: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+        std::env::var("RUSTFS_TLS_PATH")
+            .ok()
+            .and_then(|s| if s.is_empty() { None } else { Some(s.into()) })
+    });
+    TLS_PATH.as_ref()
+}
+
+/// Load CA root certificates from the RUSTFS_TLS_PATH directory.
+/// The CA certificates should be in PEM format and stored in the file
+/// specified by the RUSTFS_CA_CERT constant.
+/// If the file does not exist or cannot be read, return the builder unchanged.
+fn load_ca_roots_from_tls_path(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let Some(tp) = tls_path() else {
+        return builder;
+    };
+    let ca_path = tp.join(rustfs_config::RUSTFS_CA_CERT);
+    if !ca_path.exists() {
+        return builder;
+    }
+
+    let Ok(certs_der) = rustfs_utils::load_cert_bundle_der_bytes(ca_path.to_str().unwrap_or_default()) else {
+        return builder;
+    };
+
+    let mut b = builder;
+    for der in certs_der {
+        if let Ok(cert) = Certificate::from_der(&der) {
+            b = b.add_root_certificate(cert);
+        }
+    }
+    b
+}
+
+/// Load optional mTLS identity from the RUSTFS_TLS_PATH directory.
+/// The client certificate and private key should be in PEM format and stored in the files
+/// specified by RUSTFS_CLIENT_CERT_FILENAME and RUSTFS_CLIENT_KEY_FILENAME constants.
+/// If the files do not exist or cannot be read, return None.
+fn load_optional_mtls_identity_from_tls_path() -> Option<Identity> {
+    let tp = tls_path()?;
+    let cert = std::fs::read(tp.join(rustfs_config::RUSTFS_CLIENT_CERT_FILENAME)).ok()?;
+    let key = std::fs::read(tp.join(rustfs_config::RUSTFS_CLIENT_KEY_FILENAME)).ok()?;
+
+    let mut pem = Vec::with_capacity(cert.len() + key.len() + 1);
+    pem.extend_from_slice(&cert);
+    if !pem.ends_with(b"\n") {
+        pem.push(b'\n');
+    }
+    pem.extend_from_slice(&key);
+
+    match Identity::from_pem(&pem) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            error!("Failed to load mTLS identity from PEM: {e}");
+            None
+        }
+    }
+}
 
 fn get_http_client() -> Client {
     // Reuse the HTTP connection pool in the global `reqwest::Client` instance
     // TODO: interact with load balancing?
     static CLIENT: LazyLock<Client> = LazyLock::new(|| {
-        Client::builder()
+        let mut builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .tcp_keepalive(std::time::Duration::from_secs(10))
             .http2_keep_alive_interval(std::time::Duration::from_secs(5))
             .http2_keep_alive_timeout(std::time::Duration::from_secs(3))
-            .http2_keep_alive_while_idle(true)
-            .build()
-            .expect("Failed to create global HTTP client")
+            .http2_keep_alive_while_idle(true);
+
+        // HTTPS root trust + optional mTLS identity from RUSTFS_TLS_PATH
+        builder = load_ca_roots_from_tls_path(builder);
+        if let Some(id) = load_optional_mtls_identity_from_tls_path() {
+            builder = builder.identity(id);
+        }
+
+        builder.build().expect("Failed to create global HTTP client")
     });
     CLIENT.clone()
 }
