@@ -510,8 +510,9 @@ envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
     exit 1
 }
 
-# Step 7: Provision s3-tests users (main and alt)
-log_info "Provisioning s3-tests users..."
+# Step 7: Provision s3-tests alt user
+# Note: Main user (rustfsadmin) is a system user and doesn't need to be created via API
+log_info "Provisioning s3-tests alt user..."
 if ! command -v awscurl >/dev/null 2>&1; then
     python3 -m pip install --user --upgrade pip awscurl || {
         log_error "Failed to install awscurl"
@@ -520,30 +521,7 @@ if ! command -v awscurl >/dev/null 2>&1; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# Step 7.1: Ensure main user exists (create if not exists)
-log_info "Ensuring main user (${S3_ACCESS_KEY}) exists..."
-awscurl \
-    --service s3 \
-    --region "${S3_REGION}" \
-    --access_key "${S3_ACCESS_KEY}" \
-    --secret_key "${S3_SECRET_KEY}" \
-    -X PUT \
-    -H 'Content-Type: application/json' \
-    -d "{\"secretKey\":\"${S3_SECRET_KEY}\",\"status\":\"enabled\",\"policy\":\"readwrite\"}" \
-    "http://${S3_HOST}:${S3_PORT}/rustfs/admin/v3/add-user?accessKey=${S3_ACCESS_KEY}" 2>&1 | grep -v "already exists" || true
-
-# Step 7.2: Set main user policy
-awscurl \
-    --service s3 \
-    --region "${S3_REGION}" \
-    --access_key "${S3_ACCESS_KEY}" \
-    --secret_key "${S3_SECRET_KEY}" \
-    -X PUT \
-    "http://${S3_HOST}:${S3_PORT}/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${S3_ACCESS_KEY}&isGroup=false" 2>&1 || {
-    log_warn "Failed to set main user policy (may already be set)"
-}
-
-# Step 7.3: Provision alt user (required by suite)
+# Provision alt user (required by suite)
 log_info "Provisioning alt user (${S3_ALT_ACCESS_KEY})..."
 awscurl \
     --service s3 \
