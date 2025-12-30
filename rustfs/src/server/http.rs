@@ -529,7 +529,16 @@ fn process_connection(
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
         let service = hybrid(s3_service, rpc_service);
 
-        let remote_addr = socket.peer_addr().ok().map(RemoteAddr);
+        let remote_addr = match socket.peer_addr() {
+            Ok(addr) => Some(RemoteAddr(addr)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to obtain peer address; policy evaluation may fall back to a default source IP"
+                );
+                None
+            }
+        };
 
         let hybrid_service = ServiceBuilder::new()
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
