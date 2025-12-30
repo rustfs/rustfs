@@ -139,6 +139,10 @@ impl ObjectStore {
         Ok(en)
     }
 
+    fn try_decrypt_data(data: &[u8]) -> bool {
+        Self::decrypt_data(data).is_ok()
+    }
+
     async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, ObjectInfo)> {
         let (data, obj) = read_config_with_metadata(self.object_api.clone(), path.as_ref(), &ObjectOptions::default()).await?;
 
@@ -264,6 +268,14 @@ impl ObjectStore {
         for name in names {
             let user_name = rustfs_utils::path::dir(name);
             futures.push(async move {
+                if let Ok(data) = read_config(self.object_api.clone(), &get_user_identity_path(&user_name, user_type)).await {
+                    if !Self::try_decrypt_data(&data) {
+                        // Cannot decrypt this user's identity, skip it
+                        warn!("skip user due to decrypt failure: {}", user_name);
+                        return Ok(UserIdentity::default());
+                    }
+                }
+
                 match self.load_user_identity(&user_name, user_type).await {
                     Ok(res) => Ok(res),
                     Err(err) => {
@@ -410,9 +422,8 @@ impl Store for ObjectStore {
         data = match Self::decrypt_data(&data) {
             Ok(v) => v,
             Err(err) => {
-                warn!("delete the config file when decrypt failed failed: {}, path: {}", err, path.as_ref());
-                // delete the config file when decrypt failed
-                let _ = self.delete_iam_config(path.as_ref()).await;
+                warn!("config decrypt failed, keeping file: {}, path: {}", err, path.as_ref());
+                // keep the config file when decrypt failed - do not delete
                 return Err(Error::ConfigNotFound);
             }
         };
