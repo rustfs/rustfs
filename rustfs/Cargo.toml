@@ -65,7 +65,6 @@ rustfs-zip = { workspace = true }
 # Async Runtime and Networking
 async-trait = { workspace = true }
 axum.workspace = true
-axum-extra = { workspace = true }
 axum-server = { workspace = true }
 futures.workspace = true
 futures-util.workspace = true
@@ -95,6 +94,7 @@ serde_urlencoded = { workspace = true }
 # Cryptography and Security
 rustls = { workspace = true }
 subtle = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 # Time and Date
 chrono = { workspace = true }
