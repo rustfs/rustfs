@@ -3043,8 +3043,9 @@ impl S3 for FS {
             })
             .collect::<Vec<_>>();
 
-        // Only set next_version_id_marker if it has a value, per AWS S3 API spec
-        // boto3 expects it to be a string or omitted, not None
+        // Only set next_key_marker and next_version_id_marker if they have values, per AWS S3 API spec
+        // boto3 expects them to be strings or omitted, not None or empty strings
+        let next_key_marker = object_infos.next_marker.filter(|v| !v.is_empty());
         let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
 
         let output = ListObjectVersionsOutput {
@@ -3056,7 +3057,7 @@ impl S3 for FS {
             common_prefixes: Some(common_prefixes),
             versions: Some(objects),
             delete_markers: Some(delete_markers),
-            next_key_marker: object_infos.next_marker,
+            next_key_marker,
             next_version_id_marker,
             ..Default::default()
         };
