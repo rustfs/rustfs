@@ -301,7 +301,7 @@ pub fn get_condition_values(
     // Get remote address from header or use default
     let remote_addr_s = remote_addr
         .map(|a| a.ip().to_string())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+        .unwrap_or_else(|| "".to_string());
 
     let mut args = HashMap::new();
 
@@ -1213,9 +1213,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         let cred = Credentials::default();
 
-        // Case 1: No headers, no remote addr -> 127.0.0.1
+        // Case 1: No headers, no remote addr -> empty string
         let conditions = get_condition_values(&headers, &cred, None, None, None);
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "127.0.0.1");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "");
 
         // Case 2: No headers, with remote addr -> remote addr
         let remote_addr: std::net::SocketAddr = "192.168.0.10:12345".parse().unwrap();
