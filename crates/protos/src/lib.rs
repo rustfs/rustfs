@@ -114,8 +114,7 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
             connector = connector.tls_config(tls)?;
             debug!("Configured TLS with custom root certificate for: {}", addr);
         } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "HTTPS requested but no trusted roots are configured. Provide tls/ca.crt (or enable system roots via RUSTFS_TRUST_SYSTEM_CA=true)."
             ).into());
         }
