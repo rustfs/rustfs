@@ -132,6 +132,25 @@ pub enum BucketLookupType {
     BucketLookupPath,
 }
 
+fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
+    // Load the root certificate bundle from the path specified by the
+    // RUSTFS_TLS_PATH environment variable.
+    let tp = std::env::var("RUSTFS_TLS_PATH").ok()?;
+    let ca = std::path::Path::new(&tp).join(rustfs_config::RUSTFS_CA_CERT);
+    if !ca.exists() {
+        return None;
+    }
+
+    let der_list = rustfs_utils::load_cert_bundle_der_bytes(ca.to_str().unwrap_or_default()).ok()?;
+    let mut store = rustls::RootCertStore::empty();
+    for der in der_list {
+        if let Err(e) = store.add(der.into()) {
+            warn!("Warning: failed to add certificate from '{}' to root store: {e}", ca.display());
+        }
+    }
+    Some(store)
+}
+
 impl TransitionClient {
     pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let clnt = Self::private_new(endpoint, opts, tier_type).await?;
@@ -142,18 +161,22 @@ impl TransitionClient {
     async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        //#[cfg(feature = "ring")]
         let _ = rustls::crypto::ring::default_provider().install_default();
-        //#[cfg(feature = "aws-lc-rs")]
-        // let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
         let scheme = endpoint_url.scheme();
         let client;
-        let tls = rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth();
+        let tls = if let Some(store) = load_root_store_from_tls_path() {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(store)
+                .with_no_client_auth()
+        } else {
+            rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth()
+        };
+
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
             .https_or_http()
             .enable_http1()
+            .enable_http2()
             .build();
         client = Client::builder(TokioExecutor::new()).build(https);
 
