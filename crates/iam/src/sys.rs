@@ -24,19 +24,18 @@ use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
 use crate::utils::extract_claims;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;
 use rustfs_policy::arn::ARN;
-use rustfs_policy::auth::Credentials;
 use rustfs_policy::auth::{
     ACCOUNT_ON, UserIdentity, contains_reserved_chars, create_new_credentials_with_metadata, generate_credentials,
     is_access_key_valid, is_secret_key_valid,
 };
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
-use rustfs_policy::policy::{EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, iam_policy_claim_name_sa};
+use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa};
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -67,6 +66,13 @@ pub struct IamSys<T> {
 }
 
 impl<T: Store> IamSys<T> {
+    /// Create a new IamSys instance with the given IamCache store
+    ///
+    /// # Arguments
+    /// * `store` - An Arc to the IamCache instance
+    ///
+    /// # Returns
+    /// A new instance of IamSys
     pub fn new(store: Arc<IamCache<T>>) -> Self {
         tokio::spawn(async move {
             match opa::lookup_config().await {
@@ -87,6 +93,11 @@ impl<T: Store> IamSys<T> {
             roles_map: HashMap::new(),
         }
     }
+
+    /// Check if the IamSys has a watcher configured
+    ///
+    /// # Returns
+    /// `true` if a watcher is configured, `false` otherwise
     pub fn has_watcher(&self) -> bool {
         self.store.api.has_watcher()
     }
@@ -871,6 +882,11 @@ impl<T: Store> IamSys<T> {
         }
 
         self.get_combined_policy(&policies).await.is_allowed(args).await
+    }
+
+    /// Check if the underlying store is ready
+    pub fn is_ready(&self) -> bool {
+        self.store.is_ready()
     }
 }
 

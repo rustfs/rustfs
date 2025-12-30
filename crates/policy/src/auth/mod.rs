@@ -14,8 +14,9 @@
 
 mod credentials;
 
-pub use credentials::Credentials;
 pub use credentials::*;
+
+use rustfs_credentials::Credentials;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -29,6 +30,13 @@ pub struct UserIdentity {
 }
 
 impl UserIdentity {
+    /// Create a new UserIdentity
+    ///
+    /// # Arguments
+    /// * `credentials` - Credentials object
+    ///
+    /// # Returns
+    /// * UserIdentity
     pub fn new(credentials: Credentials) -> Self {
         UserIdentity {
             version: 1,
@@ -52,12 +60,7 @@ impl UserIdentity {
             .as_ref()
             .and_then(|claims| claims.get("ssh_public_keys"))
             .and_then(|keys| keys.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(String::from)
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(String::from).collect())
             .unwrap_or_default()
     }
 }

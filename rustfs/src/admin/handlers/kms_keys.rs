@@ -17,6 +17,7 @@
 use super::Operation;
 use crate::admin::auth::validate_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
+use crate::server::RemoteAddr;
 use hyper::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -79,6 +80,7 @@ impl Operation for CreateKmsKeyHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -212,6 +214,7 @@ impl Operation for DeleteKmsKeyHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -360,6 +363,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -488,6 +492,7 @@ impl Operation for ListKmsKeysHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -599,6 +604,7 @@ impl Operation for DescribeKmsKeyHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 

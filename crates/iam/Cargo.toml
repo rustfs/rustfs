@@ -29,6 +29,7 @@ documentation = "https://docs.rs/rustfs-iam/latest/rustfs_iam/"
 workspace = true
 
 [dependencies]
+rustfs-credentials = { workspace = true }
 tokio.workspace = true
 time = { workspace = true, features = ["serde-human-readable"] }
 serde = { workspace = true, features = ["derive", "rc"] }

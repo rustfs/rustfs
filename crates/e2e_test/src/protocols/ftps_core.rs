@@ -14,15 +14,15 @@
 
 //! Core FTPS tests
 
-use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use crate::common::rustfs_binary_path;
+use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
 use native_tls::TlsConnector;
 use rcgen::generate_simple_self_signed;
 use std::io::Cursor;
 use std::path::PathBuf;
-use suppaftp::NativeTlsFtpStream;
 use suppaftp::NativeTlsConnector;
+use suppaftp::NativeTlsFtpStream;
 use tokio::process::Command;
 use tracing::info;
 
@@ -32,8 +32,7 @@ const FTPS_ADDRESS: &str = "127.0.0.1:9021";
 
 /// Test FTPS: put, ls, mkdir, rmdir, delete operations
 pub async fn test_ftps_core_operations() -> Result<()> {
-    let env = ProtocolTestEnvironment::new()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let env = ProtocolTestEnvironment::new().map_err(|e| anyhow::anyhow!("{}", e))?;
 
     // Generate and write certificate
     let cert = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
@@ -51,9 +50,12 @@ pub async fn test_ftps_core_operations() -> Result<()> {
     let mut server_process = Command::new(&binary_path)
         .args([
             "--ftps-enable",
-            "--ftps-address", FTPS_ADDRESS,
-            "--ftps-certs-file", cert_path.to_str().unwrap(),
-            "--ftps-key-file", key_path.to_str().unwrap(),
+            "--ftps-address",
+            FTPS_ADDRESS,
+            "--ftps-certs-file",
+            cert_path.to_str().unwrap(),
+            "--ftps-key-file",
+            key_path.to_str().unwrap(),
             &env.temp_dir,
         ])
         .spawn()?;
@@ -61,20 +63,18 @@ pub async fn test_ftps_core_operations() -> Result<()> {
     // Ensure server is cleaned up even on failure
     let result = (async || {
         // Wait for server to be ready
-        ProtocolTestEnvironment::wait_for_port_ready(FTPS_PORT, 30).await
+        ProtocolTestEnvironment::wait_for_port_ready(FTPS_PORT, 30)
+            .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         // Create native TLS connector that accepts the certificate
-        let tls_connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .build()?;
+        let tls_connector = TlsConnector::builder().danger_accept_invalid_certs(true).build()?;
 
         // Wrap in suppaftp's NativeTlsConnector
         let tls_connector = NativeTlsConnector::from(tls_connector);
 
         // Connect to FTPS server
-        let ftp_stream = NativeTlsFtpStream::connect(FTPS_ADDRESS)
-            .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
+        let ftp_stream = NativeTlsFtpStream::connect(FTPS_ADDRESS).map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
 
         // Upgrade to secure connection
         let mut ftp_stream = ftp_stream
@@ -111,11 +111,19 @@ pub async fn test_ftps_core_operations() -> Result<()> {
         let list_root = ftp_stream.list(Some("/")).unwrap();
         assert!(list_root.iter().any(|line| line.contains(bucket_name)), "Bucket should appear in ls /");
         assert!(!list_root.iter().any(|line| line.contains(filename)), "File should not appear in ls /");
-        info!("PASS: ls / successful, bucket '{}' found, file '{}' not found in root", bucket_name, filename);
+        info!(
+            "PASS: ls / successful, bucket '{}' found, file '{}' not found in root",
+            bucket_name, filename
+        );
 
         info!("Testing FTPS: ls /. (list root directory with /.)");
-        let list_root_dot = ftp_stream.list(Some("/.")).unwrap_or_else(|_| ftp_stream.list(Some("/")).unwrap());
-        assert!(list_root_dot.iter().any(|line| line.contains(bucket_name)), "Bucket should appear in ls /.");
+        let list_root_dot = ftp_stream
+            .list(Some("/."))
+            .unwrap_or_else(|_| ftp_stream.list(Some("/")).unwrap());
+        assert!(
+            list_root_dot.iter().any(|line| line.contains(bucket_name)),
+            "Bucket should appear in ls /."
+        );
         info!("PASS: ls /. successful, bucket '{}' found", bucket_name);
 
         info!("Testing FTPS: ls /bucket (list bucket by absolute path)");
@@ -129,7 +137,10 @@ pub async fn test_ftps_core_operations() -> Result<()> {
 
         info!("Testing FTPS: ls after cd . (should still see file)");
         let list_after_dot = ftp_stream.list(None)?;
-        assert!(list_after_dot.iter().any(|line| line.contains(filename)), "File should still appear in list after cd .");
+        assert!(
+            list_after_dot.iter().any(|line| line.contains(filename)),
+            "File should still appear in list after cd ."
+        );
         info!("PASS: ls after cd . successful, file '{}' still found in bucket", filename);
 
         info!("Testing FTPS: cd / (go to root directory)");
@@ -138,8 +149,14 @@ pub async fn test_ftps_core_operations() -> Result<()> {
 
         info!("Testing FTPS: ls after cd / (should see bucket only)");
         let root_list_after = ftp_stream.list(None)?;
-        assert!(!root_list_after.iter().any(|line| line.contains(filename)), "File should not appear in root ls");
-        assert!(root_list_after.iter().any(|line| line.contains(bucket_name)), "Bucket should appear in root ls");
+        assert!(
+            !root_list_after.iter().any(|line| line.contains(filename)),
+            "File should not appear in root ls"
+        );
+        assert!(
+            root_list_after.iter().any(|line| line.contains(bucket_name)),
+            "Bucket should appear in root ls"
+        );
         info!("PASS: ls after cd / successful, file not in root, bucket '{}' found in root", bucket_name);
 
         info!("Testing FTPS: cd back to bucket");
@@ -183,7 +200,8 @@ pub async fn test_ftps_core_operations() -> Result<()> {
 
         info!("FTPS core tests passed");
         Ok(())
-    })().await;
+    })()
+    .await;
 
     // Always cleanup server process
     let _ = server_process.kill().await;

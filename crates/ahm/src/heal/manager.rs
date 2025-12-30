@@ -468,14 +468,17 @@ impl HealManager {
         let active_heals = self.active_heals.clone();
         let cancel_token = self.cancel_token.clone();
         let storage = self.storage.clone();
-
-        info!(
-            "start_auto_disk_scanner: Starting auto disk scanner with interval: {:?}",
-            config.read().await.heal_interval
-        );
+        let mut duration = {
+            let config = config.read().await;
+            config.heal_interval
+        };
+        if duration < Duration::from_secs(1) {
+            duration = Duration::from_secs(1);
+        }
+        info!("start_auto_disk_scanner: Starting auto disk scanner with interval: {:?}", duration);
 
         tokio::spawn(async move {
-            let mut interval = interval(config.read().await.heal_interval);
+            let mut interval = interval(duration);
 
             loop {
                 tokio::select! {

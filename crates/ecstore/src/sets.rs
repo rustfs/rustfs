@@ -40,7 +40,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_common::{
-    globals::GLOBAL_LOCAL_NODE_NAME,
+    GLOBAL_LOCAL_NODE_NAME,
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
@@ -255,7 +255,7 @@ impl Sets {
         self.connect_disks().await;
 
         // TODO: config interval
-        let mut interval = tokio::time::interval(Duration::from_secs(15 * 3));
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
                _= interval.tick()=>{

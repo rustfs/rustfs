@@ -49,21 +49,6 @@ pub const SERVICE_VERSION: &str = "1.0.0";
 /// Default value: production
 pub const ENVIRONMENT: &str = "production";
 
-/// Default Access Key
-/// Default value: rustfsadmin
-/// Environment variable: RUSTFS_ACCESS_KEY
-/// Command line argument: --access-key
-/// Example: RUSTFS_ACCESS_KEY=rustfsadmin
-/// Example: --access-key rustfsadmin
-pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
-/// Default Secret Key
-/// Default value: rustfsadmin
-/// Environment variable: RUSTFS_SECRET_KEY
-/// Command line argument: --secret-key
-/// Example: RUSTFS_SECRET_KEY=rustfsadmin
-/// Example: --secret-key rustfsadmin
-pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
-
 /// Default console enable
 /// This is the default value for the console server.
 /// It is used to enable or disable the console server.
@@ -88,6 +73,30 @@ pub const RUSTFS_TLS_KEY: &str = "rustfs_key.pem";
 /// Default TLS cert for rustfs
 /// This is the default cert for TLS.
 pub const RUSTFS_TLS_CERT: &str = "rustfs_cert.pem";
+
+/// Default public certificate filename for rustfs
+/// This is the default public certificate filename for rustfs.
+/// It is used to store the public certificate of the application.
+/// Default value: public.crt
+pub const RUSTFS_PUBLIC_CERT: &str = "public.crt";
+
+/// Default CA certificate filename for rustfs
+/// This is the default CA certificate filename for rustfs.
+/// It is used to store the CA certificate of the application.
+/// Default value: ca.crt
+pub const RUSTFS_CA_CERT: &str = "ca.crt";
+
+/// Default HTTP prefix for rustfs
+/// This is the default HTTP prefix for rustfs.
+/// It is used to identify HTTP URLs.
+/// Default value: http://
+pub const RUSTFS_HTTP_PREFIX: &str = "http://";
+
+/// Default HTTPS prefix for rustfs
+/// This is the default HTTPS prefix for rustfs.
+/// It is used to identify HTTPS URLs.
+/// Default value: https://
+pub const RUSTFS_HTTPS_PREFIX: &str = "https://";
 
 /// Default port for rustfs
 /// This is the default port for rustfs.
@@ -161,6 +170,12 @@ pub const KI_B: usize = 1024;
 /// Default value: 1048576
 pub const MI_B: usize = 1024 * 1024;
 
+/// Environment variable for gRPC authentication token
+/// Used to set the authentication token for gRPC communication
+/// Example: RUSTFS_GRPC_AUTH_TOKEN=your_token_here
+/// Default value: No default value. RUSTFS_SECRET_KEY value is recommended.
+pub const ENV_GRPC_AUTH_TOKEN: &str = "RUSTFS_GRPC_AUTH_TOKEN";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,20 +214,6 @@ mod tests {
             ["development", "staging", "production", "test"].contains(&ENVIRONMENT),
             "Environment should be a standard environment name"
         );
-    }
-
-    #[test]
-    fn test_security_constants() {
-        // Test security related constants
-        assert_eq!(DEFAULT_ACCESS_KEY, "rustfsadmin");
-        assert!(DEFAULT_ACCESS_KEY.len() >= 8, "Access key should be at least 8 characters");
-
-        assert_eq!(DEFAULT_SECRET_KEY, "rustfsadmin");
-        assert!(DEFAULT_SECRET_KEY.len() >= 8, "Secret key should be at least 8 characters");
-
-        // In production environment, access key and secret key should be different
-        // These are default values, so being the same is acceptable, but should be warned in documentation
-        println!("Warning: Default access key and secret key are the same. Change them in production!");
     }
 
     #[test]
@@ -276,8 +277,6 @@ mod tests {
             DEFAULT_LOG_LEVEL,
             SERVICE_VERSION,
             ENVIRONMENT,
-            DEFAULT_ACCESS_KEY,
-            DEFAULT_SECRET_KEY,
             RUSTFS_TLS_KEY,
             RUSTFS_TLS_CERT,
             DEFAULT_ADDRESS,
@@ -305,29 +304,6 @@ mod tests {
         // These are const non-zero values, so zero checks are redundant
         assert_ne!(DEFAULT_PORT, 0, "Default port should not be zero");
         assert_ne!(DEFAULT_CONSOLE_PORT, 0, "Console port should not be zero");
-    }
-
-    #[test]
-    fn test_security_best_practices() {
-        // Test security best practices
-
-        // These are default values, should be changed in production environments
-        println!("Security Warning: Default credentials detected!");
-        println!("Access Key: {DEFAULT_ACCESS_KEY}");
-        println!("Secret Key: {DEFAULT_SECRET_KEY}");
-        println!("These should be changed in production environments!");
-
-        // Verify that key lengths meet minimum security requirements
-        assert!(DEFAULT_ACCESS_KEY.len() >= 8, "Access key should be at least 8 characters");
-        assert!(DEFAULT_SECRET_KEY.len() >= 8, "Secret key should be at least 8 characters");
-
-        // Check if default credentials contain common insecure patterns
-        let _insecure_patterns = ["admin", "password", "123456", "default"];
-        let _access_key_lower = DEFAULT_ACCESS_KEY.to_lowercase();
-        let _secret_key_lower = DEFAULT_SECRET_KEY.to_lowercase();
-
-        // Note: More security check logic can be added here
-        // For example, check if keys contain insecure patterns
     }
 
     #[test]

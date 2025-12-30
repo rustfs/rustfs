@@ -60,7 +60,9 @@ impl ProtocolTestSuite {
     /// Create default test suite
     pub fn new() -> Self {
         let tests = vec![
-            TestDefinition { name: "test_ftps_core_operations".to_string() },
+            TestDefinition {
+                name: "test_ftps_core_operations".to_string(),
+            },
             // TestDefinition { name: "test_sftp_core_operations".to_string() },
         ];
 
@@ -88,7 +90,7 @@ impl ProtocolTestSuite {
                     info!("=== Starting SFTP Module Test ===");
                     "SFTP core operations (put, ls, mkdir, rmdir, delete)"
                 }
-                _ => ""
+                _ => "",
             };
 
             info!("Test {}/{} - {}", i + 1, self.tests.len(), test_description);

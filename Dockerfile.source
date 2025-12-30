@@ -148,8 +148,8 @@ ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_OBS_LOG_DIRECTORY="/logs" \
     RUSTFS_USERNAME="rustfs" \
     RUSTFS_GROUPNAME="rustfs" \
-    RUSTFS_UID="1000" \
-    RUSTFS_GID="1000"
+    RUSTFS_UID="10001" \
+    RUSTFS_GID="10001"
 
 # Note: We don't COPY source here because we expect it to be mounted at /app
 # We rely on cargo run to build and run
@@ -187,8 +187,8 @@ RUN set -eux; \
 
 # Create a conventional runtime user/group (final switch happens in entrypoint via chroot --userspec)
 RUN set -eux; \
-    groupadd -g 1000 rustfs; \
-    useradd -u 1000 -g rustfs -M -s /usr/sbin/nologin rustfs
+    groupadd -g 10001 rustfs; \
+    useradd -u 10001 -g rustfs -M -s /usr/sbin/nologin rustfs
 
 WORKDIR /app
 
@@ -212,8 +212,8 @@ ENV RUSTFS_ADDRESS=":9000" \
     RUST_LOG="warn" \
     RUSTFS_USERNAME="rustfs" \
     RUSTFS_GROUPNAME="rustfs" \
-    RUSTFS_UID="1000" \
-    RUSTFS_GID="1000"
+    RUSTFS_UID="10001" \
+    RUSTFS_GID="10001"
 
 EXPOSE 9000
 VOLUME ["/data"]

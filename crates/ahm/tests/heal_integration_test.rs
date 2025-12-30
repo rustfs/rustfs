@@ -38,9 +38,13 @@ use walkdir::WalkDir;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>)> = OnceLock::new();
 static INIT: Once = Once::new();
 
-fn init_tracing() {
+pub fn init_tracing() {
     INIT.call_once(|| {
-        let _ = tracing_subscriber::fmt::try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+            .with_thread_names(true)
+            .try_init();
     });
 }
 
@@ -356,7 +360,7 @@ mod serial_tests {
 
         // Create heal manager with faster interval
         let cfg = HealConfig {
-            heal_interval: Duration::from_secs(2),
+            heal_interval: Duration::from_secs(1),
             ..Default::default()
         };
         let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));

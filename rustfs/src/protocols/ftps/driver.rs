@@ -38,13 +38,12 @@ use tracing::{debug, error, info, trace};
 
 /// FTPS storage driver implementation
 #[derive(Debug)]
-pub struct FtpsDriver {
-}
+pub struct FtpsDriver {}
 
 impl FtpsDriver {
     /// Create a new FTPS driver
     pub fn new() -> Self {
-        Self { }
+        Self {}
     }
 
     /// Validate FTP feature support
@@ -75,9 +74,12 @@ impl FtpsDriver {
         Ok(s3_client)
     }
 
-    
     /// List all buckets (for root path)
-    async fn list_buckets(&self, user: &super::server::FtpsUser, session_context: &SessionContext) -> Result<Vec<Fileinfo<PathBuf, FtpsMetadata>>> {
+    async fn list_buckets(
+        &self,
+        user: &super::server::FtpsUser,
+        session_context: &SessionContext,
+    ) -> Result<Vec<Fileinfo<PathBuf, FtpsMetadata>>> {
         let s3_client = self.create_s3_client_for_user(user)?;
 
         let action = S3Action::ListBuckets;
@@ -104,12 +106,17 @@ impl FtpsDriver {
 
         // Get the real secret key from the authenticated user
         let secret_key = &session_context.principal.user_identity.credentials.secret_key;
-        debug!("FTPS LIST - calling S3 list_buckets with access_key: {}", session_context.principal.access_key());
+        debug!(
+            "FTPS LIST - calling S3 list_buckets with access_key: {}",
+            session_context.principal.access_key()
+        );
 
         match s3_client.list_buckets(input, secret_key).await {
             Ok(output) => {
-                debug!("FTPS LIST - S3 list_buckets succeeded, buckets count: {:?}",
-                       output.buckets.as_ref().map(|b| b.len()).unwrap_or(0));
+                debug!(
+                    "FTPS LIST - S3 list_buckets succeeded, buckets count: {:?}",
+                    output.buckets.as_ref().map(|b| b.len()).unwrap_or(0)
+                );
                 if let Some(buckets) = output.buckets {
                     for bucket in buckets {
                         if let Some(ref bucket_name) = bucket.name {
@@ -189,11 +196,7 @@ impl FtpsDriver {
         debug!("FTPS parse_path - input: '{}'", path_str);
         let (bucket, object) = path::path_to_bucket_object(path_str);
 
-        let key = if object.is_empty() {
-            None
-        } else {
-            Some(object)
-        };
+        let key = if object.is_empty() { None } else { Some(object) };
 
         debug!("FTPS parse_path - bucket: '{}', key: {:?}", bucket, key);
         Ok((bucket, key))
@@ -696,8 +699,10 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
                     if let Some(objects) = output.contents {
                         if !objects.is_empty() {
                             debug!("FTPS RMD - bucket '{}' is not empty, cannot delete", bucket);
-                            return Err(Error::new(ErrorKind::PermanentFileNotAvailable,
-                                format!("Bucket '{}' is not empty", bucket)));
+                            return Err(Error::new(
+                                ErrorKind::PermanentFileNotAvailable,
+                                format!("Bucket '{}' is not empty", bucket),
+                            ));
                         }
                     }
                 }
@@ -750,7 +755,10 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
 
             match s3_client.delete_object(input).await {
                 Ok(_) => {
-                    debug!("FTPS RMD - successfully removed directory marker: '{}' in bucket '{}'", dir_key_for_log, bucket_for_log);
+                    debug!(
+                        "FTPS RMD - successfully removed directory marker: '{}' in bucket '{}'",
+                        dir_key_for_log, bucket_for_log
+                    );
                     Ok(())
                 }
                 Err(e) => {
@@ -796,9 +804,14 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         // S3 does not support hierarchical directories - you can only cd to bucket root
         // Exception: key being "." means stay in current place (handled earlier), but path::clean may have converted it
         if key.is_some() && key.as_ref().map(|k| k != ".").unwrap_or(true) {
-            error!("FTPS cwd - S3 does not support multi-level directories, cannot cd to path with key: {:?}", key);
-            return Err(Error::new(ErrorKind::PermanentFileNotAvailable,
-                "S3 does not support multi-level directories. Use absolute path to switch buckets."));
+            error!(
+                "FTPS cwd - S3 does not support multi-level directories, cannot cd to path with key: {:?}",
+                key
+            );
+            return Err(Error::new(
+                ErrorKind::PermanentFileNotAvailable,
+                "S3 does not support multi-level directories. Use absolute path to switch buckets.",
+            ));
         }
 
         // Validate feature support

@@ -25,10 +25,10 @@ pub fn is_operation_supported(protocol: Protocol, action: &S3Action) -> bool {
             S3Action::DeleteBucket => false,
 
             // Object operations: All file operations supported
-            S3Action::GetObject => true,     // RETR command
-            S3Action::PutObject => true,     // STOR and APPE commands both map to PutObject
-            S3Action::DeleteObject => true,  // DELE command
-            S3Action::HeadObject => true,    // SIZE command
+            S3Action::GetObject => true,    // RETR command
+            S3Action::PutObject => true,    // STOR and APPE commands both map to PutObject
+            S3Action::DeleteObject => true, // DELE command
+            S3Action::HeadObject => true,   // SIZE command
 
             // Multipart operations: FTPS has no native multipart upload support
             S3Action::CreateMultipartUpload => false,
@@ -45,10 +45,10 @@ pub fn is_operation_supported(protocol: Protocol, action: &S3Action) -> bool {
             S3Action::PutObjectAcl => false,
 
             // Other operations
-            S3Action::CopyObject => false,    // No native copy support in FTPS
-            S3Action::ListBucket => true,     // LIST command
-            S3Action::ListBuckets => true,    // LIST at root level
-            S3Action::HeadBucket => true,     // Can check if directory exists
+            S3Action::CopyObject => false, // No native copy support in FTPS
+            S3Action::ListBucket => true,  // LIST command
+            S3Action::ListBuckets => true, // LIST at root level
+            S3Action::HeadBucket => true,  // Can check if directory exists
         },
         Protocol::Sftp => match action {
             // Bucket operations: SFTP can create/delete buckets via mkdir/rmdir
@@ -56,10 +56,10 @@ pub fn is_operation_supported(protocol: Protocol, action: &S3Action) -> bool {
             S3Action::DeleteBucket => true,
 
             // Object operations: All file operations supported
-            S3Action::GetObject => true,     // RealPath + Open + Read
-            S3Action::PutObject => true,     // Open + Write
-            S3Action::DeleteObject => true,  // Remove
-            S3Action::HeadObject => true,    // Stat/Fstat
+            S3Action::GetObject => true,    // RealPath + Open + Read
+            S3Action::PutObject => true,    // Open + Write
+            S3Action::DeleteObject => true, // Remove
+            S3Action::HeadObject => true,   // Stat/Fstat
 
             // Multipart operations: SFTP has no native multipart upload support
             S3Action::CreateMultipartUpload => false,
@@ -76,10 +76,10 @@ pub fn is_operation_supported(protocol: Protocol, action: &S3Action) -> bool {
             S3Action::PutObjectAcl => false,
 
             // Other operations
-            S3Action::CopyObject => false,    // No remote copy, only local rename
-            S3Action::ListBucket => true,     // Readdir
-            S3Action::ListBuckets => true,    // Readdir at root
-            S3Action::HeadBucket => true,     // Stat on directory
+            S3Action::CopyObject => false, // No remote copy, only local rename
+            S3Action::ListBucket => true,  // Readdir
+            S3Action::ListBuckets => true, // Readdir at root
+            S3Action::HeadBucket => true,  // Stat on directory
         },
     }
 }

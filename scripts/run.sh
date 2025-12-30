@@ -66,8 +66,8 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
 #export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
-export RUSTFS_OBS_ENVIRONMENT=production # Environment name
-export RUSTFS_OBS_LOGGER_LEVEL=warn # Log level, supports trace, debug, info, warn, error
+export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
+export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
 export RUSTFS_OBS_LOG_STDOUT_ENABLED=false # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
@@ -182,6 +182,9 @@ export RUSTFS_ENABLE_PROFILING=false
 
 # Heal configuration queue size
 export RUSTFS_HEAL_QUEUE_SIZE=10000
+
+# rustfs trust system CA certificates
+export RUSTFS_TRUST_SYSTEM_CA=true
 
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"

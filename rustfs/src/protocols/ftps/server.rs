@@ -264,8 +264,8 @@ impl FtpsAuthenticator {
 impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
     /// Authenticate FTP user against RustFS IAM system
     async fn authenticate(&self, username: &str, creds: &libunftp::auth::Credentials) -> Result<FtpsUser, AuthenticationError> {
+        use rustfs_credentials::Credentials as S3Credentials;
         use rustfs_iam::get;
-        use rustfs_policy::auth::Credentials as S3Credentials;
 
         debug!("FTPS authentication attempt for user: {}", username);
 

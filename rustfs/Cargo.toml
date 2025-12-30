@@ -44,6 +44,7 @@ rustfs-appauth = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
+rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-filemeta.workspace = true
 rustfs-iam = { workspace = true }
@@ -72,6 +73,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
+http-body-util.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
@@ -80,7 +82,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic = { workspace = true }
 tower.workspace = true
-tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id"] }
+tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id", "add-extension"] }
 
 # Serialization and Data Formats
 bytes = { workspace = true }
@@ -152,6 +154,7 @@ pprof = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
+serial_test = { workspace = true }
 
 [build-dependencies]
 http.workspace = true

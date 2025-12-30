@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
-use rustfs_common::{globals::GLOBAL_LOCAL_NODE_NAME, heal_channel::HealOpts};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, heal_channel::HealOpts};
 use rustfs_ecstore::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},
@@ -1774,11 +1774,34 @@ impl Node for NodeService {
 
     async fn get_metrics(&self, request: Request<GetMetricsRequest>) -> Result<Response<GetMetricsResponse>, Status> {
         let request = request.into_inner();
-        let mut buf_t = Deserializer::new(Cursor::new(request.metric_type));
-        let t: MetricType = Deserialize::deserialize(&mut buf_t).unwrap();
 
+        // Deserialize metric_type with error handling
+        let mut buf_t = Deserializer::new(Cursor::new(request.metric_type));
+        let t: MetricType = match Deserialize::deserialize(&mut buf_t) {
+            Ok(t) => t,
+            Err(err) => {
+                error!("Failed to deserialize metric_type: {}", err);
+                return Ok(Response::new(GetMetricsResponse {
+                    success: false,
+                    realtime_metrics: Bytes::new(),
+                    error_info: Some(format!("Invalid metric_type: {}", err)),
+                }));
+            }
+        };
+
+        // Deserialize opts with error handling
         let mut buf_o = Deserializer::new(Cursor::new(request.opts));
-        let opts: CollectMetricsOpts = Deserialize::deserialize(&mut buf_o).unwrap();
+        let opts: CollectMetricsOpts = match Deserialize::deserialize(&mut buf_o) {
+            Ok(opts) => opts,
+            Err(err) => {
+                error!("Failed to deserialize opts: {}", err);
+                return Ok(Response::new(GetMetricsResponse {
+                    success: false,
+                    realtime_metrics: Bytes::new(),
+                    error_info: Some(format!("Invalid opts: {}", err)),
+                }));
+            }
+        };
 
         let info = collect_local_metrics(t, &opts).await;
 
@@ -3647,5 +3670,33 @@ mod tests {
         let disk = service.find_disk(&"non-existent-disk".to_string()).await;
         // Should return None for non-existent disk
         assert!(disk.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_metrics_invalid_metric_type() {
+        let service = create_test_node_service();
+        let request = Request::new(GetMetricsRequest {
+            metric_type: Bytes::from(vec![0x00u8, 0x01u8]), // Invalid rmp data
+            opts: Bytes::new(),                             // Valid or invalid
+        });
+        let response = service.get_metrics(request).await.unwrap().into_inner();
+        assert!(!response.success);
+        assert!(response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_metrics_invalid_opts() {
+        let service = create_test_node_service();
+        // Serialize a valid MetricType
+        let metric_type = MetricType::DISK;
+        let metric_type_bytes = rmp_serde::to_vec(&metric_type).unwrap();
+
+        let request = Request::new(GetMetricsRequest {
+            metric_type: Bytes::from(metric_type_bytes),
+            opts: Bytes::from(vec![0x00u8, 0x01u8]), // Invalid rmp data
+        });
+        let response = service.get_metrics(request).await.unwrap().into_inner();
+        assert!(!response.success);
+        assert!(response.error_info.is_some());
     }
 }

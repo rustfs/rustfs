@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::protocols::sftp::handler::SftpHandler;
-use crate::protocols::session::context::{SessionContext, Protocol as SessionProtocol};
+use crate::protocols::session::context::{Protocol as SessionProtocol, SessionContext};
 use crate::protocols::session::principal::ProtocolPrincipal;
+use crate::protocols::sftp::handler::SftpHandler;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use russh::ChannelId;
+use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey, PublicKeyBase64};
 use russh::server::{Auth, Handler, Server as RusshServer, Session};
-use russh::keys::{PrivateKey, PublicKey, Algorithm, HashAlg, PublicKeyBase64};
 use ssh_key::Certificate;
 use ssh_key::certificate::CertType;
 use std::borrow::Cow;
@@ -28,7 +29,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::mpsc;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tracing::{debug, error, info, warn};
 
 const DEFAULT_ADDR: &str = "0.0.0.0:0";
@@ -144,8 +144,12 @@ impl SftpServer {
         config.preferred.key = Cow::Borrowed(&[
             Algorithm::Ed25519,
             Algorithm::Rsa { hash: None },
-            Algorithm::Rsa { hash: Some(HashAlg::Sha256) },
-            Algorithm::Rsa { hash: Some(HashAlg::Sha512) },
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256),
+            },
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            },
         ]);
 
         config
@@ -201,8 +205,8 @@ impl Handler for SftpConnectionHandler {
         let state = self.state.clone();
 
         async move {
+            use rustfs_credentials::Credentials as S3Credentials;
             use rustfs_iam::get;
-            use rustfs_policy::auth::Credentials as S3Credentials;
 
             let (username, suffix) = parse_auth_username(&raw_user);
             if let Some(s) = suffix {
@@ -214,24 +218,38 @@ impl Handler for SftpConnectionHandler {
             let s3_creds = S3Credentials {
                 access_key: username.to_string(),
                 secret_key: password.clone(),
-                session_token: String::new(), expiration: None, status: String::new(),
-                parent_user: String::new(), groups: None, claims: None, name: None, description: None,
+                session_token: String::new(),
+                expiration: None,
+                status: String::new(),
+                parent_user: String::new(),
+                groups: None,
+                claims: None,
+                name: None,
+                description: None,
             };
 
-            let (user_identity, is_valid) = iam_sys.check_key(&s3_creds.access_key).await
+            let (user_identity, is_valid) = iam_sys
+                .check_key(&s3_creds.access_key)
+                .await
                 .map_err(|e| format!("IAM check failed: {}", e))?;
 
             if !is_valid {
                 warn!("Invalid AccessKey: {}", username);
                 tokio::time::sleep(std::time::Duration::from_millis(AUTH_FAILURE_DELAY_MS)).await;
-                return Ok(Auth::Reject { proceed_with_methods: None, partial_success: false });
+                return Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                });
             }
 
             if let Some(identity) = user_identity {
                 if identity.credentials.secret_key != s3_creds.secret_key {
                     warn!("Invalid SecretKey for user: {}", username);
                     tokio::time::sleep(std::time::Duration::from_millis(AUTH_FAILURE_DELAY_MS)).await;
-                    return Ok(Auth::Reject { proceed_with_methods: None, partial_success: false });
+                    return Ok(Auth::Reject {
+                        proceed_with_methods: None,
+                        partial_success: false,
+                    });
                 }
 
                 {
@@ -241,7 +259,10 @@ impl Handler for SftpConnectionHandler {
                 debug!("User {} authenticated successfully via password", username);
                 Ok(Auth::Accept)
             } else {
-                Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
             }
         }
     }
@@ -267,7 +288,9 @@ impl Handler for SftpConnectionHandler {
                         use rustfs_iam::get;
                         let iam_sys = get().map_err(|e| format!("IAM system unavailable: {}", e))?;
 
-                        let (user_identity, is_valid) = iam_sys.check_key(username).await
+                        let (user_identity, is_valid) = iam_sys
+                            .check_key(username)
+                            .await
                             .map_err(|e| format!("IAM lookup error: {}", e))?;
 
                         if is_valid && user_identity.is_some() {
@@ -279,15 +302,22 @@ impl Handler for SftpConnectionHandler {
                             Ok(Auth::Accept)
                         } else {
                             warn!("Valid certificate presented, but user '{}' does not exist in IAM", username);
-                            Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+                            Ok(Auth::Reject {
+                                proceed_with_methods: None,
+                                partial_success: false,
+                            })
                         }
                     }
-                    Ok(false) => {
-                        Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
-                    }
+                    Ok(false) => Ok(Auth::Reject {
+                        proceed_with_methods: None,
+                        partial_success: false,
+                    }),
                     Err(e) => {
                         error!("SSH certificate validation error: {}", e);
-                        Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+                        Ok(Auth::Reject {
+                            proceed_with_methods: None,
+                            partial_success: false,
+                        })
                     }
                 }
             } else {
@@ -327,71 +357,99 @@ impl Handler for SftpConnectionHandler {
                                     }
                                 }
                             }
-                            warn!("Key matched pre-loaded authorized keys, but IAM verification failed for user '{}'", username);
+                            warn!(
+                                "Key matched pre-loaded authorized keys, but IAM verification failed for user '{}'",
+                                username
+                            );
                         }
                     }
                 }
 
                 use rustfs_iam::get;
                 match get() {
-                    Ok(iam_sys) => {
-                        match iam_sys.check_key(username).await {
-                            Ok((user_identity, is_valid)) => {
-                                if is_valid {
-                                    if let Some(identity) = user_identity {
-                                        let authorized_keys = identity.get_ssh_public_keys();
+                    Ok(iam_sys) => match iam_sys.check_key(username).await {
+                        Ok((user_identity, is_valid)) => {
+                            if is_valid {
+                                if let Some(identity) = user_identity {
+                                    let authorized_keys = identity.get_ssh_public_keys();
 
-                                        if authorized_keys.is_empty() {
-                                            warn!("User '{}' found in IAM but has no SSH public keys registered", username);
-                                            return Ok(Auth::Reject { proceed_with_methods: None, partial_success: false });
-                                        }
-
-                                        let key_valid = authorized_keys.iter().any(|authorized_key| {
-                                            authorized_key.contains(&client_key_openssh)
-                                                || authorized_key == &client_key_openssh
-                                                || compare_keys(authorized_key, &client_key_openssh)
+                                    if authorized_keys.is_empty() {
+                                        warn!("User '{}' found in IAM but has no SSH public keys registered", username);
+                                        return Ok(Auth::Reject {
+                                            proceed_with_methods: None,
+                                            partial_success: false,
                                         });
+                                    }
 
-                                        if key_valid {
-                                            {
-                                                let mut guard = state.lock().unwrap();
-                                                guard.identity = Some(identity);
-                                            }
-                                            info!("User {} authenticated via public key from IAM", username);
-                                            Ok(Auth::Accept)
-                                        } else {
-                                            warn!("Public key auth failed: client key not in IAM for user '{}'", username);
-                                            Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+                                    let key_valid = authorized_keys.iter().any(|authorized_key| {
+                                        authorized_key.contains(&client_key_openssh)
+                                            || authorized_key == &client_key_openssh
+                                            || compare_keys(authorized_key, &client_key_openssh)
+                                    });
+
+                                    if key_valid {
+                                        {
+                                            let mut guard = state.lock().unwrap();
+                                            guard.identity = Some(identity);
                                         }
+                                        info!("User {} authenticated via public key from IAM", username);
+                                        Ok(Auth::Accept)
                                     } else {
-                                        warn!("Public key auth failed: user '{}' not found in IAM", username);
-                                        Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+                                        warn!("Public key auth failed: client key not in IAM for user '{}'", username);
+                                        Ok(Auth::Reject {
+                                            proceed_with_methods: None,
+                                            partial_success: false,
+                                        })
                                     }
                                 } else {
-                                    warn!("Public key auth failed: user '{}' not valid in IAM", username);
-                                    Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+                                    warn!("Public key auth failed: user '{}' not found in IAM", username);
+                                    Ok(Auth::Reject {
+                                        proceed_with_methods: None,
+                                        partial_success: false,
+                                    })
                                 }
-                            }
-                            Err(e) => {
-                                error!("IAM lookup error: {}", e);
-                                Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+                            } else {
+                                warn!("Public key auth failed: user '{}' not valid in IAM", username);
+                                Ok(Auth::Reject {
+                                    proceed_with_methods: None,
+                                    partial_success: false,
+                                })
                             }
                         }
-                    }
+                        Err(e) => {
+                            error!("IAM lookup error: {}", e);
+                            Ok(Auth::Reject {
+                                proceed_with_methods: None,
+                                partial_success: false,
+                            })
+                        }
+                    },
                     Err(e) => {
                         error!("IAM system unavailable: {}", e);
-                        Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+                        Ok(Auth::Reject {
+                            proceed_with_methods: None,
+                            partial_success: false,
+                        })
                     }
                 }
             }
         }
     }
 
-    fn channel_open_session(&mut self, _channel: russh::Channel<russh::server::Msg>, _session: &mut Session) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+    fn channel_open_session(
+        &mut self,
+        _channel: russh::Channel<russh::server::Msg>,
+        _session: &mut Session,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
         async move { Ok(true) }
     }
 
-    fn data(&mut self, channel_id: ChannelId, data: &[u8], _session: &mut Session) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn data(
+        &mut self,
+        channel_id: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let state = self.state.clone();
         let data = data.to_vec();
 
@@ -408,7 +466,12 @@ impl Handler for SftpConnectionHandler {
         }
     }
 
-    fn subsystem_request(&mut self, channel_id: ChannelId, name: &str, session: &mut Session) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn subsystem_request(
+        &mut self,
+        channel_id: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let name = name.to_string();
         let state = self.state.clone();
         let session_handle = session.handle();
@@ -427,11 +490,8 @@ impl Handler for SftpConnectionHandler {
 
                 debug!("Initializing SFTP subsystem for user: {}", identity.credentials.access_key);
 
-                let context = SessionContext::new(
-                    ProtocolPrincipal::new(Arc::new(identity)),
-                    SessionProtocol::Sftp,
-                    client_ip.ip(),
-                );
+                let context =
+                    SessionContext::new(ProtocolPrincipal::new(Arc::new(identity)), SessionProtocol::Sftp, client_ip.ip());
 
                 let (client_pipe, server_pipe) = tokio::io::duplex(SFTP_BUFFER_SIZE);
                 let (mut client_read, mut client_write) = tokio::io::split(client_pipe);
@@ -526,7 +586,10 @@ fn load_authorized_keys(auth_keys_path: &str) -> Result<Vec<String>, ServerError
         if line.starts_with(SSH_KEY_TYPE_RSA) || line.starts_with(SSH_KEY_TYPE_ED25519) || line.starts_with(SSH_KEY_TYPE_ECDSA) {
             keys.push(line.to_string());
         } else {
-            warn!("Skipping invalid authorized key line in {}: doesn't start with valid key type", auth_keys_path);
+            warn!(
+                "Skipping invalid authorized key line in {}: doesn't start with valid key type",
+                auth_keys_path
+            );
         }
     }
 
@@ -567,7 +630,7 @@ fn validate_ssh_certificate(
     let signature_key = cert.signature_key();
 
     for ca in trusted_cas {
-        if ca.key_data() == signature_key  {
+        if ca.key_data() == signature_key {
             signature_valid = true;
             debug!("Certificate signed by trusted CA: {}", ca.fingerprint(Default::default()));
             break;
@@ -593,12 +656,16 @@ fn validate_ssh_certificate(
     }
 
     if !cert.valid_principals().contains(&username.to_string()) {
-        warn!("Certificate does not authorize user '{}'. Principals: {:?}", username, cert.valid_principals());
+        warn!(
+            "Certificate does not authorize user '{}'. Principals: {:?}",
+            username,
+            cert.valid_principals()
+        );
         return Ok(false);
     }
 
     match cert.cert_type() {
-        CertType::User => {},
+        CertType::User => {}
         _ => {
             warn!("Certificate is not a User certificate");
             return Ok(false);

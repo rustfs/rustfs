@@ -104,10 +104,10 @@ Render RUSTFS_VOLUMES
 */}}
 {{- define "rustfs.volumes" -}}
 {{- if eq (int .Values.replicaCount) 4 }}
-{{- printf "http://%s-{0...%d}.%s-headless:%d/data/rustfs{0...%d}" (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" . ) (.Values.service.ep_port | int) (sub (.Values.replicaCount | int) 1) }}
+{{- printf "http://%s-{0...%d}.%s-headless:%d/data/rustfs{0...%d}" (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" . ) (.Values.service.endpoint.port | int) (sub (.Values.replicaCount | int) 1) }}
 {{- end }}
 {{- if eq (int .Values.replicaCount) 16 }}
-{{- printf "http://%s-{0...%d}.%s-headless:%d/data" (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) (.Values.service.ep_port | int) }}
+{{- printf "http://%s-{0...%d}.%s-headless:%d/data" (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) (.Values.service.endpoint.port | int) }}
 {{- end }}
 {{- end }}
 

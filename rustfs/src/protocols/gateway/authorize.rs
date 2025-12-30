@@ -15,6 +15,7 @@
 use super::action::S3Action;
 use super::adapter::is_operation_supported;
 use crate::protocols::session::context::SessionContext;
+use rustfs_credentials;
 use rustfs_iam::get;
 use rustfs_policy::policy::Args;
 use std::collections::HashMap;
@@ -40,7 +41,7 @@ pub async fn is_authorized(session_context: &SessionContext, action: &S3Action, 
     let policy_action: rustfs_policy::policy::action::Action = action.clone().into();
 
     // Check if user is the owner (admin)
-    let is_owner = if let Some(global_cred) = rustfs_ecstore::global::get_global_action_cred() {
+    let is_owner = if let Some(global_cred) = rustfs_credentials::get_global_action_cred() {
         session_context.principal.access_key() == global_cred.access_key
     } else {
         false
@@ -58,8 +59,10 @@ pub async fn is_authorized(session_context: &SessionContext, action: &S3Action, 
         deny_only: false,
     };
 
-    debug!("FTPS AUTH - Checking authorization: account={}, action={:?}, bucket='{}', object={:?}",
-           args.account, args.action, args.bucket, args.object);
+    debug!(
+        "FTPS AUTH - Checking authorization: account={}, action={:?}, bucket='{}', object={:?}",
+        args.account, args.action, args.bucket, args.object
+    );
 
     let allowed = iam_sys.is_allowed(&args).await;
     debug!("FTPS AUTH - Authorization result: {}", allowed);

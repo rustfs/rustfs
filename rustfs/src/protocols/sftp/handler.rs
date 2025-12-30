@@ -99,19 +99,17 @@ impl SftpHandler {
             return Err(StatusCode::PermissionDenied);
         }
 
-
         // Clean the path to normalize
         let cleaned_path = path::clean(path_str);
 
         let (bucket, object) = path::path_to_bucket_object(&cleaned_path);
 
-        let key = if object.is_empty() {
-            None
-        } else {
-            Some(object)
-        };
+        let key = if object.is_empty() { None } else { Some(object) };
 
-        debug!("SFTP parse_path - input: '{}', cleaned: '{}', bucket: '{}', key: {:?}", path_str, cleaned_path, bucket, key);
+        debug!(
+            "SFTP parse_path - input: '{}', cleaned: '{}', bucket: '{}', key: {:?}",
+            path_str, cleaned_path, bucket, key
+        );
         Ok((bucket, key))
     }
 
@@ -136,7 +134,10 @@ impl SftpHandler {
             if *current == ROOT_PATH {
                 ROOT_PATH.to_string()
             } else {
-                let parent = std::path::Path::new(&*current).parent().map(|p| p.to_str().unwrap()).unwrap_or(ROOT_PATH);
+                let parent = std::path::Path::new(&*current)
+                    .parent()
+                    .map(|p| p.to_str().unwrap())
+                    .unwrap_or(ROOT_PATH);
                 path::clean(parent).to_string()
             }
         } else {
@@ -144,7 +145,12 @@ impl SftpHandler {
             let joined = if *current == ROOT_PATH {
                 format!("{}{}", PATH_SEPARATOR, path_str.trim_start_matches(PATH_SEPARATOR))
             } else {
-                format!("{}{}{}", current.trim_end_matches(PATH_SEPARATOR), PATH_SEPARATOR, path_str.trim_start_matches(PATH_SEPARATOR))
+                format!(
+                    "{}{}{}",
+                    current.trim_end_matches(PATH_SEPARATOR),
+                    PATH_SEPARATOR,
+                    path_str.trim_start_matches(PATH_SEPARATOR)
+                )
             };
             path::clean(&joined).to_string()
         };
@@ -204,7 +210,7 @@ impl SftpHandler {
                     }
                     Err(_) => Err(StatusCode::NoSuchFile),
                 }
-            },
+            }
 
             S3Action::HeadObject => {
                 let key = key_opt.unwrap();
@@ -230,7 +236,7 @@ impl SftpHandler {
                     }
                     Err(_) => Err(StatusCode::NoSuchFile),
                 }
-            },
+            }
 
             _ => {
                 error!("SFTP do_stat - Unexpected action type");
@@ -384,7 +390,7 @@ impl Handler for SftpHandler {
                         .body(Option::from(body))
                         .content_length(Option::from(file_size as i64)) // 告诉 S3 文件多大
                         .build()
-                        .unwrap(); 
+                        .unwrap();
 
                     let result = match s3_client.put_object(input).await {
                         Ok(_) => Status {
@@ -540,23 +546,20 @@ impl Handler for SftpHandler {
                     .map_err(|_| StatusCode::PermissionDenied)?;
 
                 // List all buckets
-                let s3_client = this.create_s3_client()
-                    .map_err(|e| {
-                        error!("SFTP Opendir - failed to create S3 client: {}", e);
-                        e
-                    })?;
+                let s3_client = this.create_s3_client().map_err(|e| {
+                    error!("SFTP Opendir - failed to create S3 client: {}", e);
+                    e
+                })?;
 
                 let input = s3s::dto::ListBucketsInput::builder()
                     .build()
                     .map_err(|_| StatusCode::Failure)?;
 
                 let secret_key = &this.session_context.principal.user_identity.credentials.secret_key;
-                let output = s3_client.list_buckets(input, secret_key)
-                    .await
-                    .map_err(|e| {
-                        error!("SFTP Opendir - failed to list buckets: {}", e);
-                        StatusCode::Failure
-                    })?;
+                let output = s3_client.list_buckets(input, secret_key).await.map_err(|e| {
+                    error!("SFTP Opendir - failed to list buckets: {}", e);
+                    StatusCode::Failure
+                })?;
 
                 let mut files = Vec::new();
                 if let Some(buckets) = output.buckets {
@@ -576,11 +579,14 @@ impl Handler for SftpHandler {
 
                 let handle_id = this.generate_handle_id();
                 let mut guard = this.handles.write().await;
-                guard.insert(handle_id.clone(), HandleState::Dir {
-                    path: "/".to_string(),
-                    files,
-                    offset: 0
-                });
+                guard.insert(
+                    handle_id.clone(),
+                    HandleState::Dir {
+                        path: "/".to_string(),
+                        files,
+                        offset: 0,
+                    },
+                );
                 return Ok(Handle { id, handle: handle_id });
             }
 
@@ -816,14 +822,12 @@ impl Handler for SftpHandler {
                 };
 
                 match s3_client.create_bucket(input).await {
-                    Ok(_) => {
-                        Ok(Status {
-                            id,
-                            status_code: StatusCode::Ok,
-                            error_message: "Bucket created".into(),
-                            language_tag: "en".into(),
-                        })
-                    }
+                    Ok(_) => Ok(Status {
+                        id,
+                        status_code: StatusCode::Ok,
+                        error_message: "Bucket created".into(),
+                        language_tag: "en".into(),
+                    }),
                     Err(e) => {
                         error!("FTPS Failed to create bucket: {}", e);
                         Ok(Status {
@@ -891,7 +895,8 @@ impl Handler for SftpHandler {
                 id,
                 files: vec![File {
                     filename: resolved.clone(),
-                    longname: format!("{:?} {:>4} {:>6} {:>6} {:>8} {} {}",
+                    longname: format!(
+                        "{:?} {:>4} {:>6} {:>6} {:>8} {} {}",
                         if attrs.is_dir() { "drwxr-xr-x" } else { "-rw-r--r--" },
                         1,
                         "rustfs",
