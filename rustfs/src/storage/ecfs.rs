@@ -3046,7 +3046,16 @@ impl S3 for FS {
 
         // Only set next_version_id_marker if it has a value, per AWS S3 API spec
         // boto3 expects it to be a string or omitted, not None
-        let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
+        // When truncated with next_key_marker, ensure next_version_id_marker also has a value
+        // Use "null" as default for non-versioned objects per S3 spec
+        let next_version_id_marker = if object_infos.is_truncated && object_infos.next_marker.is_some() {
+            object_infos
+                .next_version_idmarker
+                .filter(|v| !v.is_empty())
+                .or_else(|| Some("null".to_string()))
+        } else {
+            None
+        };
 
         let output = ListObjectVersionsOutput {
             is_truncated: Some(object_infos.is_truncated),
