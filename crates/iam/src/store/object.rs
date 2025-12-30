@@ -268,14 +268,6 @@ impl ObjectStore {
         for name in names {
             let user_name = rustfs_utils::path::dir(name);
             futures.push(async move {
-                if let Ok(data) = read_config(self.object_api.clone(), &get_user_identity_path(&user_name, user_type)).await {
-                    if !Self::try_decrypt_data(&data) {
-                        // Cannot decrypt this user's identity, skip it
-                        warn!("skip user due to decrypt failure: {}", user_name);
-                        return Ok(UserIdentity::default());
-                    }
-                }
-
                 match self.load_user_identity(&user_name, user_type).await {
                     Ok(res) => Ok(res),
                     Err(err) => {
