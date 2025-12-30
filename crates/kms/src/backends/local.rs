@@ -65,17 +65,6 @@ struct StoredMasterKey {
     nonce: Vec<u8>,
 }
 
-/// Data key envelope stored with each data key generation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DataKeyEnvelope {
-    key_id: String,
-    master_key_id: String,
-    key_spec: String,
-    encrypted_key: Vec<u8>,
-    nonce: Vec<u8>,
-    encryption_context: HashMap<String, String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-}
 
 impl LocalKmsClient {
     /// Create a new local KMS client
@@ -232,6 +221,7 @@ impl LocalKmsClient {
         Ok(())
     }
 
+
     /// Get the actual key material for a master key
     async fn get_key_material(&self, key_id: &str) -> Result<Vec<u8>> {
         let (_stored_key, key_material) = self.decode_stored_key(key_id).await?;
@@ -258,6 +248,9 @@ impl KmsClient for LocalKmsClient {
     async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKeyInfo> {
         debug!("Generating data key for master key: {}", request.master_key_id);
 
+        // Verify master key exists and get its version
+        let master_key_info = self.describe_key(&request.master_key_id, context).await?;
+
         // Generate random data key material
         let key_length = match request.key_spec.as_str() {
             "AES_256" => 32,
@@ -275,6 +268,7 @@ impl KmsClient for LocalKmsClient {
         let envelope = DataKeyEnvelope {
             key_id: uuid::Uuid::new_v4().to_string(),
             master_key_id: request.master_key_id.clone(),
+            master_key_version: master_key_info.version,
             key_spec: request.key_spec.clone(),
             encrypted_key: encrypted_key.clone(),
             nonce,
@@ -812,11 +806,27 @@ impl KmsBackend for LocalKmsBackend {
 
         // Save the updated key to disk - this is the missing critical step!
         // Preserve existing key material instead of generating new one
-        let (_stored_key, existing_key_material) = self
-            .client
-            .decode_stored_key(key_id)
+        let key_path = self.client.master_key_path(key_id);
+        let content = tokio::fs::read(&key_path)
             .await
-            .map_err(|e| KmsError::internal_error(format!("Failed to decode key: {e}")))?;
+            .map_err(|e| KmsError::internal_error(format!("Failed to read key file: {e}")))?;
+        let stored_key: StoredMasterKey =
+            serde_json::from_slice(&content).map_err(|e| KmsError::internal_error(format!("Failed to parse stored key: {e}")))?;
+
+        // Decrypt the existing key material to preserve it
+        let existing_key_material = if let Some(ref cipher) = self.client.master_cipher {
+            if stored_key.nonce.len() != 12 {
+                return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
+            }
+            let mut nonce_array = [0u8; 12];
+            nonce_array.copy_from_slice(&stored_key.nonce);
+            let nonce = Nonce::from(nonce_array);
+            cipher
+                .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
+                .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
+        } else {
+            stored_key.encrypted_key_material
+        };
 
         self.client.save_master_key(&master_key, &existing_key_material).await?;
 
