@@ -410,9 +410,8 @@ impl Store for ObjectStore {
         data = match Self::decrypt_data(&data) {
             Ok(v) => v,
             Err(err) => {
-                warn!("delete the config file when decrypt failed failed: {}, path: {}", err, path.as_ref());
-                // delete the config file when decrypt failed
-                let _ = self.delete_iam_config(path.as_ref()).await;
+                warn!("config decrypt failed, keeping file: {}, path: {}", err, path.as_ref());
+                // keep the config file when decrypt failed - do not delete
                 return Err(Error::ConfigNotFound);
             }
         };
