@@ -84,18 +84,18 @@ async fn read_file(path: &PathBuf, desc: &str) -> Result<Vec<u8>, RustFSError> {
 /// Initialize TLS material for both server and outbound client connections.
 ///
 /// Loads roots from:
-/// - `${RUSTFS_TLS_DIR}/ca.crt` (or `tls/ca.crt`)
-/// - `${RUSTFS_TLS_DIR}/public.crt` (optional additional root bundle)
-/// - system roots if `RUSTFS_TRUST_SYSTEM_CA=true` (default)
+/// - `${RUSTFS_TLS_PATH}/ca.crt` (or `tls/ca.crt`)
+/// - `${RUSTFS_TLS_PATH}/public.crt` (optional additional root bundle)
+/// - system roots if `RUSTFS_TRUST_SYSTEM_CA=true` (default: false)
 /// - if `RUSTFS_TRUST_LEAF_CERT_AS_CA=true`, also loads leaf cert(s) from
-///   `${RUSTFS_TLS_DIR}/rustfs_cert.pem` into the root store.
+///   `${RUSTFS_TLS_PATH}/rustfs_cert.pem` into the root store.
 ///
 /// Loads mTLS client identity (optional) from:
-/// - `${RUSTFS_TLS_DIR}/client_cert.pem`
-/// - `${RUSTFS_TLS_DIR}/client_key.pem`
+/// - `${RUSTFS_TLS_PATH}/client_cert.pem`
+/// - `${RUSTFS_TLS_PATH}/client_key.pem`
 ///
 /// Environment overrides:
-/// - RUSTFS_TLS_DIR
+/// - RUSTFS_TLS_PATH
 /// - RUSTFS_MTLS_CLIENT_CERT
 /// - RUSTFS_MTLS_CLIENT_KEY
 pub(crate) async fn init_cert(tls_path: &str) -> Result<(), RustFSError> {

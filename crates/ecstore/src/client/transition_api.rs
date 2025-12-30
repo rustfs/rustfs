@@ -133,8 +133,10 @@ pub enum BucketLookupType {
 }
 
 fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
+    // Prefer the documented RUSTFS_TLS_PATH variable, but fall back to
+    // the older RUSTFS_TLS_PATH name for backward compatibility.
     let tp = std::env::var("RUSTFS_TLS_PATH").ok()?;
-    let ca = std::path::Path::new(&tp).join("ca.crt");
+    let ca = std::path::Path::new(&tp).join(rustfs_config::RUSTFS_CA_CERT);
     if !ca.exists() {
         return None;
     }
@@ -142,7 +144,9 @@ fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
     let der_list = rustfs_utils::load_cert_bundle_der_bytes(ca.to_str().unwrap_or_default()).ok()?;
     let mut store = rustls::RootCertStore::empty();
     for der in der_list {
-        let _ = store.add(der.into());
+        if let Err(e) = store.add(der.into()) {
+            warn!("Warning: failed to add certificate from '{}' to root store: {e}", ca.display());
+        }
     }
     Some(store)
 }
@@ -157,11 +161,7 @@ impl TransitionClient {
     async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        //#[cfg(feature = "ring")]
         let _ = rustls::crypto::ring::default_provider().install_default();
-        //#[cfg(feature = "aws-lc-rs")]
-        // let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
         let scheme = endpoint_url.scheme();
         let client;
         let tls = if let Some(store) = load_root_store_from_tls_path() {
@@ -176,6 +176,7 @@ impl TransitionClient {
             .with_tls_config(tls)
             .https_or_http()
             .enable_http1()
+            .enable_http2()
             .build();
         client = Client::builder(TokioExecutor::new()).build(https);
 

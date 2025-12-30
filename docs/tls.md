@@ -7,7 +7,7 @@ server-authenticated TLS only.
 
 ## Recommended `tls/` directory layout
 
-Place these files in a directory (default: `./tls`, configurable via `RUSTFS_TLS_DIR`).
+Place these files in a directory (default: `./tls`, configurable via `RUSTFS_TLS_PATH`).
 
 ```
 TLS_DIR/
@@ -25,8 +25,8 @@ TLS_DIR/
 
 ### Root trust
 
-- `RUSTFS_TLS_DIR` (default: `tls`): TLS directory.
-- `RUSTFS_TRUST_SYSTEM_CA` (default: `true`): When `true`, include the platform/system
+- `RUSTFS_TLS_PATH` (default: `tls`): TLS directory.
+- `RUSTFS_TRUST_SYSTEM_CA` (default: `false`): When `true`, include the platform/system
   trust store as additional roots. When `false`, system roots are not used.
 - `RUSTFS_TRUST_LEAF_CERT_AS_CA` (default: `false`): Compatibility switch. If `true`,
   RustFS will also load `rustfs_cert.pem` into the root store (treating leaf certificates
@@ -34,8 +34,8 @@ TLS_DIR/
 
 ### Outbound mTLS identity
 
-- `RUSTFS_MTLS_CLIENT_CERT` (default: `${RUSTFS_TLS_DIR}/client_cert.pem`): path to PEM client cert/chain.
-- `RUSTFS_MTLS_CLIENT_KEY` (default: `${RUSTFS_TLS_DIR}/client_key.pem`): path to PEM private key.
+- `RUSTFS_MTLS_CLIENT_CERT` (default: `${RUSTFS_TLS_PATH}/client_cert.pem`): path to PEM client cert/chain.
+- `RUSTFS_MTLS_CLIENT_KEY` (default: `${RUSTFS_TLS_PATH}/client_key.pem`): path to PEM private key.
 
 If both files exist, RustFS enables outbound mTLS. If either is missing, RustFS proceeds
 with server-only TLS.

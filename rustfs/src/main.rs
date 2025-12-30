@@ -114,7 +114,7 @@ async fn async_main() -> Result<()> {
     if let Some(tls_path) = &opt.tls_path {
         match init_cert(tls_path).await {
             Ok(_) => {
-                info!(target: "rustfs::main","TLS initialized successfully with certs from {}", tls_path);
+                info!(target: "rustfs::main", "TLS initialized successfully with certs from {}", tls_path);
             }
             Err(e) => {
                 error!("Failed to initialize TLS from {}: {}", tls_path, e);

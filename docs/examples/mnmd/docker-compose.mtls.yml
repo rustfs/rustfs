@@ -19,7 +19,7 @@ services:
     depends_on:
       - mnmd
     environment:
-      - RUSTFS_TLS_DIR=/tls
+      - RUSTFS_TLS_PATH=/tls
       - RUSTFS_TRUST_SYSTEM_CA=false
       - RUSTFS_TRUST_LEAF_CERT_AS_CA=false
       # Enable outbound mTLS (client identity) for MNMD

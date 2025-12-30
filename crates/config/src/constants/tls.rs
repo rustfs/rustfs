@@ -48,7 +48,7 @@ pub const ENV_TRUST_LEAF_CERT_AS_CA: &str = "RUSTFS_TRUST_LEAF_CERT_AS_CA";
 pub const DEFAULT_TRUST_LEAF_CERT_AS_CA: bool = false;
 
 /// Default filename for client CA certificate
-/// client_ca.crt（client mTLS Verify the server）
+/// client_ca.crt (CA bundle for verifying client certificates in server mTLS)
 pub const RUSTFS_CLIENT_CA_CERT_FILENAME: &str = "client_ca.crt";
 
 /// Environment variable for client certificate file path

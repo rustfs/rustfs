@@ -30,10 +30,11 @@ pub static GLOBAL_MTLS_IDENTITY: LazyLock<RwLock<Option<MtlsIdentityPem>>> = Laz
 /// Set the global RustFS address used for gRPC connections.
 ///
 /// # Arguments
-/// * `addr` - A string slice representing the RustFS address (e.g., "
+/// * `addr` - A string slice representing the RustFS address (e.g., "https://node1:9000").
 pub async fn set_global_addr(addr: &str) {
     *GLOBAL_RUSTFS_ADDR.write().await = addr.to_string();
 }
+
 /// Set the global root CA certificate for outbound gRPC clients.
 /// This certificate is used to validate server TLS certificates.
 /// When set to None, clients use the system default root CAs.

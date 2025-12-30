@@ -27,6 +27,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::io::StreamReader;
+use tracing::error;
 
 /// Get the TLS path from the RUSTFS_TLS_PATH environment variable.
 /// If the variable is not set, return None.
@@ -81,7 +82,13 @@ fn load_optional_mtls_identity_from_tls_path() -> Option<Identity> {
     }
     pem.extend_from_slice(&key);
 
-    Identity::from_pem(&pem).ok()
+    match Identity::from_pem(&pem) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            error!("Failed to load mTLS identity from PEM: {e}");
+            None
+        }
+    }
 }
 
 fn get_http_client() -> Client {
