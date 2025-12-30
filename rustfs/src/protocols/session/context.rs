@@ -13,12 +13,6 @@
 // limitations under the License.
 
 //! Session context for protocol implementations
-//!
-//! This module provides session context for all protocol implementations.
-//! It ensures that all protocols use the same session context and security boundaries.
-//!
-//! MINIO CONSTRAINT: Session context MUST be protocol-agnostic and
-//! MUST NOT provide capabilities beyond what external S3 clients can do.
 
 use crate::protocols::session::principal::ProtocolPrincipal;
 use std::net::IpAddr;

@@ -141,6 +141,14 @@ pub struct Opt {
     #[arg(long, env = "RUSTFS_FTPS_KEY_FILE")]
     pub ftps_key_file: Option<String>,
 
+    /// FTPS server passive ports range (e.g., "40000-50000")
+    #[arg(long, env = "RUSTFS_FTPS_PASSIVE_PORTS")]
+    pub ftps_passive_ports: Option<String>,
+
+    /// FTPS server external IP address for passive mode (auto-detected if not specified)
+    #[arg(long, env = "RUSTFS_FTPS_EXTERNAL_IP")]
+    pub ftps_external_ip: Option<String>,
+
     /// Enable SFTP server
     #[arg(long, default_value_t = false, env = "RUSTFS_SFTP_ENABLE")]
     pub sftp_enable: bool,
@@ -152,6 +160,11 @@ pub struct Opt {
     /// SFTP server host key file path
     #[arg(long, env = "RUSTFS_SFTP_HOST_KEY")]
     pub sftp_host_key: Option<String>,
+
+    /// Path to authorized SSH public keys file for SFTP authentication
+    /// Each line should contain an OpenSSH public key: ssh-rsa AAAA... comment
+    #[arg(long, env = "RUSTFS_SFTP_AUTHORIZED_KEYS")]
+    pub sftp_authorized_keys: Option<String>,
 }
 
 // lazy_static::lazy_static! {

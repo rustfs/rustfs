@@ -13,10 +13,5 @@
 // limitations under the License.
 
 //! SFTP protocol implementation
-//!
-//! This module provides the SFTP protocol implementation for RustFS.
-//! It uses russh and russh-sftp as the SFTP server implementation and integrates
-//! with the RustFS gateway for S3 operations.
-
 pub mod handler;
 pub mod server;

@@ -310,8 +310,9 @@ pub async fn init_ftp_system(
     // Create FTPS configuration
     let config = FtpsConfig {
         bind_addr: addr,
-        passive_ports: None, // TODO: Add passive ports configuration
-        ftps_required: true, // Always require FTPS for security
+        passive_ports: opt.ftps_passive_ports.clone(),
+        external_ip: opt.ftps_external_ip.clone(),
+        ftps_required: true,
         cert_file: opt.ftps_certs_file.clone(),
         key_file: opt.ftps_key_file.clone(),
     };
@@ -370,8 +371,9 @@ pub async fn init_sftp_system(
     let config = SftpConfig {
         bind_addr: addr,
         require_key_auth: false, // TODO: Add key auth configuration
-        cert_file: opt.sftp_host_key.clone(),
-        key_file: None, // TODO: Add key file configuration
+        cert_file: None, // CA certificates for client certificate authentication
+        key_file: opt.sftp_host_key.clone(), // SFTP server host key
+        authorized_keys_file: opt.sftp_authorized_keys.clone(), // Pre-loaded authorized SSH public keys
     };
 
     // Create SFTP server

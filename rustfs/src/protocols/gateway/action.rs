@@ -38,7 +38,7 @@ pub enum S3Action {
     ListMultipartUploads,
     ListParts,
 
-    // TODO :ACL operations
+    // ACL operations
     GetBucketAcl,
     PutBucketAcl,
     GetObjectAcl,

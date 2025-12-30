@@ -26,6 +26,7 @@ workspace = true
 [dependencies]
 rustfs-ecstore.workspace = true
 rustfs-common.workspace = true
+rustfs-iam.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 rustfs-lock.workspace = true
@@ -56,3 +57,6 @@ suppaftp = { workspace = true }
 rcgen = { workspace = true }
 anyhow = { workspace = true }
 native-tls = { workspace = true }
+rustls = "0.23"
+rustls-pemfile = "2.1"
+log = "0.4.29"

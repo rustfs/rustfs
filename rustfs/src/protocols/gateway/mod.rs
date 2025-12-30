@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Gateway module for protocol implementations
-//!
-//! This module provides the gateway layer that translates protocol-specific operations
-//! into S3 actions, ensuring all protocols follow the same S3 semantics.
 
 pub mod action;
 pub mod adapter;

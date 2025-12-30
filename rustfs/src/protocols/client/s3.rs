@@ -161,25 +161,6 @@ impl ProtocolS3Client {
         Ok(resp.output)
     }
 
-    /// Copy object - maps to S3 CopyObject
-    pub async fn copy_object(&self, input: CopyObjectInput) -> S3Result<CopyObjectOutput> {
-        trace!("Protocol S3 client CopyObject request: bucket={}, key={:?}, access_key={}", input.bucket, input.key, self.access_key);
-        let uri: http::Uri = format!("/{}{}", input.bucket, input.key.as_str()).parse().unwrap_or_default();
-        let req = S3Request {
-            input,
-            method: Method::PUT,
-            uri,
-            headers: HeaderMap::default(),
-            extensions: http::Extensions::default(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-        let resp = self.fs.copy_object(req).await?;
-        Ok(resp.output)
-    }
-
     /// List buckets - maps to S3 ListBuckets
     /// Note: This requires credentials and ReqInfo because list_buckets performs credential validation
     pub async fn list_buckets(&self, input: ListBucketsInput, secret_key: &str) -> S3Result<ListBucketsOutput> {
@@ -252,6 +233,25 @@ impl ProtocolS3Client {
             trailing_headers: None,
         };
         let resp = self.fs.create_bucket(req).await?;
+        Ok(resp.output)
+    }
+
+    /// Delete bucket - maps to S3 DeleteBucket
+    pub async fn delete_bucket(&self, input: DeleteBucketInput) -> S3Result<DeleteBucketOutput> {
+        trace!("Protocol S3 client DeleteBucket request: bucket={}, access_key={}", input.bucket, self.access_key);
+        let uri: http::Uri = format!("/{}", input.bucket).parse().unwrap_or_default();
+        let req = S3Request {
+            input,
+            method: Method::DELETE,
+            uri,
+            headers: HeaderMap::default(),
+            extensions: http::Extensions::default(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let resp = self.fs.delete_bucket(req).await?;
         Ok(resp.output)
     }
 }

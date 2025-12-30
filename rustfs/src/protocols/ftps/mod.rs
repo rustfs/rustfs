@@ -13,10 +13,6 @@
 // limitations under the License.
 
 //! FTPS protocol implementation
-//!
-//! This module provides the FTPS protocol implementation for RustFS.
-//! It uses libunftp as the FTP server implementation and integrates
-//! with the RustFS gateway for S3 operations.
 
 pub mod driver;
 pub mod server;
