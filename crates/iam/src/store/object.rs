@@ -139,7 +139,7 @@ impl ObjectStore {
         Ok(en)
     }
 
-    fn try_decrypt_data(data: &[u8]) -> bool {
+    fn can_decrypt_data(data: &[u8]) -> bool {
         Self::decrypt_data(data).is_ok()
     }
 
