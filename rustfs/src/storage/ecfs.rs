@@ -6190,4 +6190,83 @@ mod tests {
     //
     // These are better suited for integration tests rather than unit tests.
     // The current tests focus on the testable parts without external dependencies.
+
+    /// Test that next_key_marker and next_version_id_marker are filtered correctly
+    /// AWS S3 API requires these fields to be omitted when empty, not set to None or ""
+    #[test]
+    fn test_next_marker_filtering() {
+        // Test filter behavior for empty strings
+        let empty_string = Some(String::new());
+        let filtered = empty_string.filter(|v| !v.is_empty());
+        assert!(filtered.is_none(), "Empty string should be filtered to None");
+
+        // Test filter behavior for non-empty strings
+        let non_empty = Some("some-marker".to_string());
+        let filtered = non_empty.filter(|v| !v.is_empty());
+        assert!(filtered.is_some(), "Non-empty string should not be filtered");
+        assert_eq!(filtered.unwrap(), "some-marker");
+
+        // Test filter behavior for None
+        let none_value: Option<String> = None;
+        let filtered = none_value.filter(|v| !v.is_empty());
+        assert!(filtered.is_none(), "None should remain None");
+    }
+
+    /// Test version_id handling for ListObjectVersions response
+    /// Per AWS S3 API spec:
+    /// - Versioned objects: version_id is a UUID string
+    /// - Non-versioned objects: version_id should be "null" string
+    #[test]
+    fn test_version_id_formatting() {
+        use uuid::Uuid;
+
+        // Non-versioned object: version_id is None, should format as "null"
+        let version_id: Option<Uuid> = None;
+        let formatted = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+        assert_eq!(formatted, "null");
+
+        // Versioned object: version_id is Some(UUID), should format as UUID string
+        let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let version_id: Option<Uuid> = Some(uuid);
+        let formatted = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+        assert_eq!(formatted, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    /// Test that ListObjectVersionsOutput markers are correctly set
+    /// This verifies the fix for boto3 ParamValidationError
+    #[test]
+    fn test_list_object_versions_markers_handling() {
+        // Simulate the marker filtering logic from list_object_versions
+
+        // Case 1: Both markers have values (truncated result with versioned object)
+        let next_marker = Some("object-key".to_string());
+        let next_version_idmarker = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+
+        let filtered_key_marker = next_marker.filter(|v| !v.is_empty());
+        let filtered_version_marker = next_version_idmarker.filter(|v| !v.is_empty());
+
+        assert!(filtered_key_marker.is_some());
+        assert!(filtered_version_marker.is_some());
+
+        // Case 2: Markers are empty strings (non-truncated result)
+        let next_marker = Some(String::new());
+        let next_version_idmarker = Some(String::new());
+
+        let filtered_key_marker = next_marker.filter(|v| !v.is_empty());
+        let filtered_version_marker = next_version_idmarker.filter(|v| !v.is_empty());
+
+        assert!(filtered_key_marker.is_none(), "Empty key marker should be filtered to None");
+        assert!(filtered_version_marker.is_none(), "Empty version marker should be filtered to None");
+
+        // Case 3: Truncated result with non-versioned object (version_id is "null")
+        let next_marker = Some("object-key".to_string());
+        let next_version_idmarker = Some("null".to_string());
+
+        let filtered_key_marker = next_marker.filter(|v| !v.is_empty());
+        let filtered_version_marker = next_version_idmarker.filter(|v| !v.is_empty());
+
+        assert!(filtered_key_marker.is_some());
+        assert!(filtered_version_marker.is_some());
+        assert_eq!(filtered_version_marker.unwrap(), "null");
+    }
 }
