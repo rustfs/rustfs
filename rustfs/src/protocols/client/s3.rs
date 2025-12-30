@@ -202,7 +202,7 @@ impl ProtocolS3Client {
         extensions.insert(crate::storage::access::ReqInfo {
             cred: Some(rustfs_credentials::Credentials {
                 access_key: self.access_key.clone(),
-                secret_key: secret_key.to_string().into(),
+                secret_key: secret_key.to_string(),
                 session_token: String::new(),
                 expiration: None,
                 status: String::new(),

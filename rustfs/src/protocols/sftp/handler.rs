@@ -128,7 +128,7 @@ impl SftpHandler {
         }
 
         // Relative path
-        let resolved = if path_str == CURRENT_DIR {
+        if path_str == CURRENT_DIR {
             current.clone()
         } else if path_str == PARENT_DIR {
             if *current == ROOT_PATH {
@@ -153,9 +153,7 @@ impl SftpHandler {
                 )
             };
             path::clean(&joined).to_string()
-        };
-
-        resolved
+        }
     }
 
     async fn cleanup_state(&self, state: HandleState) {
@@ -213,7 +211,7 @@ impl SftpHandler {
             }
 
             S3Action::HeadObject => {
-                let key = key_opt.unwrap();
+                let key = key_opt.expect("key_opt should be Some for HeadObject action");
                 let input = s3s::dto::HeadObjectInput {
                     bucket,
                     key,
@@ -253,15 +251,9 @@ impl Handler for SftpHandler {
         StatusCode::OpUnsupported
     }
 
-    fn init(
-        &mut self,
-        version: u32,
-        _extensions: HashMap<String, String>,
-    ) -> impl Future<Output = Result<Version, Self::Error>> + Send {
-        async move {
-            trace!("SFTP Init version: {}", version);
-            Ok(Version::new())
-        }
+    async fn init(&mut self, version: u32, _extensions: HashMap<String, String>) -> Result<Version, Self::Error> {
+        trace!("SFTP Init version: {}", version);
+        Ok(Version::new())
     }
 
     fn open(
@@ -450,7 +442,7 @@ impl Handler for SftpHandler {
                 Ok(output) => {
                     let mut data = Vec::with_capacity(len as usize);
                     if let Some(body) = output.body {
-                        let stream = body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+                        let stream = body.map_err(std::io::Error::other);
                         let mut reader = tokio_util::io::StreamReader::new(stream);
                         let _ = reader.read_to_end(&mut data).await;
                     }
@@ -546,9 +538,8 @@ impl Handler for SftpHandler {
                     .map_err(|_| StatusCode::PermissionDenied)?;
 
                 // List all buckets
-                let s3_client = this.create_s3_client().map_err(|e| {
+                let s3_client = this.create_s3_client().inspect_err(|&e| {
                     error!("SFTP Opendir - failed to create S3 client: {}", e);
-                    e
                 })?;
 
                 let input = s3s::dto::ListBucketsInput::builder()
@@ -622,7 +613,12 @@ impl Handler for SftpHandler {
                     if let Some(prefixes) = output.common_prefixes {
                         for p in prefixes {
                             if let Some(prefix_str) = p.prefix {
-                                let name = prefix_str.trim_end_matches('/').split('/').last().unwrap_or("").to_string();
+                                let name = prefix_str
+                                    .trim_end_matches('/')
+                                    .split('/')
+                                    .next_back()
+                                    .unwrap_or("")
+                                    .to_string();
                                 if !name.is_empty() {
                                     let mut attrs = FileAttributes::default();
                                     attrs.set_dir(true);
@@ -642,11 +638,13 @@ impl Handler for SftpHandler {
                                 if key.ends_with('/') {
                                     continue;
                                 }
-                                let name = key.split('/').last().unwrap_or("").to_string();
+                                let name = key.split('/').next_back().unwrap_or("").to_string();
                                 let size = obj.size.unwrap_or(0) as u64;
-                                let mut attrs = FileAttributes::default();
-                                attrs.size = Some(size);
-                                attrs.permissions = Some(0o644);
+                                let mut attrs = FileAttributes {
+                                    size: Some(size),
+                                    permissions: Some(0o644),
+                                    ..Default::default()
+                                };
                                 if let Some(lm) = obj.last_modified {
                                     let dt = time::OffsetDateTime::from(lm);
                                     attrs.mtime = Some(dt.unix_timestamp() as u32);
@@ -710,7 +708,32 @@ impl Handler for SftpHandler {
 
             let (bucket, key_opt) = this.parse_path(&resolved_filename)?;
 
-            if key_opt.is_none() {
+            if let Some(key) = key_opt {
+                // Delete object
+                let action = S3Action::DeleteObject;
+                authorize_operation(&this.session_context, &action, &bucket, Some(&key))
+                    .await
+                    .map_err(|_| StatusCode::PermissionDenied)?;
+
+                let input = DeleteObjectInput {
+                    bucket,
+                    key,
+                    ..Default::default()
+                };
+
+                let s3_client = this.create_s3_client()?;
+                s3_client.delete_object(input).await.map_err(|e| {
+                    error!("SFTP REMOVE - failed to delete object: {}", e);
+                    StatusCode::Failure
+                })?;
+
+                Ok(Status {
+                    id,
+                    status_code: StatusCode::Ok,
+                    error_message: "Success".into(),
+                    language_tag: "en".into(),
+                })
+            } else {
                 // Delete bucket - check if bucket is empty first
                 debug!("SFTP REMOVE - attempting to delete bucket: '{}'", bucket);
 
@@ -736,7 +759,7 @@ impl Handler for SftpHandler {
                                 return Ok(Status {
                                     id,
                                     status_code: StatusCode::Failure,
-                                    error_message: format!("Bucket '{}' is not empty", bucket).into(),
+                                    error_message: format!("Bucket '{}' is not empty", bucket),
                                     language_tag: "en".into(),
                                 });
                             }
@@ -753,49 +776,29 @@ impl Handler for SftpHandler {
                     ..Default::default()
                 };
 
-                s3_client.delete_bucket(delete_bucket_input).await.map_err(|e| {
-                    error!("SFTP REMOVE - failed to delete bucket '{}': {}", bucket, e);
-                    StatusCode::Failure
-                })?;
-
-                debug!("SFTP REMOVE - successfully deleted bucket: '{}'", bucket);
-                Ok(Status {
-                    id,
-                    status_code: StatusCode::Ok,
-                    error_message: "Success".into(),
-                    language_tag: "en".into(),
-                })
-            } else {
-                // Delete object
-                let key = key_opt.unwrap();
-
-                let action = S3Action::DeleteObject;
-                authorize_operation(&this.session_context, &action, &bucket, Some(&key))
-                    .await
-                    .map_err(|_| StatusCode::PermissionDenied)?;
-
-                let input = DeleteObjectInput {
-                    bucket,
-                    key,
-                    ..Default::default()
-                };
-
-                let s3_client = this.create_s3_client()?;
-                s3_client.delete_object(input).await.map_err(|e| {
-                    error!("SFTP REMOVE - failed to delete object: {}", e);
-                    StatusCode::Failure
-                })?;
-
-                Ok(Status {
-                    id,
-                    status_code: StatusCode::Ok,
-                    error_message: "Success".into(),
-                    language_tag: "en".into(),
-                })
+                match s3_client.delete_bucket(delete_bucket_input).await {
+                    Ok(_) => {
+                        debug!("SFTP REMOVE - successfully deleted bucket: '{}'", bucket);
+                        Ok(Status {
+                            id,
+                            status_code: StatusCode::Ok,
+                            error_message: "Success".into(),
+                            language_tag: "en".into(),
+                        })
+                    }
+                    Err(e) => {
+                        error!("SFTP REMOVE - failed to delete bucket '{}': {}", bucket, e);
+                        Ok(Status {
+                            id,
+                            status_code: StatusCode::Failure,
+                            error_message: format!("Failed to delete bucket: {}", e),
+                            language_tag: "en".into(),
+                        })
+                    }
+                }
             }
         }
     }
-
     fn mkdir(
         &mut self,
         id: u32,
@@ -806,8 +809,44 @@ impl Handler for SftpHandler {
         async move {
             let (bucket, key_opt) = this.parse_path(&path)?;
 
-            // If no key, create bucket instead
-            if key_opt.is_none() {
+            if let Some(key) = key_opt {
+                // Create directory inside bucket
+                let dir_key = path::retain_slash(&key);
+
+                let action = S3Action::PutObject;
+                authorize_operation(&this.session_context, &action, &bucket, Some(&dir_key))
+                    .await
+                    .map_err(|_| StatusCode::PermissionDenied)?;
+
+                let s3_client = this.create_s3_client()?;
+                let empty_stream = futures::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
+                let body = StreamingBlob::wrap(empty_stream);
+                let input = PutObjectInput {
+                    bucket,
+                    key: dir_key,
+                    body: Some(body),
+                    ..Default::default()
+                };
+
+                match s3_client.put_object(input).await {
+                    Ok(_) => Ok(Status {
+                        id,
+                        status_code: StatusCode::Ok,
+                        error_message: "Directory created".into(),
+                        language_tag: "en".into(),
+                    }),
+                    Err(e) => {
+                        error!("SFTP Failed to create directory: {}", e);
+                        Ok(Status {
+                            id,
+                            status_code: StatusCode::Failure,
+                            error_message: format!("Failed to create directory: {}", e),
+                            language_tag: "en".into(),
+                        })
+                    }
+                }
+            } else {
+                // Create bucket
                 debug!("SFTP mkdir - Creating bucket: '{}'", bucket);
 
                 let action = S3Action::CreateBucket;
@@ -817,7 +856,7 @@ impl Handler for SftpHandler {
 
                 let s3_client = this.create_s3_client()?;
                 let input = s3s::dto::CreateBucketInput {
-                    bucket: bucket,
+                    bucket,
                     ..Default::default()
                 };
 
@@ -829,46 +868,15 @@ impl Handler for SftpHandler {
                         language_tag: "en".into(),
                     }),
                     Err(e) => {
-                        error!("FTPS Failed to create bucket: {}", e);
+                        error!("SFTP Failed to create bucket: {}", e);
                         Ok(Status {
                             id,
                             status_code: StatusCode::Failure,
-                            error_message: format!("Failed to create bucket: {}", e).into(),
+                            error_message: format!("Failed to create bucket: {}", e),
                             language_tag: "en".into(),
                         })
                     }
                 }
-            } else {
-                // Create directory inside bucket
-                let key = key_opt.unwrap();
-                let dir_key = path::retain_slash(&key);
-
-                let action = S3Action::PutObject;
-                authorize_operation(&this.session_context, &action, &bucket, Some(&dir_key))
-                    .await
-                    .map_err(|_| StatusCode::PermissionDenied)?;
-
-                let empty_stream = futures::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
-                let body = StreamingBlob::wrap(empty_stream);
-                let input = PutObjectInput {
-                    bucket,
-                    key: dir_key,
-                    body: Some(body),
-                    ..Default::default()
-                };
-
-                let s3_client = this.create_s3_client()?;
-                s3_client.put_object(input).await.map_err(|e| {
-                    error!("Mkdir failed: {}", e);
-                    StatusCode::Failure
-                })?;
-
-                Ok(Status {
-                    id,
-                    status_code: StatusCode::Ok,
-                    error_message: "Success".into(),
-                    language_tag: "en".into(),
-                })
             }
         }
     }
@@ -903,7 +911,7 @@ impl Handler for SftpHandler {
                         "rustfs",
                         attrs.size.unwrap_or(0),
                         "Jan 1 1970",
-                        resolved.split('/').last().unwrap_or(&resolved)
+                        resolved.split('/').next_back().unwrap_or(&resolved)
                     ),
                     attrs,
                 }],

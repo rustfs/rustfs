@@ -61,7 +61,7 @@ pub async fn test_ftps_core_operations() -> Result<()> {
         .spawn()?;
 
     // Ensure server is cleaned up even on failure
-    let result = (async || {
+    let result = async {
         // Wait for server to be ready
         ProtocolTestEnvironment::wait_for_port_ready(FTPS_PORT, 30)
             .await
@@ -96,6 +96,13 @@ pub async fn test_ftps_core_operations() -> Result<()> {
         let content = "Hello, FTPS!";
         ftp_stream.put_file(filename, &mut Cursor::new(content.as_bytes()))?;
         info!("PASS: put file '{}' ({} bytes) successful", filename, content.len());
+
+        info!("Testing FTPS: get object");
+        let mut retrieved_content = Vec::new();
+        ftp_stream.retr(filename, &mut retrieved_content)?;
+        let retrieved_string = String::from_utf8(retrieved_content)?;
+        assert_eq!(retrieved_string, content, "Retrieved content should match uploaded content");
+        info!("PASS: get object '{}' successful, content matches", filename);
 
         info!("Testing FTPS: ls list objects in bucket");
         let list = ftp_stream.list(None)?;
@@ -200,7 +207,7 @@ pub async fn test_ftps_core_operations() -> Result<()> {
 
         info!("FTPS core tests passed");
         Ok(())
-    })()
+    }
     .await;
 
     // Always cleanup server process

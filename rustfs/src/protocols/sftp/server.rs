@@ -436,12 +436,12 @@ impl Handler for SftpConnectionHandler {
         }
     }
 
-    fn channel_open_session(
+    async fn channel_open_session(
         &mut self,
         _channel: russh::Channel<russh::server::Msg>,
         _session: &mut Session,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        async move { Ok(true) }
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
     }
 
     fn data(

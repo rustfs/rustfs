@@ -324,9 +324,9 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
 
         // Handle paths ending with /., e.g., /testbucket/.
         // Remove trailing /. to get the actual path
-        let cleaned_path = if path_str.ends_with("/.") {
+        let cleaned_path = if let Some(stripped) = path_str.strip_suffix("/.") {
             info!("FTPS LIST - path ends with /., removing trailing /.");
-            &path_str[..path_str.len() - 2]
+            stripped
         } else {
             &path_str
         };
@@ -470,7 +470,7 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
             Ok(output) => {
                 if let Some(body) = output.body {
                     // Map the s3s/Box<dyn StdError> error to std::io::Error
-                    let stream = body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+                    let stream = body.map_err(std::io::Error::other);
                     // Wrap the stream in StreamReader to make it a tokio::io::AsyncRead
                     let reader = tokio_util::io::StreamReader::new(stream);
                     Ok(Box::new(reader))
@@ -674,7 +674,46 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         let path_str = path.as_ref().to_string_lossy();
         let (bucket, key) = self.parse_path(&path_str)?;
 
-        if key.is_none() {
+        if let Some(key) = key {
+            // Remove directory inside bucket
+            let dir_key = path::retain_slash(&key);
+
+            let action = S3Action::DeleteObject;
+            if !is_operation_supported(crate::protocols::session::context::Protocol::Ftps, &action) {
+                return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Operation not supported"));
+            }
+
+            // Authorize the operation
+            authorize_operation(&session_context, &action, &bucket, Some(&dir_key))
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
+            // Save references for debug output after build
+            let bucket_for_log = bucket.clone();
+            let dir_key_for_log = dir_key.clone();
+
+            let mut builder = s3s::dto::DeleteObjectInput::builder();
+            builder = builder.bucket(bucket);
+            builder = builder.key(dir_key);
+            let input = builder
+                .build()
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build DeleteObjectInput"))?;
+
+            match s3_client.delete_object(input).await {
+                Ok(_) => {
+                    debug!(
+                        "FTPS RMD - successfully removed directory marker: '{}' in bucket '{}'",
+                        dir_key_for_log, bucket_for_log
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("FTPS RMD - failed to remove directory marker: {}", e);
+                    let protocol_error = map_s3_error_to_ftps(&e);
+                    Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
+                }
+            }
+        } else {
             // Delete bucket - check if bucket is empty first
             debug!("FTPS RMD - attempting to delete bucket: '{}'", bucket);
 
@@ -724,45 +763,6 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
                 }
                 Err(e) => {
                     error!("FTPS RMD - failed to delete bucket '{}': {}", bucket, e);
-                    let protocol_error = map_s3_error_to_ftps(&e);
-                    Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
-                }
-            }
-        } else {
-            // Remove directory inside bucket
-            let dir_key = path::retain_slash(&key.unwrap());
-
-            let action = S3Action::DeleteObject;
-            if !is_operation_supported(crate::protocols::session::context::Protocol::Ftps, &action) {
-                return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Operation not supported"));
-            }
-
-            // Authorize the operation
-            authorize_operation(&session_context, &action, &bucket, Some(&dir_key))
-                .await
-                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
-
-            // Save references for debug output after build
-            let bucket_for_log = bucket.clone();
-            let dir_key_for_log = dir_key.clone();
-
-            let mut builder = s3s::dto::DeleteObjectInput::builder();
-            builder = builder.bucket(bucket);
-            builder = builder.key(dir_key);
-            let input = builder
-                .build()
-                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build DeleteObjectInput"))?;
-
-            match s3_client.delete_object(input).await {
-                Ok(_) => {
-                    debug!(
-                        "FTPS RMD - successfully removed directory marker: '{}' in bucket '{}'",
-                        dir_key_for_log, bucket_for_log
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    error!("FTPS RMD - failed to remove directory marker: {}", e);
                     let protocol_error = map_s3_error_to_ftps(&e);
                     Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
                 }

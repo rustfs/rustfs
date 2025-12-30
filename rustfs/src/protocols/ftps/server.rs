@@ -92,12 +92,10 @@ pub struct FtpsConfig {
 impl FtpsConfig {
     /// Validates the configuration
     pub async fn validate(&self) -> Result<(), FtpsInitError> {
-        if self.ftps_required {
-            if self.cert_file.is_none() || self.key_file.is_none() {
-                return Err(FtpsInitError::InvalidConfig(
-                    "FTPS is required but certificate or key file is missing".to_string(),
-                ));
-            }
+        if self.ftps_required && (self.cert_file.is_none() || self.key_file.is_none()) {
+            return Err(FtpsInitError::InvalidConfig(
+                "FTPS is required but certificate or key file is missing".to_string(),
+            ));
         }
 
         if let Some(path) = &self.cert_file {
@@ -171,7 +169,7 @@ impl FtpsServer {
         info!("Initializing FTPS server on {}", self.config.bind_addr);
 
         let mut server_builder =
-            libunftp::ServerBuilder::with_authenticator(Box::new(|| FtpsDriver::new()), Arc::new(FtpsAuthenticator::new()));
+            libunftp::ServerBuilder::with_authenticator(Box::new(FtpsDriver::new), Arc::new(FtpsAuthenticator::new()));
 
         // Configure passive ports for data connections
         if let Some(passive_ports) = &self.config.passive_ports {
@@ -204,7 +202,7 @@ impl FtpsServer {
         }
 
         // Build the server instance
-        let server = server_builder.build().map_err(|e| FtpsInitError::Server(e))?;
+        let server = server_builder.build().map_err(FtpsInitError::Server)?;
 
         // libunftp's listen() binds to the address and runs the loop
         let bind_addr = self.config.bind_addr.to_string();
@@ -230,7 +228,7 @@ impl FtpsServer {
                     }
                     Err(e) => {
                         error!("FTPS server panic or task cancellation: {}", e);
-                        Err(FtpsInitError::Bind(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                        Err(FtpsInitError::Bind(std::io::Error::other(e.to_string())))
                     }
                 }
             }
@@ -291,7 +289,6 @@ impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
             description: None,
         };
 
-        // 3. Validate Access Key (User existence)
         let (user_identity, is_valid) = iam_sys.check_key(&s3_creds.access_key).await.map_err(|e| {
             error!("IAM check_key failed for {}: {}", username, e);
             AuthenticationError::ImplPropagated("Authentication verification failed".to_string(), Some(Box::new(e)))
@@ -302,7 +299,6 @@ impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
             return Err(AuthenticationError::BadUser);
         }
 
-        // 4. Validate Secret Key
         let identity = user_identity.ok_or_else(|| {
             error!("User identity missing despite valid key for {}", username);
             AuthenticationError::BadUser
@@ -314,10 +310,7 @@ impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
             return Err(AuthenticationError::BadPassword);
         }
 
-        // 5. Construct Session Context
-        // LIMITATION: libunftp's Authenticator trait does not currently provide the client's source IP address.
-        // We set it to a safe default (0.0.0.0) or loopback.
-        // This means Policy conditions relying on `aws:SourceIp` will currently not work correctly for FTP.
+        // Policy conditions relying on `aws:SourceIp` will currently not work correctly for FTP.
         // TODO: Investigate wrapping the authenticator or using Proxy Protocol metadata if available in future libunftp versions.
         let source_ip: IpAddr = DEFAULT_SOURCE_IP.parse().unwrap();
 
