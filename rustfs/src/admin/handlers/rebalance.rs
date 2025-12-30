@@ -15,6 +15,7 @@
 use crate::{
     admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
+    server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
@@ -103,6 +104,7 @@ impl Operation for RebalanceStart {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -180,6 +182,7 @@ impl Operation for RebalanceStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -297,6 +300,7 @@ impl Operation for RebalanceStop {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 

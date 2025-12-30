@@ -17,6 +17,7 @@ use crate::config::workload_profiles::{
     RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
 };
 use crate::error::ApiError;
+use crate::server::RemoteAddr;
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
@@ -4689,7 +4690,8 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None);
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None, remote_addr);
 
         let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,

@@ -36,3 +36,6 @@ pub(crate) use service_state::ServiceState;
 pub(crate) use service_state::ServiceStateManager;
 pub(crate) use service_state::ShutdownSignal;
 pub(crate) use service_state::wait_for_shutdown;
+
+#[derive(Clone, Copy, Debug)]
+pub struct RemoteAddr(pub std::net::SocketAddr);

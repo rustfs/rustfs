@@ -17,7 +17,7 @@ use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::{ReadinessGateLayer, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
+use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -44,6 +44,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
+use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -528,9 +529,21 @@ fn process_connection(
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
         let service = hybrid(s3_service, rpc_service);
 
+        let remote_addr = match socket.peer_addr() {
+            Ok(addr) => Some(RemoteAddr(addr)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to obtain peer address; policy evaluation may fall back to a default source IP"
+                );
+                None
+            }
+        };
+
         let hybrid_service = ServiceBuilder::new()
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
+            .layer(AddExtensionLayer::new(remote_addr))
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
             .layer(ReadinessGateLayer::new(readiness))
