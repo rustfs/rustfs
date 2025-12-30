@@ -17,6 +17,7 @@
 use crate::backends::{BackendInfo, KmsBackend, KmsClient};
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
+use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use aes_gcm::{
@@ -39,6 +40,8 @@ pub struct LocalKmsClient {
     key_cache: RwLock<HashMap<String, MasterKey>>,
     /// Master encryption key for encrypting stored keys
     master_cipher: Option<Aes256Gcm>,
+    /// DEK encryption implementation
+    dek_crypto: AesDekCrypto,
 }
 
 /// Serializable representation of a master key stored on disk
@@ -60,17 +63,6 @@ struct StoredMasterKey {
     nonce: Vec<u8>,
 }
 
-/// Data key envelope stored with each data key generation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DataKeyEnvelope {
-    key_id: String,
-    master_key_id: String,
-    key_spec: String,
-    encrypted_key: Vec<u8>,
-    nonce: Vec<u8>,
-    encryption_context: HashMap<String, String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-}
 
 impl LocalKmsClient {
     /// Create a new local KMS client
@@ -94,6 +86,7 @@ impl LocalKmsClient {
             config,
             key_cache: RwLock::new(HashMap::new()),
             master_cipher,
+            dek_crypto: AesDekCrypto::new(),
         })
     }
 
@@ -209,12 +202,6 @@ impl LocalKmsClient {
         Ok(())
     }
 
-    /// Generate a random 256-bit key
-    fn generate_key_material() -> Vec<u8> {
-        let mut key_material = vec![0u8; 32]; // 256 bits
-        rand::rng().fill(&mut key_material[..]);
-        key_material
-    }
 
     /// Get the actual key material for a master key
     async fn get_key_material(&self, key_id: &str) -> Result<Vec<u8>> {
@@ -249,42 +236,14 @@ impl LocalKmsClient {
     async fn encrypt_with_master_key(&self, key_id: &str, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         // Load the actual master key material
         let key_material = self.get_key_material(key_id).await?;
-        let key = Key::<Aes256Gcm>::try_from(key_material.as_slice())
-            .map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
-        let cipher = Aes256Gcm::new(&key);
-
-        let mut nonce_bytes = [0u8; 12];
-        rand::rng().fill(&mut nonce_bytes[..]);
-
-        let nonce = Nonce::from(nonce_bytes);
-
-        let ciphertext = cipher
-            .encrypt(&nonce, plaintext)
-            .map_err(|e| KmsError::cryptographic_error("encrypt", e.to_string()))?;
-
-        Ok((ciphertext, nonce_bytes.to_vec()))
+        self.dek_crypto.encrypt(&key_material, plaintext).await
     }
 
     /// Decrypt data using a master key
     async fn decrypt_with_master_key(&self, key_id: &str, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
-        if nonce.len() != 12 {
-            return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
-        }
         // Load the actual master key material
         let key_material = self.get_key_material(key_id).await?;
-        let key = Key::<Aes256Gcm>::try_from(key_material.as_slice())
-            .map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
-        let cipher = Aes256Gcm::new(&key);
-
-        let mut nonce_array = [0u8; 12];
-        nonce_array.copy_from_slice(nonce);
-        let nonce_ref = Nonce::from(nonce_array);
-
-        let plaintext = cipher
-            .decrypt(&nonce_ref, ciphertext)
-            .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?;
-
-        Ok(plaintext)
+        self.dek_crypto.decrypt(&key_material, ciphertext, nonce).await
     }
 }
 
@@ -293,8 +252,8 @@ impl KmsClient for LocalKmsClient {
     async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKey> {
         debug!("Generating data key for master key: {}", request.master_key_id);
 
-        // Verify master key exists
-        let _master_key = self.describe_key(&request.master_key_id, context).await?;
+        // Verify master key exists and get its version
+        let master_key_info = self.describe_key(&request.master_key_id, context).await?;
 
         // Generate random data key material
         let key_length = match request.key_spec.as_str() {
@@ -309,10 +268,11 @@ impl KmsClient for LocalKmsClient {
         // Encrypt the data key with the master key
         let (encrypted_key, nonce) = self.encrypt_with_master_key(&request.master_key_id, &plaintext_key).await?;
 
-        // Create data key envelope
+        // Create data key envelope with master key version for rotation support
         let envelope = DataKeyEnvelope {
             key_id: uuid::Uuid::new_v4().to_string(),
             master_key_id: request.master_key_id.clone(),
+            master_key_version: master_key_info.version,
             key_spec: request.key_spec.clone(),
             encrypted_key: encrypted_key.clone(),
             nonce,
@@ -358,15 +318,19 @@ impl KmsClient for LocalKmsClient {
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
 
         // Verify encryption context matches
-        if !request.encryption_context.is_empty() {
-            for (key, expected_value) in &request.encryption_context {
-                if let Some(actual_value) = envelope.encryption_context.get(key) {
-                    if actual_value != expected_value {
-                        return Err(KmsError::context_mismatch(format!(
-                            "Context mismatch for key '{key}': expected '{expected_value}', got '{actual_value}'"
-                        )));
-                    }
-                } else {
+        // Check that all keys in envelope.encryption_context are present in request.encryption_context
+        // and their values match. This ensures the context used for decryption matches what was used for encryption.
+        for (key, expected_value) in &envelope.encryption_context {
+            if let Some(actual_value) = request.encryption_context.get(key) {
+                if actual_value != expected_value {
+                    return Err(KmsError::context_mismatch(format!(
+                        "Context mismatch for key '{key}': expected '{expected_value}', got '{actual_value}'"
+                    )));
+                }
+            } else {
+                // If request.encryption_context is empty, allow decryption (backward compatibility)
+                // Otherwise, require all envelope context keys to be present
+                if !request.encryption_context.is_empty() {
                     return Err(KmsError::context_mismatch(format!("Missing context key '{key}'")));
                 }
             }
@@ -395,7 +359,7 @@ impl KmsClient for LocalKmsClient {
         }
 
         // Generate key material
-        let key_material = Self::generate_key_material();
+        let key_material = generate_key_material(algorithm)?;
 
         let created_by = context
             .map(|ctx| ctx.principal.clone())
@@ -489,7 +453,7 @@ impl KmsClient for LocalKmsClient {
 
         // For simplicity, we'll regenerate key material
         // In a real implementation, we'd preserve the original key material
-        let key_material = Self::generate_key_material();
+        let key_material = generate_key_material(&master_key.algorithm)?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -506,7 +470,7 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Disabled;
 
-        let key_material = Self::generate_key_material();
+        let key_material = generate_key_material(&master_key.algorithm)?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -528,7 +492,7 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::PendingDeletion;
 
-        let key_material = Self::generate_key_material();
+        let key_material = generate_key_material(&master_key.algorithm)?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -545,7 +509,7 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Active;
 
-        let key_material = Self::generate_key_material();
+        let key_material = generate_key_material(&master_key.algorithm)?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -564,7 +528,7 @@ impl KmsClient for LocalKmsClient {
         master_key.rotated_at = Some(chrono::Utc::now());
 
         // Generate new key material
-        let key_material = Self::generate_key_material();
+        let key_material = generate_key_material(&master_key.algorithm)?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -624,12 +588,13 @@ impl KmsBackend for LocalKmsBackend {
 
         // Create master key with description directly
         let _master_key = {
+            let algorithm = "AES_256";
             // Generate key material
-            let key_material = LocalKmsClient::generate_key_material();
+            let key_material = generate_key_material(algorithm)?;
 
             let master_key = MasterKey::new_with_description(
                 key_id.clone(),
-                "AES_256".to_string(),
+                algorithm.to_string(),
                 Some("local-kms".to_string()),
                 request.description.clone(),
             );
@@ -860,8 +825,30 @@ impl KmsBackend for LocalKmsBackend {
         master_key.status = KeyStatus::Active;
 
         // Save the updated key to disk - this is the missing critical step!
-        let key_material = LocalKmsClient::generate_key_material();
-        self.client.save_master_key(&master_key, &key_material).await?;
+        // Preserve existing key material instead of generating new one
+        let key_path = self.client.master_key_path(key_id);
+        let content = tokio::fs::read(&key_path)
+            .await
+            .map_err(|e| KmsError::internal_error(format!("Failed to read key file: {e}")))?;
+        let stored_key: StoredMasterKey =
+            serde_json::from_slice(&content).map_err(|e| KmsError::internal_error(format!("Failed to parse stored key: {e}")))?;
+
+        // Decrypt the existing key material to preserve it
+        let existing_key_material = if let Some(ref cipher) = self.client.master_cipher {
+            if stored_key.nonce.len() != 12 {
+                return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
+            }
+            let mut nonce_array = [0u8; 12];
+            nonce_array.copy_from_slice(&stored_key.nonce);
+            let nonce = Nonce::from(nonce_array);
+            cipher
+                .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
+                .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
+        } else {
+            stored_key.encrypted_key_material
+        };
+
+        self.client.save_master_key(&master_key, &existing_key_material).await?;
 
         // Update cache
         let mut cache = self.client.key_cache.write().await;
