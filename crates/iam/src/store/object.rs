@@ -139,10 +139,6 @@ impl ObjectStore {
         Ok(en)
     }
 
-    fn can_decrypt_data(data: &[u8]) -> bool {
-        Self::decrypt_data(data).is_ok()
-    }
-
     async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, ObjectInfo)> {
         let (data, obj) = read_config_with_metadata(self.object_api.clone(), path.as_ref(), &ObjectOptions::default()).await?;
 
