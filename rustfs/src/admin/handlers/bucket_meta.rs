@@ -20,6 +20,7 @@ use std::{
 use crate::{
     admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
+    server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
@@ -97,6 +98,7 @@ impl Operation for ExportBucketMetadata {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -389,6 +391,7 @@ impl Operation for ImportBucketMetadata {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 

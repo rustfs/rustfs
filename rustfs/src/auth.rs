@@ -241,6 +241,7 @@ pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str
 /// * `cred` - User credentials
 /// * `version_id` - Optional version ID of the object
 /// * `region` - Optional region/location constraint
+/// * `remote_addr` - Optional remote address of the connection
 ///
 /// # Returns
 /// * `HashMap<String, Vec<String>>` - Condition values for policy evaluation
@@ -250,6 +251,7 @@ pub fn get_condition_values(
     cred: &Credentials,
     version_id: Option<&str>,
     region: Option<&str>,
+    remote_addr: Option<std::net::SocketAddr>,
 ) -> HashMap<String, Vec<String>> {
     let username = if cred.is_temp() || cred.is_service_account() {
         cred.parent_user.clone()
@@ -297,12 +299,7 @@ pub fn get_condition_values(
         .unwrap_or(false);
 
     // Get remote address from header or use default
-    let remote_addr = header
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .or_else(|| header.get("x-real-ip").and_then(|v| v.to_str().ok()))
-        .unwrap_or("127.0.0.1");
+    let remote_addr_s = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
 
     let mut args = HashMap::new();
 
@@ -310,7 +307,7 @@ pub fn get_condition_values(
     args.insert("CurrentTime".to_owned(), vec![curr_time.format(&Rfc3339).unwrap_or_default()]);
     args.insert("EpochTime".to_owned(), vec![epoch_time.to_string()]);
     args.insert("SecureTransport".to_owned(), vec![is_tls.to_string()]);
-    args.insert("SourceIp".to_owned(), vec![get_source_ip_raw(header, remote_addr)]);
+    args.insert("SourceIp".to_owned(), vec![get_source_ip_raw(header, &remote_addr_s)]);
 
     // Add user agent and referer
     if let Some(user_agent) = header.get("user-agent") {
@@ -848,7 +845,7 @@ mod tests {
         let cred = create_test_credentials();
         let headers = HeaderMap::new();
 
-        let conditions = get_condition_values(&headers, &cred, None, None);
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
 
         assert_eq!(conditions.get("userid"), Some(&vec!["test-access-key".to_string()]));
         assert_eq!(conditions.get("username"), Some(&vec!["test-access-key".to_string()]));
@@ -860,7 +857,7 @@ mod tests {
         let cred = create_temp_credentials();
         let headers = HeaderMap::new();
 
-        let conditions = get_condition_values(&headers, &cred, None, None);
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
 
         assert_eq!(conditions.get("userid"), Some(&vec!["parent-user".to_string()]));
         assert_eq!(conditions.get("username"), Some(&vec!["parent-user".to_string()]));
@@ -872,7 +869,7 @@ mod tests {
         let cred = create_service_account_credentials();
         let headers = HeaderMap::new();
 
-        let conditions = get_condition_values(&headers, &cred, None, None);
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
 
         assert_eq!(conditions.get("userid"), Some(&vec!["service-parent".to_string()]));
         assert_eq!(conditions.get("username"), Some(&vec!["service-parent".to_string()]));
@@ -887,7 +884,7 @@ mod tests {
         headers.insert("x-amz-object-lock-mode", HeaderValue::from_static("GOVERNANCE"));
         headers.insert("x-amz-object-lock-retain-until-date", HeaderValue::from_static("2024-12-31T23:59:59Z"));
 
-        let conditions = get_condition_values(&headers, &cred, None, None);
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
 
         assert_eq!(conditions.get("object-lock-mode"), Some(&vec!["GOVERNANCE".to_string()]));
         assert_eq!(
@@ -902,7 +899,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-amz-signature-age", HeaderValue::from_static("300"));
 
-        let conditions = get_condition_values(&headers, &cred, None, None);
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
 
         assert_eq!(conditions.get("signatureAge"), Some(&vec!["300".to_string()]));
         // Verify the header is removed after processing
@@ -919,7 +916,7 @@ mod tests {
 
         let headers = HeaderMap::new();
 
-        let conditions = get_condition_values(&headers, &cred, None, None);
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
 
         assert_eq!(conditions.get("username"), Some(&vec!["ldap-user".to_string()]));
         assert_eq!(conditions.get("groups"), Some(&vec!["group1".to_string(), "group2".to_string()]));
@@ -932,7 +929,7 @@ mod tests {
 
         let headers = HeaderMap::new();
 
-        let conditions = get_condition_values(&headers, &cred, None, None);
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
 
         assert_eq!(
             conditions.get("groups"),
@@ -1207,5 +1204,160 @@ mod tests {
         let key3 = "AKIAIOSFODNN7EXAMPLF";
         assert!(constant_time_eq(key1, key2));
         assert!(!constant_time_eq(key1, key3));
+    }
+
+    #[test]
+    fn test_get_condition_values_source_ip() {
+        let mut headers = HeaderMap::new();
+        let cred = Credentials::default();
+
+        // Case 1: No headers, no remote addr -> empty string
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "");
+
+        // Case 2: No headers, with remote addr -> remote addr
+        let remote_addr: std::net::SocketAddr = "192.168.0.10:12345".parse().unwrap();
+        let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
+
+        // Case 3: X-Forwarded-For present -> XFF (takes precedence over remote_addr)
+        headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+        let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.1");
+
+        // Case 4: X-Forwarded-For with multiple IPs -> First IP
+        headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.3, 10.0.0.4"));
+        let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.3");
+
+        // Case 5: X-Real-IP present (XFF removed) -> X-Real-IP
+        headers.remove("x-forwarded-for");
+        headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.2"));
+        let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.2");
+
+        // Case 6: Forwarded header present (X-Real-IP removed) -> Forwarded
+        headers.remove("x-real-ip");
+        headers.insert("forwarded", HeaderValue::from_static("for=10.0.0.5;proto=http"));
+        let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.5");
+
+        // Case 7: Forwarded header with quotes and multiple values
+        headers.insert("forwarded", HeaderValue::from_static("for=\"10.0.0.6\", for=10.0.0.7"));
+        let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.6");
+
+        // Case 8: IPv6 Remote Addr
+        let remote_addr_v6: std::net::SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+        headers.clear();
+        let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr_v6));
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "2001:db8::1");
+    }
+}
+
+#[cfg(test)]
+mod tests_policy {
+    use rustfs_policy::policy::action::{Action, S3Action};
+    use rustfs_policy::policy::{Args, BucketPolicy, BucketPolicyArgs, Policy};
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_iam_policy_source_ip() {
+        let policy_json = r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"],
+                    "Resource": ["arn:aws:s3:::mybucket/*"],
+                    "Condition": {
+                        "IpAddress": {
+                            "aws:SourceIp": "192.168.1.0/24"
+                        }
+                    }
+                }
+            ]
+        }"#;
+
+        let policy: Policy = serde_json::from_str(policy_json).expect("Failed to parse IAM policy");
+
+        // Case 1: Matching IP
+        let mut conditions = HashMap::new();
+        conditions.insert("SourceIp".to_string(), vec!["192.168.1.10".to_string()]);
+
+        let claims = HashMap::new();
+        let args = Args {
+            account: "test-account",
+            groups: &None,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "mybucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "myobject",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(policy.is_allowed(&args).await, "IAM Policy should allow matching IP");
+
+        // Case 2: Non-matching IP
+        let mut conditions_fail = HashMap::new();
+        conditions_fail.insert("SourceIp".to_string(), vec!["10.0.0.1".to_string()]);
+
+        let args_fail = Args {
+            conditions: &conditions_fail,
+            ..args
+        };
+
+        assert!(!policy.is_allowed(&args_fail).await, "IAM Policy should deny non-matching IP");
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_source_ip() {
+        let policy_json = r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": ["*"]},
+                    "Action": ["s3:GetObject"],
+                    "Resource": ["arn:aws:s3:::mybucket/*"],
+                    "Condition": {
+                        "IpAddress": {
+                            "aws:SourceIp": "192.168.1.0/24"
+                        }
+                    }
+                }
+            ]
+        }"#;
+
+        let policy: BucketPolicy = serde_json::from_str(policy_json).expect("Failed to parse Bucket policy");
+
+        // Case 1: Matching IP
+        let mut conditions = HashMap::new();
+        conditions.insert("SourceIp".to_string(), vec!["192.168.1.10".to_string()]);
+
+        let args = BucketPolicyArgs {
+            account: "test-account",
+            groups: &None,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "mybucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "myobject",
+        };
+
+        assert!(policy.is_allowed(&args).await, "Bucket Policy should allow matching IP");
+
+        // Case 2: Non-matching IP
+        let mut conditions_fail = HashMap::new();
+        conditions_fail.insert("SourceIp".to_string(), vec!["10.0.0.1".to_string()]);
+
+        let args_fail = BucketPolicyArgs {
+            conditions: &conditions_fail,
+            ..args
+        };
+
+        assert!(!policy.is_allowed(&args_fail).await, "Bucket Policy should deny non-matching IP");
     }
 }
