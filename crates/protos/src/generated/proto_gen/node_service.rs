@@ -303,6 +303,10 @@ pub struct ListDirRequest {
     pub disk: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub volume: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub dir_path: ::prost::alloc::string::String,
+    #[prost(int32, tag = "4")]
+    pub count: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListDirResponse {

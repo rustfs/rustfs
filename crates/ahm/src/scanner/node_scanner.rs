@@ -711,6 +711,7 @@ impl NodeScanner {
         // start scanning loop
         let scanner_clone = self.clone_for_background();
         tokio::spawn(async move {
+            // update object count and size for each bucket
             if let Err(e) = scanner_clone.scan_loop_with_resume(None).await {
                 error!("scanning loop failed: {}", e);
             }

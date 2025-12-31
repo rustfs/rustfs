@@ -127,12 +127,12 @@ async fn test_get_deleted_object_returns_nosuchkey() -> Result<(), Box<dyn std::
             info!("Service error code: {:?}", s3_err.meta().code());
 
             // The error should be NoSuchKey
-            assert!(s3_err.is_no_such_key(), "Error should be NoSuchKey, got: {:?}", s3_err);
+            assert!(s3_err.is_no_such_key(), "Error should be NoSuchKey, got: {s3_err:?}");
 
             info!("✅ Test passed: GetObject on deleted object correctly returns NoSuchKey");
         }
         other_err => {
-            panic!("Expected ServiceError with NoSuchKey, but got: {:?}", other_err);
+            panic!("Expected ServiceError with NoSuchKey, but got: {other_err:?}");
         }
     }
 
@@ -182,13 +182,12 @@ async fn test_head_deleted_object_returns_nosuchkey() -> Result<(), Box<dyn std:
             let s3_err = service_err.into_err();
             assert!(
                 s3_err.meta().code() == Some("NoSuchKey") || s3_err.meta().code() == Some("NotFound"),
-                "Error should be NoSuchKey or NotFound, got: {:?}",
-                s3_err
+                "Error should be NoSuchKey or NotFound, got: {s3_err:?}"
             );
             info!("✅ HeadObject correctly returns NoSuchKey/NotFound");
         }
         other_err => {
-            panic!("Expected ServiceError but got: {:?}", other_err);
+            panic!("Expected ServiceError but got: {other_err:?}");
         }
     }
 
@@ -220,11 +219,11 @@ async fn test_get_nonexistent_object_returns_nosuchkey() -> Result<(), Box<dyn s
     match get_result.unwrap_err() {
         SdkError::ServiceError(service_err) => {
             let s3_err = service_err.into_err();
-            assert!(s3_err.is_no_such_key(), "Error should be NoSuchKey, got: {:?}", s3_err);
+            assert!(s3_err.is_no_such_key(), "Error should be NoSuchKey, got: {s3_err:?}");
             info!("✅ GetObject correctly returns NoSuchKey for non-existent object");
         }
         other_err => {
-            panic!("Expected ServiceError with NoSuchKey, but got: {:?}", other_err);
+            panic!("Expected ServiceError with NoSuchKey, but got: {other_err:?}");
         }
     }
 
@@ -266,15 +265,15 @@ async fn test_multiple_gets_deleted_object() -> Result<(), Box<dyn std::error::E
         info!("Attempt {} to get deleted object", i);
         let get_result = client.get_object().bucket(BUCKET).key(key).send().await;
 
-        assert!(get_result.is_err(), "Attempt {}: should return error", i);
+        assert!(get_result.is_err(), "Attempt {i}: should return error");
 
         match get_result.unwrap_err() {
             SdkError::ServiceError(service_err) => {
                 let s3_err = service_err.into_err();
-                assert!(s3_err.is_no_such_key(), "Attempt {}: Error should be NoSuchKey, got: {:?}", i, s3_err);
+                assert!(s3_err.is_no_such_key(), "Attempt {i}: Error should be NoSuchKey, got: {s3_err:?}");
             }
             other_err => {
-                panic!("Attempt {}: Expected ServiceError but got: {:?}", i, other_err);
+                panic!("Attempt {i}: Expected ServiceError but got: {other_err:?}");
             }
         }
     }

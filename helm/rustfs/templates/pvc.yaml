@@ -2,23 +2,31 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
+  annotations:
+    helm.sh/resource-policy: keep
   name: {{ include "rustfs.fullname" . }}-data
+  labels:
+    {{- toYaml .Values.commonLabels | nindent 4 }}
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: {{ .Values.storageclass.name }}
   resources:
     requests:
-      storage: {{ .Values.storageclass.size }}
+      storage: {{ .Values.storageclass.dataStorageSize }}
 
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
+  annotations:
+    helm.sh/resource-policy: keep
   name: {{ include "rustfs.fullname" . }}-logs
+  labels:
+    {{- toYaml .Values.commonLabels | nindent 4 }}
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: {{ .Values.storageclass.name }}
   resources:
     requests:
-      storage: {{ .Values.storageclass.size }}
+      storage: {{ .Values.storageclass.logStorageSize }}
 {{- end }}

@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/en/introduction.html">Getting Started</a>
-  · <a href="https://docs.rustfs.com/en/">Docs</a>
+  <a href="https://docs.rustfs.com/installation/">Getting Started</a>
+  · <a href="https://docs.rustfs.com/">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Bug reports</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">Discussions</a>
 </p>
@@ -114,7 +114,7 @@ If you have any questions or need assistance, you can:
 - **Business**: <hello@rustfs.com>
 - **Jobs**: <jobs@rustfs.com>
 - **General Discussion**: [GitHub Discussions](https://github.com/rustfs/rustfs/discussions)
-- **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Contributing**: [CONTRIBUTING.md](../CONTRIBUTING.md)
 
 ## Contributors
 

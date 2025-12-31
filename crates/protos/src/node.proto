@@ -225,6 +225,8 @@ message ReadAtResponse {
 message ListDirRequest {
   string disk = 1;  // indicate which one in the disks
   string volume = 2;
+  string dir_path = 3;
+  int32 count = 4;
 }
 
 message ListDirResponse {

@@ -29,6 +29,7 @@ documentation = "https://docs.rs/rustfs-iam/latest/rustfs_iam/"
 workspace = true
 
 [dependencies]
+rustfs-credentials = { workspace = true }
 tokio.workspace = true
 time = { workspace = true, features = ["serde-human-readable"] }
 serde = { workspace = true, features = ["derive", "rc"] }
@@ -47,5 +48,7 @@ tracing.workspace = true
 rustfs-madmin.workspace = true
 rustfs-utils = { workspace = true, features = ["path"] }
 tokio-util.workspace = true
+pollster.workspace = true
 
 [dev-dependencies]
+pollster.workspace = true

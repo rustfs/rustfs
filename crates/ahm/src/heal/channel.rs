@@ -90,7 +90,12 @@ impl HealChannelProcessor {
 
     /// Process start request
     async fn process_start_request(&self, request: HealChannelRequest) -> Result<()> {
-        info!("Processing heal start request: {} for bucket: {}", request.id, request.bucket);
+        info!(
+            "Processing heal start request: {} for bucket: {}/{}",
+            request.id,
+            request.bucket,
+            request.object_prefix.as_deref().unwrap_or("")
+        );
 
         // Convert channel request to heal request
         let heal_request = self.convert_to_heal_request(request.clone())?;
@@ -323,6 +328,14 @@ mod tests {
         }
         async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> crate::Result<Vec<String>> {
             Ok(vec![])
+        }
+        async fn list_objects_for_heal_page(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<&str>,
+        ) -> crate::Result<(Vec<String>, Option<String>, bool)> {
+            Ok((vec![], None, false))
         }
         async fn get_disk_for_resume(&self, _set_disk_id: &str) -> crate::Result<rustfs_ecstore::disk::DiskStore> {
             Err(crate::Error::other("Not implemented in mock"))

@@ -13,10 +13,11 @@
 // limitations under the License.
 
 // Ensure the correct path for parse_license is imported
+use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::{ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
+use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -28,12 +29,13 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
-use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_common::GlobalReadiness;
+use rustfs_config::{MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3Service, service::S3ServiceBuilder};
-use socket2::SockRef;
+use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -42,8 +44,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
+use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::compression::{CompressionLayer, predicate::Predicate};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
@@ -108,63 +111,10 @@ fn get_cors_allowed_origins() -> String {
         .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
 }
 
-/// Predicate to determine if a response should be compressed.
-///
-/// This predicate implements intelligent compression selection to avoid issues
-/// with error responses and small payloads. It excludes:
-/// - Client error responses (4xx status codes) - typically small XML/JSON error messages
-/// - Server error responses (5xx status codes) - ensures error details are preserved
-/// - Very small responses (< 256 bytes) - compression overhead outweighs benefits
-///
-/// # Rationale
-/// The CompressionLayer can cause Content-Length header mismatches with error responses,
-/// particularly when the s3s library generates XML error responses (~119 bytes for NoSuchKey).
-/// By excluding these responses from compression, we ensure:
-/// 1. Error responses are sent with accurate Content-Length headers
-/// 2. Clients receive complete error bodies without truncation
-/// 3. Small responses avoid compression overhead
-///
-/// # Performance
-/// This predicate is evaluated per-response and has O(1) complexity.
-#[derive(Clone, Copy, Debug)]
-struct ShouldCompress;
-
-impl Predicate for ShouldCompress {
-    fn should_compress<B>(&self, response: &Response<B>) -> bool
-    where
-        B: http_body::Body,
-    {
-        let status = response.status();
-
-        // Never compress error responses (4xx and 5xx status codes)
-        // This prevents Content-Length mismatch issues with error responses
-        if status.is_client_error() || status.is_server_error() {
-            debug!("Skipping compression for error response: status={}", status.as_u16());
-            return false;
-        }
-
-        // Check Content-Length header to avoid compressing very small responses
-        // Responses smaller than 256 bytes typically don't benefit from compression
-        // and may actually increase in size due to compression overhead
-        if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH) {
-            if let Ok(length_str) = content_length.to_str() {
-                if let Ok(length) = length_str.parse::<u64>() {
-                    if length < 256 {
-                        debug!("Skipping compression for small response: size={} bytes", length);
-                        return false;
-                    }
-                }
-            }
-        }
-
-        // Compress successful responses with sufficient size
-        true
-    }
-}
-
 pub async fn start_http_server(
     opt: &config::Opt,
     worker_state_manager: ServiceStateManager,
+    readiness: Arc<GlobalReadiness>,
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
@@ -172,16 +122,26 @@ pub async fn start_http_server(
     // The listening address and port are obtained from the parameters
     let listener = {
         let mut server_addr = server_addr;
-        let mut socket = socket2::Socket::new(
+
+        // Try to create a socket for the address family; if that fails, fallback to IPv4.
+        let mut socket = match socket2::Socket::new(
             socket2::Domain::for_address(server_addr),
             socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
-        )?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to create socket for {:?}: {}, falling back to IPv4", server_addr, e);
+                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+                server_addr = ipv4_addr;
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?
+            }
+        };
 
+        // If address is IPv6 try to enable dual-stack; on failure, switch to IPv4 socket.
         if server_addr.is_ipv6() {
             if let Err(e) = socket.set_only_v6(false) {
-                warn!("Failed to set IPV6_V6ONLY=false, falling back to IPv4-only: {}", e);
-                // Fallback to a new IPv4 socket if setting dual-stack fails.
+                warn!("Failed to set IPV6_V6ONLY=false, attempting IPv4 fallback: {}", e);
                 let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
                 server_addr = ipv4_addr;
                 socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
@@ -193,8 +153,27 @@ pub async fn start_http_server(
         socket.set_reuse_address(true)?;
         // Set the socket to non-blocking before passing it to Tokio.
         socket.set_nonblocking(true)?;
-        socket.bind(&server_addr.into())?;
-        socket.listen(backlog)?;
+
+        // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
+        if let Err(bind_err) = socket.bind(&server_addr.into()) {
+            warn!("Failed to bind to {}: {}.", server_addr, bind_err);
+            if server_addr.is_ipv6() {
+                // Try IPv4 fallback
+                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+                server_addr = ipv4_addr;
+                socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+                socket.set_reuse_address(true)?;
+                socket.set_nonblocking(true)?;
+                socket.bind(&server_addr.into())?;
+                // [FIX] Ensure fallback socket is moved to listening state as well.
+                socket.listen(backlog)?;
+            } else {
+                return Err(bind_err);
+            }
+        } else {
+            // Listen on the socket when initial bind succeeded
+            socket.listen(backlog)?;
+        }
         TcpListener::from_std(socket.into())?
     };
 
@@ -213,7 +192,7 @@ pub async fn start_http_server(
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("{protocol}://{local_ip}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
-
+    let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     if opt.console_enable {
         admin::console::init_console_cfg(local_ip, server_port);
 
@@ -227,15 +206,20 @@ pub async fn start_http_server(
 
         );
 
+        println!("Console WebUI Start Time: {now_time}");
         println!("Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html");
         println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
     } else {
-        info!("   API: {}  {}", api_endpoints, localhost_endpoint);
-        println!("   API: {api_endpoints}  {localhost_endpoint}");
-        if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
+        info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
+        println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
+        println!("RustFS Start Time: {now_time}");
+        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&opt.access_key)
+            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&opt.secret_key)
+        {
             warn!(
                 "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
-                DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
+                rustfs_credentials::DEFAULT_ACCESS_KEY,
+                rustfs_credentials::DEFAULT_SECRET_KEY
             );
         }
         info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
@@ -287,6 +271,17 @@ pub async fn start_http_server(
     } else {
         Some(cors_allowed_origins)
     };
+
+    // Create compression configuration from environment variables
+    let compression_config = CompressionConfig::from_env();
+    if compression_config.enabled {
+        info!(
+            "HTTP response compression enabled: extensions={:?}, mime_patterns={:?}, min_size={} bytes",
+            compression_config.extensions, compression_config.mime_patterns, compression_config.min_size
+        );
+    } else {
+        debug!("HTTP response compression is disabled");
+    }
 
     let is_console = opt.console_enable;
     tokio::spawn(async move {
@@ -369,6 +364,20 @@ pub async fn start_http_server(
             };
 
             let socket_ref = SockRef::from(&socket);
+
+            // Enable TCP Keepalive to detect dead clients (e.g. power loss)
+            // Idle: 10s, Interval: 5s, Retries: 3
+            let ka = TcpKeepalive::new()
+                .with_time(Duration::from_secs(10))
+                .with_interval(Duration::from_secs(5));
+
+            #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
+            let ka = ka.with_retries(3);
+
+            if let Err(err) = socket_ref.set_tcp_keepalive(&ka) {
+                warn!(?err, "Failed to set TCP_KEEPALIVE");
+            }
+
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
@@ -379,15 +388,16 @@ pub async fn start_http_server(
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
 
-            process_connection(
-                socket,
-                tls_acceptor.clone(),
-                http_server.clone(),
-                s3_service.clone(),
-                graceful.clone(),
-                cors_layer.clone(),
+            let connection_ctx = ConnectionContext {
+                http_server: http_server.clone(),
+                s3_service: s3_service.clone(),
+                cors_layer: cors_layer.clone(),
+                compression_config: compression_config.clone(),
                 is_console,
-            );
+                readiness: readiness.clone(),
+            };
+
+            process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.clone());
         }
 
         worker_state_manager.update(ServiceState::Stopping);
@@ -421,11 +431,11 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         debug!("TLS path is not provided or does not exist, starting with HTTP");
         return Ok(None);
     }
-
     debug!("Found TLS directory, checking for certificates");
 
     // Make sure to use a modern encryption suite
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let mtls_verifier = rustfs_utils::build_webpki_client_verifier(tls_path)?;
 
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
     if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
@@ -436,9 +446,15 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
             let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
 
             // Configure the server to enable SNI support
-            let mut server_config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(resolver));
+            let mut server_config = if let Some(verifier) = mtls_verifier.clone() {
+                ServerConfig::builder()
+                    .with_client_cert_verifier(verifier)
+                    .with_cert_resolver(Arc::new(resolver))
+            } else {
+                ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(resolver))
+            };
 
             // Configure ALPN protocol priority
             server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
@@ -460,10 +476,17 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         let certs = rustfs_utils::load_certs(&cert_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
         let key = rustfs_utils::load_private_key(&key_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
 
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+        let mut server_config = if let Some(verifier) = mtls_verifier {
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+                .map_err(|e| rustfs_utils::certs_error(e.to_string()))?
+        } else {
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| rustfs_utils::certs_error(e.to_string()))?
+        };
 
         // Configure ALPN protocol priority
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
@@ -480,6 +503,16 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
     Ok(None)
 }
 
+#[derive(Clone)]
+struct ConnectionContext {
+    http_server: Arc<ConnBuilder<TokioExecutor>>,
+    s3_service: S3Service,
+    cors_layer: CorsLayer,
+    compression_config: CompressionConfig,
+    is_console: bool,
+    readiness: Arc<GlobalReadiness>,
+}
+
 /// Process a single incoming TCP connection.
 ///
 /// This function is executed in a new Tokio task and it will:
@@ -491,21 +524,42 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 fn process_connection(
     socket: TcpStream,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
-    http_server: Arc<ConnBuilder<TokioExecutor>>,
-    s3_service: S3Service,
+    context: ConnectionContext,
     graceful: Arc<GracefulShutdown>,
-    cors_layer: CorsLayer,
-    is_console: bool,
 ) {
     tokio::spawn(async move {
+        let ConnectionContext {
+            http_server,
+            s3_service,
+            cors_layer,
+            compression_config,
+            is_console,
+            readiness,
+        } = context;
+
         // Build services inside each connected task to avoid passing complex service types across tasks,
         // It also ensures that each connection has an independent service instance.
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
         let service = hybrid(s3_service, rpc_service);
 
+        let remote_addr = match socket.peer_addr() {
+            Ok(addr) => Some(RemoteAddr(addr)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to obtain peer address; policy evaluation may fall back to a default source IP"
+                );
+                None
+            }
+        };
+
         let hybrid_service = ServiceBuilder::new()
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
+            .layer(AddExtensionLayer::new(remote_addr))
+            // CRITICAL: Insert ReadinessGateLayer before business logic
+            // This stops requests from hitting IAMAuth or Storage if they are not ready.
+            .layer(ReadinessGateLayer::new(readiness))
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
@@ -561,8 +615,9 @@ fn process_connection(
             )
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(cors_layer)
-            // Compress responses, but exclude error responses to avoid Content-Length mismatch issues
-            .layer(CompressionLayer::new().compress_when(ShouldCompress))
+            // Compress responses based on whitelist configuration
+            // Only compresses when enabled and matches configured extensions/MIME types
+            .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
 
@@ -659,7 +714,12 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
-    let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
+    let token_str = rustfs_credentials::get_grpc_token();
+
+    let token: MetadataValue<_> = token_str.parse().map_err(|e| {
+        error!("Failed to parse RUSTFS_GRPC_AUTH_TOKEN into gRPC metadata value: {}", e);
+        Status::internal("Invalid auth token configuration")
+    })?;
 
     match req.metadata().get("authorization") {
         Some(t) if token == t => Ok(req),

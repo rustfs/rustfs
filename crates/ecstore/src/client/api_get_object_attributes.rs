@@ -21,24 +21,17 @@
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use std::collections::HashMap;
-use std::io::Cursor;
 use time::OffsetDateTime;
-use tokio::io::BufReader;
 
 use crate::client::constants::{GET_OBJECT_ATTRIBUTES_MAX_PARTS, GET_OBJECT_ATTRIBUTES_TAGS, ISO8601_DATEFORMAT};
-use rustfs_utils::EMPTY_STRING_SHA256_HASH;
-use s3s::header::{
-    X_AMZ_DELETE_MARKER, X_AMZ_MAX_PARTS, X_AMZ_METADATA_DIRECTIVE, X_AMZ_OBJECT_ATTRIBUTES, X_AMZ_PART_NUMBER_MARKER,
-    X_AMZ_REQUEST_CHARGED, X_AMZ_RESTORE, X_AMZ_VERSION_ID,
-};
-use s3s::{Body, dto::Owner};
-
 use crate::client::{
-    api_error_response::err_invalid_argument,
     api_get_object_acl::AccessControlPolicy,
-    api_get_options::GetObjectOptions,
-    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
+    transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
 };
+use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
+use rustfs_utils::EMPTY_STRING_SHA256_HASH;
+use s3s::Body;
+use s3s::header::{X_AMZ_MAX_PARTS, X_AMZ_OBJECT_ATTRIBUTES, X_AMZ_PART_NUMBER_MARKER, X_AMZ_VERSION_ID};
 
 pub struct ObjectAttributesOptions {
     pub max_parts: i64,
@@ -143,7 +136,12 @@ impl ObjectAttributes {
         self.last_modified = mod_time;
         self.version_id = h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap().to_string();
 
-        let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+        let b = resp
+            .body_mut()
+            .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
+            .await
+            .unwrap()
+            .to_vec();
         let mut response = match quick_xml::de::from_str::<ObjectAttributesResponse>(&String::from_utf8(b).unwrap()) {
             Ok(result) => result,
             Err(err) => {
@@ -224,7 +222,12 @@ impl TransitionClient {
         }
 
         if resp.status() != http::StatusCode::OK {
-            let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+            let b = resp
+                .body_mut()
+                .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
+                .await
+                .unwrap()
+                .to_vec();
             let err_body = String::from_utf8(b).unwrap();
             let mut er = match quick_xml::de::from_str::<AccessControlPolicy>(&err_body) {
                 Ok(result) => result,

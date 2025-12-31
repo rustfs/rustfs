@@ -26,7 +26,7 @@ use rustfs_madmin::{
     net::NetInfo,
 };
 use rustfs_protos::{
-    node_service_time_out_client,
+    evict_failed_connection, node_service_time_out_client,
     proto_gen::node_service::{
         DeleteBucketMetadataRequest, DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest,
         GetMemInfoRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest,
@@ -82,10 +82,25 @@ impl PeerRestClient {
 
         (remote, all)
     }
+
+    /// Evict the connection to this peer from the global cache.
+    /// This should be called when communication with this peer fails.
+    pub async fn evict_connection(&self) {
+        evict_failed_connection(&self.grid_host).await;
+    }
 }
 
 impl PeerRestClient {
     pub async fn local_storage_info(&self) -> Result<rustfs_madmin::StorageInfo> {
+        let result = self.local_storage_info_inner().await;
+        if result.is_err() {
+            // Evict stale connection on any error for cluster recovery
+            self.evict_connection().await;
+        }
+        result
+    }
+
+    async fn local_storage_info_inner(&self) -> Result<rustfs_madmin::StorageInfo> {
         let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::other(err.to_string()))?;
@@ -107,6 +122,15 @@ impl PeerRestClient {
     }
 
     pub async fn server_info(&self) -> Result<ServerProperties> {
+        let result = self.server_info_inner().await;
+        if result.is_err() {
+            // Evict stale connection on any error for cluster recovery
+            self.evict_connection().await;
+        }
+        result
+    }
+
+    async fn server_info_inner(&self) -> Result<ServerProperties> {
         let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::other(err.to_string()))?;
@@ -478,7 +502,11 @@ impl PeerRestClient {
             access_key: access_key.to_string(),
         });
 
-        let response = client.delete_user(request).await?.into_inner();
+        let result = client.delete_user(request).await;
+        if result.is_err() {
+            self.evict_connection().await;
+        }
+        let response = result?.into_inner();
         if !response.success {
             if let Some(msg) = response.error_info {
                 return Err(Error::other(msg));
@@ -496,7 +524,11 @@ impl PeerRestClient {
             access_key: access_key.to_string(),
         });
 
-        let response = client.delete_service_account(request).await?.into_inner();
+        let result = client.delete_service_account(request).await;
+        if result.is_err() {
+            self.evict_connection().await;
+        }
+        let response = result?.into_inner();
         if !response.success {
             if let Some(msg) = response.error_info {
                 return Err(Error::other(msg));
@@ -515,7 +547,11 @@ impl PeerRestClient {
             temp,
         });
 
-        let response = client.load_user(request).await?.into_inner();
+        let result = client.load_user(request).await;
+        if result.is_err() {
+            self.evict_connection().await;
+        }
+        let response = result?.into_inner();
         if !response.success {
             if let Some(msg) = response.error_info {
                 return Err(Error::other(msg));
@@ -533,7 +569,11 @@ impl PeerRestClient {
             access_key: access_key.to_string(),
         });
 
-        let response = client.load_service_account(request).await?.into_inner();
+        let result = client.load_service_account(request).await;
+        if result.is_err() {
+            self.evict_connection().await;
+        }
+        let response = result?.into_inner();
         if !response.success {
             if let Some(msg) = response.error_info {
                 return Err(Error::other(msg));
@@ -551,7 +591,11 @@ impl PeerRestClient {
             group: group.to_string(),
         });
 
-        let response = client.load_group(request).await?.into_inner();
+        let result = client.load_group(request).await;
+        if result.is_err() {
+            self.evict_connection().await;
+        }
+        let response = result?.into_inner();
         if !response.success {
             if let Some(msg) = response.error_info {
                 return Err(Error::other(msg));

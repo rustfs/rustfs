@@ -24,10 +24,10 @@ mod principal;
 pub mod resource;
 pub mod statement;
 pub(crate) mod utils;
+pub mod variables;
 
 pub use action::ActionSet;
 pub use doc::PolicyDoc;
-
 pub use effect::Effect;
 pub use function::Functions;
 pub use id::ID;
@@ -35,9 +35,6 @@ pub use policy::*;
 pub use principal::Principal;
 pub use resource::ResourceSet;
 pub use statement::Statement;
-
-pub const EMBEDDED_POLICY_TYPE: &str = "embedded-policy";
-pub const INHERITED_POLICY_TYPE: &str = "inherited-policy";
 
 #[derive(thiserror::Error, Debug)]
 #[cfg_attr(test, derive(Eq, PartialEq))]

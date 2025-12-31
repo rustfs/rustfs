@@ -14,11 +14,13 @@
 
 use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
-    auth::{check_key_valid, get_session_token},
+    auth::{check_key_valid, constant_time_eq, get_session_token},
+    server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
+use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
     sys::NewServiceAccountOpts,
@@ -76,7 +78,7 @@ impl Operation for AddUser {
         }
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
@@ -95,7 +97,7 @@ impl Operation for AddUser {
         }
 
         if let Some(sys_cred) = get_global_action_cred() {
-            if sys_cred.access_key == ak {
+            if constant_time_eq(&sys_cred.access_key, ak) {
                 return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
             }
         }
@@ -123,6 +125,7 @@ impl Operation for AddUser {
             owner,
             deny_only,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -162,7 +165,7 @@ impl Operation for SetUserStatus {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        if input_cred.access_key == ak {
+        if constant_time_eq(&input_cred.access_key, ak) {
             return Err(s3_error!(InvalidArgument, "can't change status of self"));
         }
 
@@ -175,6 +178,7 @@ impl Operation for SetUserStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -219,6 +223,7 @@ impl Operation for ListUsers {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListUsersAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -277,6 +282,7 @@ impl Operation for RemoveUser {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -376,6 +382,7 @@ impl Operation for GetUserInfo {
             owner,
             deny_only,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -425,8 +432,15 @@ impl Operation for ExportIam {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ExportIAMAction)])
-            .await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let Ok(iam_store) = rustfs_iam::get() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -632,11 +646,18 @@ impl Operation for ImportIam {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ExportIAMAction)])
-            .await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_IAM_IMPORT_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);

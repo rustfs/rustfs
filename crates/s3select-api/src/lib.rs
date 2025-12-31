@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::Display;
-
 use datafusion::{common::DataFusionError, sql::sqlparser::parser::ParserError};
 use snafu::{Backtrace, Location, Snafu};
+use std::fmt::Display;
 
 pub mod object_store;
 pub mod query;

@@ -17,9 +17,11 @@
 use super::Operation;
 use crate::admin::auth::validate_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
+use crate::server::RemoteAddr;
 use base64::Engine;
 use hyper::{HeaderMap, StatusCode};
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{get_global_encryption_service, types::*};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
@@ -126,12 +128,13 @@ impl Operation for CreateKeyHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)], // TODO: Add specific KMS action
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -204,6 +207,7 @@ impl Operation for DescribeKeyHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -259,6 +263,7 @@ impl Operation for ListKeysHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -320,12 +325,13 @@ impl Operation for GenerateDataKeyHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -385,6 +391,7 @@ impl Operation for KmsStatusHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -442,6 +449,7 @@ impl Operation for KmsConfigHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -486,6 +494,7 @@ impl Operation for KmsClearCacheHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 

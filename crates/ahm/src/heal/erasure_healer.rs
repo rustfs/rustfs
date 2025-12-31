@@ -256,84 +256,114 @@ impl ErasureSetHealer {
             }
         };
 
-        // 2. get objects to heal
-        let objects = self.storage.list_objects_for_heal(bucket, "").await?;
+        // 2. process objects with pagination to avoid loading all objects into memory
+        let mut continuation_token: Option<String> = None;
+        let mut global_obj_idx = 0usize;
 
-        // 3. continue from checkpoint
-        for (obj_idx, object) in objects.iter().enumerate().skip(*current_object_index) {
-            // check if already processed
-            if checkpoint_manager.get_checkpoint().await.processed_objects.contains(object) {
-                continue;
-            }
-
-            // update current object
-            resume_manager
-                .set_current_item(Some(bucket.to_string()), Some(object.clone()))
+        loop {
+            // Get one page of objects
+            let (objects, next_token, is_truncated) = self
+                .storage
+                .list_objects_for_heal_page(bucket, "", continuation_token.as_deref())
                 .await?;
 
-            // Check if object still exists before attempting heal
-            let object_exists = match self.storage.object_exists(bucket, object).await {
-                Ok(exists) => exists,
-                Err(e) => {
-                    warn!("Failed to check existence of {}/{}: {}, marking as failed", bucket, object, e);
-                    *failed_objects += 1;
-                    checkpoint_manager.add_failed_object(object.clone()).await?;
-                    *current_object_index = obj_idx + 1;
+            // Process objects in this page
+            for object in objects {
+                // Skip objects before the checkpoint
+                if global_obj_idx < *current_object_index {
+                    global_obj_idx += 1;
                     continue;
                 }
-            };
 
-            if !object_exists {
-                info!(
-                    target: "rustfs:ahm:heal_bucket_with_resume" ,"Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
-                    bucket, object
-                );
-                checkpoint_manager.add_processed_object(object.clone()).await?;
-                *successful_objects += 1; // Treat as successful - object is gone as intended
-                *current_object_index = obj_idx + 1;
-                continue;
-            }
-
-            // heal object
-            let heal_opts = HealOpts {
-                scan_mode: HealScanMode::Normal,
-                remove: true,
-                recreate: true, // Keep recreate enabled for legitimate heal scenarios
-                ..Default::default()
-            };
-
-            match self.storage.heal_object(bucket, object, None, &heal_opts).await {
-                Ok((_result, None)) => {
-                    *successful_objects += 1;
-                    checkpoint_manager.add_processed_object(object.clone()).await?;
-                    info!("Successfully healed object {}/{}", bucket, object);
+                // check if already processed
+                if checkpoint_manager.get_checkpoint().await.processed_objects.contains(&object) {
+                    global_obj_idx += 1;
+                    continue;
                 }
-                Ok((_, Some(err))) => {
-                    *failed_objects += 1;
-                    checkpoint_manager.add_failed_object(object.clone()).await?;
-                    warn!("Failed to heal object {}/{}: {}", bucket, object, err);
-                }
-                Err(err) => {
-                    *failed_objects += 1;
-                    checkpoint_manager.add_failed_object(object.clone()).await?;
-                    warn!("Error healing object {}/{}: {}", bucket, object, err);
-                }
-            }
 
-            *processed_objects += 1;
-            *current_object_index = obj_idx + 1;
-
-            // check cancel status
-            if self.cancel_token.is_cancelled() {
-                info!("Heal task cancelled during object processing");
-                return Err(Error::TaskCancelled);
-            }
-
-            // save checkpoint periodically
-            if obj_idx % 100 == 0 {
-                checkpoint_manager
-                    .update_position(bucket_index, *current_object_index)
+                // update current object
+                resume_manager
+                    .set_current_item(Some(bucket.to_string()), Some(object.clone()))
                     .await?;
+
+                // Check if object still exists before attempting heal
+                let object_exists = match self.storage.object_exists(bucket, &object).await {
+                    Ok(exists) => exists,
+                    Err(e) => {
+                        warn!("Failed to check existence of {}/{}: {}, marking as failed", bucket, object, e);
+                        *failed_objects += 1;
+                        checkpoint_manager.add_failed_object(object.clone()).await?;
+                        global_obj_idx += 1;
+                        *current_object_index = global_obj_idx;
+                        continue;
+                    }
+                };
+
+                if !object_exists {
+                    info!(
+                        target: "rustfs:ahm:heal_bucket_with_resume" ,"Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
+                        bucket, object
+                    );
+                    checkpoint_manager.add_processed_object(object.clone()).await?;
+                    *successful_objects += 1; // Treat as successful - object is gone as intended
+                    global_obj_idx += 1;
+                    *current_object_index = global_obj_idx;
+                    continue;
+                }
+
+                // heal object
+                let heal_opts = HealOpts {
+                    scan_mode: HealScanMode::Normal,
+                    remove: true,
+                    recreate: true, // Keep recreate enabled for legitimate heal scenarios
+                    ..Default::default()
+                };
+
+                match self.storage.heal_object(bucket, &object, None, &heal_opts).await {
+                    Ok((_result, None)) => {
+                        *successful_objects += 1;
+                        checkpoint_manager.add_processed_object(object.clone()).await?;
+                        info!("Successfully healed object {}/{}", bucket, object);
+                    }
+                    Ok((_, Some(err))) => {
+                        *failed_objects += 1;
+                        checkpoint_manager.add_failed_object(object.clone()).await?;
+                        warn!("Failed to heal object {}/{}: {}", bucket, object, err);
+                    }
+                    Err(err) => {
+                        *failed_objects += 1;
+                        checkpoint_manager.add_failed_object(object.clone()).await?;
+                        warn!("Error healing object {}/{}: {}", bucket, object, err);
+                    }
+                }
+
+                *processed_objects += 1;
+                global_obj_idx += 1;
+                *current_object_index = global_obj_idx;
+
+                // check cancel status
+                if self.cancel_token.is_cancelled() {
+                    info!("Heal task cancelled during object processing");
+                    return Err(Error::TaskCancelled);
+                }
+
+                // save checkpoint periodically
+                if global_obj_idx % 100 == 0 {
+                    checkpoint_manager
+                        .update_position(bucket_index, *current_object_index)
+                        .await?;
+                }
+            }
+
+            // Check if there are more pages
+            if !is_truncated {
+                break;
+            }
+
+            continuation_token = next_token;
+            if continuation_token.is_none() {
+                warn!("List is truncated but no continuation token provided for {}", bucket);
+                break;
             }
         }
 
@@ -399,16 +429,12 @@ impl ErasureSetHealer {
             }
         };
 
-        // 2. get objects to heal
-        let objects = storage.list_objects_for_heal(bucket, "").await?;
+        // 2. process objects with pagination to avoid loading all objects into memory
+        let mut continuation_token: Option<String> = None;
+        let mut total_scanned = 0u64;
+        let mut total_success = 0u64;
+        let mut total_failed = 0u64;
 
-        // 3. update progress
-        {
-            let mut p = progress.write().await;
-            p.objects_scanned += objects.len() as u64;
-        }
-
-        // 4. heal objects concurrently
         let heal_opts = HealOpts {
             scan_mode: HealScanMode::Normal,
             remove: true,   // remove corrupted data
@@ -416,27 +442,65 @@ impl ErasureSetHealer {
             ..Default::default()
         };
 
-        let object_results = Self::heal_objects_concurrently(storage, bucket, &objects, &heal_opts, progress).await;
+        loop {
+            // Get one page of objects
+            let (objects, next_token, is_truncated) = storage
+                .list_objects_for_heal_page(bucket, "", continuation_token.as_deref())
+                .await?;
 
-        // 5. count results
-        let (success_count, failure_count) = object_results
-            .into_iter()
-            .fold((0, 0), |(success, failure), result| match result {
-                Ok(_) => (success + 1, failure),
-                Err(_) => (success, failure + 1),
-            });
+            let page_count = objects.len() as u64;
+            total_scanned += page_count;
 
-        // 6. update progress
+            // 3. update progress
+            {
+                let mut p = progress.write().await;
+                p.objects_scanned = total_scanned;
+            }
+
+            // 4. heal objects concurrently for this page
+            let object_results = Self::heal_objects_concurrently(storage, bucket, &objects, &heal_opts, progress).await;
+
+            // 5. count results for this page
+            let (success_count, failure_count) =
+                object_results
+                    .into_iter()
+                    .fold((0, 0), |(success, failure), result| match result {
+                        Ok(_) => (success + 1, failure),
+                        Err(_) => (success, failure + 1),
+                    });
+
+            total_success += success_count;
+            total_failed += failure_count;
+
+            // 6. update progress
+            {
+                let mut p = progress.write().await;
+                p.objects_healed = total_success;
+                p.objects_failed = total_failed;
+                p.set_current_object(Some(format!("processing bucket: {bucket} (page)")));
+            }
+
+            // Check if there are more pages
+            if !is_truncated {
+                break;
+            }
+
+            continuation_token = next_token;
+            if continuation_token.is_none() {
+                warn!("List is truncated but no continuation token provided for {}", bucket);
+                break;
+            }
+        }
+
+        // 7. final progress update
         {
             let mut p = progress.write().await;
-            p.objects_healed += success_count;
-            p.objects_failed += failure_count;
             p.set_current_object(Some(format!("completed bucket: {bucket}")));
         }
 
         info!(
-            "Completed heal for bucket {}: {} success, {} failures",
-            bucket, success_count, failure_count
+            "Completed heal for bucket {}: {} success, {} failures (total scanned: {})",
+            bucket, total_success, total_failed, total_scanned
         );
 
         Ok(())

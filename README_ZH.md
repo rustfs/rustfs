@@ -11,11 +11,17 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/introduction.html">快速开始</a>
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+</p>
+
+<p align="center">
+  <a href="https://docs.rustfs.com/installation/">快速开始</a>
   · <a href="https://docs.rustfs.com/">文档</a>
   · <a href="https://github.com/rustfs/rustfs/issues">报告 Bug</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">社区讨论</a>
 </p>
+
+
 
 <p align="center">
   <a href="https://github.com/rustfs/rustfs/blob/main/README.md">English</a> | 简体中文 |
@@ -46,7 +52,7 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 | :--- | :--- | :--- | :--- |
 | **S3 核心功能** | ✅ 可用 |    **Bitrot (防数据腐烂)** | ✅ 可用 |
 | **上传 / 下载** | ✅ 可用 |     **单机模式** | ✅ 可用 |
-| **版本控制** | ✅ 可用 | **存储桶复制** | ⚠️ 部分可用 |
+| **版本控制** | ✅ 可用 | **存储桶复制** | ✅ 可用 |
 | **日志功能** | ✅ 可用 |  **生命周期管理** | 🚧 测试中 |
 | **事件通知** | ✅ 可用 |  **分布式模式** | 🚧 测试中 |
 | **K8s Helm Chart** | ✅ 可用 |  **OPA (策略引擎)** | 🚧 测试中 |
@@ -153,7 +159,7 @@ make help-docker                      # 显示所有 Docker 相关命令
 
 ### 4\. 使用 Helm Chart 安装 (选项 4) - 云原生环境
 
-请按照 [Helm Chart README](https://www.google.com/search?q=./helm/README.md) 上的说明在 Kubernetes 集群上安装 RustFS。
+请按照 [Helm Chart README](https://charts.rustfs.com) 上的说明在 Kubernetes 集群上安装 RustFS。
 
 -----
 
@@ -200,11 +206,7 @@ RustFS 是一个社区驱动的项目，我们感谢所有的贡献。请查看 
 <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="Contributors" />
 </a>
 
-## Github Trending Top
 
-🚀 RustFS 深受全球开源爱好者和企业用户的喜爱，经常荣登 GitHub Trending 榜单。
-
-<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
 
 ## Star 历史
 

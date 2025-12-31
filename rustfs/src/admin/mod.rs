@@ -22,9 +22,10 @@ pub mod utils;
 #[cfg(test)]
 mod console_test;
 
+use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use handlers::{
-    GetReplicationMetricsHandler, HealthCheckHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler,
-    bucket_meta,
+    GetReplicationMetricsHandler, HealthCheckHandler, IsAdminHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler,
+    SetRemoteTargetHandler, bucket_meta,
     event::{ListNotificationTargets, ListTargetsArns, NotificationTarget, RemoveNotificationTarget},
     group, kms, kms_dynamic, kms_keys, policies, pools,
     profile::{TriggerProfileCPU, TriggerProfileMemory},
@@ -37,20 +38,30 @@ use router::{AdminOperation, S3Router};
 use rpc::register_rpc_route;
 use s3s::route::S3Route;
 
-const ADMIN_PREFIX: &str = "/rustfs/admin";
-// const ADMIN_PREFIX: &str = "/minio/admin";
-
+/// Create admin router
+///
+/// # Arguments
+/// * `console_enabled` - Whether the console is enabled
+///
+/// # Returns
+/// An instance of S3Route for admin operations
 pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
 
     // Health check endpoint for monitoring and orchestration
-    r.insert(Method::GET, "/health", AdminOperation(&HealthCheckHandler {}))?;
-    r.insert(Method::HEAD, "/health", AdminOperation(&HealthCheckHandler {}))?;
-    r.insert(Method::GET, "/profile/cpu", AdminOperation(&TriggerProfileCPU {}))?;
-    r.insert(Method::GET, "/profile/memory", AdminOperation(&TriggerProfileMemory {}))?;
+    r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::GET, PROFILE_CPU_PATH, AdminOperation(&TriggerProfileCPU {}))?;
+    r.insert(Method::GET, PROFILE_MEMORY_PATH, AdminOperation(&TriggerProfileMemory {}))?;
 
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/is-admin").as_str(),
+        AdminOperation(&IsAdminHandler {}),
+    )?;
 
     register_rpc_route(&mut r)?;
     register_user_route(&mut r)?;
@@ -137,6 +148,11 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
 
     // Some APIs are only available in EC mode
     // if is_dist_erasure().await || is_erasure().await {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}").as_str(),
+        AdminOperation(&handlers::HealHandler {}),
+    )?;
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{prefix}").as_str(),

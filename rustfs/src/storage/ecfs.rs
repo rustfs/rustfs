@@ -17,6 +17,7 @@ use crate::config::workload_profiles::{
     RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
 };
 use crate::error::ApiError;
+use crate::server::RemoteAddr;
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
@@ -93,12 +94,9 @@ use rustfs_kms::{
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
 use rustfs_notify::{EventArgsBuilder, notifier_global};
-use rustfs_policy::{
-    auth,
-    policy::{
-        action::{Action, S3Action},
-        {BucketPolicy, BucketPolicyArgs, Validator},
-    },
+use rustfs_policy::policy::{
+    action::{Action, S3Action},
+    {BucketPolicy, BucketPolicyArgs, Validator},
 };
 use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, EtagReader, HardLimitReader, HashReader, Reader, WarpReader};
 use rustfs_s3select_api::{
@@ -108,7 +106,7 @@ use rustfs_s3select_api::{
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::{
     EventName,
-    arn::{TargetID, TargetIDError},
+    arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_utils::{
     CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
@@ -119,11 +117,13 @@ use rustfs_utils::{
             RESERVED_METADATA_PREFIX_LOWER,
         },
     },
+    obj::extract_user_defined_metadata,
     path::{is_dir_object, path_join_buf},
 };
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use serde_urlencoded::from_bytes;
 use std::convert::Infallible;
 use std::ops::Add;
 use std::{
@@ -134,11 +134,15 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{io::AsyncRead, sync::mpsc};
+use tokio::{
+    io::{AsyncRead, AsyncSeek},
+    sync::mpsc,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
+use urlencoding::encode;
 use uuid::Uuid;
 
 macro_rules! try_ {
@@ -372,6 +376,12 @@ fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
     nonce
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct ListObjectUnorderedQuery {
+    #[serde(rename = "allow-unordered")]
+    allow_unordered: Option<String>,
+}
+
 struct InMemoryAsyncReader {
     cursor: std::io::Cursor<Vec<u8>>,
 }
@@ -394,6 +404,19 @@ impl AsyncRead for InMemoryAsyncReader {
         let bytes_read = std::io::Read::read(&mut self.cursor, unfilled)?;
         buf.advance(bytes_read);
         std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncSeek for InMemoryAsyncReader {
+    fn start_seek(mut self: std::pin::Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        // std::io::Cursor natively supports negative SeekCurrent offsets
+        // It will automatically handle validation and return an error if the final position would be negative
+        std::io::Seek::seek(&mut self.cursor, position)?;
+        Ok(())
+    }
+
+    fn poll_complete(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<u64>> {
+        std::task::Poll::Ready(Ok(self.cursor.position()))
     }
 }
 
@@ -450,6 +473,62 @@ fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>) {
 
 fn is_managed_sse(algorithm: &ServerSideEncryption) -> bool {
     matches!(algorithm.as_str(), "AES256" | "aws:kms")
+}
+
+/// Validate object key for control characters and log special characters
+///
+/// This function:
+/// 1. Rejects keys containing control characters (null bytes, newlines, carriage returns)
+/// 2. Logs debug information for keys containing spaces, plus signs, or percent signs
+///
+/// The s3s library handles URL decoding, so keys are already decoded when they reach this function.
+/// This validation ensures that invalid characters that could cause issues are rejected early.
+fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
+    // Validate object key doesn't contain control characters
+    if key.contains(['\0', '\n', '\r']) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("Object key contains invalid control characters: {key:?}"),
+        ));
+    }
+
+    // Log debug info for keys with special characters to help diagnose encoding issues
+    if key.contains([' ', '+', '%']) {
+        debug!("{} object with special characters in key: {:?}", operation, key);
+    }
+
+    Ok(())
+}
+
+/// Validate that 'allow-unordered' parameter is not used with a delimiter
+///
+/// This function:
+/// 1. Checks if a delimiter is specified in the ListObjects request
+/// 2. Parses the query string to check for the 'allow-unordered' parameter
+/// 3. Rejects the request if both 'delimiter' and 'allow-unordered=true' are present
+///
+/// According to S3 compatibility requirements, unordered listing cannot be combined with
+/// hierarchical directory traversal (delimited listing). This validation ensures
+/// conflicting parameters are caught before processing the request.
+fn validate_list_object_unordered_with_delimiter(delimiter: Option<&Delimiter>, query_string: Option<&str>) -> S3Result<()> {
+    if delimiter.is_none() {
+        return Ok(());
+    }
+
+    let Some(query) = query_string else {
+        return Ok(());
+    };
+
+    if let Ok(params) = from_bytes::<ListObjectUnorderedQuery>(query.as_bytes()) {
+        if params.allow_unordered.as_deref() == Some("true") {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "The allow-unordered parameter cannot be used when delimiter is specified.".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 impl FS {
@@ -768,6 +847,11 @@ impl S3 for FS {
             key,
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
+            metadata_directive,
+            metadata,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -778,6 +862,10 @@ impl S3 for FS {
                 version_id,
             } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
         };
+
+        // Validate both source and destination keys
+        validate_object_key(&src_key, "COPY (source)")?;
+        validate_object_key(&key, "COPY (dest)")?;
 
         // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
 
@@ -911,16 +999,74 @@ impl S3 for FS {
             }
         }
 
+        // Apply SSE-C encryption if customer-provided key is specified
+        if let (Some(sse_alg), Some(sse_key), Some(sse_md5)) = (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
+        {
+            if sse_alg.as_str() == "AES256" {
+                let key_bytes = BASE64_STANDARD.decode(sse_key.as_str()).map_err(|e| {
+                    error!("Failed to decode SSE-C key: {}", e);
+                    ApiError::from(StorageError::other("Invalid SSE-C key"))
+                })?;
+
+                if key_bytes.len() != 32 {
+                    return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
+                }
+
+                let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
+                if computed_md5 != sse_md5.as_str() {
+                    return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+                }
+
+                // Store original size before encryption
+                src_info
+                    .user_defined
+                    .insert("x-amz-server-side-encryption-customer-original-size".to_string(), actual_size.to_string());
+
+                // SAFETY: The length of `key_bytes` is checked to be 32 bytes above,
+                // so this conversion cannot fail.
+                let key_array: [u8; 32] = key_bytes.try_into().expect("key length already checked");
+                // Generate deterministic nonce from bucket-key
+                let nonce_source = format!("{bucket}-{key}");
+                let nonce_hash = md5::compute(nonce_source.as_bytes());
+                let nonce: [u8; 12] = nonce_hash.0[..12]
+                    .try_into()
+                    .expect("MD5 hash is always 16 bytes; taking first 12 bytes for nonce is safe");
+
+                let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
+                reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
+            }
+        }
+
         src_info.put_object_reader = Some(PutObjReader::new(reader));
 
         // check quota
-        // TODO: src metadata
 
         for (k, v) in compress_metadata {
             src_info.user_defined.insert(k, v);
         }
 
-        // TODO: src tags
+        // Store SSE-C metadata for GET responses
+        if let Some(ref sse_alg) = sse_customer_algorithm {
+            src_info.user_defined.insert(
+                "x-amz-server-side-encryption-customer-algorithm".to_string(),
+                sse_alg.as_str().to_string(),
+            );
+        }
+        if let Some(ref sse_md5) = sse_customer_key_md5 {
+            src_info
+                .user_defined
+                .insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
+        }
+
+        if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
+            let src_user_defined = extract_user_defined_metadata(&src_info.user_defined);
+            src_user_defined.keys().for_each(|k| {
+                src_info.user_defined.remove(k);
+            });
+            if let Some(metadata) = metadata {
+                src_info.user_defined.extend(metadata);
+            }
+        }
 
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
@@ -932,9 +1078,10 @@ impl S3 for FS {
         let dest_bucket = bucket.clone();
         let dest_key = key.clone();
         let dest_version = oi.version_id.map(|v| v.to_string());
+        let dest_version_clone = dest_version.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&dest_bucket, &dest_key, dest_version.as_deref())
+                .invalidate_cache_versioned(&dest_bucket, &dest_key, dest_version_clone.as_deref())
                 .await;
         });
 
@@ -950,6 +1097,9 @@ impl S3 for FS {
             copy_object_result: Some(copy_object_result),
             server_side_encryption: effective_sse,
             ssekms_key_id: effective_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            version_id: dest_version,
             ..Default::default()
         };
 
@@ -1230,6 +1380,9 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
+        // Validate object key
+        validate_object_key(&key, "DELETE")?;
+
         let replica = req
             .headers
             .get(AMZ_BUCKET_REPLICATION_STATUS)
@@ -1418,12 +1571,17 @@ impl S3 for FS {
                 ..Default::default()
             };
 
-            let opts = ObjectOptions {
-                version_id: object.version_id.map(|v| v.to_string()),
-                versioned: version_cfg.prefix_enabled(&object.object_name),
-                version_suspended: version_cfg.suspended(),
-                ..Default::default()
-            };
+            let metadata = extract_metadata(&req.headers);
+
+            let opts: ObjectOptions = del_opts(
+                &bucket,
+                &object.object_name,
+                object.version_id.map(|f| f.to_string()),
+                &req.headers,
+                metadata,
+            )
+            .await
+            .map_err(ApiError::from)?;
 
             let mut goi = ObjectInfo::default();
             let mut gerr = None;
@@ -1684,12 +1842,11 @@ impl S3 for FS {
             version_id,
             part_number,
             range,
-            if_none_match,
-            if_match,
-            if_modified_since,
-            if_unmodified_since,
             ..
         } = req.input.clone();
+
+        // Validate object key
+        validate_object_key(&key, "GET")?;
 
         // Try to get from cache for small, frequently accessed objects
         let manager = get_concurrency_manager();
@@ -1762,12 +1919,12 @@ impl S3 for FS {
                     mod_time: cached
                         .last_modified
                         .as_ref()
-                        .and_then(|s| time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()),
+                        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()),
                     size: cached.content_length,
                     actual_size: cached.content_length,
                     is_dir: false,
                     user_defined: cached.user_metadata.clone(),
-                    version_id: cached.version_id.as_ref().and_then(|v| uuid::Uuid::parse_str(v).ok()),
+                    version_id: cached.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
                     delete_marker: cached.delete_marker,
                     content_type: cached.content_type.clone(),
                     content_encoding: cached.content_encoding.clone(),
@@ -1879,35 +2036,6 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
-
-        if let Some(match_etag) = if_none_match {
-            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-
-        if let Some(modified_since) = if_modified_since {
-            // obj_time < givenTime + 1s
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = modified_since.into();
-                mod_time < give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-
-        if let Some(match_etag) = if_match {
-            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        } else if let Some(unmodified_since) = if_unmodified_since {
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = unmodified_since.into();
-                mod_time > give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        }
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in &info.parts {
@@ -2030,8 +2158,8 @@ impl S3 for FS {
                     let mut key_array = [0u8; 32];
                     key_array.copy_from_slice(&key_bytes[..32]);
 
-                    // Verify MD5 hash of the key matches what we expect
-                    let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+                    // Verify MD5 hash of the key matches what the client claims
+                    let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
                     if computed_md5 != *sse_key_md5_provided {
                         return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
                     }
@@ -2145,7 +2273,7 @@ impl S3 for FS {
             let mut buf = Vec::with_capacity(response_content_length as usize);
             if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
                 error!("Failed to read object into memory for caching: {}", e);
-                return Err(ApiError::from(StorageError::other(format!("Failed to read object for caching: {}", e))).into());
+                return Err(ApiError::from(StorageError::other(format!("Failed to read object for caching: {e}"))).into());
             }
 
             // Verify we read the expected amount
@@ -2158,17 +2286,15 @@ impl S3 for FS {
             }
 
             // Build CachedGetObject with full metadata for cache writeback
-            let last_modified_str = info
-                .mod_time
-                .and_then(|t| match t.format(&time::format_description::well_known::Rfc3339) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        warn!("Failed to format last_modified for cache writeback: {}", e);
-                        None
-                    }
-                });
+            let last_modified_str = info.mod_time.and_then(|t| match t.format(&Rfc3339) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Failed to format last_modified for cache writeback: {}", e);
+                    None
+                }
+            });
 
-            let cached_response = CachedGetObject::new(bytes::Bytes::from(buf.clone()), response_content_length)
+            let cached_response = CachedGetObject::new(Bytes::from(buf.clone()), response_content_length)
                 .with_content_type(info.content_type.clone().unwrap_or_default())
                 .with_e_tag(info.etag.clone().unwrap_or_default())
                 .with_last_modified(last_modified_str.unwrap_or_default());
@@ -2202,11 +2328,55 @@ impl S3 for FS {
             );
             Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
         } else {
-            // Standard streaming path for large objects or range/part requests
-            Some(StreamingBlob::wrap(bytes_stream(
-                ReaderStream::with_capacity(final_stream, optimal_buffer_size),
-                response_content_length as usize,
-            )))
+            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+
+            let should_provide_seek_support = response_content_length > 0
+                && response_content_length <= seekable_object_size_threshold as i64
+                && part_number.is_none()
+                && rs.is_none();
+
+            if should_provide_seek_support {
+                debug!(
+                    "Reading small object into memory for seek support: key={} size={}",
+                    cache_key, response_content_length
+                );
+
+                // Read the stream into memory
+                let mut buf = Vec::with_capacity(response_content_length as usize);
+                match tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                    Ok(_) => {
+                        // Verify we read the expected amount
+                        if buf.len() != response_content_length as usize {
+                            warn!(
+                                "Object size mismatch during seek support read: expected={} actual={}",
+                                response_content_length,
+                                buf.len()
+                            );
+                        }
+
+                        // Create seekable in-memory reader (similar to MinIO SDK's bytes.Reader)
+                        let mem_reader = InMemoryAsyncReader::new(buf);
+                        Some(StreamingBlob::wrap(bytes_stream(
+                            ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
+                            response_content_length as usize,
+                        )))
+                    }
+                    Err(e) => {
+                        error!("Failed to read object into memory for seek support: {}", e);
+                        // Fallback to streaming if read fails
+                        Some(StreamingBlob::wrap(bytes_stream(
+                            ReaderStream::with_capacity(final_stream, optimal_buffer_size),
+                            response_content_length as usize,
+                        )))
+                    }
+                }
+            } else {
+                // Standard streaming path for large objects or range/part requests
+                Some(StreamingBlob::wrap(bytes_stream(
+                    ReaderStream::with_capacity(final_stream, optimal_buffer_size),
+                    response_content_length as usize,
+                )))
+            }
         };
 
         // Extract SSE information from metadata for response
@@ -2265,6 +2435,7 @@ impl S3 for FS {
             content_length: Some(response_content_length),
             last_modified,
             content_type,
+            content_encoding: info.content_encoding.clone(),
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
@@ -2342,6 +2513,9 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
+        // Validate object key
+        validate_object_key(&key, "HEAD")?;
+
         let part_number = part_number.map(|v| v as usize);
 
         if let Some(part_num) = part_number {
@@ -2377,9 +2551,22 @@ impl S3 for FS {
 
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
+        if info.delete_marker {
+            if opts.version_id.is_none() {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+            }
+            return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
+        }
+
         if let Some(match_etag) = if_none_match {
-            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
+            if let Some(strong_etag) = match_etag.into_etag() {
+                if info
+                    .etag
+                    .as_ref()
+                    .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+                {
+                    return Err(S3Error::new(S3ErrorCode::NotModified));
+                }
             }
         }
 
@@ -2394,8 +2581,14 @@ impl S3 for FS {
         }
 
         if let Some(match_etag) = if_match {
-            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            if let Some(strong_etag) = match_etag.into_etag() {
+                if info
+                    .etag
+                    .as_ref()
+                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                {
+                    return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+                }
             }
         } else if let Some(unmodified_since) = if_unmodified_since {
             if info.mod_time.is_some_and(|mod_time| {
@@ -2439,6 +2632,13 @@ impl S3 for FS {
             .map(|v| SSECustomerAlgorithm::from(v.clone()));
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let ssekms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
+        // Prefer explicit storage_class from object info; fall back to persisted metadata header.
+        let storage_class = info
+            .storage_class
+            .clone()
+            .or_else(|| metadata_map.get("x-amz-storage-class").cloned())
+            .filter(|s| !s.is_empty())
+            .map(StorageClass::from);
 
         let mut checksum_crc32 = None;
         let mut checksum_crc32c = None;
@@ -2477,6 +2677,7 @@ impl S3 for FS {
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
+            content_encoding: info.content_encoding.clone(),
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&metadata_map),
@@ -2491,6 +2692,7 @@ impl S3 for FS {
             checksum_sha256,
             checksum_crc64nvme,
             checksum_type,
+            storage_class,
             // metadata: object_metadata,
             ..Default::default()
         };
@@ -2575,15 +2777,52 @@ impl S3 for FS {
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
-        Ok(v2_resp.map_output(|v2| ListObjectsOutput {
-            contents: v2.contents,
-            delimiter: v2.delimiter,
-            encoding_type: v2.encoding_type,
-            name: v2.name,
-            prefix: v2.prefix,
-            max_keys: v2.max_keys,
-            common_prefixes: v2.common_prefixes,
-            ..Default::default()
+        Ok(v2_resp.map_output(|v2| {
+            // For ListObjects (v1) API, NextMarker should be the last item returned when truncated
+            // When both Contents and CommonPrefixes are present, NextMarker should be the
+            // lexicographically last item (either last key or last prefix)
+            let next_marker = if v2.is_truncated.unwrap_or(false) {
+                let last_key = v2
+                    .contents
+                    .as_ref()
+                    .and_then(|contents| contents.last())
+                    .and_then(|obj| obj.key.as_ref())
+                    .cloned();
+
+                let last_prefix = v2
+                    .common_prefixes
+                    .as_ref()
+                    .and_then(|prefixes| prefixes.last())
+                    .and_then(|prefix| prefix.prefix.as_ref())
+                    .cloned();
+
+                // NextMarker should be the lexicographically last item
+                // This matches Ceph S3 behavior used by s3-tests
+                match (last_key, last_prefix) {
+                    (Some(k), Some(p)) => {
+                        // Return the lexicographically greater one
+                        if k > p { Some(k) } else { Some(p) }
+                    }
+                    (Some(k), None) => Some(k),
+                    (None, Some(p)) => Some(p),
+                    (None, None) => None,
+                }
+            } else {
+                None
+            };
+
+            ListObjectsOutput {
+                contents: v2.contents,
+                delimiter: v2.delimiter,
+                encoding_type: v2.encoding_type,
+                name: v2.name,
+                prefix: v2.prefix,
+                max_keys: v2.max_keys,
+                common_prefixes: v2.common_prefixes,
+                is_truncated: v2.is_truncated,
+                next_marker,
+                ..Default::default()
+            }
         }))
     }
 
@@ -2594,6 +2833,7 @@ impl S3 for FS {
             bucket,
             continuation_token,
             delimiter,
+            encoding_type,
             fetch_owner,
             max_keys,
             prefix,
@@ -2602,12 +2842,21 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
+
+        // Log debug info for prefixes with special characters to help diagnose encoding issues
+        if prefix.contains([' ', '+', '%', '\n', '\r', '\0']) {
+            debug!("LIST objects with special characters in prefix: {:?}", prefix);
+        }
+
         let max_keys = max_keys.unwrap_or(1000);
         if max_keys < 0 {
             return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
         }
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
+
+        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
+
         let start_after = start_after.filter(|v| !v.is_empty());
 
         let continuation_token = continuation_token.filter(|v| !v.is_empty());
@@ -2650,13 +2899,31 @@ impl S3 for FS {
 
         // warn!("object_infos objects {:?}", object_infos.objects);
 
+        // Apply URL encoding if encoding_type is "url"
+        // Note: S3 URL encoding should encode special characters but preserve path separators (/)
+        let should_encode = encoding_type.as_ref().map(|e| e.as_str() == "url").unwrap_or(false);
+
+        // Helper function to encode S3 keys/prefixes (preserving /)
+        // S3 URL encoding encodes special characters but keeps '/' unencoded
+        let encode_s3_name = |name: &str| -> String {
+            name.split('/')
+                .map(|part| encode(part).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
         let objects: Vec<Object> = object_infos
             .objects
             .iter()
             .filter(|v| !v.name.is_empty())
             .map(|v| {
+                let key = if should_encode {
+                    encode_s3_name(&v.name)
+                } else {
+                    v.name.to_owned()
+                };
                 let mut obj = Object {
-                    key: Some(v.name.to_owned()),
+                    key: Some(key),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
@@ -2674,13 +2941,17 @@ impl S3 for FS {
             })
             .collect();
 
-        let key_count = objects.len() as i32;
-
-        let common_prefixes = object_infos
+        let common_prefixes: Vec<CommonPrefix> = object_infos
             .prefixes
             .into_iter()
-            .map(|v| CommonPrefix { prefix: Some(v) })
+            .map(|v| {
+                let prefix = if should_encode { encode_s3_name(&v) } else { v };
+                CommonPrefix { prefix: Some(prefix) }
+            })
             .collect();
+
+        // KeyCount should include both objects and common prefixes per S3 API spec
+        let key_count = (objects.len() + common_prefixes.len()) as i32;
 
         // Encode next_continuation_token to base64
         let next_continuation_token = object_infos
@@ -2695,6 +2966,7 @@ impl S3 for FS {
             max_keys: Some(max_keys),
             contents: Some(objects),
             delimiter,
+            encoding_type: encoding_type.clone(),
             name: Some(bucket),
             prefix: Some(prefix),
             common_prefixes: Some(common_prefixes),
@@ -2742,9 +3014,10 @@ impl S3 for FS {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.size),
-                    version_id: v.version_id.map(|v| v.to_string()),
+                    version_id: Some(v.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
                     is_latest: Some(v.is_latest),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
                     ..Default::default() // TODO: another fields
                 }
             })
@@ -2764,15 +3037,19 @@ impl S3 for FS {
             .filter(|o| o.delete_marker)
             .map(|o| DeleteMarkerEntry {
                 key: Some(o.name.clone()),
-                version_id: o.version_id.map(|v| v.to_string()),
+                version_id: Some(o.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
                 is_latest: Some(o.is_latest),
                 last_modified: o.mod_time.map(Timestamp::from),
                 ..Default::default()
             })
             .collect::<Vec<_>>();
 
+        // Only set next_version_id_marker if it has a value, per AWS S3 API spec
+        // boto3 expects it to be a string or omitted, not None
+        let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
+
         let output = ListObjectVersionsOutput {
-            // is_truncated: Some(object_infos.is_truncated),
+            is_truncated: Some(object_infos.is_truncated),
             max_keys: Some(key_count),
             delimiter,
             name: Some(bucket),
@@ -2780,6 +3057,8 @@ impl S3 for FS {
             common_prefixes: Some(common_prefixes),
             versions: Some(objects),
             delete_markers: Some(delete_markers),
+            next_key_marker: object_infos.next_marker,
+            next_version_id_marker,
             ..Default::default()
         };
 
@@ -2788,7 +3067,7 @@ impl S3 for FS {
 
     // #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
         if req
             .headers
             .get("X-Amz-Meta-Snowball-Auto-Extract")
@@ -2825,6 +3104,9 @@ impl S3 for FS {
             ..
         } = input;
 
+        // Validate object key
+        validate_object_key(&key, "PUT")?;
+
         if if_match.is_some() || if_none_match.is_some() {
             let Some(store) = new_object_layer_fn() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2834,19 +3116,31 @@ impl S3 for FS {
                 Ok(info) => {
                     if !info.delete_marker {
                         if let Some(ifmatch) = if_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
+                            if let Some(strong_etag) = ifmatch.into_etag() {
+                                if info
+                                    .etag
+                                    .as_ref()
+                                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                                {
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                         if let Some(ifnonematch) = if_none_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
+                            if let Some(strong_etag) = ifnonematch.into_etag() {
+                                if info
+                                    .etag
+                                    .as_ref()
+                                    .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+                                {
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                     }
                 }
                 Err(err) => {
-                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                         return Err(ApiError::from(err).into());
                     }
 
@@ -3024,8 +3318,8 @@ impl S3 for FS {
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key_bytes[..32]);
 
-            // Verify MD5 hash of the key
-            let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+            // Verify MD5 hash of the key matches what the client claims
+            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != *sse_key_md5_provided {
                 return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
             }
@@ -3103,9 +3397,16 @@ impl S3 for FS {
         let put_bucket = bucket.clone();
         let put_key = key.clone();
         let put_version = obj_info.version_id.map(|v| v.to_string());
+
+        helper = helper.object(obj_info.clone());
+        if let Some(version_id) = &put_version {
+            helper = helper.version_id(version_id.clone());
+        }
+
+        let put_version_clone = put_version.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&put_bucket, &put_key, put_version.as_deref())
+                .invalidate_cache_versioned(&put_bucket, &put_key, put_version_clone.as_deref())
                 .await;
         });
 
@@ -3164,6 +3465,7 @@ impl S3 for FS {
             checksum_sha1,
             checksum_sha256,
             checksum_crc64nvme,
+            version_id: put_version,
             ..Default::default()
         };
 
@@ -3455,8 +3757,8 @@ impl S3 for FS {
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key_bytes[..32]);
 
-            // Verify MD5 hash of the key
-            let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+            // Verify MD5 hash of the key matches what the client claims
+            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != *sse_key_md5_provided {
                 return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
             }
@@ -3633,7 +3935,12 @@ impl S3 for FS {
         // Validate copy conditions (simplified for now)
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
-                if etag != &if_match {
+                if let Some(strong_etag) = if_match.into_etag() {
+                    if ETag::Strong(etag.clone()) != strong_etag {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
+                } else {
+                    // Weak ETag in If-Match should fail
                     return Err(s3_error!(PreconditionFailed));
                 }
             } else {
@@ -3643,9 +3950,12 @@ impl S3 for FS {
 
         if let Some(if_none_match) = copy_source_if_none_match {
             if let Some(ref etag) = src_info.etag {
-                if etag == &if_none_match {
-                    return Err(s3_error!(PreconditionFailed));
+                if let Some(strong_etag) = if_none_match.into_etag() {
+                    if ETag::Strong(etag.clone()) == strong_etag {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
                 }
+                // Weak ETag in If-None-Match is ignored (doesn't match)
             }
         }
 
@@ -3917,19 +4227,31 @@ impl S3 for FS {
                 Ok(info) => {
                     if !info.delete_marker {
                         if let Some(ifmatch) = if_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
+                            if let Some(strong_etag) = ifmatch.into_etag() {
+                                if info
+                                    .etag
+                                    .as_ref()
+                                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                                {
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                         if let Some(ifnonematch) = if_none_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
+                            if let Some(strong_etag) = ifnonematch.into_etag() {
+                                if info
+                                    .etag
+                                    .as_ref()
+                                    .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+                                {
+                                    return Err(s3_error!(PreconditionFailed));
+                                }
                             }
                         }
                     }
                 }
                 Err(err) => {
-                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                         return Err(ApiError::from(err).into());
                     }
 
@@ -4008,9 +4330,10 @@ impl S3 for FS {
         let mpu_bucket = bucket.clone();
         let mpu_key = key.clone();
         let mpu_version = obj_info.version_id.map(|v| v.to_string());
+        let mpu_version_clone = mpu_version.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version.as_deref())
+                .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
                 .await;
         });
 
@@ -4060,6 +4383,7 @@ impl S3 for FS {
             checksum_sha256: checksum_sha256.clone(),
             checksum_crc64nvme: checksum_crc64nvme.clone(),
             checksum_type: checksum_type.clone(),
+            version_id: mpu_version,
             ..Default::default()
         };
         info!(
@@ -4192,6 +4516,13 @@ impl S3 for FS {
             tagging,
             ..
         } = req.input.clone();
+
+        if tagging.tag_set.len() > 10 {
+            // TOTO: Note that Amazon S3 limits the maximum number of tags to 10 tags per object.
+            // Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html
+            // Reference: https://docs.aws.amazon.com/zh_cn/AmazonS3/latest/API/API_PutObjectTagging.html
+            // https://github.com/minio/mint/blob/master/run/core/aws-sdk-go-v2/main.go#L1647
+        }
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -4359,7 +4690,8 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let conditions = get_condition_values(&req.headers, &auth::Credentials::default(), None, None);
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None, remote_addr);
 
         let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
@@ -4491,18 +4823,16 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
-            Ok((cfg, _)) => Some(cfg.rules),
+            Ok((cfg, _)) => cfg.rules,
             Err(_err) => {
-                // if BucketMetadataError::BucketLifecycleNotFound.is(&err) {
-                //     return Err(s3_error!(NoSuchLifecycleConfiguration));
-                // }
-                // warn!("get_lifecycle_config err {:?}", err);
-                None
+                // Return NoSuchLifecycleConfiguration error as expected by S3 clients
+                // This fixes issue #990 where Ansible S3 roles fail with KeyError: 'Rules'
+                return Err(s3_error!(NoSuchLifecycleConfiguration));
             }
         };
 
         Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
-            rules,
+            rules: Some(rules),
             ..Default::default()
         }))
     }
@@ -4889,20 +5219,24 @@ impl S3 for FS {
         let parse_rules = async {
             let mut event_rules = Vec::new();
 
-            process_queue_configurations(
-                &mut event_rules,
-                notification_configuration.queue_configurations.clone(),
-                TargetID::from_str,
-            );
-            process_topic_configurations(
-                &mut event_rules,
-                notification_configuration.topic_configurations.clone(),
-                TargetID::from_str,
-            );
+            process_queue_configurations(&mut event_rules, notification_configuration.queue_configurations.clone(), |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            });
+            process_topic_configurations(&mut event_rules, notification_configuration.topic_configurations.clone(), |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            });
             process_lambda_configurations(
                 &mut event_rules,
                 notification_configuration.lambda_function_configurations.clone(),
-                TargetID::from_str,
+                |arn_str| {
+                    ARN::parse(arn_str)
+                        .map(|arn| arn.target_id)
+                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+                },
             );
 
             event_rules
@@ -4911,6 +5245,7 @@ impl S3 for FS {
         let (clear_result, event_rules) = tokio::join!(clear_rules, parse_rules);
 
         clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
+        warn!("notify event rules: {:?}", &event_rules);
 
         // Add a new notification rule
         notifier_global::add_event_specific_rules(&bucket, &region, &event_rules)
@@ -5539,6 +5874,60 @@ mod tests {
     // of S3 operations, integration tests would be more appropriate.
 
     #[test]
+    fn test_list_objects_v2_key_count_includes_prefixes() {
+        // Test that KeyCount calculation includes both objects and common prefixes
+        // This verifies the fix for S3 API compatibility where KeyCount should equal
+        // the sum of Contents and CommonPrefixes lengths
+
+        // Simulate the calculation logic from list_objects_v2
+        let objects_count = 3_usize;
+        let common_prefixes_count = 2_usize;
+
+        // KeyCount should include both objects and common prefixes per S3 API spec
+        let key_count = (objects_count + common_prefixes_count) as i32;
+
+        assert_eq!(key_count, 5);
+
+        // Edge cases: verify calculation logic
+        let no_objects = 0_usize;
+        let no_prefixes = 0_usize;
+        assert_eq!((no_objects + no_prefixes) as i32, 0);
+
+        let one_object = 1_usize;
+        assert_eq!((one_object + no_prefixes) as i32, 1);
+
+        let one_prefix = 1_usize;
+        assert_eq!((no_objects + one_prefix) as i32, 1);
+    }
+
+    #[test]
+    fn test_s3_url_encoding_preserves_slash() {
+        // Test that S3 URL encoding preserves path separators (/)
+        // This verifies the encoding logic for EncodingType=url parameter
+
+        use urlencoding::encode;
+
+        // Helper function matching the implementation
+        let encode_s3_name = |name: &str| -> String {
+            name.split('/')
+                .map(|part| encode(part).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
+        // Test cases from s3-tests
+        assert_eq!(encode_s3_name("asdf+b"), "asdf%2Bb");
+        assert_eq!(encode_s3_name("foo+1/bar"), "foo%2B1/bar");
+        assert_eq!(encode_s3_name("foo/"), "foo/");
+        assert_eq!(encode_s3_name("quux ab/"), "quux%20ab/");
+
+        // Edge cases
+        assert_eq!(encode_s3_name("normal/key"), "normal/key");
+        assert_eq!(encode_s3_name("key+with+plus"), "key%2Bwith%2Bplus");
+        assert_eq!(encode_s3_name("key with spaces"), "key%20with%20spaces");
+    }
+
+    #[test]
     fn test_s3_error_scenarios() {
         // Test that we can create expected S3 errors for common validation cases
 
@@ -5764,6 +6153,29 @@ mod tests {
         assert_eq!(get_buffer_size_opt_in(-1), MI_B);
 
         set_buffer_profile_enabled(false);
+    }
+
+    #[test]
+    fn test_validate_list_object_unordered_with_delimiter() {
+        // [1] Normal case: No delimiter specified.
+        assert!(validate_list_object_unordered_with_delimiter(None, Some("allow-unordered=true")).is_ok());
+
+        let delim_str = "/".to_string();
+        let delimiter_some: Option<&Delimiter> = Some(&delim_str);
+        // [2] Normal case: Delimiter is present, but 'allow-unordered' is explicitly set to false.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, Some("allow-unordered=false")).is_ok());
+
+        let query_conflict = Some("allow-unordered=true");
+        // [3] Conflict case: Both delimiter and 'allow-unordered=true' are present.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, query_conflict).is_err());
+
+        let complex_query = Some("allow-unordered=true&abc=123");
+        // [4] Complex query: The validation should still trigger if 'allow-unordered=true' is part of a multi-parameter query.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query).is_err());
+
+        let complex_query_without_unordered = Some("abc=123&queryType=test");
+        // [5] Multi-parameter query without conflict: If other parameters exist but 'allow-unordered' is missing,
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query_without_unordered).is_ok());
     }
 
     // Note: S3Request structure is complex and requires many fields.

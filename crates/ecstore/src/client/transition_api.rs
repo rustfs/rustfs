@@ -18,6 +18,20 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use crate::client::bucket_cache::BucketLocationCache;
+use crate::client::{
+    api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
+    api_get_options::GetObjectOptions,
+    api_put_object::PutObjectOptions,
+    api_put_object_multipart::UploadPartParams,
+    api_s3_datatypes::{
+        CompleteMultipartUpload, CompletePart, ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult,
+        ListObjectPartsResult, ObjectPart,
+    },
+    constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
+    credentials::{CredContext, Credentials, SignatureType, Static},
+};
+use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
 use bytes::Bytes;
 use futures::{Future, StreamExt};
 use http::{HeaderMap, HeaderName};
@@ -30,7 +44,18 @@ use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector,
 use md5::Digest;
 use md5::Md5;
 use rand::Rng;
+use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
+use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
+use rustfs_utils::{
+    net::get_endpoint_url,
+    retry::{
+        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
+    },
+};
+use s3s::S3ErrorCode;
+use s3s::dto::ReplicationStatus;
+use s3s::{Body, dto::Owner};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::Cursor;
@@ -47,31 +72,6 @@ use tokio::io::BufReader;
 use tracing::{debug, error, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
-
-use crate::client::bucket_cache::BucketLocationCache;
-use crate::client::{
-    api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
-    api_get_options::GetObjectOptions,
-    api_put_object::PutObjectOptions,
-    api_put_object_multipart::UploadPartParams,
-    api_s3_datatypes::{
-        CompleteMultipartUpload, CompletePart, ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult,
-        ListObjectPartsResult, ObjectPart,
-    },
-    constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
-    credentials::{CredContext, Credentials, SignatureType, Static},
-};
-use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
-use rustfs_rio::HashReader;
-use rustfs_utils::{
-    net::get_endpoint_url,
-    retry::{
-        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
-    },
-};
-use s3s::S3ErrorCode;
-use s3s::dto::ReplicationStatus;
-use s3s::{Body, dto::Owner};
 
 const C_USER_AGENT: &str = "RustFS (linux; x86)";
 
@@ -132,6 +132,25 @@ pub enum BucketLookupType {
     BucketLookupPath,
 }
 
+fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
+    // Load the root certificate bundle from the path specified by the
+    // RUSTFS_TLS_PATH environment variable.
+    let tp = std::env::var("RUSTFS_TLS_PATH").ok()?;
+    let ca = std::path::Path::new(&tp).join(rustfs_config::RUSTFS_CA_CERT);
+    if !ca.exists() {
+        return None;
+    }
+
+    let der_list = rustfs_utils::load_cert_bundle_der_bytes(ca.to_str().unwrap_or_default()).ok()?;
+    let mut store = rustls::RootCertStore::empty();
+    for der in der_list {
+        if let Err(e) = store.add(der.into()) {
+            warn!("Warning: failed to add certificate from '{}' to root store: {e}", ca.display());
+        }
+    }
+    Some(store)
+}
+
 impl TransitionClient {
     pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let clnt = Self::private_new(endpoint, opts, tier_type).await?;
@@ -142,18 +161,22 @@ impl TransitionClient {
     async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        //#[cfg(feature = "ring")]
         let _ = rustls::crypto::ring::default_provider().install_default();
-        //#[cfg(feature = "aws-lc-rs")]
-        // let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
         let scheme = endpoint_url.scheme();
         let client;
-        let tls = rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth();
+        let tls = if let Some(store) = load_root_store_from_tls_path() {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(store)
+                .with_no_client_auth()
+        } else {
+            rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth()
+        };
+
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
             .https_or_http()
             .enable_http1()
+            .enable_http2()
             .build();
         client = Client::builder(TokioExecutor::new()).build(https);
 
@@ -291,7 +314,12 @@ impl TransitionClient {
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
         if resp.status() != StatusCode::OK {
             //self.dump_http(&cloned_req, &resp)?;
-            let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+            let b = resp
+                .body_mut()
+                .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
+                .await
+                .unwrap()
+                .to_vec();
             warn!("err_body: {}", String::from_utf8(b).unwrap());
         }
 
@@ -334,7 +362,12 @@ impl TransitionClient {
                 }
             }
 
-            let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+            let b = resp
+                .body_mut()
+                .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
+                .await
+                .unwrap()
+                .to_vec();
             let mut err_response = http_resp_to_error_response(&resp, b.clone(), &metadata.bucket_name, &metadata.object_name);
             err_response.message = format!("remote tier error: {}", err_response.message);
 

@@ -2,8 +2,7 @@
 
 ## Supported Versions
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+Security updates are provided for the latest released version of this project.
 
 | Version | Supported          |
 | ------- | ------------------ |
@@ -11,8 +10,10 @@ currently being supported with security updates.
 
 ## Reporting a Vulnerability
 
-Use this section to tell people how to report a vulnerability.
+Please report security vulnerabilities **privately** via GitHub Security Advisories:
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+https://github.com/rustfs/rustfs/security/advisories/new
+
+Do **not** open a public issue for security-sensitive bugs.
+
+You can expect an initial response within a reasonable timeframe. Further updates will be provided as the report is triaged.

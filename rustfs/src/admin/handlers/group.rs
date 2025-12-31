@@ -12,9 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{
+    admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
+    auth::{check_key_valid, constant_time_eq, get_session_token},
+    server::RemoteAddr,
+};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
 use rustfs_madmin::GroupAddRemove;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -26,11 +32,6 @@ use s3s::{
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tracing::warn;
-
-use crate::{
-    admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
-    auth::{check_key_valid, get_session_token},
-};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct GroupQuery {
@@ -57,6 +58,7 @@ impl Operation for ListGroups {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListGroupsAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -95,6 +97,7 @@ impl Operation for GetGroup {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::GetGroupAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -142,6 +145,7 @@ impl Operation for SetGroupStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableGroupAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -209,15 +213,16 @@ impl Operation for UpdateGroupMembers {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::AddUserToGroupAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "group configuration body too large or failed to read"));
             }
         };
 
@@ -240,7 +245,7 @@ impl Operation for UpdateGroupMembers {
 
                     get_global_action_cred()
                         .map(|cred| {
-                            if cred.access_key == *member {
+                            if constant_time_eq(&cred.access_key, member) {
                                 return Err(S3Error::with_message(
                                     S3ErrorCode::MethodNotAllowed,
                                     format!("can't add root {member}"),

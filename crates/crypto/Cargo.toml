@@ -30,7 +30,7 @@ workspace = true
 
 [dependencies]
 aes-gcm = { workspace = true, optional = true }
-argon2 = { workspace = true, features = ["std"], optional = true }
+argon2 = { workspace = true, optional = true }
 cfg-if = { workspace = true }
 chacha20poly1305 = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }

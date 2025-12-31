@@ -60,3 +60,54 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Return the secret name
+*/}}
+{{- define "rustfs.secretName" -}}
+{{- if .Values.secret.existingSecret }}
+{{- .Values.secret.existingSecret }}
+{{- else }}
+{{- printf "%s-secret" (include "rustfs.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Return image pull secret content
+*/}}
+{{- define "imagePullSecret" }}
+{{- with .Values.imageRegistryCredentials }}
+{{- printf "{\"auths\":{\"%s\":{\"username\":\"%s\",\"password\":\"%s\",\"email\":\"%s\",\"auth\":\"%s\"}}}" .registry .username .password .email (printf "%s:%s" .username .password | b64enc) | b64enc }}
+{{- end }}
+{{- end }}
+
+{{/*
+Return the default imagePullSecret name
+*/}}
+{{- define "rustfs.imagePullSecret.name" -}}
+{{- printf "%s-registry-secret" (include "rustfs.fullname" .) }}
+{{- end }}
+
+{{/*
+Render imagePullSecrets for workloads - appends registry secret
+*/}}
+{{- define "chart.imagePullSecrets" -}}
+{{- $secrets := .Values.imagePullSecrets | default list }}
+{{- if .Values.imageRegistryCredentials.enabled }}
+{{- $secrets = append $secrets (dict "name" (include "rustfs.imagePullSecret.name" .)) }}
+{{- end }}
+{{- toYaml $secrets }}
+{{- end }}
+
+{{/*
+Render RUSTFS_VOLUMES
+*/}}
+{{- define "rustfs.volumes" -}}
+{{- if eq (int .Values.replicaCount) 4 }}
+{{- printf "http://%s-{0...%d}.%s-headless:%d/data/rustfs{0...%d}" (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" . ) (.Values.service.endpoint.port | int) (sub (.Values.replicaCount | int) 1) }}
+{{- end }}
+{{- if eq (int .Values.replicaCount) 16 }}
+{{- printf "http://%s-{0...%d}.%s-headless:%d/data" (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) (.Values.service.endpoint.port | int) }}
+{{- end }}
+{{- end }}
+

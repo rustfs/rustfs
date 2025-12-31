@@ -83,7 +83,7 @@ jobs:
   # Build strategy check - determine build type based on trigger
   build-check:
     name: Build Strategy Check
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       build_type: ${{ steps.check.outputs.build_type }}
@@ -92,7 +92,7 @@ jobs:
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -167,19 +167,19 @@ jobs:
       matrix:
         include:
           # Linux builds
-          - os: ubuntu-latest
+          - os: ubicloud-standard-2
             target: x86_64-unknown-linux-musl
             cross: false
             platform: linux
-          - os: ubuntu-latest
+          - os: ubicloud-standard-2
             target: aarch64-unknown-linux-musl
             cross: true
             platform: linux
-          - os: ubuntu-latest
+          - os: ubicloud-standard-2
             target: x86_64-unknown-linux-gnu
             cross: false
             platform: linux
-          - os: ubuntu-latest
+          - os: ubicloud-standard-2
             target: aarch64-unknown-linux-gnu
             cross: true
             platform: linux
@@ -203,7 +203,7 @@ jobs:
           #  platform: windows
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -454,7 +454,7 @@ jobs:
           OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
           OSS_REGION: cn-beijing
-          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+          OSS_ENDPOINT: https://oss-accelerate.aliyuncs.com
         shell: bash
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
@@ -532,7 +532,7 @@ jobs:
     name: Build Summary
     needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Build completion summary
         shell: bash
@@ -584,7 +584,7 @@ jobs:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     permissions:
       contents: write
     outputs:
@@ -592,7 +592,7 @@ jobs:
       release_url: ${{ steps.create.outputs.release_url }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -670,13 +670,13 @@ jobs:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     permissions:
       contents: write
       actions: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v5
@@ -751,7 +751,7 @@ jobs:
     name: Update Latest Version
     needs: [ build-check, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Update latest.json
         env:
@@ -801,12 +801,12 @@ jobs:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     permissions:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Update release notes and publish
         env:

@@ -356,6 +356,8 @@ impl HTTPRangeSpec {
 pub struct HTTPPreconditions {
     pub if_match: Option<String>,
     pub if_none_match: Option<String>,
+    pub if_modified_since: Option<OffsetDateTime>,
+    pub if_unmodified_since: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -456,6 +458,76 @@ impl ObjectOptions {
             ..Default::default()
         }
     }
+
+    pub fn precondition_check(&self, obj_info: &ObjectInfo) -> Result<()> {
+        let has_valid_mod_time = obj_info.mod_time.is_some_and(|t| t != OffsetDateTime::UNIX_EPOCH);
+
+        if let Some(part_number) = self.part_number {
+            if part_number > 1 && !obj_info.parts.is_empty() {
+                let part_found = obj_info.parts.iter().any(|pi| pi.number == part_number);
+                if !part_found {
+                    return Err(Error::InvalidPartNumber(part_number));
+                }
+            }
+        }
+
+        if let Some(pre) = &self.http_preconditions {
+            if let Some(if_none_match) = &pre.if_none_match {
+                if let Some(etag) = &obj_info.etag {
+                    if is_etag_equal(etag, if_none_match) {
+                        return Err(Error::NotModified);
+                    }
+                }
+            }
+
+            if has_valid_mod_time {
+                if let Some(if_modified_since) = &pre.if_modified_since {
+                    if let Some(mod_time) = &obj_info.mod_time {
+                        if !is_modified_since(mod_time, if_modified_since) {
+                            return Err(Error::NotModified);
+                        }
+                    }
+                }
+            }
+
+            if let Some(if_match) = &pre.if_match {
+                if let Some(etag) = &obj_info.etag {
+                    if !is_etag_equal(etag, if_match) {
+                        return Err(Error::PreconditionFailed);
+                    }
+                } else {
+                    return Err(Error::PreconditionFailed);
+                }
+            }
+            if has_valid_mod_time && pre.if_match.is_none() {
+                if let Some(if_unmodified_since) = &pre.if_unmodified_since {
+                    if let Some(mod_time) = &obj_info.mod_time {
+                        if is_modified_since(mod_time, if_unmodified_since) {
+                            return Err(Error::PreconditionFailed);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn is_etag_equal(etag1: &str, etag2: &str) -> bool {
+    let e1 = etag1.trim_matches('"');
+    let e2 = etag2.trim_matches('"');
+    // Handle wildcard "*" - matches any ETag (per HTTP/1.1 RFC 7232)
+    if e2 == "*" {
+        return true;
+    }
+    e1 == e2
+}
+
+fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> bool {
+    let mod_secs = mod_time.unix_timestamp();
+    let given_secs = given_time.unix_timestamp();
+    mod_secs > given_secs
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -755,7 +827,12 @@ impl ObjectInfo {
         for entry in entries.entries() {
             if entry.is_object() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    if let Some(idx) = remaining.find(delimiter.as_str()) {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -806,7 +883,14 @@ impl ObjectInfo {
 
             if entry.is_dir() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    if let Some(idx) = {
+                        let remaining = if entry.name.starts_with(prefix) {
+                            &entry.name[prefix.len()..]
+                        } else {
+                            entry.name.as_str()
+                        };
+                        remaining.find(delimiter.as_str())
+                    } {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -842,7 +926,12 @@ impl ObjectInfo {
         for entry in entries.entries() {
             if entry.is_object() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    if let Some(idx) = remaining.find(delimiter.as_str()) {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -879,7 +968,14 @@ impl ObjectInfo {
 
             if entry.is_dir() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    if let Some(idx) = {
+                        let remaining = if entry.name.starts_with(prefix) {
+                            &entry.name[prefix.len()..]
+                        } else {
+                            entry.name.as_str()
+                        };
+                        remaining.find(delimiter.as_str())
+                    } {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {

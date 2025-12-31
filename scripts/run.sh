@@ -1,4 +1,6 @@
-#!/bin/bash -e
+#!/usr/bin/env bash
+set -e
+
 # Copyright 2024 RustFS Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +36,7 @@ mkdir -p ./target/volume/test{1..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug,iam=info"
+    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug,iam=info,notify=info"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -64,8 +66,8 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
 #export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
-export RUSTFS_OBS_ENVIRONMENT=production # Environment name
-export RUSTFS_OBS_LOGGER_LEVEL=warn # Log level, supports trace, debug, info, warn, error
+export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
+export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
 export RUSTFS_OBS_LOG_STDOUT_ENABLED=false # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
@@ -88,27 +90,83 @@ export OTEL_INSTRUMENTATION_VERSION="0.1.1"
 export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
 export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
 
-# notify
-export RUSTFS_NOTIFY_WEBHOOK_ENABLE="on" # Whether to enable webhook notification
-export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # Webhook notification address
-export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
-
-export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook notification
-export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY="http://[::]:3020/webhook" # Webhook notification address
-export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/notify"
-
-export RUSTFS_NOTIFY_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook notification
-export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MASTER="http://[::]:3020/webhook" # Webhook notification address
-export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
+## notify
+#export RUSTFS_NOTIFY_WEBHOOK_ENABLE="on" # Whether to enable webhook notification
+#export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://127.0.0.1:3020/webhook" # Webhook notification address
+#export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
+#
+#export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook notification
+#export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY="http://127.0.0.1:3020/webhook" # Webhook notification address
+#export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/notify"
+#
+#export RUSTFS_NOTIFY_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook notification
+#export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MASTER="http://127.0.0.1:3020/webhook" # Webhook notification address
+#export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
+#
+#export RUSTFS_AUDIT_WEBHOOK_ENABLE="on" # Whether to enable webhook audit
+#export RUSTFS_AUDIT_WEBHOOK_ENDPOINT="http://127.0.0.1:3020/webhook" # Webhook audit address
+#export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/audit"
+#
+#export RUSTFS_AUDIT_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook audit
+#export RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY="http://127.0.0.1:3020/webhook" # Webhook audit address
+#export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/audit"
+#
+#export RUSTFS_AUDIT_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook audit
+#export RUSTFS_AUDIT_WEBHOOK_ENDPOINT_MASTER="http://127.0.0.1:3020/webhook" # Webhook audit address
+#export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/audit"
 
 # export RUSTFS_POLICY_PLUGIN_URL="http://localhost:8181/v1/data/rustfs/authz/allow"  # The URL of the OPA system
 # export RUSTFS_POLICY_PLUGIN_AUTH_TOKEN="your-opa-token"  # The authentication token for the OPA system is optional
 
 
 export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
-# exportRUSTFS_SKIP_BACKGROUND_TASK=true
+# export RUSTFS_SKIP_BACKGROUND_TASK=true
 
-# export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
+# Storage level compression (compression at object storage level)
+# export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable storage-level compression for objects
+
+# HTTP Response Compression (whitelist-based, aligned with MinIO)
+# By default, HTTP response compression is DISABLED (aligned with MinIO behavior)
+# When enabled, only explicitly configured file types will be compressed
+# This preserves Content-Length headers for better browser download experience
+
+# Enable HTTP response compression
+# export RUSTFS_COMPRESS_ENABLE=on
+
+# Example 1: Compress text files and logs
+# Suitable for log files, text documents, CSV files
+# export RUSTFS_COMPRESS_ENABLE=on
+# export RUSTFS_COMPRESS_EXTENSIONS=.txt,.log,.csv
+# export RUSTFS_COMPRESS_MIME_TYPES=text/*
+# export RUSTFS_COMPRESS_MIN_SIZE=1000
+
+# Example 2: Compress JSON and XML API responses
+# Suitable for API services that return JSON/XML data
+# export RUSTFS_COMPRESS_ENABLE=on
+# export RUSTFS_COMPRESS_EXTENSIONS=.json,.xml
+# export RUSTFS_COMPRESS_MIME_TYPES=application/json,application/xml
+# export RUSTFS_COMPRESS_MIN_SIZE=1000
+
+# Example 3: Comprehensive web content compression
+# Suitable for web applications (HTML, CSS, JavaScript, JSON)
+# export RUSTFS_COMPRESS_ENABLE=on
+# export RUSTFS_COMPRESS_EXTENSIONS=.html,.css,.js,.json,.xml,.txt,.svg
+# export RUSTFS_COMPRESS_MIME_TYPES=text/*,application/json,application/xml,application/javascript,image/svg+xml
+# export RUSTFS_COMPRESS_MIN_SIZE=1000
+
+# Example 4: Compress only large text files (minimum 10KB)
+# Useful when you want to avoid compression overhead for small files
+# export RUSTFS_COMPRESS_ENABLE=on
+# export RUSTFS_COMPRESS_EXTENSIONS=.txt,.log
+# export RUSTFS_COMPRESS_MIME_TYPES=text/*
+# export RUSTFS_COMPRESS_MIN_SIZE=10240
+
+# Notes:
+# - Only files matching EITHER extensions OR MIME types will be compressed (whitelist approach)
+# - Error responses (4xx, 5xx) are never compressed to avoid Content-Length issues
+# - Already encoded content (gzip, br, deflate, zstd) is automatically skipped
+# - Minimum size threshold prevents compression of small files where overhead > benefit
+# - Wildcard patterns supported in MIME types (e.g., text/* matches text/plain, text/html, etc.)
 
 #export RUSTFS_REGION="us-east-1"
 
@@ -121,6 +179,12 @@ export RUSTFS_OBJECT_CACHE_ENABLE=true
 
 # Profiling configuration
 export RUSTFS_ENABLE_PROFILING=false
+
+# Heal configuration queue size
+export RUSTFS_HEAL_QUEUE_SIZE=10000
+
+# rustfs trust system CA certificates
+export RUSTFS_TRUST_SYSTEM_CA=true
 
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
@@ -151,4 +215,3 @@ fi
 #cargo run --profile release --bin rustfs
 # To run in debug mode, use the following line
 cargo run --bin rustfs
-

@@ -24,19 +24,18 @@ use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
 use crate::utils::extract_claims;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;
 use rustfs_policy::arn::ARN;
-use rustfs_policy::auth::Credentials;
 use rustfs_policy::auth::{
     ACCOUNT_ON, UserIdentity, contains_reserved_chars, create_new_credentials_with_metadata, generate_credentials,
     is_access_key_valid, is_secret_key_valid,
 };
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
-use rustfs_policy::policy::{EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, iam_policy_claim_name_sa};
+use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa};
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -67,6 +66,13 @@ pub struct IamSys<T> {
 }
 
 impl<T: Store> IamSys<T> {
+    /// Create a new IamSys instance with the given IamCache store
+    ///
+    /// # Arguments
+    /// * `store` - An Arc to the IamCache instance
+    ///
+    /// # Returns
+    /// A new instance of IamSys
     pub fn new(store: Arc<IamCache<T>>) -> Self {
         tokio::spawn(async move {
             match opa::lookup_config().await {
@@ -87,6 +93,11 @@ impl<T: Store> IamSys<T> {
             roles_map: HashMap::new(),
         }
     }
+
+    /// Check if the IamSys has a watcher configured
+    ///
+    /// # Returns
+    /// `true` if a watcher is configured, `false` otherwise
     pub fn has_watcher(&self) -> bool {
         self.store.api.has_watcher()
     }
@@ -240,14 +251,19 @@ impl<T: Store> IamSys<T> {
             return;
         }
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            let resp = notification_sys.load_user(name, is_temp).await;
-            for r in resp {
-                if let Some(err) = r.err {
-                    warn!("notify load_user failed: {}", err);
+        // Fire-and-forget notification to peers - don't block auth operations
+        // This is critical for cluster recovery: login should not wait for dead peers
+        let name = name.to_string();
+        tokio::spawn(async move {
+            if let Some(notification_sys) = get_global_notification_sys() {
+                let resp = notification_sys.load_user(&name, is_temp).await;
+                for r in resp {
+                    if let Some(err) = r.err {
+                        warn!("notify load_user failed (non-blocking): {}", err);
+                    }
                 }
             }
-        }
+        });
     }
 
     async fn notify_for_service_account(&self, name: &str) {
@@ -255,14 +271,18 @@ impl<T: Store> IamSys<T> {
             return;
         }
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            let resp = notification_sys.load_service_account(name).await;
-            for r in resp {
-                if let Some(err) = r.err {
-                    warn!("notify load_service_account failed: {}", err);
+        // Fire-and-forget notification to peers - don't block service account operations
+        let name = name.to_string();
+        tokio::spawn(async move {
+            if let Some(notification_sys) = get_global_notification_sys() {
+                let resp = notification_sys.load_service_account(&name).await;
+                for r in resp {
+                    if let Some(err) = r.err {
+                        warn!("notify load_service_account failed (non-blocking): {}", err);
+                    }
                 }
             }
-        }
+        });
     }
 
     pub async fn current_policies(&self, name: &str) -> String {
@@ -571,14 +591,18 @@ impl<T: Store> IamSys<T> {
             return;
         }
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            let resp = notification_sys.load_group(group).await;
-            for r in resp {
-                if let Some(err) = r.err {
-                    warn!("notify load_group failed: {}", err);
+        // Fire-and-forget notification to peers - don't block group operations
+        let group = group.to_string();
+        tokio::spawn(async move {
+            if let Some(notification_sys) = get_global_notification_sys() {
+                let resp = notification_sys.load_group(&group).await;
+                for r in resp {
+                    if let Some(err) = r.err {
+                        warn!("notify load_group failed (non-blocking): {}", err);
+                    }
                 }
             }
-        }
+        });
     }
 
     pub async fn create_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
@@ -611,6 +635,19 @@ impl<T: Store> IamSys<T> {
         }
 
         self.store.update_user_secret_key(access_key, secret_key).await
+    }
+
+    /// Add SSH public key for a user (for SFTP authentication)
+    pub async fn add_user_ssh_public_key(&self, access_key: &str, public_key: &str) -> Result<()> {
+        if !is_access_key_valid(access_key) {
+            return Err(IamError::InvalidAccessKeyLength);
+        }
+
+        if public_key.is_empty() {
+            return Err(IamError::InvalidArgument);
+        }
+
+        self.store.add_user_ssh_public_key(access_key, public_key).await
     }
 
     pub async fn check_key(&self, access_key: &str) -> Result<(Option<UserIdentity>, bool)> {
@@ -742,10 +779,10 @@ impl<T: Store> IamSys<T> {
 
         let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
         if has_session_policy {
-            return is_allowed_sp && (is_owner || combined_policy.is_allowed(args));
+            return is_allowed_sp && (is_owner || combined_policy.is_allowed(args).await);
         }
 
-        is_owner || combined_policy.is_allowed(args)
+        is_owner || combined_policy.is_allowed(args).await
     }
 
     pub async fn is_allowed_service_account(&self, args: &Args<'_>, parent_user: &str) -> bool {
@@ -801,15 +838,15 @@ impl<T: Store> IamSys<T> {
         };
 
         if sa_str == INHERITED_POLICY_TYPE {
-            return is_owner || combined_policy.is_allowed(&parent_args);
+            return is_owner || combined_policy.is_allowed(&parent_args).await;
         }
 
         let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy_for_service_account(args);
         if has_session_policy {
-            return is_allowed_sp && (is_owner || combined_policy.is_allowed(&parent_args));
+            return is_allowed_sp && (is_owner || combined_policy.is_allowed(&parent_args).await);
         }
 
-        is_owner || combined_policy.is_allowed(&parent_args)
+        is_owner || combined_policy.is_allowed(&parent_args).await
     }
 
     pub async fn get_combined_policy(&self, policies: &[String]) -> Policy {
@@ -844,7 +881,12 @@ impl<T: Store> IamSys<T> {
             return false;
         }
 
-        self.get_combined_policy(&policies).await.is_allowed(args)
+        self.get_combined_policy(&policies).await.is_allowed(args).await
+    }
+
+    /// Check if the underlying store is ready
+    pub fn is_ready(&self) -> bool {
+        self.store.is_ready()
     }
 }
 
@@ -870,7 +912,7 @@ fn is_allowed_by_session_policy(args: &Args<'_>) -> (bool, bool) {
     let mut session_policy_args = args.clone();
     session_policy_args.is_owner = false;
 
-    (has_session_policy, sub_policy.is_allowed(&session_policy_args))
+    (has_session_policy, pollster::block_on(sub_policy.is_allowed(&session_policy_args)))
 }
 
 fn is_allowed_by_session_policy_for_service_account(args: &Args<'_>) -> (bool, bool) {
@@ -896,7 +938,7 @@ fn is_allowed_by_session_policy_for_service_account(args: &Args<'_>) -> (bool, b
     let mut session_policy_args = args.clone();
     session_policy_args.is_owner = false;
 
-    (has_session_policy, sub_policy.is_allowed(&session_policy_args))
+    (has_session_policy, pollster::block_on(sub_policy.is_allowed(&session_policy_args)))
 }
 
 #[derive(Debug, Clone, Default)]

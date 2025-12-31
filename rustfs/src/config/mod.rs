@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use clap::Parser;
+use clap::builder::NonEmptyStringValueParser;
 use const_str::concat;
 use std::string::ToString;
 shadow_rs::shadow!(build);
@@ -50,7 +51,12 @@ const LONG_VERSION: &str = concat!(
 #[command(version = SHORT_VERSION, long_version = LONG_VERSION)]
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
-    #[arg(required = true, env = "RUSTFS_VOLUMES")]
+    #[arg(
+        required = true,
+        env = "RUSTFS_VOLUMES",
+        value_delimiter = ' ',
+        value_parser = NonEmptyStringValueParser::new()
+    )]
     pub volumes: Vec<String>,
 
     /// bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname
@@ -58,15 +64,20 @@ pub struct Opt {
     pub address: String,
 
     /// Domain name used for virtual-hosted-style requests.
-    #[arg(long, env = "RUSTFS_SERVER_DOMAINS")]
+    #[arg(
+        long,
+        env = "RUSTFS_SERVER_DOMAINS",
+        value_delimiter = ',',
+        value_parser = NonEmptyStringValueParser::new()
+    )]
     pub server_domains: Vec<String>,
 
     /// Access key used for authentication.
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
+    #[arg(long, default_value_t = rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
     pub access_key: String,
 
     /// Secret key used for authentication.
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
+    #[arg(long, default_value_t = rustfs_credentials::DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
     pub secret_key: String,
 
     /// Enable console server
@@ -124,6 +135,47 @@ pub struct Opt {
     /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
     #[arg(long, default_value_t = String::from("GeneralPurpose"), env = "RUSTFS_BUFFER_PROFILE")]
     pub buffer_profile: String,
+
+    /// Enable FTPS server
+    #[arg(long, default_value_t = false, env = "RUSTFS_FTPS_ENABLE")]
+    pub ftps_enable: bool,
+
+    /// FTPS server bind address
+    #[arg(long, default_value_t = String::from("0.0.0.0:21"), env = "RUSTFS_FTPS_ADDRESS")]
+    pub ftps_address: String,
+
+    /// FTPS server certificate file path
+    #[arg(long, env = "RUSTFS_FTPS_CERTS_FILE")]
+    pub ftps_certs_file: Option<String>,
+
+    /// FTPS server private key file path
+    #[arg(long, env = "RUSTFS_FTPS_KEY_FILE")]
+    pub ftps_key_file: Option<String>,
+
+    /// FTPS server passive ports range (e.g., "40000-50000")
+    #[arg(long, env = "RUSTFS_FTPS_PASSIVE_PORTS")]
+    pub ftps_passive_ports: Option<String>,
+
+    /// FTPS server external IP address for passive mode (auto-detected if not specified)
+    #[arg(long, env = "RUSTFS_FTPS_EXTERNAL_IP")]
+    pub ftps_external_ip: Option<String>,
+
+    /// Enable SFTP server
+    #[arg(long, default_value_t = false, env = "RUSTFS_SFTP_ENABLE")]
+    pub sftp_enable: bool,
+
+    /// SFTP server bind address
+    #[arg(long, default_value_t = String::from("0.0.0.0:22"), env = "RUSTFS_SFTP_ADDRESS")]
+    pub sftp_address: String,
+
+    /// SFTP server host key file path
+    #[arg(long, env = "RUSTFS_SFTP_HOST_KEY")]
+    pub sftp_host_key: Option<String>,
+
+    /// Path to authorized SSH public keys file for SFTP authentication
+    /// Each line should contain an OpenSSH public key: ssh-rsa AAAA... comment
+    #[arg(long, env = "RUSTFS_SFTP_AUTHORIZED_KEYS")]
+    pub sftp_authorized_keys: Option<String>,
 }
 
 // lazy_static::lazy_static! {

@@ -22,7 +22,7 @@ pub struct PolicySys {}
 impl PolicySys {
     pub async fn is_allowed(args: &BucketPolicyArgs<'_>) -> bool {
         match Self::get(args.bucket).await {
-            Ok(cfg) => return cfg.is_allowed(args),
+            Ok(cfg) => return cfg.is_allowed(args).await,
             Err(err) => {
                 if err != StorageError::ConfigNotFound {
                     info!("config get err {:?}", err);
