@@ -476,7 +476,7 @@ impl FileMeta {
                     // For non-versioned buckets, treat None as Uuid::nil()
                     let fi_vid = fi.version_id.or(Some(Uuid::nil()));
                     let ver_vid = version.header.version_id.or(Some(Uuid::nil()));
-                    
+
                     if ver_vid == fi_vid {
                         let mut ver = FileMetaVersion::try_from(version.meta.as_slice())?;
 
@@ -485,8 +485,7 @@ impl FileMeta {
                                 // Split metadata into meta_user and meta_sys based on prefix
                                 // This logic must match From<FileInfo> for MetaObject
                                 if k.len() > RESERVED_METADATA_PREFIX.len()
-                                    && (k.starts_with(RESERVED_METADATA_PREFIX)
-                                        || k.starts_with(RESERVED_METADATA_PREFIX_LOWER))
+                                    && (k.starts_with(RESERVED_METADATA_PREFIX) || k.starts_with(RESERVED_METADATA_PREFIX_LOWER))
                                 {
                                     // Skip internal flags that shouldn't be persisted
                                     if k == headers::X_RUSTFS_HEALING || k == headers::X_RUSTFS_DATA_MOV {
