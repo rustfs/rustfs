@@ -115,6 +115,8 @@ md5.workspace = true
 mime_guess = { workspace = true }
 moka = { workspace = true }
 pin-project-lite.workspace = true
+# rand = "0.8" is pinned due to dependency conflicts with workspace version
+rand = "0.8"
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
@@ -128,6 +130,12 @@ zip = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
+
+# FTP and SFTP Libraries
+libunftp = { workspace = true }
+russh = { workspace = true }
+russh-sftp = { workspace = true }
+ssh-key = { workspace = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 sysctl = { workspace = true }

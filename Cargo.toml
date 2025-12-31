@@ -266,6 +266,17 @@ opentelemetry_sdk = { version = "0.31.0" }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.31.0" }
 
+# FTP and SFTP
+libunftp = "0.21.0"
+russh = "0.55.0"
+russh-sftp = "2.1.1"
+russh-keys = "0.49.2"
+ssh-key = "0.7.0-rc.4"
+ssh2 = "0.9"
+suppaftp = { version = "7.0.7", features = ["async-std", "rustls", "native-tls"] }
+rcgen = "0.14.6"
+native-tls = "0.2.14"
+
 # Performance Analysis and Memory Profiling
 mimalloc = "0.1"
 # Use tikv-jemallocator as memory allocator and enable performance analysis
