@@ -26,6 +26,7 @@ workspace = true
 [dependencies]
 rustfs-ecstore.workspace = true
 rustfs-common.workspace = true
+rustfs-iam.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 rustfs-lock.workspace = true
@@ -51,3 +52,10 @@ base64 = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 md5 = { workspace = true }
+ssh2.workspace = true
+suppaftp.workspace = true
+rcgen.workspace = true
+anyhow.workspace = true
+native-tls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true

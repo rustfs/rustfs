@@ -1258,6 +1258,28 @@ where
         self.update_user_with_claims(access_key, u)
     }
 
+    /// Add SSH public key for a user (for SFTP authentication)
+    pub async fn add_user_ssh_public_key(&self, access_key: &str, public_key: &str) -> Result<()> {
+        if access_key.is_empty() || public_key.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let users = self.cache.users.load();
+        let u = match users.get(access_key) {
+            Some(u) => u,
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
+        };
+
+        let mut user_identity = u.clone();
+        user_identity.add_ssh_public_key(public_key);
+
+        self.api
+            .save_user_identity(access_key, UserType::Reg, user_identity.clone(), None)
+            .await?;
+
+        self.update_user_with_claims(access_key, user_identity)
+    }
+
     pub async fn set_user_status(&self, access_key: &str, status: AccountStatus) -> Result<OffsetDateTime> {
         if access_key.is_empty() {
             return Err(Error::InvalidArgument);

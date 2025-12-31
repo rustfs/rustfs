@@ -12,34 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod reliant;
+use rustfs_policy::auth::UserIdentity;
+use std::sync::Arc;
 
-// Common utilities for all E2E tests
-#[cfg(test)]
-pub mod common;
+/// Protocol principal representing an authenticated user
+#[derive(Debug, Clone)]
+pub struct ProtocolPrincipal {
+    /// User identity from IAM system
+    pub user_identity: Arc<UserIdentity>,
+}
 
-#[cfg(test)]
-mod version_id_regression_test;
+impl ProtocolPrincipal {
+    /// Create a new protocol principal
+    pub fn new(user_identity: Arc<UserIdentity>) -> Self {
+        Self { user_identity }
+    }
 
-// Data usage regression tests
-#[cfg(test)]
-mod data_usage_test;
-
-// KMS-specific test modules
-#[cfg(test)]
-mod kms;
-
-// Special characters in path test modules
-#[cfg(test)]
-mod special_chars_test;
-
-// Content-Encoding header preservation test
-#[cfg(test)]
-mod content_encoding_test;
-
-// Policy variables tests
-#[cfg(test)]
-mod policy;
-
-#[cfg(test)]
-mod protocols;
+    /// Get the access key for this principal
+    pub fn access_key(&self) -> &str {
+        &self.user_identity.credentials.access_key
+    }
+}

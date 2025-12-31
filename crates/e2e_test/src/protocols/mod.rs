@@ -12,34 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod reliant;
+//! Protocol tests for FTPS and SFTP
 
-// Common utilities for all E2E tests
-#[cfg(test)]
-pub mod common;
-
-#[cfg(test)]
-mod version_id_regression_test;
-
-// Data usage regression tests
-#[cfg(test)]
-mod data_usage_test;
-
-// KMS-specific test modules
-#[cfg(test)]
-mod kms;
-
-// Special characters in path test modules
-#[cfg(test)]
-mod special_chars_test;
-
-// Content-Encoding header preservation test
-#[cfg(test)]
-mod content_encoding_test;
-
-// Policy variables tests
-#[cfg(test)]
-mod policy;
-
-#[cfg(test)]
-mod protocols;
+pub mod ftps_core;
+pub mod test_env;
+pub mod test_runner;

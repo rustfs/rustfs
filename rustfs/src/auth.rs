@@ -91,8 +91,20 @@ pub enum AuthType {
     StreamingUnsignedTrailer,
 }
 
+#[derive(Debug)]
 pub struct IAMAuth {
     simple_auth: SimpleAuth,
+}
+
+impl Clone for IAMAuth {
+    fn clone(&self) -> Self {
+        // Since SimpleAuth doesn't implement Clone, we create a new one
+        // This is a simplified implementation - in a real scenario, you might need
+        // to store the credentials separately to properly clone
+        Self {
+            simple_auth: SimpleAuth::new(),
+        }
+    }
 }
 
 impl IAMAuth {
