@@ -161,6 +161,134 @@ static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
     id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
 });
 
+/// Metadata key for storing object ACL
+const AMZ_OBJECT_ACL: &str = "x-amz-acl";
+
+/// Serializable ACL grant for storage
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredGrant {
+    permission: String,
+    grantee_type: String,
+    grantee_id: Option<String>,
+    grantee_display_name: Option<String>,
+    grantee_uri: Option<String>,
+    grantee_email: Option<String>,
+}
+
+/// Serializable ACL for storage
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredAcl {
+    owner_id: String,
+    owner_display_name: String,
+    grants: Vec<StoredGrant>,
+}
+
+impl StoredAcl {
+    /// Create default ACL with owner having FULL_CONTROL
+    fn default_acl() -> Self {
+        StoredAcl {
+            owner_id: RUSTFS_OWNER.id.clone().unwrap_or_default(),
+            owner_display_name: RUSTFS_OWNER.display_name.clone().unwrap_or_default(),
+            grants: vec![StoredGrant {
+                permission: Permission::FULL_CONTROL.to_string(),
+                grantee_type: Type::CANONICAL_USER.to_string(),
+                grantee_id: RUSTFS_OWNER.id.clone(),
+                grantee_display_name: RUSTFS_OWNER.display_name.clone(),
+                grantee_uri: None,
+                grantee_email: None,
+            }],
+        }
+    }
+
+    /// Create ACL from canned ACL string
+    /// Note: Group grants are placed before owner grant to match AWS S3 behavior
+    fn from_canned_acl(canned_acl: &str) -> Self {
+        let owner_grant = StoredGrant {
+            permission: Permission::FULL_CONTROL.to_string(),
+            grantee_type: Type::CANONICAL_USER.to_string(),
+            grantee_id: RUSTFS_OWNER.id.clone(),
+            grantee_display_name: RUSTFS_OWNER.display_name.clone(),
+            grantee_uri: None,
+            grantee_email: None,
+        };
+
+        let mut grants = vec![];
+
+        match canned_acl {
+            "public-read" => {
+                // Group grant first, then owner grant (matches AWS S3 behavior)
+                grants.push(StoredGrant {
+                    permission: Permission::READ.to_string(),
+                    grantee_type: Type::GROUP.to_string(),
+                    grantee_id: None,
+                    grantee_display_name: None,
+                    grantee_uri: Some("http://acs.amazonaws.com/groups/global/AllUsers".to_string()),
+                    grantee_email: None,
+                });
+                grants.push(owner_grant);
+            }
+            "public-read-write" => {
+                grants.push(StoredGrant {
+                    permission: Permission::READ.to_string(),
+                    grantee_type: Type::GROUP.to_string(),
+                    grantee_id: None,
+                    grantee_display_name: None,
+                    grantee_uri: Some("http://acs.amazonaws.com/groups/global/AllUsers".to_string()),
+                    grantee_email: None,
+                });
+                grants.push(StoredGrant {
+                    permission: Permission::WRITE.to_string(),
+                    grantee_type: Type::GROUP.to_string(),
+                    grantee_id: None,
+                    grantee_display_name: None,
+                    grantee_uri: Some("http://acs.amazonaws.com/groups/global/AllUsers".to_string()),
+                    grantee_email: None,
+                });
+                grants.push(owner_grant);
+            }
+            "authenticated-read" => {
+                grants.push(StoredGrant {
+                    permission: Permission::READ.to_string(),
+                    grantee_type: Type::GROUP.to_string(),
+                    grantee_id: None,
+                    grantee_display_name: None,
+                    grantee_uri: Some("http://acs.amazonaws.com/groups/global/AuthenticatedUsers".to_string()),
+                    grantee_email: None,
+                });
+                grants.push(owner_grant);
+            }
+            _ => {
+                // private or unknown - just owner with FULL_CONTROL
+                // private or unknown - just owner with FULL_CONTROL
+                grants.push(owner_grant);
+            }
+        }
+
+        StoredAcl {
+            owner_id: RUSTFS_OWNER.id.clone().unwrap_or_default(),
+            owner_display_name: RUSTFS_OWNER.display_name.clone().unwrap_or_default(),
+            grants,
+        }
+    }
+
+    /// Convert to S3 grants
+    fn to_grants(&self) -> Vec<Grant> {
+        self.grants
+            .iter()
+            .map(|g| Grant {
+                permission: Some(Permission::from(g.permission.clone())),
+                grantee: Some(Grantee {
+                    type_: Type::from(g.grantee_type.clone()),
+                    id: g.grantee_id.clone(),
+                    display_name: g.grantee_display_name.clone(),
+                    uri: g.grantee_uri.clone(),
+                    email_address: g.grantee_email.clone(),
+                }),
+            })
+            .collect()
+    }
+}
+
 /// Calculate adaptive buffer size with workload profile support.
 ///
 /// This enhanced version supports different workload profiles for optimal performance
@@ -2450,6 +2578,7 @@ impl S3 for FS {
             checksum_sha256,
             checksum_crc64nvme,
             checksum_type,
+            version_id: info.version_id.map(|v| v.to_string()),
             ..Default::default()
         };
 
@@ -2904,7 +3033,6 @@ impl S3 for FS {
         let should_encode = encoding_type.as_ref().map(|e| e.as_str() == "url").unwrap_or(false);
 
         // Helper function to encode S3 keys/prefixes (preserving /)
-        // S3 URL encoding encodes special characters but keeps '/' unencoded
         let encode_s3_name = |name: &str| -> String {
             name.split('/')
                 .map(|part| encode(part).to_string())
@@ -5279,9 +5407,9 @@ impl S3 for FS {
         let grants = vec![Grant {
             grantee: Some(Grantee {
                 type_: Type::from_static(Type::CANONICAL_USER),
-                display_name: None,
+                display_name: RUSTFS_OWNER.display_name.clone(),
                 email_address: None,
-                id: None,
+                id: RUSTFS_OWNER.id.clone(),
                 uri: None,
             }),
             permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
@@ -5337,26 +5465,40 @@ impl S3 for FS {
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
-        let GetObjectAclInput { bucket, key, .. } = req.input;
+        let GetObjectAclInput {
+            bucket, key, version_id, ..
+        } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
-        }
+        let opts = ObjectOptions {
+            version_id: version_id.clone(),
+            ..Default::default()
+        };
 
-        let grants = vec![Grant {
-            grantee: Some(Grantee {
-                type_: Type::from_static(Type::CANONICAL_USER),
-                display_name: None,
-                email_address: None,
-                id: None,
-                uri: None,
-            }),
-            permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
-        }];
+        let obj_info = match store.get_object_info(&bucket, &key, &opts).await {
+            Ok(info) => info,
+            Err(e) => {
+                if rustfs_ecstore::error::is_err_object_not_found(&e) {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::NoSuchKey,
+                        "The specified key does not exist.".to_string(),
+                    ));
+                }
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
+            }
+        };
+
+        // Try to read stored ACL from object metadata
+        let stored_acl = obj_info
+            .user_defined
+            .get(AMZ_OBJECT_ACL)
+            .and_then(|acl_json| serde_json::from_str::<StoredAcl>(acl_json).ok())
+            .unwrap_or_else(StoredAcl::default_acl);
+
+        let grants = stored_acl.to_grants();
 
         Ok(S3Response::new(GetObjectAclOutput {
             grants: Some(grants),
@@ -5409,6 +5551,7 @@ impl S3 for FS {
             key,
             acl,
             access_control_policy,
+            version_id,
             ..
         } = req.input;
 
@@ -5416,31 +5559,76 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+        let opts = ObjectOptions {
+            version_id: version_id.clone(),
+            ..Default::default()
+        };
+
+        // Verify object exists
+        if let Err(e) = store.get_object_info(&bucket, &key, &opts).await {
+            if rustfs_ecstore::error::is_err_object_not_found(&e) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::NoSuchKey,
+                    "The specified key does not exist.".to_string(),
+                ));
+            }
             return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
         }
 
-        if let Some(canned_acl) = acl {
-            if canned_acl.as_str() != BucketCannedACL::PRIVATE {
-                return Err(s3_error!(NotImplemented));
+        // Build StoredAcl from request
+        let stored_acl = if let Some(canned_acl) = acl {
+            StoredAcl::from_canned_acl(canned_acl.as_str())
+        } else if let Some(policy) = access_control_policy {
+            // Build from explicit access control policy
+            let mut grants = vec![];
+            if let Some(gs) = policy.grants {
+                for g in gs {
+                    if let Some(grantee) = g.grantee {
+                        grants.push(StoredGrant {
+                            permission: g.permission.map(|p| p.as_str().to_string()).unwrap_or_default(),
+                            grantee_type: grantee.type_.as_str().to_string(),
+                            grantee_id: grantee.id,
+                            grantee_display_name: grantee.display_name,
+                            grantee_uri: grantee.uri,
+                            grantee_email: grantee.email_address,
+                        });
+                    }
+                }
+            }
+            StoredAcl {
+                owner_id: policy
+                    .owner
+                    .as_ref()
+                    .and_then(|o| o.id.clone())
+                    .unwrap_or_else(|| RUSTFS_OWNER.id.clone().unwrap_or_default()),
+                owner_display_name: policy
+                    .owner
+                    .as_ref()
+                    .and_then(|o| o.display_name.clone())
+                    .unwrap_or_else(|| RUSTFS_OWNER.display_name.clone().unwrap_or_default()),
+                grants,
             }
         } else {
-            let is_full_control = access_control_policy.is_some_and(|v| {
-                v.grants.is_some_and(|gs| {
-                    //
-                    !gs.is_empty()
-                        && gs.first().is_some_and(|g| {
-                            g.to_owned()
-                                .permission
-                                .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)
-                        })
-                })
-            });
+            // Default to private
+            StoredAcl::default_acl()
+        };
+        // Serialize ACL to JSON
+        let acl_json = serde_json::to_string(&stored_acl)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to serialize ACL: {e}")))?;
 
-            if !is_full_control {
-                return Err(s3_error!(NotImplemented));
-            }
-        }
+        // Store ACL in object metadata
+        let mut eval_metadata = HashMap::new();
+        eval_metadata.insert(AMZ_OBJECT_ACL.to_string(), acl_json);
+
+        let update_opts = ObjectOptions {
+            version_id,
+            eval_metadata: Some(eval_metadata),
+            ..Default::default()
+        };
+        store
+            .put_object_metadata(&bucket, &key, &update_opts)
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update ACL: {e}")))?;
         Ok(S3Response::new(PutObjectAclOutput::default()))
     }
 
