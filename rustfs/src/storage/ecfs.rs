@@ -5832,6 +5832,10 @@ mod tests {
     use super::*;
     use rustfs_config::MI_B;
     use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
+    use uuid::Uuid;
+
+    // Test constant for UUID validation
+    const TEST_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     #[test]
     fn test_fs_creation() {
@@ -6228,10 +6232,10 @@ mod tests {
         assert_eq!(formatted, "null");
 
         // Versioned object: version_id is Some(UUID), should format as UUID string
-        let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let uuid = Uuid::parse_str(TEST_UUID).unwrap();
         let version_id: Option<Uuid> = Some(uuid);
         let formatted = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
-        assert_eq!(formatted, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(formatted, TEST_UUID);
     }
 
     /// Test that ListObjectVersionsOutput markers are correctly set
@@ -6242,7 +6246,7 @@ mod tests {
 
         // Case 1: Both markers have values (truncated result with versioned object)
         let next_marker = Some("object-key".to_string());
-        let next_version_idmarker = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+        let next_version_idmarker = Some(TEST_UUID.to_string());
 
         let filtered_key_marker = next_marker.filter(|v| !v.is_empty());
         let filtered_version_marker = next_version_idmarker.filter(|v| !v.is_empty());

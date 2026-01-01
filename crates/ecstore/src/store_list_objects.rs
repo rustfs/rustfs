@@ -1387,6 +1387,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod test {
     use uuid::Uuid;
 
+    // Test constant for UUID validation
+    const TEST_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
     /// Test that "null" version marker is handled correctly
     /// AWS S3 API uses "null" string to represent non-versioned objects
     #[test]
@@ -1401,14 +1404,13 @@ mod test {
         assert!(parsed.is_none(), "\"null\" should be parsed as None");
 
         // Valid UUID should be parsed correctly
-        let valid_uuid = "550e8400-e29b-41d4-a716-446655440000";
-        let parsed: Option<Uuid> = if valid_uuid == "null" {
+        let parsed: Option<Uuid> = if TEST_UUID == "null" {
             None
         } else {
-            Uuid::parse_str(valid_uuid).ok()
+            Uuid::parse_str(TEST_UUID).ok()
         };
         assert!(parsed.is_some(), "Valid UUID should be parsed correctly");
-        assert_eq!(parsed.unwrap().to_string(), "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(parsed.unwrap().to_string(), TEST_UUID);
     }
 
     /// Test that next_version_idmarker returns "null" for non-versioned objects
@@ -1420,9 +1422,9 @@ mod test {
         assert_eq!(next_version_idmarker, "null");
 
         // When version_id is Some, next_version_idmarker should be the UUID string
-        let version_id: Option<Uuid> = Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap());
+        let version_id: Option<Uuid> = Some(Uuid::parse_str(TEST_UUID).unwrap());
         let next_version_idmarker = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
-        assert_eq!(next_version_idmarker, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(next_version_idmarker, TEST_UUID);
     }
 
     /// Test the round-trip: next_version_idmarker -> VersionIdMarker parameter -> parsing
@@ -1445,8 +1447,7 @@ mod test {
         // Server returns UUID as NextVersionIdMarker
         // Client sends UUID as VersionIdMarker
         // Server parses UUID correctly
-        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
-        let server_response = uuid_str;
+        let server_response = TEST_UUID;
         let client_request = server_response;
         let parsed: Option<Uuid> = if client_request == "null" {
             None
@@ -1454,7 +1455,7 @@ mod test {
             Uuid::parse_str(client_request).ok()
         };
         assert!(parsed.is_some());
-        assert_eq!(parsed.unwrap().to_string(), uuid_str);
+        assert_eq!(parsed.unwrap().to_string(), TEST_UUID);
     }
 
     // use std::sync::Arc;
