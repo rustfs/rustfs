@@ -504,13 +504,15 @@ fi
 log_info "Using template: ${TEMPLATE_PATH}"
 log_info "Generating config: ${CONF_OUTPUT_PATH}"
 
-export S3_HOST
+# Export all required variables for envsubst
+export S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_ALT_ACCESS_KEY S3_ALT_SECRET_KEY
 envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
     log_error "Failed to generate s3tests config"
     exit 1
 }
 
 # Step 7: Provision s3-tests alt user
+# Note: Main user (rustfsadmin) is a system user and doesn't need to be created via API
 log_info "Provisioning s3-tests alt user..."
 if ! command -v awscurl >/dev/null 2>&1; then
     python3 -m pip install --user --upgrade pip awscurl || {
@@ -520,7 +522,8 @@ if ! command -v awscurl >/dev/null 2>&1; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# Admin API requires AWS SigV4 signing
+# Provision alt user (required by suite)
+log_info "Provisioning alt user (${S3_ALT_ACCESS_KEY})..."
 awscurl \
     --service s3 \
     --region "${S3_REGION}" \
