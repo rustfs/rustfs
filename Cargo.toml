@@ -270,8 +270,6 @@ opentelemetry-stdout = { version = "0.31.0" }
 libunftp = "0.21.0"
 russh = { version = "0.56.0", features = ["aws-lc-rs", "rsa"], default-features = false }
 russh-sftp = "2.1.1"
-russh-keys = "0.50.0-beta.7"
-ssh-key = { version = "0.7.0-rc.4", features = ["std", "rsa", "ed25519"] }
 suppaftp = { version = "7.0.7", features = ["tokio", "tokio-rustls", "rustls"] }
 rcgen = "0.14.6"
 

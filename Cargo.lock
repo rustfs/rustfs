@@ -57,7 +57,6 @@ dependencies = [
  "cfg-if",
  "cipher 0.5.0-rc.2",
  "cpufeatures",
- "zeroize",
 ]
 
 [[package]]
@@ -86,7 +85,6 @@ dependencies = [
  "ctr 0.10.0-rc.2",
  "ghash 0.6.0-rc.3",
  "subtle",
- "zeroize",
 ]
 
 [[package]]
@@ -1331,7 +1329,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96eb4cdd6cf1b31d671e9efe75c5d1ec614776856cefbe109ca373554a6d514f"
 dependencies = [
  "hybrid-array",
- "zeroize",
 ]
 
 [[package]]
@@ -1593,7 +1590,6 @@ dependencies = [
  "cipher 0.5.0-rc.2",
  "cpufeatures",
  "rand_core 0.10.0-rc-2",
- "zeroize",
 ]
 
 [[package]]
@@ -1678,7 +1674,6 @@ dependencies = [
  "block-buffer 0.11.0",
  "crypto-common 0.2.0-rc.5",
  "inout 0.2.2",
- "zeroize",
 ]
 
 [[package]]
@@ -2145,25 +2140,10 @@ dependencies = [
  "cpufeatures",
  "curve25519-dalek-derive",
  "digest 0.10.7",
- "fiat-crypto 0.2.9",
+ "fiat-crypto",
  "rustc_version",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "curve25519-dalek"
-version = "5.0.0-pre.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d8cfa313d59919eda35b420bd37db85bf58d6754d6f128b9949932b0c0fcce7"
-dependencies = [
- "cfg-if",
- "cpufeatures",
- "curve25519-dalek-derive",
- "digest 0.11.0-rc.4",
- "fiat-crypto 0.3.0",
- "rustc_version",
- "subtle",
 ]
 
 [[package]]
@@ -3163,15 +3143,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "des"
-version = "0.9.0-rc.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "512ca722eff02fa73c43e5136f440c46f861d41f9dd7761c1f2817a5ca5d9ad7"
-dependencies = [
- "cipher 0.5.0-rc.2",
-]
-
-[[package]]
 name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3336,39 +3307,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "ed25519"
-version = "3.0.0-rc.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "594435fe09e345ee388e4e8422072ff7dfeca8729389fbd997b3f5504c44cd47"
-dependencies = [
- "signature 3.0.0-rc.5",
-]
-
-[[package]]
 name = "ed25519-dalek"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
- "curve25519-dalek 4.1.3",
- "ed25519 2.2.3",
+ "curve25519-dalek",
+ "ed25519",
  "rand_core 0.6.4",
  "serde",
  "sha2 0.10.9",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "ed25519-dalek"
-version = "3.0.0-pre.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbef01b6e6a5f913ae480bb34ddd798ce6d358054bebf77177200ec84af61ad5"
-dependencies = [
- "curve25519-dalek 5.0.0-pre.2",
- "ed25519 3.0.0-rc.2",
- "sha2 0.11.0-rc.3",
- "subtle",
 ]
 
 [[package]]
@@ -3609,12 +3559,6 @@ name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
-
-[[package]]
-name = "fiat-crypto"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
 name = "filetime"
@@ -4543,7 +4487,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f471e0a81b2f90ffc0cb2f951ae04da57de8baa46fa99112b062a5173a5088d0"
 dependencies = [
  "typenum",
- "zeroize",
 ]
 
 [[package]]
@@ -4877,7 +4820,7 @@ dependencies = [
  "bcrypt-pbkdf",
  "digest 0.11.0-rc.4",
  "ecdsa 0.16.9",
- "ed25519-dalek 2.2.0",
+ "ed25519-dalek",
  "hex",
  "hmac 0.12.1",
  "num-bigint-dig",
@@ -4892,8 +4835,8 @@ dependencies = [
  "sha2 0.10.9",
  "signature 2.2.0",
  "signature 3.0.0-rc.5",
- "ssh-cipher 0.2.0",
- "ssh-encoding 0.2.0",
+ "ssh-cipher",
+ "ssh-encoding",
  "subtle",
  "zeroize",
 ]
@@ -5014,7 +4957,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c76e1c7d7df3e34443b3621b459b066a7b79644f059fc8b2db7070c825fd417e"
 dependencies = [
  "base64",
- "ed25519-dalek 2.2.0",
+ "ed25519-dalek",
  "getrandom 0.2.16",
  "hmac 0.12.1",
  "js-sys",
@@ -6019,12 +5962,6 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openssl-probe"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
-
-[[package]]
-name = "openssl-probe"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f50d9b3dabb09ecd771ad0aa242ca6894994c130308ca3d7684634df8037391"
@@ -6669,7 +6606,6 @@ checksum = "d9c0749ae91cfe6e68c77c4d48802d9720ee06aed3f7100a38975fb0962d50bc"
 dependencies = [
  "cpufeatures",
  "universal-hash 0.6.0-rc.3",
- "zeroize",
 ]
 
 [[package]]
@@ -7612,13 +7548,13 @@ dependencies = [
  "bytes",
  "cbc",
  "ctr 0.9.2",
- "curve25519-dalek 4.1.3",
+ "curve25519-dalek",
  "data-encoding",
  "delegate",
  "der 0.7.10",
  "digest 0.10.7",
  "ecdsa 0.16.9",
- "ed25519-dalek 2.2.0",
+ "ed25519-dalek",
  "elliptic-curve 0.13.8",
  "enum_dispatch",
  "futures",
@@ -7651,7 +7587,7 @@ dependencies = [
  "sha2 0.10.9",
  "signature 2.2.0",
  "spki 0.7.3",
- "ssh-encoding 0.2.0",
+ "ssh-encoding",
  "subtle",
  "thiserror 1.0.69",
  "tokio",
@@ -7668,7 +7604,7 @@ dependencies = [
  "libc",
  "log",
  "nix 0.29.0",
- "ssh-encoding 0.2.0",
+ "ssh-encoding",
  "winapi",
 ]
 
@@ -7831,7 +7767,6 @@ dependencies = [
  "serial_test",
  "shadow-rs",
  "socket2",
- "ssh-key",
  "subtle",
  "sysctl",
  "sysinfo",
@@ -8557,7 +8492,7 @@ version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "612460d5f7bea540c490b2b6395d8e34a953e52b491accd6c86c8164c5932a63"
 dependencies = [
- "openssl-probe 0.2.0",
+ "openssl-probe",
  "rustls-pki-types",
  "schannel",
  "security-framework",
@@ -8789,16 +8724,6 @@ dependencies = [
  "pkcs8 0.10.2",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "sec1"
-version = "0.8.0-rc.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1dff52f6118bc9f0ac974a54a639d499ac26a6cad7a6e39bc0990c19625e793b"
-dependencies = [
- "base16ct 0.3.0",
- "hybrid-array",
 ]
 
 [[package]]
@@ -9361,24 +9286,8 @@ dependencies = [
  "cipher 0.4.4",
  "ctr 0.9.2",
  "poly1305 0.8.0",
- "ssh-encoding 0.2.0",
+ "ssh-encoding",
  "subtle",
-]
-
-[[package]]
-name = "ssh-cipher"
-version = "0.3.0-rc.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "361de425e489d5fe3f1ecfd91531c8fe91ededbbc567e24b77a560d503309bf9"
-dependencies = [
- "aes 0.9.0-rc.2",
- "aes-gcm 0.11.0-rc.2",
- "chacha20 0.10.0-rc.5",
- "cipher 0.5.0-rc.2",
- "des",
- "poly1305 0.9.0-rc.3",
- "ssh-encoding 0.3.0-rc.3",
- "zeroize",
 ]
 
 [[package]]
@@ -9391,38 +9300,6 @@ dependencies = [
  "bytes",
  "pem-rfc7468 0.7.0",
  "sha2 0.10.9",
-]
-
-[[package]]
-name = "ssh-encoding"
-version = "0.3.0-rc.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ad6a09263583e83e934fcd436b7e3bb9d69602e2feef3787adb615c1fe3a343"
-dependencies = [
- "base64ct",
- "crypto-bigint 0.7.0-rc.10",
- "digest 0.11.0-rc.4",
- "pem-rfc7468 1.0.0",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "ssh-key"
-version = "0.7.0-rc.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7faefb89d4a5304e31238913d1f7f164e22494276ed58cd84d5058ba7b04911f"
-dependencies = [
- "ed25519-dalek 3.0.0-pre.2",
- "rand_core 0.10.0-rc-2",
- "rsa 0.10.0-rc.10",
- "sec1 0.8.0-rc.10",
- "sha2 0.11.0-rc.3",
- "signature 3.0.0-rc.5",
- "ssh-cipher 0.3.0-rc.4",
- "ssh-encoding 0.3.0-rc.3",
- "subtle",
- "zeroize",
 ]
 
 [[package]]
@@ -9530,11 +9407,11 @@ dependencies = [
  "lazy-regex",
  "log",
  "pin-project",
- "rustls 0.23.35",
+ "rustls",
  "rustls-pki-types",
  "thiserror 2.0.17",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls",
 ]
 
 [[package]]
