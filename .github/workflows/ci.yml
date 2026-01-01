@@ -160,7 +160,7 @@ jobs:
         with:
           tool: s3s-e2e
           git: https://github.com/Nugine/s3s.git
-          rev: b7714bfaa17ddfa9b23ea01774a1e7bbdbfc2ca3
+          rev: 9e41304ed549b89cfb03ede98e9c0d2ac7522051
 
       - name: Build debug binary
         run: |
