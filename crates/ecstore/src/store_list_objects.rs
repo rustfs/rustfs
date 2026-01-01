@@ -1408,10 +1408,7 @@ mod test {
             Uuid::parse_str(valid_uuid).ok()
         };
         assert!(parsed.is_some(), "Valid UUID should be parsed correctly");
-        assert_eq!(
-            parsed.unwrap().to_string(),
-            "550e8400-e29b-41d4-a716-446655440000"
-        );
+        assert_eq!(parsed.unwrap().to_string(), "550e8400-e29b-41d4-a716-446655440000");
     }
 
     /// Test that next_version_idmarker returns "null" for non-versioned objects
