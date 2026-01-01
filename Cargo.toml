@@ -267,7 +267,7 @@ opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_
 opentelemetry-stdout = { version = "0.31.0" }
 
 # FTP and SFTP
-libunftp = { version = "0.21.0", features = ["aws_lc_rs"] }
+libunftp = "0.21.0"
 russh = { version = "0.56.0", features = ["aws-lc-rs", "rsa"], default-features = false }
 russh-sftp = "2.1.1"
 russh-keys = "0.50.0-beta.7"

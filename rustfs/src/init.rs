@@ -320,32 +320,42 @@ pub(crate) fn init_buffer_profile_system(opt: &config::Opt) {
 /// as other services and MUST integrate with the global shutdown system.
 #[instrument(skip_all)]
 pub async fn init_ftp_system(
-    opt: &crate::config::Opt,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::protocols::ftps::server::{FtpsConfig, FtpsServer};
     use std::net::SocketAddr;
 
     // Check if FTPS is enabled
-    if !opt.ftps_enable {
+    let ftps_enable = std::env::var(rustfs_config::ENV_FTPS_ENABLE)
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false);
+    if !ftps_enable {
         debug!("FTPS system is disabled");
         return Ok(());
     }
 
     // Parse FTPS address
-    let addr: SocketAddr = opt
-        .ftps_address
+    let ftps_address_str =
+        std::env::var(rustfs_config::ENV_FTPS_ADDRESS).unwrap_or_else(|_| rustfs_config::DEFAULT_FTPS_ADDRESS.to_string());
+    let addr: SocketAddr = ftps_address_str
         .parse()
-        .map_err(|e| format!("Invalid FTPS address '{}': {}", opt.ftps_address, e))?;
+        .map_err(|e| format!("Invalid FTPS address '{}': {}", ftps_address_str, e))?;
+
+    // Get FTPS configuration from environment variables
+    let cert_file = std::env::var(rustfs_config::ENV_FTPS_CERTS_FILE).ok();
+    let key_file = std::env::var(rustfs_config::ENV_FTPS_KEY_FILE).ok();
+    let passive_ports = std::env::var(rustfs_config::ENV_FTPS_PASSIVE_PORTS).ok();
+    let external_ip = std::env::var(rustfs_config::ENV_FTPS_EXTERNAL_IP).ok();
 
     // Create FTPS configuration
     let config = FtpsConfig {
         bind_addr: addr,
-        passive_ports: opt.ftps_passive_ports.clone(),
-        external_ip: opt.ftps_external_ip.clone(),
+        passive_ports,
+        external_ip,
         ftps_required: true,
-        cert_file: opt.ftps_certs_file.clone(),
-        key_file: opt.ftps_key_file.clone(),
+        cert_file,
+        key_file,
     };
 
     // Create FTPS server
@@ -380,31 +390,39 @@ pub async fn init_ftp_system(
 /// as other services and MUST integrate with the global shutdown system.
 #[instrument(skip_all)]
 pub async fn init_sftp_system(
-    opt: &config::Opt,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::protocols::sftp::server::{SftpConfig, SftpServer};
     use std::net::SocketAddr;
 
     // Check if SFTP is enabled
-    if !opt.sftp_enable {
+    let sftp_enable = std::env::var(rustfs_config::ENV_SFTP_ENABLE)
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false);
+    if !sftp_enable {
         debug!("SFTP system is disabled");
         return Ok(());
     }
 
     // Parse SFTP address
-    let addr: SocketAddr = opt
-        .sftp_address
+    let sftp_address_str =
+        std::env::var(rustfs_config::ENV_SFTP_ADDRESS).unwrap_or_else(|_| rustfs_config::DEFAULT_SFTP_ADDRESS.to_string());
+    let addr: SocketAddr = sftp_address_str
         .parse()
-        .map_err(|e| format!("Invalid SFTP address '{}': {}", opt.sftp_address, e))?;
+        .map_err(|e| format!("Invalid SFTP address '{}': {}", sftp_address_str, e))?;
+
+    // Get SFTP configuration from environment variables
+    let host_key = std::env::var(rustfs_config::ENV_SFTP_HOST_KEY).ok();
+    let authorized_keys = std::env::var(rustfs_config::ENV_SFTP_AUTHORIZED_KEYS).ok();
 
     // Create SFTP configuration
     let config = SftpConfig {
         bind_addr: addr,
-        require_key_auth: false,                                // TODO: Add key auth configuration
-        cert_file: None,                                        // CA certificates for client certificate authentication
-        key_file: opt.sftp_host_key.clone(),                    // SFTP server host key
-        authorized_keys_file: opt.sftp_authorized_keys.clone(), // Pre-loaded authorized SSH public keys
+        require_key_auth: false,               // TODO: Add key auth configuration
+        cert_file: None,                       // CA certificates for client certificate authentication
+        key_file: host_key,                    // SFTP server host key
+        authorized_keys_file: authorized_keys, // Pre-loaded authorized SSH public keys
     };
 
     // Create SFTP server

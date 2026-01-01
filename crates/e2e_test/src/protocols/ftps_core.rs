@@ -50,16 +50,11 @@ pub async fn test_ftps_core_operations() -> Result<()> {
     info!("Starting FTPS server on {}", FTPS_ADDRESS);
     let binary_path = rustfs_binary_path();
     let mut server_process = Command::new(&binary_path)
-        .args([
-            "--ftps-enable",
-            "--ftps-address",
-            FTPS_ADDRESS,
-            "--ftps-certs-file",
-            cert_path.to_str().unwrap(),
-            "--ftps-key-file",
-            key_path.to_str().unwrap(),
-            &env.temp_dir,
-        ])
+        .env("RUSTFS_FTPS_ENABLE", "true")
+        .env("RUSTFS_FTPS_ADDRESS", FTPS_ADDRESS)
+        .env("RUSTFS_FTPS_CERTS_FILE", cert_path.to_str().unwrap())
+        .env("RUSTFS_FTPS_KEY_FILE", key_path.to_str().unwrap())
+        .arg(&env.temp_dir)
         .spawn()?;
 
     // Ensure server is cleaned up even on failure
