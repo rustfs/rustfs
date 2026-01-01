@@ -473,12 +473,30 @@ impl FileMeta {
             match version.header.version_type {
                 VersionType::Invalid | VersionType::Legacy => (),
                 VersionType::Object => {
-                    if version.header.version_id == fi.version_id {
+                    // For non-versioned buckets, treat None as Uuid::nil()
+                    let fi_vid = fi.version_id.or(Some(Uuid::nil()));
+                    let ver_vid = version.header.version_id.or(Some(Uuid::nil()));
+
+                    if ver_vid == fi_vid {
                         let mut ver = FileMetaVersion::try_from(version.meta.as_slice())?;
 
                         if let Some(ref mut obj) = ver.object {
                             for (k, v) in fi.metadata.iter() {
-                                obj.meta_user.insert(k.clone(), v.clone());
+                                // Split metadata into meta_user and meta_sys based on prefix
+                                // This logic must match From<FileInfo> for MetaObject
+                                if k.len() > RESERVED_METADATA_PREFIX.len()
+                                    && (k.starts_with(RESERVED_METADATA_PREFIX) || k.starts_with(RESERVED_METADATA_PREFIX_LOWER))
+                                {
+                                    // Skip internal flags that shouldn't be persisted
+                                    if k == headers::X_RUSTFS_HEALING || k == headers::X_RUSTFS_DATA_MOV {
+                                        continue;
+                                    }
+                                    // Insert into meta_sys
+                                    obj.meta_sys.insert(k.clone(), v.as_bytes().to_vec());
+                                } else {
+                                    // Insert into meta_user
+                                    obj.meta_user.insert(k.clone(), v.clone());
+                                }
                             }
 
                             if let Some(mod_time) = fi.mod_time {
