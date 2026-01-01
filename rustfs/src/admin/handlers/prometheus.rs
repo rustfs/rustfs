@@ -1,0 +1,432 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! HTTP handlers for Prometheus metrics endpoints.
+//!
+//! This module provides handlers for serving RustFS metrics in Prometheus
+//! text exposition format. These endpoints are designed to be scraped by
+//! Prometheus servers for monitoring and alerting.
+//!
+//! # Endpoints
+//!
+//! - `/rustfs/v2/metrics/cluster` - Cluster-wide capacity and usage metrics
+//! - `/rustfs/v2/metrics/bucket` - Per-bucket usage and quota metrics
+//! - `/rustfs/v2/metrics/node` - Per-node disk capacity and health metrics
+//! - `/rustfs/v2/metrics/resource` - System resource metrics (CPU, memory, uptime)
+//! - `/rustfs/v2/metrics/config` - Generate Prometheus scrape configuration
+//!
+//! # Authentication
+//!
+//! All metrics endpoints require Bearer token authentication. Tokens can be
+//! generated using the `/rustfs/v2/metrics/config` endpoint.
+
+use super::super::router::Operation;
+use http::{HeaderMap, HeaderValue};
+use hyper::StatusCode;
+use matchit::Params;
+use rustfs_credentials::{get_global_action_cred, get_global_secret_key};
+use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
+use rustfs_ecstore::store_api::{BucketOptions, StorageAPI};
+use rustfs_obs::prometheus::{
+    auth::{AuthError, generate_prometheus_config, generate_prometheus_token, verify_bearer_token},
+    collectors::{
+        BucketStats, ClusterStats, DiskStats, ResourceStats, collect_bucket_metrics, collect_cluster_metrics,
+        collect_node_metrics, collect_resource_metrics,
+    },
+    render_metrics,
+};
+use s3s::header::CONTENT_TYPE;
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use serde::{Deserialize, Serialize};
+use tracing::{error, warn};
+
+/// Content-Type header value for Prometheus text exposition format.
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Verify Bearer token from request headers.
+///
+/// Returns an S3Error if authentication fails.
+fn verify_prometheus_auth(headers: &HeaderMap) -> S3Result<()> {
+    let secret_key = get_global_secret_key();
+    if secret_key.is_empty() {
+        return Err(s3_error!(InternalError, "server credentials not initialized"));
+    }
+
+    match verify_bearer_token(headers, &secret_key) {
+        Ok(_) => Ok(()),
+        Err(AuthError::MissingAuthHeader) => Err(s3_error!(AccessDenied, "missing authorization header")),
+        Err(AuthError::InvalidAuthFormat) => {
+            Err(s3_error!(AccessDenied, "invalid authorization format, expected 'Bearer <token>'"))
+        }
+        Err(AuthError::InvalidToken(msg)) => Err(s3_error!(AccessDenied, "invalid or expired token: {}", msg)),
+        Err(AuthError::TokenGenerationFailed(msg)) => Err(s3_error!(InternalError, "token verification failed: {}", msg)),
+    }
+}
+
+/// Create response with Prometheus content type.
+fn prometheus_response(body: String) -> S3Response<(StatusCode, Body)> {
+    let mut headers = HeaderMap::new();
+    if let Ok(content_type) = PROMETHEUS_CONTENT_TYPE.parse::<HeaderValue>() {
+        headers.insert(CONTENT_TYPE, content_type);
+    }
+    S3Response::with_headers((StatusCode::OK, Body::from(body)), headers)
+}
+
+/// Collect cluster statistics from the storage layer.
+async fn collect_cluster_stats() -> ClusterStats {
+    let Some(store) = new_object_layer_fn() else {
+        return ClusterStats::default();
+    };
+
+    let storage_info = store.storage_info().await;
+
+    let raw_capacity: u64 = storage_info.disks.iter().map(|d| d.total_space).sum();
+    let used: u64 = storage_info.disks.iter().map(|d| d.used_space).sum();
+    let usable_capacity = get_total_usable_capacity(&storage_info.disks, &storage_info) as u64;
+    let free = get_total_usable_capacity_free(&storage_info.disks, &storage_info) as u64;
+
+    // Get bucket and object counts
+    let buckets = match store
+        .list_bucket(&BucketOptions {
+            cached: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("Failed to list buckets for cluster metrics: {}", e);
+            Vec::new()
+        }
+    };
+
+    let buckets_count = buckets.len() as u64;
+
+    ClusterStats {
+        raw_capacity_bytes: raw_capacity,
+        usable_capacity_bytes: usable_capacity,
+        used_bytes: used,
+        free_bytes: free,
+        objects_count: 0, // Would require scanning all buckets
+        buckets_count,
+    }
+}
+
+/// Collect bucket statistics from the storage layer.
+async fn collect_bucket_stats() -> Vec<BucketStats> {
+    let Some(store) = new_object_layer_fn() else {
+        return Vec::new();
+    };
+
+    let buckets = match store
+        .list_bucket(&BucketOptions {
+            cached: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("Failed to list buckets for metrics: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // Return basic bucket info without detailed stats (avoid expensive scans)
+    buckets
+        .into_iter()
+        .filter(|b| !b.name.starts_with('.'))
+        .map(|b| BucketStats {
+            name: b.name,
+            size_bytes: 0,    // Would require scanning
+            objects_count: 0, // Would require scanning
+            quota_bytes: 0,   // Would require quota lookup
+        })
+        .collect()
+}
+
+/// Collect disk statistics from the storage layer.
+async fn collect_disk_stats() -> Vec<DiskStats> {
+    let Some(store) = new_object_layer_fn() else {
+        return Vec::new();
+    };
+
+    let storage_info = store.storage_info().await;
+
+    storage_info
+        .disks
+        .iter()
+        .map(|disk| DiskStats {
+            server: disk.endpoint.clone(),
+            drive: disk.drive_path.clone(),
+            total_bytes: disk.total_space,
+            used_bytes: disk.used_space,
+            free_bytes: disk.available_space,
+        })
+        .collect()
+}
+
+/// Collect resource statistics for the current process.
+fn collect_process_stats() -> ResourceStats {
+    // Basic process stats - could be enhanced with sysinfo crate
+    ResourceStats {
+        cpu_percent: 0.0,
+        memory_bytes: 0,
+        uptime_seconds: 0,
+    }
+}
+
+/// Handler for `/rustfs/v2/metrics/cluster` endpoint.
+///
+/// Returns cluster-wide metrics including:
+/// - Total raw storage capacity
+/// - Usable capacity (after erasure coding overhead)
+/// - Used and free storage
+/// - Object and bucket counts
+pub struct ClusterMetricsHandler;
+
+#[async_trait::async_trait]
+impl Operation for ClusterMetricsHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        verify_prometheus_auth(&req.headers)?;
+
+        let stats = collect_cluster_stats().await;
+        let metrics = collect_cluster_metrics(&stats);
+        let body = render_metrics(&metrics);
+
+        Ok(prometheus_response(body))
+    }
+}
+
+/// Handler for `/rustfs/v2/metrics/bucket` endpoint.
+///
+/// Returns per-bucket metrics including:
+/// - Bucket size in bytes
+/// - Object count per bucket
+/// - Quota information (if configured)
+pub struct BucketMetricsHandler;
+
+#[async_trait::async_trait]
+impl Operation for BucketMetricsHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        verify_prometheus_auth(&req.headers)?;
+
+        let stats = collect_bucket_stats().await;
+        let metrics = collect_bucket_metrics(&stats);
+        let body = render_metrics(&metrics);
+
+        Ok(prometheus_response(body))
+    }
+}
+
+/// Handler for `/rustfs/v2/metrics/node` endpoint.
+///
+/// Returns per-node disk metrics including:
+/// - Total disk capacity
+/// - Used disk space
+/// - Free disk space
+pub struct NodeMetricsHandler;
+
+#[async_trait::async_trait]
+impl Operation for NodeMetricsHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        verify_prometheus_auth(&req.headers)?;
+
+        let stats = collect_disk_stats().await;
+        let metrics = collect_node_metrics(&stats);
+        let body = render_metrics(&metrics);
+
+        Ok(prometheus_response(body))
+    }
+}
+
+/// Handler for `/rustfs/v2/metrics/resource` endpoint.
+///
+/// Returns system resource metrics including:
+/// - CPU usage percentage
+/// - Memory usage in bytes
+/// - Process uptime in seconds
+///
+/// # Note
+///
+/// This handler currently returns placeholder data (all zeros) for the initial
+/// implementation. Full resource metrics collection requires integration with
+/// system monitoring libraries (e.g., sysinfo crate) which is planned for a
+/// future release.
+pub struct ResourceMetricsHandler;
+
+#[async_trait::async_trait]
+impl Operation for ResourceMetricsHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        verify_prometheus_auth(&req.headers)?;
+
+        let stats = collect_process_stats();
+        let metrics = collect_resource_metrics(&stats);
+        let body = render_metrics(&metrics);
+
+        Ok(prometheus_response(body))
+    }
+}
+
+/// Response structure for Prometheus configuration endpoint.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PrometheusConfigResponse {
+    /// Bearer token for authenticating Prometheus scraper
+    pub bearer_token: String,
+    /// YAML configuration for Prometheus scrape_configs
+    pub scrape_config: String,
+}
+
+/// Handler for `/rustfs/v2/metrics/config` endpoint.
+///
+/// Generates a Prometheus scrape configuration YAML with a JWT bearer token.
+/// This endpoint requires admin credentials (S3 signature authentication).
+///
+/// Query parameters:
+/// - `scheme` - URL scheme ("http" or "https"), defaults to "http"
+/// - `endpoint` - Override the server endpoint, defaults to request Host header
+pub struct PrometheusConfigHandler;
+
+#[async_trait::async_trait]
+impl Operation for PrometheusConfigHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        // This endpoint requires admin credentials, not Bearer token
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "authentication required"));
+        };
+
+        // Verify this is an admin user
+        let Some(admin_cred) = get_global_action_cred() else {
+            return Err(s3_error!(InternalError, "server credentials not initialized"));
+        };
+
+        // Check if the requester is the admin
+        if !crate::auth::constant_time_eq(&input_cred.access_key, &admin_cred.access_key) {
+            return Err(s3_error!(AccessDenied, "admin credentials required"));
+        }
+
+        // Extract query parameters
+        let scheme = extract_query_param(&req.uri, "scheme").unwrap_or_else(|| "http".to_string());
+        let endpoint = extract_query_param(&req.uri, "endpoint").unwrap_or_else(|| {
+            req.headers
+                .get(http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("localhost:9000")
+                .to_string()
+        });
+
+        // Generate token using admin's secret key
+        let token = match generate_prometheus_token(&admin_cred.access_key, &admin_cred.secret_key, None) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to generate Prometheus token: {}", e);
+                return Err(s3_error!(InternalError, "failed to generate token"));
+            }
+        };
+
+        let scrape_config = generate_prometheus_config(&token, &endpoint, &scheme);
+
+        let response = PrometheusConfigResponse {
+            bearer_token: token,
+            scrape_config,
+        };
+
+        let data = serde_json::to_vec(&response).map_err(|e| {
+            error!("Failed to serialize Prometheus config response: {}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize response")
+        })?;
+
+        let mut headers = HeaderMap::new();
+        if let Ok(content_type) = "application/json".parse::<HeaderValue>() {
+            headers.insert(CONTENT_TYPE, content_type);
+        }
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+    }
+}
+
+/// Extract a query parameter from the URI.
+fn extract_query_param(uri: &http::Uri, key: &str) -> Option<String> {
+    uri.query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            if k == key {
+                urlencoding::decode(v).ok().map(|s| s.into_owned())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_query_param() {
+        let uri: http::Uri = "http://localhost/test?scheme=https&endpoint=server:9000".parse().unwrap();
+        assert_eq!(extract_query_param(&uri, "scheme"), Some("https".to_string()));
+        assert_eq!(extract_query_param(&uri, "endpoint"), Some("server:9000".to_string()));
+        assert_eq!(extract_query_param(&uri, "missing"), None);
+    }
+
+    #[test]
+    fn test_extract_query_param_url_encoded() {
+        let uri: http::Uri = "http://localhost/test?endpoint=server%3A9000".parse().unwrap();
+        assert_eq!(extract_query_param(&uri, "endpoint"), Some("server:9000".to_string()));
+    }
+
+    #[test]
+    fn test_extract_query_param_no_query() {
+        let uri: http::Uri = "http://localhost/test".parse().unwrap();
+        assert_eq!(extract_query_param(&uri, "scheme"), None);
+    }
+
+    #[test]
+    fn test_prometheus_content_type() {
+        assert_eq!(PROMETHEUS_CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8");
+    }
+
+    #[test]
+    fn test_prometheus_response_creates_correct_headers() {
+        let response = prometheus_response("test_metric 1".to_string());
+        assert!(response.headers.get(CONTENT_TYPE).is_some());
+    }
+
+    #[test]
+    fn test_collect_process_stats_returns_default() {
+        let stats = collect_process_stats();
+        // Currently returns defaults
+        assert_eq!(stats.cpu_percent, 0.0);
+        assert_eq!(stats.memory_bytes, 0);
+        assert_eq!(stats.uptime_seconds, 0);
+    }
+
+    #[test]
+    fn test_prometheus_config_response_serialization() {
+        let response = PrometheusConfigResponse {
+            bearer_token: "test-token".to_string(),
+            scrape_config: "scrape_configs:\n- job_name: test".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("bearer_token"));
+        assert!(json.contains("scrape_config"));
+
+        let deserialized: PrometheusConfigResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.bearer_token, "test-token");
+    }
+}

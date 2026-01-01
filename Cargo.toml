@@ -259,6 +259,7 @@ zstd = "0.13.3"
 
 # Observability and Metrics
 metrics = "0.24.3"
+metrics-exporter-prometheus = "0.16.0"
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
 opentelemetry-otlp = { version = "0.31.0", features = ["gzip-http", "reqwest-rustls"] }

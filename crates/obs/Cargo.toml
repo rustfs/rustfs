@@ -37,7 +37,10 @@ full = ["gpu"]
 rustfs-config = { workspace = true, features = ["constants", "observability"] }
 rustfs-utils = { workspace = true, features = ["ip", "path"] }
 flexi_logger = { workspace = true }
+http = { workspace = true }
+jsonwebtoken = { workspace = true }
 metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 nu-ansi-term = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
@@ -59,4 +62,5 @@ thiserror = { workspace = true }
 
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

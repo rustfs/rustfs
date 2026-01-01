@@ -15,6 +15,9 @@
 use crate::admin::console::is_console_path;
 use crate::admin::console::make_console_server;
 use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX};
+
+/// Prefix for Prometheus metrics endpoints (uses Bearer token auth instead of S3 signatures)
+const PROMETHEUS_METRICS_PREFIX: &str = "/rustfs/v2/metrics/";
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -107,7 +110,10 @@ where
             return true;
         }
 
-        path.starts_with(ADMIN_PREFIX) || path.starts_with(RPC_PREFIX) || is_console_path(path)
+        path.starts_with(ADMIN_PREFIX)
+            || path.starts_with(RPC_PREFIX)
+            || path.starts_with(PROMETHEUS_METRICS_PREFIX)
+            || is_console_path(path)
     }
 
     // check_access before call
@@ -127,6 +133,12 @@ where
 
         // Allow unauthenticated access to console static files if console is enabled
         if self.console_enabled && is_console_path(path) {
+            return Ok(());
+        }
+
+        // Prometheus metrics endpoints use Bearer token auth (validated in handler)
+        // Allow the request through - the handler will verify the Bearer token
+        if path.starts_with(PROMETHEUS_METRICS_PREFIX) {
             return Ok(());
         }
 
