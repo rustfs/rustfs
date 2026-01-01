@@ -141,7 +141,7 @@ pub struct Opt {
     pub ftps_enable: bool,
 
     /// FTPS server bind address
-    #[arg(long, default_value_t = String::from("0.0.0.0:21"), env = "RUSTFS_FTPS_ADDRESS")]
+    #[arg(long, default_value_t = String::from("0.0.0.0:8021"), env = "RUSTFS_FTPS_ADDRESS")]
     pub ftps_address: String,
 
     /// FTPS server certificate file path
@@ -165,7 +165,7 @@ pub struct Opt {
     pub sftp_enable: bool,
 
     /// SFTP server bind address
-    #[arg(long, default_value_t = String::from("0.0.0.0:22"), env = "RUSTFS_SFTP_ADDRESS")]
+    #[arg(long, default_value_t = String::from("0.0.0.0:8022"), env = "RUSTFS_SFTP_ADDRESS")]
     pub sftp_address: String,
 
     /// SFTP server host key file path

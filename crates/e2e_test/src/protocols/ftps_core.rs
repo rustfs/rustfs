@@ -76,10 +76,10 @@ pub async fn test_ftps_core_operations() -> Result<()> {
 
         // Create a simple rustls config that accepts any certificate for testing
         let mut root_store = RootCertStore::empty();
-        // For testing, we'll add the self-signed certificate to the trust store
-        // In a real environment, you'd use proper root certificates
+        // Add the self-signed certificate to the trust store for e2e
+        // Note: In a real environment, you'd use proper root certificates
         let cert_pem = cert.cert.pem();
-        let cert_der = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem))
+        let cert_der = rustls_pemfile::certs(&mut Cursor::new(cert_pem))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("Failed to parse cert: {}", e))?;
 

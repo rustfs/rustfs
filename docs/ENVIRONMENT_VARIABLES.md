@@ -122,7 +122,7 @@ Controls whether the FTPS (FTP over TLS) server should be started.
 
 FTPS server bind address.
 
-- **Default**: `0.0.0.0:21`
+- **Default**: `0.0.0.0:8021`
 - **Valid values**: Valid IP:PORT combination
 - **Description**: The address and port where the FTPS server will listen for connections.
 
@@ -170,7 +170,7 @@ Controls whether the SFTP (SSH File Transfer Protocol) server should be started.
 
 SFTP server bind address.
 
-- **Default**: `0.0.0.0:22`
+- **Default**: `0.0.0.0:8022`
 - **Valid values**: Valid IP:PORT combination
 - **Description**: The address and port where the SFTP server will listen for connections.
 
