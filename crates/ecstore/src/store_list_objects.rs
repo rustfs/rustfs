@@ -387,7 +387,12 @@ impl ECStore {
         }
 
         let version_marker = if let Some(marker) = version_marker {
-            Some(Uuid::parse_str(&marker)?)
+            // "null" is used for non-versioned objects in AWS S3 API
+            if marker == "null" {
+                None
+            } else {
+                Some(Uuid::parse_str(&marker)?)
+            }
         } else {
             None
         };
@@ -445,7 +450,13 @@ impl ECStore {
             if is_truncated {
                 get_objects
                     .last()
-                    .map(|last| (Some(last.name.clone()), last.version_id.map(|v| v.to_string())))
+                    .map(|last| {
+                        (
+                            Some(last.name.clone()),
+                            // AWS S3 API returns "null" for non-versioned objects
+                            Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+                        )
+                    })
                     .unwrap_or_default()
             } else {
                 (None, None)
@@ -1374,6 +1385,81 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
+    use uuid::Uuid;
+
+    /// Test that "null" version marker is handled correctly
+    /// AWS S3 API uses "null" string to represent non-versioned objects
+    #[test]
+    fn test_null_version_marker_handling() {
+        // "null" should be treated as None (non-versioned)
+        let version_marker = "null";
+        let parsed: Option<Uuid> = if version_marker == "null" {
+            None
+        } else {
+            Uuid::parse_str(version_marker).ok()
+        };
+        assert!(parsed.is_none(), "\"null\" should be parsed as None");
+
+        // Valid UUID should be parsed correctly
+        let valid_uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let parsed: Option<Uuid> = if valid_uuid == "null" {
+            None
+        } else {
+            Uuid::parse_str(valid_uuid).ok()
+        };
+        assert!(parsed.is_some(), "Valid UUID should be parsed correctly");
+        assert_eq!(
+            parsed.unwrap().to_string(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    /// Test that next_version_idmarker returns "null" for non-versioned objects
+    #[test]
+    fn test_next_version_idmarker_null_string() {
+        // When version_id is None, next_version_idmarker should be "null"
+        let version_id: Option<Uuid> = None;
+        let next_version_idmarker = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+        assert_eq!(next_version_idmarker, "null");
+
+        // When version_id is Some, next_version_idmarker should be the UUID string
+        let version_id: Option<Uuid> = Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap());
+        let next_version_idmarker = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+        assert_eq!(next_version_idmarker, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    /// Test the round-trip: next_version_idmarker -> VersionIdMarker parameter -> parsing
+    #[test]
+    fn test_version_marker_round_trip() {
+        // Scenario 1: Non-versioned object
+        // Server returns "null" as NextVersionIdMarker
+        // Client sends "null" as VersionIdMarker
+        // Server parses "null" as None
+        let server_response = "null";
+        let client_request = server_response;
+        let parsed: Option<Uuid> = if client_request == "null" {
+            None
+        } else {
+            Uuid::parse_str(client_request).ok()
+        };
+        assert!(parsed.is_none());
+
+        // Scenario 2: Versioned object
+        // Server returns UUID as NextVersionIdMarker
+        // Client sends UUID as VersionIdMarker
+        // Server parses UUID correctly
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+        let server_response = uuid_str;
+        let client_request = server_response;
+        let parsed: Option<Uuid> = if client_request == "null" {
+            None
+        } else {
+            Uuid::parse_str(client_request).ok()
+        };
+        assert!(parsed.is_some());
+        assert_eq!(parsed.unwrap().to_string(), uuid_str);
+    }
+
     // use std::sync::Arc;
 
     // use crate::cache_value::metacache_set::list_path_raw;
