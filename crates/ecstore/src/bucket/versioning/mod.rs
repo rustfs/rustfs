@@ -37,10 +37,11 @@ impl VersioningApi for VersioningConfiguration {
             return true;
         }
 
-        if let Some(exclude_folders) = self.exclude_folders {
-            if exclude_folders && prefix.ends_with('/') {
-                return false;
-            }
+        if let Some(exclude_folders) = self.exclude_folders
+            && exclude_folders
+            && prefix.ends_with('/')
+        {
+            return false;
         }
 
         if let Some(ref excluded_prefixes) = self.excluded_prefixes {
@@ -67,10 +68,11 @@ impl VersioningApi for VersioningConfiguration {
                 return false;
             }
 
-            if let Some(exclude_folders) = self.exclude_folders {
-                if exclude_folders && prefix.ends_with('/') {
-                    return true;
-                }
+            if let Some(exclude_folders) = self.exclude_folders
+                && exclude_folders
+                && prefix.ends_with('/')
+            {
+                return true;
             }
 
             if let Some(ref excluded_prefixes) = self.excluded_prefixes {

@@ -203,13 +203,13 @@ impl<T: Store> IamSys<T> {
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
         let updated_at = self.store.set_policy(name, policy).await?;
 
-        if !self.has_watcher() {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.load_policy(name).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify load_policy failed: {}", err);
-                    }
+        if !self.has_watcher()
+            && let Some(notification_sys) = get_global_notification_sys()
+        {
+            let resp = notification_sys.load_policy(name).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify load_policy failed: {}", err);
                 }
             }
         }
@@ -232,13 +232,14 @@ impl<T: Store> IamSys<T> {
     pub async fn delete_user(&self, name: &str, notify: bool) -> Result<()> {
         self.store.delete_user(name, UserType::Reg).await?;
 
-        if notify && !self.has_watcher() {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.delete_user(name).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify delete_user failed: {}", err);
-                    }
+        if notify
+            && !self.has_watcher()
+            && let Some(notification_sys) = get_global_notification_sys()
+        {
+            let resp = notification_sys.delete_user(name).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify delete_user failed: {}", err);
                 }
             }
         }
@@ -476,13 +477,12 @@ impl<T: Store> IamSys<T> {
 
         let op_pt = claims.get(&iam_policy_claim_name_sa());
         let op_sp = claims.get(SESSION_POLICY_NAME);
-        if let (Some(pt), Some(sp)) = (op_pt, op_sp) {
-            if pt == EMBEDDED_POLICY_TYPE {
-                let policy = serde_json::from_slice(
-                    &base64_simd::URL_SAFE_NO_PAD.decode_to_vec(sp.as_str().unwrap_or_default().as_bytes())?,
-                )?;
-                return Ok((sa, Some(policy)));
-            }
+        if let (Some(pt), Some(sp)) = (op_pt, op_sp)
+            && pt == EMBEDDED_POLICY_TYPE
+        {
+            let policy =
+                serde_json::from_slice(&base64_simd::URL_SAFE_NO_PAD.decode_to_vec(sp.as_str().unwrap_or_default().as_bytes())?)?;
+            return Ok((sa, Some(policy)));
         }
 
         Ok((sa, None))
@@ -537,13 +537,12 @@ impl<T: Store> IamSys<T> {
 
         let op_pt = claims.get(&iam_policy_claim_name_sa());
         let op_sp = claims.get(SESSION_POLICY_NAME);
-        if let (Some(pt), Some(sp)) = (op_pt, op_sp) {
-            if pt == EMBEDDED_POLICY_TYPE {
-                let policy = serde_json::from_slice(
-                    &base64_simd::URL_SAFE_NO_PAD.decode_to_vec(sp.as_str().unwrap_or_default().as_bytes())?,
-                )?;
-                return Ok((sa, Some(policy)));
-            }
+        if let (Some(pt), Some(sp)) = (op_pt, op_sp)
+            && pt == EMBEDDED_POLICY_TYPE
+        {
+            let policy =
+                serde_json::from_slice(&base64_simd::URL_SAFE_NO_PAD.decode_to_vec(sp.as_str().unwrap_or_default().as_bytes())?)?;
+            return Ok((sa, Some(policy)));
         }
 
         Ok((sa, None))
@@ -572,13 +571,14 @@ impl<T: Store> IamSys<T> {
 
         self.store.delete_user(access_key, UserType::Svc).await?;
 
-        if notify && !self.has_watcher() {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.delete_service_account(access_key).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify delete_service_account failed: {}", err);
-                    }
+        if notify
+            && !self.has_watcher()
+            && let Some(notification_sys) = get_global_notification_sys()
+        {
+            let resp = notification_sys.delete_service_account(access_key).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify delete_service_account failed: {}", err);
                 }
             }
         }
@@ -651,10 +651,10 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn check_key(&self, access_key: &str) -> Result<(Option<UserIdentity>, bool)> {
-        if let Some(sys_cred) = get_global_action_cred() {
-            if sys_cred.access_key == access_key {
-                return Ok((Some(UserIdentity::new(sys_cred)), true));
-            }
+        if let Some(sys_cred) = get_global_action_cred()
+            && sys_cred.access_key == access_key
+        {
+            return Ok((Some(UserIdentity::new(sys_cred)), true));
         }
 
         match self.store.get_user(access_key).await {
@@ -725,13 +725,13 @@ impl<T: Store> IamSys<T> {
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
         let updated_at = self.store.policy_db_set(name, user_type, is_group, policy).await?;
 
-        if !self.has_watcher() {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.load_policy_mapping(name, user_type.to_u64(), is_group).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify load_policy failed: {}", err);
-                    }
+        if !self.has_watcher()
+            && let Some(notification_sys) = get_global_notification_sys()
+        {
+            let resp = notification_sys.load_policy_mapping(name, user_type.to_u64(), is_group).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify load_policy failed: {}", err);
                 }
             }
         }

@@ -122,10 +122,10 @@ impl Resource {
             // Apply condition substitutions
             if !conditions.is_empty() {
                 for key in KeyName::COMMON_KEYS {
-                    if let Some(rvalue) = conditions.get(key.name()) {
-                        if matches!(rvalue.first().map(|c| !c.is_empty()), Some(true)) {
-                            resolved_pattern = resolved_pattern.replace(&key.var_name(), &rvalue[0]);
-                        }
+                    if let Some(rvalue) = conditions.get(key.name())
+                        && matches!(rvalue.first().map(|c| !c.is_empty()), Some(true))
+                    {
+                        resolved_pattern = resolved_pattern.replace(&key.var_name(), &rvalue[0]);
                     }
                 }
             }

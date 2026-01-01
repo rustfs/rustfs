@@ -74,14 +74,14 @@ impl KmsManager {
         // Check cache first if enabled
         if self.config.enable_cache {
             let cache = self.cache.read().await;
-            if let Some(cached_key) = cache.get_data_key(&request.key_id).await {
-                if cached_key.key_spec == request.key_spec {
-                    return Ok(GenerateDataKeyResponse {
-                        key_id: request.key_id.clone(),
-                        plaintext_key: cached_key.plaintext.clone(),
-                        ciphertext_blob: cached_key.ciphertext.clone(),
-                    });
-                }
+            if let Some(cached_key) = cache.get_data_key(&request.key_id).await
+                && cached_key.key_spec == request.key_spec
+            {
+                return Ok(GenerateDataKeyResponse {
+                    key_id: request.key_id.clone(),
+                    plaintext_key: cached_key.plaintext.clone(),
+                    ciphertext_blob: cached_key.ciphertext.clone(),
+                });
             }
         }
 

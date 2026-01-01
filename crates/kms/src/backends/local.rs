@@ -452,27 +452,25 @@ impl KmsClient for LocalKmsClient {
             }
 
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "key") {
-                if let Some(stem) = path.file_stem() {
-                    if let Some(key_id) = stem.to_str() {
-                        if let Ok(key_info) = self.describe_key(key_id, None).await {
-                            // Apply filters
-                            if let Some(ref status_filter) = request.status_filter {
-                                if &key_info.status != status_filter {
-                                    continue;
-                                }
-                            }
-                            if let Some(ref usage_filter) = request.usage_filter {
-                                if &key_info.usage != usage_filter {
-                                    continue;
-                                }
-                            }
-
-                            keys.push(key_info);
-                            count += 1;
-                        }
-                    }
+            if path.extension().is_some_and(|ext| ext == "key")
+                && let Some(stem) = path.file_stem()
+                && let Some(key_id) = stem.to_str()
+                && let Ok(key_info) = self.describe_key(key_id, None).await
+            {
+                // Apply filters
+                if let Some(ref status_filter) = request.status_filter
+                    && &key_info.status != status_filter
+                {
+                    continue;
                 }
+                if let Some(ref usage_filter) = request.usage_filter
+                    && &key_info.usage != usage_filter
+                {
+                    continue;
+                }
+
+                keys.push(key_info);
+                count += 1;
             }
         }
 

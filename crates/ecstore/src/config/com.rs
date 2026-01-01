@@ -211,10 +211,11 @@ async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: 
         for (i, count) in set_drive_counts.iter().enumerate() {
             match storageclass::lookup_config(&kvs, *count) {
                 Ok(res) => {
-                    if i == 0 && GLOBAL_STORAGE_CLASS.get().is_none() {
-                        if let Err(r) = GLOBAL_STORAGE_CLASS.set(res) {
-                            error!("GLOBAL_STORAGE_CLASS.set failed {:?}", r);
-                        }
+                    if i == 0
+                        && GLOBAL_STORAGE_CLASS.get().is_none()
+                        && let Err(r) = GLOBAL_STORAGE_CLASS.set(res)
+                    {
+                        error!("GLOBAL_STORAGE_CLASS.set failed {:?}", r);
                     }
                 }
                 Err(err) => {

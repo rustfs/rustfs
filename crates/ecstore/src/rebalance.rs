@@ -380,10 +380,10 @@ impl ECStore {
     #[tracing::instrument(skip(self, fi))]
     pub async fn update_pool_stats(&self, pool_index: usize, bucket: String, fi: &FileInfo) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
-        if let Some(meta) = rebalance_meta.as_mut() {
-            if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
-                pool_stat.update(bucket, fi);
-            }
+        if let Some(meta) = rebalance_meta.as_mut()
+            && let Some(pool_stat) = meta.pool_stats.get_mut(pool_index)
+        {
+            pool_stat.update(bucket, fi);
         }
 
         Ok(())
@@ -394,20 +394,20 @@ impl ECStore {
         info!("next_rebal_bucket: pool_index: {}", pool_index);
         let rebalance_meta = self.rebalance_meta.read().await;
         info!("next_rebal_bucket: rebalance_meta: {:?}", rebalance_meta);
-        if let Some(meta) = rebalance_meta.as_ref() {
-            if let Some(pool_stat) = meta.pool_stats.get(pool_index) {
-                if pool_stat.info.status == RebalStatus::Completed || !pool_stat.participating {
-                    info!("next_rebal_bucket: pool_index: {} completed or not participating", pool_index);
-                    return Ok(None);
-                }
-
-                if pool_stat.buckets.is_empty() {
-                    info!("next_rebal_bucket: pool_index: {} buckets is empty", pool_index);
-                    return Ok(None);
-                }
-                info!("next_rebal_bucket: pool_index: {} bucket: {}", pool_index, pool_stat.buckets[0]);
-                return Ok(Some(pool_stat.buckets[0].clone()));
+        if let Some(meta) = rebalance_meta.as_ref()
+            && let Some(pool_stat) = meta.pool_stats.get(pool_index)
+        {
+            if pool_stat.info.status == RebalStatus::Completed || !pool_stat.participating {
+                info!("next_rebal_bucket: pool_index: {} completed or not participating", pool_index);
+                return Ok(None);
             }
+
+            if pool_stat.buckets.is_empty() {
+                info!("next_rebal_bucket: pool_index: {} buckets is empty", pool_index);
+                return Ok(None);
+            }
+            info!("next_rebal_bucket: pool_index: {} bucket: {}", pool_index, pool_stat.buckets[0]);
+            return Ok(Some(pool_stat.buckets[0].clone()));
         }
 
         info!("next_rebal_bucket: pool_index: {} None", pool_index);
@@ -417,28 +417,28 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn bucket_rebalance_done(&self, pool_index: usize, bucket: String) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
-        if let Some(meta) = rebalance_meta.as_mut() {
-            if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
-                info!("bucket_rebalance_done: buckets {:?}", &pool_stat.buckets);
+        if let Some(meta) = rebalance_meta.as_mut()
+            && let Some(pool_stat) = meta.pool_stats.get_mut(pool_index)
+        {
+            info!("bucket_rebalance_done: buckets {:?}", &pool_stat.buckets);
 
-                // Use retain to filter out buckets slated for removal
-                let mut found = false;
-                pool_stat.buckets.retain(|b| {
-                    if b.as_str() == bucket.as_str() {
-                        found = true;
-                        pool_stat.rebalanced_buckets.push(b.clone());
-                        false // Remove this element
-                    } else {
-                        true // Keep this element
-                    }
-                });
-
-                if found {
-                    info!("bucket_rebalance_done: bucket {} rebalanced", &bucket);
-                    return Ok(());
+            // Use retain to filter out buckets slated for removal
+            let mut found = false;
+            pool_stat.buckets.retain(|b| {
+                if b.as_str() == bucket.as_str() {
+                    found = true;
+                    pool_stat.rebalanced_buckets.push(b.clone());
+                    false // Remove this element
                 } else {
-                    info!("bucket_rebalance_done: bucket {} not found", bucket);
+                    true // Keep this element
                 }
+            });
+
+            if found {
+                info!("bucket_rebalance_done: bucket {} rebalanced", &bucket);
+                return Ok(());
+            } else {
+                info!("bucket_rebalance_done: bucket {} not found", bucket);
             }
         }
         info!("bucket_rebalance_done: bucket {} not found", bucket);
@@ -492,10 +492,10 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn stop_rebalance(self: &Arc<Self>) -> Result<()> {
         let rebalance_meta = self.rebalance_meta.read().await;
-        if let Some(meta) = rebalance_meta.as_ref() {
-            if let Some(cancel_tx) = meta.cancel.as_ref() {
-                cancel_tx.cancel();
-            }
+        if let Some(meta) = rebalance_meta.as_ref()
+            && let Some(cancel_tx) = meta.cancel.as_ref()
+        {
+            cancel_tx.cancel();
         }
 
         Ok(())
@@ -690,24 +690,24 @@ impl ECStore {
     async fn check_if_rebalance_done(&self, pool_index: usize) -> bool {
         let mut rebalance_meta = self.rebalance_meta.write().await;
 
-        if let Some(meta) = rebalance_meta.as_mut() {
-            if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
-                // Check if the pool's rebalance status is already completed
-                if pool_stat.info.status == RebalStatus::Completed {
-                    info!("check_if_rebalance_done: pool {} is already completed", pool_index);
-                    return true;
-                }
+        if let Some(meta) = rebalance_meta.as_mut()
+            && let Some(pool_stat) = meta.pool_stats.get_mut(pool_index)
+        {
+            // Check if the pool's rebalance status is already completed
+            if pool_stat.info.status == RebalStatus::Completed {
+                info!("check_if_rebalance_done: pool {} is already completed", pool_index);
+                return true;
+            }
 
-                // Calculate the percentage of free space improvement
-                let pfi = (pool_stat.init_free_space + pool_stat.bytes) as f64 / pool_stat.init_capacity as f64;
+            // Calculate the percentage of free space improvement
+            let pfi = (pool_stat.init_free_space + pool_stat.bytes) as f64 / pool_stat.init_capacity as f64;
 
-                // Mark pool rebalance as done if within 5% of the PercentFreeGoal
-                if (pfi - meta.percent_free_goal).abs() <= 0.05 {
-                    pool_stat.info.status = RebalStatus::Completed;
-                    pool_stat.info.end_time = Some(OffsetDateTime::now_utc());
-                    info!("check_if_rebalance_done: pool {} is completed, pfi: {}", pool_index, pfi);
-                    return true;
-                }
+            // Mark pool rebalance as done if within 5% of the PercentFreeGoal
+            if (pfi - meta.percent_free_goal).abs() <= 0.05 {
+                pool_stat.info.status = RebalStatus::Completed;
+                pool_stat.info.end_time = Some(OffsetDateTime::now_utc());
+                info!("check_if_rebalance_done: pool {} is completed, pfi: {}", pool_index, pfi);
+                return true;
             }
         }
 
@@ -1102,11 +1102,11 @@ impl ECStore {
     pub async fn save_rebalance_stats(&self, pool_idx: usize, opt: RebalSaveOpt) -> Result<()> {
         // TODO: lock
         let mut meta = RebalanceMeta::new();
-        if let Err(err) = meta.load(self.pools[0].clone()).await {
-            if err != Error::ConfigNotFound {
-                info!("save_rebalance_stats: load err: {:?}", err);
-                return Err(err);
-            }
+        if let Err(err) = meta.load(self.pools[0].clone()).await
+            && err != Error::ConfigNotFound
+        {
+            info!("save_rebalance_stats: load err: {:?}", err);
+            return Err(err);
         }
 
         match opt {

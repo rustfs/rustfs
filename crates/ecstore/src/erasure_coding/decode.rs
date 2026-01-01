@@ -266,12 +266,11 @@ impl Erasure {
 
             let (mut shards, errs) = reader.read().await;
 
-            if ret_err.is_none() {
-                if let (_, Some(err)) = reduce_errs(&errs, &[]) {
-                    if err == Error::FileNotFound || err == Error::FileCorrupt {
-                        ret_err = Some(err.into());
-                    }
-                }
+            if ret_err.is_none()
+                && let (_, Some(err)) = reduce_errs(&errs, &[])
+                && (err == Error::FileNotFound || err == Error::FileCorrupt)
+            {
+                ret_err = Some(err.into());
             }
 
             if !reader.can_decode(&shards) {

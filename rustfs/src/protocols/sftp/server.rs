@@ -697,10 +697,10 @@ fn compare_keys(stored_key: &str, client_key_base64: &str) -> bool {
         return true;
     }
 
-    if let Ok(stored_bytes) = BASE64.decode(stored_key_data) {
-        if let Ok(client_bytes) = BASE64.decode(client_key_base64) {
-            return stored_bytes == client_bytes;
-        }
+    if let Ok(stored_bytes) = BASE64.decode(stored_key_data)
+        && let Ok(client_bytes) = BASE64.decode(client_key_base64)
+    {
+        return stored_bytes == client_bytes;
     }
 
     false
