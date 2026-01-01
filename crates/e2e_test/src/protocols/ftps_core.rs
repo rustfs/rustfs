@@ -17,12 +17,14 @@
 use crate::common::rustfs_binary_path;
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
-use native_tls::TlsConnector;
 use rcgen::generate_simple_self_signed;
+use rustls::crypto::aws_lc_rs::default_provider;
+use rustls::{ClientConfig, RootCertStore};
 use std::io::Cursor;
 use std::path::PathBuf;
-use suppaftp::NativeTlsConnector;
-use suppaftp::NativeTlsFtpStream;
+use std::sync::Arc;
+use suppaftp::RustlsConnector;
+use suppaftp::RustlsFtpStream;
 use tokio::process::Command;
 use tracing::info;
 
@@ -67,14 +69,31 @@ pub async fn test_ftps_core_operations() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        // Create native TLS connector that accepts the certificate
-        let tls_connector = TlsConnector::builder().danger_accept_invalid_certs(true).build()?;
+        // Install the aws-lc-rs crypto provider
+        default_provider()
+            .install_default()
+            .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))?;
 
-        // Wrap in suppaftp's NativeTlsConnector
-        let tls_connector = NativeTlsConnector::from(tls_connector);
+        // Create a simple rustls config that accepts any certificate for testing
+        let mut root_store = RootCertStore::empty();
+        // For testing, we'll add the self-signed certificate to the trust store
+        // In a real environment, you'd use proper root certificates
+        let cert_pem = cert.cert.pem();
+        let cert_der = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Failed to parse cert: {}", e))?;
+
+        root_store.add_parsable_certificates(cert_der);
+
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        // Wrap in suppaftp's RustlsConnector
+        let tls_connector = RustlsConnector::from(Arc::new(config));
 
         // Connect to FTPS server
-        let ftp_stream = NativeTlsFtpStream::connect(FTPS_ADDRESS).map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
+        let ftp_stream = RustlsFtpStream::connect(FTPS_ADDRESS).map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
 
         // Upgrade to secure connection
         let mut ftp_stream = ftp_stream

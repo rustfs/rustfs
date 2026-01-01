@@ -21,8 +21,8 @@ pub fn is_operation_supported(protocol: Protocol, action: &S3Action) -> bool {
     match protocol {
         Protocol::Ftps => match action {
             // Bucket operations: FTPS cannot create buckets via protocol commands
-            S3Action::CreateBucket => false,
-            S3Action::DeleteBucket => false,
+            S3Action::CreateBucket => true,
+            S3Action::DeleteBucket => true,
 
             // Object operations: All file operations supported
             S3Action::GetObject => true,    // RETR command

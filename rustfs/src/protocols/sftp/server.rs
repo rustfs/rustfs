@@ -69,7 +69,8 @@ impl SftpServer {
             russh::keys::load_secret_key(path, None)?
         } else {
             warn!("No host key provided, generating random key (not recommended for production).");
-            let mut rng = rand::rngs::OsRng;
+            use russh::keys::signature::rand_core::OsRng;
+            let mut rng = OsRng;
             PrivateKey::random(&mut rng, Algorithm::Ed25519)?
         };
 
