@@ -43,6 +43,42 @@ The OpenTelemetry Collector offers a vendor-agnostic implementation on how to re
 data. It removes the need to run, operate, and maintain multiple agents/collectors in order to support open-source
 observability data formats (e.g. Jaeger, Prometheus, etc.) sending to one or more open-source or commercial back-ends.
 
+## Metrics Collection Methods
+
+RustFS supports two ways to expose Prometheus metrics:
+
+1. **Via OpenTelemetry Collector** (default) - Metrics flow through OTLP to the collector which exposes a Prometheus endpoint
+2. **Native Prometheus Endpoints** - Direct scraping from RustFS with JWT authentication
+
+### Native Prometheus Endpoints
+
+RustFS exposes native Prometheus scrape endpoints that can be scraped directly without the OpenTelemetry Collector:
+
+| Endpoint | Description |
+|----------|-------------|
+| `/rustfs/v2/metrics/cluster` | Cluster-wide metrics |
+| `/rustfs/v2/metrics/bucket` | Per-bucket metrics |
+| `/rustfs/v2/metrics/node` | Per-node/disk metrics |
+| `/rustfs/v2/metrics/resource` | System resource metrics |
+
+These endpoints require JWT Bearer token authentication. Generate a configuration with:
+
+```bash
+curl -X GET "http://localhost:9000/rustfs/admin/v3/prometheus/config" \
+  -H "Authorization: <S3-signature>"
+```
+
+Example Prometheus configuration:
+
+```yaml
+scrape_configs:
+  - job_name: rustfs-cluster
+    bearer_token: <generated-jwt-token>
+    metrics_path: /rustfs/v2/metrics/cluster
+    static_configs:
+      - targets: ['rustfs:9000']
+```
+
 ## How to use
 
 To deploy the observability stack, run the following command:
@@ -56,7 +92,7 @@ docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
 - docker compose v2.0.0 or before
 
 ```bash
-docke-compose -f docker-compose.yml -f docker-compose.override.yml up -d
+docker-compose -f docker-compose.yml -f docker-compose.override.yml up -d
 ```
 
 To access the Grafana dashboard, navigate to `http://localhost:3000` in your browser. The default username and password
