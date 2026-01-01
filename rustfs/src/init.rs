@@ -326,27 +326,23 @@ pub async fn init_ftp_system(
     use std::net::SocketAddr;
 
     // Check if FTPS is enabled
-    let ftps_enable = std::env::var(rustfs_config::ENV_FTPS_ENABLE)
-        .unwrap_or_else(|_| "false".to_string())
-        .parse::<bool>()
-        .unwrap_or(false);
+    let ftps_enable = rustfs_utils::get_env_bool(rustfs_config::ENV_FTPS_ENABLE, false);
     if !ftps_enable {
         debug!("FTPS system is disabled");
         return Ok(());
     }
 
     // Parse FTPS address
-    let ftps_address_str =
-        std::env::var(rustfs_config::ENV_FTPS_ADDRESS).unwrap_or_else(|_| rustfs_config::DEFAULT_FTPS_ADDRESS.to_string());
+    let ftps_address_str = rustfs_utils::get_env_str(rustfs_config::ENV_FTPS_ADDRESS, rustfs_config::DEFAULT_FTPS_ADDRESS);
     let addr: SocketAddr = ftps_address_str
         .parse()
         .map_err(|e| format!("Invalid FTPS address '{}': {}", ftps_address_str, e))?;
 
     // Get FTPS configuration from environment variables
-    let cert_file = std::env::var(rustfs_config::ENV_FTPS_CERTS_FILE).ok();
-    let key_file = std::env::var(rustfs_config::ENV_FTPS_KEY_FILE).ok();
-    let passive_ports = std::env::var(rustfs_config::ENV_FTPS_PASSIVE_PORTS).ok();
-    let external_ip = std::env::var(rustfs_config::ENV_FTPS_EXTERNAL_IP).ok();
+    let cert_file = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_CERTS_FILE);
+    let key_file = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_KEY_FILE);
+    let passive_ports = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_PASSIVE_PORTS);
+    let external_ip = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_EXTERNAL_IP);
 
     // Create FTPS configuration
     let config = FtpsConfig {
@@ -396,25 +392,21 @@ pub async fn init_sftp_system(
     use std::net::SocketAddr;
 
     // Check if SFTP is enabled
-    let sftp_enable = std::env::var(rustfs_config::ENV_SFTP_ENABLE)
-        .unwrap_or_else(|_| "false".to_string())
-        .parse::<bool>()
-        .unwrap_or(false);
+    let sftp_enable = rustfs_utils::get_env_bool(rustfs_config::ENV_SFTP_ENABLE, false);
     if !sftp_enable {
         debug!("SFTP system is disabled");
         return Ok(());
     }
 
     // Parse SFTP address
-    let sftp_address_str =
-        std::env::var(rustfs_config::ENV_SFTP_ADDRESS).unwrap_or_else(|_| rustfs_config::DEFAULT_SFTP_ADDRESS.to_string());
+    let sftp_address_str = rustfs_utils::get_env_str(rustfs_config::ENV_SFTP_ADDRESS, rustfs_config::DEFAULT_SFTP_ADDRESS);
     let addr: SocketAddr = sftp_address_str
         .parse()
         .map_err(|e| format!("Invalid SFTP address '{}': {}", sftp_address_str, e))?;
 
     // Get SFTP configuration from environment variables
-    let host_key = std::env::var(rustfs_config::ENV_SFTP_HOST_KEY).ok();
-    let authorized_keys = std::env::var(rustfs_config::ENV_SFTP_AUTHORIZED_KEYS).ok();
+    let host_key = rustfs_utils::get_env_opt_str(rustfs_config::ENV_SFTP_HOST_KEY);
+    let authorized_keys = rustfs_utils::get_env_opt_str(rustfs_config::ENV_SFTP_AUTHORIZED_KEYS);
 
     // Create SFTP configuration
     let config = SftpConfig {
