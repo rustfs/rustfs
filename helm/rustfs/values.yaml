@@ -110,6 +110,7 @@ ingress:
     traefik.ingress.kubernetes.io/service.sticky.cookie.secure: "true"
   nginxAnnotations:
     nginx.ingress.kubernetes.io/affinity: cookie
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
     nginx.ingress.kubernetes.io/session-cookie-expires: "3600"
     nginx.ingress.kubernetes.io/session-cookie-hash: sha1
     nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
