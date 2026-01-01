@@ -98,16 +98,16 @@ impl FtpsConfig {
             ));
         }
 
-        if let Some(path) = &self.cert_file {
-            if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-                return Err(FtpsInitError::InvalidConfig(format!("Certificate file not found: {}", path)));
-            }
+        if let Some(path) = &self.cert_file
+            && !tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
+            return Err(FtpsInitError::InvalidConfig(format!("Certificate file not found: {}", path)));
         }
 
-        if let Some(path) = &self.key_file {
-            if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-                return Err(FtpsInitError::InvalidConfig(format!("Key file not found: {}", path)));
-            }
+        if let Some(path) = &self.key_file
+            && !tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
+            return Err(FtpsInitError::InvalidConfig(format!("Key file not found: {}", path)));
         }
 
         // Validate passive ports format

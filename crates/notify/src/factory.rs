@@ -204,10 +204,10 @@ impl TargetFactory for MQTTTargetFactory {
             if !std::path::Path::new(&queue_dir).is_absolute() {
                 return Err(TargetError::Configuration("MQTT queue directory must be an absolute path".to_string()));
             }
-            if let Some(qos_str) = config.lookup(MQTT_QOS) {
-                if qos_str == "0" {
-                    warn!("Using queue_dir with QoS 0 may result in event loss");
-                }
+            if let Some(qos_str) = config.lookup(MQTT_QOS)
+                && qos_str == "0"
+            {
+                warn!("Using queue_dir with QoS 0 may result in event loss");
             }
         }
 

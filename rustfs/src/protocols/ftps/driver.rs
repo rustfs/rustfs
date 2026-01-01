@@ -735,14 +735,14 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
 
             match s3_client.list_objects_v2(list_input).await {
                 Ok(output) => {
-                    if let Some(objects) = output.contents {
-                        if !objects.is_empty() {
-                            debug!("FTPS RMD - bucket '{}' is not empty, cannot delete", bucket);
-                            return Err(Error::new(
-                                ErrorKind::PermanentFileNotAvailable,
-                                format!("Bucket '{}' is not empty", bucket),
-                            ));
-                        }
+                    if let Some(objects) = output.contents
+                        && !objects.is_empty()
+                    {
+                        debug!("FTPS RMD - bucket '{}' is not empty, cannot delete", bucket);
+                        return Err(Error::new(
+                            ErrorKind::PermanentFileNotAvailable,
+                            format!("Bucket '{}' is not empty", bucket),
+                        ));
                     }
                 }
                 Err(e) => {

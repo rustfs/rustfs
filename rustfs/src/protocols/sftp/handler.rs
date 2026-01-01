@@ -753,16 +753,16 @@ impl Handler for SftpHandler {
 
                 match s3_client.list_objects_v2(list_input).await {
                     Ok(output) => {
-                        if let Some(objects) = output.contents {
-                            if !objects.is_empty() {
-                                debug!("SFTP REMOVE - bucket '{}' is not empty, cannot delete", bucket);
-                                return Ok(Status {
-                                    id,
-                                    status_code: StatusCode::Failure,
-                                    error_message: format!("Bucket '{}' is not empty", bucket),
-                                    language_tag: "en".into(),
-                                });
-                            }
+                        if let Some(objects) = output.contents
+                            && !objects.is_empty()
+                        {
+                            debug!("SFTP REMOVE - bucket '{}' is not empty, cannot delete", bucket);
+                            return Ok(Status {
+                                id,
+                                status_code: StatusCode::Failure,
+                                error_message: format!("Bucket '{}' is not empty", bucket),
+                                language_tag: "en".into(),
+                            });
                         }
                     }
                     Err(e) => {

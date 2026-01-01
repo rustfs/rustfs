@@ -96,10 +96,10 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        if let Some(sys_cred) = get_global_action_cred() {
-            if constant_time_eq(&sys_cred.access_key, ak) {
-                return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
-            }
+        if let Some(sys_cred) = get_global_action_cred()
+            && constant_time_eq(&sys_cred.access_key, ak)
+        {
+            return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
         }
 
         let Ok(iam_store) = rustfs_iam::get() else {
@@ -777,10 +777,10 @@ impl Operation for ImportIam {
                 let groups: HashMap<String, GroupInfo> = serde_json::from_slice(&file_content)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                 for (group_name, group_info) in groups {
-                    if let Err(e) = iam_store.get_group_description(&group_name).await {
-                        if matches!(e, rustfs_iam::error::Error::NoSuchGroup(_)) || has_space_be(&group_name) {
-                            return Err(s3_error!(InvalidArgument, "group not found or has space be"));
-                        }
+                    if let Err(e) = iam_store.get_group_description(&group_name).await
+                        && (matches!(e, rustfs_iam::error::Error::NoSuchGroup(_)) || has_space_be(&group_name))
+                    {
+                        return Err(s3_error!(InvalidArgument, "group not found or has space be"));
                     }
 
                     if let Err(e) = iam_store.add_users_to_group(&group_name, group_info.members.clone()).await {
