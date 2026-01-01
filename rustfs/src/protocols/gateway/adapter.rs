@@ -20,7 +20,7 @@ use crate::protocols::session::context::Protocol;
 pub fn is_operation_supported(protocol: Protocol, action: &S3Action) -> bool {
     match protocol {
         Protocol::Ftps => match action {
-            // Bucket operations: FTPS cannot create buckets via protocol commands
+            // Bucket operations: FTPS has no native bucket commands, but gateway allows create/delete
             S3Action::CreateBucket => true,
             S3Action::DeleteBucket => true,
 
