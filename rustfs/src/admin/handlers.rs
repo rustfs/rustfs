@@ -18,6 +18,7 @@ use crate::auth::check_key_valid;
 use crate::auth::get_condition_values;
 use crate::auth::get_session_token;
 use crate::error::ApiError;
+use crate::server::RemoteAddr;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, Uri};
@@ -210,7 +211,8 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let conditions = get_condition_values(&req.headers, &cred_clone, None, None);
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let conditions = get_condition_values(&req.headers, &cred_clone, None, None, remote_addr);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
 
@@ -405,12 +407,14 @@ impl Operation for ServerInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            remote_addr,
         )
         .await?;
 
@@ -451,12 +455,14 @@ impl Operation for StorageInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::StorageInfoAdminAction)],
+            remote_addr,
         )
         .await?;
 
@@ -492,6 +498,7 @@ impl Operation for DataUsageInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
         validate_admin_request(
             &req.headers,
             &cred,
@@ -501,6 +508,7 @@ impl Operation for DataUsageInfoHandler {
                 Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
                 Action::S3Action(S3Action::ListBucketAction),
             ],
+            remote_addr,
         )
         .await?;
 

@@ -11,6 +11,11 @@
 </p>
 
 <p align="center">
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+</p>
+
+
+<p align="center">
   <a href="https://docs.rustfs.com/installation/">Getting Started</a>
   · <a href="https://docs.rustfs.com/">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Bug reports</a>
@@ -45,10 +50,10 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 | :--- | :--- | :--- | :--- |
 | **S3 Core Features** | ✅ Available | **Bitrot Protection** | ✅ Available |
 | **Upload / Download** | ✅ Available | **Single Node Mode** | ✅ Available |
-| **Versioning** | ✅ Available |  **Bucket Replication** | ⚠️ Partial Support |
+| **Versioning** | ✅ Available |  **Bucket Replication** | ✅ Available |
 | **Logging** | ✅ Available |  **Lifecycle Management** | 🚧 Under Testing |
 | **Event Notifications** | ✅ Available |  **Distributed Mode** | 🚧 Under Testing |
-| **K8s Helm Charts** | ✅ Available |  **OPA (Open Policy Agent)** | 🚧 Under Testing |
+| **K8s Helm Charts** | ✅ Available |   **RustFS KMS** | 🚧 Under Testing | 
 
 
 
@@ -215,11 +220,6 @@ RustFS is a community-driven project, and we appreciate all contributions. Check
 <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="Contributors" />
 </a>
 
-## Github Trending Top
-
-🚀 RustFS is beloved by open-source enthusiasts and enterprise users worldwide, often appearing on the GitHub Trending top charts.
-
-<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
 
 ## Star History
 

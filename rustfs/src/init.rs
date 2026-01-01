@@ -309,3 +309,122 @@ pub(crate) fn init_buffer_profile_system(opt: &config::Opt) {
         info!("Buffer profiling system initialized successfully");
     }
 }
+
+/// Initialize the FTPS system
+///
+/// This function initializes the FTPS server if enabled in the configuration.
+/// It sets up the FTPS server with the appropriate configuration and starts
+/// the server in a background task.
+///
+/// MINIO CONSTRAINT: FTPS server MUST follow the same lifecycle management
+/// as other services and MUST integrate with the global shutdown system.
+#[instrument(skip_all)]
+pub async fn init_ftp_system(
+    opt: &crate::config::Opt,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::protocols::ftps::server::{FtpsConfig, FtpsServer};
+    use std::net::SocketAddr;
+
+    // Check if FTPS is enabled
+    if !opt.ftps_enable {
+        debug!("FTPS system is disabled");
+        return Ok(());
+    }
+
+    // Parse FTPS address
+    let addr: SocketAddr = opt
+        .ftps_address
+        .parse()
+        .map_err(|e| format!("Invalid FTPS address '{}': {}", opt.ftps_address, e))?;
+
+    // Create FTPS configuration
+    let config = FtpsConfig {
+        bind_addr: addr,
+        passive_ports: opt.ftps_passive_ports.clone(),
+        external_ip: opt.ftps_external_ip.clone(),
+        ftps_required: true,
+        cert_file: opt.ftps_certs_file.clone(),
+        key_file: opt.ftps_key_file.clone(),
+    };
+
+    // Create FTPS server
+    let server = FtpsServer::new(config).await?;
+
+    // Log server configuration
+    info!(
+        "FTPS server configured on {} with passive ports {:?}",
+        server.config().bind_addr,
+        server.config().passive_ports
+    );
+
+    // Start FTPS server in background task
+    let shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        if let Err(e) = server.start(shutdown_rx).await {
+            error!("FTPS server error: {}", e);
+        }
+    });
+
+    info!("FTPS system initialized successfully");
+    Ok(())
+}
+
+/// Initialize the SFTP system
+///
+/// This function initializes the SFTP server if enabled in the configuration.
+/// It sets up the SFTP server with the appropriate configuration and starts
+/// the server in a background task.
+///
+/// MINIO CONSTRAINT: SFTP server MUST follow the same lifecycle management
+/// as other services and MUST integrate with the global shutdown system.
+#[instrument(skip_all)]
+pub async fn init_sftp_system(
+    opt: &config::Opt,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::protocols::sftp::server::{SftpConfig, SftpServer};
+    use std::net::SocketAddr;
+
+    // Check if SFTP is enabled
+    if !opt.sftp_enable {
+        debug!("SFTP system is disabled");
+        return Ok(());
+    }
+
+    // Parse SFTP address
+    let addr: SocketAddr = opt
+        .sftp_address
+        .parse()
+        .map_err(|e| format!("Invalid SFTP address '{}': {}", opt.sftp_address, e))?;
+
+    // Create SFTP configuration
+    let config = SftpConfig {
+        bind_addr: addr,
+        require_key_auth: false,                                // TODO: Add key auth configuration
+        cert_file: None,                                        // CA certificates for client certificate authentication
+        key_file: opt.sftp_host_key.clone(),                    // SFTP server host key
+        authorized_keys_file: opt.sftp_authorized_keys.clone(), // Pre-loaded authorized SSH public keys
+    };
+
+    // Create SFTP server
+    let server = SftpServer::new(config)?;
+
+    // Log server configuration
+    info!(
+        "SFTP server configured on {} with key auth requirement: {}",
+        server.config().bind_addr,
+        server.config().require_key_auth
+    );
+
+    // Start SFTP server in background task
+    let shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        if let Err(e) = server.start(shutdown_rx).await {
+            error!("SFTP server error: {}", e);
+        }
+    });
+
+    info!("SFTP system initialized successfully");
+    Ok(())
+}

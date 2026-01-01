@@ -14,6 +14,7 @@
 
 use crate::admin::utils::has_space_be;
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
+use crate::server::RemoteAddr;
 use crate::{admin::router::Operation, auth::check_key_valid};
 use http::HeaderMap;
 use hyper::StatusCode;
@@ -119,7 +120,13 @@ impl Operation for AddServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::CreateServiceAccountAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(&req.headers, &cred, None, None),
+                conditions: &get_condition_values(
+                    &req.headers,
+                    &cred,
+                    None,
+                    None,
+                    req.extensions.get::<RemoteAddr>().map(|a| a.0),
+                ),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
@@ -270,7 +277,13 @@ impl Operation for UpdateServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(&req.headers, &cred, None, None),
+                conditions: &get_condition_values(
+                    &req.headers,
+                    &cred,
+                    None,
+                    None,
+                    req.extensions.get::<RemoteAddr>().map(|a| a.0),
+                ),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
@@ -363,7 +376,13 @@ impl Operation for InfoServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(&req.headers, &cred, None, None),
+                conditions: &get_condition_values(
+                    &req.headers,
+                    &cred,
+                    None,
+                    None,
+                    req.extensions.get::<RemoteAddr>().map(|a| a.0),
+                ),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
@@ -491,7 +510,13 @@ impl Operation for ListServiceAccount {
                     groups: &cred.groups,
                     action: Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction),
                     bucket: "",
-                    conditions: &get_condition_values(&req.headers, &cred, None, None),
+                    conditions: &get_condition_values(
+                        &req.headers,
+                        &cred,
+                        None,
+                        None,
+                        req.extensions.get::<RemoteAddr>().map(|a| a.0),
+                    ),
                     is_owner: owner,
                     object: "",
                     claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
@@ -589,7 +614,13 @@ impl Operation for DeleteServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::RemoveServiceAccountAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(&req.headers, &cred, None, None),
+                conditions: &get_condition_values(
+                    &req.headers,
+                    &cred,
+                    None,
+                    None,
+                    req.extensions.get::<RemoteAddr>().map(|a| a.0),
+                ),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),

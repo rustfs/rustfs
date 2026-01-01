@@ -30,12 +30,13 @@ pub async fn validate_admin_request(
     is_owner: bool,
     deny_only: bool,
     actions: Vec<Action>,
+    remote_addr: Option<std::net::SocketAddr>,
 ) -> S3Result<()> {
     let Ok(iam_store) = rustfs_iam::get() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
     for action in actions {
-        match check_admin_request_auth(iam_store.clone(), headers, cred, is_owner, deny_only, action).await {
+        match check_admin_request_auth(iam_store.clone(), headers, cred, is_owner, deny_only, action, remote_addr).await {
             Ok(_) => return Ok(()),
             Err(_) => {
                 continue;
@@ -53,8 +54,9 @@ async fn check_admin_request_auth(
     is_owner: bool,
     deny_only: bool,
     action: Action,
+    remote_addr: Option<std::net::SocketAddr>,
 ) -> S3Result<()> {
-    let conditions = get_condition_values(headers, cred, None, None);
+    let conditions = get_condition_values(headers, cred, None, None, remote_addr);
 
     if !iam_store
         .is_allowed(&Args {

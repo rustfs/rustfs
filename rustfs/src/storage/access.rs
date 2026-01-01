@@ -15,6 +15,7 @@
 use super::ecfs::FS;
 use crate::auth::{check_key_valid, get_condition_values, get_session_token};
 use crate::license::license_check;
+use crate::server::RemoteAddr;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -36,6 +37,7 @@ pub(crate) struct ReqInfo {
 
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
+    let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
     let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
 
     if let Some(cred) = &req_info.cred {
@@ -48,7 +50,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
-        let conditions = get_condition_values(&req.headers, cred, req_info.version_id.as_deref(), None);
+        let conditions = get_condition_values(&req.headers, cred, req_info.version_id.as_deref(), None, remote_addr);
 
         if action == Action::S3Action(S3Action::DeleteObjectAction)
             && req_info.version_id.is_some()
@@ -109,6 +111,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             &rustfs_credentials::Credentials::default(),
             req_info.version_id.as_deref(),
             req.region.as_deref(),
+            remote_addr,
         );
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {

@@ -17,7 +17,7 @@ use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::{ReadinessGateLayer, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
+use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -44,6 +44,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
+use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -430,11 +431,11 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         debug!("TLS path is not provided or does not exist, starting with HTTP");
         return Ok(None);
     }
-
     debug!("Found TLS directory, checking for certificates");
 
     // Make sure to use a modern encryption suite
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let mtls_verifier = rustfs_utils::build_webpki_client_verifier(tls_path)?;
 
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
     if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
@@ -445,9 +446,15 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
             let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
 
             // Configure the server to enable SNI support
-            let mut server_config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(resolver));
+            let mut server_config = if let Some(verifier) = mtls_verifier.clone() {
+                ServerConfig::builder()
+                    .with_client_cert_verifier(verifier)
+                    .with_cert_resolver(Arc::new(resolver))
+            } else {
+                ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(resolver))
+            };
 
             // Configure ALPN protocol priority
             server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
@@ -469,10 +476,17 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         let certs = rustfs_utils::load_certs(&cert_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
         let key = rustfs_utils::load_private_key(&key_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
 
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+        let mut server_config = if let Some(verifier) = mtls_verifier {
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+                .map_err(|e| rustfs_utils::certs_error(e.to_string()))?
+        } else {
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| rustfs_utils::certs_error(e.to_string()))?
+        };
 
         // Configure ALPN protocol priority
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
@@ -528,9 +542,21 @@ fn process_connection(
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
         let service = hybrid(s3_service, rpc_service);
 
+        let remote_addr = match socket.peer_addr() {
+            Ok(addr) => Some(RemoteAddr(addr)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to obtain peer address; policy evaluation may fall back to a default source IP"
+                );
+                None
+            }
+        };
+
         let hybrid_service = ServiceBuilder::new()
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
+            .layer(AddExtensionLayer::new(remote_addr))
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
             .layer(ReadinessGateLayer::new(readiness))

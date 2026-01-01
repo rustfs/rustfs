@@ -15,6 +15,7 @@
 use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
     auth::{check_key_valid, constant_time_eq, get_session_token},
+    server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
@@ -124,6 +125,7 @@ impl Operation for AddUser {
             owner,
             deny_only,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -176,6 +178,7 @@ impl Operation for SetUserStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -220,6 +223,7 @@ impl Operation for ListUsers {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListUsersAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -278,6 +282,7 @@ impl Operation for RemoveUser {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -377,6 +382,7 @@ impl Operation for GetUserInfo {
             owner,
             deny_only,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -426,8 +432,15 @@ impl Operation for ExportIam {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ExportIAMAction)])
-            .await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let Ok(iam_store) = rustfs_iam::get() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -633,8 +646,15 @@ impl Operation for ImportIam {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ExportIAMAction)])
-            .await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let mut input = req.input;
         let body = match input.store_all_limited(MAX_IAM_IMPORT_SIZE).await {

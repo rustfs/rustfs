@@ -637,6 +637,19 @@ impl<T: Store> IamSys<T> {
         self.store.update_user_secret_key(access_key, secret_key).await
     }
 
+    /// Add SSH public key for a user (for SFTP authentication)
+    pub async fn add_user_ssh_public_key(&self, access_key: &str, public_key: &str) -> Result<()> {
+        if !is_access_key_valid(access_key) {
+            return Err(IamError::InvalidAccessKeyLength);
+        }
+
+        if public_key.is_empty() {
+            return Err(IamError::InvalidArgument);
+        }
+
+        self.store.add_user_ssh_public_key(access_key, public_key).await
+    }
+
     pub async fn check_key(&self, access_key: &str) -> Result<(Option<UserIdentity>, bool)> {
         if let Some(sys_cred) = get_global_action_cred() {
             if sys_cred.access_key == access_key {
