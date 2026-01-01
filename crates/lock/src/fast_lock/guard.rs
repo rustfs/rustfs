@@ -953,10 +953,10 @@ mod tests {
         // Wait for all operations to complete
         let mut successful_operations = 0;
         for handle in handles {
-            if let Ok(success) = handle.await {
-                if success {
-                    successful_operations += 1;
-                }
+            if let Ok(success) = handle.await
+                && success
+            {
+                successful_operations += 1;
             }
         }
 

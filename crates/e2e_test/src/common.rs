@@ -178,11 +178,11 @@ impl RustFSTestEnvironment {
         info!("Cleaning up any existing RustFS processes");
         let output = Command::new("pkill").args(["-f", "rustfs"]).output();
 
-        if let Ok(output) = output {
-            if output.status.success() {
-                info!("Killed existing RustFS processes");
-                sleep(Duration::from_millis(1000)).await;
-            }
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            info!("Killed existing RustFS processes");
+            sleep(Duration::from_millis(1000)).await;
         }
         Ok(())
     }

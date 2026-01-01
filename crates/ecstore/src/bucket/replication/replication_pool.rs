@@ -512,20 +512,20 @@ impl<S: StorageAPI> ReplicationPool<S> {
             if !lrg_workers.is_empty() {
                 let index = (hash as usize) % lrg_workers.len();
 
-                if let Some(worker) = lrg_workers.get(index) {
-                    if worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err() {
-                        // Queue to MRF if worker is busy
-                        let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
+                if let Some(worker) = lrg_workers.get(index)
+                    && worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err()
+                {
+                    // Queue to MRF if worker is busy
+                    let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
 
-                        // Try to add more workers if possible
-                        let max_l_workers = *self.max_l_workers.read().await;
-                        let existing = lrg_workers.len();
-                        if self.active_lrg_workers() < std::cmp::min(max_l_workers, LARGE_WORKER_COUNT) as i32 {
-                            let workers = std::cmp::min(existing + 1, max_l_workers);
+                    // Try to add more workers if possible
+                    let max_l_workers = *self.max_l_workers.read().await;
+                    let existing = lrg_workers.len();
+                    if self.active_lrg_workers() < std::cmp::min(max_l_workers, LARGE_WORKER_COUNT) as i32 {
+                        let workers = std::cmp::min(existing + 1, max_l_workers);
 
-                            drop(lrg_workers);
-                            self.resize_lrg_workers(workers, existing).await;
-                        }
+                        drop(lrg_workers);
+                        self.resize_lrg_workers(workers, existing).await;
                     }
                 }
             }
@@ -539,47 +539,45 @@ impl<S: StorageAPI> ReplicationPool<S> {
             _ => self.get_worker_ch(&ri.bucket, &ri.name, ri.size).await,
         };
 
-        if let Some(channel) = ch {
-            if channel.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err() {
-                // Queue to MRF if all workers are busy
-                let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
+        if let Some(channel) = ch
+            && channel.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err()
+        {
+            // Queue to MRF if all workers are busy
+            let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
 
-                // Try to scale up workers based on priority
-                let priority = self.priority.read().await.clone();
-                let max_workers = *self.max_workers.read().await;
+            // Try to scale up workers based on priority
+            let priority = self.priority.read().await.clone();
+            let max_workers = *self.max_workers.read().await;
 
-                match priority {
-                    ReplicationPriority::Fast => {
-                        // Log warning about unable to keep up
-                        info!("Warning: Unable to keep up with incoming traffic");
+            match priority {
+                ReplicationPriority::Fast => {
+                    // Log warning about unable to keep up
+                    info!("Warning: Unable to keep up with incoming traffic");
+                }
+                ReplicationPriority::Slow => {
+                    info!("Warning: Unable to keep up with incoming traffic - recommend increasing replication priority to auto");
+                }
+                ReplicationPriority::Auto => {
+                    let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
+                    let active_workers = self.active_workers();
+
+                    if active_workers < max_w as i32 {
+                        let workers = self.workers.read().await;
+                        let new_count = std::cmp::min(workers.len() + 1, max_w);
+                        let existing = workers.len();
+
+                        drop(workers);
+                        self.resize_workers(new_count, existing).await;
                     }
-                    ReplicationPriority::Slow => {
-                        info!(
-                            "Warning: Unable to keep up with incoming traffic - recommend increasing replication priority to auto"
-                        );
-                    }
-                    ReplicationPriority::Auto => {
-                        let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                        let active_workers = self.active_workers();
 
-                        if active_workers < max_w as i32 {
-                            let workers = self.workers.read().await;
-                            let new_count = std::cmp::min(workers.len() + 1, max_w);
-                            let existing = workers.len();
+                    let max_mrf_workers = std::cmp::min(max_workers, MRF_WORKER_MAX_LIMIT);
+                    let active_mrf = self.active_mrf_workers();
 
-                            drop(workers);
-                            self.resize_workers(new_count, existing).await;
-                        }
+                    if active_mrf < max_mrf_workers as i32 {
+                        let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
+                        let new_mrf = std::cmp::min(current_mrf + 1, max_mrf_workers as i32);
 
-                        let max_mrf_workers = std::cmp::min(max_workers, MRF_WORKER_MAX_LIMIT);
-                        let active_mrf = self.active_mrf_workers();
-
-                        if active_mrf < max_mrf_workers as i32 {
-                            let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
-                            let new_mrf = std::cmp::min(current_mrf + 1, max_mrf_workers as i32);
-
-                            self.resize_failed_workers(new_mrf).await;
-                        }
+                        self.resize_failed_workers(new_mrf).await;
                     }
                 }
             }
@@ -593,31 +591,29 @@ impl<S: StorageAPI> ReplicationPool<S> {
             _ => self.get_worker_ch(&doi.bucket, &doi.delete_object.object_name, 0).await,
         };
 
-        if let Some(channel) = ch {
-            if channel.try_send(ReplicationOperation::Delete(Box::new(doi.clone()))).is_err() {
-                let _ = self.mrf_save_tx.try_send(doi.to_mrf_entry());
+        if let Some(channel) = ch
+            && channel.try_send(ReplicationOperation::Delete(Box::new(doi.clone()))).is_err()
+        {
+            let _ = self.mrf_save_tx.try_send(doi.to_mrf_entry());
 
-                let priority = self.priority.read().await.clone();
-                let max_workers = *self.max_workers.read().await;
+            let priority = self.priority.read().await.clone();
+            let max_workers = *self.max_workers.read().await;
 
-                match priority {
-                    ReplicationPriority::Fast => {
-                        info!("Warning: Unable to keep up with incoming deletes");
-                    }
-                    ReplicationPriority::Slow => {
-                        info!(
-                            "Warning: Unable to keep up with incoming deletes - recommend increasing replication priority to auto"
-                        );
-                    }
-                    ReplicationPriority::Auto => {
-                        let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                        if self.active_workers() < max_w as i32 {
-                            let workers = self.workers.read().await;
-                            let new_count = std::cmp::min(workers.len() + 1, max_w);
-                            let existing = workers.len();
-                            drop(workers);
-                            self.resize_workers(new_count, existing).await;
-                        }
+            match priority {
+                ReplicationPriority::Fast => {
+                    info!("Warning: Unable to keep up with incoming deletes");
+                }
+                ReplicationPriority::Slow => {
+                    info!("Warning: Unable to keep up with incoming deletes - recommend increasing replication priority to auto");
+                }
+                ReplicationPriority::Auto => {
+                    let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
+                    if self.active_workers() < max_w as i32 {
+                        let workers = self.workers.read().await;
+                        let new_count = std::cmp::min(workers.len() + 1, max_w);
+                        let existing = workers.len();
+                        drop(workers);
+                        self.resize_workers(new_count, existing).await;
                     }
                 }
             }

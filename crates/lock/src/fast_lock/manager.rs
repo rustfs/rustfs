@@ -414,10 +414,10 @@ impl Default for FastObjectLockManager {
 impl Drop for FastObjectLockManager {
     fn drop(&mut self) {
         // Note: We can't use async in Drop, so we just abort the cleanup task
-        if let Ok(handle_guard) = self.cleanup_handle.try_read() {
-            if let Some(handle) = handle_guard.as_ref() {
-                handle.abort();
-            }
+        if let Ok(handle_guard) = self.cleanup_handle.try_read()
+            && let Some(handle) = handle_guard.as_ref()
+        {
+            handle.abort();
         }
     }
 }

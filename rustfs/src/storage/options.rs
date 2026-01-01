@@ -64,13 +64,12 @@ pub async fn del_opts(
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if *id != Uuid::nil().to_string()
-            && let Err(err) = Uuid::parse_str(id.as_str())
-        {
-            error!("del_opts: invalid version id: {} error: {}", id, err);
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
+    if let Some(ref id) = vid
+        && *id != Uuid::nil().to_string()
+        && let Err(err) = Uuid::parse_str(id.as_str())
+    {
+        error!("del_opts: invalid version id: {} error: {}", id, err);
+        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
 
     let mut opts = put_opts_from_headers(headers, metadata.clone()).map_err(|err| {
@@ -111,12 +110,11 @@ pub async fn get_opts(
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if *id != Uuid::nil().to_string()
-            && let Err(_err) = Uuid::parse_str(id.as_str())
-        {
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
+    if let Some(ref id) = vid
+        && *id != Uuid::nil().to_string()
+        && let Err(_err) = Uuid::parse_str(id.as_str())
+    {
+        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
 
     let mut opts = get_default_opts(headers, HashMap::new(), false)
@@ -187,12 +185,11 @@ pub async fn put_opts(
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if *id != Uuid::nil().to_string()
-            && let Err(_err) = Uuid::parse_str(id.as_str())
-        {
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
+    if let Some(ref id) = vid
+        && *id != Uuid::nil().to_string()
+        && let Err(_err) = Uuid::parse_str(id.as_str())
+    {
+        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
 
     let mut opts = put_opts_from_headers(headers, metadata)
@@ -512,12 +509,11 @@ fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
             // such broken clients and content-length > 0.
             // For now, we'll assume strict compatibility is disabled
             // In a real implementation, you would check a global config
-            if let Some(content_length) = headers.get("content-length") {
-                if let Ok(length_str) = content_length.to_str() {
-                    if let Ok(length) = length_str.parse::<i64>() {
-                        return length > 0; // && !global_server_ctxt.strict_s3_compat
-                    }
-                }
+            if let Some(content_length) = headers.get("content-length")
+                && let Ok(length_str) = content_length.to_str()
+                && let Ok(length) = length_str.parse::<i64>()
+            {
+                return length > 0; // && !global_server_ctxt.strict_s3_compat
             }
             false
         }
@@ -546,10 +542,10 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
     };
 
     // We found 'X-Amz-Content-Sha256' return the captured value.
-    if let Some(header_value) = content_sha256 {
-        if let Ok(value) = header_value.to_str() {
-            return value.to_string();
-        }
+    if let Some(header_value) = content_sha256
+        && let Ok(value) = header_value.to_str()
+    {
+        return value.to_string();
     }
 
     // We couldn't find 'X-Amz-Content-Sha256'.

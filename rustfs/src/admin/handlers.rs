@@ -636,50 +636,50 @@ fn extract_metrics_init_params(uri: &Uri) -> MetricsParams {
         for param in params {
             let mut parts = param.split('=');
             if let Some(key) = parts.next() {
-                if key == "disks" {
-                    if let Some(value) = parts.next() {
-                        mp.disks = value.to_string();
-                    }
+                if key == "disks"
+                    && let Some(value) = parts.next()
+                {
+                    mp.disks = value.to_string();
                 }
-                if key == "hosts" {
-                    if let Some(value) = parts.next() {
-                        mp.hosts = value.to_string();
-                    }
+                if key == "hosts"
+                    && let Some(value) = parts.next()
+                {
+                    mp.hosts = value.to_string();
                 }
-                if key == "interval" {
-                    if let Some(value) = parts.next() {
-                        mp.tick = value.to_string();
-                    }
+                if key == "interval"
+                    && let Some(value) = parts.next()
+                {
+                    mp.tick = value.to_string();
                 }
-                if key == "n" {
-                    if let Some(value) = parts.next() {
-                        mp.n = value.parse::<u64>().unwrap_or(u64::MAX);
-                    }
+                if key == "n"
+                    && let Some(value) = parts.next()
+                {
+                    mp.n = value.parse::<u64>().unwrap_or(u64::MAX);
                 }
-                if key == "types" {
-                    if let Some(value) = parts.next() {
-                        mp.types = value.parse::<u32>().unwrap_or_default();
-                    }
+                if key == "types"
+                    && let Some(value) = parts.next()
+                {
+                    mp.types = value.parse::<u32>().unwrap_or_default();
                 }
-                if key == "by-disk" {
-                    if let Some(value) = parts.next() {
-                        mp.by_disk = value.to_string();
-                    }
+                if key == "by-disk"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_disk = value.to_string();
                 }
-                if key == "by-host" {
-                    if let Some(value) = parts.next() {
-                        mp.by_host = value.to_string();
-                    }
+                if key == "by-host"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_host = value.to_string();
                 }
-                if key == "by-jobID" {
-                    if let Some(value) = parts.next() {
-                        mp.by_job_id = value.to_string();
-                    }
+                if key == "by-jobID"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_job_id = value.to_string();
                 }
-                if key == "by-depID" {
-                    if let Some(value) = parts.next() {
-                        mp.by_dep_id = value.to_string();
-                    }
+                if key == "by-depID"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_dep_id = value.to_string();
                 }
             }
         }
@@ -830,10 +830,10 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
         for param in params {
             let mut parts = param.split('=');
             if let Some(key) = parts.next() {
-                if key == "clientToken" {
-                    if let Some(value) = parts.next() {
-                        hip.client_token = value.to_string();
-                    }
+                if key == "clientToken"
+                    && let Some(value) = parts.next()
+                {
+                    hip.client_token = value.to_string();
                 }
                 if key == "forceStart" && parts.next().is_some() {
                     hip.force_start = true;

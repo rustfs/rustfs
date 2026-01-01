@@ -318,7 +318,7 @@ fn get_divisible_size(total_sizes: &[usize]) -> usize {
 fn possible_set_counts(set_size: usize) -> Vec<usize> {
     let mut ss = Vec::new();
     for s in SET_SIZES {
-        if set_size % s == 0 {
+        if set_size.is_multiple_of(s) {
             ss.push(s);
         }
     }
@@ -340,7 +340,7 @@ fn common_set_drive_count(divisible_size: usize, set_counts: &[usize]) -> usize 
     let mut prev_d = divisible_size / set_counts[0];
     let mut set_size = 0;
     for &cnt in set_counts {
-        if divisible_size % cnt == 0 {
+        if divisible_size.is_multiple_of(cnt) {
             let d = divisible_size / cnt;
             if d <= prev_d {
                 prev_d = d;

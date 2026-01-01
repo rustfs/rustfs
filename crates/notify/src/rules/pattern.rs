@@ -24,30 +24,30 @@ pub fn new_pattern(prefix: Option<&str>, suffix: Option<&str>) -> String {
     let mut pattern = String::new();
 
     // Process the prefix part
-    if let Some(p) = prefix {
-        if !p.is_empty() {
-            pattern.push_str(p);
-            if !p.ends_with('*') {
-                pattern.push('*');
-            }
+    if let Some(p) = prefix
+        && !p.is_empty()
+    {
+        pattern.push_str(p);
+        if !p.ends_with('*') {
+            pattern.push('*');
         }
     }
 
     // Process the suffix part
-    if let Some(s) = suffix {
-        if !s.is_empty() {
-            let mut s_to_append = s.to_string();
-            if !s.starts_with('*') {
-                s_to_append.insert(0, '*');
-            }
+    if let Some(s) = suffix
+        && !s.is_empty()
+    {
+        let mut s_to_append = s.to_string();
+        if !s.starts_with('*') {
+            s_to_append.insert(0, '*');
+        }
 
-            // If the pattern is empty (only suffixes are provided), then the pattern is the suffix
-            // Otherwise, append the suffix to the pattern
-            if pattern.is_empty() {
-                pattern = s_to_append;
-            } else {
-                pattern.push_str(&s_to_append);
-            }
+        // If the pattern is empty (only suffixes are provided), then the pattern is the suffix
+        // Otherwise, append the suffix to the pattern
+        if pattern.is_empty() {
+            pattern = s_to_append;
+        } else {
+            pattern.push_str(&s_to_append);
         }
     }
 

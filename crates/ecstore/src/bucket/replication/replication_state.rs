@@ -49,13 +49,13 @@ impl ExponentialMovingAverage {
     pub fn update_exponential_moving_average(&self, now: SystemTime) {
         if let Ok(mut last_update_guard) = self.last_update.try_lock() {
             let last_update = *last_update_guard;
-            if let Ok(duration) = now.duration_since(last_update) {
-                if duration.as_secs() > 0 {
-                    let decay = (-duration.as_secs_f64() / 60.0).exp(); // 1 minute decay
-                    let current_value = f64::from_bits(self.value.load(AtomicOrdering::Relaxed));
-                    self.value.store((current_value * decay).to_bits(), AtomicOrdering::Relaxed);
-                    *last_update_guard = now;
-                }
+            if let Ok(duration) = now.duration_since(last_update)
+                && duration.as_secs() > 0
+            {
+                let decay = (-duration.as_secs_f64() / 60.0).exp(); // 1 minute decay
+                let current_value = f64::from_bits(self.value.load(AtomicOrdering::Relaxed));
+                self.value.store((current_value * decay).to_bits(), AtomicOrdering::Relaxed);
+                *last_update_guard = now;
             }
         }
     }
@@ -757,10 +757,10 @@ impl ReplicationStats {
 
     /// Check if bucket replication statistics have usage
     pub fn has_replication_usage(&self, bucket: &str) -> bool {
-        if let Ok(cache) = self.cache.try_read() {
-            if let Some(stats) = cache.get(bucket) {
-                return stats.has_replication_usage();
-            }
+        if let Ok(cache) = self.cache.try_read()
+            && let Some(stats) = cache.get(bucket)
+        {
+            return stats.has_replication_usage();
         }
         false
     }

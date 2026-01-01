@@ -86,21 +86,21 @@ impl std::fmt::Debug for OtelGuard {
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
-        if let Some(provider) = self.tracer_provider.take() {
-            if let Err(err) = provider.shutdown() {
-                eprintln!("Tracer shutdown error: {err:?}");
-            }
+        if let Some(provider) = self.tracer_provider.take()
+            && let Err(err) = provider.shutdown()
+        {
+            eprintln!("Tracer shutdown error: {err:?}");
         }
 
-        if let Some(provider) = self.meter_provider.take() {
-            if let Err(err) = provider.shutdown() {
-                eprintln!("Meter shutdown error: {err:?}");
-            }
+        if let Some(provider) = self.meter_provider.take()
+            && let Err(err) = provider.shutdown()
+        {
+            eprintln!("Meter shutdown error: {err:?}");
         }
-        if let Some(provider) = self.logger_provider.take() {
-            if let Err(err) = provider.shutdown() {
-                eprintln!("Logger shutdown error: {err:?}");
-            }
+        if let Some(provider) = self.logger_provider.take()
+            && let Err(err) = provider.shutdown()
+        {
+            eprintln!("Logger shutdown error: {err:?}");
         }
 
         if let Some(handle) = self.flexi_logger_handles.take() {

@@ -302,10 +302,10 @@ impl ECStore {
                 ..Default::default()
             });
 
-        if let Some(err) = list_result.err.clone() {
-            if err != rustfs_filemeta::Error::Unexpected {
-                return Err(to_object_err(err.into(), vec![bucket, prefix]));
-            }
+        if let Some(err) = list_result.err.clone()
+            && err != rustfs_filemeta::Error::Unexpected
+        {
+            return Err(to_object_err(err.into(), vec![bucket, prefix]));
         }
 
         if let Some(result) = list_result.entries.as_mut() {
@@ -413,10 +413,10 @@ impl ECStore {
             },
         };
 
-        if let Some(err) = list_result.err.clone() {
-            if err != rustfs_filemeta::Error::Unexpected {
-                return Err(to_object_err(err.into(), vec![bucket, prefix]));
-            }
+        if let Some(err) = list_result.err.clone()
+            && err != rustfs_filemeta::Error::Unexpected
+        {
+            return Err(to_object_err(err.into(), vec![bucket, prefix]));
         }
 
         if let Some(result) = list_result.entries.as_mut() {
@@ -498,10 +498,11 @@ impl ECStore {
         let mut o = o.clone();
         o.marker = o.marker.filter(|v| v >= &o.prefix);
 
-        if let Some(marker) = &o.marker {
-            if !o.prefix.is_empty() && !marker.starts_with(&o.prefix) {
-                return Err(Error::Unexpected);
-            }
+        if let Some(marker) = &o.marker
+            && !o.prefix.is_empty()
+            && !marker.starts_with(&o.prefix)
+        {
+            return Err(Error::Unexpected);
         }
 
         if o.limit == 0 {
@@ -806,10 +807,10 @@ impl ECStore {
                                     let value = tx2.clone();
                                     let resolver = resolver.clone();
                                     async move {
-                                        if let Some(entry) = entries.resolve(resolver) {
-                                            if let Err(err) = value.send(entry).await {
-                                                error!("list_path send fail {:?}", err);
-                                            }
+                                        if let Some(entry) = entries.resolve(resolver)
+                                            && let Err(err) = value.send(entry).await
+                                        {
+                                            error!("list_path send fail {:?}", err);
                                         }
                                     }
                                 })
@@ -975,20 +976,21 @@ async fn gather_results(
             continue;
         }
 
-        if let Some(marker) = &opts.marker {
-            if &entry.name < marker {
-                continue;
-            }
+        if let Some(marker) = &opts.marker
+            && &entry.name < marker
+        {
+            continue;
         }
 
         if !entry.name.starts_with(&opts.prefix) {
             continue;
         }
 
-        if let Some(separator) = &opts.separator {
-            if !opts.recursive && !entry.is_in_dir(&opts.prefix, separator) {
-                continue;
-            }
+        if let Some(separator) = &opts.separator
+            && !opts.recursive
+            && !entry.is_in_dir(&opts.prefix, separator)
+        {
+            continue;
         }
 
         if !opts.incl_deleted && entry.is_object() && entry.is_latest_delete_marker() && !entry.is_object_dir() {
@@ -1189,16 +1191,16 @@ async fn merge_entry_channels(
                     }
                 }
 
-                if let Some(xl) = has_xl.as_mut() {
-                    if !versions.is_empty() {
-                        xl.versions = merge_file_meta_versions(read_quorum, true, 0, &versions);
+                if let Some(xl) = has_xl.as_mut()
+                    && !versions.is_empty()
+                {
+                    xl.versions = merge_file_meta_versions(read_quorum, true, 0, &versions);
 
-                        if let Ok(meta) = xl.marshal_msg() {
-                            if let Some(b) = best.as_mut() {
-                                b.metadata = meta;
-                                b.cached = Some(xl.clone());
-                            }
-                        }
+                    if let Ok(meta) = xl.marshal_msg()
+                        && let Some(b) = best.as_mut()
+                    {
+                        b.metadata = meta;
+                        b.cached = Some(xl.clone());
                     }
                 }
             }
@@ -1206,11 +1208,11 @@ async fn merge_entry_channels(
             to_merge.clear();
         }
 
-        if let Some(best_entry) = &best {
-            if best_entry.name > last {
-                out_channel.send(best_entry.clone()).await.map_err(Error::other)?;
-                last = best_entry.name.clone();
-            }
+        if let Some(best_entry) = &best
+            && best_entry.name > last
+        {
+            out_channel.send(best_entry.clone()).await.map_err(Error::other)?;
+            last = best_entry.name.clone();
         }
 
         select_from(&mut in_channels, best_idx, &mut top, &mut n_done).await?;
@@ -1296,10 +1298,10 @@ impl SetDisks {
                         let value = tx2.clone();
                         let resolver = resolver.clone();
                         async move {
-                            if let Some(entry) = entries.resolve(resolver) {
-                                if let Err(err) = value.send(entry).await {
-                                    error!("list_path send fail {:?}", err);
-                                }
+                            if let Some(entry) = entries.resolve(resolver)
+                                && let Err(err) = value.send(entry).await
+                            {
+                                error!("list_path send fail {:?}", err);
                             }
                         }
                     })

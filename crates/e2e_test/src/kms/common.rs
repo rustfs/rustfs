@@ -406,11 +406,11 @@ impl VaultTestEnvironment {
             let port_check = TcpStream::connect(VAULT_ADDRESS).await.is_ok();
             if port_check {
                 // Additional check by making a health request
-                if let Ok(response) = reqwest::get(&format!("{VAULT_URL}/v1/sys/health")).await {
-                    if response.status().is_success() {
-                        info!("Vault server is ready after {} seconds", i);
-                        return Ok(());
-                    }
+                if let Ok(response) = reqwest::get(&format!("{VAULT_URL}/v1/sys/health")).await
+                    && response.status().is_success()
+                {
+                    info!("Vault server is ready after {} seconds", i);
+                    return Ok(());
                 }
             }
 
