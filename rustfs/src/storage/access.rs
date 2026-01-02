@@ -25,7 +25,7 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
 
 #[allow(dead_code)]
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub(crate) struct ReqInfo {
     pub cred: Option<rustfs_credentials::Credentials>,
     pub is_owner: bool,
@@ -38,6 +38,7 @@ pub(crate) struct ReqInfo {
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
     let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+
     let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
 
     if let Some(cred) = &req_info.cred {
@@ -426,8 +427,8 @@ impl S3Access for FS {
     /// Checks whether the DeleteObjects request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_objects(&self, _req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
+        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await
     }
 
     /// Checks whether the DeletePublicAccessBlock request has accesses to the resources.
