@@ -175,7 +175,7 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: e2e-test-logs-${{ github.run_number }}
           path: /tmp/rustfs.log
