@@ -428,6 +428,10 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = None;
+        req_info.version_id = None;
         authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await
     }
 
