@@ -40,7 +40,7 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::{BucketOptions, StorageAPI};
 use rustfs_obs::prometheus::{
-    auth::{AuthError, generate_prometheus_config, generate_prometheus_token, verify_bearer_token},
+    auth::{AuthError, generate_prometheus_config, generate_prometheus_token, verify_bearer_token_with_query},
     collectors::{
         BucketStats, ClusterStats, DiskStats, ResourceStats, collect_bucket_metrics, collect_cluster_metrics,
         collect_node_metrics, collect_resource_metrics,
@@ -55,18 +55,24 @@ use tracing::{error, warn};
 /// Content-Type header value for Prometheus text exposition format.
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// Verify Bearer token from request headers.
+/// Verify Bearer token from request headers or query parameter.
+///
+/// This function checks for the JWT token in two places:
+/// 1. The `Authorization: Bearer <token>` header (standard approach)
+/// 2. The `?token=<token>` query parameter (fallback for when s3s intercepts the Authorization header)
 ///
 /// Returns an S3Error if authentication fails.
-fn verify_prometheus_auth(headers: &HeaderMap) -> S3Result<()> {
+fn verify_prometheus_auth(headers: &HeaderMap, uri: &http::Uri) -> S3Result<()> {
     let secret_key = get_global_secret_key();
     if secret_key.is_empty() {
         return Err(s3_error!(InternalError, "server credentials not initialized"));
     }
 
-    match verify_bearer_token(headers, &secret_key) {
+    match verify_bearer_token_with_query(headers, uri, &secret_key) {
         Ok(_) => Ok(()),
-        Err(AuthError::MissingAuthHeader) => Err(s3_error!(AccessDenied, "missing authorization header")),
+        Err(AuthError::MissingAuthHeader) => {
+            Err(s3_error!(AccessDenied, "missing authorization header or token query parameter"))
+        }
         Err(AuthError::InvalidAuthFormat) => {
             Err(s3_error!(AccessDenied, "invalid authorization format, expected 'Bearer <token>'"))
         }
@@ -200,7 +206,7 @@ pub struct ClusterMetricsHandler;
 #[async_trait::async_trait]
 impl Operation for ClusterMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        verify_prometheus_auth(&req.headers)?;
+        verify_prometheus_auth(&req.headers, &req.uri)?;
 
         let stats = collect_cluster_stats().await;
         let metrics = collect_cluster_metrics(&stats);
@@ -221,7 +227,7 @@ pub struct BucketMetricsHandler;
 #[async_trait::async_trait]
 impl Operation for BucketMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        verify_prometheus_auth(&req.headers)?;
+        verify_prometheus_auth(&req.headers, &req.uri)?;
 
         let stats = collect_bucket_stats().await;
         let metrics = collect_bucket_metrics(&stats);
@@ -242,7 +248,7 @@ pub struct NodeMetricsHandler;
 #[async_trait::async_trait]
 impl Operation for NodeMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        verify_prometheus_auth(&req.headers)?;
+        verify_prometheus_auth(&req.headers, &req.uri)?;
 
         let stats = collect_disk_stats().await;
         let metrics = collect_node_metrics(&stats);
@@ -270,7 +276,7 @@ pub struct ResourceMetricsHandler;
 #[async_trait::async_trait]
 impl Operation for ResourceMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        verify_prometheus_auth(&req.headers)?;
+        verify_prometheus_auth(&req.headers, &req.uri)?;
 
         let stats = collect_process_stats();
         let metrics = collect_resource_metrics(&stats);

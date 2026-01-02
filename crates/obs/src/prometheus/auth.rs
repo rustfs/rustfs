@@ -197,6 +197,71 @@ pub fn verify_bearer_token(headers: &HeaderMap, secret_key: &str) -> Result<Prom
     validate_token(token, secret_key)
 }
 
+/// Verify a Bearer token from HTTP request headers or query parameter.
+///
+/// This function first tries to extract the JWT token from the Authorization header.
+/// If the header is missing, it falls back to checking the `token` query parameter.
+/// This is useful when the Authorization header cannot be used (e.g., when s3s
+/// intercepts it for AWS signature parsing).
+///
+/// # Arguments
+///
+/// * `headers` - The HTTP headers from the incoming request
+/// * `uri` - The request URI (used to extract query parameters)
+/// * `secret_key` - The secret key used to verify the token signature
+///
+/// # Returns
+///
+/// Returns the decoded `PrometheusClaims` on success, or an `AuthError` on failure.
+///
+/// # Example
+///
+/// ```rust
+/// use rustfs_obs::prometheus::auth::verify_bearer_token_with_query;
+/// use http::{HeaderMap, Uri};
+///
+/// // With query parameter
+/// let headers = HeaderMap::new();
+/// let uri: Uri = "/metrics?token=eyJ...".parse().unwrap();
+///
+/// match verify_bearer_token_with_query(&headers, &uri, "secret-key") {
+///     Ok(claims) => println!("Authenticated as: {}", claims.sub),
+///     Err(e) => eprintln!("Authentication failed: {}", e),
+/// }
+/// ```
+pub fn verify_bearer_token_with_query(
+    headers: &HeaderMap,
+    uri: &http::Uri,
+    secret_key: &str,
+) -> Result<PrometheusClaims, AuthError> {
+    // First try the Authorization header
+    if let Some(auth_header) = headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        && let Some(token) = auth_header.strip_prefix("Bearer ")
+    {
+        return validate_token(token, secret_key);
+    }
+
+    // Fall back to query parameter
+    let token = extract_token_from_query(uri).ok_or(AuthError::MissingAuthHeader)?;
+    validate_token(&token, secret_key)
+}
+
+/// Extract the token from a URI query string.
+///
+/// Looks for a `token` parameter in the query string and returns its value.
+fn extract_token_from_query(uri: &http::Uri) -> Option<String> {
+    uri.query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            if k == "token" {
+                urlencoding::decode(v).ok().map(|s| s.into_owned())
+            } else {
+                None
+            }
+        })
+    })
+}
+
 /// Validate a JWT token string.
 ///
 /// Decodes and validates the JWT token using the HS512 algorithm,
@@ -496,6 +561,105 @@ mod tests {
 
         let claims = validate_token(&token, secret_key).expect("Validation should succeed");
 
+        assert_eq!(claims.sub, access_key);
+    }
+
+    #[test]
+    fn test_verify_bearer_token_with_query_from_header() {
+        let access_key = "admin";
+        let secret_key = "supersecretkey123456789";
+
+        let token = generate_prometheus_token(access_key, secret_key, None).expect("Token generation should succeed");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
+
+        let uri: http::Uri = "/metrics".parse().unwrap();
+
+        let claims = verify_bearer_token_with_query(&headers, &uri, secret_key).expect("Token verification should succeed");
+        assert_eq!(claims.sub, access_key);
+    }
+
+    #[test]
+    fn test_verify_bearer_token_with_query_from_query_param() {
+        let access_key = "admin";
+        let secret_key = "supersecretkey123456789";
+
+        let token = generate_prometheus_token(access_key, secret_key, None).expect("Token generation should succeed");
+
+        let headers = HeaderMap::new();
+        let uri: http::Uri = format!("/metrics?token={}", token).parse().unwrap();
+
+        let claims = verify_bearer_token_with_query(&headers, &uri, secret_key).expect("Token verification should succeed");
+        assert_eq!(claims.sub, access_key);
+    }
+
+    #[test]
+    fn test_verify_bearer_token_with_query_prefers_header() {
+        let access_key_header = "header-user";
+        let access_key_query = "query-user";
+        let secret_key = "supersecretkey123456789";
+
+        let token_header =
+            generate_prometheus_token(access_key_header, secret_key, None).expect("Token generation should succeed");
+        let token_query =
+            generate_prometheus_token(access_key_query, secret_key, None).expect("Token generation should succeed");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, format!("Bearer {}", token_header).parse().unwrap());
+
+        let uri: http::Uri = format!("/metrics?token={}", token_query).parse().unwrap();
+
+        // Should use the header token, not the query param
+        let claims = verify_bearer_token_with_query(&headers, &uri, secret_key).expect("Token verification should succeed");
+        assert_eq!(claims.sub, access_key_header);
+    }
+
+    #[test]
+    fn test_verify_bearer_token_with_query_missing_both() {
+        let headers = HeaderMap::new();
+        let uri: http::Uri = "/metrics".parse().unwrap();
+
+        let result = verify_bearer_token_with_query(&headers, &uri, "secret");
+        assert!(matches!(result, Err(AuthError::MissingAuthHeader)));
+    }
+
+    #[test]
+    fn test_verify_bearer_token_with_query_invalid_token() {
+        let headers = HeaderMap::new();
+        let uri: http::Uri = "/metrics?token=invalid-token".parse().unwrap();
+
+        let result = verify_bearer_token_with_query(&headers, &uri, "secret");
+        assert!(matches!(result, Err(AuthError::InvalidToken(_))));
+    }
+
+    #[test]
+    fn test_extract_token_from_query_url_encoded() {
+        let access_key = "user";
+        let secret_key = "secret123456";
+
+        let token = generate_prometheus_token(access_key, secret_key, Some(3600)).expect("Token generation should succeed");
+
+        // URL-encode the token (JWT tokens contain '.' which are safe, but test the mechanism)
+        let encoded_token = urlencoding::encode(&token);
+        let headers = HeaderMap::new();
+        let uri: http::Uri = format!("/metrics?token={}", encoded_token).parse().unwrap();
+
+        let claims = verify_bearer_token_with_query(&headers, &uri, secret_key).expect("Token verification should succeed");
+        assert_eq!(claims.sub, access_key);
+    }
+
+    #[test]
+    fn test_extract_token_from_query_with_other_params() {
+        let access_key = "user";
+        let secret_key = "secret123456";
+
+        let token = generate_prometheus_token(access_key, secret_key, Some(3600)).expect("Token generation should succeed");
+
+        let headers = HeaderMap::new();
+        let uri: http::Uri = format!("/metrics?foo=bar&token={}&baz=qux", token).parse().unwrap();
+
+        let claims = verify_bearer_token_with_query(&headers, &uri, secret_key).expect("Token verification should succeed");
         assert_eq!(claims.sub, access_key);
     }
 }

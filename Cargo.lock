@@ -3373,6 +3373,7 @@ dependencies = [
  "rustfs-iam",
  "rustfs-lock",
  "rustfs-madmin",
+ "rustfs-obs",
  "rustfs-protos",
  "rustls",
  "rustls-pemfile",
@@ -8532,6 +8533,7 @@ dependencies = [
  "tracing-error",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "urlencoding",
 ]
 
 [[package]]
