@@ -13,13 +13,16 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, ops::Deref};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, Error as DeError, Visitor},
+};
+use std::{collections::HashSet, fmt, ops::Deref};
 use strum::{EnumString, IntoStaticStr};
 
 use super::{Error as IamError, Validator, utils::wildcard};
 
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[derive(Serialize, Clone, Default, Debug)]
 pub struct ActionSet(pub HashSet<Action>);
 
 impl ActionSet {
@@ -58,6 +61,54 @@ impl Validator for ActionSet {
 impl PartialEq for ActionSet {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len() && self.0.iter().all(|x| other.0.contains(x))
+    }
+}
+
+impl<'de> Deserialize<'de> for ActionSet {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ActionOrVecVisitor;
+
+        impl<'de> Visitor<'de> for ActionOrVecVisitor {
+            type Value = ActionSet;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string or an array of strings")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let action = Action::try_from(value).map_err(|e| E::custom(format!("invalid action: {}", e)))?;
+                let mut set = HashSet::new();
+                set.insert(action);
+                Ok(ActionSet(set))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+                A::Error: DeError,
+            {
+                let mut set = HashSet::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(value) = seq.next_element::<String>()? {
+                    match Action::try_from(value.as_str()) {
+                        Ok(action) => {
+                            set.insert(action);
+                        }
+                        Err(e) => {
+                            return Err(A::Error::custom(format!("invalid action: {}", e)));
+                        }
+                    }
+                }
+                Ok(ActionSet(set))
+            }
+        }
+
+        deserializer.deserialize_any(ActionOrVecVisitor)
     }
 }
 
