@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 /// DEFAULT_VERSION is the default version.
 /// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_version.html
 pub const DEFAULT_VERSION: &str = "2012-10-17";
-
+use tracing::error;
 /// check the data is Validator
 pub trait Validator {
     type Error;
@@ -145,8 +145,13 @@ impl Policy {
 
     pub fn parse_config(data: &[u8]) -> Result<Policy> {
         let policy: Policy = serde_json::from_slice(data)?;
-        policy.validate()?;
-        Ok(policy)
+        match policy.validate() {
+            Ok(_) => Ok(policy),
+            Err(e) => {
+                error!("parse policy error: {}", e);
+                Err(Error::other(e))
+            }
+        }
     }
 }
 
@@ -523,6 +528,49 @@ mod test {
         let _p2 = Policy::parse_config(str.as_bytes())?;
 
         // assert_eq!(p, p2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_policy_with_single_string_action_and_resource() -> Result<()> {
+        // Test policy with single string Action and Resource (AWS IAM allows both formats)
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::test/analytics/customers/*"
+    }
+  ]
+}
+"#;
+
+        let p = Policy::parse_config(data.as_bytes())?;
+        assert!(!p.statements.is_empty());
+        assert!(!p.statements[0].actions.is_empty());
+        assert!(!p.statements[0].resources.is_empty());
+
+        // Test with array format (should still work)
+        let data_array = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::test/analytics/customers/*"]
+    }
+  ]
+}
+"#;
+
+        let p2 = Policy::parse_config(data_array.as_bytes())?;
+        assert!(!p2.statements.is_empty());
+        assert!(!p2.statements[0].actions.is_empty());
+        assert!(!p2.statements[0].resources.is_empty());
+
         Ok(())
     }
 
