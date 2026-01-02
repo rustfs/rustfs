@@ -1502,9 +1502,13 @@ impl S3 for FS {
 
     /// Delete multiple objects
     #[instrument(level = "debug", skip(self, req))]
-    async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
+    async fn delete_objects(&self, mut req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, "s3:DeleteObjects").suppress_event();
-        let DeleteObjectsInput { bucket, delete, .. } = req.input.clone();
+        let (bucket, delete) = {
+            let bucket = req.input.bucket.clone();
+            let delete = req.input.delete.clone();
+            (bucket, delete)
+        };
 
         if delete.objects.is_empty() || delete.objects.len() > 1000 {
             return Err(S3Error::with_message(
@@ -1544,7 +1548,6 @@ impl S3 for FS {
 
         let mut object_to_delete = Vec::new();
         let mut object_to_delete_index = HashMap::new();
-
         for (idx, object) in delete.objects.iter().enumerate() {
             if let Some(version_id) = object.version_id.clone() {
                 let _vid = match Uuid::parse_str(&version_id) {
@@ -1561,25 +1564,23 @@ impl S3 for FS {
                     }
                 };
             };
+
             {
-                let mut req_per = req.clone();
-                let req_info = req_per.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+                let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
                 req_info.bucket = Some(bucket.clone());
                 req_info.object = Some(object.key.clone());
                 req_info.version_id = object.version_id.clone();
+            }
 
-                // Perform authorization check; if it fails, record error and skip the object
-                let auth_res = authorize_request(&mut req_per, Action::S3Action(S3Action::DeleteObjectAction)).await;
-
-                if let Err(e) = auth_res {
-                    delete_results[idx].error = Some(Error {
-                        code: Some("AccessDenied".to_string()),
-                        key: Some(object.key.clone()),
-                        message: Some(e.to_string()),
-                        version_id: object.version_id.clone(),
-                    });
-                    continue;
-                }
+            let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::DeleteObjectAction)).await;
+            if let Err(e) = auth_res {
+                delete_results[idx].error = Some(Error {
+                    code: Some("AccessDenied".to_string()),
+                    key: Some(object.key.clone()),
+                    message: Some(e.to_string()),
+                    version_id: object.version_id.clone(),
+                });
+                continue;
             }
 
             let mut object = ObjectToDelete {
