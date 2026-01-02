@@ -55,12 +55,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// These claims follow standard JWT conventions and are used to identify
 /// the authenticated user and validate token expiration.
+///
+/// Note: `iat` is optional for compatibility with MinIO CLI-generated tokens
+/// which only include `iss`, `sub`, and `exp` fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrometheusClaims {
     /// Subject - the access key ID of the authenticated user
     pub sub: String,
-    /// Issued at timestamp (Unix epoch seconds)
-    pub iat: u64,
+    /// Issued at timestamp (Unix epoch seconds) - optional for mc CLI compatibility
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iat: Option<u64>,
     /// Expiration timestamp (Unix epoch seconds)
     pub exp: u64,
     /// Issuer identifier
@@ -134,7 +138,7 @@ pub fn generate_prometheus_token(access_key: &str, secret_key: &str, expiry_secs
 
     let claims = PrometheusClaims {
         sub: access_key.to_string(),
-        iat: now,
+        iat: Some(now),
         exp: now + expiry,
         iss: PROMETHEUS_ISSUER.to_string(),
     };
@@ -523,9 +527,10 @@ mod tests {
         // Verify all fields are populated correctly
         assert_eq!(claims.sub, access_key);
         assert_eq!(claims.iss, PROMETHEUS_ISSUER);
-        assert!(claims.iat > 0);
-        assert!(claims.exp > claims.iat);
-        assert_eq!(claims.exp - claims.iat, 7200);
+        let iat = claims.iat.expect("iat should be present in generated tokens");
+        assert!(iat > 0);
+        assert!(claims.exp > iat);
+        assert_eq!(claims.exp - iat, 7200);
     }
 
     #[test]

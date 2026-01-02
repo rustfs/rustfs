@@ -18,6 +18,9 @@ use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMOR
 
 /// Prefix for Prometheus metrics endpoints (uses Bearer token auth instead of S3 signatures)
 const PROMETHEUS_METRICS_PREFIX: &str = "/rustfs/v2/metrics/";
+
+/// Path for Prometheus token endpoint (uses Basic Auth instead of S3 signatures)
+const PROMETHEUS_TOKEN_PATH: &str = "/rustfs/admin/v3/prometheus/token";
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -139,6 +142,11 @@ where
         // Prometheus metrics endpoints use Bearer token auth (validated in handler)
         // Allow the request through - the handler will verify the Bearer token
         if path.starts_with(PROMETHEUS_METRICS_PREFIX) {
+            return Ok(());
+        }
+
+        // Prometheus token endpoint uses Basic Auth (validated in handler)
+        if path == PROMETHEUS_TOKEN_PATH {
             return Ok(());
         }
 

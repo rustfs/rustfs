@@ -30,7 +30,8 @@ use handlers::{
     group, kms, kms_dynamic, kms_keys, policies, pools,
     profile::{TriggerProfileCPU, TriggerProfileMemory},
     prometheus::{
-        BucketMetricsHandler, ClusterMetricsHandler, NodeMetricsHandler, PrometheusConfigHandler, ResourceMetricsHandler,
+        BucketMetricsHandler, ClusterMetricsHandler, NodeMetricsHandler, PrometheusConfigHandler, PrometheusTokenHandler,
+        ResourceMetricsHandler,
     },
     rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
@@ -364,11 +365,8 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
     // Prometheus metrics endpoints
     // These endpoints use Bearer token authentication for Prometheus scrapers
     r.insert(Method::GET, "/rustfs/v2/metrics/cluster", AdminOperation(&ClusterMetricsHandler {}))?;
-
     r.insert(Method::GET, "/rustfs/v2/metrics/bucket", AdminOperation(&BucketMetricsHandler {}))?;
-
     r.insert(Method::GET, "/rustfs/v2/metrics/node", AdminOperation(&NodeMetricsHandler {}))?;
-
     r.insert(Method::GET, "/rustfs/v2/metrics/resource", AdminOperation(&ResourceMetricsHandler {}))?;
 
     // Prometheus configuration generator (admin auth required)
@@ -376,6 +374,13 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/prometheus/config").as_str(),
         AdminOperation(&PrometheusConfigHandler {}),
+    )?;
+
+    // Prometheus token endpoint (uses Basic Auth, validated in handler)
+    r.insert(
+        Method::POST,
+        "/rustfs/admin/v3/prometheus/token",
+        AdminOperation(&PrometheusTokenHandler {}),
     )?;
 
     Ok(r)

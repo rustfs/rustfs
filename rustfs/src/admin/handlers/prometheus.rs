@@ -406,6 +406,80 @@ fn extract_query_param(uri: &http::Uri, key: &str) -> Option<String> {
     })
 }
 
+/// Response structure for Prometheus token endpoint.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PrometheusTokenResponse {
+    /// Bearer token for authenticating Prometheus scraper
+    pub bearer_token: String,
+}
+
+/// Handler for Prometheus token generation via query parameters.
+///
+/// This endpoint accepts credentials via query parameters and returns a JWT bearer token
+/// that can be used to authenticate Prometheus scrape requests.
+///
+/// # Authentication
+///
+/// The request must include `access_key` and `secret_key` query parameters
+/// with the admin credentials.
+///
+/// # Example
+///
+/// ```bash
+/// curl -X POST "http://localhost:9000/rustfs/admin/v3/prometheus/token?access_key=admin&secret_key=password"
+/// ```
+///
+/// # Response
+///
+/// On success, returns a JSON response with the bearer token:
+/// ```json
+/// {"bearer_token": "<jwt_token>"}
+/// ```
+pub struct PrometheusTokenHandler;
+
+#[async_trait::async_trait]
+impl Operation for PrometheusTokenHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        // Extract credentials from query parameters
+        let access_key = extract_query_param(&req.uri, "access_key")
+            .ok_or_else(|| s3_error!(AccessDenied, "missing 'access_key' query parameter"))?;
+
+        let secret_key = extract_query_param(&req.uri, "secret_key")
+            .ok_or_else(|| s3_error!(AccessDenied, "missing 'secret_key' query parameter"))?;
+
+        // Get admin credentials
+        let admin_cred = get_global_action_cred()
+            .ok_or_else(|| s3_error!(InternalError, "server credentials not initialized"))?;
+
+        // Validate credentials using constant-time comparison
+        if !crate::auth::constant_time_eq(&access_key, &admin_cred.access_key)
+            || !crate::auth::constant_time_eq(&secret_key, &admin_cred.secret_key)
+        {
+            return Err(s3_error!(AccessDenied, "invalid credentials"));
+        }
+
+        // Generate JWT token
+        let token = generate_prometheus_token(&admin_cred.access_key, &admin_cred.secret_key, None).map_err(|e| {
+            error!("Failed to generate Prometheus token: {}", e);
+            s3_error!(InternalError, "failed to generate token")
+        })?;
+
+        let response = PrometheusTokenResponse { bearer_token: token };
+
+        let data = serde_json::to_vec(&response).map_err(|e| {
+            error!("Failed to serialize Prometheus token response: {}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize response")
+        })?;
+
+        let mut headers = HeaderMap::new();
+        if let Ok(content_type) = "application/json".parse::<HeaderValue>() {
+            headers.insert(CONTENT_TYPE, content_type);
+        }
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +537,19 @@ mod tests {
 
         let deserialized: PrometheusConfigResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.bearer_token, "test-token");
+    }
+
+    #[test]
+    fn test_prometheus_token_response_serialization() {
+        let response = PrometheusTokenResponse {
+            bearer_token: "jwt-test-token".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("bearer_token"));
+        assert!(json.contains("jwt-test-token"));
+
+        let deserialized: PrometheusTokenResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.bearer_token, "jwt-test-token");
     }
 }
