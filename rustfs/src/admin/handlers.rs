@@ -18,12 +18,15 @@ use crate::auth::check_key_valid;
 use crate::auth::get_condition_values;
 use crate::auth::get_session_token;
 use crate::error::ApiError;
+use crate::server::RemoteAddr;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
+use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_HEAL_REQUEST_SIZE};
+use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
@@ -34,7 +37,6 @@ use rustfs_ecstore::data_usage::{
     aggregate_local_snapshots, compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend,
 };
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_ecstore::new_object_layer_fn;
@@ -71,7 +73,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 use tracing::{error, info, warn};
 use url::Host;
-// use url::UrlQuery;
 
 pub mod bucket_meta;
 pub mod event;
@@ -158,14 +159,15 @@ impl Operation for IsAdminHandler {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (_cred, _owner) =
+        let (cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         let access_key_to_check = input_cred.access_key.clone();
 
         // Check if the user is admin by comparing with global credentials
         let is_admin = if let Some(sys_cred) = get_global_action_cred() {
-            sys_cred.access_key == access_key_to_check
+            crate::auth::constant_time_eq(&access_key_to_check, &sys_cred.access_key)
+                || crate::auth::constant_time_eq(&cred.parent_user, &sys_cred.access_key)
         } else {
             false
         };
@@ -209,7 +211,8 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let conditions = get_condition_values(&req.headers, &cred_clone, None, None);
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let conditions = get_condition_values(&req.headers, &cred_clone, None, None, remote_addr);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
 
@@ -404,12 +407,14 @@ impl Operation for ServerInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            remote_addr,
         )
         .await?;
 
@@ -450,12 +455,14 @@ impl Operation for StorageInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::StorageInfoAdminAction)],
+            remote_addr,
         )
         .await?;
 
@@ -491,6 +498,7 @@ impl Operation for DataUsageInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
         validate_admin_request(
             &req.headers,
             &cred,
@@ -500,6 +508,7 @@ impl Operation for DataUsageInfoHandler {
                 Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
                 Action::S3Action(S3Action::ListBucketAction),
             ],
+            remote_addr,
         )
         .await?;
 
@@ -627,50 +636,50 @@ fn extract_metrics_init_params(uri: &Uri) -> MetricsParams {
         for param in params {
             let mut parts = param.split('=');
             if let Some(key) = parts.next() {
-                if key == "disks" {
-                    if let Some(value) = parts.next() {
-                        mp.disks = value.to_string();
-                    }
+                if key == "disks"
+                    && let Some(value) = parts.next()
+                {
+                    mp.disks = value.to_string();
                 }
-                if key == "hosts" {
-                    if let Some(value) = parts.next() {
-                        mp.hosts = value.to_string();
-                    }
+                if key == "hosts"
+                    && let Some(value) = parts.next()
+                {
+                    mp.hosts = value.to_string();
                 }
-                if key == "interval" {
-                    if let Some(value) = parts.next() {
-                        mp.tick = value.to_string();
-                    }
+                if key == "interval"
+                    && let Some(value) = parts.next()
+                {
+                    mp.tick = value.to_string();
                 }
-                if key == "n" {
-                    if let Some(value) = parts.next() {
-                        mp.n = value.parse::<u64>().unwrap_or(u64::MAX);
-                    }
+                if key == "n"
+                    && let Some(value) = parts.next()
+                {
+                    mp.n = value.parse::<u64>().unwrap_or(u64::MAX);
                 }
-                if key == "types" {
-                    if let Some(value) = parts.next() {
-                        mp.types = value.parse::<u32>().unwrap_or_default();
-                    }
+                if key == "types"
+                    && let Some(value) = parts.next()
+                {
+                    mp.types = value.parse::<u32>().unwrap_or_default();
                 }
-                if key == "by-disk" {
-                    if let Some(value) = parts.next() {
-                        mp.by_disk = value.to_string();
-                    }
+                if key == "by-disk"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_disk = value.to_string();
                 }
-                if key == "by-host" {
-                    if let Some(value) = parts.next() {
-                        mp.by_host = value.to_string();
-                    }
+                if key == "by-host"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_host = value.to_string();
                 }
-                if key == "by-jobID" {
-                    if let Some(value) = parts.next() {
-                        mp.by_job_id = value.to_string();
-                    }
+                if key == "by-jobID"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_job_id = value.to_string();
                 }
-                if key == "by-depID" {
-                    if let Some(value) = parts.next() {
-                        mp.by_dep_id = value.to_string();
-                    }
+                if key == "by-depID"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_dep_id = value.to_string();
                 }
             }
         }
@@ -821,10 +830,10 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
         for param in params {
             let mut parts = param.split('=');
             if let Some(key) = parts.next() {
-                if key == "clientToken" {
-                    if let Some(value) = parts.next() {
-                        hip.client_token = value.to_string();
-                    }
+                if key == "clientToken"
+                    && let Some(value) = parts.next()
+                {
+                    hip.client_token = value.to_string();
                 }
                 if key == "forceStart" && parts.next().is_some() {
                     hip.force_start = true;
@@ -859,11 +868,11 @@ impl Operation for HealHandler {
         let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
         info!("cred: {:?}", cred);
         let mut input = req.input;
-        let bytes = match input.store_all_unlimited().await {
+        let bytes = match input.store_all_limited(MAX_HEAL_REQUEST_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "heal request body too large or failed to read"));
             }
         };
         info!("bytes: {:?}", bytes);
@@ -1051,11 +1060,11 @@ impl Operation for SetRemoteTargetHandler {
             .map_err(ApiError::from)?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "remote target configuration body too large or failed to read"));
             }
         };
 
@@ -1326,8 +1335,7 @@ impl Operation for ProfileHandler {
             let target_arch = std::env::consts::ARCH;
             let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
             let msg = format!(
-                "CPU profiling is not supported on this platform. target_os={}, target_env={}, target_arch={}, requested_url={}",
-                target_os, target_env, target_arch, requested_url
+                "CPU profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}, requested_url={requested_url}"
             );
             return Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(msg))));
         }

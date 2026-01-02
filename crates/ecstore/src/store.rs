@@ -55,8 +55,8 @@ use futures::future::join_all;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::Rng as _;
-use rustfs_common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
@@ -127,11 +127,11 @@ impl ECStore {
         info!("ECStore new address: {}", address.to_string());
         let mut host = address.ip().to_string();
         if host.is_empty() {
-            host = GLOBAL_Rustfs_Host.read().await.to_string()
+            host = GLOBAL_RUSTFS_HOST.read().await.to_string()
         }
         let mut port = address.port().to_string();
         if port.is_empty() {
-            port = GLOBAL_Rustfs_Port.read().await.to_string()
+            port = GLOBAL_RUSTFS_PORT.read().await.to_string()
         }
         info!("ECStore new host: {}, port: {}", host, port);
         init_local_peer(&endpoint_pools, &host, &port).await;
@@ -243,10 +243,10 @@ impl ECStore {
         });
 
         // Only set it when the global deployment ID is not yet configured
-        if let Some(dep_id) = deployment_id {
-            if get_global_deployment_id().is_none() {
-                set_global_deployment_id(dep_id);
-            }
+        if let Some(dep_id) = deployment_id
+            && get_global_deployment_id().is_none()
+        {
+            set_global_deployment_id(dep_id);
         }
 
         let wait_sec = 5;
@@ -768,10 +768,10 @@ impl ECStore {
             def_pool = pinfo.clone();
             has_def_pool = true;
             // https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-deletes.html
-            if is_err_object_not_found(err) {
-                if let Err(err) = opts.precondition_check(&pinfo.object_info) {
-                    return Err(err.clone());
-                }
+            if is_err_object_not_found(err)
+                && let Err(err) = opts.precondition_check(&pinfo.object_info)
+            {
+                return Err(err.clone());
             }
 
             if !is_err_object_not_found(err) && !is_err_version_not_found(err) {
@@ -885,13 +885,14 @@ impl ECStore {
                 return Ok((obj, res.idx));
             }
 
-            if let Some(err) = res.err {
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(err);
-                }
-
-                // TODO: delete marker
+            if let Some(err) = res.err
+                && !is_err_object_not_found(&err)
+                && !is_err_version_not_found(&err)
+            {
+                return Err(err);
             }
+
+            // TODO: delete marker
         }
 
         let object = decode_dir_object(object);
@@ -918,12 +919,12 @@ impl ECStore {
         let mut derrs = Vec::new();
 
         for pe in errs.iter() {
-            if let Some(err) = &pe.err {
-                if err == &StorageError::ErasureWriteQuorum {
-                    objs.push(None);
-                    derrs.push(Some(StorageError::ErasureWriteQuorum));
-                    continue;
-                }
+            if let Some(err) = &pe.err
+                && err == &StorageError::ErasureWriteQuorum
+            {
+                objs.push(None);
+                derrs.push(Some(StorageError::ErasureWriteQuorum));
+                continue;
             }
 
             if let Some(idx) = pe.index {
@@ -1226,13 +1227,13 @@ impl StorageAPI for ECStore {
 
     #[instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        if !is_meta_bucketname(bucket) {
-            if let Err(err) = check_valid_bucket_name_strict(bucket) {
-                return Err(StorageError::BucketNameInvalid(err.to_string()));
-            }
-
-            // TODO: nslock
+        if !is_meta_bucketname(bucket)
+            && let Err(err) = check_valid_bucket_name_strict(bucket)
+        {
+            return Err(StorageError::BucketNameInvalid(err.to_string()));
         }
+
+        // TODO: nslock
 
         if let Err(err) = self.peer_sys.make_bucket(bucket, opts).await {
             let err = to_object_err(err.into(), vec![bucket]);
@@ -1427,12 +1428,12 @@ impl StorageAPI for ECStore {
         let pool_idx = self.get_pool_idx_no_lock(src_bucket, &src_object, src_info.size).await?;
 
         if cp_src_dst_same {
-            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id) {
-                if src_vid == dst_vid {
-                    return self.pools[pool_idx]
-                        .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, dst_opts)
-                        .await;
-                }
+            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
+                && src_vid == dst_vid
+            {
+                return self.pools[pool_idx]
+                    .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, dst_opts)
+                    .await;
             }
 
             if !dst_opts.versioned && src_opts.version_id.is_none() {
@@ -2329,15 +2330,15 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
 
     if peer_set.is_empty() {
         if !host.is_empty() {
-            *GLOBAL_Local_Node_Name.write().await = format!("{host}:{port}");
+            *GLOBAL_LOCAL_NODE_NAME.write().await = format!("{host}:{port}");
             return;
         }
 
-        *GLOBAL_Local_Node_Name.write().await = format!("127.0.0.1:{port}");
+        *GLOBAL_LOCAL_NODE_NAME.write().await = format!("127.0.0.1:{port}");
         return;
     }
 
-    *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();
+    *GLOBAL_LOCAL_NODE_NAME.write().await = peer_set[0].clone();
 }
 
 pub fn is_valid_object_prefix(_object: &str) -> bool {
@@ -2433,13 +2434,13 @@ fn check_list_multipart_args(
     check_list_objs_args(bucket, prefix, key_marker)?;
 
     if let Some(upload_id_marker) = upload_id_marker {
-        if let Some(key_marker) = key_marker {
-            if key_marker.ends_with('/') {
-                return Err(StorageError::InvalidUploadIDKeyCombination(
-                    upload_id_marker.to_string(),
-                    key_marker.to_string(),
-                ));
-            }
+        if let Some(key_marker) = key_marker
+            && key_marker.ends_with('/')
+        {
+            return Err(StorageError::InvalidUploadIDKeyCombination(
+                upload_id_marker.to_string(),
+                key_marker.to_string(),
+            ));
         }
 
         if let Err(_e) = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(upload_id_marker.as_bytes()) {
@@ -2510,10 +2511,10 @@ pub async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>
     let opts = &DiskInfoOptions::default();
     let mut res = vec![None; disks.len()];
     for (idx, disk_op) in disks.iter().enumerate() {
-        if let Some(disk) = disk_op {
-            if let Ok(info) = disk.disk_info(opts).await {
-                res[idx] = Some(info);
-            }
+        if let Some(disk) = disk_op
+            && let Ok(info) = disk.disk_info(opts).await
+        {
+            res[idx] = Some(info);
         }
     }
 

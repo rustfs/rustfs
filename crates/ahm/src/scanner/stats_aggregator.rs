@@ -327,16 +327,16 @@ impl DecentralizedStatsAggregator {
         );
 
         // Check cache validity if timestamp is not initial value (UNIX_EPOCH)
-        if cache_timestamp != SystemTime::UNIX_EPOCH {
-            if let Ok(elapsed) = now.duration_since(cache_timestamp) {
-                if elapsed < cache_ttl {
-                    if let Some(cached) = self.cached_stats.read().await.as_ref() {
-                        debug!("Returning cached aggregated stats, remaining TTL: {:?}", cache_ttl - elapsed);
-                        return Ok(cached.clone());
-                    }
-                } else {
-                    debug!("Cache expired: elapsed={:?} >= ttl={:?}", elapsed, cache_ttl);
+        if cache_timestamp != SystemTime::UNIX_EPOCH
+            && let Ok(elapsed) = now.duration_since(cache_timestamp)
+        {
+            if elapsed < cache_ttl {
+                if let Some(cached) = self.cached_stats.read().await.as_ref() {
+                    debug!("Returning cached aggregated stats, remaining TTL: {:?}", cache_ttl - elapsed);
+                    return Ok(cached.clone());
                 }
+            } else {
+                debug!("Cache expired: elapsed={:?} >= ttl={:?}", elapsed, cache_ttl);
             }
         }
 
@@ -347,7 +347,8 @@ impl DecentralizedStatsAggregator {
 
         // update cache
         *self.cached_stats.write().await = Some(aggregated.clone());
-        *self.cache_timestamp.write().await = aggregation_timestamp;
+        // Use the time when aggregation completes as cache timestamp to avoid premature expiry during long runs
+        *self.cache_timestamp.write().await = SystemTime::now();
 
         Ok(aggregated)
     }
@@ -359,7 +360,8 @@ impl DecentralizedStatsAggregator {
 
         // update cache
         *self.cached_stats.write().await = Some(aggregated.clone());
-        *self.cache_timestamp.write().await = now;
+        // Cache timestamp should reflect completion time rather than aggregation start
+        *self.cache_timestamp.write().await = SystemTime::now();
 
         Ok(aggregated)
     }

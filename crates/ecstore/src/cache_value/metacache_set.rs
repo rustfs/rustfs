@@ -16,7 +16,7 @@ use crate::disk::error::DiskError;
 use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
 use futures::future::join_all;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin};
 use tokio::spawn;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -71,14 +71,14 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
-    let fds = Arc::new(opts.fallback_disks.clone());
+    let fds = opts.fallback_disks.iter().flatten().cloned().collect::<Vec<_>>();
 
     let cancel_rx = CancellationToken::new();
 
     for disk in opts.disks.iter() {
         let opdisk = disk.clone();
         let opts_clone = opts.clone();
-        let fds_clone = fds.clone();
+        let mut fds_clone = fds.clone();
         let cancel_rx_clone = cancel_rx.clone();
         let (rd, mut wr) = tokio::io::duplex(64);
         readers.push(MetacacheReader::new(rd));
@@ -113,21 +113,20 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             }
 
             while need_fallback {
-                // warn!("list_path_raw: while need_fallback start");
-                let disk = match fds_clone.iter().find(|d| d.is_some()) {
-                    Some(d) => {
-                        if let Some(disk) = d.clone() {
-                            disk
-                        } else {
-                            warn!("list_path_raw: fallback disk is none");
-                            break;
-                        }
-                    }
-                    None => {
-                        warn!("list_path_raw: fallback disk is none2");
-                        break;
+                let disk_op = {
+                    if fds_clone.is_empty() {
+                        None
+                    } else {
+                        let disk = fds_clone.remove(0);
+                        if disk.is_online().await { Some(disk.clone()) } else { None }
                     }
                 };
+
+                let Some(disk) = disk_op else {
+                    warn!("list_path_raw: fallback disk is none");
+                    break;
+                };
+
                 match disk
                     .as_ref()
                     .walk_dir(
@@ -309,12 +308,10 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
             // Break if all at EOF or error.
             if at_eof + has_err == readers.len() {
-                if has_err > 0 {
-                    if let Some(finished_fn) = opts.finished.as_ref() {
-                        if has_err > 0 {
-                            finished_fn(&errs).await;
-                        }
-                    }
+                if has_err > 0
+                    && let Some(finished_fn) = opts.finished.as_ref()
+                {
+                    finished_fn(&errs).await;
                 }
 
                 // error!("list_path_raw: at_eof + has_err == readers.len() break {:?}", &errs);

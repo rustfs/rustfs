@@ -13,24 +13,14 @@
 // limitations under the License.
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
-use http::{HeaderMap, StatusCode};
-//use iam::get_global_action_cred;
-use matchit::Params;
-use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{
-    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
-    header::{CONTENT_LENGTH, CONTENT_TYPE},
-    s3_error,
-};
-use serde_urlencoded::from_bytes;
-use time::OffsetDateTime;
-use tracing::{debug, warn};
-
 use crate::{
     admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
+    server::RemoteAddr,
 };
-
+use http::{HeaderMap, StatusCode};
+use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::{
     config::storageclass,
     global::GLOBAL_TierConfigMgr,
@@ -44,6 +34,15 @@ use rustfs_ecstore::{
         },
     },
 };
+use rustfs_policy::policy::action::{Action, AdminAction};
+use s3s::{
+    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    s3_error,
+};
+use serde_urlencoded::from_bytes;
+use time::OffsetDateTime;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct AddTierQuery {
@@ -92,14 +91,22 @@ impl Operation for AddTier {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::SetTierAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "tier configuration body too large or failed to read"));
             }
         };
 
@@ -220,14 +227,22 @@ impl Operation for EditTier {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::SetTierAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "tier configuration body too large or failed to read"));
             }
         };
 
@@ -295,7 +310,15 @@ impl Operation for ListTiers {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ListTierAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
         let tiers = tier_config_mgr.list_tiers();
@@ -331,7 +354,15 @@ impl Operation for RemoveTier {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::SetTierAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let mut force: bool = false;
         let force_str = query.force.clone().unwrap_or_default();
@@ -394,7 +425,15 @@ impl Operation for VerifyTier {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ListTierAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         tier_config_mgr.verify(&query.tier.unwrap()).await;
@@ -417,7 +456,15 @@ impl Operation for GetTierInfo {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ListTierAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -469,7 +516,15 @@ impl Operation for ClearTier {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::SetTierAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+        )
+        .await?;
 
         let mut force: bool = false;
         let force_str = query.force;

@@ -39,9 +39,9 @@ use rustfs_config::{
         ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_FLUSH_MS, ENV_OBS_LOG_MESSAGE_CAPA, ENV_OBS_LOG_POOL_CAPA,
     },
 };
-use rustfs_utils::{get_env_u64, get_env_usize, get_local_ip_with_default};
+use rustfs_utils::{get_env_opt_str, get_env_u64, get_env_usize, get_local_ip_with_default};
 use smallvec::SmallVec;
-use std::{borrow::Cow, env, fs, io::IsTerminal, time::Duration};
+use std::{borrow::Cow, fs, io::IsTerminal, time::Duration};
 use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
@@ -86,21 +86,21 @@ impl std::fmt::Debug for OtelGuard {
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
-        if let Some(provider) = self.tracer_provider.take() {
-            if let Err(err) = provider.shutdown() {
-                eprintln!("Tracer shutdown error: {err:?}");
-            }
+        if let Some(provider) = self.tracer_provider.take()
+            && let Err(err) = provider.shutdown()
+        {
+            eprintln!("Tracer shutdown error: {err:?}");
         }
 
-        if let Some(provider) = self.meter_provider.take() {
-            if let Err(err) = provider.shutdown() {
-                eprintln!("Meter shutdown error: {err:?}");
-            }
+        if let Some(provider) = self.meter_provider.take()
+            && let Err(err) = provider.shutdown()
+        {
+            eprintln!("Meter shutdown error: {err:?}");
         }
-        if let Some(provider) = self.logger_provider.take() {
-            if let Err(err) = provider.shutdown() {
-                eprintln!("Logger shutdown error: {err:?}");
-            }
+        if let Some(provider) = self.logger_provider.take()
+            && let Err(err) = provider.shutdown()
+        {
+            eprintln!("Logger shutdown error: {err:?}");
         }
 
         if let Some(handle) = self.flexi_logger_handles.take() {
@@ -574,8 +574,8 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> Result<OtelGuard, Telemetry
     }
 
     // Rule 2: The user has explicitly customized the log directory (determined by whether ENV_OBS_LOG_DIRECTORY is set)
-    let user_set_log_dir = env::var(ENV_OBS_LOG_DIRECTORY).is_ok();
-    if user_set_log_dir {
+    let user_set_log_dir = get_env_opt_str(ENV_OBS_LOG_DIRECTORY);
+    if user_set_log_dir.filter(|d| !d.is_empty()).is_some() {
         return init_file_logging(config, logger_level, is_production);
     }
 

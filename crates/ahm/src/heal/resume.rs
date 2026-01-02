@@ -541,10 +541,10 @@ impl ResumeUtils {
         for entry in entries {
             if entry.ends_with(&format!("_{RESUME_STATE_FILE}")) {
                 // Extract task ID from filename: {task_id}_ahm_resume_state.json
-                if let Some(task_id) = entry.strip_suffix(&format!("_{RESUME_STATE_FILE}")) {
-                    if !task_id.is_empty() {
-                        task_ids.push(task_id.to_string());
-                    }
+                if let Some(task_id) = entry.strip_suffix(&format!("_{RESUME_STATE_FILE}"))
+                    && !task_id.is_empty()
+                {
+                    task_ids.push(task_id.to_string());
                 }
             }
         }

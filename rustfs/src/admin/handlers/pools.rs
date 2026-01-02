@@ -26,6 +26,7 @@ use crate::{
     admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
     error::ApiError,
+    server::RemoteAddr,
 };
 
 pub struct ListPools {}
@@ -53,6 +54,7 @@ impl Operation for ListPools {
                 Action::AdminAction(AdminAction::ServerInfoAdminAction),
                 Action::AdminAction(AdminAction::DecommissionAdminAction),
             ],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -119,6 +121,7 @@ impl Operation for StatusPool {
                 Action::AdminAction(AdminAction::ServerInfoAdminAction),
                 Action::AdminAction(AdminAction::DecommissionAdminAction),
             ],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -194,6 +197,7 @@ impl Operation for StartDecommission {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DecommissionAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -292,6 +296,7 @@ impl Operation for CancelDecommission {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DecommissionAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 

@@ -22,6 +22,7 @@ pub mod utils;
 #[cfg(test)]
 mod console_test;
 
+use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use handlers::{
     GetReplicationMetricsHandler, HealthCheckHandler, IsAdminHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler,
     SetRemoteTargetHandler, bucket_meta,
@@ -37,17 +38,21 @@ use router::{AdminOperation, S3Router};
 use rpc::register_rpc_route;
 use s3s::route::S3Route;
 
-const ADMIN_PREFIX: &str = "/rustfs/admin";
-// const ADMIN_PREFIX: &str = "/minio/admin";
-
+/// Create admin router
+///
+/// # Arguments
+/// * `console_enabled` - Whether the console is enabled
+///
+/// # Returns
+/// An instance of S3Route for admin operations
 pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
 
     // Health check endpoint for monitoring and orchestration
-    r.insert(Method::GET, "/health", AdminOperation(&HealthCheckHandler {}))?;
-    r.insert(Method::HEAD, "/health", AdminOperation(&HealthCheckHandler {}))?;
-    r.insert(Method::GET, "/profile/cpu", AdminOperation(&TriggerProfileCPU {}))?;
-    r.insert(Method::GET, "/profile/memory", AdminOperation(&TriggerProfileMemory {}))?;
+    r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::GET, PROFILE_CPU_PATH, AdminOperation(&TriggerProfileCPU {}))?;
+    r.insert(Method::GET, PROFILE_MEMORY_PATH, AdminOperation(&TriggerProfileMemory {}))?;
 
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;

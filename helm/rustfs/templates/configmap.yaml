@@ -2,23 +2,20 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "rustfs.fullname" . }}-config
+  labels:
+    {{- toYaml .Values.commonLabels | nindent 4 }}
 data:
   RUSTFS_ADDRESS: {{ .Values.config.rustfs.address | quote }}
   RUSTFS_CONSOLE_ADDRESS: {{ .Values.config.rustfs.console_address | quote }}
-  RUSTFS_OBS_LOG_DIRECTORY: {{ .Values.config.rustfs.obs_log_directory | quote }}
   RUSTFS_CONSOLE_ENABLE: {{ .Values.config.rustfs.console_enable | quote }}
+  RUSTFS_OBS_LOG_DIRECTORY: {{ .Values.config.rustfs.obs_log_directory | quote }}
   RUSTFS_OBS_LOGGER_LEVEL: {{ .Values.config.rustfs.log_level | quote }}
-  {{- if and .Values.mode.distributed.enabled (or (gt (int .Values.replicaCount) 1) (gt (int .Values.volumesPerReplica) 1)) }}
-  {{- $podIndex := "0" }}
-  {{- if gt (int .Values.replicaCount) 1 }}
-  {{- $podIndex = printf "{0...%d}" (sub (int .Values.replicaCount) 1) }}
+  RUSTFS_OBS_ENVIRONMENT: {{ .Values.config.rustfs.obs_environment | quote }}
+  {{- if .Values.config.rustfs.region }}
+  RUSTFS_REGION: {{ .Values.config.rustfs.region | quote }}
   {{- end }}
-  {{- $volumePath := "/data" }}
-  {{- if gt (int .Values.volumesPerReplica) 1 }}
-  {{- $volumePath = printf "/data/rustfs{0...%d}" (sub (int .Values.volumesPerReplica) 1) }}
-  {{- end }}
-  RUSTFS_VOLUMES: "http://{{ include "rustfs.fullname" . }}-{{ $podIndex }}.{{ include "rustfs.fullname" . }}-headless:9000{{ $volumePath }}"
+  {{- if .Values.mode.distributed.enabled }}
+  RUSTFS_VOLUMES: {{ .Values.config.rustfs.volumes | default (include "rustfs.volumes" .) }}
   {{- else }}
   RUSTFS_VOLUMES: "/data"
   {{- end }}
-  RUSTFS_OBS_ENVIRONMENT: "develop"

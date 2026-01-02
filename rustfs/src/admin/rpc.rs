@@ -15,10 +15,12 @@
 use super::router::AdminOperation;
 use super::router::Operation;
 use super::router::S3Router;
+use crate::server::RPC_PREFIX;
 use futures::StreamExt;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::disk::WalkDirOptions;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -34,8 +36,6 @@ use serde_urlencoded::from_bytes;
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 use tracing::warn;
-
-pub const RPC_PREFIX: &str = "/rustfs/rpc";
 
 pub fn register_rpc_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -141,11 +141,11 @@ impl Operation for WalkDir {
         };
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "RPC request body too large or failed to read"));
             }
         };
 

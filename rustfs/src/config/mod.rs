@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use clap::Parser;
+use clap::builder::NonEmptyStringValueParser;
 use const_str::concat;
 use std::string::ToString;
 shadow_rs::shadow!(build);
@@ -50,7 +51,12 @@ const LONG_VERSION: &str = concat!(
 #[command(version = SHORT_VERSION, long_version = LONG_VERSION)]
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
-    #[arg(required = true, env = "RUSTFS_VOLUMES")]
+    #[arg(
+        required = true,
+        env = "RUSTFS_VOLUMES",
+        value_delimiter = ' ',
+        value_parser = NonEmptyStringValueParser::new()
+    )]
     pub volumes: Vec<String>,
 
     /// bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname
@@ -58,15 +64,20 @@ pub struct Opt {
     pub address: String,
 
     /// Domain name used for virtual-hosted-style requests.
-    #[arg(long, env = "RUSTFS_SERVER_DOMAINS")]
+    #[arg(
+        long,
+        env = "RUSTFS_SERVER_DOMAINS",
+        value_delimiter = ',',
+        value_parser = NonEmptyStringValueParser::new()
+    )]
     pub server_domains: Vec<String>,
 
     /// Access key used for authentication.
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
+    #[arg(long, default_value_t = rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
     pub access_key: String,
 
     /// Secret key used for authentication.
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
+    #[arg(long, default_value_t = rustfs_credentials::DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
     pub secret_key: String,
 
     /// Enable console server

@@ -40,7 +40,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_common::{
-    globals::GLOBAL_Local_Node_Name,
+    GLOBAL_LOCAL_NODE_NAME,
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
@@ -170,7 +170,7 @@ impl Sets {
 
             let set_disks = SetDisks::new(
                 fast_lock_manager.clone(),
-                GLOBAL_Local_Node_Name.read().await.to_string(),
+                GLOBAL_LOCAL_NODE_NAME.read().await.to_string(),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
                 parity_count,
@@ -255,7 +255,7 @@ impl Sets {
         self.connect_disks().await;
 
         // TODO: config interval
-        let mut interval = tokio::time::interval(Duration::from_secs(15 * 3));
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
                _= interval.tick()=>{
@@ -491,12 +491,12 @@ impl StorageAPI for Sets {
         let cp_src_dst_same = path_join_buf(&[src_bucket, src_object]) == path_join_buf(&[dst_bucket, dst_object]);
 
         if cp_src_dst_same {
-            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id) {
-                if src_vid == dst_vid {
-                    return src_set
-                        .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-                        .await;
-                }
+            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
+                && src_vid == dst_vid
+            {
+                return src_set
+                    .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+                    .await;
             }
 
             if !dst_opts.versioned && src_opts.version_id.is_none() {
@@ -823,10 +823,10 @@ impl StorageAPI for Sets {
                         Ok((m, n)) => (m, n),
                         Err(_) => continue,
                     };
-                    if let Some(set) = self.disk_set.get(m) {
-                        if let Some(Some(disk)) = set.disks.read().await.get(n) {
-                            let _ = disk.close().await;
-                        }
+                    if let Some(set) = self.disk_set.get(m)
+                        && let Some(Some(disk)) = set.disks.read().await.get(n)
+                    {
+                        let _ = disk.close().await;
                     }
 
                     if let Some(Some(disk)) = disks.get(index) {
@@ -980,25 +980,24 @@ fn new_heal_format_sets(
     let mut current_disks_info = vec![vec![DiskInfo::default(); set_drive_count]; set_count];
     for (i, set) in ref_format.erasure.sets.iter().enumerate() {
         for j in 0..set.len() {
-            if let Some(Some(err)) = errs.get(i * set_drive_count + j) {
-                if *err == DiskError::UnformattedDisk {
-                    let mut fm = FormatV3::new(set_count, set_drive_count);
-                    fm.id = ref_format.id;
-                    fm.format = ref_format.format.clone();
-                    fm.version = ref_format.version.clone();
-                    fm.erasure.this = ref_format.erasure.sets[i][j];
-                    fm.erasure.sets = ref_format.erasure.sets.clone();
-                    fm.erasure.version = ref_format.erasure.version.clone();
-                    fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
-                    new_formats[i][j] = Some(fm);
-                }
+            if let Some(Some(err)) = errs.get(i * set_drive_count + j)
+                && *err == DiskError::UnformattedDisk
+            {
+                let mut fm = FormatV3::new(set_count, set_drive_count);
+                fm.id = ref_format.id;
+                fm.format = ref_format.format.clone();
+                fm.version = ref_format.version.clone();
+                fm.erasure.this = ref_format.erasure.sets[i][j];
+                fm.erasure.sets = ref_format.erasure.sets.clone();
+                fm.erasure.version = ref_format.erasure.version.clone();
+                fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
+                new_formats[i][j] = Some(fm);
             }
-            if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j]) {
-                if let Some(info) = &format.disk_info {
-                    if !info.endpoint.is_empty() {
-                        current_disks_info[i][j] = info.clone();
-                    }
-                }
+            if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j])
+                && let Some(info) = &format.disk_info
+                && !info.endpoint.is_empty()
+            {
+                current_disks_info[i][j] = info.clone();
             }
         }
     }

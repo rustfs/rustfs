@@ -97,11 +97,11 @@ pub fn parse_key(s: &str) -> Key {
     }
 
     // Number of batch items parsed
-    if let Some(colon_pos) = name.find(':') {
-        if let Ok(count) = name[..colon_pos].parse::<usize>() {
-            item_count = count;
-            name = name[colon_pos + 1..].to_string();
-        }
+    if let Some(colon_pos) = name.find(':')
+        && let Ok(count) = name[..colon_pos].parse::<usize>()
+    {
+        item_count = count;
+        name = name[colon_pos + 1..].to_string();
     }
 
     // Resolve extension
@@ -312,7 +312,7 @@ where
             compress: true,
         };
 
-        let data = serde_json::to_vec(&item).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let data = serde_json::to_vec(&*item).map_err(|e| StoreError::Serialization(e.to_string()))?;
         self.write_file(&key, &data)?;
 
         Ok(key)

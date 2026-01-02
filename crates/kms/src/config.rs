@@ -279,14 +279,13 @@ impl KmsConfig {
                 }
 
                 // Validate TLS configuration if using HTTPS
-                if config.address.starts_with("https://") {
-                    if let Some(ref tls) = config.tls {
-                        if !tls.skip_verify {
-                            // In production, we should have proper TLS configuration
-                            if tls.ca_cert_path.is_none() && tls.client_cert_path.is_none() {
-                                tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
-                            }
-                        }
+                if config.address.starts_with("https://")
+                    && let Some(ref tls) = config.tls
+                    && !tls.skip_verify
+                {
+                    // In production, we should have proper TLS configuration
+                    if tls.ca_cert_path.is_none() && tls.client_cert_path.is_none() {
+                        tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
                     }
                 }
             }

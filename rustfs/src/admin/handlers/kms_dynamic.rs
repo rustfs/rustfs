@@ -17,8 +17,10 @@
 use super::Operation;
 use crate::admin::auth::validate_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
+use crate::server::RemoteAddr;
 use hyper::StatusCode;
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_kms::{
@@ -97,12 +99,13 @@ impl Operation for ConfigureKmsHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -195,12 +198,13 @@ impl Operation for StartKmsHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -328,6 +332,7 @@ impl Operation for StopKmsHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -393,6 +398,7 @@ impl Operation for GetKmsStatusHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
@@ -464,12 +470,13 @@ impl Operation for ReconfigureKmsHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<RemoteAddr>().map(|a| a.0),
         )
         .await?;
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 

@@ -442,10 +442,10 @@ impl MetaCacheEntriesSorted {
     }
 
     pub fn forward_past(&mut self, marker: Option<String>) {
-        if let Some(val) = marker {
-            if let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val) {
-                self.o.0 = self.o.0.split_off(idx);
-            }
+        if let Some(val) = marker
+            && let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val)
+        {
+            self.o.0 = self.o.0.split_off(idx);
         }
     }
 }
@@ -788,22 +788,23 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
-        if now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() {
-            if let Some(v) = v {
-                return Ok(v);
-            }
+        if now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs()
+            && let Some(v) = v
+        {
+            return Ok(v);
         }
 
-        if self.opts.no_wait && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2 {
-            if let Some(value) = v {
-                if self.updating.try_lock().is_ok() {
-                    let this = Arc::clone(&self);
-                    spawn(async move {
-                        let _ = this.update().await;
-                    });
-                }
-                return Ok(value);
+        if self.opts.no_wait
+            && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2
+            && let Some(value) = v
+        {
+            if self.updating.try_lock().is_ok() {
+                let this = Arc::clone(&self);
+                spawn(async move {
+                    let _ = this.update().await;
+                });
             }
+            return Ok(value);
         }
 
         let _ = self.updating.lock().await;
@@ -811,10 +812,9 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
         if let (Ok(duration), Some(value)) = (
             SystemTime::now().duration_since(UNIX_EPOCH + Duration::from_secs(self.last_update_ms.load(AtomicOrdering::SeqCst))),
             v,
-        ) {
-            if duration < self.ttl {
-                return Ok(value);
-            }
+        ) && duration < self.ttl
+        {
+            return Ok(value);
         }
 
         match self.update().await {
@@ -831,10 +831,16 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
         }
     }
 
+    #[allow(unsafe_code)]
     async fn update(&self) -> std::io::Result<()> {
         match (self.update_fn)().await {
             Ok(val) => {
-                self.val.store(Box::into_raw(Box::new(val)), AtomicOrdering::SeqCst);
+                let old = self.val.swap(Box::into_raw(Box::new(val)), AtomicOrdering::SeqCst);
+                if !old.is_null() {
+                    unsafe {
+                        drop(Box::from_raw(old));
+                    }
+                }
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards")

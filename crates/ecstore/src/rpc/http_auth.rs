@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::global::get_global_action_cred;
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use hmac::{Hmac, KeyInit, Mac};
@@ -20,6 +19,7 @@ use http::HeaderMap;
 use http::HeaderValue;
 use http::Method;
 use http::Uri;
+use rustfs_credentials::get_global_action_cred;
 use sha2::Sha256;
 use time::OffsetDateTime;
 use tracing::error;

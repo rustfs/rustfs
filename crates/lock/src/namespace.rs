@@ -165,10 +165,10 @@ impl NamespaceLock {
         let mut successful_clients = Vec::new();
 
         for (idx, res) in results {
-            if let Ok(resp) = res {
-                if resp.success {
-                    successful_clients.push(idx);
-                }
+            if let Ok(resp) = res
+                && resp.success
+            {
+                successful_clients.push(idx);
             }
         }
 

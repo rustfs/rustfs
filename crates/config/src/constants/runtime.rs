@@ -39,3 +39,10 @@ pub const DEFAULT_MAX_IO_EVENTS_PER_TICK: usize = 1024;
 /// Event polling default (Tokio default 61)
 pub const DEFAULT_EVENT_INTERVAL: u32 = 61;
 pub const DEFAULT_RNG_SEED: Option<u64> = None; // None means random
+
+/// Threshold for small object seek support in megabytes.
+///
+/// When an object is smaller than this size, rustfs will provide seek support.
+///
+/// Default is set to 10MB.
+pub const DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD: usize = 10 * 1024 * 1024;

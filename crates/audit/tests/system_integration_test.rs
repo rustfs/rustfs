@@ -135,7 +135,7 @@ async fn test_global_audit_functions() {
 
 #[tokio::test]
 async fn test_config_parsing_with_multiple_instances() {
-    let mut registry = AuditRegistry::new();
+    let registry = AuditRegistry::new();
 
     // Create config with multiple webhook instances
     let mut config = Config(HashMap::new());
@@ -164,7 +164,7 @@ async fn test_config_parsing_with_multiple_instances() {
     config.0.insert("audit_webhook".to_string(), webhook_section);
 
     // Try to create targets from config
-    let result = registry.create_targets_from_config(&config).await;
+    let result = registry.create_audit_targets_from_config(&config).await;
 
     // Should fail due to server storage not initialized, but parsing should work
     match result {

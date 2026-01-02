@@ -196,13 +196,12 @@ impl ParsedURL {
 impl std::fmt::Display for ParsedURL {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut url = self.0.clone();
-        if let Some(host) = url.host_str().map(|h| h.to_string()) {
-            if let Some(port) = url.port() {
-                if (url.scheme() == "http" && port == 80) || (url.scheme() == "https" && port == 443) {
-                    url.set_host(Some(&host)).unwrap();
-                    url.set_port(None).unwrap();
-                }
-            }
+        if let Some(host) = url.host_str().map(|h| h.to_string())
+            && let Some(port) = url.port()
+            && ((url.scheme() == "http" && port == 80) || (url.scheme() == "https" && port == 443))
+        {
+            url.set_host(Some(&host)).unwrap();
+            url.set_port(None).unwrap();
         }
         let mut s = url.to_string();
 
@@ -251,12 +250,12 @@ impl<'de> serde::Deserialize<'de> for ParsedURL {
 /// Returns NetError if parsing fails or host is invalid.
 ///
 pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
-    if let Some(scheme_end) = s.find("://") {
-        if s[scheme_end + 3..].starts_with('/') {
-            let scheme = &s[..scheme_end];
-            if !scheme.is_empty() {
-                return Err(NetError::SchemeWithEmptyHost);
-            }
+    if let Some(scheme_end) = s.find("://")
+        && s[scheme_end + 3..].starts_with('/')
+    {
+        let scheme = &s[..scheme_end];
+        if !scheme.is_empty() {
+            return Err(NetError::SchemeWithEmptyHost);
         }
     }
 

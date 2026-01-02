@@ -18,9 +18,9 @@ use hashbrown::HashSet;
 use rumqttc::QoS;
 use rustfs_config::notify::{ENV_NOTIFY_MQTT_KEYS, ENV_NOTIFY_WEBHOOK_KEYS, NOTIFY_MQTT_KEYS, NOTIFY_WEBHOOK_KEYS};
 use rustfs_config::{
-    DEFAULT_DIR, DEFAULT_LIMIT, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT,
-    MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY,
-    WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+    DEFAULT_LIMIT, EVENT_DEFAULT_DIR, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
+    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT,
+    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
 use rustfs_ecstore::config::KVS;
 use rustfs_targets::{
@@ -60,14 +60,15 @@ impl TargetFactory for WebhookTargetFactory {
         let endpoint = config
             .lookup(WEBHOOK_ENDPOINT)
             .ok_or_else(|| TargetError::Configuration("Missing webhook endpoint".to_string()))?;
-        let endpoint_url = Url::parse(&endpoint)
-            .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {e} (value: '{endpoint}')")))?;
+        let parsed_endpoint = endpoint.trim();
+        let endpoint_url = Url::parse(parsed_endpoint)
+            .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {e} (value: '{parsed_endpoint}')")))?;
 
         let args = WebhookArgs {
             enable: true, // If we are here, it's already enabled.
             endpoint: endpoint_url,
             auth_token: config.lookup(WEBHOOK_AUTH_TOKEN).unwrap_or_default(),
-            queue_dir: config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(DEFAULT_DIR.to_string()),
+            queue_dir: config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(EVENT_DEFAULT_DIR.to_string()),
             queue_limit: config
                 .lookup(WEBHOOK_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
@@ -100,7 +101,7 @@ impl TargetFactory for WebhookTargetFactory {
             ));
         }
 
-        let queue_dir = config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(DEFAULT_DIR.to_string());
+        let queue_dir = config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(EVENT_DEFAULT_DIR.to_string());
         if !queue_dir.is_empty() && !std::path::Path::new(&queue_dir).is_absolute() {
             return Err(TargetError::Configuration("Webhook queue directory must be an absolute path".to_string()));
         }
@@ -159,7 +160,7 @@ impl TargetFactory for MQTTTargetFactory {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(Duration::from_secs)
                 .unwrap_or_else(|| Duration::from_secs(30)),
-            queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or(DEFAULT_DIR.to_string()),
+            queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or(EVENT_DEFAULT_DIR.to_string()),
             queue_limit: config
                 .lookup(MQTT_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
@@ -203,10 +204,10 @@ impl TargetFactory for MQTTTargetFactory {
             if !std::path::Path::new(&queue_dir).is_absolute() {
                 return Err(TargetError::Configuration("MQTT queue directory must be an absolute path".to_string()));
             }
-            if let Some(qos_str) = config.lookup(MQTT_QOS) {
-                if qos_str == "0" {
-                    warn!("Using queue_dir with QoS 0 may result in event loss");
-                }
+            if let Some(qos_str) = config.lookup(MQTT_QOS)
+                && qos_str == "0"
+            {
+                warn!("Using queue_dir with QoS 0 may result in event loss");
             }
         }
 

@@ -18,30 +18,58 @@ use rustfs_ecstore::store::ECStore;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
-use tracing::{debug, instrument};
+use tracing::{error, info, instrument};
 
 pub mod cache;
 pub mod error;
 pub mod manager;
 pub mod store;
-pub mod utils;
-
 pub mod sys;
+pub mod utils;
 
 static IAM_SYS: OnceLock<Arc<IamSys<ObjectStore>>> = OnceLock::new();
 
 #[instrument(skip(ecstore))]
 pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
-    debug!("init iam system");
-    let s = IamCache::new(ObjectStore::new(ecstore)).await;
+    if IAM_SYS.get().is_some() {
+        info!("IAM system already initialized, skipping.");
+        return Ok(());
+    }
 
-    IAM_SYS.get_or_init(move || IamSys::new(s).into());
+    info!("Starting IAM system initialization sequence...");
+
+    // 1. Create the persistent storage adapter
+    let storage_adapter = ObjectStore::new(ecstore);
+
+    // 2. Create the cache manager.
+    // The `new` method now performs a blocking initial load from disk.
+    let cache_manager = IamCache::new(storage_adapter).await;
+
+    // 3. Construct the system interface
+    let iam_instance = Arc::new(IamSys::new(cache_manager));
+
+    // 4. Securely set the global singleton
+    if IAM_SYS.set(iam_instance).is_err() {
+        error!("Critical: Race condition detected during IAM initialization!");
+        return Err(Error::IamSysAlreadyInitialized);
+    }
+
+    info!("IAM system initialization completed successfully.");
     Ok(())
 }
 
 #[inline]
 pub fn get() -> Result<Arc<IamSys<ObjectStore>>> {
-    IAM_SYS.get().map(Arc::clone).ok_or(Error::IamSysNotInitialized)
+    let sys = IAM_SYS.get().map(Arc::clone).ok_or(Error::IamSysNotInitialized)?;
+
+    // Double-check the internal readiness state. The OnceLock is only set
+    // after initialization and data loading complete, so this is a defensive
+    // guard to ensure callers never operate on a partially initialized system.
+    if !sys.is_ready() {
+        return Err(Error::IamSysNotInitialized);
+    }
+
+    Ok(sys)
 }
 
 pub fn get_global_iam_sys() -> Option<Arc<IamSys<ObjectStore>>> {

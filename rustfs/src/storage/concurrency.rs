@@ -251,6 +251,8 @@ struct IoLoadMetrics {
     recent_waits: Vec<Duration>,
     /// Maximum samples to keep in the window
     max_samples: usize,
+    /// The earliest record index in the recent_waits vector
+    earliest_index: usize,
     /// Total wait time observed (for averaging)
     total_wait_ns: AtomicU64,
     /// Total number of observations
@@ -263,6 +265,7 @@ impl IoLoadMetrics {
         Self {
             recent_waits: Vec::with_capacity(max_samples),
             max_samples,
+            earliest_index: 0,
             total_wait_ns: AtomicU64::new(0),
             observation_count: AtomicU64::new(0),
         }
@@ -271,10 +274,12 @@ impl IoLoadMetrics {
     /// Record a new permit wait observation
     fn record(&mut self, wait: Duration) {
         // Add to recent waits (with eviction if full)
-        if self.recent_waits.len() >= self.max_samples {
-            self.recent_waits.remove(0);
+        if self.recent_waits.len() < self.max_samples {
+            self.recent_waits.push(wait);
+        } else {
+            self.recent_waits[self.earliest_index] = wait;
+            self.earliest_index = (self.earliest_index + 1) % self.max_samples;
         }
-        self.recent_waits.push(wait);
 
         // Update totals for overall statistics
         self.total_wait_ns.fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
@@ -1165,12 +1170,12 @@ impl HotObjectCache {
     #[allow(dead_code)]
     async fn invalidate_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
         // Always invalidate the latest version key
-        let base_key = format!("{}/{}", bucket, key);
+        let base_key = format!("{bucket}/{key}");
         self.invalidate(&base_key).await;
 
         // Also invalidate the specific version if provided
         if let Some(vid) = version_id {
-            let versioned_key = format!("{}?versionId={}", base_key, vid);
+            let versioned_key = format!("{base_key}?versionId={vid}");
             self.invalidate(&versioned_key).await;
         }
     }
@@ -1625,8 +1630,8 @@ impl ConcurrencyManager {
     /// Cache key string
     pub fn make_cache_key(bucket: &str, key: &str, version_id: Option<&str>) -> String {
         match version_id {
-            Some(vid) => format!("{}/{}?versionId={}", bucket, key, vid),
-            None => format!("{}/{}", bucket, key),
+            Some(vid) => format!("{bucket}/{key}?versionId={vid}"),
+            None => format!("{bucket}/{key}"),
         }
     }
 
@@ -1650,13 +1655,19 @@ pub fn get_concurrency_manager() -> &'static ConcurrencyManager {
     &CONCURRENCY_MANAGER
 }
 
+/// Testing helper to reset the global request counter.
+#[allow(dead_code)]
+pub(crate) fn reset_active_get_requests() {
+    ACTIVE_GET_REQUESTS.store(0, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_concurrent_request_tracking() {
-        // Ensure we start from a clean state
+        reset_active_get_requests();
         assert_eq!(GetObjectGuard::concurrent_requests(), 0);
 
         let _guard1 = GetObjectGuard::new();
@@ -1722,7 +1733,7 @@ mod tests {
         // Fill cache with objects
         for i in 0..200 {
             let data = vec![0u8; 64 * KI_B];
-            cache.put(format!("key_{}", i), data).await;
+            cache.put(format!("key_{i}"), data).await;
         }
 
         let stats = cache.stats().await;
@@ -1779,8 +1790,7 @@ mod tests {
         let result = get_advanced_buffer_size(32 * KI_B as i64, 256 * KI_B, true);
         assert!(
             (16 * KI_B..=64 * KI_B).contains(&result),
-            "Small files should use reduced buffer: {}",
-            result
+            "Small files should use reduced buffer: {result}"
         );
     }
 
@@ -1861,5 +1871,155 @@ mod tests {
         assert!(manager.is_cached("warm1").await);
         assert!(manager.is_cached("warm2").await);
         assert!(manager.is_cached("warm3").await);
+    }
+
+    #[test]
+    fn test_io_load_metrics_record_not_full() {
+        let mut metrics = IoLoadMetrics::new(5);
+        metrics.record(Duration::from_millis(10));
+        metrics.record(Duration::from_millis(20));
+        assert_eq!(metrics.recent_waits.len(), 2);
+        assert_eq!(metrics.recent_waits[0], Duration::from_millis(10));
+        assert_eq!(metrics.recent_waits[1], Duration::from_millis(20));
+        assert_eq!(metrics.observation_count(), 2);
+    }
+
+    #[test]
+    fn test_io_load_metrics_record_full_and_circular() {
+        let mut metrics = IoLoadMetrics::new(3);
+        metrics.record(Duration::from_millis(10));
+        metrics.record(Duration::from_millis(20));
+        metrics.record(Duration::from_millis(30));
+        assert_eq!(metrics.recent_waits.len(), 3);
+        assert_eq!(metrics.earliest_index, 0);
+
+        // This should overwrite the first element (10ms)
+        metrics.record(Duration::from_millis(40));
+        assert_eq!(metrics.recent_waits.len(), 3);
+        assert_eq!(metrics.recent_waits[0], Duration::from_millis(40));
+        assert_eq!(metrics.recent_waits[1], Duration::from_millis(20));
+        assert_eq!(metrics.recent_waits[2], Duration::from_millis(30));
+        assert_eq!(metrics.earliest_index, 1);
+        assert_eq!(metrics.observation_count(), 4);
+
+        // This should overwrite the second element (20ms)
+        metrics.record(Duration::from_millis(50));
+        assert_eq!(metrics.recent_waits.len(), 3);
+        assert_eq!(metrics.recent_waits[0], Duration::from_millis(40));
+        assert_eq!(metrics.recent_waits[1], Duration::from_millis(50));
+        assert_eq!(metrics.recent_waits[2], Duration::from_millis(30));
+        assert_eq!(metrics.earliest_index, 2);
+        assert_eq!(metrics.observation_count(), 5);
+
+        // This should overwrite the third element (30ms)
+        metrics.record(Duration::from_millis(60));
+        assert_eq!(metrics.recent_waits.len(), 3);
+        assert_eq!(metrics.recent_waits[0], Duration::from_millis(40));
+        assert_eq!(metrics.recent_waits[1], Duration::from_millis(50));
+        assert_eq!(metrics.recent_waits[2], Duration::from_millis(60));
+        assert_eq!(metrics.earliest_index, 0);
+        assert_eq!(metrics.observation_count(), 6);
+    }
+
+    #[test]
+    fn test_io_load_metrics_average_wait() {
+        let mut metrics = IoLoadMetrics::new(3);
+        metrics.record(Duration::from_millis(10));
+        metrics.record(Duration::from_millis(20));
+        metrics.record(Duration::from_millis(30));
+        assert_eq!(metrics.average_wait(), Duration::from_millis(20));
+
+        // Overwrite 10ms with 40ms, new avg = (20+30+40)/3 = 30
+        metrics.record(Duration::from_millis(40));
+        assert_eq!(metrics.average_wait(), Duration::from_millis(30));
+    }
+
+    #[test]
+    fn test_io_load_metrics_max_wait() {
+        let mut metrics = IoLoadMetrics::new(3);
+        assert_eq!(metrics.max_wait(), Duration::ZERO);
+        metrics.record(Duration::from_millis(40));
+        metrics.record(Duration::from_millis(30));
+        metrics.record(Duration::from_millis(20));
+        assert_eq!(metrics.max_wait(), Duration::from_millis(40));
+
+        // Overwrite 40ms with 5ms, max should still be 30
+        metrics.record(Duration::from_millis(5));
+        assert_eq!(metrics.max_wait(), Duration::from_millis(30));
+
+        // Overwrite 30ms with 10ms
+        metrics.record(Duration::from_millis(10));
+        assert_eq!(metrics.max_wait(), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn test_io_load_metrics_p95_wait() {
+        let mut metrics = IoLoadMetrics::new(20);
+        for i in 1..=20 {
+            metrics.record(Duration::from_millis(i * 5)); // 5, 10, ..., 100
+        }
+        assert_eq!(metrics.p95_wait(), Duration::from_millis(100));
+
+        // Test with different values
+        let mut metrics = IoLoadMetrics::new(10);
+        metrics.record(Duration::from_millis(10));
+        metrics.record(Duration::from_millis(20));
+        metrics.record(Duration::from_millis(30));
+        metrics.record(Duration::from_millis(40));
+        metrics.record(Duration::from_millis(50));
+        metrics.record(Duration::from_millis(60));
+        metrics.record(Duration::from_millis(70));
+        metrics.record(Duration::from_millis(80));
+        metrics.record(Duration::from_millis(90));
+        metrics.record(Duration::from_millis(1000)); // outlier
+        assert_eq!(metrics.p95_wait(), Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn test_io_load_metrics_smoothed_load_level() {
+        let mut metrics = IoLoadMetrics::new(3);
+        // Average is low
+        metrics.record(Duration::from_millis(5));
+        metrics.record(Duration::from_millis(8));
+        assert_eq!(metrics.smoothed_load_level(), IoLoadLevel::Low);
+
+        // Average is medium
+        metrics.record(Duration::from_millis(40)); // avg = (5+8+40)/3 = 17.6 -> Medium
+        assert_eq!(metrics.smoothed_load_level(), IoLoadLevel::Medium);
+
+        // Average is High
+        metrics.record(Duration::from_millis(100)); // avg = (8+40+100)/3 = 49.3 -> Medium
+        assert_eq!(metrics.smoothed_load_level(), IoLoadLevel::Medium);
+
+        metrics.record(Duration::from_millis(100)); // avg = (40+100+100)/3 = 80 -> High
+        assert_eq!(metrics.smoothed_load_level(), IoLoadLevel::High);
+
+        // Average is Critical
+        metrics.record(Duration::from_millis(300)); // avg = (100+100+300)/3 = 166.6 -> High
+        assert_eq!(metrics.smoothed_load_level(), IoLoadLevel::High);
+
+        metrics.record(Duration::from_millis(300)); // avg = (100+300+300)/3 = 233.3 -> Critical
+        assert_eq!(metrics.smoothed_load_level(), IoLoadLevel::Critical);
+    }
+
+    #[test]
+    fn test_io_load_metrics_lifetime_average() {
+        let mut metrics = IoLoadMetrics::new(2);
+        metrics.record(Duration::from_millis(10));
+        metrics.record(Duration::from_millis(20));
+        // total = 30, count = 2, avg = 15
+        assert_eq!(metrics.lifetime_average_wait(), Duration::from_millis(15));
+
+        metrics.record(Duration::from_millis(30)); // recent=(20, 30), but lifetime avg is over all records
+        // total = 10+20+30=60, count = 3, avg = 20
+        let total_ns = metrics.total_wait_ns.load(Ordering::Relaxed);
+        let count = metrics.observation_count.load(Ordering::Relaxed);
+        assert_eq!(total_ns, 60_000_000);
+        assert_eq!(count, 3);
+        assert_eq!(metrics.lifetime_average_wait(), Duration::from_millis(20));
+
+        metrics.record(Duration::from_millis(40));
+        // total = 60+40=100, count = 4, avg = 25
+        assert_eq!(metrics.lifetime_average_wait(), Duration::from_millis(25));
     }
 }

@@ -86,10 +86,10 @@ impl OperationHelper {
             .req_path(req.uri.path().to_string())
             .req_query(extract_req_params(req));
 
-        if let Some(req_id) = req.headers.get("x-amz-request-id") {
-            if let Ok(id_str) = req_id.to_str() {
-                audit_builder = audit_builder.request_id(id_str);
-            }
+        if let Some(req_id) = req.headers.get("x-amz-request-id")
+            && let Ok(id_str) = req_id.to_str()
+        {
+            audit_builder = audit_builder.request_id(id_str);
         }
 
         // initialize event builder
@@ -194,15 +194,15 @@ impl Drop for OperationHelper {
         }
 
         // Distribute event notification (only on success)
-        if self.api_builder.0.status.as_deref() == Some("success") {
-            if let Some(builder) = self.event_builder.take() {
-                let event_args = builder.build();
-                // Avoid generating notifications for copy requests
-                if !event_args.is_replication_request() {
-                    spawn_background(async move {
-                        notifier_global::notify(event_args).await;
-                    });
-                }
+        if self.api_builder.0.status.as_deref() == Some("success")
+            && let Some(builder) = self.event_builder.take()
+        {
+            let event_args = builder.build();
+            // Avoid generating notifications for copy requests
+            if !event_args.is_replication_request() {
+                spawn_background(async move {
+                    notifier_global::notify(event_args).await;
+                });
             }
         }
     }

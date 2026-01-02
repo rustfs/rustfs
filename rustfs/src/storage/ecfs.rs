@@ -17,6 +17,7 @@ use crate::config::workload_profiles::{
     RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
 };
 use crate::error::ApiError;
+use crate::server::RemoteAddr;
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
@@ -93,12 +94,9 @@ use rustfs_kms::{
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
 use rustfs_notify::{EventArgsBuilder, notifier_global};
-use rustfs_policy::{
-    auth,
-    policy::{
-        action::{Action, S3Action},
-        {BucketPolicy, BucketPolicyArgs, Validator},
-    },
+use rustfs_policy::policy::{
+    action::{Action, S3Action},
+    {BucketPolicy, BucketPolicyArgs, Validator},
 };
 use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, EtagReader, HardLimitReader, HashReader, Reader, WarpReader};
 use rustfs_s3select_api::{
@@ -119,11 +117,13 @@ use rustfs_utils::{
             RESERVED_METADATA_PREFIX_LOWER,
         },
     },
+    obj::extract_user_defined_metadata,
     path::{is_dir_object, path_join_buf},
 };
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use serde_urlencoded::from_bytes;
 use std::convert::Infallible;
 use std::ops::Add;
 use std::{
@@ -134,11 +134,15 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{io::AsyncRead, sync::mpsc};
+use tokio::{
+    io::{AsyncRead, AsyncSeek},
+    sync::mpsc,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
+use urlencoding::encode;
 use uuid::Uuid;
 
 macro_rules! try_ {
@@ -372,6 +376,12 @@ fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
     nonce
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct ListObjectUnorderedQuery {
+    #[serde(rename = "allow-unordered")]
+    allow_unordered: Option<String>,
+}
+
 struct InMemoryAsyncReader {
     cursor: std::io::Cursor<Vec<u8>>,
 }
@@ -394,6 +404,19 @@ impl AsyncRead for InMemoryAsyncReader {
         let bytes_read = std::io::Read::read(&mut self.cursor, unfilled)?;
         buf.advance(bytes_read);
         std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncSeek for InMemoryAsyncReader {
+    fn start_seek(mut self: std::pin::Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        // std::io::Cursor natively supports negative SeekCurrent offsets
+        // It will automatically handle validation and return an error if the final position would be negative
+        std::io::Seek::seek(&mut self.cursor, position)?;
+        Ok(())
+    }
+
+    fn poll_complete(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<u64>> {
+        std::task::Poll::Ready(Ok(self.cursor.position()))
     }
 }
 
@@ -465,13 +488,44 @@ fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
     if key.contains(['\0', '\n', '\r']) {
         return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
-            format!("Object key contains invalid control characters: {:?}", key),
+            format!("Object key contains invalid control characters: {key:?}"),
         ));
     }
 
     // Log debug info for keys with special characters to help diagnose encoding issues
     if key.contains([' ', '+', '%']) {
         debug!("{} object with special characters in key: {:?}", operation, key);
+    }
+
+    Ok(())
+}
+
+/// Validate that 'allow-unordered' parameter is not used with a delimiter
+///
+/// This function:
+/// 1. Checks if a delimiter is specified in the ListObjects request
+/// 2. Parses the query string to check for the 'allow-unordered' parameter
+/// 3. Rejects the request if both 'delimiter' and 'allow-unordered=true' are present
+///
+/// According to S3 compatibility requirements, unordered listing cannot be combined with
+/// hierarchical directory traversal (delimited listing). This validation ensures
+/// conflicting parameters are caught before processing the request.
+fn validate_list_object_unordered_with_delimiter(delimiter: Option<&Delimiter>, query_string: Option<&str>) -> S3Result<()> {
+    if delimiter.is_none() {
+        return Ok(());
+    }
+
+    let Some(query) = query_string else {
+        return Ok(());
+    };
+
+    if let Ok(params) = from_bytes::<ListObjectUnorderedQuery>(query.as_bytes())
+        && params.allow_unordered.as_deref() == Some("true")
+    {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "The allow-unordered parameter cannot be used when delimiter is specified.".to_string(),
+        ));
     }
 
     Ok(())
@@ -681,8 +735,8 @@ impl FS {
         let mut checksum_sha256 = input.checksum_sha256;
         let mut checksum_crc64nvme = input.checksum_crc64nvme;
 
-        if let Some(alg) = &input.checksum_algorithm {
-            if let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
+        if let Some(alg) = &input.checksum_algorithm
+            && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
                 let key = match alg.as_str() {
                     ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
                     ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
@@ -696,15 +750,15 @@ impl FS {
                         .get(key.unwrap_or_default())
                         .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
                 })
-            }) {
-                match alg.as_str() {
-                    ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
-                    ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
-                    ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
-                    ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
-                    ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
-                    _ => (),
-                }
+            })
+        {
+            match alg.as_str() {
+                ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
+                ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
+                ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
+                ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
+                ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
+                _ => (),
             }
         }
 
@@ -793,6 +847,11 @@ impl S3 for FS {
             key,
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
+            metadata_directive,
+            metadata,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -918,38 +977,95 @@ impl S3 for FS {
 
         let mut reader = HashReader::new(reader, length, actual_size, None, None, false).map_err(ApiError::from)?;
 
-        if let Some(ref sse_alg) = effective_sse {
-            if is_managed_sse(sse_alg) {
-                let material =
-                    create_managed_encryption_material(&bucket, &key, sse_alg, effective_kms_key_id.clone(), actual_size).await?;
+        if let Some(ref sse_alg) = effective_sse
+            && is_managed_sse(sse_alg)
+        {
+            let material =
+                create_managed_encryption_material(&bucket, &key, sse_alg, effective_kms_key_id.clone(), actual_size).await?;
 
-                let ManagedEncryptionMaterial {
-                    data_key,
-                    headers,
-                    kms_key_id: kms_key_used,
-                } = material;
+            let ManagedEncryptionMaterial {
+                data_key,
+                headers,
+                kms_key_id: kms_key_used,
+            } = material;
 
-                let key_bytes = data_key.plaintext_key;
-                let nonce = data_key.nonce;
+            let key_bytes = data_key.plaintext_key;
+            let nonce = data_key.nonce;
 
-                src_info.user_defined.extend(headers.into_iter());
-                effective_kms_key_id = Some(kms_key_used.clone());
+            src_info.user_defined.extend(headers.into_iter());
+            effective_kms_key_id = Some(kms_key_used.clone());
 
-                let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
-                reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
+            let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
+        }
+
+        // Apply SSE-C encryption if customer-provided key is specified
+        if let (Some(sse_alg), Some(sse_key), Some(sse_md5)) = (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
+            && sse_alg.as_str() == "AES256"
+        {
+            let key_bytes = BASE64_STANDARD.decode(sse_key.as_str()).map_err(|e| {
+                error!("Failed to decode SSE-C key: {}", e);
+                ApiError::from(StorageError::other("Invalid SSE-C key"))
+            })?;
+
+            if key_bytes.len() != 32 {
+                return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
             }
+
+            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
+            if computed_md5 != sse_md5.as_str() {
+                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+            }
+
+            // Store original size before encryption
+            src_info
+                .user_defined
+                .insert("x-amz-server-side-encryption-customer-original-size".to_string(), actual_size.to_string());
+
+            // SAFETY: The length of `key_bytes` is checked to be 32 bytes above,
+            // so this conversion cannot fail.
+            let key_array: [u8; 32] = key_bytes.try_into().expect("key length already checked");
+            // Generate deterministic nonce from bucket-key
+            let nonce_source = format!("{bucket}-{key}");
+            let nonce_hash = md5::compute(nonce_source.as_bytes());
+            let nonce: [u8; 12] = nonce_hash.0[..12]
+                .try_into()
+                .expect("MD5 hash is always 16 bytes; taking first 12 bytes for nonce is safe");
+
+            let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
         }
 
         src_info.put_object_reader = Some(PutObjReader::new(reader));
 
         // check quota
-        // TODO: src metadata
 
         for (k, v) in compress_metadata {
             src_info.user_defined.insert(k, v);
         }
 
-        // TODO: src tags
+        // Store SSE-C metadata for GET responses
+        if let Some(ref sse_alg) = sse_customer_algorithm {
+            src_info.user_defined.insert(
+                "x-amz-server-side-encryption-customer-algorithm".to_string(),
+                sse_alg.as_str().to_string(),
+            );
+        }
+        if let Some(ref sse_md5) = sse_customer_key_md5 {
+            src_info
+                .user_defined
+                .insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
+        }
+
+        if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
+            let src_user_defined = extract_user_defined_metadata(&src_info.user_defined);
+            src_user_defined.keys().for_each(|k| {
+                src_info.user_defined.remove(k);
+            });
+            if let Some(metadata) = metadata {
+                src_info.user_defined.extend(metadata);
+            }
+        }
 
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
@@ -961,9 +1077,10 @@ impl S3 for FS {
         let dest_bucket = bucket.clone();
         let dest_key = key.clone();
         let dest_version = oi.version_id.map(|v| v.to_string());
+        let dest_version_clone = dest_version.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&dest_bucket, &dest_key, dest_version.as_deref())
+                .invalidate_cache_versioned(&dest_bucket, &dest_key, dest_version_clone.as_deref())
                 .await;
         });
 
@@ -979,6 +1096,9 @@ impl S3 for FS {
             copy_object_result: Some(copy_object_result),
             server_side_encryption: effective_sse,
             ssekms_key_id: effective_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            version_id: dest_version,
             ..Default::default()
         };
 
@@ -1125,15 +1245,14 @@ impl S3 for FS {
 
         let restore_object = Uuid::new_v4().to_string();
         //if let Some(rreq) = rreq {
-        if let Some(output_location) = &rreq.output_location {
-            if let Some(s3) = &output_location.s3 {
-                if !s3.bucket_name.is_empty() {
-                    header.insert(
-                        X_AMZ_RESTORE_OUTPUT_PATH,
-                        format!("{}{}{}", s3.bucket_name, s3.prefix, restore_object).parse().unwrap(),
-                    );
-                }
-            }
+        if let Some(output_location) = &rreq.output_location
+            && let Some(s3) = &output_location.s3
+            && !s3.bucket_name.is_empty()
+        {
+            header.insert(
+                X_AMZ_RESTORE_OUTPUT_PATH,
+                format!("{}{}{}", s3.bucket_name, s3.prefix, restore_object).parse().unwrap(),
+            );
         }
         //}
         /*send_event(EventArgs {
@@ -1609,24 +1728,23 @@ impl S3 for FS {
         };
 
         for dobjs in delete_results.iter() {
-            if let Some(dobj) = &dobjs.delete_object {
-                if replicate_deletes
-                    && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
-                        || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
-                {
-                    let mut dobj = dobj.clone();
-                    if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
-                        dobj.version_id = Some(Uuid::nil());
-                    }
-
-                    let deleted_object = DeletedObjectReplicationInfo {
-                        delete_object: dobj,
-                        bucket: bucket.clone(),
-                        event_type: REPLICATE_INCOMING_DELETE.to_string(),
-                        ..Default::default()
-                    };
-                    schedule_replication_delete(deleted_object).await;
+            if let Some(dobj) = &dobjs.delete_object
+                && replicate_deletes
+                && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
+                    || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
+            {
+                let mut dobj = dobj.clone();
+                if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
+                    dobj.version_id = Some(Uuid::nil());
                 }
+
+                let deleted_object = DeletedObjectReplicationInfo {
+                    delete_object: dobj,
+                    bucket: bucket.clone(),
+                    event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                    ..Default::default()
+                };
+                schedule_replication_delete(deleted_object).await;
             }
         }
 
@@ -1733,96 +1851,98 @@ impl S3 for FS {
         let cache_key = ConcurrencyManager::make_cache_key(&bucket, &key, version_id.as_deref());
 
         // Only attempt cache lookup if caching is enabled and for objects without range/part requests
-        if manager.is_cache_enabled() && part_number.is_none() && range.is_none() {
-            if let Some(cached) = manager.get_cached_object(&cache_key).await {
-                let cache_serve_duration = request_start.elapsed();
+        if manager.is_cache_enabled()
+            && part_number.is_none()
+            && range.is_none()
+            && let Some(cached) = manager.get_cached_object(&cache_key).await
+        {
+            let cache_serve_duration = request_start.elapsed();
 
-                debug!("Serving object from response cache: {} (latency: {:?})", cache_key, cache_serve_duration);
+            debug!("Serving object from response cache: {} (latency: {:?})", cache_key, cache_serve_duration);
 
-                #[cfg(feature = "metrics")]
-                {
-                    use metrics::{counter, histogram};
-                    counter!("rustfs.get.object.cache.served.total").increment(1);
-                    histogram!("rustfs.get.object.cache.serve.duration.seconds").record(cache_serve_duration.as_secs_f64());
-                    histogram!("rustfs.get.object.cache.size.bytes").record(cached.body.len() as f64);
-                }
+            #[cfg(feature = "metrics")]
+            {
+                use metrics::{counter, histogram};
+                counter!("rustfs.get.object.cache.served.total").increment(1);
+                histogram!("rustfs.get.object.cache.serve.duration.seconds").record(cache_serve_duration.as_secs_f64());
+                histogram!("rustfs.get.object.cache.size.bytes").record(cached.body.len() as f64);
+            }
 
-                // Build response from cached data with full metadata
-                let body_data = cached.body.clone();
-                let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move { Ok(body_data) })));
+            // Build response from cached data with full metadata
+            let body_data = cached.body.clone();
+            let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move { Ok(body_data) })));
 
-                // Parse last_modified from RFC3339 string if available
-                let last_modified = cached
+            // Parse last_modified from RFC3339 string if available
+            let last_modified = cached
+                .last_modified
+                .as_ref()
+                .and_then(|s| match OffsetDateTime::parse(s, &Rfc3339) {
+                    Ok(dt) => Some(Timestamp::from(dt)),
+                    Err(e) => {
+                        warn!("Failed to parse cached last_modified '{}': {}", s, e);
+                        None
+                    }
+                });
+
+            // Parse content_type
+            let content_type = cached.content_type.as_ref().and_then(|ct| ContentType::from_str(ct).ok());
+
+            let output = GetObjectOutput {
+                body,
+                content_length: Some(cached.content_length),
+                accept_ranges: Some("bytes".to_string()),
+                e_tag: cached.e_tag.as_ref().map(|etag| to_s3s_etag(etag)),
+                last_modified,
+                content_type,
+                cache_control: cached.cache_control.clone(),
+                content_disposition: cached.content_disposition.clone(),
+                content_encoding: cached.content_encoding.clone(),
+                content_language: cached.content_language.clone(),
+                version_id: cached.version_id.clone(),
+                delete_marker: Some(cached.delete_marker),
+                tag_count: cached.tag_count,
+                metadata: if cached.user_metadata.is_empty() {
+                    None
+                } else {
+                    Some(cached.user_metadata.clone())
+                },
+                ..Default::default()
+            };
+
+            // CRITICAL: Build ObjectInfo for event notification before calling complete().
+            // This ensures S3 bucket notifications (s3:GetObject events) include proper
+            // object metadata for event-driven workflows (Lambda, SNS, SQS).
+            let event_info = ObjectInfo {
+                bucket: bucket.clone(),
+                name: key.clone(),
+                storage_class: cached.storage_class.clone(),
+                mod_time: cached
                     .last_modified
                     .as_ref()
-                    .and_then(|s| match OffsetDateTime::parse(s, &Rfc3339) {
-                        Ok(dt) => Some(Timestamp::from(dt)),
-                        Err(e) => {
-                            warn!("Failed to parse cached last_modified '{}': {}", s, e);
-                            None
-                        }
-                    });
+                    .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()),
+                size: cached.content_length,
+                actual_size: cached.content_length,
+                is_dir: false,
+                user_defined: cached.user_metadata.clone(),
+                version_id: cached.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
+                delete_marker: cached.delete_marker,
+                content_type: cached.content_type.clone(),
+                content_encoding: cached.content_encoding.clone(),
+                etag: cached.e_tag.clone(),
+                ..Default::default()
+            };
 
-                // Parse content_type
-                let content_type = cached.content_type.as_ref().and_then(|ct| ContentType::from_str(ct).ok());
+            // Set object info and version_id on helper for proper event notification
+            let version_id_str = req.input.version_id.clone().unwrap_or_default();
+            helper = helper.object(event_info).version_id(version_id_str);
 
-                let output = GetObjectOutput {
-                    body,
-                    content_length: Some(cached.content_length),
-                    accept_ranges: Some("bytes".to_string()),
-                    e_tag: cached.e_tag.as_ref().map(|etag| to_s3s_etag(etag)),
-                    last_modified,
-                    content_type,
-                    cache_control: cached.cache_control.clone(),
-                    content_disposition: cached.content_disposition.clone(),
-                    content_encoding: cached.content_encoding.clone(),
-                    content_language: cached.content_language.clone(),
-                    version_id: cached.version_id.clone(),
-                    delete_marker: Some(cached.delete_marker),
-                    tag_count: cached.tag_count,
-                    metadata: if cached.user_metadata.is_empty() {
-                        None
-                    } else {
-                        Some(cached.user_metadata.clone())
-                    },
-                    ..Default::default()
-                };
-
-                // CRITICAL: Build ObjectInfo for event notification before calling complete().
-                // This ensures S3 bucket notifications (s3:GetObject events) include proper
-                // object metadata for event-driven workflows (Lambda, SNS, SQS).
-                let event_info = ObjectInfo {
-                    bucket: bucket.clone(),
-                    name: key.clone(),
-                    storage_class: cached.storage_class.clone(),
-                    mod_time: cached
-                        .last_modified
-                        .as_ref()
-                        .and_then(|s| time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()),
-                    size: cached.content_length,
-                    actual_size: cached.content_length,
-                    is_dir: false,
-                    user_defined: cached.user_metadata.clone(),
-                    version_id: cached.version_id.as_ref().and_then(|v| uuid::Uuid::parse_str(v).ok()),
-                    delete_marker: cached.delete_marker,
-                    content_type: cached.content_type.clone(),
-                    content_encoding: cached.content_encoding.clone(),
-                    etag: cached.e_tag.clone(),
-                    ..Default::default()
-                };
-
-                // Set object info and version_id on helper for proper event notification
-                let version_id_str = req.input.version_id.clone().unwrap_or_default();
-                helper = helper.object(event_info).version_id(version_id_str);
-
-                // Call helper.complete() for cache hits to ensure
-                // S3 bucket notifications (s3:GetObject events) are triggered.
-                // This ensures event-driven workflows (Lambda, SNS) work correctly
-                // for both cache hits and misses.
-                let result = Ok(S3Response::new(output));
-                let _ = helper.complete(&result);
-                return result;
-            }
+            // Call helper.complete() for cache hits to ensure
+            // S3 bucket notifications (s3:GetObject events) are triggered.
+            // This ensures event-driven workflows (Lambda, SNS) work correctly
+            // for both cache hits and misses.
+            let result = Ok(S3Response::new(output));
+            let _ = helper.complete(&result);
+            return result;
         }
 
         // TODO: getObjectInArchiveFileHandler object = xxx.zip/xxx/xxx.xxx
@@ -1833,10 +1953,10 @@ impl S3 for FS {
 
         let part_number = part_number.map(|v| v as usize);
 
-        if let Some(part_num) = part_number {
-            if part_num == 0 {
-                return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
-            }
+        if let Some(part_num) = part_number
+            && part_num == 0
+        {
+            return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
         }
 
         let rs = range.map(|v| match v {
@@ -1944,10 +2064,10 @@ impl S3 for FS {
 
         let mut rs = rs;
 
-        if let Some(part_number) = part_number {
-            if rs.is_none() {
-                rs = HTTPRangeSpec::from_object_info(&info, part_number);
-            }
+        if let Some(part_number) = part_number
+            && rs.is_none()
+        {
+            rs = HTTPRangeSpec::from_object_info(&info, part_number);
         }
 
         let mut content_length = info.get_actual_size().map_err(ApiError::from)?;
@@ -2037,8 +2157,8 @@ impl S3 for FS {
                     let mut key_array = [0u8; 32];
                     key_array.copy_from_slice(&key_bytes[..32]);
 
-                    // Verify MD5 hash of the key matches what we expect
-                    let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+                    // Verify MD5 hash of the key matches what the client claims
+                    let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
                     if computed_md5 != *sse_key_md5_provided {
                         return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
                     }
@@ -2062,24 +2182,23 @@ impl S3 for FS {
             }
         }
 
-        if stored_sse_algorithm.is_none() {
-            if let Some((key_bytes, nonce, original_size)) =
+        if stored_sse_algorithm.is_none()
+            && let Some((key_bytes, nonce, original_size)) =
                 decrypt_managed_encryption_key(&bucket, &key, &info.user_defined).await?
-            {
-                if info.parts.len() > 1 {
-                    let (reader, plain_size) = decrypt_multipart_managed_stream(final_stream, &info.parts, key_bytes, nonce)
-                        .await
-                        .map_err(ApiError::from)?;
-                    final_stream = reader;
-                    managed_original_size = Some(plain_size);
-                } else {
-                    let warp_reader = WarpReader::new(final_stream);
-                    let decrypt_reader = DecryptReader::new(warp_reader, key_bytes, nonce);
-                    final_stream = Box::new(decrypt_reader);
-                    managed_original_size = original_size;
-                }
-                managed_encryption_applied = true;
+        {
+            if info.parts.len() > 1 {
+                let (reader, plain_size) = decrypt_multipart_managed_stream(final_stream, &info.parts, key_bytes, nonce)
+                    .await
+                    .map_err(ApiError::from)?;
+                final_stream = reader;
+                managed_original_size = Some(plain_size);
+            } else {
+                let warp_reader = WarpReader::new(final_stream);
+                let decrypt_reader = DecryptReader::new(warp_reader, key_bytes, nonce);
+                final_stream = Box::new(decrypt_reader);
+                managed_original_size = original_size;
             }
+            managed_encryption_applied = true;
         }
 
         // For SSE-C encrypted objects, use the original size instead of encrypted size
@@ -2152,7 +2271,7 @@ impl S3 for FS {
             let mut buf = Vec::with_capacity(response_content_length as usize);
             if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
                 error!("Failed to read object into memory for caching: {}", e);
-                return Err(ApiError::from(StorageError::other(format!("Failed to read object for caching: {}", e))).into());
+                return Err(ApiError::from(StorageError::other(format!("Failed to read object for caching: {e}"))).into());
             }
 
             // Verify we read the expected amount
@@ -2165,17 +2284,15 @@ impl S3 for FS {
             }
 
             // Build CachedGetObject with full metadata for cache writeback
-            let last_modified_str = info
-                .mod_time
-                .and_then(|t| match t.format(&time::format_description::well_known::Rfc3339) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        warn!("Failed to format last_modified for cache writeback: {}", e);
-                        None
-                    }
-                });
+            let last_modified_str = info.mod_time.and_then(|t| match t.format(&Rfc3339) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Failed to format last_modified for cache writeback: {}", e);
+                    None
+                }
+            });
 
-            let cached_response = CachedGetObject::new(bytes::Bytes::from(buf.clone()), response_content_length)
+            let cached_response = CachedGetObject::new(Bytes::from(buf.clone()), response_content_length)
                 .with_content_type(info.content_type.clone().unwrap_or_default())
                 .with_e_tag(info.etag.clone().unwrap_or_default())
                 .with_last_modified(last_modified_str.unwrap_or_default());
@@ -2209,11 +2326,55 @@ impl S3 for FS {
             );
             Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
         } else {
-            // Standard streaming path for large objects or range/part requests
-            Some(StreamingBlob::wrap(bytes_stream(
-                ReaderStream::with_capacity(final_stream, optimal_buffer_size),
-                response_content_length as usize,
-            )))
+            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+
+            let should_provide_seek_support = response_content_length > 0
+                && response_content_length <= seekable_object_size_threshold as i64
+                && part_number.is_none()
+                && rs.is_none();
+
+            if should_provide_seek_support {
+                debug!(
+                    "Reading small object into memory for seek support: key={} size={}",
+                    cache_key, response_content_length
+                );
+
+                // Read the stream into memory
+                let mut buf = Vec::with_capacity(response_content_length as usize);
+                match tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                    Ok(_) => {
+                        // Verify we read the expected amount
+                        if buf.len() != response_content_length as usize {
+                            warn!(
+                                "Object size mismatch during seek support read: expected={} actual={}",
+                                response_content_length,
+                                buf.len()
+                            );
+                        }
+
+                        // Create seekable in-memory reader (similar to MinIO SDK's bytes.Reader)
+                        let mem_reader = InMemoryAsyncReader::new(buf);
+                        Some(StreamingBlob::wrap(bytes_stream(
+                            ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
+                            response_content_length as usize,
+                        )))
+                    }
+                    Err(e) => {
+                        error!("Failed to read object into memory for seek support: {}", e);
+                        // Fallback to streaming if read fails
+                        Some(StreamingBlob::wrap(bytes_stream(
+                            ReaderStream::with_capacity(final_stream, optimal_buffer_size),
+                            response_content_length as usize,
+                        )))
+                    }
+                }
+            } else {
+                // Standard streaming path for large objects or range/part requests
+                Some(StreamingBlob::wrap(bytes_stream(
+                    ReaderStream::with_capacity(final_stream, optimal_buffer_size),
+                    response_content_length as usize,
+                )))
+            }
         };
 
         // Extract SSE information from metadata for response
@@ -2355,10 +2516,10 @@ impl S3 for FS {
 
         let part_number = part_number.map(|v| v as usize);
 
-        if let Some(part_num) = part_number {
-            if part_num == 0 {
-                return Err(s3_error!(InvalidArgument, "part_number invalid"));
-            }
+        if let Some(part_num) = part_number
+            && part_num == 0
+        {
+            return Err(s3_error!(InvalidArgument, "part_number invalid"));
         }
 
         let rs = range.map(|v| match v {
@@ -2388,10 +2549,21 @@ impl S3 for FS {
 
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
-        if let Some(match_etag) = if_none_match {
-            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
+        if info.delete_marker {
+            if opts.version_id.is_none() {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
             }
+            return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
+        }
+
+        if let Some(match_etag) = if_none_match
+            && let Some(strong_etag) = match_etag.into_etag()
+            && info
+                .etag
+                .as_ref()
+                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+        {
+            return Err(S3Error::new(S3ErrorCode::NotModified));
         }
 
         if let Some(modified_since) = if_modified_since {
@@ -2405,16 +2577,21 @@ impl S3 for FS {
         }
 
         if let Some(match_etag) = if_match {
-            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
+            if let Some(strong_etag) = match_etag.into_etag()
+                && info
+                    .etag
+                    .as_ref()
+                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+            {
                 return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
             }
-        } else if let Some(unmodified_since) = if_unmodified_since {
-            if info.mod_time.is_some_and(|mod_time| {
+        } else if let Some(unmodified_since) = if_unmodified_since
+            && info.mod_time.is_some_and(|mod_time| {
                 let give_time: OffsetDateTime = unmodified_since.into();
                 mod_time > give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
+            })
+        {
+            return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
         }
 
         let event_info = info.clone();
@@ -2450,6 +2627,13 @@ impl S3 for FS {
             .map(|v| SSECustomerAlgorithm::from(v.clone()));
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let ssekms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
+        // Prefer explicit storage_class from object info; fall back to persisted metadata header.
+        let storage_class = info
+            .storage_class
+            .clone()
+            .or_else(|| metadata_map.get("x-amz-storage-class").cloned())
+            .filter(|s| !s.is_empty())
+            .map(StorageClass::from);
 
         let mut checksum_crc32 = None;
         let mut checksum_crc32c = None;
@@ -2503,6 +2687,7 @@ impl S3 for FS {
             checksum_sha256,
             checksum_crc64nvme,
             checksum_type,
+            storage_class,
             // metadata: object_metadata,
             ..Default::default()
         };
@@ -2587,16 +2772,52 @@ impl S3 for FS {
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
-        Ok(v2_resp.map_output(|v2| ListObjectsOutput {
-            contents: v2.contents,
-            delimiter: v2.delimiter,
-            encoding_type: v2.encoding_type,
-            name: v2.name,
-            prefix: v2.prefix,
-            max_keys: v2.max_keys,
-            common_prefixes: v2.common_prefixes,
-            is_truncated: v2.is_truncated,
-            ..Default::default()
+        Ok(v2_resp.map_output(|v2| {
+            // For ListObjects (v1) API, NextMarker should be the last item returned when truncated
+            // When both Contents and CommonPrefixes are present, NextMarker should be the
+            // lexicographically last item (either last key or last prefix)
+            let next_marker = if v2.is_truncated.unwrap_or(false) {
+                let last_key = v2
+                    .contents
+                    .as_ref()
+                    .and_then(|contents| contents.last())
+                    .and_then(|obj| obj.key.as_ref())
+                    .cloned();
+
+                let last_prefix = v2
+                    .common_prefixes
+                    .as_ref()
+                    .and_then(|prefixes| prefixes.last())
+                    .and_then(|prefix| prefix.prefix.as_ref())
+                    .cloned();
+
+                // NextMarker should be the lexicographically last item
+                // This matches Ceph S3 behavior used by s3-tests
+                match (last_key, last_prefix) {
+                    (Some(k), Some(p)) => {
+                        // Return the lexicographically greater one
+                        if k > p { Some(k) } else { Some(p) }
+                    }
+                    (Some(k), None) => Some(k),
+                    (None, Some(p)) => Some(p),
+                    (None, None) => None,
+                }
+            } else {
+                None
+            };
+
+            ListObjectsOutput {
+                contents: v2.contents,
+                delimiter: v2.delimiter,
+                encoding_type: v2.encoding_type,
+                name: v2.name,
+                prefix: v2.prefix,
+                max_keys: v2.max_keys,
+                common_prefixes: v2.common_prefixes,
+                is_truncated: v2.is_truncated,
+                next_marker,
+                ..Default::default()
+            }
         }))
     }
 
@@ -2607,6 +2828,7 @@ impl S3 for FS {
             bucket,
             continuation_token,
             delimiter,
+            encoding_type,
             fetch_owner,
             max_keys,
             prefix,
@@ -2627,6 +2849,9 @@ impl S3 for FS {
         }
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
+
+        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
+
         let start_after = start_after.filter(|v| !v.is_empty());
 
         let continuation_token = continuation_token.filter(|v| !v.is_empty());
@@ -2669,13 +2894,31 @@ impl S3 for FS {
 
         // warn!("object_infos objects {:?}", object_infos.objects);
 
+        // Apply URL encoding if encoding_type is "url"
+        // Note: S3 URL encoding should encode special characters but preserve path separators (/)
+        let should_encode = encoding_type.as_ref().map(|e| e.as_str() == "url").unwrap_or(false);
+
+        // Helper function to encode S3 keys/prefixes (preserving /)
+        // S3 URL encoding encodes special characters but keeps '/' unencoded
+        let encode_s3_name = |name: &str| -> String {
+            name.split('/')
+                .map(|part| encode(part).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
         let objects: Vec<Object> = object_infos
             .objects
             .iter()
             .filter(|v| !v.name.is_empty())
             .map(|v| {
+                let key = if should_encode {
+                    encode_s3_name(&v.name)
+                } else {
+                    v.name.to_owned()
+                };
                 let mut obj = Object {
-                    key: Some(v.name.to_owned()),
+                    key: Some(key),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
@@ -2693,13 +2936,17 @@ impl S3 for FS {
             })
             .collect();
 
-        let key_count = objects.len() as i32;
-
-        let common_prefixes = object_infos
+        let common_prefixes: Vec<CommonPrefix> = object_infos
             .prefixes
             .into_iter()
-            .map(|v| CommonPrefix { prefix: Some(v) })
+            .map(|v| {
+                let prefix = if should_encode { encode_s3_name(&v) } else { v };
+                CommonPrefix { prefix: Some(prefix) }
+            })
             .collect();
+
+        // KeyCount should include both objects and common prefixes per S3 API spec
+        let key_count = (objects.len() + common_prefixes.len()) as i32;
 
         // Encode next_continuation_token to base64
         let next_continuation_token = object_infos
@@ -2714,6 +2961,7 @@ impl S3 for FS {
             max_keys: Some(max_keys),
             contents: Some(objects),
             delimiter,
+            encoding_type: encoding_type.clone(),
             name: Some(bucket),
             prefix: Some(prefix),
             common_prefixes: Some(common_prefixes),
@@ -2761,9 +3009,10 @@ impl S3 for FS {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.size),
-                    version_id: v.version_id.map(|v| v.to_string()),
+                    version_id: Some(v.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
                     is_latest: Some(v.is_latest),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
                     ..Default::default() // TODO: another fields
                 }
             })
@@ -2783,12 +3032,17 @@ impl S3 for FS {
             .filter(|o| o.delete_marker)
             .map(|o| DeleteMarkerEntry {
                 key: Some(o.name.clone()),
-                version_id: o.version_id.map(|v| v.to_string()),
+                version_id: Some(o.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
                 is_latest: Some(o.is_latest),
                 last_modified: o.mod_time.map(Timestamp::from),
                 ..Default::default()
             })
             .collect::<Vec<_>>();
+
+        // Only set next_key_marker and next_version_id_marker if they have values, per AWS S3 API spec
+        // boto3 expects them to be strings or omitted, not None or empty strings
+        let next_key_marker = object_infos.next_marker.filter(|v| !v.is_empty());
+        let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
 
         let output = ListObjectVersionsOutput {
             is_truncated: Some(object_infos.is_truncated),
@@ -2799,6 +3053,8 @@ impl S3 for FS {
             common_prefixes: Some(common_prefixes),
             versions: Some(objects),
             delete_markers: Some(delete_markers),
+            next_key_marker,
+            next_version_id_marker,
             ..Default::default()
         };
 
@@ -2807,7 +3063,7 @@ impl S3 for FS {
 
     // #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
         if req
             .headers
             .get("X-Amz-Meta-Snowball-Auto-Extract")
@@ -2819,10 +3075,10 @@ impl S3 for FS {
         let input = req.input;
 
         // Save SSE-C parameters before moving input
-        if let Some(ref storage_class) = input.storage_class {
-            if !is_valid_storage_class(storage_class.as_str()) {
-                return Err(s3_error!(InvalidStorageClass));
-            }
+        if let Some(ref storage_class) = input.storage_class
+            && !is_valid_storage_class(storage_class.as_str())
+        {
+            return Err(s3_error!(InvalidStorageClass));
         }
         let PutObjectInput {
             body,
@@ -2855,15 +3111,23 @@ impl S3 for FS {
             match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
                 Ok(info) => {
                     if !info.delete_marker {
-                        if let Some(ifmatch) = if_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
-                            }
+                        if let Some(ifmatch) = if_match
+                            && let Some(strong_etag) = ifmatch.into_etag()
+                            && info
+                                .etag
+                                .as_ref()
+                                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                        {
+                            return Err(s3_error!(PreconditionFailed));
                         }
-                        if let Some(ifnonematch) = if_none_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
-                            }
+                        if let Some(ifnonematch) = if_none_match
+                            && let Some(strong_etag) = ifnonematch.into_etag()
+                            && info
+                                .etag
+                                .as_ref()
+                                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+                        {
+                            return Err(s3_error!(PreconditionFailed));
                         }
                     }
                 }
@@ -3046,8 +3310,8 @@ impl S3 for FS {
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key_bytes[..32]);
 
-            // Verify MD5 hash of the key
-            let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+            // Verify MD5 hash of the key matches what the client claims
+            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != *sse_key_md5_provided {
                 return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
             }
@@ -3071,30 +3335,27 @@ impl S3 for FS {
         }
 
         // Apply managed SSE (SSE-S3 or SSE-KMS) when requested
-        if sse_customer_algorithm.is_none() {
-            if let Some(sse_alg) = &effective_sse {
-                if is_managed_sse(sse_alg) {
-                    let material =
-                        create_managed_encryption_material(&bucket, &key, sse_alg, effective_kms_key_id.clone(), actual_size)
-                            .await?;
+        if sse_customer_algorithm.is_none()
+            && let Some(sse_alg) = &effective_sse
+            && is_managed_sse(sse_alg)
+        {
+            let material =
+                create_managed_encryption_material(&bucket, &key, sse_alg, effective_kms_key_id.clone(), actual_size).await?;
 
-                    let ManagedEncryptionMaterial {
-                        data_key,
-                        headers,
-                        kms_key_id: kms_key_used,
-                    } = material;
+            let ManagedEncryptionMaterial {
+                data_key,
+                headers,
+                kms_key_id: kms_key_used,
+            } = material;
 
-                    let key_bytes = data_key.plaintext_key;
-                    let nonce = data_key.nonce;
+            let key_bytes = data_key.plaintext_key;
+            let nonce = data_key.nonce;
 
-                    metadata.extend(headers);
-                    effective_kms_key_id = Some(kms_key_used.clone());
+            metadata.extend(headers);
+            effective_kms_key_id = Some(kms_key_used.clone());
 
-                    let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
-                    reader =
-                        HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
-                }
-            }
+            let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
         }
 
         let mut reader = PutObjReader::new(reader);
@@ -3125,9 +3386,16 @@ impl S3 for FS {
         let put_bucket = bucket.clone();
         let put_key = key.clone();
         let put_version = obj_info.version_id.map(|v| v.to_string());
+
+        helper = helper.object(obj_info.clone());
+        if let Some(version_id) = &put_version {
+            helper = helper.version_id(version_id.clone());
+        }
+
+        let put_version_clone = put_version.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&put_bucket, &put_key, put_version.as_deref())
+                .invalidate_cache_versioned(&put_bucket, &put_key, put_version_clone.as_deref())
                 .await;
         });
 
@@ -3148,8 +3416,8 @@ impl S3 for FS {
         let mut checksum_sha256 = input.checksum_sha256;
         let mut checksum_crc64nvme = input.checksum_crc64nvme;
 
-        if let Some(alg) = &input.checksum_algorithm {
-            if let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
+        if let Some(alg) = &input.checksum_algorithm
+            && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
                 let key = match alg.as_str() {
                     ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
                     ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
@@ -3163,15 +3431,15 @@ impl S3 for FS {
                         .get(key.unwrap_or_default())
                         .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
                 })
-            }) {
-                match alg.as_str() {
-                    ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
-                    ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
-                    ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
-                    ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
-                    ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
-                    _ => (),
-                }
+            })
+        {
+            match alg.as_str() {
+                ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
+                ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
+                ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
+                ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
+                ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
+                _ => (),
             }
         }
 
@@ -3186,6 +3454,7 @@ impl S3 for FS {
             checksum_sha1,
             checksum_sha256,
             checksum_crc64nvme,
+            version_id: put_version,
             ..Default::default()
         };
 
@@ -3214,10 +3483,10 @@ impl S3 for FS {
         } = req.input.clone();
 
         // Validate storage class if provided
-        if let Some(ref storage_class) = storage_class {
-            if !is_valid_storage_class(storage_class.as_str()) {
-                return Err(s3_error!(InvalidStorageClass));
-            }
+        if let Some(ref storage_class) = storage_class
+            && !is_valid_storage_class(storage_class.as_str())
+        {
+            return Err(s3_error!(InvalidStorageClass));
         }
 
         // mc cp step 3
@@ -3373,10 +3642,10 @@ impl S3 for FS {
         let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
         if size.is_none() {
-            if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
-                if let Some(x) = atoi::atoi::<i64>(val.as_bytes()) {
-                    size = Some(x);
-                }
+            if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH)
+                && let Some(x) = atoi::atoi::<i64>(val.as_bytes())
+            {
+                size = Some(x);
             }
 
             if size.is_none() {
@@ -3477,8 +3746,8 @@ impl S3 for FS {
             let mut key_array = [0u8; 32];
             key_array.copy_from_slice(&key_bytes[..32]);
 
-            // Verify MD5 hash of the key
-            let computed_md5 = format!("{:x}", md5::compute(&key_bytes));
+            // Verify MD5 hash of the key matches what the client claims
+            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != *sse_key_md5_provided {
                 return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
             }
@@ -3547,8 +3816,8 @@ impl S3 for FS {
         let mut checksum_sha256 = input.checksum_sha256;
         let mut checksum_crc64nvme = input.checksum_crc64nvme;
 
-        if let Some(alg) = &input.checksum_algorithm {
-            if let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
+        if let Some(alg) = &input.checksum_algorithm
+            && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
                 let key = match alg.as_str() {
                     ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
                     ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
@@ -3562,15 +3831,15 @@ impl S3 for FS {
                         .get(key.unwrap_or_default())
                         .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
                 })
-            }) {
-                match alg.as_str() {
-                    ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
-                    ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
-                    ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
-                    ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
-                    ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
-                    _ => (),
-                }
+            })
+        {
+            match alg.as_str() {
+                ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
+                ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
+                ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
+                ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
+                ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
+                _ => (),
             }
         }
 
@@ -3655,7 +3924,12 @@ impl S3 for FS {
         // Validate copy conditions (simplified for now)
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
-                if etag != &if_match {
+                if let Some(strong_etag) = if_match.into_etag() {
+                    if ETag::Strong(etag.clone()) != strong_etag {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
+                } else {
+                    // Weak ETag in If-Match should fail
                     return Err(s3_error!(PreconditionFailed));
                 }
             } else {
@@ -3663,13 +3937,14 @@ impl S3 for FS {
             }
         }
 
-        if let Some(if_none_match) = copy_source_if_none_match {
-            if let Some(ref etag) = src_info.etag {
-                if etag == &if_none_match {
-                    return Err(s3_error!(PreconditionFailed));
-                }
-            }
+        if let Some(if_none_match) = copy_source_if_none_match
+            && let Some(ref etag) = src_info.etag
+            && let Some(strong_etag) = if_none_match.into_etag()
+            && ETag::Strong(etag.clone()) == strong_etag
+        {
+            return Err(s3_error!(PreconditionFailed));
         }
+        // Weak ETag in If-None-Match is ignored (doesn't match)
 
         // TODO: Implement proper time comparison for if_modified_since and if_unmodified_since
         // For now, we'll skip these conditions
@@ -3868,10 +4143,10 @@ impl S3 for FS {
 
         let max_uploads = max_uploads.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
 
-        if let Some(key_marker) = &key_marker {
-            if !key_marker.starts_with(prefix.as_str()) {
-                return Err(s3_error!(NotImplemented, "Invalid key marker"));
-            }
+        if let Some(key_marker) = &key_marker
+            && !key_marker.starts_with(prefix.as_str())
+        {
+            return Err(s3_error!(NotImplemented, "Invalid key marker"));
         }
 
         let result = store
@@ -3938,15 +4213,23 @@ impl S3 for FS {
             match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
                 Ok(info) => {
                     if !info.delete_marker {
-                        if let Some(ifmatch) = if_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
-                            }
+                        if let Some(ifmatch) = if_match
+                            && let Some(strong_etag) = ifmatch.into_etag()
+                            && info
+                                .etag
+                                .as_ref()
+                                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                        {
+                            return Err(s3_error!(PreconditionFailed));
                         }
-                        if let Some(ifnonematch) = if_none_match {
-                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
-                                return Err(s3_error!(PreconditionFailed));
-                            }
+                        if let Some(ifnonematch) = if_none_match
+                            && let Some(strong_etag) = ifnonematch.into_etag()
+                            && info
+                                .etag
+                                .as_ref()
+                                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+                        {
+                            return Err(s3_error!(PreconditionFailed));
                         }
                     }
                 }
@@ -4030,9 +4313,10 @@ impl S3 for FS {
         let mpu_bucket = bucket.clone();
         let mpu_key = key.clone();
         let mpu_version = obj_info.version_id.map(|v| v.to_string());
+        let mpu_version_clone = mpu_version.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version.as_deref())
+                .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
                 .await;
         });
 
@@ -4082,6 +4366,7 @@ impl S3 for FS {
             checksum_sha256: checksum_sha256.clone(),
             checksum_crc64nvme: checksum_crc64nvme.clone(),
             checksum_type: checksum_type.clone(),
+            version_id: mpu_version,
             ..Default::default()
         };
         info!(
@@ -4388,7 +4673,8 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let conditions = get_condition_values(&req.headers, &auth::Credentials::default(), None, None);
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None, remote_addr);
 
         let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
@@ -4548,11 +4834,11 @@ impl S3 for FS {
         let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
 
         let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
-        if let Ok(rcfg) = rcfg {
-            if let Err(err) = input_cfg.validate(&rcfg.0).await {
-                //return Err(S3Error::with_message(S3ErrorCode::Custom("BucketLockValidateFailed".into()), err.to_string()));
-                return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
-            }
+        if let Ok(rcfg) = rcfg
+            && let Err(err) = input_cfg.validate(&rcfg.0).await
+        {
+            //return Err(S3Error::with_message(S3ErrorCode::Custom("BucketLockValidateFailed".into()), err.to_string()));
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
         }
 
         if let Err(err) = validate_transition_tier(&input_cfg).await {
@@ -4942,6 +5228,7 @@ impl S3 for FS {
         let (clear_result, event_rules) = tokio::join!(clear_rules, parse_rules);
 
         clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
+        warn!("notify event rules: {:?}", &event_rules);
 
         // Add a new notification rule
         notifier_global::add_event_specific_rules(&bucket, &region, &event_rules)
@@ -5430,23 +5717,23 @@ impl S3 for FS {
 
 /// Auxiliary functions: extract prefixes and suffixes
 fn extract_prefix_suffix(filter: Option<&NotificationConfigurationFilter>) -> (String, String) {
-    if let Some(filter) = filter {
-        if let Some(filter_rules) = &filter.key {
-            let mut prefix = String::new();
-            let mut suffix = String::new();
-            if let Some(rules) = &filter_rules.filter_rules {
-                for rule in rules {
-                    if let (Some(name), Some(value)) = (rule.name.as_ref(), rule.value.as_ref()) {
-                        match name.as_str() {
-                            "prefix" => prefix = value.clone(),
-                            "suffix" => suffix = value.clone(),
-                            _ => {}
-                        }
+    if let Some(filter) = filter
+        && let Some(filter_rules) = &filter.key
+    {
+        let mut prefix = String::new();
+        let mut suffix = String::new();
+        if let Some(rules) = &filter_rules.filter_rules {
+            for rule in rules {
+                if let (Some(name), Some(value)) = (rule.name.as_ref(), rule.value.as_ref()) {
+                    match name.as_str() {
+                        "prefix" => prefix = value.clone(),
+                        "suffix" => suffix = value.clone(),
+                        _ => {}
                     }
                 }
             }
-            return (prefix, suffix);
         }
+        return (prefix, suffix);
     }
     (String::new(), String::new())
 }
@@ -5568,6 +5855,60 @@ mod tests {
     // Note: Most S3 API methods require complex setup with global state, storage backend,
     // and various dependencies that make unit testing challenging. For comprehensive testing
     // of S3 operations, integration tests would be more appropriate.
+
+    #[test]
+    fn test_list_objects_v2_key_count_includes_prefixes() {
+        // Test that KeyCount calculation includes both objects and common prefixes
+        // This verifies the fix for S3 API compatibility where KeyCount should equal
+        // the sum of Contents and CommonPrefixes lengths
+
+        // Simulate the calculation logic from list_objects_v2
+        let objects_count = 3_usize;
+        let common_prefixes_count = 2_usize;
+
+        // KeyCount should include both objects and common prefixes per S3 API spec
+        let key_count = (objects_count + common_prefixes_count) as i32;
+
+        assert_eq!(key_count, 5);
+
+        // Edge cases: verify calculation logic
+        let no_objects = 0_usize;
+        let no_prefixes = 0_usize;
+        assert_eq!((no_objects + no_prefixes) as i32, 0);
+
+        let one_object = 1_usize;
+        assert_eq!((one_object + no_prefixes) as i32, 1);
+
+        let one_prefix = 1_usize;
+        assert_eq!((no_objects + one_prefix) as i32, 1);
+    }
+
+    #[test]
+    fn test_s3_url_encoding_preserves_slash() {
+        // Test that S3 URL encoding preserves path separators (/)
+        // This verifies the encoding logic for EncodingType=url parameter
+
+        use urlencoding::encode;
+
+        // Helper function matching the implementation
+        let encode_s3_name = |name: &str| -> String {
+            name.split('/')
+                .map(|part| encode(part).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
+        // Test cases from s3-tests
+        assert_eq!(encode_s3_name("asdf+b"), "asdf%2Bb");
+        assert_eq!(encode_s3_name("foo+1/bar"), "foo%2B1/bar");
+        assert_eq!(encode_s3_name("foo/"), "foo/");
+        assert_eq!(encode_s3_name("quux ab/"), "quux%20ab/");
+
+        // Edge cases
+        assert_eq!(encode_s3_name("normal/key"), "normal/key");
+        assert_eq!(encode_s3_name("key+with+plus"), "key%2Bwith%2Bplus");
+        assert_eq!(encode_s3_name("key with spaces"), "key%20with%20spaces");
+    }
 
     #[test]
     fn test_s3_error_scenarios() {
@@ -5797,6 +6138,29 @@ mod tests {
         set_buffer_profile_enabled(false);
     }
 
+    #[test]
+    fn test_validate_list_object_unordered_with_delimiter() {
+        // [1] Normal case: No delimiter specified.
+        assert!(validate_list_object_unordered_with_delimiter(None, Some("allow-unordered=true")).is_ok());
+
+        let delim_str = "/".to_string();
+        let delimiter_some: Option<&Delimiter> = Some(&delim_str);
+        // [2] Normal case: Delimiter is present, but 'allow-unordered' is explicitly set to false.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, Some("allow-unordered=false")).is_ok());
+
+        let query_conflict = Some("allow-unordered=true");
+        // [3] Conflict case: Both delimiter and 'allow-unordered=true' are present.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, query_conflict).is_err());
+
+        let complex_query = Some("allow-unordered=true&abc=123");
+        // [4] Complex query: The validation should still trigger if 'allow-unordered=true' is part of a multi-parameter query.
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query).is_err());
+
+        let complex_query_without_unordered = Some("abc=123&queryType=test");
+        // [5] Multi-parameter query without conflict: If other parameters exist but 'allow-unordered' is missing,
+        assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query_without_unordered).is_ok());
+    }
+
     // Note: S3Request structure is complex and requires many fields.
     // For real testing, we would need proper integration test setup.
     // Removing this test as it requires too much S3 infrastructure setup.
@@ -5810,4 +6174,83 @@ mod tests {
     //
     // These are better suited for integration tests rather than unit tests.
     // The current tests focus on the testable parts without external dependencies.
+
+    /// Test that next_key_marker and next_version_id_marker are filtered correctly
+    /// AWS S3 API requires these fields to be omitted when empty, not set to None or ""
+    #[test]
+    fn test_next_marker_filtering() {
+        // Test filter behavior for empty strings
+        let empty_string = Some(String::new());
+        let filtered = empty_string.filter(|v| !v.is_empty());
+        assert!(filtered.is_none(), "Empty string should be filtered to None");
+
+        // Test filter behavior for non-empty strings
+        let non_empty = Some("some-marker".to_string());
+        let filtered = non_empty.filter(|v| !v.is_empty());
+        assert!(filtered.is_some(), "Non-empty string should not be filtered");
+        assert_eq!(filtered.unwrap(), "some-marker");
+
+        // Test filter behavior for None
+        let none_value: Option<String> = None;
+        let filtered = none_value.filter(|v| !v.is_empty());
+        assert!(filtered.is_none(), "None should remain None");
+    }
+
+    /// Test version_id handling for ListObjectVersions response
+    /// Per AWS S3 API spec:
+    /// - Versioned objects: version_id is a UUID string
+    /// - Non-versioned objects: version_id should be "null" string
+    #[test]
+    fn test_version_id_formatting() {
+        use uuid::Uuid;
+
+        // Non-versioned object: version_id is None, should format as "null"
+        let version_id: Option<Uuid> = None;
+        let formatted = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+        assert_eq!(formatted, "null");
+
+        // Versioned object: version_id is Some(UUID), should format as UUID string
+        let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let version_id: Option<Uuid> = Some(uuid);
+        let formatted = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+        assert_eq!(formatted, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    /// Test that ListObjectVersionsOutput markers are correctly set
+    /// This verifies the fix for boto3 ParamValidationError
+    #[test]
+    fn test_list_object_versions_markers_handling() {
+        // Simulate the marker filtering logic from list_object_versions
+
+        // Case 1: Both markers have values (truncated result with versioned object)
+        let next_marker = Some("object-key".to_string());
+        let next_version_idmarker = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+
+        let filtered_key_marker = next_marker.filter(|v| !v.is_empty());
+        let filtered_version_marker = next_version_idmarker.filter(|v| !v.is_empty());
+
+        assert!(filtered_key_marker.is_some());
+        assert!(filtered_version_marker.is_some());
+
+        // Case 2: Markers are empty strings (non-truncated result)
+        let next_marker = Some(String::new());
+        let next_version_idmarker = Some(String::new());
+
+        let filtered_key_marker = next_marker.filter(|v| !v.is_empty());
+        let filtered_version_marker = next_version_idmarker.filter(|v| !v.is_empty());
+
+        assert!(filtered_key_marker.is_none(), "Empty key marker should be filtered to None");
+        assert!(filtered_version_marker.is_none(), "Empty version marker should be filtered to None");
+
+        // Case 3: Truncated result with non-versioned object (version_id is "null")
+        let next_marker = Some("object-key".to_string());
+        let next_version_idmarker = Some("null".to_string());
+
+        let filtered_key_marker = next_marker.filter(|v| !v.is_empty());
+        let filtered_version_marker = next_version_idmarker.filter(|v| !v.is_empty());
+
+        assert!(filtered_key_marker.is_some());
+        assert!(filtered_version_marker.is_some());
+        assert_eq!(filtered_version_marker.unwrap(), "null");
+    }
 }

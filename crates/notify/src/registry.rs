@@ -16,9 +16,11 @@ use crate::Event;
 use crate::factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory};
 use futures::stream::{FuturesUnordered, StreamExt};
 use hashbrown::{HashMap, HashSet};
-use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, notify::NOTIFY_ROUTE_PREFIX};
+use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, EnableState, notify::NOTIFY_ROUTE_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::{Target, TargetError, target::ChannelTargetType};
+use std::str::FromStr;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 /// Registry for managing target factories
@@ -117,16 +119,11 @@ impl TargetRegistry {
                 format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{target_type}{DEFAULT_DELIMITER}{ENABLE_KEY}{DEFAULT_DELIMITER}")
                     .to_uppercase();
             for (key, value) in &all_env {
-                if value.eq_ignore_ascii_case(rustfs_config::EnableState::One.as_str())
-                    || value.eq_ignore_ascii_case(rustfs_config::EnableState::On.as_str())
-                    || value.eq_ignore_ascii_case(rustfs_config::EnableState::True.as_str())
-                    || value.eq_ignore_ascii_case(rustfs_config::EnableState::Yes.as_str())
+                if EnableState::from_str(value).ok().map(|s| s.is_enabled()).unwrap_or(false)
+                    && let Some(id) = key.strip_prefix(&enable_prefix)
+                    && !id.is_empty()
                 {
-                    if let Some(id) = key.strip_prefix(&enable_prefix) {
-                        if !id.is_empty() {
-                            instance_ids_from_env.insert(id.to_lowercase());
-                        }
-                    }
+                    instance_ids_from_env.insert(id.to_lowercase());
                 }
             }
 
@@ -208,10 +205,10 @@ impl TargetRegistry {
                 let enabled = merged_config
                     .lookup(ENABLE_KEY)
                     .map(|v| {
-                        v.eq_ignore_ascii_case(rustfs_config::EnableState::One.as_str())
-                            || v.eq_ignore_ascii_case(rustfs_config::EnableState::On.as_str())
-                            || v.eq_ignore_ascii_case(rustfs_config::EnableState::True.as_str())
-                            || v.eq_ignore_ascii_case(rustfs_config::EnableState::Yes.as_str())
+                        EnableState::from_str(v.as_str())
+                            .ok()
+                            .map(|s| s.is_enabled())
+                            .unwrap_or(false)
                     })
                     .unwrap_or(false);
 
@@ -220,10 +217,10 @@ impl TargetRegistry {
                     // 5.3. Create asynchronous tasks for enabled instances
                     let target_type_clone = target_type.clone();
                     let tid = id.clone();
-                    let merged_config_arc = std::sync::Arc::new(merged_config);
+                    let merged_config_arc = Arc::new(merged_config);
                     tasks.push(async move {
                         let result = factory.create_target(tid.clone(), &merged_config_arc).await;
-                        (target_type_clone, tid, result, std::sync::Arc::clone(&merged_config_arc))
+                        (target_type_clone, tid, result, Arc::clone(&merged_config_arc))
                     });
                 } else {
                     info!(instance_id = %id, "Skip the disabled target and will be removed from the final configuration");
@@ -275,10 +272,10 @@ impl TargetRegistry {
             for section in sections {
                 let mut section_map: std::collections::HashMap<String, KVS> = std::collections::HashMap::new();
                 // Add default item
-                if let Some(default_kvs) = section_defaults.get(&section) {
-                    if !default_kvs.is_empty() {
-                        section_map.insert(DEFAULT_DELIMITER.to_string(), default_kvs.clone());
-                    }
+                if let Some(default_kvs) = section_defaults.get(&section)
+                    && !default_kvs.is_empty()
+                {
+                    section_map.insert(DEFAULT_DELIMITER.to_string(), default_kvs.clone());
                 }
 
                 // Add successful instance item

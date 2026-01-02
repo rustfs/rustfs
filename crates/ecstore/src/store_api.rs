@@ -144,10 +144,10 @@ impl GetObjectReader {
     ) -> Result<(Self, usize, i64)> {
         let mut rs = rs;
 
-        if let Some(part_number) = opts.part_number {
-            if rs.is_none() {
-                rs = HTTPRangeSpec::from_object_info(oi, part_number);
-            }
+        if let Some(part_number) = opts.part_number
+            && rs.is_none()
+        {
+            rs = HTTPRangeSpec::from_object_info(oi, part_number);
         }
 
         // TODO:Encrypted
@@ -462,32 +462,30 @@ impl ObjectOptions {
     pub fn precondition_check(&self, obj_info: &ObjectInfo) -> Result<()> {
         let has_valid_mod_time = obj_info.mod_time.is_some_and(|t| t != OffsetDateTime::UNIX_EPOCH);
 
-        if let Some(part_number) = self.part_number {
-            if part_number > 1 && !obj_info.parts.is_empty() {
-                let part_found = obj_info.parts.iter().any(|pi| pi.number == part_number);
-                if !part_found {
-                    return Err(Error::InvalidPartNumber(part_number));
-                }
+        if let Some(part_number) = self.part_number
+            && part_number > 1
+            && !obj_info.parts.is_empty()
+        {
+            let part_found = obj_info.parts.iter().any(|pi| pi.number == part_number);
+            if !part_found {
+                return Err(Error::InvalidPartNumber(part_number));
             }
         }
 
         if let Some(pre) = &self.http_preconditions {
-            if let Some(if_none_match) = &pre.if_none_match {
-                if let Some(etag) = &obj_info.etag {
-                    if is_etag_equal(etag, if_none_match) {
-                        return Err(Error::NotModified);
-                    }
-                }
+            if let Some(if_none_match) = &pre.if_none_match
+                && let Some(etag) = &obj_info.etag
+                && is_etag_equal(etag, if_none_match)
+            {
+                return Err(Error::NotModified);
             }
 
-            if has_valid_mod_time {
-                if let Some(if_modified_since) = &pre.if_modified_since {
-                    if let Some(mod_time) = &obj_info.mod_time {
-                        if !is_modified_since(mod_time, if_modified_since) {
-                            return Err(Error::NotModified);
-                        }
-                    }
-                }
+            if has_valid_mod_time
+                && let Some(if_modified_since) = &pre.if_modified_since
+                && let Some(mod_time) = &obj_info.mod_time
+                && !is_modified_since(mod_time, if_modified_since)
+            {
+                return Err(Error::NotModified);
             }
 
             if let Some(if_match) = &pre.if_match {
@@ -499,14 +497,13 @@ impl ObjectOptions {
                     return Err(Error::PreconditionFailed);
                 }
             }
-            if has_valid_mod_time && pre.if_match.is_none() {
-                if let Some(if_unmodified_since) = &pre.if_unmodified_since {
-                    if let Some(mod_time) = &obj_info.mod_time {
-                        if is_modified_since(mod_time, if_unmodified_since) {
-                            return Err(Error::PreconditionFailed);
-                        }
-                    }
-                }
+            if has_valid_mod_time
+                && pre.if_match.is_none()
+                && let Some(if_unmodified_since) = &pre.if_unmodified_since
+                && let Some(mod_time) = &obj_info.mod_time
+                && is_modified_since(mod_time, if_unmodified_since)
+            {
+                return Err(Error::PreconditionFailed);
             }
         }
 
@@ -698,12 +695,12 @@ impl ObjectInfo {
         }
 
         if self.is_compressed() {
-            if let Some(size_str) = self.user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size")) {
-                if !size_str.is_empty() {
-                    // Todo: deal with error
-                    let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
-                    return Ok(size);
-                }
+            if let Some(size_str) = self.user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"))
+                && !size_str.is_empty()
+            {
+                // Todo: deal with error
+                let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
+                return Ok(size);
             }
             let mut actual_size = 0;
             self.parts.iter().for_each(|part| {
@@ -827,7 +824,12 @@ impl ObjectInfo {
         for entry in entries.entries() {
             if entry.is_object() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    if let Some(idx) = remaining.find(delimiter.as_str()) {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -876,25 +878,31 @@ impl ObjectInfo {
                 continue;
             }
 
-            if entry.is_dir() {
-                if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
-                        let idx = prefix.len() + idx + delimiter.len();
-                        if let Some(curr_prefix) = entry.name.get(0..idx) {
-                            if curr_prefix == prev_prefix {
-                                continue;
-                            }
-
-                            prev_prefix = curr_prefix;
-
-                            objects.push(ObjectInfo {
-                                is_dir: true,
-                                bucket: bucket.to_owned(),
-                                name: curr_prefix.to_owned(),
-                                ..Default::default()
-                            });
-                        }
+            if entry.is_dir()
+                && let Some(delimiter) = &delimiter
+                && let Some(idx) = {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    remaining.find(delimiter.as_str())
+                }
+            {
+                let idx = prefix.len() + idx + delimiter.len();
+                if let Some(curr_prefix) = entry.name.get(0..idx) {
+                    if curr_prefix == prev_prefix {
+                        continue;
                     }
+
+                    prev_prefix = curr_prefix;
+
+                    objects.push(ObjectInfo {
+                        is_dir: true,
+                        bucket: bucket.to_owned(),
+                        name: curr_prefix.to_owned(),
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -914,7 +922,12 @@ impl ObjectInfo {
         for entry in entries.entries() {
             if entry.is_object() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    if let Some(idx) = remaining.find(delimiter.as_str()) {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -949,25 +962,31 @@ impl ObjectInfo {
                 continue;
             }
 
-            if entry.is_dir() {
-                if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
-                        let idx = prefix.len() + idx + delimiter.len();
-                        if let Some(curr_prefix) = entry.name.get(0..idx) {
-                            if curr_prefix == prev_prefix {
-                                continue;
-                            }
-
-                            prev_prefix = curr_prefix;
-
-                            objects.push(ObjectInfo {
-                                is_dir: true,
-                                bucket: bucket.to_owned(),
-                                name: curr_prefix.to_owned(),
-                                ..Default::default()
-                            });
-                        }
+            if entry.is_dir()
+                && let Some(delimiter) = &delimiter
+                && let Some(idx) = {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    remaining.find(delimiter.as_str())
+                }
+            {
+                let idx = prefix.len() + idx + delimiter.len();
+                if let Some(curr_prefix) = entry.name.get(0..idx) {
+                    if curr_prefix == prev_prefix {
+                        continue;
                     }
+
+                    prev_prefix = curr_prefix;
+
+                    objects.push(ObjectInfo {
+                        is_dir: true,
+                        bucket: bucket.to_owned(),
+                        name: curr_prefix.to_owned(),
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -1002,10 +1021,10 @@ impl ObjectInfo {
     }
 
     pub fn decrypt_checksums(&self, part: usize, _headers: &HeaderMap) -> Result<(HashMap<String, String>, bool)> {
-        if part > 0 {
-            if let Some(checksums) = self.parts.iter().find(|p| p.number == part).and_then(|p| p.checksums.clone()) {
-                return Ok((checksums, true));
-            }
+        if part > 0
+            && let Some(checksums) = self.parts.iter().find(|p| p.number == part).and_then(|p| p.checksums.clone())
+        {
+            return Ok((checksums, true));
         }
 
         // TODO: decrypt checksums

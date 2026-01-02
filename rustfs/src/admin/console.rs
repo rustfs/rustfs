@@ -14,6 +14,7 @@
 
 use crate::config::build;
 use crate::license::get_license;
+use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, RUSTFS_ADMIN_PREFIX};
 use axum::{
     Router,
     body::Body,
@@ -22,7 +23,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use axum_extra::extract::Host;
 use axum_server::tls_rustls::RustlsConfig;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use mime_guess::from_path;
@@ -44,9 +44,6 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, instrument, warn};
-
-pub(crate) const CONSOLE_PREFIX: &str = "/rustfs/console";
-const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/static"]
@@ -266,21 +263,27 @@ async fn version_handler() -> impl IntoResponse {
 ///
 /// # Arguments:
 /// - `uri`: The request URI.
-/// - `Host(host)`: The host extracted from the request.
 /// - `headers`: The request headers.
 ///
 /// # Returns:
 /// - 200 OK with JSON body containing the console configuration if initialized.
 /// - 500 Internal Server Error if configuration is not initialized.
-#[instrument(fields(host))]
-async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
+#[instrument(fields(uri))]
+async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme
     let scheme = headers
         .get(HeaderName::from_static("x-forwarded-proto"))
         .and_then(|value| value.to_str().ok())
         .unwrap_or_else(|| uri.scheme().map(|s| s.as_str()).unwrap_or("http"));
 
-    let raw_host = uri.host().unwrap_or(host.as_str());
+    // Prefer URI host, fallback to `Host` header
+    let header_host = headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    let raw_host = uri.host().unwrap_or(header_host);
+
     let host_for_url = if let Ok(socket_addr) = raw_host.parse::<SocketAddr>() {
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.
@@ -364,35 +367,35 @@ async fn _setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<R
     debug!("Found TLS directory for console, checking for certificates");
 
     // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
-    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
-        if !cert_key_pairs.is_empty() {
-            debug!(
-                "Found {} certificates for console, creating SNI-aware multi-cert resolver",
-                cert_key_pairs.len()
-            );
+    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path)
+        && !cert_key_pairs.is_empty()
+    {
+        debug!(
+            "Found {} certificates for console, creating SNI-aware multi-cert resolver",
+            cert_key_pairs.len()
+        );
 
-            // Create an SNI-enabled certificate resolver
-            let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
+        // Create an SNI-enabled certificate resolver
+        let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
 
-            // Configure the server to enable SNI support
-            let mut server_config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(resolver));
+        // Configure the server to enable SNI support
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver));
 
-            // Configure ALPN protocol priority
-            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+        // Configure ALPN protocol priority
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
-            // Log SNI requests
-            if rustfs_utils::tls_key_log() {
-                server_config.key_log = Arc::new(rustls::KeyLogFile::new());
-            }
-
-            info!(target: "rustfs::console::tls", "Console TLS enabled with multi-certificate SNI support");
-            return Ok(Some(RustlsConfig::from_config(Arc::new(server_config))));
+        // Log SNI requests
+        if rustfs_utils::tls_key_log() {
+            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
+
+        info!(target: "rustfs::console::tls", "Console TLS enabled with multi-certificate SNI support");
+        return Ok(Some(RustlsConfig::from_config(Arc::new(server_config))));
     }
 
     // 2. Revert to the traditional single-certificate mode
@@ -457,7 +460,7 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
 /// # Returns:
 /// - `true` if the path is for console access, `false` otherwise.
 pub fn is_console_path(path: &str) -> bool {
-    path == "/favicon.ico" || path.starts_with(CONSOLE_PREFIX)
+    path == FAVICON_PATH || path.starts_with(CONSOLE_PREFIX)
 }
 
 /// Setup comprehensive middleware stack with tower-http features
@@ -477,11 +480,11 @@ fn setup_console_middleware_stack(
     auth_timeout: u64,
 ) -> Router {
     let mut app = Router::new()
-        .route("/favicon.ico", get(static_handler))
+        .route(FAVICON_PATH, get(static_handler))
         .route(&format!("{CONSOLE_PREFIX}/license"), get(license_handler))
         .route(&format!("{CONSOLE_PREFIX}/config.json"), get(config_handler))
         .route(&format!("{CONSOLE_PREFIX}/version"), get(version_handler))
-        .route(&format!("{CONSOLE_PREFIX}/health"), get(health_check).head(health_check))
+        .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
 
