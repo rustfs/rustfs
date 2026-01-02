@@ -310,7 +310,6 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             if at_eof + has_err == readers.len() {
                 if has_err > 0
                     && let Some(finished_fn) = opts.finished.as_ref()
-                    && has_err > 0
                 {
                     finished_fn(&errs).await;
                 }
