@@ -55,10 +55,10 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 if !has_arn {
                     has_arn = true;
                 }
-                if let Some(status) = &rule.existing_object_replication {
-                    if status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED) {
-                        return (true, true);
-                    }
+                if let Some(status) = &rule.existing_object_replication
+                    && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED)
+                {
+                    return (true, true);
                 }
             }
         }
@@ -86,12 +86,11 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            if let Some(status) = &rule.existing_object_replication {
-                if obj.existing_object
-                    && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
-                {
-                    continue;
-                }
+            if let Some(status) = &rule.existing_object_replication
+                && obj.existing_object
+                && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
+            {
+                continue;
             }
 
             if !obj.name.starts_with(rule.prefix()) {
@@ -145,12 +144,11 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            if let Some(status) = &rule.existing_object_replication {
-                if obj.existing_object
-                    && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
-                {
-                    return false;
-                }
+            if let Some(status) = &rule.existing_object_replication
+                && obj.existing_object
+                && status.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
+            {
+                return false;
             }
 
             if obj.op_type == ReplicationType::Delete {
@@ -186,19 +184,19 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            if let Some(filter) = &rule.filter {
-                if let Some(filter_prefix) = &filter.prefix {
-                    if !prefix.is_empty() && !filter_prefix.is_empty() {
-                        // The provided prefix must fall within the rule prefix
-                        if !recursive && !prefix.starts_with(filter_prefix) {
-                            continue;
-                        }
-                    }
-
-                    // When recursive, skip this rule if it does not match the test prefix or hierarchy
-                    if recursive && !rule.prefix().starts_with(prefix) && !prefix.starts_with(rule.prefix()) {
+            if let Some(filter) = &rule.filter
+                && let Some(filter_prefix) = &filter.prefix
+            {
+                if !prefix.is_empty() && !filter_prefix.is_empty() {
+                    // The provided prefix must fall within the rule prefix
+                    if !recursive && !prefix.starts_with(filter_prefix) {
                         continue;
                     }
+                }
+
+                // When recursive, skip this rule if it does not match the test prefix or hierarchy
+                if recursive && !rule.prefix().starts_with(prefix) && !prefix.starts_with(rule.prefix()) {
+                    continue;
                 }
             }
             return true;

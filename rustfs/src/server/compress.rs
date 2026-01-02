@@ -282,40 +282,35 @@ impl Predicate for CompressionPredicate {
         // CompressionLayer before calling this predicate, so we don't need to check them here.
 
         // Check Content-Length header for minimum size threshold
-        if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH) {
-            if let Ok(length_str) = content_length.to_str() {
-                if let Ok(length) = length_str.parse::<u64>() {
-                    if length < self.config.min_size {
-                        debug!(
-                            "Skipping compression for small response: size={} bytes, min_size={}",
-                            length, self.config.min_size
-                        );
-                        return false;
-                    }
-                }
-            }
+        if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH)
+            && let Ok(length_str) = content_length.to_str()
+            && let Ok(length) = length_str.parse::<u64>()
+            && length < self.config.min_size
+        {
+            debug!(
+                "Skipping compression for small response: size={} bytes, min_size={}",
+                length, self.config.min_size
+            );
+            return false;
         }
 
         // Check if the response matches configured extension via Content-Disposition
-        if let Some(content_disposition) = response.headers().get(http::header::CONTENT_DISPOSITION) {
-            if let Ok(cd) = content_disposition.to_str() {
-                if let Some(filename) = CompressionConfig::extract_filename_from_content_disposition(cd) {
-                    if self.config.matches_extension(&filename) {
-                        debug!("Compressing response: filename '{}' matches configured extension", filename);
-                        return true;
-                    }
-                }
-            }
+        if let Some(content_disposition) = response.headers().get(http::header::CONTENT_DISPOSITION)
+            && let Ok(cd) = content_disposition.to_str()
+            && let Some(filename) = CompressionConfig::extract_filename_from_content_disposition(cd)
+            && self.config.matches_extension(&filename)
+        {
+            debug!("Compressing response: filename '{}' matches configured extension", filename);
+            return true;
         }
 
         // Check if the response matches configured MIME type
-        if let Some(content_type) = response.headers().get(http::header::CONTENT_TYPE) {
-            if let Ok(ct) = content_type.to_str() {
-                if self.config.matches_mime_type(ct) {
-                    debug!("Compressing response: Content-Type '{}' matches configured MIME pattern", ct);
-                    return true;
-                }
-            }
+        if let Some(content_type) = response.headers().get(http::header::CONTENT_TYPE)
+            && let Ok(ct) = content_type.to_str()
+            && self.config.matches_mime_type(ct)
+        {
+            debug!("Compressing response: Content-Type '{}' matches configured MIME pattern", ct);
+            return true;
         }
 
         // Default: don't compress (whitelist approach)

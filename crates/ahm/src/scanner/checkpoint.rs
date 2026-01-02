@@ -83,10 +83,10 @@ pub struct CheckpointManager {
 
 impl CheckpointManager {
     pub fn new(node_id: &str, data_dir: &Path) -> Self {
-        if !data_dir.exists() {
-            if let Err(e) = std::fs::create_dir_all(data_dir) {
-                error!("create data dir failed {:?}: {}", data_dir, e);
-            }
+        if !data_dir.exists()
+            && let Err(e) = std::fs::create_dir_all(data_dir)
+        {
+            error!("create data dir failed {:?}: {}", data_dir, e);
         }
 
         let checkpoint_file = data_dir.join(format!("scanner_checkpoint_{node_id}.json"));

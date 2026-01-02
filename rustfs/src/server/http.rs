@@ -139,13 +139,13 @@ pub async fn start_http_server(
         };
 
         // If address is IPv6 try to enable dual-stack; on failure, switch to IPv4 socket.
-        if server_addr.is_ipv6() {
-            if let Err(e) = socket.set_only_v6(false) {
-                warn!("Failed to set IPV6_V6ONLY=false, attempting IPv4 fallback: {}", e);
-                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
-                server_addr = ipv4_addr;
-                socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-            }
+        if server_addr.is_ipv6()
+            && let Err(e) = socket.set_only_v6(false)
+        {
+            warn!("Failed to set IPV6_V6ONLY=false, attempting IPv4 fallback: {}", e);
+            let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+            server_addr = ipv4_addr;
+            socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
         }
 
         // Common setup for both IPv4 and successful dual-stack IPv6
@@ -434,38 +434,38 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
     debug!("Found TLS directory, checking for certificates");
 
     // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mtls_verifier = rustfs_utils::build_webpki_client_verifier(tls_path)?;
 
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
-    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
-        if !cert_key_pairs.is_empty() {
-            debug!("Found {} certificates, creating SNI-aware multi-cert resolver", cert_key_pairs.len());
+    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path)
+        && !cert_key_pairs.is_empty()
+    {
+        debug!("Found {} certificates, creating SNI-aware multi-cert resolver", cert_key_pairs.len());
 
-            // Create an SNI-enabled certificate resolver
-            let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
+        // Create an SNI-enabled certificate resolver
+        let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
 
-            // Configure the server to enable SNI support
-            let mut server_config = if let Some(verifier) = mtls_verifier.clone() {
-                ServerConfig::builder()
-                    .with_client_cert_verifier(verifier)
-                    .with_cert_resolver(Arc::new(resolver))
-            } else {
-                ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(Arc::new(resolver))
-            };
+        // Configure the server to enable SNI support
+        let mut server_config = if let Some(verifier) = mtls_verifier.clone() {
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(Arc::new(resolver))
+        } else {
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(resolver))
+        };
 
-            // Configure ALPN protocol priority
-            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+        // Configure ALPN protocol priority
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
-            // Log SNI requests
-            if rustfs_utils::tls_key_log() {
-                server_config.key_log = Arc::new(rustls::KeyLogFile::new());
-            }
-
-            return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
+        // Log SNI requests
+        if rustfs_utils::tls_key_log() {
+            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
+
+        return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
     }
 
     // 2. Revert to the traditional single-certificate mode
@@ -520,7 +520,8 @@ struct ConnectionContext {
 /// 2. Build a complete service stack for this connection, including S3, RPC services, and all middleware.
 /// 3. Use Hyper to handle HTTP requests on this connection.
 /// 4. Incorporate connections into the management of elegant closures.
-#[instrument(skip_all, fields(peer_addr = %socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string())))]
+#[instrument(skip_all, fields(peer_addr = %socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string())
+))]
 fn process_connection(
     socket: TcpStream,
     tls_acceptor: Option<Arc<TlsAcceptor>>,

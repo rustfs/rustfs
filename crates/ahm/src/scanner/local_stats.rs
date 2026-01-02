@@ -112,10 +112,10 @@ impl LocalStatsManager {
     /// create new local stats manager
     pub fn new(node_id: &str, data_dir: &Path) -> Self {
         // ensure data directory exists
-        if !data_dir.exists() {
-            if let Err(e) = std::fs::create_dir_all(data_dir) {
-                error!("create stats data directory failed {:?}: {}", data_dir, e);
-            }
+        if !data_dir.exists()
+            && let Err(e) = std::fs::create_dir_all(data_dir)
+        {
+            error!("create stats data directory failed {:?}: {}", data_dir, e);
         }
 
         let stats_file = data_dir.join(format!("scanner_stats_{node_id}.json"));

@@ -244,10 +244,12 @@ impl PoolMeta {
     }
     pub fn decommission(&mut self, idx: usize, pi: PoolSpaceInfo) -> Result<()> {
         if let Some(pool) = self.pools.get_mut(idx) {
-            if let Some(ref info) = pool.decommission {
-                if !info.complete && !info.failed && !info.canceled {
-                    return Err(StorageError::DecommissionAlreadyRunning);
-                }
+            if let Some(ref info) = pool.decommission
+                && !info.complete
+                && !info.failed
+                && !info.canceled
+            {
+                return Err(StorageError::DecommissionAlreadyRunning);
             }
 
             let now = OffsetDateTime::now_utc();
@@ -273,12 +275,12 @@ impl PoolMeta {
     pub fn pending_buckets(&self, idx: usize) -> Vec<DecomBucketInfo> {
         let mut list = Vec::new();
 
-        if let Some(pool) = self.pools.get(idx) {
-            if let Some(ref info) = pool.decommission {
-                for bk in info.queued_buckets.iter() {
-                    let (name, prefix) = path2_bucket_object(bk);
-                    list.push(DecomBucketInfo { name, prefix });
-                }
+        if let Some(pool) = self.pools.get(idx)
+            && let Some(ref info) = pool.decommission
+        {
+            for bk in info.queued_buckets.iter() {
+                let (name, prefix) = path2_bucket_object(bk);
+                list.push(DecomBucketInfo { name, prefix });
             }
         }
 
@@ -306,15 +308,15 @@ impl PoolMeta {
     }
 
     pub fn count_item(&mut self, idx: usize, size: usize, failed: bool) {
-        if let Some(pool) = self.pools.get_mut(idx) {
-            if let Some(info) = pool.decommission.as_mut() {
-                if failed {
-                    info.items_decommission_failed += 1;
-                    info.bytes_failed += size;
-                } else {
-                    info.items_decommissioned += 1;
-                    info.bytes_done += size;
-                }
+        if let Some(pool) = self.pools.get_mut(idx)
+            && let Some(info) = pool.decommission.as_mut()
+        {
+            if failed {
+                info.items_decommission_failed += 1;
+                info.bytes_failed += size;
+            } else {
+                info.items_decommissioned += 1;
+                info.bytes_done += size;
             }
         }
     }
@@ -324,11 +326,11 @@ impl PoolMeta {
             return;
         }
 
-        if let Some(pool) = self.pools.get_mut(idx) {
-            if let Some(info) = pool.decommission.as_mut() {
-                info.object = object;
-                info.bucket = bucket;
-            }
+        if let Some(pool) = self.pools.get_mut(idx)
+            && let Some(info) = pool.decommission.as_mut()
+        {
+            info.object = object;
+            info.bucket = bucket;
         }
     }
 
@@ -407,10 +409,10 @@ impl PoolMeta {
 
         if specified_pools.len() == remembered_pools.len() {
             for (k, pi) in remembered_pools.iter() {
-                if let Some(pos) = specified_pools.get(k) {
-                    if *pos != pi.position {
-                        update = true; // Pool order changed, allow the update.
-                    }
+                if let Some(pos) = specified_pools.get(k)
+                    && *pos != pi.position
+                {
+                    update = true; // Pool order changed, allow the update.
                 }
             }
         }
@@ -640,10 +642,12 @@ impl ECStore {
     pub async fn is_decommission_running(&self) -> bool {
         let pool_meta = self.pool_meta.read().await;
         for pool in pool_meta.pools.iter() {
-            if let Some(ref info) = pool.decommission {
-                if !info.complete && !info.failed && !info.canceled {
-                    return true;
-                }
+            if let Some(ref info) = pool.decommission
+                && !info.complete
+                && !info.failed
+                && !info.canceled
+            {
+                return true;
             }
         }
 
@@ -850,8 +854,8 @@ impl ECStore {
             decommissioned += 1;
         }
 
-        if decommissioned == fivs.versions.len() {
-            if let Err(err) = set
+        if decommissioned == fivs.versions.len()
+            && let Err(err) = set
                 .delete_object(
                     bucket.as_str(),
                     &encode_dir_object(&entry.name),
@@ -863,9 +867,8 @@ impl ECStore {
                     },
                 )
                 .await
-            {
-                error!("decommission_pool: delete_object err {:?}", &err);
-            }
+        {
+            error!("decommission_pool: delete_object err {:?}", &err);
         }
 
         {
@@ -879,10 +882,8 @@ impl ECStore {
                 .unwrap_or_default();
 
             drop(pool_meta);
-            if ok {
-                if let Some(notification_sys) = get_global_notification_sys() {
-                    notification_sys.reload_pool_meta().await;
-                }
+            if ok && let Some(notification_sys) = get_global_notification_sys() {
+                notification_sys.reload_pool_meta().await;
             }
         }
 
@@ -1080,10 +1081,10 @@ impl ECStore {
 
                 {
                     let mut pool_meta = self.pool_meta.write().await;
-                    if pool_meta.bucket_done(idx, bucket.to_string()) {
-                        if let Err(err) = pool_meta.save(self.pools.clone()).await {
-                            error!("decom pool_meta.save err {:?}", err);
-                        }
+                    if pool_meta.bucket_done(idx, bucket.to_string())
+                        && let Err(err) = pool_meta.save(self.pools.clone()).await
+                    {
+                        error!("decom pool_meta.save err {:?}", err);
                     }
                 }
                 continue;
@@ -1100,10 +1101,10 @@ impl ECStore {
 
             {
                 let mut pool_meta = self.pool_meta.write().await;
-                if pool_meta.bucket_done(idx, bucket.to_string()) {
-                    if let Err(err) = pool_meta.save(self.pools.clone()).await {
-                        error!("decom pool_meta.save err {:?}", err);
-                    }
+                if pool_meta.bucket_done(idx, bucket.to_string())
+                    && let Err(err) = pool_meta.save(self.pools.clone()).await
+                {
+                    error!("decom pool_meta.save err {:?}", err);
                 }
 
                 warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
@@ -1138,11 +1139,10 @@ impl ECStore {
             if let Err(err) = self
                 .make_bucket(bk.to_string_lossy().to_string().as_str(), &MakeBucketOptions::default())
                 .await
+                && !is_err_bucket_exists(&err)
             {
-                if !is_err_bucket_exists(&err) {
-                    error!("decommission: make bucket failed: {err}");
-                    return Err(err);
-                }
+                error!("decommission: make bucket failed: {err}");
+                return Err(err);
             }
         }
 

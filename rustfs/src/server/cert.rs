@@ -260,12 +260,12 @@ async fn walk_dir(path: PathBuf, cert_name: &str, cert_data: &mut Vec<u8>) {
                     // Only check direct subdirectories, no deeper recursion
                     if let Ok(mut sub_rd) = tokio::fs::read_dir(&entry.path()).await {
                         while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
-                            if let Ok(sub_ft) = sub_entry.file_type().await {
-                                if sub_ft.is_file() {
-                                    load_if_matches(&sub_entry, cert_name, cert_data).await;
-                                }
-                                // Ignore subdirectories and symlinks in subdirs to limit to one level
+                            if let Ok(sub_ft) = sub_entry.file_type().await
+                                && sub_ft.is_file()
+                            {
+                                load_if_matches(&sub_entry, cert_name, cert_data).await;
                             }
+                            // Ignore subdirectories and symlinks in subdirs to limit to one level
                         }
                     }
                 } else if ft.is_symlink() {
@@ -277,12 +277,12 @@ async fn walk_dir(path: PathBuf, cert_name: &str, cert_data: &mut Vec<u8>) {
                             // Treat as directory but only check its direct contents
                             if let Ok(mut sub_rd) = tokio::fs::read_dir(&entry.path()).await {
                                 while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
-                                    if let Ok(sub_ft) = sub_entry.file_type().await {
-                                        if sub_ft.is_file() {
-                                            load_if_matches(&sub_entry, cert_name, cert_data).await;
-                                        }
-                                        // Ignore deeper levels
+                                    if let Ok(sub_ft) = sub_entry.file_type().await
+                                        && sub_ft.is_file()
+                                    {
+                                        load_if_matches(&sub_entry, cert_name, cert_data).await;
                                     }
+                                    // Ignore deeper levels
                                 }
                             }
                         }
