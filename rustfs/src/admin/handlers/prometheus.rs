@@ -18,18 +18,24 @@
 //! text exposition format. These endpoints are designed to be scraped by
 //! Prometheus servers for monitoring and alerting.
 //!
+//! # Performance
+//!
+//! Each endpoint uses a 10-second cache to avoid redundant data collection.
+//! This is shorter than typical Prometheus scrape intervals (15-60s) to
+//! ensure reasonably fresh data while minimizing CPU overhead.
+//!
 //! # Endpoints
 //!
 //! - `/rustfs/v2/metrics/cluster` - Cluster-wide capacity and usage metrics
 //! - `/rustfs/v2/metrics/bucket` - Per-bucket usage and quota metrics
 //! - `/rustfs/v2/metrics/node` - Per-node disk capacity and health metrics
 //! - `/rustfs/v2/metrics/resource` - System resource metrics (CPU, memory, uptime)
-//! - `/rustfs/v2/metrics/config` - Generate Prometheus scrape configuration
+//! - `/rustfs/admin/v3/prometheus/config` - Generate Prometheus scrape configuration
 //!
 //! # Authentication
 //!
 //! All metrics endpoints require Bearer token authentication. Tokens can be
-//! generated using the `/rustfs/v2/metrics/config` endpoint.
+//! generated using the `/rustfs/admin/v3/prometheus/config` endpoint.
 
 use super::super::router::Operation;
 use http::{HeaderMap, HeaderValue};
@@ -41,6 +47,7 @@ use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity
 use rustfs_ecstore::store_api::{BucketOptions, StorageAPI};
 use rustfs_obs::prometheus::{
     auth::{AuthError, generate_prometheus_config, generate_prometheus_token, verify_bearer_token_with_query},
+    cache::MetricsCache,
     collectors::{
         BucketStats, ClusterStats, DiskStats, ResourceStats, collect_bucket_metrics, collect_cluster_metrics,
         collect_node_metrics, collect_resource_metrics,
@@ -50,10 +57,20 @@ use rustfs_obs::prometheus::{
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use tracing::{error, warn};
 
 /// Content-Type header value for Prometheus text exposition format.
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Global caches for each metrics endpoint.
+///
+/// TTL is configurable via `RUSTFS_PROMETHEUS_CACHE_TTL` environment variable (in seconds).
+/// Default is 10 seconds. Set to 0 to disable caching.
+static CLUSTER_CACHE: LazyLock<MetricsCache> = LazyLock::new(MetricsCache::with_configured_ttl);
+static BUCKET_CACHE: LazyLock<MetricsCache> = LazyLock::new(MetricsCache::with_configured_ttl);
+static NODE_CACHE: LazyLock<MetricsCache> = LazyLock::new(MetricsCache::with_configured_ttl);
+static RESOURCE_CACHE: LazyLock<MetricsCache> = LazyLock::new(MetricsCache::with_configured_ttl);
 
 /// Verify Bearer token from request headers or query parameter.
 ///
@@ -62,6 +79,7 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// 2. The `?token=<token>` query parameter (fallback for when s3s intercepts the Authorization header)
 ///
 /// Returns an S3Error if authentication fails.
+#[inline]
 fn verify_prometheus_auth(headers: &HeaderMap, uri: &http::Uri) -> S3Result<()> {
     let secret_key = get_global_secret_key();
     if secret_key.is_empty() {
@@ -82,6 +100,7 @@ fn verify_prometheus_auth(headers: &HeaderMap, uri: &http::Uri) -> S3Result<()> 
 }
 
 /// Create response with Prometheus content type.
+#[inline]
 fn prometheus_response(body: String) -> S3Response<(StatusCode, Body)> {
     let mut headers = HeaderMap::new();
     if let Ok(content_type) = PROMETHEUS_CONTENT_TYPE.parse::<HeaderValue>() {
@@ -185,6 +204,7 @@ async fn collect_disk_stats() -> Vec<DiskStats> {
 }
 
 /// Collect resource statistics for the current process.
+#[inline]
 fn collect_process_stats() -> ResourceStats {
     // Basic process stats - could be enhanced with sysinfo crate
     ResourceStats {
@@ -208,9 +228,13 @@ impl Operation for ClusterMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         verify_prometheus_auth(&req.headers, &req.uri)?;
 
-        let stats = collect_cluster_stats().await;
-        let metrics = collect_cluster_metrics(&stats);
-        let body = render_metrics(&metrics);
+        let body = CLUSTER_CACHE
+            .get_or_compute_async(|| async {
+                let stats = collect_cluster_stats().await;
+                let metrics = collect_cluster_metrics(&stats);
+                render_metrics(&metrics)
+            })
+            .await;
 
         Ok(prometheus_response(body))
     }
@@ -229,9 +253,13 @@ impl Operation for BucketMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         verify_prometheus_auth(&req.headers, &req.uri)?;
 
-        let stats = collect_bucket_stats().await;
-        let metrics = collect_bucket_metrics(&stats);
-        let body = render_metrics(&metrics);
+        let body = BUCKET_CACHE
+            .get_or_compute_async(|| async {
+                let stats = collect_bucket_stats().await;
+                let metrics = collect_bucket_metrics(&stats);
+                render_metrics(&metrics)
+            })
+            .await;
 
         Ok(prometheus_response(body))
     }
@@ -245,14 +273,19 @@ impl Operation for BucketMetricsHandler {
 /// - Free disk space
 pub struct NodeMetricsHandler;
 
-#[async_trait::async_trait]
+#[async_trait::async_trait
+]
 impl Operation for NodeMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         verify_prometheus_auth(&req.headers, &req.uri)?;
 
-        let stats = collect_disk_stats().await;
-        let metrics = collect_node_metrics(&stats);
-        let body = render_metrics(&metrics);
+        let body = NODE_CACHE
+            .get_or_compute_async(|| async {
+                let stats = collect_disk_stats().await;
+                let metrics = collect_node_metrics(&stats);
+                render_metrics(&metrics)
+            })
+            .await;
 
         Ok(prometheus_response(body))
     }
@@ -264,13 +297,6 @@ impl Operation for NodeMetricsHandler {
 /// - CPU usage percentage
 /// - Memory usage in bytes
 /// - Process uptime in seconds
-///
-/// # Note
-///
-/// This handler currently returns placeholder data (all zeros) for the initial
-/// implementation. Full resource metrics collection requires integration with
-/// system monitoring libraries (e.g., sysinfo crate) which is planned for a
-/// future release.
 pub struct ResourceMetricsHandler;
 
 #[async_trait::async_trait]
@@ -278,9 +304,11 @@ impl Operation for ResourceMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         verify_prometheus_auth(&req.headers, &req.uri)?;
 
-        let stats = collect_process_stats();
-        let metrics = collect_resource_metrics(&stats);
-        let body = render_metrics(&metrics);
+        let body = RESOURCE_CACHE.get_or_compute(|| {
+            let stats = collect_process_stats();
+            let metrics = collect_resource_metrics(&stats);
+            render_metrics(&metrics)
+        });
 
         Ok(prometheus_response(body))
     }
@@ -295,7 +323,7 @@ pub struct PrometheusConfigResponse {
     pub scrape_config: String,
 }
 
-/// Handler for `/rustfs/v2/metrics/config` endpoint.
+/// Handler for `/rustfs/admin/v3/prometheus/config` endpoint.
 ///
 /// Generates a Prometheus scrape configuration YAML with a JWT bearer token.
 /// This endpoint requires admin credentials (S3 signature authentication).
@@ -364,6 +392,7 @@ impl Operation for PrometheusConfigHandler {
 }
 
 /// Extract a query parameter from the URI.
+#[inline]
 fn extract_query_param(uri: &http::Uri, key: &str) -> Option<String> {
     uri.query().and_then(|query| {
         query.split('&').find_map(|pair| {

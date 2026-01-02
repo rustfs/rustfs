@@ -18,6 +18,7 @@
 //! including capacity, usage, and health status.
 
 use crate::prometheus::{MetricType, PrometheusMetric};
+use std::borrow::Cow;
 
 /// Statistics for a single disk/drive.
 #[derive(Debug, Clone, Default)]
@@ -33,6 +34,15 @@ pub struct DiskStats {
     /// Free space in bytes
     pub free_bytes: u64,
 }
+
+// Static metric definitions
+const METRIC_TOTAL: &str = "rustfs_node_disk_total_bytes";
+const METRIC_USED: &str = "rustfs_node_disk_used_bytes";
+const METRIC_FREE: &str = "rustfs_node_disk_free_bytes";
+
+const HELP_TOTAL: &str = "Total disk capacity in bytes";
+const HELP_USED: &str = "Used disk space in bytes";
+const HELP_FREE: &str = "Free disk space in bytes";
 
 /// Collects per-node disk metrics from the provided disk statistics.
 ///
@@ -66,41 +76,34 @@ pub struct DiskStats {
 /// assert_eq!(metrics.len(), 3);
 /// ```
 #[must_use]
+#[inline]
 pub fn collect_node_metrics(disks: &[DiskStats]) -> Vec<PrometheusMetric> {
+    if disks.is_empty() {
+        return Vec::new();
+    }
+
     let mut metrics = Vec::with_capacity(disks.len() * 3);
 
     for disk in disks {
+        let server_label: Cow<'static, str> = Cow::Owned(disk.server.clone());
+        let drive_label: Cow<'static, str> = Cow::Owned(disk.drive.clone());
+
         metrics.push(
-            PrometheusMetric::new(
-                "rustfs_node_disk_total_bytes",
-                MetricType::Gauge,
-                "Total disk capacity in bytes",
-                disk.total_bytes as f64,
-            )
-            .with_label("server", &disk.server)
-            .with_label("drive", &disk.drive),
+            PrometheusMetric::new(METRIC_TOTAL, MetricType::Gauge, HELP_TOTAL, disk.total_bytes as f64)
+                .with_label("server", server_label.clone())
+                .with_label("drive", drive_label.clone()),
         );
 
         metrics.push(
-            PrometheusMetric::new(
-                "rustfs_node_disk_used_bytes",
-                MetricType::Gauge,
-                "Used disk space in bytes",
-                disk.used_bytes as f64,
-            )
-            .with_label("server", &disk.server)
-            .with_label("drive", &disk.drive),
+            PrometheusMetric::new(METRIC_USED, MetricType::Gauge, HELP_USED, disk.used_bytes as f64)
+                .with_label("server", server_label.clone())
+                .with_label("drive", drive_label.clone()),
         );
 
         metrics.push(
-            PrometheusMetric::new(
-                "rustfs_node_disk_free_bytes",
-                MetricType::Gauge,
-                "Free disk space in bytes",
-                disk.free_bytes as f64,
-            )
-            .with_label("server", &disk.server)
-            .with_label("drive", &disk.drive),
+            PrometheusMetric::new(METRIC_FREE, MetricType::Gauge, HELP_FREE, disk.free_bytes as f64)
+                .with_label("server", server_label)
+                .with_label("drive", drive_label),
         );
     }
 
@@ -137,18 +140,18 @@ mod tests {
 
         // Verify node1 disk1 total bytes
         let node1_total = metrics.iter().find(|m| {
-            m.name == "rustfs_node_disk_total_bytes"
-                && m.labels.iter().any(|(k, v)| k == "server" && v == "node1:9000")
-                && m.labels.iter().any(|(k, v)| k == "drive" && v == "/data/disk1")
+            m.name == METRIC_TOTAL
+                && m.labels.iter().any(|(k, v)| *k == "server" && v == "node1:9000")
+                && m.labels.iter().any(|(k, v)| *k == "drive" && v == "/data/disk1")
         });
         assert!(node1_total.is_some());
         assert_eq!(node1_total.map(|m| m.value), Some(1000000.0));
 
         // Verify node2 disk2 used bytes
         let node2_used = metrics.iter().find(|m| {
-            m.name == "rustfs_node_disk_used_bytes"
-                && m.labels.iter().any(|(k, v)| k == "server" && v == "node2:9000")
-                && m.labels.iter().any(|(k, v)| k == "drive" && v == "/data/disk2")
+            m.name == METRIC_USED
+                && m.labels.iter().any(|(k, v)| *k == "server" && v == "node2:9000")
+                && m.labels.iter().any(|(k, v)| *k == "drive" && v == "/data/disk2")
         });
         assert!(node2_used.is_some());
         assert_eq!(node2_used.map(|m| m.value), Some(800000.0));
@@ -175,8 +178,8 @@ mod tests {
 
         for metric in &metrics {
             assert_eq!(metric.labels.len(), 2);
-            assert!(metric.labels.iter().any(|(k, _)| k == "server"));
-            assert!(metric.labels.iter().any(|(k, _)| k == "drive"));
+            assert!(metric.labels.iter().any(|(k, _)| *k == "server"));
+            assert!(metric.labels.iter().any(|(k, _)| *k == "drive"));
         }
     }
 

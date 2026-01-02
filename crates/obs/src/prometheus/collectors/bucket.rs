@@ -18,6 +18,7 @@
 //! size, object counts, and quota information.
 
 use crate::prometheus::{MetricType, PrometheusMetric};
+use std::borrow::Cow;
 
 /// Usage statistics for a single bucket.
 #[derive(Debug, Clone, Default)]
@@ -31,6 +32,15 @@ pub struct BucketStats {
     /// Quota limit in bytes (0 means no quota)
     pub quota_bytes: u64,
 }
+
+// Static metric definitions
+const METRIC_SIZE: &str = "rustfs_bucket_usage_bytes";
+const METRIC_OBJECTS: &str = "rustfs_bucket_objects_total";
+const METRIC_QUOTA: &str = "rustfs_bucket_quota_bytes";
+
+const HELP_SIZE: &str = "Total bytes used by the bucket";
+const HELP_OBJECTS: &str = "Total number of objects in the bucket";
+const HELP_QUOTA: &str = "Quota limit in bytes for the bucket";
 
 /// Collects per-bucket usage metrics from the provided bucket statistics.
 ///
@@ -63,42 +73,34 @@ pub struct BucketStats {
 /// assert_eq!(metrics.len(), 3); // size, objects, quota
 /// ```
 #[must_use]
+#[inline]
 pub fn collect_bucket_metrics(buckets: &[BucketStats]) -> Vec<PrometheusMetric> {
+    if buckets.is_empty() {
+        return Vec::new();
+    }
+
     let mut metrics = Vec::with_capacity(buckets.len() * 3);
 
     for bucket in buckets {
+        let bucket_label: Cow<'static, str> = Cow::Owned(bucket.name.clone());
+
         // Bucket size in bytes
         metrics.push(
-            PrometheusMetric::new(
-                "rustfs_bucket_usage_bytes",
-                MetricType::Gauge,
-                "Total bytes used by the bucket",
-                bucket.size_bytes as f64,
-            )
-            .with_label("bucket", &bucket.name),
+            PrometheusMetric::new(METRIC_SIZE, MetricType::Gauge, HELP_SIZE, bucket.size_bytes as f64)
+                .with_label("bucket", bucket_label.clone()),
         );
 
         // Object count
         metrics.push(
-            PrometheusMetric::new(
-                "rustfs_bucket_objects_total",
-                MetricType::Gauge,
-                "Total number of objects in the bucket",
-                bucket.objects_count as f64,
-            )
-            .with_label("bucket", &bucket.name),
+            PrometheusMetric::new(METRIC_OBJECTS, MetricType::Gauge, HELP_OBJECTS, bucket.objects_count as f64)
+                .with_label("bucket", bucket_label.clone()),
         );
 
         // Quota (only if configured)
         if bucket.quota_bytes > 0 {
             metrics.push(
-                PrometheusMetric::new(
-                    "rustfs_bucket_quota_bytes",
-                    MetricType::Gauge,
-                    "Quota limit in bytes for the bucket",
-                    bucket.quota_bytes as f64,
-                )
-                .with_label("bucket", &bucket.name),
+                PrometheusMetric::new(METRIC_QUOTA, MetricType::Gauge, HELP_QUOTA, bucket.quota_bytes as f64)
+                    .with_label("bucket", bucket_label),
             );
         }
     }
@@ -135,7 +137,7 @@ mod tests {
         // Verify test-bucket metrics
         let test_bucket_size = metrics
             .iter()
-            .find(|m| m.name == "rustfs_bucket_usage_bytes" && m.labels.iter().any(|(k, v)| k == "bucket" && v == "test-bucket"));
+            .find(|m| m.name == METRIC_SIZE && m.labels.iter().any(|(k, v)| *k == "bucket" && v == "test-bucket"));
         assert!(test_bucket_size.is_some());
         assert_eq!(test_bucket_size.map(|m| m.value), Some(1000.0));
     }
@@ -155,7 +157,7 @@ mod tests {
         assert_eq!(metrics.len(), 3);
 
         // Verify quota metric exists
-        let quota_metric = metrics.iter().find(|m| m.name == "rustfs_bucket_quota_bytes");
+        let quota_metric = metrics.iter().find(|m| m.name == METRIC_QUOTA);
         assert!(quota_metric.is_some());
         assert_eq!(quota_metric.map(|m| m.value), Some(10000.0));
     }
@@ -180,7 +182,7 @@ mod tests {
 
         // Zero quota should not produce a quota metric
         assert_eq!(metrics.len(), 2);
-        assert!(!metrics.iter().any(|m| m.name == "rustfs_bucket_quota_bytes"));
+        assert!(!metrics.iter().any(|m| m.name == METRIC_QUOTA));
     }
 
     #[test]

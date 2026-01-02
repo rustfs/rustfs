@@ -33,6 +33,18 @@ pub struct ResourceStats {
     pub uptime_seconds: u64,
 }
 
+// Static metric definitions
+const METRIC_CPU: &str = "rustfs_process_cpu_percent";
+const METRIC_MEMORY: &str = "rustfs_process_memory_bytes";
+const METRIC_UPTIME: &str = "rustfs_process_uptime_seconds";
+
+const HELP_CPU: &str = "CPU usage of the RustFS process as a percentage";
+const HELP_MEMORY: &str = "Resident memory usage of the RustFS process in bytes";
+const HELP_UPTIME: &str = "Uptime of the RustFS process in seconds";
+
+/// Number of metrics produced by this collector.
+const METRIC_COUNT: usize = 3;
+
 /// Collects system resource metrics from the provided statistics.
 ///
 /// # Metrics Produced
@@ -58,27 +70,27 @@ pub struct ResourceStats {
 /// let metrics = collect_resource_metrics(&stats);
 /// ```
 #[must_use]
+#[inline]
 pub fn collect_resource_metrics(stats: &ResourceStats) -> Vec<PrometheusMetric> {
-    vec![
-        PrometheusMetric::new(
-            "rustfs_process_cpu_percent",
-            MetricType::Gauge,
-            "CPU usage of the RustFS process as a percentage",
-            stats.cpu_percent,
-        ),
-        PrometheusMetric::new(
-            "rustfs_process_memory_bytes",
-            MetricType::Gauge,
-            "Resident memory usage of the RustFS process in bytes",
-            stats.memory_bytes as f64,
-        ),
-        PrometheusMetric::new(
-            "rustfs_process_uptime_seconds",
-            MetricType::Gauge,
-            "Uptime of the RustFS process in seconds",
-            stats.uptime_seconds as f64,
-        ),
-    ]
+    let mut metrics = Vec::with_capacity(METRIC_COUNT);
+
+    metrics.push(PrometheusMetric::new(METRIC_CPU, MetricType::Gauge, HELP_CPU, stats.cpu_percent));
+
+    metrics.push(PrometheusMetric::new(
+        METRIC_MEMORY,
+        MetricType::Gauge,
+        HELP_MEMORY,
+        stats.memory_bytes as f64,
+    ));
+
+    metrics.push(PrometheusMetric::new(
+        METRIC_UPTIME,
+        MetricType::Gauge,
+        HELP_UPTIME,
+        stats.uptime_seconds as f64,
+    ));
+
+    metrics
 }
 
 #[cfg(test)]
@@ -98,17 +110,17 @@ mod tests {
         assert_eq!(metrics.len(), 3);
 
         // Verify CPU metric
-        let cpu = metrics.iter().find(|m| m.name == "rustfs_process_cpu_percent");
+        let cpu = metrics.iter().find(|m| m.name == METRIC_CPU);
         assert!(cpu.is_some());
         assert_eq!(cpu.map(|m| m.value), Some(45.5));
 
         // Verify memory metric
-        let memory = metrics.iter().find(|m| m.name == "rustfs_process_memory_bytes");
+        let memory = metrics.iter().find(|m| m.name == METRIC_MEMORY);
         assert!(memory.is_some());
         assert_eq!(memory.map(|m| m.value), Some((1024 * 1024 * 256) as f64));
 
         // Verify uptime metric
-        let uptime = metrics.iter().find(|m| m.name == "rustfs_process_uptime_seconds");
+        let uptime = metrics.iter().find(|m| m.name == METRIC_UPTIME);
         assert!(uptime.is_some());
         assert_eq!(uptime.map(|m| m.value), Some(7200.0));
     }
@@ -137,7 +149,7 @@ mod tests {
 
         let metrics = collect_resource_metrics(&stats);
 
-        let cpu = metrics.iter().find(|m| m.name == "rustfs_process_cpu_percent");
+        let cpu = metrics.iter().find(|m| m.name == METRIC_CPU);
         assert!(cpu.is_some());
         assert_eq!(cpu.map(|m| m.value), Some(150.0));
     }

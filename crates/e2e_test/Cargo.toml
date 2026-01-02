@@ -59,3 +59,4 @@ anyhow.workspace = true
 native-tls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+rustfs-obs.workspace = true

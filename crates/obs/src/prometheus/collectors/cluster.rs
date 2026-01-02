@@ -40,6 +40,24 @@ pub struct ClusterStats {
     pub buckets_count: u64,
 }
 
+// Static metric definitions to avoid allocations
+const METRIC_RAW_CAPACITY: &str = "rustfs_cluster_capacity_raw_total_bytes";
+const METRIC_USABLE_CAPACITY: &str = "rustfs_cluster_capacity_usable_total_bytes";
+const METRIC_USED: &str = "rustfs_cluster_capacity_used_bytes";
+const METRIC_FREE: &str = "rustfs_cluster_capacity_free_bytes";
+const METRIC_OBJECTS: &str = "rustfs_cluster_objects_total";
+const METRIC_BUCKETS: &str = "rustfs_cluster_buckets_total";
+
+const HELP_RAW_CAPACITY: &str = "Total raw storage capacity in bytes across all disks";
+const HELP_USABLE_CAPACITY: &str = "Total usable storage capacity in bytes (accounting for erasure coding)";
+const HELP_USED: &str = "Total used storage capacity in bytes";
+const HELP_FREE: &str = "Total free storage capacity in bytes";
+const HELP_OBJECTS: &str = "Total number of objects in the cluster";
+const HELP_BUCKETS: &str = "Total number of buckets in the cluster";
+
+/// Number of metrics produced by this collector.
+const METRIC_COUNT: usize = 6;
+
 /// Collects cluster-wide metrics from the provided statistics.
 ///
 /// # Metrics Produced
@@ -72,45 +90,48 @@ pub struct ClusterStats {
 /// assert_eq!(metrics.len(), 6);
 /// ```
 #[must_use]
+#[inline]
 pub fn collect_cluster_metrics(stats: &ClusterStats) -> Vec<PrometheusMetric> {
-    vec![
-        PrometheusMetric::new(
-            "rustfs_cluster_capacity_raw_total_bytes",
-            MetricType::Gauge,
-            "Total raw storage capacity in bytes across all disks",
-            stats.raw_capacity_bytes as f64,
-        ),
-        PrometheusMetric::new(
-            "rustfs_cluster_capacity_usable_total_bytes",
-            MetricType::Gauge,
-            "Total usable storage capacity in bytes (accounting for erasure coding)",
-            stats.usable_capacity_bytes as f64,
-        ),
-        PrometheusMetric::new(
-            "rustfs_cluster_capacity_used_bytes",
-            MetricType::Gauge,
-            "Total used storage capacity in bytes",
-            stats.used_bytes as f64,
-        ),
-        PrometheusMetric::new(
-            "rustfs_cluster_capacity_free_bytes",
-            MetricType::Gauge,
-            "Total free storage capacity in bytes",
-            stats.free_bytes as f64,
-        ),
-        PrometheusMetric::new(
-            "rustfs_cluster_objects_total",
-            MetricType::Gauge,
-            "Total number of objects in the cluster",
-            stats.objects_count as f64,
-        ),
-        PrometheusMetric::new(
-            "rustfs_cluster_buckets_total",
-            MetricType::Gauge,
-            "Total number of buckets in the cluster",
-            stats.buckets_count as f64,
-        ),
-    ]
+    let mut metrics = Vec::with_capacity(METRIC_COUNT);
+
+    metrics.push(PrometheusMetric::new(
+        METRIC_RAW_CAPACITY,
+        MetricType::Gauge,
+        HELP_RAW_CAPACITY,
+        stats.raw_capacity_bytes as f64,
+    ));
+    metrics.push(PrometheusMetric::new(
+        METRIC_USABLE_CAPACITY,
+        MetricType::Gauge,
+        HELP_USABLE_CAPACITY,
+        stats.usable_capacity_bytes as f64,
+    ));
+    metrics.push(PrometheusMetric::new(
+        METRIC_USED,
+        MetricType::Gauge,
+        HELP_USED,
+        stats.used_bytes as f64,
+    ));
+    metrics.push(PrometheusMetric::new(
+        METRIC_FREE,
+        MetricType::Gauge,
+        HELP_FREE,
+        stats.free_bytes as f64,
+    ));
+    metrics.push(PrometheusMetric::new(
+        METRIC_OBJECTS,
+        MetricType::Gauge,
+        HELP_OBJECTS,
+        stats.objects_count as f64,
+    ));
+    metrics.push(PrometheusMetric::new(
+        METRIC_BUCKETS,
+        MetricType::Gauge,
+        HELP_BUCKETS,
+        stats.buckets_count as f64,
+    ));
+
+    metrics
 }
 
 #[cfg(test)]
@@ -133,22 +154,22 @@ mod tests {
         assert_eq!(metrics.len(), 6);
 
         // Verify raw capacity
-        let raw_capacity = metrics.iter().find(|m| m.name == "rustfs_cluster_capacity_raw_total_bytes");
+        let raw_capacity = metrics.iter().find(|m| m.name == METRIC_RAW_CAPACITY);
         assert!(raw_capacity.is_some());
         assert_eq!(raw_capacity.map(|m| m.value), Some(3000.0));
 
         // Verify used capacity
-        let used = metrics.iter().find(|m| m.name == "rustfs_cluster_capacity_used_bytes");
+        let used = metrics.iter().find(|m| m.name == METRIC_USED);
         assert!(used.is_some());
         assert_eq!(used.map(|m| m.value), Some(1200.0));
 
         // Verify object count
-        let objects = metrics.iter().find(|m| m.name == "rustfs_cluster_objects_total");
+        let objects = metrics.iter().find(|m| m.name == METRIC_OBJECTS);
         assert!(objects.is_some());
         assert_eq!(objects.map(|m| m.value), Some(100.0));
 
         // Verify bucket count
-        let buckets = metrics.iter().find(|m| m.name == "rustfs_cluster_buckets_total");
+        let buckets = metrics.iter().find(|m| m.name == METRIC_BUCKETS);
         assert!(buckets.is_some());
         assert_eq!(buckets.map(|m| m.value), Some(5.0));
     }
