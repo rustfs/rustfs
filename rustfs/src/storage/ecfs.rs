@@ -1564,6 +1564,26 @@ impl S3 for FS {
                     }
                 };
             };
+            {
+                let mut req_per = req.clone();
+                let req_info = req_per.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+                req_info.bucket = Some(bucket.clone());
+                req_info.object = Some(object.key.clone());
+                req_info.version_id = object.version_id.clone();
+
+                // Perform authorization check; if it fails, record error and skip the object
+                let auth_res = authorize_request(&mut req_per, Action::S3Action(S3Action::DeleteObjectAction)).await;
+
+                if let Err(e) = auth_res {
+                    delete_results[idx].error = Some(Error {
+                        code: Some("AccessDenied".to_string()),
+                        key: Some(object.key.clone()),
+                        message: Some(e.to_string()),
+                        version_id: object.version_id.clone(),
+                    });
+                    continue;
+                }
+            }
 
             {
                 let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
