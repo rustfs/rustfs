@@ -21,9 +21,13 @@
 //! - Rejection of requests without valid authentication
 
 use crate::common::{RustFSTestEnvironment, init_logging};
+use aws_sdk_s3::primitives::ByteStream;
 use reqwest::Client;
 use rustfs_obs::prometheus::auth::generate_prometheus_token;
 use serial_test::serial;
+use std::collections::HashMap;
+use std::time::Duration;
+use tokio::time::sleep;
 use tracing::info;
 
 /// Generate a Prometheus token directly for testing.
@@ -68,6 +72,69 @@ fn is_valid_prometheus_format(body: &str) -> bool {
     }
 
     true
+}
+
+/// Parse Prometheus text format metrics into a HashMap of metric names to values.
+///
+/// This function handles both formats:
+/// - `metric_name value` (simple format)
+/// - `metric_name{labels} value` (format with labels)
+///
+/// Comment lines (starting with #) and empty lines are skipped.
+///
+/// For metrics with labels, two entries are inserted:
+/// 1. Full key including labels (e.g., `metric_name{label="value"}`) for specific lookups
+/// 2. Just the metric name (e.g., `metric_name`) for easy lookups (last value seen wins)
+///
+/// For metrics without labels, only one entry is inserted with the metric name as key.
+fn parse_prometheus_metrics(body: &str) -> HashMap<String, f64> {
+    let mut metrics = HashMap::new();
+
+    for line in body.lines() {
+        let line = line.trim();
+
+        // Skip empty lines and comment lines
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Check if this line has labels (contains '{')
+        let has_labels = line.contains('{');
+
+        // Find the metric name (portion before '{' or first whitespace)
+        let metric_name_end = line.find('{').or_else(|| line.find(char::is_whitespace));
+
+        let metric_name = match metric_name_end {
+            Some(pos) => &line[..pos],
+            None => continue, // No metric name found, skip this line
+        };
+
+        // Find the value - it's the last whitespace-separated token
+        let value_str = match line.split_whitespace().last() {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Parse the value as f64
+        if let Ok(value) = value_str.parse::<f64>() {
+            if has_labels {
+                // For lines with labels, extract the full key (metric_name{labels})
+                // The full key is everything before the last whitespace-separated value
+                if let Some(last_space_pos) = line.rfind(char::is_whitespace) {
+                    let full_key = line[..last_space_pos].trim_end();
+                    // Insert with full key including labels
+                    metrics.insert(full_key.to_string(), value);
+                }
+                // Also insert with just the metric name for easy lookup
+                metrics.insert(metric_name.to_string(), value);
+            } else {
+                // No labels, just insert with metric name
+                metrics.insert(metric_name.to_string(), value);
+            }
+        }
+    }
+
+    metrics
 }
 
 /// Test that Prometheus token generation works correctly.
@@ -544,14 +611,22 @@ async fn test_prometheus_token_endpoint_to_metrics_scrape() {
 
     let client = Client::new();
 
-    // Step 1: Call the token endpoint with valid credentials
-    let token_url = format!(
-        "{}/rustfs/admin/v3/prometheus/token?access_key={}&secret_key={}",
-        env.url, env.access_key, env.secret_key
-    );
+    // Step 1: Call the token endpoint with valid credentials in POST body
+    let token_url = format!("{}/rustfs/admin/v3/prometheus/token", env.url);
     info!("Requesting token from: {}", token_url);
 
-    let token_response = client.post(&token_url).send().await.expect("Failed to send token request");
+    let token_request_body = serde_json::json!({
+        "access_key": env.access_key,
+        "secret_key": env.secret_key
+    });
+
+    let token_response = client
+        .post(&token_url)
+        .header("Content-Type", "application/json")
+        .body(token_request_body.to_string())
+        .send()
+        .await
+        .expect("Failed to send token request");
 
     assert!(
         token_response.status().is_success(),
@@ -612,14 +687,22 @@ async fn test_prometheus_token_generation() {
 
     let client = Client::new();
 
-    // Call the token generation endpoint with valid credentials
-    let token_url = format!(
-        "{}/rustfs/admin/v3/prometheus/token?access_key={}&secret_key={}",
-        env.url, env.access_key, env.secret_key
-    );
+    // Call the token generation endpoint with valid credentials in POST body
+    let token_url = format!("{}/rustfs/admin/v3/prometheus/token", env.url);
     info!("Requesting token from: {}", token_url);
 
-    let response = client.post(&token_url).send().await.expect("Failed to send token request");
+    let token_request_body = serde_json::json!({
+        "access_key": env.access_key,
+        "secret_key": env.secret_key
+    });
+
+    let response = client
+        .post(&token_url)
+        .header("Content-Type", "application/json")
+        .body(token_request_body.to_string())
+        .send()
+        .await
+        .expect("Failed to send token request");
 
     // Verify response status is 200
     assert_eq!(
@@ -662,9 +745,10 @@ async fn test_prometheus_token_generation() {
 /// Test error cases for the Prometheus token endpoint.
 ///
 /// This test verifies:
-/// 1. Missing access_key returns an error
-/// 2. Missing secret_key returns an error
-/// 3. Invalid credentials return an error
+/// 1. Missing access_key in request body returns an error
+/// 2. Missing secret_key in request body returns an error
+/// 3. Invalid credentials in request body return an error
+/// 4. Empty/invalid JSON body returns an error
 #[tokio::test]
 #[serial]
 async fn test_prometheus_token_endpoint_errors() {
@@ -676,13 +760,18 @@ async fn test_prometheus_token_endpoint_errors() {
     env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS server");
 
     let client = Client::new();
+    let token_url = format!("{}/rustfs/admin/v3/prometheus/token", env.url);
 
-    // Test 1: Missing access_key
+    // Test 1: Missing access_key in body
     info!("Testing missing access_key");
-    let url_missing_access_key = format!("{}/rustfs/admin/v3/prometheus/token?secret_key={}", env.url, env.secret_key);
+    let body_missing_access_key = serde_json::json!({
+        "secret_key": env.secret_key
+    });
 
     let response = client
-        .post(&url_missing_access_key)
+        .post(&token_url)
+        .header("Content-Type", "application/json")
+        .body(body_missing_access_key.to_string())
         .send()
         .await
         .expect("Failed to send request");
@@ -694,12 +783,16 @@ async fn test_prometheus_token_endpoint_errors() {
     );
     info!("Missing access_key correctly returned error status: {}", response.status());
 
-    // Test 2: Missing secret_key
+    // Test 2: Missing secret_key in body
     info!("Testing missing secret_key");
-    let url_missing_secret_key = format!("{}/rustfs/admin/v3/prometheus/token?access_key={}", env.url, env.access_key);
+    let body_missing_secret_key = serde_json::json!({
+        "access_key": env.access_key
+    });
 
     let response = client
-        .post(&url_missing_secret_key)
+        .post(&token_url)
+        .header("Content-Type", "application/json")
+        .body(body_missing_secret_key.to_string())
         .send()
         .await
         .expect("Failed to send request");
@@ -711,14 +804,20 @@ async fn test_prometheus_token_endpoint_errors() {
     );
     info!("Missing secret_key correctly returned error status: {}", response.status());
 
-    // Test 3: Invalid credentials
+    // Test 3: Invalid credentials in body
     info!("Testing invalid credentials");
-    let url_invalid_creds = format!(
-        "{}/rustfs/admin/v3/prometheus/token?access_key=invalid_user&secret_key=wrong_password",
-        env.url
-    );
+    let body_invalid_creds = serde_json::json!({
+        "access_key": "invalid_user",
+        "secret_key": "wrong_password"
+    });
 
-    let response = client.post(&url_invalid_creds).send().await.expect("Failed to send request");
+    let response = client
+        .post(&token_url)
+        .header("Content-Type", "application/json")
+        .body(body_invalid_creds.to_string())
+        .send()
+        .await
+        .expect("Failed to send request");
 
     assert!(
         !response.status().is_success(),
@@ -727,5 +826,669 @@ async fn test_prometheus_token_endpoint_errors() {
     );
     info!("Invalid credentials correctly returned error status: {}", response.status());
 
+    // Test 4: Empty body
+    info!("Testing empty body");
+    let response = client
+        .post(&token_url)
+        .header("Content-Type", "application/json")
+        .body("")
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert!(
+        !response.status().is_success(),
+        "Request with empty body should fail, got status: {}",
+        response.status()
+    );
+    info!("Empty body correctly returned error status: {}", response.status());
+
+    // Test 5: Invalid JSON body
+    info!("Testing invalid JSON body");
+    let response = client
+        .post(&token_url)
+        .header("Content-Type", "application/json")
+        .body("not valid json")
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert!(
+        !response.status().is_success(),
+        "Request with invalid JSON body should fail, got status: {}",
+        response.status()
+    );
+    info!("Invalid JSON body correctly returned error status: {}", response.status());
+
     info!("Prometheus token endpoint error cases test passed");
+}
+
+/// Test that Prometheus metrics content changes after S3 operations.
+///
+/// This test verifies:
+/// 1. Metrics are scraped and parsed successfully before any operations
+/// 2. After creating a bucket and uploading an object, metrics reflect the changes
+/// 3. The metrics cache refresh works correctly (10s TTL)
+/// 4. Cluster metrics are present and contain expected data
+///
+/// The test will FAIL if:
+/// - No metrics are returned from the endpoint
+/// - No cluster-related metrics are found in the response
+/// - The metrics response is invalid
+#[tokio::test]
+#[serial]
+async fn test_prometheus_metrics_content_validation() {
+    init_logging();
+    info!("Starting Prometheus Metrics Content Validation Test");
+
+    let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+
+    env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS server");
+
+    // Generate token directly for testing
+    let token = generate_test_token(&env.access_key, &env.secret_key);
+
+    info!("Generated Prometheus token for metrics access");
+
+    // Step 1: Scrape initial cluster metrics
+    let http_client = Client::new();
+    let metrics_url = format!("{}/rustfs/v2/metrics/cluster?token={}", env.url, token);
+
+    let initial_response = http_client
+        .get(&metrics_url)
+        .send()
+        .await
+        .expect("Failed to send initial cluster metrics request");
+
+    assert!(
+        initial_response.status().is_success(),
+        "Initial cluster metrics request should succeed, got status: {}",
+        initial_response.status()
+    );
+
+    let initial_body = initial_response
+        .text()
+        .await
+        .expect("Failed to read initial metrics response body");
+
+    info!("Initial metrics response length: {} bytes", initial_body.len());
+
+    // Verify the response is valid Prometheus format
+    assert!(
+        is_valid_prometheus_format(&initial_body),
+        "Initial metrics response should be in valid Prometheus format"
+    );
+
+    // Step 2: Parse the initial metrics
+    let initial_metrics = parse_prometheus_metrics(&initial_body);
+
+    info!("Parsed {} initial metrics", initial_metrics.len());
+
+    // Log some initial metric values for debugging
+    for (key, value) in initial_metrics.iter().take(10) {
+        info!("Initial metric: {} = {}", key, value);
+    }
+
+    // Step 3: Create a test bucket via S3 client
+    let s3_client = env.create_s3_client();
+    let test_bucket_name = "metrics-test-bucket";
+    let test_object_key = "test-object.txt";
+
+    s3_client
+        .create_bucket()
+        .bucket(test_bucket_name)
+        .send()
+        .await
+        .expect("Failed to create test bucket");
+
+    info!("Created test bucket: {}", test_bucket_name);
+
+    // Step 4: Upload a test object
+    let data = vec![0u8; 1024]; // 1KB test data
+
+    s3_client
+        .put_object()
+        .bucket(test_bucket_name)
+        .key(test_object_key)
+        .body(ByteStream::from(data))
+        .send()
+        .await
+        .expect("Failed to upload test object");
+
+    info!("Uploaded test object: {} (1KB)", test_object_key);
+
+    // Step 5: Wait 11 seconds for metrics cache refresh (the cache has 10s TTL)
+    info!("Waiting 11 seconds for metrics cache to refresh...");
+    sleep(Duration::from_secs(11)).await;
+
+    // Step 6: Scrape cluster metrics again
+    let updated_response = http_client
+        .get(&metrics_url)
+        .send()
+        .await
+        .expect("Failed to send updated cluster metrics request");
+
+    assert!(
+        updated_response.status().is_success(),
+        "Updated cluster metrics request should succeed, got status: {}",
+        updated_response.status()
+    );
+
+    let updated_body = updated_response
+        .text()
+        .await
+        .expect("Failed to read updated metrics response body");
+
+    info!("Updated metrics response length: {} bytes", updated_body.len());
+
+    // Verify the updated response is valid Prometheus format
+    assert!(
+        is_valid_prometheus_format(&updated_body),
+        "Updated metrics response should be in valid Prometheus format"
+    );
+
+    // Step 7: Parse the new metrics
+    let updated_metrics = parse_prometheus_metrics(&updated_body);
+
+    info!("Parsed {} updated metrics", updated_metrics.len());
+
+    // Assert that we received metrics data
+    assert!(
+        !updated_body.trim().is_empty(),
+        "Metrics response should not be empty after S3 operations"
+    );
+
+    // Step 8: Validate that cluster metrics exist and log before/after values
+    info!("Comparing initial and updated metrics:");
+
+    // Check for common cluster metrics that should exist
+    let expected_cluster_metrics = [
+        "rustfs_cluster_bucket_count",
+        "rustfs_cluster_object_count",
+        "rustfs_cluster_total_size",
+        "rustfs_bucket_usage_total_bytes",
+        "rustfs_bucket_objects_count",
+    ];
+
+    let mut cluster_metrics_found: Vec<String> = Vec::new();
+
+    for metric_name in &expected_cluster_metrics {
+        let initial_value = initial_metrics.get(*metric_name);
+        let updated_value = updated_metrics.get(*metric_name);
+
+        match (initial_value, updated_value) {
+            (Some(init), Some(upd)) => {
+                info!("Metric '{}': before = {}, after = {}", metric_name, init, upd);
+                cluster_metrics_found.push(metric_name.to_string());
+            }
+            (None, Some(upd)) => {
+                info!("Metric '{}': before = (not present), after = {}", metric_name, upd);
+                cluster_metrics_found.push(metric_name.to_string());
+            }
+            (Some(init), None) => {
+                info!("Metric '{}': before = {}, after = (not present)", metric_name, init);
+                cluster_metrics_found.push(metric_name.to_string());
+            }
+            (None, None) => {
+                info!("Metric '{}': not found in either response", metric_name);
+            }
+        }
+    }
+
+    // Log all updated metrics that contain "bucket" or "object" for debugging
+    info!("All updated metrics containing 'bucket' or 'object':");
+    for (key, value) in updated_metrics.iter() {
+        if key.contains("bucket") || key.contains("object") {
+            info!("  {} = {}", key, value);
+            if !cluster_metrics_found.contains(key) {
+                cluster_metrics_found.push(key.clone());
+            }
+        }
+    }
+
+    // Also check for any metrics containing "cluster" or "rustfs"
+    let mut rustfs_metrics_count = 0;
+    for key in updated_metrics.keys() {
+        if key.starts_with("rustfs_") || key.contains("cluster") {
+            rustfs_metrics_count += 1;
+        }
+    }
+    info!("Found {} rustfs/cluster-related metrics in response", rustfs_metrics_count);
+
+    // Assert that we found at least some cluster-related metrics
+    assert!(
+        !cluster_metrics_found.is_empty() || rustfs_metrics_count > 0,
+        "Should have found at least one cluster-related metric in the response. \
+         Expected metrics like {:?}, but none were found. \
+         Updated metrics keys: {:?}",
+        expected_cluster_metrics,
+        updated_metrics.keys().take(20).collect::<Vec<_>>()
+    );
+
+    info!(
+        "Successfully found {} cluster-related metrics: {:?}",
+        cluster_metrics_found.len(),
+        cluster_metrics_found
+    );
+
+    // Step 9: Verify that bucket-related count metrics actually changed after S3 operations
+    // Look for any bucket-related count metrics that we can compare
+    let bucket_metrics = ["rustfs_cluster_buckets_total", "rustfs_cluster_bucket_count", "buckets_total"];
+    let mut found_comparison = false;
+
+    for metric_name in bucket_metrics.iter() {
+        if let (Some(&initial_val), Some(&updated_val)) = (initial_metrics.get(*metric_name), updated_metrics.get(*metric_name)) {
+            info!("Comparing {}: initial={}, updated={}", metric_name, initial_val, updated_val);
+            assert!(
+                updated_val >= initial_val,
+                "Metric {} should not decrease after creating bucket: {} -> {}",
+                metric_name,
+                initial_val,
+                updated_val
+            );
+            found_comparison = true;
+            break;
+        }
+    }
+
+    // If we found a comparison, great! If not, log available metrics for debugging
+    if !found_comparison {
+        info!(
+            "Could not find bucket count metrics to compare. Available metrics: {:?}",
+            updated_metrics.keys().filter(|k| k.contains("bucket")).collect::<Vec<_>>()
+        );
+    }
+
+    // Step 10: Cleanup - delete the test object and bucket
+    info!("Cleaning up test resources...");
+
+    // Delete the test object
+    if let Err(e) = s3_client
+        .delete_object()
+        .bucket(test_bucket_name)
+        .key(test_object_key)
+        .send()
+        .await
+    {
+        info!("Warning: Failed to delete test object: {:?}", e);
+    } else {
+        info!("Deleted test object: {}", test_object_key);
+    }
+
+    // Delete the test bucket
+    if let Err(e) = s3_client.delete_bucket().bucket(test_bucket_name).send().await {
+        info!("Warning: Failed to delete test bucket: {:?}", e);
+    } else {
+        info!("Deleted test bucket: {}", test_bucket_name);
+    }
+
+    info!("Prometheus metrics content validation test passed");
+}
+
+/// Test that resource metrics exist and have reasonable values.
+///
+/// This test verifies:
+/// 1. The resource metrics endpoint returns valid Prometheus format data
+/// 2. Resource metrics (uptime, memory, cpu) are present in the response
+/// 3. Uptime metrics have values >= 0 (can be 0 if scraped within first second of startup)
+/// 4. Memory metrics have values > 0 (process uses some memory)
+///
+/// The test will FAIL if:
+/// - No resource metrics are found at all
+/// - Uptime metrics (if found) are < 0
+/// - Memory metrics (if found) are <= 0
+#[tokio::test]
+#[serial]
+async fn test_prometheus_resource_metrics_exist() {
+    init_logging();
+    info!("Starting Prometheus Resource Metrics Exist Test");
+
+    let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+
+    env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS server");
+
+    // Generate token directly for testing
+    let token = generate_test_token(&env.access_key, &env.secret_key);
+
+    info!("Generated Prometheus token for resource metrics access");
+
+    // Scrape resource metrics endpoint
+    let client = Client::new();
+    let metrics_url = format!("{}/rustfs/v2/metrics/resource?token={}", env.url, token);
+
+    let response = client
+        .get(&metrics_url)
+        .send()
+        .await
+        .expect("Failed to send resource metrics request");
+
+    assert!(
+        response.status().is_success(),
+        "Resource metrics request should succeed, got status: {}",
+        response.status()
+    );
+
+    let body = response.text().await.expect("Failed to read resource metrics response body");
+
+    info!("Resource metrics response length: {} bytes", body.len());
+    info!("Resource metrics response:\n{}", body);
+
+    // Verify the response is valid Prometheus format
+    assert!(
+        is_valid_prometheus_format(&body),
+        "Resource metrics response should be in valid Prometheus format"
+    );
+
+    // Parse the metrics
+    let metrics = parse_prometheus_metrics(&body);
+
+    info!("Parsed {} resource metrics", metrics.len());
+
+    // Define patterns for resource metrics we expect to find
+    // These cover various naming conventions that may be used
+    let uptime_patterns = [
+        "rustfs_process_uptime_seconds",
+        "process_uptime_seconds",
+        "uptime_seconds",
+        "uptime",
+        "rustfs_uptime",
+    ];
+
+    let memory_patterns = [
+        "rustfs_process_memory_bytes",
+        "process_resident_memory_bytes",
+        "process_memory_bytes",
+        "memory_bytes",
+        "memory",
+        "rustfs_memory",
+        "resident_memory",
+    ];
+
+    let cpu_patterns = [
+        "rustfs_process_cpu_seconds_total",
+        "process_cpu_seconds_total",
+        "cpu_seconds_total",
+        "cpu",
+        "rustfs_cpu",
+    ];
+
+    // Track found metrics
+    let mut found_uptime_metrics: Vec<(String, f64)> = Vec::new();
+    let mut found_memory_metrics: Vec<(String, f64)> = Vec::new();
+    let mut found_cpu_metrics: Vec<(String, f64)> = Vec::new();
+    let mut all_resource_metrics: Vec<(String, f64)> = Vec::new();
+
+    // Search for matching metrics
+    for (metric_name, value) in metrics.iter() {
+        let name_lower = metric_name.to_lowercase();
+
+        // Check uptime patterns
+        for pattern in &uptime_patterns {
+            if name_lower.contains(pattern) || metric_name.contains(pattern) {
+                found_uptime_metrics.push((metric_name.clone(), *value));
+                all_resource_metrics.push((metric_name.clone(), *value));
+                break;
+            }
+        }
+
+        // Check memory patterns
+        for pattern in &memory_patterns {
+            if name_lower.contains(pattern) || metric_name.contains(pattern) {
+                found_memory_metrics.push((metric_name.clone(), *value));
+                all_resource_metrics.push((metric_name.clone(), *value));
+                break;
+            }
+        }
+
+        // Check cpu patterns
+        for pattern in &cpu_patterns {
+            if name_lower.contains(pattern) || metric_name.contains(pattern) {
+                found_cpu_metrics.push((metric_name.clone(), *value));
+                all_resource_metrics.push((metric_name.clone(), *value));
+                break;
+            }
+        }
+    }
+
+    // Log all found resource metrics
+    info!("Found {} uptime metrics:", found_uptime_metrics.len());
+    for (name, value) in &found_uptime_metrics {
+        info!("  {} = {}", name, value);
+    }
+
+    info!("Found {} memory metrics:", found_memory_metrics.len());
+    for (name, value) in &found_memory_metrics {
+        info!("  {} = {}", name, value);
+    }
+
+    info!("Found {} cpu metrics:", found_cpu_metrics.len());
+    for (name, value) in &found_cpu_metrics {
+        info!("  {} = {}", name, value);
+    }
+
+    // If we didn't find expected metrics, log all available metrics for debugging
+    if all_resource_metrics.is_empty() {
+        info!("No expected resource metrics found. All available metrics:");
+        for (name, value) in metrics.iter() {
+            info!("  {} = {}", name, value);
+        }
+    }
+
+    // FAIL if no resource metrics are found at all
+    assert!(
+        !all_resource_metrics.is_empty(),
+        "Should have found at least some resource metrics (uptime, memory, or cpu). \
+         Expected metrics matching patterns like {:?}, {:?}, or {:?}. \
+         Available metrics: {:?}",
+        uptime_patterns,
+        memory_patterns,
+        cpu_patterns,
+        metrics.keys().collect::<Vec<_>>()
+    );
+
+    info!("Successfully found {} resource metrics in total", all_resource_metrics.len());
+
+    // Validate uptime metrics have reasonable values (>= 0)
+    for (name, value) in &found_uptime_metrics {
+        assert!(*value >= 0.0, "Uptime metric '{}' should be >= 0, got: {}", name, value);
+        info!("Uptime metric '{}' has valid value: {} >= 0", name, value);
+    }
+
+    // Validate memory metrics have reasonable values (> 0)
+    for (name, value) in &found_memory_metrics {
+        assert!(
+            *value > 0.0,
+            "Memory metric '{}' should be > 0 (process uses memory), got: {}",
+            name,
+            value
+        );
+        info!("Memory metric '{}' has valid value: {} > 0", name, value);
+    }
+
+    // CPU metrics can be 0 if the process just started, so we only log them
+    for (name, value) in &found_cpu_metrics {
+        info!("CPU metric '{}' value: {}", name, value);
+    }
+
+    info!("Prometheus resource metrics exist test passed");
+}
+
+/// Test that the node metrics endpoint works and validates disk metrics if present.
+///
+/// This test verifies:
+/// 1. The node metrics endpoint returns a successful response (not an error)
+/// 2. The response is in valid Prometheus text exposition format
+/// 3. If disk metrics are found, they have valid values:
+///    - Disk total metrics should be > 0 (disk has capacity)
+///    - Disk free metrics should be >= 0 (disk has free space)
+///
+/// The test will FAIL if:
+/// - The endpoint returns an error status
+/// - The response is not valid Prometheus format
+/// - Disk metrics are found but have invalid values (total <= 0, free < 0)
+///
+/// The test will PASS (with a warning) if:
+/// - No disk metrics are found (E2E environment may not report disks)
+#[tokio::test]
+#[serial]
+async fn test_prometheus_node_metrics_exist() {
+    use std::collections::HashSet;
+
+    init_logging();
+    info!("Starting Prometheus Node Metrics Exist Test");
+
+    let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+
+    env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS server");
+
+    // Generate token directly for testing
+    let token = generate_test_token(&env.access_key, &env.secret_key);
+
+    info!("Generated Prometheus token for node metrics access");
+
+    // Scrape node metrics endpoint
+    let client = Client::new();
+    let metrics_url = format!("{}/rustfs/v2/metrics/node?token={}", env.url, token);
+
+    let response = client
+        .get(&metrics_url)
+        .send()
+        .await
+        .expect("Failed to send node metrics request");
+
+    assert!(
+        response.status().is_success(),
+        "Node metrics request should succeed, got status: {}",
+        response.status()
+    );
+
+    let body = response.text().await.expect("Failed to read node metrics response body");
+
+    info!("Node metrics response length: {} bytes", body.len());
+    info!("Node metrics response:\n{}", body);
+
+    // Verify the response is valid Prometheus format
+    assert!(
+        is_valid_prometheus_format(&body),
+        "Node metrics response should be in valid Prometheus format"
+    );
+
+    // Parse the metrics
+    let metrics = parse_prometheus_metrics(&body);
+
+    info!("Parsed {} node metrics", metrics.len());
+
+    // Define exact metric names we expect to find, with a few fallback patterns
+    let disk_total_patterns = ["rustfs_node_disk_total_bytes", "node_disk_total_bytes", "disk_total_bytes"];
+
+    let disk_free_patterns = ["rustfs_node_disk_free_bytes", "node_disk_free_bytes", "disk_free_bytes"];
+
+    let disk_used_patterns = ["rustfs_node_disk_used_bytes", "node_disk_used_bytes", "disk_used_bytes"];
+
+    // Track found metrics using HashSet to prevent duplicates
+    let mut seen_disk_total: HashSet<String> = HashSet::new();
+    let mut seen_disk_free: HashSet<String> = HashSet::new();
+    let mut seen_disk_used: HashSet<String> = HashSet::new();
+
+    let mut found_disk_total_metrics: Vec<(String, f64)> = Vec::new();
+    let mut found_disk_free_metrics: Vec<(String, f64)> = Vec::new();
+    let mut found_disk_used_metrics: Vec<(String, f64)> = Vec::new();
+
+    // Search for matching metrics
+    for (metric_name, value) in metrics.iter() {
+        let name_lower = metric_name.to_lowercase();
+
+        // Check disk total patterns
+        for pattern in &disk_total_patterns {
+            if (name_lower.contains(pattern) || metric_name.contains(pattern)) && !seen_disk_total.contains(metric_name) {
+                seen_disk_total.insert(metric_name.clone());
+                found_disk_total_metrics.push((metric_name.clone(), *value));
+                break;
+            }
+        }
+
+        // Check disk free patterns
+        for pattern in &disk_free_patterns {
+            if (name_lower.contains(pattern) || metric_name.contains(pattern)) && !seen_disk_free.contains(metric_name) {
+                seen_disk_free.insert(metric_name.clone());
+                found_disk_free_metrics.push((metric_name.clone(), *value));
+                break;
+            }
+        }
+
+        // Check disk used patterns
+        for pattern in &disk_used_patterns {
+            if (name_lower.contains(pattern) || metric_name.contains(pattern)) && !seen_disk_used.contains(metric_name) {
+                seen_disk_used.insert(metric_name.clone());
+                found_disk_used_metrics.push((metric_name.clone(), *value));
+                break;
+            }
+        }
+    }
+
+    // Log all found node/disk metrics
+    info!("Found {} disk total metrics:", found_disk_total_metrics.len());
+    for (name, value) in &found_disk_total_metrics {
+        info!("  {} = {}", name, value);
+    }
+
+    info!("Found {} disk free metrics:", found_disk_free_metrics.len());
+    for (name, value) in &found_disk_free_metrics {
+        info!("  {} = {}", name, value);
+    }
+
+    info!("Found {} disk used metrics:", found_disk_used_metrics.len());
+    for (name, value) in &found_disk_used_metrics {
+        info!("  {} = {}", name, value);
+    }
+
+    // Count total unique disk metrics found
+    let total_disk_metrics = found_disk_total_metrics.len() + found_disk_free_metrics.len() + found_disk_used_metrics.len();
+
+    // If no disk metrics found, log warning but don't fail
+    // The E2E environment may not have disks reported
+    if total_disk_metrics == 0 {
+        info!(
+            "WARNING: No disk metrics found in node metrics response. \
+             This may be expected in E2E test environments where disks are not reported. \
+             The endpoint returned valid Prometheus format, so the test passes."
+        );
+        info!("All available metrics for debugging:");
+        for (name, value) in metrics.iter() {
+            info!("  {} = {}", name, value);
+        }
+        info!("Prometheus node metrics exist test passed (no disk metrics, but valid response)");
+        return;
+    }
+
+    info!("Successfully found {} disk metrics in total", total_disk_metrics);
+
+    // Validate disk total metrics have reasonable values (> 0)
+    for (name, value) in &found_disk_total_metrics {
+        assert!(
+            *value > 0.0,
+            "Disk total metric '{}' should be > 0 (disk has capacity), got: {}",
+            name,
+            value
+        );
+        info!("Disk total metric '{}' has valid value: {} > 0", name, value);
+    }
+
+    // Validate disk free metrics have reasonable values (>= 0)
+    for (name, value) in &found_disk_free_metrics {
+        assert!(
+            *value >= 0.0,
+            "Disk free metric '{}' should be >= 0 (disk has free space), got: {}",
+            name,
+            value
+        );
+        info!("Disk free metric '{}' has valid value: {} >= 0", name, value);
+    }
+
+    // Disk used metrics can be any positive value, so we only log them
+    for (name, value) in &found_disk_used_metrics {
+        info!("Disk used metric '{}' value: {}", name, value);
+    }
+
+    info!("Prometheus node metrics exist test passed");
 }

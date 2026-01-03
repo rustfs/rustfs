@@ -49,4 +49,10 @@ impl BucketQuota {
         let t: BucketQuota = rmp_serde::from_slice(buf)?;
         Ok(t)
     }
+
+    /// Returns the configured quota in bytes, if set.
+    /// Falls back to the `size` field if `quota` is not set.
+    pub fn quota_bytes(&self) -> u64 {
+        self.quota.unwrap_or(self.size)
+    }
 }

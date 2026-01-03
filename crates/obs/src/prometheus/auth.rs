@@ -111,7 +111,7 @@ const PROMETHEUS_ISSUER: &str = "prometheus";
 ///
 /// * `access_key` - The access key ID to include in the token's subject claim
 /// * `secret_key` - The secret key used to sign the token (HS512 algorithm)
-/// * `expiry_secs` - Optional expiry duration in seconds (defaults to 30 days)
+/// * `expiry_secs` - Optional expiry duration in seconds (defaults to 100 years)
 ///
 /// # Returns
 ///
@@ -122,7 +122,7 @@ const PROMETHEUS_ISSUER: &str = "prometheus";
 /// ```rust
 /// use rustfs_obs::prometheus::auth::generate_prometheus_token;
 ///
-/// // Generate with default expiry (30 days)
+/// // Generate with default expiry (100 years)
 /// let token = generate_prometheus_token("admin", "supersecret123", None)
 ///     .expect("Failed to generate token");
 ///

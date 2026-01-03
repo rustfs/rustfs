@@ -30,6 +30,7 @@
 //! - Automatic expiration on read
 //! - Minimal overhead when cache is warm
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -114,10 +115,28 @@ impl CacheEntry {
 /// // Second call - cache hit
 /// assert!(cache.get().is_some());
 /// ```
+/// Guard that resets the computing flag on drop (including panic unwind).
+///
+/// This ensures that if the compute function panics, the `computing` flag
+/// is always reset, preventing the cache from being permanently locked.
+struct ComputeGuard<'a>(&'a AtomicBool);
+
+impl Drop for ComputeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Thread-safe cache with stampede protection.
+///
+/// The `computing` flag prevents multiple threads from simultaneously
+/// computing the value when the cache expires (cache stampede).
 #[derive(Debug)]
 pub struct MetricsCache {
     entry: RwLock<Option<CacheEntry>>,
     ttl: Duration,
+    /// Atomic flag to prevent cache stampede - only one thread computes at a time.
+    computing: AtomicBool,
 }
 
 impl MetricsCache {
@@ -126,6 +145,7 @@ impl MetricsCache {
         Self {
             entry: RwLock::new(None),
             ttl,
+            computing: AtomicBool::new(false),
         }
     }
 
@@ -167,6 +187,13 @@ impl MetricsCache {
     /// This is the recommended way to use the cache - it handles the
     /// cache miss case by computing and caching the new value.
     ///
+    /// # Stampede Protection
+    ///
+    /// When multiple threads simultaneously request an expired cache entry,
+    /// only one thread will compute the new value while others wait.
+    /// This prevents the "thundering herd" problem where many threads
+    /// would all try to compute the same expensive value at once.
+    ///
     /// # Example
     ///
     /// ```
@@ -189,13 +216,41 @@ impl MetricsCache {
             return cached;
         }
 
-        // Slow path: compute and cache
-        let data = compute();
-        self.set(data.clone());
-        data
+        // Try to acquire compute lock using CAS
+        if self
+            .computing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            // We won the race - compute the value.
+            // Use a guard to ensure the flag is reset even if compute() panics.
+            let _guard = ComputeGuard(&self.computing);
+            let data = compute();
+            self.set(data.clone());
+            // _guard dropped here, releasing the flag (also on panic unwind)
+            return data;
+        }
+
+        // Another thread is computing - wait and retry
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(10));
+            if let Some(cached) = self.get() {
+                return cached;
+            }
+        }
+
+        // Timeout - compute anyway as fallback
+        compute()
     }
 
     /// Async version of get_or_compute for async collection functions.
+    ///
+    /// # Stampede Protection
+    ///
+    /// When multiple tasks simultaneously request an expired cache entry,
+    /// only one task will compute the new value while others wait.
+    /// This prevents the "thundering herd" problem where many tasks
+    /// would all try to compute the same expensive value at once.
     pub async fn get_or_compute_async<F, Fut>(&self, compute: F) -> String
     where
         F: FnOnce() -> Fut,
@@ -206,10 +261,31 @@ impl MetricsCache {
             return cached;
         }
 
-        // Slow path: compute and cache
-        let data = compute().await;
-        self.set(data.clone());
-        data
+        // Try to acquire compute lock using CAS
+        if self
+            .computing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            // We won the race - compute the value.
+            // Use a guard to ensure the flag is reset even if compute() panics.
+            let _guard = ComputeGuard(&self.computing);
+            let data = compute().await;
+            self.set(data.clone());
+            // _guard dropped here, releasing the flag (also on panic unwind)
+            return data;
+        }
+
+        // Another task is computing - wait and retry
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if let Some(cached) = self.get() {
+                return cached;
+            }
+        }
+
+        // Timeout - compute anyway as fallback
+        compute().await
     }
 }
 
@@ -222,6 +298,8 @@ impl Default for MetricsCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     use std::thread;
 
     // Use a fixed TTL for tests to avoid env var interference
@@ -290,5 +368,145 @@ mod tests {
     #[test]
     fn test_default_ttl_value() {
         assert_eq!(DEFAULT_CACHE_TTL_SECS, 10);
+    }
+
+    #[test]
+    fn test_stampede_protection() {
+        // Test that when multiple threads try to compute simultaneously,
+        // only one actually runs the compute function (stampede protection).
+        let cache = Arc::new(MetricsCache::new(TEST_TTL));
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        let num_threads = 10;
+
+        let mut handles = Vec::with_capacity(num_threads);
+
+        for _ in 0..num_threads {
+            let cache = Arc::clone(&cache);
+            let compute_count = Arc::clone(&compute_count);
+
+            handles.push(thread::spawn(move || {
+                cache.get_or_compute(|| {
+                    // Increment counter to track how many times compute is called
+                    compute_count.fetch_add(1, Ordering::SeqCst);
+                    // Simulate some compute work
+                    thread::sleep(Duration::from_millis(50));
+                    "computed_value".to_string()
+                })
+            }));
+        }
+
+        // Wait for all threads to complete
+        let results: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // All results should be the same computed value
+        for result in &results {
+            assert_eq!(result, "computed_value");
+        }
+
+        // The compute function should have been called at most 2 times:
+        // - 1 winner thread that computes and caches
+        // - Possibly 1 timeout thread if waiting took too long
+        // In practice, with stampede protection, we expect exactly 1 call
+        // but allow for some edge cases with timing
+        let actual_count = compute_count.load(Ordering::SeqCst);
+        assert!(
+            actual_count <= 2,
+            "Expected at most 2 compute calls, but got {actual_count}. \
+             Stampede protection may not be working correctly."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stampede_protection_async() {
+        use tokio::task::JoinSet;
+
+        // Test that when multiple tasks try to compute simultaneously,
+        // only one actually runs the compute function (stampede protection).
+        let cache = Arc::new(MetricsCache::new(TEST_TTL));
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        let num_tasks = 10;
+
+        let mut join_set = JoinSet::new();
+
+        for _ in 0..num_tasks {
+            let cache = Arc::clone(&cache);
+            let compute_count = Arc::clone(&compute_count);
+
+            join_set.spawn(async move {
+                cache
+                    .get_or_compute_async(|| {
+                        let compute_count = Arc::clone(&compute_count);
+                        async move {
+                            // Increment counter to track how many times compute is called
+                            compute_count.fetch_add(1, Ordering::SeqCst);
+                            // Simulate some compute work
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            "computed_value".to_string()
+                        }
+                    })
+                    .await
+            });
+        }
+
+        // Wait for all tasks to complete and collect results
+        let mut results = Vec::with_capacity(num_tasks);
+        while let Some(result) = join_set.join_next().await {
+            results.push(result.unwrap());
+        }
+
+        // All results should be the same computed value
+        for result in &results {
+            assert_eq!(result, "computed_value");
+        }
+
+        // The compute function should have been called at most 2 times
+        let actual_count = compute_count.load(Ordering::SeqCst);
+        assert!(
+            actual_count <= 2,
+            "Expected at most 2 compute calls, but got {actual_count}. \
+             Stampede protection may not be working correctly."
+        );
+    }
+
+    #[test]
+    fn test_panic_safety() {
+        use std::panic;
+
+        let cache = MetricsCache::new(TEST_TTL);
+
+        // First call panics
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            cache.get_or_compute(|| {
+                panic!("intentional panic");
+            })
+        }));
+        assert!(result.is_err());
+
+        // Second call should still work (computing flag was reset)
+        let value = cache.get_or_compute(|| "recovered".to_string());
+        assert_eq!(value, "recovered");
+    }
+
+    #[tokio::test]
+    async fn test_panic_safety_async() {
+        use tokio::task;
+
+        let cache = Arc::new(MetricsCache::new(TEST_TTL));
+
+        // First call panics - spawn a task that will panic
+        let cache_clone = Arc::clone(&cache);
+        let handle = task::spawn(async move {
+            cache_clone
+                .get_or_compute_async(|| async { panic!("intentional panic") })
+                .await
+        });
+
+        // The spawned task should panic
+        let result = handle.await;
+        assert!(result.is_err());
+
+        // Second call should still work (computing flag was reset)
+        let value = cache.get_or_compute_async(|| async { "recovered".to_string() }).await;
+        assert_eq!(value, "recovered");
     }
 }

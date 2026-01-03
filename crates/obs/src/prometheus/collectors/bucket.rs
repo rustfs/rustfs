@@ -50,7 +50,7 @@ const HELP_QUOTA: &str = "Quota limit in bytes for the bucket";
 ///
 /// - `rustfs_bucket_usage_bytes`: Total bytes used by the bucket
 /// - `rustfs_bucket_objects_total`: Total number of objects in the bucket
-/// - `rustfs_bucket_quota_bytes`: Quota limit in bytes (only if quota > 0)
+/// - `rustfs_bucket_quota_bytes`: Quota limit in bytes (0 if no quota configured)
 ///
 /// # Arguments
 ///
@@ -96,13 +96,11 @@ pub fn collect_bucket_metrics(buckets: &[BucketStats]) -> Vec<PrometheusMetric> 
                 .with_label("bucket", bucket_label.clone()),
         );
 
-        // Quota (only if configured)
-        if bucket.quota_bytes > 0 {
-            metrics.push(
-                PrometheusMetric::new(METRIC_QUOTA, MetricType::Gauge, HELP_QUOTA, bucket.quota_bytes as f64)
-                    .with_label("bucket", bucket_label),
-            );
-        }
+        // Quota (always emit, 0 when no quota configured for consistent PromQL queries)
+        metrics.push(
+            PrometheusMetric::new(METRIC_QUOTA, MetricType::Gauge, HELP_QUOTA, bucket.quota_bytes as f64)
+                .with_label("bucket", bucket_label),
+        );
     }
 
     metrics
@@ -131,8 +129,8 @@ mod tests {
 
         let metrics = collect_bucket_metrics(&buckets);
 
-        // 2 buckets * 2 metrics each (no quota) = 4 metrics
-        assert_eq!(metrics.len(), 4);
+        // 2 buckets * 3 metrics each (size, objects, quota) = 6 metrics
+        assert_eq!(metrics.len(), 6);
 
         // Verify test-bucket metrics
         let test_bucket_size = metrics
@@ -170,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_bucket_metrics_zero_quota_not_reported() {
+    fn test_collect_bucket_metrics_zero_quota_always_reported() {
         let buckets = vec![BucketStats {
             name: "no-quota-bucket".to_string(),
             size_bytes: 100,
@@ -180,9 +178,11 @@ mod tests {
 
         let metrics = collect_bucket_metrics(&buckets);
 
-        // Zero quota should not produce a quota metric
-        assert_eq!(metrics.len(), 2);
-        assert!(!metrics.iter().any(|m| m.name == METRIC_QUOTA));
+        // Zero quota should still produce a quota metric with value 0 for consistent PromQL queries
+        assert_eq!(metrics.len(), 3);
+        let quota_metric = metrics.iter().find(|m| m.name == METRIC_QUOTA);
+        assert!(quota_metric.is_some());
+        assert_eq!(quota_metric.map(|m| m.value), Some(0.0));
     }
 
     #[test]
