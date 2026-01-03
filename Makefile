@@ -19,7 +19,7 @@ NUM_CORES := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 MAKEFLAGS += -j$(NUM_CORES) -l$(NUM_CORES)
 MAKEFLAGS += --silent
 
-SHELL:= /bin/bash
+SHELL := $(shell which bash)
 .SHELLFLAGS = -eu -o pipefail -c
 
 DOCKER_CLI ?= docker
