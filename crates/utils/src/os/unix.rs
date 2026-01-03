@@ -13,9 +13,36 @@
 // limitations under the License.
 
 use super::{DiskInfo, IOStats};
+use nix::sys::statfs::Statfs;
 use nix::sys::{stat::stat, statfs::statfs};
 use std::io::Error;
 use std::path::Path;
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
+fn blocks_available(stat: &Statfs) -> u64 {
+    match stat.blocks_available().try_into() {
+        Ok(bavail) => bavail,
+        Err(_e) => 0,
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+pub fn files_free(stat: &Statfs) -> u64 {
+    match stat.files_free().try_into() {
+        Ok(bavail) => bavail,
+        Err(_e) => 0,
+    }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn files_free(stat: &Statfs) -> u64 {
+    stat.files_free()
+}
+
+#[cfg(not(any(target_os = "freebsd", target_os = "openbsd")))]
+fn blocks_available(stat: &Statfs) -> u64 {
+    stat.blocks_available()
+}
 
 /// Returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
@@ -24,10 +51,10 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
 
     let bsize = stat.block_size() as u64;
     let bfree = stat.blocks_free();
-    let bavail = stat.blocks_available();
+    let bavail = blocks_available(&stat);
     let blocks = stat.blocks();
 
-    let reserved = match bfree.checked_sub(bavail) {
+    let reserved = match bfree.checked_sub(bavail.into()) {
         Some(reserved) => reserved,
         None => {
             return Err(Error::other(format!(
@@ -60,7 +87,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         free,
         used,
         files: stat.files(),
-        ffree: stat.files_free(),
+        ffree: files_free(&stat),
         fstype: stat.filesystem_type_name().to_string(),
         ..Default::default()
     })
