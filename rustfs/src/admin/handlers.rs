@@ -1475,6 +1475,103 @@ impl Operation for ProfileStatusHandler {
     }
 }
 
+/// S3 XML namespace constant
+const XMLNS_S3: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+/// Default quota values (matching Ceph RGW defaults)
+const DEFAULT_QUOTA_MAX_BYTES: i64 = -1;
+const DEFAULT_QUOTA_MAX_BUCKETS: i64 = 1000;
+const DEFAULT_QUOTA_MAX_OBJ_COUNT: i64 = -1;
+const DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET: i64 = -1;
+const DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET: i64 = -1;
+
+/// Account Usage Handler for ListBuckets with `?usage` parameter.
+///
+/// This handler provides S3-compatible account usage information in a format
+/// compatible with Ceph RGW's extended ListBuckets API. When clients request
+/// ListBuckets with the `?usage` query parameter, this handler returns the
+/// standard bucket list along with a Summary section containing quota information.
+pub struct AccountUsageHandler;
+
+#[async_trait::async_trait]
+impl Operation for AccountUsageHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        // Verify authentication
+        let cred = req
+            .credentials
+            .as_ref()
+            .ok_or_else(|| s3_error!(AccessDenied, "Access Denied"))?;
+
+        // Get bucket list from storage
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Storage not initialized"));
+        };
+
+        let bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
+
+        // Generate XML response with Summary
+        let xml = generate_list_buckets_with_usage_xml(&bucket_infos, &cred.access_key);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(xml)), headers))
+    }
+}
+
+/// Generate ListAllMyBucketsResult XML with Summary for usage query.
+///
+/// This function produces an XML response that includes:
+/// - Standard ListAllMyBucketsResult with Owner and Buckets elements
+/// - A Summary element with quota information (Ceph RGW extension)
+fn generate_list_buckets_with_usage_xml(bucket_infos: &[rustfs_ecstore::store_api::BucketInfo], owner_id: &str) -> String {
+    use time::format_description::well_known::Rfc3339;
+
+    let mut buckets_xml = String::new();
+    for info in bucket_infos {
+        let creation_date = info.created.and_then(|t| t.format(&Rfc3339).ok()).unwrap_or_default();
+        buckets_xml.push_str(&format!(
+            "        <Bucket>\n            <Name>{}</Name>\n            <CreationDate>{}</CreationDate>\n        </Bucket>\n",
+            info.name, creation_date
+        ));
+    }
+
+    // Calculate owner ID hash (similar to how AWS/Ceph does it)
+    let owner_display_name = "rustfs";
+    let owner_id_hash = format!("{:x}", md5::compute(owner_id.as_bytes()));
+
+    // Note: The Summary element uses xmlns="" to override the default namespace
+    // This ensures compatibility with Ceph RGW s3-tests which expect Summary
+    // without a namespace prefix when parsing the XML response.
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListAllMyBucketsResult xmlns="{xmlns}">
+    <Owner>
+        <ID>{owner_id_hash}</ID>
+        <DisplayName>{owner_display_name}</DisplayName>
+    </Owner>
+    <Buckets>
+{buckets_xml}    </Buckets>
+    <Summary xmlns="">
+        <QuotaMaxBytes>{quota_max_bytes}</QuotaMaxBytes>
+        <QuotaMaxBuckets>{quota_max_buckets}</QuotaMaxBuckets>
+        <QuotaMaxObjCount>{quota_max_obj_count}</QuotaMaxObjCount>
+        <QuotaMaxBytesPerBucket>{quota_max_bytes_per_bucket}</QuotaMaxBytesPerBucket>
+        <QuotaMaxObjCountPerBucket>{quota_max_obj_count_per_bucket}</QuotaMaxObjCountPerBucket>
+    </Summary>
+</ListAllMyBucketsResult>"#,
+        xmlns = XMLNS_S3,
+        owner_id_hash = owner_id_hash,
+        owner_display_name = owner_display_name,
+        buckets_xml = buckets_xml,
+        quota_max_bytes = DEFAULT_QUOTA_MAX_BYTES,
+        quota_max_buckets = DEFAULT_QUOTA_MAX_BUCKETS,
+        quota_max_obj_count = DEFAULT_QUOTA_MAX_OBJ_COUNT,
+        quota_max_bytes_per_bucket = DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET,
+        quota_max_obj_count_per_bucket = DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1591,4 +1688,70 @@ mod tests {
     // These are better suited for integration tests with proper test infrastructure.
     // The current tests focus on data structures and basic functionality that can be
     // tested in isolation without complex dependencies.
+
+    #[test]
+    fn test_generate_list_buckets_with_usage_xml_empty() {
+        let xml = generate_list_buckets_with_usage_xml(&[], "testuser");
+
+        // Verify XML structure
+        assert!(xml.contains("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(xml.contains("<ListAllMyBucketsResult"));
+        assert!(xml.contains("xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\""));
+        assert!(xml.contains("<Owner>"));
+        assert!(xml.contains("<ID>"));
+        assert!(xml.contains("<DisplayName>rustfs</DisplayName>"));
+        assert!(xml.contains("<Buckets>"));
+        assert!(xml.contains("</Buckets>"));
+
+        // Verify Summary section with quota fields
+        // Note: Summary uses xmlns="" to avoid inheriting the default namespace
+        assert!(xml.contains(r#"<Summary xmlns="">"#));
+        assert!(xml.contains("<QuotaMaxBytes>-1</QuotaMaxBytes>"));
+        assert!(xml.contains("<QuotaMaxBuckets>1000</QuotaMaxBuckets>"));
+        assert!(xml.contains("<QuotaMaxObjCount>-1</QuotaMaxObjCount>"));
+        assert!(xml.contains("<QuotaMaxBytesPerBucket>-1</QuotaMaxBytesPerBucket>"));
+        assert!(xml.contains("<QuotaMaxObjCountPerBucket>-1</QuotaMaxObjCountPerBucket>"));
+        assert!(xml.contains("</Summary>"));
+    }
+
+    #[test]
+    fn test_generate_list_buckets_with_usage_xml_with_buckets() {
+        use rustfs_ecstore::store_api::BucketInfo;
+        use time::OffsetDateTime;
+
+        let bucket_infos = vec![
+            BucketInfo {
+                name: "test-bucket-1".to_string(),
+                created: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            },
+            BucketInfo {
+                name: "test-bucket-2".to_string(),
+                created: None,
+                ..Default::default()
+            },
+        ];
+
+        let xml = generate_list_buckets_with_usage_xml(&bucket_infos, "testuser");
+
+        // Verify bucket entries
+        assert!(xml.contains("<Name>test-bucket-1</Name>"));
+        assert!(xml.contains("<Name>test-bucket-2</Name>"));
+        assert!(xml.contains("<CreationDate>1970-01-01T00:00:00Z</CreationDate>"));
+
+        // Verify Summary section is present
+        // Note: Summary uses xmlns="" to avoid inheriting the default namespace
+        assert!(xml.contains(r#"<Summary xmlns="">"#));
+        assert!(xml.contains("<QuotaMaxBuckets>1000</QuotaMaxBuckets>"));
+    }
+
+    #[test]
+    fn test_account_usage_quota_defaults() {
+        // Test that quota constants match expected Ceph RGW defaults
+        assert_eq!(DEFAULT_QUOTA_MAX_BYTES, -1);
+        assert_eq!(DEFAULT_QUOTA_MAX_BUCKETS, 1000);
+        assert_eq!(DEFAULT_QUOTA_MAX_OBJ_COUNT, -1);
+        assert_eq!(DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET, -1);
+        assert_eq!(DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET, -1);
+    }
 }
