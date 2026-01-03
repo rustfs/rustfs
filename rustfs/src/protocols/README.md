@@ -10,27 +10,23 @@ RustFS provides multiple protocol interfaces for accessing object storage, inclu
 ### Enable Protocols on Startup
 
 ```bash
-# Start RustFS with all protocols enabled
-rustfs \
-  --address 0.0.0.0:9000 \
-  --access-key rustfsadmin \
-  --secret-key rustfsadmin \
-  --ftps-enable \
-  --ftps-address 0.0.0.0:21 \
-  --ftps-certs-file /path/to/cert.pem \
-  --ftps-key-file /path/to/key.pem \
-  --ftps-passive-ports "40000-41000" \
-  --sftp-enable \
-  --sftp-address 0.0.0.0:22 \
-  --sftp-host-key /path/to/host_key \
-  --sftp-authorized-keys /path/to/authorized_keys \
-  /data
+# Start RustFS with FTPS enabled
+export RUSTFS_FTPS_ENABLE=true
+export RUSTFS_FTPS_CERTS_FILE=/path/to/cert.pem
+export RUSTFS_FTPS_KEY_FILE=/path/to/key.pem
+rustfs --address 0.0.0.0:9000 --access-key rustfsadmin --secret-key rustfsadmin /data
+
+# Start RustFS with SFTP enabled
+export RUSTFS_SFTP_ENABLE=true
+export RUSTFS_SFTP_HOST_KEY=/path/to/host_key
+export RUSTFS_SFTP_AUTHORIZED_KEYS=/path/to/authorized_keys
+rustfs --address 0.0.0.0:9000 --access-key rustfsadmin --secret-key rustfsadmin /data
 ```
 
 ## Protocol Details
 
 ### FTPS
-- **Port**: 21
+- **Port**: 8021 (default)
 - **Protocol**: FTP over TLS (FTPS)
 - **Authentication**: Access Key / Secret Key (same as S3)
 - **Features**:
@@ -44,7 +40,7 @@ rustfs \
   - No multipart upload
 
 ### SFTP
-- **Port**: 22
+- **Port**: 8022 (default)
 - **Protocol**: SSH File Transfer Protocol
 - **Authentication**:
   - Password (Access Key / Secret Key)
@@ -133,23 +129,23 @@ ssh-keygen -l -f /path/to/host_key
 
 ### FTPS Configuration
 
-| Option | Environment Variable | Description | Default |
-|--------|---------------------|-------------|---------|
-| `--ftps-enable` | `RUSTFS_FTPS_ENABLE` | Enable FTPS server | `false` |
-| `--ftps-address` | `RUSTFS_FTPS_ADDRESS` | FTPS bind address | `0.0.0.0:21` |
-| `--ftps-certs-file` | `RUSTFS_FTPS_CERTS_FILE` | TLS certificate file | - |
-| `--ftps-key-file` | `RUSTFS_FTPS_KEY_FILE` | TLS private key file | - |
-| `--ftps-passive-ports` | `RUSTFS_FTPS_PASSIVE_PORTS` | Passive port range | - |
-| `--ftps-external-ip` | `RUSTFS_FTPS_EXTERNAL_IP` | External IP for NAT | - |
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `RUSTFS_FTPS_ENABLE` | Enable FTPS server | `false` |
+| `RUSTFS_FTPS_ADDRESS` | FTPS bind address | `0.0.0.0:8021` |
+| `RUSTFS_FTPS_CERTS_FILE` | TLS certificate file | - |
+| `RUSTFS_FTPS_KEY_FILE` | TLS private key file | - |
+| `RUSTFS_FTPS_PASSIVE_PORTS` | Passive port range | - |
+| `RUSTFS_FTPS_EXTERNAL_IP` | External IP for NAT | - |
 
 ### SFTP Configuration
 
-| Option | Environment Variable | Description | Default |
-|--------|---------------------|-------------|---------|
-| `--sftp-enable` | `RUSTFS_SFTP_ENABLE` | Enable SFTP server | `false` |
-| `--sftp-address` | `RUSTFS_SFTP_ADDRESS` | SFTP bind address | `0.0.0.0:22` |
-| `--sftp-host-key` | `RUSTFS_SFTP_HOST_KEY` | SSH host key file | - |
-| `--sftp-authorized-keys` | `RUSTFS_SFTP_AUTHORIZED_KEYS` | Authorized keys file | - |
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `RUSTFS_SFTP_ENABLE` | Enable SFTP server | `false` |
+| `RUSTFS_SFTP_ADDRESS` | SFTP bind address | `0.0.0.0:8022` |
+| `RUSTFS_SFTP_HOST_KEY` | SSH host key file | - |
+| `RUSTFS_SFTP_AUTHORIZED_KEYS` | Authorized keys file | - |
 
 ## See Also
 

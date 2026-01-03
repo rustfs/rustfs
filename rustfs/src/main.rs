@@ -272,14 +272,10 @@ async fn run(opt: config::Opt) -> Result<()> {
     let (ftp_sftp_shutdown_tx, _) = tokio::sync::broadcast::channel(1);
 
     // Initialize FTP system if enabled
-    init_ftp_system(&opt, ftp_sftp_shutdown_tx.clone())
-        .await
-        .map_err(Error::other)?;
+    init_ftp_system(ftp_sftp_shutdown_tx.clone()).await.map_err(Error::other)?;
 
     // Initialize SFTP system if enabled
-    init_sftp_system(&opt, ftp_sftp_shutdown_tx.clone())
-        .await
-        .map_err(Error::other)?;
+    init_sftp_system(ftp_sftp_shutdown_tx.clone()).await.map_err(Error::other)?;
 
     // Initialize buffer profiling system
     init_buffer_profile_system(&opt);

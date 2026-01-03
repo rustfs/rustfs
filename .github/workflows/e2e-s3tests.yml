@@ -205,7 +205,7 @@ jobs:
 
       - name: Upload artifacts
         if: always() && env.ACT != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: s3tests-single
           path: artifacts/**
@@ -416,7 +416,7 @@ jobs:
 
       - name: Upload artifacts
         if: always() && env.ACT != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: s3tests-multi
           path: artifacts/**
