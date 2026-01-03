@@ -12,38 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod reliant;
-
-// Common utilities for all E2E tests
-#[cfg(test)]
-pub mod common;
-
-#[cfg(test)]
-mod version_id_regression_test;
-
-// Data usage regression tests
-#[cfg(test)]
-mod data_usage_test;
-
-// KMS-specific test modules
-#[cfg(test)]
-mod kms;
-
-// Special characters in path test modules
-#[cfg(test)]
-mod special_chars_test;
-
-// Content-Encoding header preservation test
-#[cfg(test)]
-mod content_encoding_test;
-
-// Policy variables tests
-#[cfg(test)]
-mod policy;
+//! Prometheus Metrics End-to-End Tests
+//!
+//! This module contains comprehensive end-to-end tests for RustFS Prometheus
+//! metrics endpoints, including:
+//! - Configuration endpoint with JWT token generation
+//! - Cluster, bucket, node, and resource metrics endpoints
+//! - Bearer token authentication validation
+//! - Invalid token and missing auth rejection
 
 #[cfg(test)]
-mod protocols;
-
-// Prometheus metrics endpoint tests
-#[cfg(test)]
-mod prometheus;
+mod prometheus_test;

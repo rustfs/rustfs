@@ -57,6 +57,7 @@ mod config;
 mod error;
 mod global;
 mod metrics;
+pub mod prometheus;
 mod recorder;
 mod system;
 mod telemetry;

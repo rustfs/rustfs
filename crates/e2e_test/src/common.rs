@@ -173,10 +173,22 @@ impl RustFSTestEnvironment {
         Ok(port)
     }
 
-    /// Kill any existing RustFS processes
+    /// Kill any existing RustFS server processes
+    ///
+    /// Uses a specific pattern to avoid killing test processes which also
+    /// contain "rustfs" in their path. Only targets actual server binaries.
+    ///
+    /// Note: This pattern matches "rustfs --address" which may miss servers
+    /// started with different arguments. The current approach is preferred over
+    /// a broader "rustfs" pattern because it prevents accidentally killing the
+    /// test runner itself. For more robust cleanup, consider storing the PID
+    /// from `start_rustfs_server()` and killing that specific process.
     pub async fn cleanup_existing_processes(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Cleaning up any existing RustFS processes");
-        let output = Command::new("pkill").args(["-f", "rustfs"]).output();
+        // Use a more specific pattern to match only the rustfs server binary,
+        // not test processes. The server binary runs as "rustfs --address ..."
+        // while test binaries run as "e2e_test-..."
+        let output = Command::new("pkill").args(["-f", "rustfs --address"]).output();
 
         if let Ok(output) = output
             && output.status.success()
