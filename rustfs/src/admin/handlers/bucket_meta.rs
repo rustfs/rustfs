@@ -98,7 +98,7 @@ impl Operation for ExportBucketMetadata {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -391,7 +391,7 @@ impl Operation for ImportBucketMetadata {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
