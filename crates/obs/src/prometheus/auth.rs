@@ -91,11 +91,13 @@ pub enum AuthError {
     TokenGenerationFailed(String),
 }
 
-/// Default token expiry duration: 30 days in seconds.
+/// Default token expiry duration: 100 years in seconds (effectively never expires).
 ///
-/// This provides a reasonable balance between security and convenience
-/// for Prometheus scraper configurations that don't need frequent rotation.
-pub const DEFAULT_TOKEN_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
+/// Prometheus scrapers run continuously and token expiration would cause
+/// silent monitoring failures. Since these tokens only grant read access
+/// to metrics, the security risk is minimal. If a token is compromised,
+/// rotate the server's secret key to invalidate all tokens.
+pub const DEFAULT_TOKEN_EXPIRY_SECS: u64 = 100 * 365 * 24 * 60 * 60;
 
 /// Prometheus issuer identifier used in JWT claims.
 const PROMETHEUS_ISSUER: &str = "prometheus";
@@ -382,7 +384,7 @@ mod tests {
 
         let claims = validate_token(&token, "secret-key-long-enough").expect("Validation should succeed");
 
-        // Verify expiry is approximately 30 days from now
+        // Verify expiry is approximately 100 years from now (effectively never expires)
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         let expected_expiry = now + DEFAULT_TOKEN_EXPIRY_SECS;
