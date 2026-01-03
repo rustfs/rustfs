@@ -149,6 +149,7 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_SECURITY_ADMIN_USER=admin
       - TZ=Asia/Shanghai
+      - GF_INSTALL_PLUGINS=grafana-pyroscope-datasource
     restart: unless-stopped
     networks:
       - otel-network
