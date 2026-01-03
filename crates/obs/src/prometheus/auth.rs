@@ -449,7 +449,7 @@ mod tests {
     fn test_prometheus_claims_serialization() {
         let claims = PrometheusClaims {
             sub: "test-user".to_string(),
-            iat: 1000000,
+            iat: Some(1000000),
             exp: 2000000,
             iss: PROMETHEUS_ISSUER.to_string(),
         };
