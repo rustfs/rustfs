@@ -17,6 +17,7 @@ use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
+use crate::proxy::{ClientInfo, TrustedProxiesLayer};
 use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
@@ -434,7 +435,7 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
     debug!("Found TLS directory, checking for certificates");
 
     // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mtls_verifier = rustfs_utils::build_webpki_client_verifier(tls_path)?;
 
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
@@ -552,8 +553,9 @@ fn process_connection(
                 None
             }
         };
-
+        let trusted_proxies = crate::proxy::get_trusted_proxies_config().await;
         let hybrid_service = ServiceBuilder::new()
+            .layer(TrustedProxiesLayer::new(trusted_proxies.clone()))
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
             .layer(AddExtensionLayer::new(remote_addr))
@@ -568,10 +570,15 @@ fn process_connection(
                             .get(http::header::HeaderName::from_static("x-request-id"))
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("unknown");
+                        let client_info = request.extensions().get::<ClientInfo>();
+                        let real_ip = client_info
+                            .map(|info| info.real_ip.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
                         let span = tracing::info_span!("http-request",
                             trace_id = %trace_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
+                            real_ip = %real_ip,
                             uri = %request.uri(),
                             version = ?request.version(),
                         );

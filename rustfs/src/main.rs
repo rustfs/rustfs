@@ -110,6 +110,17 @@ async fn async_main() -> Result<()> {
     // Initialize performance profiling if enabled
     profiling::init_from_env().await;
 
+    // rustfs-trusted-proxies
+    match rustfs_trusted_proxies::initialize().await {
+        Ok(_) => {
+            info!(target: "rustfs::main", "Trusted proxies configuration initialized successfully.");
+        }
+        Err(e) => {
+            error!("Failed to initialize trusted proxies configuration: {:?}", e);
+            return Err(Error::other(e));
+        }
+    }
+
     // Initialize TLS if a certificate path is provided
     if let Some(tls_path) = &opt.tls_path {
         match init_cert(tls_path).await {

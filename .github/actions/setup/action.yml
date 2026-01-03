@@ -52,6 +52,10 @@ runs:
         sudo apt-get install -y \
           musl-tools \
           build-essential \
+          cmake \
+          libclang-dev \
+          golang \
+          perl \
           pkg-config \
           libssl-dev
 

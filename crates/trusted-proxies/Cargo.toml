@@ -1,0 +1,32 @@
+[package]
+name = "rustfs-trusted-proxies"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+homepage.workspace = true
+description = " RustFS Trusted Proxies module provides secure and efficient management of trusted proxy servers within the RustFS ecosystem, enhancing network security and performance."
+keywords = ["trusted-proxies", "network-security", "rustfs", "proxy-management"]
+categories = ["network-programming", "security", "web-programming"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
+ipnetwork = { workspace = true }
+metrics = { workspace = true }
+moka = { workspace = true }
+reqwest = { workspace = true }
+rustfs-config = { workspace = true, features = ["constants"] }
+rustfs-utils = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+tower = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

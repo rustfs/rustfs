@@ -59,6 +59,7 @@ rustfs-rio.workspace = true
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-trusted-proxies = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
 
@@ -82,7 +83,6 @@ tokio-util.workspace = true
 tonic = { workspace = true }
 tower.workspace = true
 tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id", "add-extension"] }
-ipnetwork = { workspace = true }
 
 # Serialization and Data Formats
 bytes = { workspace = true }
@@ -129,6 +129,7 @@ zip = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
+
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 sysctl = { workspace = true }

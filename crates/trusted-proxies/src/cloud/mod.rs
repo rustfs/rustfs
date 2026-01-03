@@ -12,15 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod app;
-pub(crate) mod body_limits;
-pub(crate) mod compress;
-pub(crate) mod console;
-pub(crate) mod env;
-pub(crate) mod heal;
-pub(crate) mod object;
-pub(crate) mod profiler;
-pub(crate) mod proxy;
-pub(crate) mod runtime;
-pub(crate) mod targets;
-pub(crate) mod tls;
+mod metadata;
+
+pub use metadata::*;
