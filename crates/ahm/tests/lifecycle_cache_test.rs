@@ -421,86 +421,86 @@ mod serial_tests {
             }
         };
 
-        if let Some(lmdb_env) = GLOBAL_LMDB_ENV.get() {
-            if let Some(lmdb) = GLOBAL_LMDB_DB.get() {
-                let mut wtxn = lmdb_env.write_txn().unwrap();
+        if let Some(lmdb_env) = GLOBAL_LMDB_ENV.get()
+            && let Some(lmdb) = GLOBAL_LMDB_DB.get()
+        {
+            let mut wtxn = lmdb_env.write_txn().unwrap();
 
-                /*if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await {
-                    if let Ok(object_info) = ecstore
-                        .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
-                        .await
-                    {
-                        let event = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::eval_action_from_lifecycle(
-                            &lc_config,
-                            None,
-                            None,
-                            &object_info,
-                        )
-                        .await;
-
-                        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
-                            ecstore.clone(),
-                            &object_info,
-                            &event,
-                            &rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
-                        )
-                        .await;
-
-                        expired = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
-                    }
-                }*/
-
-                for record in records {
-                    if !record.usage.has_live_object {
-                        continue;
-                    }
-
-                    let object_info = convert_record_to_object_info(record);
-                    println!("object_info2: {object_info:?}");
-                    let mod_time = object_info.mod_time.unwrap_or(OffsetDateTime::now_utc());
-                    let expiry_time = rustfs_ecstore::bucket::lifecycle::lifecycle::expected_expiry_time(mod_time, 1);
-
-                    let version_id = if let Some(version_id) = object_info.version_id {
-                        version_id.to_string()
-                    } else {
-                        "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz".to_string()
-                    };
-
-                    lmdb.put(
-                        &mut wtxn,
-                        &expiry_time.unix_timestamp(),
-                        &LifecycleContent {
-                            ver_no: 0,
-                            ver_id: version_id,
-                            mod_time,
-                            type_: LifecycleType::TransitionNoncurrent,
-                            object_name: object_info.name,
-                        },
+            /*if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await {
+                if let Ok(object_info) = ecstore
+                    .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
+                    .await
+                {
+                    let event = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::eval_action_from_lifecycle(
+                        &lc_config,
+                        None,
+                        None,
+                        &object_info,
                     )
-                    .unwrap();
+                    .await;
+
+                    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+                        ecstore.clone(),
+                        &object_info,
+                        &event,
+                        &rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+                    )
+                    .await;
+
+                    expired = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
+                }
+            }*/
+
+            for record in records {
+                if !record.usage.has_live_object {
+                    continue;
                 }
 
-                wtxn.commit().unwrap();
+                let object_info = convert_record_to_object_info(record);
+                println!("object_info2: {object_info:?}");
+                let mod_time = object_info.mod_time.unwrap_or(OffsetDateTime::now_utc());
+                let expiry_time = rustfs_ecstore::bucket::lifecycle::lifecycle::expected_expiry_time(mod_time, 1);
 
-                let mut wtxn = lmdb_env.write_txn().unwrap();
-                let iter = lmdb.iter_mut(&mut wtxn).unwrap();
-                //let _ = unsafe { iter.del_current().unwrap() };
-                for row in iter {
-                    if let Ok(ref elm) = row {
-                        let LifecycleContent {
-                            ver_no,
-                            ver_id,
-                            mod_time,
-                            type_,
-                            object_name,
-                        } = &elm.1;
-                        println!("cache row:{ver_no} {ver_id} {mod_time} {type_:?} {object_name}");
-                    }
-                    println!("row:{row:?}");
-                }
-                //drop(iter);
-                wtxn.commit().unwrap();
+                let version_id = if let Some(version_id) = object_info.version_id {
+                    version_id.to_string()
+                } else {
+                    "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz".to_string()
+                };
+
+                lmdb.put(
+                    &mut wtxn,
+                    &expiry_time.unix_timestamp(),
+                    &LifecycleContent {
+                        ver_no: 0,
+                        ver_id: version_id,
+                        mod_time,
+                        type_: LifecycleType::TransitionNoncurrent,
+                        object_name: object_info.name,
+                    },
+                )
+                .unwrap();
             }
+
+            wtxn.commit().unwrap();
+
+            let mut wtxn = lmdb_env.write_txn().unwrap();
+            let iter = lmdb.iter_mut(&mut wtxn).unwrap();
+            //let _ = unsafe { iter.del_current().unwrap() };
+            for row in iter {
+                if let Ok(ref elm) = row {
+                    let LifecycleContent {
+                        ver_no,
+                        ver_id,
+                        mod_time,
+                        type_,
+                        object_name,
+                    } = &elm.1;
+                    println!("cache row:{ver_no} {ver_id} {mod_time} {type_:?} {object_name}");
+                }
+                println!("row:{row:?}");
+            }
+            //drop(iter);
+            wtxn.commit().unwrap();
         }
 
         println!("Lifecycle cache test completed");

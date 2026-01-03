@@ -45,7 +45,7 @@ impl super::Erasure {
 
         let start_block = 0;
         let mut end_block = total_length / self.block_size;
-        if total_length % self.block_size != 0 {
+        if !total_length.is_multiple_of(self.block_size) {
             end_block += 1;
         }
 

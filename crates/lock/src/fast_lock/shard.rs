@@ -69,10 +69,10 @@ impl LockShard {
     /// Try fast path only (without fallback to slow path)
     pub fn try_fast_path_only(&self, request: &ObjectLockRequest) -> bool {
         // Early check to avoid unnecessary lock contention
-        if let Some(state) = self.objects.read().get(&request.key) {
-            if !state.atomic_state.is_fast_path_available(request.mode) {
-                return false;
-            }
+        if let Some(state) = self.objects.read().get(&request.key)
+            && !state.atomic_state.is_fast_path_available(request.mode)
+        {
+            return false;
         }
         self.try_fast_path(request).is_some()
     }
@@ -441,36 +441,36 @@ impl LockShard {
     /// Get lock information for monitoring
     pub fn get_lock_info(&self, key: &ObjectKey) -> Option<crate::fast_lock::types::ObjectLockInfo> {
         let objects = self.objects.read();
-        if let Some(state) = objects.get(key) {
-            if let Some(mode) = state.current_mode() {
-                let (owner, acquired_at, lock_timeout) = match mode {
-                    LockMode::Exclusive => {
-                        let current_owner = state.current_owner.read();
-                        let info = current_owner.clone()?;
-                        (info.owner, info.acquired_at, info.lock_timeout)
-                    }
-                    LockMode::Shared => {
-                        let shared_owners = state.shared_owners.read();
-                        let entry = shared_owners.first()?.clone();
-                        (entry.owner, entry.acquired_at, entry.lock_timeout)
-                    }
-                };
+        if let Some(state) = objects.get(key)
+            && let Some(mode) = state.current_mode()
+        {
+            let (owner, acquired_at, lock_timeout) = match mode {
+                LockMode::Exclusive => {
+                    let current_owner = state.current_owner.read();
+                    let info = current_owner.clone()?;
+                    (info.owner, info.acquired_at, info.lock_timeout)
+                }
+                LockMode::Shared => {
+                    let shared_owners = state.shared_owners.read();
+                    let entry = shared_owners.first()?.clone();
+                    (entry.owner, entry.acquired_at, entry.lock_timeout)
+                }
+            };
 
-                let priority = *state.priority.read();
+            let priority = *state.priority.read();
 
-                let expires_at = acquired_at
-                    .checked_add(lock_timeout)
-                    .unwrap_or_else(|| acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
+            let expires_at = acquired_at
+                .checked_add(lock_timeout)
+                .unwrap_or_else(|| acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
 
-                return Some(crate::fast_lock::types::ObjectLockInfo {
-                    key: key.clone(),
-                    mode,
-                    owner,
-                    acquired_at,
-                    expires_at,
-                    priority,
-                });
-            }
+            return Some(crate::fast_lock::types::ObjectLockInfo {
+                key: key.clone(),
+                mode,
+                owner,
+                acquired_at,
+                expires_at,
+                priority,
+            });
         }
         None
     }

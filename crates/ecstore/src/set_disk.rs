@@ -266,10 +266,10 @@ impl SetDisks {
         let mut new_disk = Vec::with_capacity(disks.len());
 
         for disk in disks.iter() {
-            if let Some(d) = disk {
-                if d.is_online().await {
-                    new_disk.push(disk.clone());
-                }
+            if let Some(d) = disk
+                && d.is_online().await
+            {
+                new_disk.push(disk.clone());
             }
         }
 
@@ -1417,22 +1417,21 @@ impl SetDisks {
         let mut valid_obj_map = HashMap::new();
 
         for (i, op_hash) in meta_hashes.iter().enumerate() {
-            if let Some(hash) = op_hash {
-                if let Some(max_hash) = max_val {
-                    if hash == max_hash {
-                        if metas[i].is_valid() && !found {
-                            found_fi = Some(metas[i].clone());
-                            found = true;
-                        }
-
-                        let props = ObjProps {
-                            mod_time: metas[i].mod_time,
-                            num_versions: metas[i].num_versions,
-                        };
-
-                        *valid_obj_map.entry(props).or_insert(0) += 1;
-                    }
+            if let Some(hash) = op_hash
+                && let Some(max_hash) = max_val
+                && hash == max_hash
+            {
+                if metas[i].is_valid() && !found {
+                    found_fi = Some(metas[i].clone());
+                    found = true;
                 }
+
+                let props = ObjProps {
+                    mod_time: metas[i].mod_time,
+                    num_versions: metas[i].num_versions,
+                };
+
+                *valid_obj_map.entry(props).or_insert(0) += 1;
             }
         }
 
@@ -3572,17 +3571,17 @@ impl SetDisks {
             let mut offline = 0;
             for (i, err) in errs.iter().enumerate() {
                 let mut found = false;
-                if let Some(err) = err {
-                    if err == &DiskError::DiskNotFound {
-                        found = true;
-                    }
+                if let Some(err) = err
+                    && err == &DiskError::DiskNotFound
+                {
+                    found = true;
                 }
                 for p in data_errs_by_part {
-                    if let Some(v) = p.1.get(i) {
-                        if *v == CHECK_PART_DISK_NOT_FOUND {
-                            found = true;
-                            break;
-                        }
+                    if let Some(v) = p.1.get(i)
+                        && *v == CHECK_PART_DISK_NOT_FOUND
+                    {
+                        found = true;
+                        break;
                     }
                 }
 
@@ -3838,10 +3837,10 @@ impl ObjectIO for SetDisks {
             None
         };
 
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
-            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
-                return Err(err);
-            }
+        if let Some(http_preconditions) = opts.http_preconditions.clone()
+            && let Some(err) = self.check_write_precondition(bucket, object, opts).await
+        {
+            return Err(err);
         }
 
         let mut user_defined = opts.user_defined.clone();
@@ -4002,16 +4001,16 @@ impl ObjectIO for SetDisks {
             }
         }
 
-        if fi.checksum.is_none() {
-            if let Some(content_hash) = data.as_hash_reader().content_hash() {
-                fi.checksum = Some(content_hash.to_bytes(&[]));
-            }
+        if fi.checksum.is_none()
+            && let Some(content_hash) = data.as_hash_reader().content_hash()
+        {
+            fi.checksum = Some(content_hash.to_bytes(&[]));
         }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
-            if sc == storageclass::STANDARD {
-                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
-            }
+        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+            && sc == storageclass::STANDARD
+        {
+            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
         }
 
         let mod_time = if let Some(mod_time) = opts.mod_time {
@@ -4062,11 +4061,11 @@ impl ObjectIO for SetDisks {
         self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
 
         for (i, op_disk) in online_disks.iter().enumerate() {
-            if let Some(disk) = op_disk {
-                if disk.is_online().await {
-                    fi = parts_metadatas[i].clone();
-                    break;
-                }
+            if let Some(disk) = op_disk
+                && disk.is_online().await
+            {
+                fi = parts_metadatas[i].clone();
+                break;
             }
         }
 
@@ -5568,10 +5567,10 @@ impl StorageAPI for SetDisks {
             user_defined.insert("etag".to_owned(), etag.clone());
         }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
-            if sc == storageclass::STANDARD {
-                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
-            }
+        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+            && sc == storageclass::STANDARD
+        {
+            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
         }
 
         let sc_parity_drives = {
@@ -5620,10 +5619,10 @@ impl StorageAPI for SetDisks {
             // TODO: get content-type
         }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
-            if sc == storageclass::STANDARD {
-                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
-            }
+        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+            && sc == storageclass::STANDARD
+        {
+            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
         }
 
         if let Some(checksum) = &opts.want_checksum {
@@ -5925,14 +5924,14 @@ impl StorageAPI for SetDisks {
                     return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
                 }
 
-                if checksum_type.full_object_requested() {
-                    if let Err(err) = checksum.add_part(&cs, ext_part.actual_size) {
-                        error!(
-                            "complete_multipart_upload checksum add_part failed part_id={}, bucket={}, object={}",
-                            p.part_num, bucket, object
-                        );
-                        return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
-                    }
+                if checksum_type.full_object_requested()
+                    && let Err(err) = checksum.add_part(&cs, ext_part.actual_size)
+                {
+                    error!(
+                        "complete_multipart_upload checksum add_part failed part_id={}, bucket={}, object={}",
+                        p.part_num, bucket, object
+                    );
+                    return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
                 }
 
                 checksum_combined.extend_from_slice(cs.raw.as_slice());
@@ -6112,11 +6111,11 @@ impl StorageAPI for SetDisks {
         });
 
         for (i, op_disk) in online_disks.iter().enumerate() {
-            if let Some(disk) = op_disk {
-                if disk.is_online().await {
-                    fi = parts_metadatas[i].clone();
-                    break;
-                }
+            if let Some(disk) = op_disk
+                && disk.is_online().await
+            {
+                fi = parts_metadatas[i].clone();
+                break;
             }
         }
 
@@ -6210,16 +6209,15 @@ impl StorageAPI for SetDisks {
         let _write_lock_guard = if !opts.no_lock {
             let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
             let mut skip_lock = false;
-            if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key) {
-                if lock_info.owner.as_ref() == self.locker_owner.as_str()
-                    && matches!(lock_info.mode, rustfs_lock::fast_lock::types::LockMode::Exclusive)
-                {
-                    debug!(
-                        "Reusing existing exclusive lock for heal operation on {}/{} held by {}",
-                        bucket, object, self.locker_owner
-                    );
-                    skip_lock = true;
-                }
+            if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key)
+                && lock_info.owner.as_ref() == self.locker_owner.as_str()
+                && matches!(lock_info.mode, rustfs_lock::fast_lock::types::LockMode::Exclusive)
+            {
+                debug!(
+                    "Reusing existing exclusive lock for heal operation on {}/{} held by {}",
+                    bucket, object, self.locker_owner
+                );
+                skip_lock = true;
             }
             if skip_lock {
                 None
@@ -6563,14 +6561,14 @@ async fn disks_with_all_parts(
         if err.is_some() {
             let part_err = conv_part_err_to_int(err);
             for p in 0..latest_meta.parts.len() {
-                if let Some(vec) = data_errs_by_part.get_mut(&p) {
-                    if index < vec.len() {
-                        info!(
-                            "data_errs_by_part: copy meta errors to part errors: object_name={}, index: {index}, part: {p}, part_err: {part_err}",
-                            object_name
-                        );
-                        vec[index] = part_err;
-                    }
+                if let Some(vec) = data_errs_by_part.get_mut(&p)
+                    && index < vec.len()
+                {
+                    info!(
+                        "data_errs_by_part: copy meta errors to part errors: object_name={}, index: {index}, part: {p}, part_err: {part_err}",
+                        object_name
+                    );
+                    vec[index] = part_err;
                 }
             }
         }
@@ -6609,14 +6607,14 @@ async fn disks_with_all_parts(
                 .await
                 .err();
 
-                if let Some(vec) = data_errs_by_part.get_mut(&0) {
-                    if index < vec.len() {
-                        vec[index] = conv_part_err_to_int(&verify_err.map(|e| e.into()));
-                        info!(
-                            "data_errs_by_part:bitrot check result: object_name={}, index: {index}, result: {}",
-                            object_name, vec[index]
-                        );
-                    }
+                if let Some(vec) = data_errs_by_part.get_mut(&0)
+                    && index < vec.len()
+                {
+                    vec[index] = conv_part_err_to_int(&verify_err.map(|e| e.into()));
+                    info!(
+                        "data_errs_by_part:bitrot check result: object_name={}, index: {index}, result: {}",
+                        object_name, vec[index]
+                    );
                 }
             }
             continue;
@@ -6654,32 +6652,32 @@ async fn disks_with_all_parts(
 
         // Update dataErrsByPart for all parts
         for p in 0..latest_meta.parts.len() {
-            if let Some(vec) = data_errs_by_part.get_mut(&p) {
-                if index < vec.len() {
-                    if verify_err.is_some() {
+            if let Some(vec) = data_errs_by_part.get_mut(&p)
+                && index < vec.len()
+            {
+                if verify_err.is_some() {
+                    info!(
+                        "data_errs_by_part: verify_err: object_name={}, index: {index}, part: {p}, verify_err: {verify_err:?}",
+                        object_name
+                    );
+                    vec[index] = conv_part_err_to_int(&verify_err.clone());
+                } else {
+                    // Fix: verify_resp.results length is based on meta.parts, not latest_meta.parts
+                    // We need to check bounds to avoid panic
+                    if p < verify_resp.results.len() {
                         info!(
-                            "data_errs_by_part: verify_err: object_name={}, index: {index}, part: {p}, verify_err: {verify_err:?}",
+                            "data_errs_by_part: update data_errs_by_part: object_name={}, index: {}, part: {}, verify_resp.results: {:?}",
+                            object_name, index, p, verify_resp.results[p]
+                        );
+                        vec[index] = verify_resp.results[p];
+                    } else {
+                        debug!(
+                            "data_errs_by_part: verify_resp.results length mismatch: expected at least {}, got {}, object_name={}, index: {index}, part: {p}",
+                            p + 1,
+                            verify_resp.results.len(),
                             object_name
                         );
-                        vec[index] = conv_part_err_to_int(&verify_err.clone());
-                    } else {
-                        // Fix: verify_resp.results length is based on meta.parts, not latest_meta.parts
-                        // We need to check bounds to avoid panic
-                        if p < verify_resp.results.len() {
-                            info!(
-                                "data_errs_by_part: update data_errs_by_part: object_name={}, index: {}, part: {}, verify_resp.results: {:?}",
-                                object_name, index, p, verify_resp.results[p]
-                            );
-                            vec[index] = verify_resp.results[p];
-                        } else {
-                            debug!(
-                                "data_errs_by_part: verify_resp.results length mismatch: expected at least {}, got {}, object_name={}, index: {index}, part: {p}",
-                                p + 1,
-                                verify_resp.results.len(),
-                                object_name
-                            );
-                            vec[index] = CHECK_PART_SUCCESS;
-                        }
+                        vec[index] = CHECK_PART_SUCCESS;
                     }
                 }
             }
@@ -6689,14 +6687,14 @@ async fn disks_with_all_parts(
     // Build dataErrsByDisk from dataErrsByPart
     for (part, disks) in data_errs_by_part.iter() {
         for (disk_idx, disk_err) in disks.iter().enumerate() {
-            if let Some(vec) = data_errs_by_disk.get_mut(&disk_idx) {
-                if *part < vec.len() {
-                    vec[*part] = *disk_err;
-                    info!(
-                        "data_errs_by_disk: update data_errs_by_disk: object_name={}, part: {part}, disk_idx: {disk_idx}, disk_err: {disk_err}",
-                        object_name,
-                    );
-                }
+            if let Some(vec) = data_errs_by_disk.get_mut(&disk_idx)
+                && *part < vec.len()
+            {
+                vec[*part] = *disk_err;
+                info!(
+                    "data_errs_by_disk: update data_errs_by_disk: object_name={}, part: {part}, disk_idx: {disk_idx}, disk_err: {disk_err}",
+                    object_name,
+                );
             }
         }
     }
@@ -6738,10 +6736,10 @@ pub fn should_heal_object_on_disk(
     meta: &FileInfo,
     latest_meta: &FileInfo,
 ) -> (bool, Option<DiskError>) {
-    if let Some(err) = err {
-        if err == &DiskError::FileNotFound || err == &DiskError::FileVersionNotFound || err == &DiskError::FileCorrupt {
-            return (true, Some(err.clone()));
-        }
+    if let Some(err) = err
+        && (err == &DiskError::FileNotFound || err == &DiskError::FileVersionNotFound || err == &DiskError::FileCorrupt)
+    {
+        return (true, Some(err.clone()));
     }
 
     if latest_meta.volume != meta.volume
@@ -6906,15 +6904,15 @@ pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
 pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
     match &oi.etag {
         Some(etag) => {
-            if let Some(if_none_match) = if_none_match {
-                if e_tag_matches(etag, &if_none_match) {
-                    return true;
-                }
+            if let Some(if_none_match) = if_none_match
+                && e_tag_matches(etag, &if_none_match)
+            {
+                return true;
             }
-            if let Some(if_match) = if_match {
-                if !e_tag_matches(etag, &if_match) {
-                    return true;
-                }
+            if let Some(if_match) = if_match
+                && !e_tag_matches(etag, &if_match)
+            {
+                return true;
             }
             false
         }

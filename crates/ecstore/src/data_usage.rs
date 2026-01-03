@@ -65,18 +65,16 @@ lazy_static::lazy_static! {
 /// Store data usage info to backend storage
 pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
     // Prevent older data from overwriting newer persisted stats
-    if let Ok(buf) = read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await {
-        if let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf) {
-            if let (Some(new_ts), Some(existing_ts)) = (data_usage_info.last_update, existing.last_update) {
-                if new_ts <= existing_ts {
-                    info!(
-                        "Skip persisting data usage: incoming last_update {:?} <= existing {:?}",
-                        new_ts, existing_ts
-                    );
-                    return Ok(());
-                }
-            }
-        }
+    if let Ok(buf) = read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await
+        && let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf)
+        && let (Some(new_ts), Some(existing_ts)) = (data_usage_info.last_update, existing.last_update)
+        && new_ts <= existing_ts
+    {
+        info!(
+            "Skip persisting data usage: incoming last_update {:?} <= existing {:?}",
+            new_ts, existing_ts
+        );
+        return Ok(());
     }
 
     let data =
@@ -149,26 +147,24 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
 
     // Handle replication info
     for (bucket, bui) in &data_usage_info.buckets_usage {
-        if bui.replicated_size_v1 > 0
+        if (bui.replicated_size_v1 > 0
             || bui.replication_failed_count_v1 > 0
             || bui.replication_failed_size_v1 > 0
-            || bui.replication_pending_count_v1 > 0
+            || bui.replication_pending_count_v1 > 0)
+            && let Ok((cfg, _)) = get_replication_config(bucket).await
+            && !cfg.role.is_empty()
         {
-            if let Ok((cfg, _)) = get_replication_config(bucket).await {
-                if !cfg.role.is_empty() {
-                    data_usage_info.replication_info.insert(
-                        cfg.role.clone(),
-                        BucketTargetUsageInfo {
-                            replication_failed_size: bui.replication_failed_size_v1,
-                            replication_failed_count: bui.replication_failed_count_v1,
-                            replicated_size: bui.replicated_size_v1,
-                            replication_pending_count: bui.replication_pending_count_v1,
-                            replication_pending_size: bui.replication_pending_size_v1,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
+            data_usage_info.replication_info.insert(
+                cfg.role.clone(),
+                BucketTargetUsageInfo {
+                    replication_failed_size: bui.replication_failed_size_v1,
+                    replication_failed_count: bui.replication_failed_count_v1,
+                    replicated_size: bui.replicated_size_v1,
+                    replication_pending_count: bui.replication_pending_count_v1,
+                    replication_pending_size: bui.replication_pending_size_v1,
+                    ..Default::default()
+                },
+            );
         }
     }
 
@@ -177,10 +173,10 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
 
 /// Aggregate usage information from local disk snapshots.
 fn merge_snapshot(aggregated: &mut DataUsageInfo, mut snapshot: LocalUsageSnapshot, latest_update: &mut Option<SystemTime>) {
-    if let Some(update) = snapshot.last_update {
-        if latest_update.is_none_or(|current| update > current) {
-            *latest_update = Some(update);
-        }
+    if let Some(update) = snapshot.last_update
+        && latest_update.is_none_or(|current| update > current)
+    {
+        *latest_update = Some(update);
     }
 
     snapshot.recompute_totals();
@@ -255,10 +251,10 @@ pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskU
                     );
                     // Best-effort cleanup so next scan can rebuild a fresh snapshot instead of repeatedly failing
                     let snapshot_file = snapshot_path(root.as_path(), &disk_id);
-                    if let Err(remove_err) = fs::remove_file(&snapshot_file).await {
-                        if remove_err.kind() != std::io::ErrorKind::NotFound {
-                            warn!("Failed to remove corrupted snapshot {:?}: {}", snapshot_file, remove_err);
-                        }
+                    if let Err(remove_err) = fs::remove_file(&snapshot_file).await
+                        && remove_err.kind() != std::io::ErrorKind::NotFound
+                    {
+                        warn!("Failed to remove corrupted snapshot {:?}: {}", snapshot_file, remove_err);
                     }
                 }
 

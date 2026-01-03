@@ -57,7 +57,7 @@ jobs:
 
       - name: Upload audit results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: security-audit-results-${{ github.run_number }}
           path: audit-results.json

@@ -178,12 +178,11 @@ impl HashReader {
                 ));
             }
 
-            if let Some(checksum) = existing_hash_reader.checksum() {
-                if let Some(ref md5) = md5hex {
-                    if checksum != md5 {
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "HashReader checksum mismatch"));
-                    }
-                }
+            if let Some(checksum) = existing_hash_reader.checksum()
+                && let Some(ref md5) = md5hex
+                && checksum != md5
+            {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "HashReader checksum mismatch"));
             }
 
             if existing_hash_reader.size() > 0 && size > 0 && existing_hash_reader.size() != size {
@@ -359,15 +358,15 @@ impl HashReader {
             }
 
             if checksum.checksum_type.trailing() {
-                if let Some(trailer) = self.trailer_s3s.as_ref() {
-                    if let Some(Some(checksum_str)) = trailer.read(|headers| {
+                if let Some(trailer) = self.trailer_s3s.as_ref()
+                    && let Some(Some(checksum_str)) = trailer.read(|headers| {
                         checksum
                             .checksum_type
                             .key()
                             .and_then(|key| headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string())))
-                    }) {
-                        map.insert(checksum.checksum_type.to_string(), checksum_str);
-                    }
+                    })
+                {
+                    map.insert(checksum.checksum_type.to_string(), checksum_str);
                 }
                 return map;
             }
@@ -450,18 +449,18 @@ impl AsyncRead for HashReader {
 
                 if filled > 0 {
                     // Update SHA256 hasher
-                    if let Some(hasher) = this.content_sha256_hasher {
-                        if let Err(e) = hasher.write_all(data) {
-                            error!("SHA256 hasher write error, error={:?}", e);
-                            return Poll::Ready(Err(std::io::Error::other(e)));
-                        }
+                    if let Some(hasher) = this.content_sha256_hasher
+                        && let Err(e) = hasher.write_all(data)
+                    {
+                        error!("SHA256 hasher write error, error={:?}", e);
+                        return Poll::Ready(Err(std::io::Error::other(e)));
                     }
 
                     // Update content hasher
-                    if let Some(hasher) = this.content_hasher {
-                        if let Err(e) = hasher.write_all(data) {
-                            return Poll::Ready(Err(std::io::Error::other(e)));
-                        }
+                    if let Some(hasher) = this.content_hasher
+                        && let Err(e) = hasher.write_all(data)
+                    {
+                        return Poll::Ready(Err(std::io::Error::other(e)));
                     }
                 }
 
@@ -477,22 +476,22 @@ impl AsyncRead for HashReader {
 
                     // check content hasher
                     if let (Some(hasher), Some(expected_content_hash)) = (this.content_hasher, this.content_hash) {
-                        if expected_content_hash.checksum_type.trailing() {
-                            if let Some(trailer) = this.trailer_s3s.as_ref() {
-                                if let Some(Some(checksum_str)) = trailer.read(|headers| {
-                                    expected_content_hash.checksum_type.key().and_then(|key| {
-                                        headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string()))
-                                    })
-                                }) {
-                                    expected_content_hash.encoded = checksum_str;
-                                    expected_content_hash.raw = general_purpose::STANDARD
-                                        .decode(&expected_content_hash.encoded)
-                                        .map_err(|_| std::io::Error::other("Invalid base64 checksum"))?;
+                        if expected_content_hash.checksum_type.trailing()
+                            && let Some(trailer) = this.trailer_s3s.as_ref()
+                            && let Some(Some(checksum_str)) = trailer.read(|headers| {
+                                expected_content_hash
+                                    .checksum_type
+                                    .key()
+                                    .and_then(|key| headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string())))
+                            })
+                        {
+                            expected_content_hash.encoded = checksum_str;
+                            expected_content_hash.raw = general_purpose::STANDARD
+                                .decode(&expected_content_hash.encoded)
+                                .map_err(|_| std::io::Error::other("Invalid base64 checksum"))?;
 
-                                    if expected_content_hash.raw.is_empty() {
-                                        return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
-                                    }
-                                }
+                            if expected_content_hash.raw.is_empty() {
+                                return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
                             }
                         }
 

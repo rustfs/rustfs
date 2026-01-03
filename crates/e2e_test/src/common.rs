@@ -34,8 +34,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 // Common constants for all E2E tests
-pub const DEFAULT_ACCESS_KEY: &str = "minioadmin";
-pub const DEFAULT_SECRET_KEY: &str = "minioadmin";
+pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
+pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 pub fn workspace_root() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -165,7 +165,7 @@ impl RustFSTestEnvironment {
     }
 
     /// Find an available port for the test
-    async fn find_available_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn find_available_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
@@ -178,11 +178,11 @@ impl RustFSTestEnvironment {
         info!("Cleaning up any existing RustFS processes");
         let output = Command::new("pkill").args(["-f", "rustfs"]).output();
 
-        if let Ok(output) = output {
-            if output.status.success() {
-                info!("Killed existing RustFS processes");
-                sleep(Duration::from_millis(1000)).await;
-            }
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            info!("Killed existing RustFS processes");
+            sleep(Duration::from_millis(1000)).await;
         }
         Ok(())
     }

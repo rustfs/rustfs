@@ -31,6 +31,8 @@ pub use constants::object::*;
 #[cfg(feature = "constants")]
 pub use constants::profiler::*;
 #[cfg(feature = "constants")]
+pub use constants::protocols::*;
+#[cfg(feature = "constants")]
 pub use constants::proxy::*;
 #[cfg(feature = "constants")]
 pub use constants::runtime::*;

@@ -40,3 +40,6 @@ mod content_encoding_test;
 // Policy variables tests
 #[cfg(test)]
 mod policy;
+
+#[cfg(test)]
+mod protocols;

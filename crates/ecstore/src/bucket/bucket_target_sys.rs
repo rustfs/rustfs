@@ -498,19 +498,19 @@ impl BucketTargetSys {
             bucket: bucket.to_string(),
         })?;
 
-        if arn.arn_type == BucketTargetType::ReplicationService {
-            if let Ok((config, _)) = get_replication_config(bucket).await {
-                for rule in config.filter_target_arns(&ObjectOpts {
-                    op_type: ReplicationType::All,
-                    ..Default::default()
-                }) {
-                    if rule == arn_str || config.role == arn_str {
-                        let arn_remotes_map = self.arn_remotes_map.read().await;
-                        if arn_remotes_map.get(arn_str).is_some() {
-                            return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
-                                bucket: bucket.to_string(),
-                            });
-                        }
+        if arn.arn_type == BucketTargetType::ReplicationService
+            && let Ok((config, _)) = get_replication_config(bucket).await
+        {
+            for rule in config.filter_target_arns(&ObjectOpts {
+                op_type: ReplicationType::All,
+                ..Default::default()
+            }) {
+                if rule == arn_str || config.role == arn_str {
+                    let arn_remotes_map = self.arn_remotes_map.read().await;
+                    if arn_remotes_map.get(arn_str).is_some() {
+                        return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
+                            bucket: bucket.to_string(),
+                        });
                     }
                 }
             }
@@ -691,22 +691,22 @@ impl BucketTargetSys {
         }
 
         // Add new targets
-        if let Some(new_targets) = targets {
-            if !new_targets.is_empty() {
-                for target in &new_targets.targets {
-                    if let Ok(client) = self.get_remote_target_client_internal(target).await {
-                        arn_remotes_map.insert(
-                            target.arn.clone(),
-                            ArnTarget {
-                                client: Some(Arc::new(client)),
-                                last_refresh: OffsetDateTime::now_utc(),
-                            },
-                        );
-                        self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
-                    }
+        if let Some(new_targets) = targets
+            && !new_targets.is_empty()
+        {
+            for target in &new_targets.targets {
+                if let Ok(client) = self.get_remote_target_client_internal(target).await {
+                    arn_remotes_map.insert(
+                        target.arn.clone(),
+                        ArnTarget {
+                            client: Some(Arc::new(client)),
+                            last_refresh: OffsetDateTime::now_utc(),
+                        },
+                    );
+                    self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
                 }
-                targets_map.insert(bucket.to_string(), new_targets.targets.clone());
             }
+            targets_map.insert(bucket.to_string(), new_targets.targets.clone());
         }
     }
 

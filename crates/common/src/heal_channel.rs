@@ -403,10 +403,10 @@ fn lc_get_prefix(rule: &LifecycleRule) -> String {
     } else if let Some(filter) = &rule.filter {
         if let Some(p) = &filter.prefix {
             return p.to_string();
-        } else if let Some(and) = &filter.and {
-            if let Some(p) = &and.prefix {
-                return p.to_string();
-            }
+        } else if let Some(and) = &filter.and
+            && let Some(p) = &and.prefix
+        {
+            return p.to_string();
         }
     }
 
@@ -475,21 +475,19 @@ pub fn rep_has_active_rules(config: &ReplicationConfiguration, prefix: &str, rec
         {
             continue;
         }
-        if !prefix.is_empty() {
-            if let Some(filter) = &rule.filter {
-                if let Some(r_prefix) = &filter.prefix {
-                    if !r_prefix.is_empty() {
-                        // incoming prefix must be in rule prefix
-                        if !recursive && !prefix.starts_with(r_prefix) {
-                            continue;
-                        }
-                        // If recursive, we can skip this rule if it doesn't match the tested prefix or level below prefix
-                        // does not match
-                        if recursive && !r_prefix.starts_with(prefix) && !prefix.starts_with(r_prefix) {
-                            continue;
-                        }
-                    }
-                }
+        if !prefix.is_empty()
+            && let Some(filter) = &rule.filter
+            && let Some(r_prefix) = &filter.prefix
+            && !r_prefix.is_empty()
+        {
+            // incoming prefix must be in rule prefix
+            if !recursive && !prefix.starts_with(r_prefix) {
+                continue;
+            }
+            // If recursive, we can skip this rule if it doesn't match the tested prefix or level below prefix
+            // does not match
+            if recursive && !r_prefix.starts_with(prefix) && !prefix.starts_with(r_prefix) {
+                continue;
             }
         }
         return true;

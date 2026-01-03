@@ -119,12 +119,11 @@ impl TargetRegistry {
                 format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{target_type}{DEFAULT_DELIMITER}{ENABLE_KEY}{DEFAULT_DELIMITER}")
                     .to_uppercase();
             for (key, value) in &all_env {
-                if EnableState::from_str(value).ok().map(|s| s.is_enabled()).unwrap_or(false) {
-                    if let Some(id) = key.strip_prefix(&enable_prefix) {
-                        if !id.is_empty() {
-                            instance_ids_from_env.insert(id.to_lowercase());
-                        }
-                    }
+                if EnableState::from_str(value).ok().map(|s| s.is_enabled()).unwrap_or(false)
+                    && let Some(id) = key.strip_prefix(&enable_prefix)
+                    && !id.is_empty()
+                {
+                    instance_ids_from_env.insert(id.to_lowercase());
                 }
             }
 
@@ -273,10 +272,10 @@ impl TargetRegistry {
             for section in sections {
                 let mut section_map: std::collections::HashMap<String, KVS> = std::collections::HashMap::new();
                 // Add default item
-                if let Some(default_kvs) = section_defaults.get(&section) {
-                    if !default_kvs.is_empty() {
-                        section_map.insert(DEFAULT_DELIMITER.to_string(), default_kvs.clone());
-                    }
+                if let Some(default_kvs) = section_defaults.get(&section)
+                    && !default_kvs.is_empty()
+                {
+                    section_map.insert(DEFAULT_DELIMITER.to_string(), default_kvs.clone());
                 }
 
                 // Add successful instance item

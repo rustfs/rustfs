@@ -18,6 +18,8 @@ pub use credentials::*;
 
 use rustfs_credentials::Credentials;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::HashMap;
 use time::OffsetDateTime;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -41,6 +43,25 @@ impl UserIdentity {
             credentials,
             update_at: Some(OffsetDateTime::now_utc()),
         }
+    }
+
+    /// Add an SSH public key to user identity for SFTP authentication
+    pub fn add_ssh_public_key(&mut self, public_key: &str) {
+        self.credentials
+            .claims
+            .get_or_insert_with(HashMap::new)
+            .insert("ssh_public_keys".to_string(), json!([public_key]));
+    }
+
+    /// Get all SSH public keys for user identity
+    pub fn get_ssh_public_keys(&self) -> Vec<String> {
+        self.credentials
+            .claims
+            .as_ref()
+            .and_then(|claims| claims.get("ssh_public_keys"))
+            .and_then(|keys| keys.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+            .unwrap_or_default()
     }
 }
 
