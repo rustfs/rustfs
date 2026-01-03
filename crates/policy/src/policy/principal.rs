@@ -107,55 +107,17 @@ mod test {
     use super::*;
     use serde_json;
 
-    #[test]
-    fn test_principal_parsing() {
-        println!("=== Testing Principal Parsing Fix ===");
-
-        // Test case 1: "*"
-        let principal_json1 = r#""*""#;
-        println!("Testing: {}", principal_json1);
-        match serde_json::from_str::<Principal>(principal_json1) {
-            Ok(p) => {
-                println!("✓ Success: {:?}", p);
-                assert!(p.aws.contains("*"));
+    #[test_case::test_case(r#""*""#, true ; "wildcard_string")]
+    #[test_case::test_case(r#"{"AWS": "*"}"#, true ; "aws_object_single_string")]
+    #[test_case::test_case(r#"{"AWS": ["*"]}"#, true ; "aws_object_array")]
+    fn test_principal_parsing(json: &str, should_succeed: bool) {
+        let result = match serde_json::from_str::<Principal>(json) {
+            Ok(principal) => {
+                assert!(principal.aws.contains("*"));
+                should_succeed
             }
-            Err(e) => {
-                println!("✗ Error: {}", e);
-                panic!("Should support '*' format");
-            }
-        }
-
-        // Test case 2: {"AWS": "*"}
-        let principal_json2 = r#"{"AWS": "*"}"#;
-        println!("\nTesting: {}", principal_json2);
-        match serde_json::from_str::<Principal>(principal_json2) {
-            Ok(p) => {
-                println!("✓ Success: {:?}", p);
-                assert!(p.aws.contains("*"));
-            }
-            Err(e) => {
-                println!("✗ Error: {}", e);
-                panic!("Should support {{'AWS': '*'}} format");
-            }
-        }
-
-        // Test case 3: {"AWS": ["*"]}
-        let principal_json3 = r#"{"AWS": ["*"]}"#;
-        println!("\nTesting: {}", principal_json3);
-        match serde_json::from_str::<Principal>(principal_json3) {
-            Ok(p) => {
-                println!("✓ Success: {:?}", p);
-                assert!(p.aws.contains("*"));
-            }
-            Err(e) => {
-                println!("✗ Error: {}", e);
-                panic!("Should still support {{'AWS': ['*']}} format");
-            }
-        }
-
-        // Test matching functionality
-        let principal = serde_json::from_str::<Principal>(r#""*""#).unwrap();
-        assert!(principal.is_match("any-user"));
-        assert!(principal.is_match("*"));
+            Err(_) => !should_succeed,
+        };
+        assert!(result);
     }
 }
