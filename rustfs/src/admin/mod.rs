@@ -57,6 +57,9 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
 
+    // Account usage: ListBuckets with ?usage parameter (Ceph RGW extension)
+    r.insert(Method::GET, "/?usage", AdminOperation(&handlers::AccountUsageHandler {}))?;
+
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/is-admin").as_str(),

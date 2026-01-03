@@ -107,6 +107,11 @@ where
             return true;
         }
 
+        // Account usage: ListBuckets with ?usage parameter (Ceph RGW extension)
+        if method == Method::GET && path == "/" && uri.query().map(|q| q.contains("usage")).unwrap_or(false) {
+            return true;
+        }
+
         path.starts_with(ADMIN_PREFIX) || path.starts_with(RPC_PREFIX) || is_console_path(path)
     }
 
@@ -163,7 +168,17 @@ where
             return Err(s3_error!(InternalError, "console is not enabled"));
         }
 
-        let uri = format!("{}|{}", &req.method, req.uri.path());
+        // Handle ListBuckets with ?usage parameter using a special route key
+        let uri = if req.method == Method::GET
+            && req.uri.path() == "/"
+            && req.uri.query().map(|q| q.contains("usage")).unwrap_or(false)
+        {
+            // Use a special route key for account usage requests
+            format!("{}|/?usage", &req.method)
+        } else {
+            format!("{}|{}", &req.method, req.uri.path())
+        };
+
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;
             let mut resp = op.call(req, mat.params).await?;
