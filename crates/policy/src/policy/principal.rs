@@ -44,9 +44,9 @@ enum AwsValues {
 impl From<PrincipalFormat> for Principal {
     fn from(format: PrincipalFormat) -> Self {
         match format {
-            PrincipalFormat::Wildcard(s) if s == "*" => {
-                Principal { aws: vec!["*".to_string()].into_iter().collect() }
-            }
+            PrincipalFormat::Wildcard(s) if s == "*" => Principal {
+                aws: vec!["*".to_string()].into_iter().collect(),
+            },
             PrincipalFormat::AwsObject(obj) => {
                 let aws = match obj.aws {
                     AwsValues::Single(s) => vec![s].into_iter().collect(),
@@ -60,7 +60,7 @@ impl From<PrincipalFormat> for Principal {
 }
 
 impl<'de> serde::Deserialize<'de> for Principal {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -70,7 +70,7 @@ impl<'de> serde::Deserialize<'de> for Principal {
 }
 
 impl serde::Serialize for Principal {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -94,7 +94,7 @@ impl Principal {
 
 impl Validator for Principal {
     type Error = Error;
-    fn is_valid(&self) -> std::result::Result<(), Error> {
+    fn is_valid(&self) -> Result<(), Error> {
         if self.aws.is_empty() {
             return Err(Error::other("Principal is empty"));
         }
@@ -111,7 +111,7 @@ mod test {
     fn test_principal_parsing() {
         println!("=== Testing Principal Parsing Fix ===");
 
-        // Test case 1: "*" (should now work!)
+        // Test case 1: "*"
         let principal_json1 = r#""*""#;
         println!("Testing: {}", principal_json1);
         match serde_json::from_str::<Principal>(principal_json1) {
@@ -125,7 +125,7 @@ mod test {
             }
         }
 
-        // Test case 2: {"AWS": "*"} (should now work!)
+        // Test case 2: {"AWS": "*"}
         let principal_json2 = r#"{"AWS": "*"}"#;
         println!("\nTesting: {}", principal_json2);
         match serde_json::from_str::<Principal>(principal_json2) {
@@ -139,7 +139,7 @@ mod test {
             }
         }
 
-        // Test case 3: {"AWS": ["*"]} (should still work)
+        // Test case 3: {"AWS": ["*"]}
         let principal_json3 = r#"{"AWS": ["*"]}"#;
         println!("\nTesting: {}", principal_json3);
         match serde_json::from_str::<Principal>(principal_json3) {
@@ -157,7 +157,5 @@ mod test {
         let principal = serde_json::from_str::<Principal>(r#""*""#).unwrap();
         assert!(principal.is_match("any-user"));
         assert!(principal.is_match("*"));
-
-        println!("\n=== All tests passed! ===");
     }
 }
