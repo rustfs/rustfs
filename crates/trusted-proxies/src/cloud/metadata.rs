@@ -177,6 +177,12 @@ pub struct AwsMetadataFetcher {
     metadata_endpoint: String,
 }
 
+impl Default for AwsMetadataFetcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AwsMetadataFetcher {
     pub fn new() -> Self {
         let client = Client::builder()
@@ -327,10 +333,10 @@ impl AwsMetadataFetcher {
             let mut ranges = Vec::new();
             for prefix in ip_ranges.prefixes {
                 // Include only service-specific IP ranges (e.g., EC2, CLOUDFRONT, etc.)
-                if matches!(prefix.service.as_str(), "EC2" | "CLOUDFRONT" | "ROUTE53" | "ROUTE53_HEALTHCHECKS") {
-                    if let Ok(network) = prefix.ip_prefix.parse::<IpNetwork>() {
-                        ranges.push(network);
-                    }
+                if matches!(prefix.service.as_str(), "EC2" | "CLOUDFRONT" | "ROUTE53" | "ROUTE53_HEALTHCHECKS")
+                    && let Ok(network) = prefix.ip_prefix.parse::<IpNetwork>()
+                {
+                    ranges.push(network);
                 }
             }
 
@@ -392,6 +398,12 @@ impl CloudMetadataFetcher for AwsMetadataFetcher {
 pub struct AzureMetadataFetcher {
     client: Client,
     metadata_endpoint: String,
+}
+
+impl Default for AzureMetadataFetcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AzureMetadataFetcher {
@@ -549,6 +561,12 @@ pub struct GcpMetadataFetcher {
     metadata_endpoint: String,
 }
 
+impl Default for GcpMetadataFetcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GcpMetadataFetcher {
     pub fn new() -> Self {
         let client = Client::builder()
@@ -602,10 +620,10 @@ impl GcpMetadataFetcher {
 
             let mut ranges = Vec::new();
             for prefix in ip_ranges.prefixes {
-                if let Some(ipv4_prefix) = prefix.ipv4_prefix {
-                    if let Ok(network) = ipv4_prefix.parse::<IpNetwork>() {
-                        ranges.push(network);
-                    }
+                if let Some(ipv4_prefix) = prefix.ipv4_prefix
+                    && let Ok(network) = ipv4_prefix.parse::<IpNetwork>()
+                {
+                    ranges.push(network);
                 }
             }
 
@@ -634,7 +652,7 @@ impl CloudMetadataFetcher for GcpMetadataFetcher {
             .lines()
             .filter_map(|line| {
                 let line = line.trim().trim_end_matches('/');
-                if line.chars().all(|c| c.is_digit(10)) {
+                if line.chars().all(|c| c.is_ascii_digit()) {
                     line.parse().ok()
                 } else {
                     None
@@ -654,12 +672,11 @@ impl CloudMetadataFetcher for GcpMetadataFetcher {
                     let ip_path = format!("instance/network-interfaces/{}/ip", index);
                     let mask_path = format!("instance/network-interfaces/{}/subnetmask", index);
 
-                    if let (Ok(ip), Ok(mask)) = tokio::join!(self.get_metadata(&ip_path), self.get_metadata(&mask_path)) {
-                        if let (Ok(ip_addr), Ok(mask_len)) = (ip.trim().parse::<Ipv4Addr>(), mask_to_prefix_length(&mask)) {
-                            if let Ok(network) = format!("{}/{}", ip_addr, mask_len).parse::<IpNetwork>() {
-                                cidrs.push(network);
-                            }
-                        }
+                    if let (Ok(ip), Ok(mask)) = tokio::join!(self.get_metadata(&ip_path), self.get_metadata(&mask_path))
+                        && let (Ok(ip_addr), Ok(mask_len)) = (ip.trim().parse::<Ipv4Addr>(), mask_to_prefix_length(&mask))
+                        && let Ok(network) = format!("{}/{}", ip_addr, mask_len).parse::<IpNetwork>()
+                    {
+                        cidrs.push(network);
                     }
                 }
                 Err(e) => {
@@ -716,6 +733,12 @@ pub fn mask_to_prefix_length(mask: &str) -> Result<u8, CloudMetadataError> {
 pub struct CloudMetadataDetector {
     client: Client,
     provider: Option<CloudProvider>,
+}
+
+impl Default for CloudMetadataDetector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CloudMetadataDetector {

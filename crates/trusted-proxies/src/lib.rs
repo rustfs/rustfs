@@ -24,7 +24,7 @@ mod proxy;
 
 pub use advanced::*;
 pub use cache::*;
-pub(crate) use cloud::*;
+pub use cloud::*;
 pub use config::*;
 pub use globals::*;
 pub use middleware::*;

@@ -124,19 +124,19 @@ impl CidrMatcher {
         match ip {
             IpAddr::V4(ipv4) => {
                 for network in &self.ipv4_networks {
-                    if let IpNetwork::V4(v4_net) = network {
-                        if v4_net.contains(*ipv4) {
-                            return true;
-                        }
+                    if let IpNetwork::V4(v4_net) = network
+                        && v4_net.contains(*ipv4)
+                    {
+                        return true;
                     }
                 }
             }
             IpAddr::V6(ipv6) => {
                 for network in &self.ipv6_networks {
-                    if let IpNetwork::V6(v6_net) = network {
-                        if v6_net.contains(*ipv6) {
-                            return true;
-                        }
+                    if let IpNetwork::V6(v6_net) = network
+                        && v6_net.contains(*ipv6)
+                    {
+                        return true;
                     }
                 }
             }
@@ -147,7 +147,7 @@ impl CidrMatcher {
 }
 
 /// Environment-specific configuration loading
-pub fn load_production_config() -> MultiProxyConfig {
+pub async fn load_production_config() -> MultiProxyConfig {
     let mut config = MultiProxyConfig::default();
 
     // Read from environment variables
@@ -160,9 +160,9 @@ pub fn load_production_config() -> MultiProxyConfig {
     }
 
     // Add trusted agents from cloud provider metadata
-    if let Ok(cloud_ips) = fetch_cloud_provider_ips() {
+    if let Ok(cloud_ips) = fetch_cloud_provider_ips().await {
         for ip_range in cloud_ips {
-            if let Ok(network) = ip_range.parse() {
+            if let Ok(network) = ip_range.parse::<IpNetwork>() {
                 config.allowed_private_nets.push(network);
             }
         }

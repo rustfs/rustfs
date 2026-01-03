@@ -17,7 +17,6 @@ use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::proxy::{ClientInfo, TrustedProxiesLayer};
 use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
@@ -33,6 +32,7 @@ use metrics::{counter, histogram};
 use rustfs_common::GlobalReadiness;
 use rustfs_config::{MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+use rustfs_trusted_proxies::{ClientInfo, TrustedProxiesLayer};
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3Service, service::S3ServiceBuilder};
@@ -547,14 +547,14 @@ fn process_connection(
         let remote_addr = match socket.peer_addr() {
             Ok(addr) => Some(RemoteAddr(addr)),
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     error = %e,
                     "Failed to obtain peer address; policy evaluation may fall back to a default source IP"
                 );
                 None
             }
         };
-        let trusted_proxies = crate::proxy::get_trusted_proxies_config().await;
+        let trusted_proxies = rustfs_trusted_proxies::get_trusted_proxies_config().await;
         let hybrid_service = ServiceBuilder::new()
             .layer(TrustedProxiesLayer::new(trusted_proxies.clone()))
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))

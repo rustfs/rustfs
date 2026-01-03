@@ -19,7 +19,6 @@ ipnetwork = { workspace = true }
 metrics = { workspace = true }
 moka = { workspace = true }
 reqwest = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-utils = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

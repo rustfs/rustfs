@@ -18,7 +18,6 @@ use crate::{
 };
 use ipnetwork::IpNetwork;
 use std::collections::HashSet;
-use std::mem::take;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -144,12 +143,11 @@ impl MultiProxyProcessor {
         let mut security_warnings = Vec::new();
 
         // Strategy 1: Prioritize the use of RFC 7239 Forwarded headers
-        if self.advanced_config.enable_rfc7239 {
-            if let Some(forwarded) = Self::parse_forwarded_header(headers) {
-                if let Some(rfc_chain) = Self::extract_chain_from_forwarded(&forwarded) {
-                    proxy_chains.push(("rfc7239", rfc_chain));
-                }
-            }
+        if self.advanced_config.enable_rfc7239
+            && let Some(forwarded) = Self::parse_forwarded_header(headers)
+            && let Some(rfc_chain) = Self::extract_chain_from_forwarded(&forwarded)
+        {
+            proxy_chains.push(("rfc7239", rfc_chain));
         }
 
         // Strategy 2: Use traditional X-Forwarded-For heads
@@ -244,7 +242,7 @@ impl MultiProxyProcessor {
         let is_last_trusted = self.is_ip_trusted(last_proxy);
 
         if is_last_trusted {
-            (client_ip, chain.iter().copied().collect(), chain.len())
+            (client_ip, chain.to_vec(), chain.len())
         } else {
             // If the last proxy is not trusted, use the IP of the last proxy
             (*last_proxy, vec![*last_proxy], 0)
@@ -508,14 +506,16 @@ impl OptimizedMultiProxyProcessor {
     }
 
     /// Optimized IP trusted checks
-    fn is_ip_trusted_optimized(&self, ip: &IpAddr) -> bool {
-        let mut cache = self.ip_cache.lock().unwrap();
+    async fn is_ip_trusted_optimized(&self, ip: &IpAddr) -> bool {
+        let cache = self.ip_cache.lock().unwrap();
 
-        cache.is_trusted(ip, |ip| {
-            // Fast Path: Check individual IP caches
-            // Slow path: Check the CIDR range
-            self.cidr_matcher.contains(ip)
-        })
+        cache
+            .is_trusted(ip, |ip| {
+                // Fast Path: Check individual IP caches
+                // Slow path: Check the CIDR range
+                self.cidr_matcher.contains(ip)
+            })
+            .await
     }
 }
 

@@ -58,13 +58,13 @@ pub struct ProxyMetrics {
 impl ProxyMetrics {
     pub fn new() -> Self {
         Self {
-            total_requests: counter!("proxy.total_requests", "The total number of requests processed"),
-            trusted_proxy_requests: counter!("proxy.trusted_requests", "Requests from trusted agents"),
-            untrusted_requests: counter!("proxy.untrusted_requests", "Requests from untrusted sources"),
-            validation_failed: counter!("proxy.validation_failed", "Validate failed requests"),
-            chain_length: histogram!("proxy.chain_length", "Proxy chain length distribution"),
-            validation_duration: histogram!("proxy.validation_duration_ms", "Validation Time (ms)"),
-            cache_hit_ratio: gauge!("proxy.cache_hit_ratio", "Cache hit rate"),
+            total_requests: counter!("proxy.total_requests", "description" => "The total number of requests processed"),
+            trusted_proxy_requests: counter!("proxy.trusted_requests", "description" => "Requests from trusted agents"),
+            untrusted_requests: counter!("proxy.untrusted_requests", "description" => "Requests from untrusted sources"),
+            validation_failed: counter!("proxy.validation_failed", "description" => "Validation failed requests"),
+            chain_length: histogram!("proxy.chain_length", "description" => "Proxy chain length distribution"),
+            validation_duration: histogram!("proxy.validation_duration_ms", "description" => "Validation duration in milliseconds"),
+            cache_hit_ratio: gauge!("proxy.cache_hit_ratio", "description" => "Cache hit rate"),
         }
     }
 
