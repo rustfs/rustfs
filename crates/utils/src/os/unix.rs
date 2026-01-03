@@ -29,7 +29,7 @@ fn blocks_available(stat: &Statfs) -> u64 {
 #[cfg(target_os = "freebsd")]
 pub fn files_free(stat: &Statfs) -> u64 {
     match stat.files_free().try_into() {
-        Ok(bavail) => bavail,
+        Ok(files_free) => files_free,
         Err(_e) => 0,
     }
 }
