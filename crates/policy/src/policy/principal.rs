@@ -14,10 +14,13 @@
 
 use super::{Validator, utils::wildcard};
 use crate::error::Error;
+use serde::Serialize;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase", default)]
 pub struct Principal {
+    #[serde(rename = "AWS")]
     aws: HashSet<String>,
 }
 
@@ -66,18 +69,6 @@ impl<'de> serde::Deserialize<'de> for Principal {
     {
         let format = PrincipalFormat::deserialize(deserializer)?;
         Ok(format.into())
-    }
-}
-
-impl serde::Serialize for Principal {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Principal", 1)?;
-        state.serialize_field("AWS", &self.aws)?;
-        state.end()
     }
 }
 
