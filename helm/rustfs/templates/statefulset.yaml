@@ -90,12 +90,14 @@ spec:
               mkdir -p {{ $logDir }}
               chown 10001:10001 /data {{ $logDir }}
           volumeMounts:
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
+            - name: logs
+              mountPath: /logs
+            {{- if gt (int .Values.volumesPerReplica) 1 }}
+            {{- range $i := until (int .Values.volumesPerReplica) }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
+            {{- else }}
             - name: data
               mountPath: /data
             {{- end }}
@@ -141,7 +143,7 @@ spec:
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
+            {{- else }}
             - name: data
               mountPath: /data
             {{- end }}
@@ -172,7 +174,7 @@ spec:
           requests:
             storage: {{ $.Values.storageclass.dataStorageSize }}
     {{- end }}
-    {{- else if eq (int .Values.replicaCount) 16 }}
+    {{- else }}
     - metadata:
         name: data
         labels:
