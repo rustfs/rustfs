@@ -106,18 +106,8 @@ pub fn collect_cluster_metrics(stats: &ClusterStats) -> Vec<PrometheusMetric> {
         HELP_USABLE_CAPACITY,
         stats.usable_capacity_bytes as f64,
     ));
-    metrics.push(PrometheusMetric::new(
-        METRIC_USED,
-        MetricType::Gauge,
-        HELP_USED,
-        stats.used_bytes as f64,
-    ));
-    metrics.push(PrometheusMetric::new(
-        METRIC_FREE,
-        MetricType::Gauge,
-        HELP_FREE,
-        stats.free_bytes as f64,
-    ));
+    metrics.push(PrometheusMetric::new(METRIC_USED, MetricType::Gauge, HELP_USED, stats.used_bytes as f64));
+    metrics.push(PrometheusMetric::new(METRIC_FREE, MetricType::Gauge, HELP_FREE, stats.free_bytes as f64));
     metrics.push(PrometheusMetric::new(
         METRIC_OBJECTS,
         MetricType::Gauge,

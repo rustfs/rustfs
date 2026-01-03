@@ -607,8 +607,7 @@ mod tests {
 
         let token_header =
             generate_prometheus_token(access_key_header, secret_key, None).expect("Token generation should succeed");
-        let token_query =
-            generate_prometheus_token(access_key_query, secret_key, None).expect("Token generation should succeed");
+        let token_query = generate_prometheus_token(access_key_query, secret_key, None).expect("Token generation should succeed");
 
         let mut headers = HeaderMap::new();
         headers.insert(http::header::AUTHORIZATION, format!("Bearer {}", token_header).parse().unwrap());

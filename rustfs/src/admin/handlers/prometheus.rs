@@ -273,8 +273,7 @@ impl Operation for BucketMetricsHandler {
 /// - Free disk space
 pub struct NodeMetricsHandler;
 
-#[async_trait::async_trait
-]
+#[async_trait::async_trait]
 impl Operation for NodeMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         verify_prometheus_auth(&req.headers, &req.uri)?;
@@ -448,8 +447,8 @@ impl Operation for PrometheusTokenHandler {
             .ok_or_else(|| s3_error!(AccessDenied, "missing 'secret_key' query parameter"))?;
 
         // Get admin credentials
-        let admin_cred = get_global_action_cred()
-            .ok_or_else(|| s3_error!(InternalError, "server credentials not initialized"))?;
+        let admin_cred =
+            get_global_action_cred().ok_or_else(|| s3_error!(InternalError, "server credentials not initialized"))?;
 
         // Validate credentials using constant-time comparison
         if !crate::auth::constant_time_eq(&access_key, &admin_cred.access_key)

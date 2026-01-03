@@ -178,10 +178,8 @@ mod tests {
     #[test]
     fn test_render_multiple_metrics_same_name() {
         let metrics = vec![
-            PrometheusMetric::new("http_requests", MetricType::Counter, "HTTP requests", 100.0)
-                .with_label("method", "GET"),
-            PrometheusMetric::new("http_requests", MetricType::Counter, "HTTP requests", 50.0)
-                .with_label("method", "POST"),
+            PrometheusMetric::new("http_requests", MetricType::Counter, "HTTP requests", 100.0).with_label("method", "GET"),
+            PrometheusMetric::new("http_requests", MetricType::Counter, "HTTP requests", 50.0).with_label("method", "POST"),
         ];
         let output = render_metrics(&metrics);
 

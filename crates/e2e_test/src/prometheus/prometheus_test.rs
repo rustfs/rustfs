@@ -135,7 +135,11 @@ async fn test_prometheus_cluster_metrics() {
     // Call cluster metrics endpoint with token query parameter
     let client = Client::new();
     let metrics_url = format!("{}/rustfs/v2/metrics/cluster?token={}", env.url, token);
-    let response = client.get(&metrics_url).send().await.expect("Failed to send cluster metrics request");
+    let response = client
+        .get(&metrics_url)
+        .send()
+        .await
+        .expect("Failed to send cluster metrics request");
 
     assert!(
         response.status().is_success(),
@@ -180,7 +184,11 @@ async fn test_prometheus_bucket_metrics() {
     // Call bucket metrics endpoint with token query parameter
     let client = Client::new();
     let metrics_url = format!("{}/rustfs/v2/metrics/bucket?token={}", env.url, token);
-    let response = client.get(&metrics_url).send().await.expect("Failed to send bucket metrics request");
+    let response = client
+        .get(&metrics_url)
+        .send()
+        .await
+        .expect("Failed to send bucket metrics request");
 
     assert!(
         response.status().is_success(),
@@ -219,7 +227,11 @@ async fn test_prometheus_node_metrics() {
     // Call node metrics endpoint with token query parameter
     let client = Client::new();
     let metrics_url = format!("{}/rustfs/v2/metrics/node?token={}", env.url, token);
-    let response = client.get(&metrics_url).send().await.expect("Failed to send node metrics request");
+    let response = client
+        .get(&metrics_url)
+        .send()
+        .await
+        .expect("Failed to send node metrics request");
 
     assert!(
         response.status().is_success(),
@@ -258,7 +270,11 @@ async fn test_prometheus_resource_metrics() {
     // Call resource metrics endpoint with token query parameter
     let client = Client::new();
     let metrics_url = format!("{}/rustfs/v2/metrics/resource?token={}", env.url, token);
-    let response = client.get(&metrics_url).send().await.expect("Failed to send resource metrics request");
+    let response = client
+        .get(&metrics_url)
+        .send()
+        .await
+        .expect("Failed to send resource metrics request");
 
     assert!(
         response.status().is_success(),
@@ -341,10 +357,7 @@ async fn test_prometheus_invalid_token() {
     let client = Client::new();
 
     // Test with various invalid tokens via query parameter
-    let invalid_tokens = [
-        "invalid-token",
-        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.invalid.signature",
-    ];
+    let invalid_tokens = ["invalid-token", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.invalid.signature"];
 
     let endpoints = [
         "/rustfs/v2/metrics/cluster",
@@ -538,11 +551,7 @@ async fn test_prometheus_token_endpoint_to_metrics_scrape() {
     );
     info!("Requesting token from: {}", token_url);
 
-    let token_response = client
-        .post(&token_url)
-        .send()
-        .await
-        .expect("Failed to send token request");
+    let token_response = client.post(&token_url).send().await.expect("Failed to send token request");
 
     assert!(
         token_response.status().is_success(),
@@ -551,34 +560,20 @@ async fn test_prometheus_token_endpoint_to_metrics_scrape() {
     );
 
     // Step 2: Parse the JSON response to extract the bearer token
-    let token_body = token_response
-        .text()
-        .await
-        .expect("Failed to read token response body");
+    let token_body = token_response.text().await.expect("Failed to read token response body");
 
     info!("Token response body: {}", token_body);
 
-    let token_data: PrometheusTokenResponse =
-        serde_json::from_str(&token_body).expect("Failed to parse token response JSON");
+    let token_data: PrometheusTokenResponse = serde_json::from_str(&token_body).expect("Failed to parse token response JSON");
 
-    assert!(
-        !token_data.bearer_token.is_empty(),
-        "Bearer token should not be empty"
-    );
+    assert!(!token_data.bearer_token.is_empty(), "Bearer token should not be empty");
     info!("Successfully obtained bearer token");
 
     // Step 3: Use the token to scrape metrics from the cluster endpoint
-    let metrics_url = format!(
-        "{}/rustfs/v2/metrics/cluster?token={}",
-        env.url, token_data.bearer_token
-    );
+    let metrics_url = format!("{}/rustfs/v2/metrics/cluster?token={}", env.url, token_data.bearer_token);
     info!("Requesting metrics from: {}", metrics_url);
 
-    let metrics_response = client
-        .get(&metrics_url)
-        .send()
-        .await
-        .expect("Failed to send metrics request");
+    let metrics_response = client.get(&metrics_url).send().await.expect("Failed to send metrics request");
 
     assert!(
         metrics_response.status().is_success(),
@@ -587,10 +582,7 @@ async fn test_prometheus_token_endpoint_to_metrics_scrape() {
     );
 
     // Step 4: Verify the response is valid Prometheus format
-    let metrics_body = metrics_response
-        .text()
-        .await
-        .expect("Failed to read metrics response body");
+    let metrics_body = metrics_response.text().await.expect("Failed to read metrics response body");
 
     info!("Metrics response:\n{}", metrics_body);
 
@@ -600,6 +592,71 @@ async fn test_prometheus_token_endpoint_to_metrics_scrape() {
     );
 
     info!("Prometheus token endpoint to metrics scrape test passed");
+}
+
+/// Test the Prometheus token generation endpoint.
+///
+/// This test verifies:
+/// 1. The token endpoint returns a 200 status with valid credentials
+/// 2. The response contains a non-empty bearer_token field
+/// 3. The token has valid JWT structure (3 parts separated by `.`)
+#[tokio::test]
+#[serial]
+async fn test_prometheus_token_generation() {
+    init_logging();
+    info!("Starting Prometheus Token Generation Test");
+
+    let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+
+    env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS server");
+
+    let client = Client::new();
+
+    // Call the token generation endpoint with valid credentials
+    let token_url = format!(
+        "{}/rustfs/admin/v3/prometheus/token?access_key={}&secret_key={}",
+        env.url, env.access_key, env.secret_key
+    );
+    info!("Requesting token from: {}", token_url);
+
+    let response = client.post(&token_url).send().await.expect("Failed to send token request");
+
+    // Verify response status is 200
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "Token endpoint should return 200 OK, got: {}",
+        response.status()
+    );
+    info!("Token endpoint returned 200 OK");
+
+    // Parse JSON response
+    let response_body = response.text().await.expect("Failed to read response body");
+    info!("Token response body: {}", response_body);
+
+    let token_data: PrometheusTokenResponse =
+        serde_json::from_str(&response_body).expect("Failed to parse token response as JSON");
+
+    // Verify bearer_token field exists and is non-empty
+    assert!(!token_data.bearer_token.is_empty(), "bearer_token field should not be empty");
+    info!("bearer_token field exists and is non-empty");
+
+    // Verify the token looks like a valid JWT (has 3 parts separated by `.`)
+    let jwt_parts: Vec<&str> = token_data.bearer_token.split('.').collect();
+    assert_eq!(
+        jwt_parts.len(),
+        3,
+        "JWT token should have 3 parts separated by '.', got {} parts",
+        jwt_parts.len()
+    );
+    info!("Token has valid JWT structure with 3 parts");
+
+    // Verify each part is non-empty
+    for (i, part) in jwt_parts.iter().enumerate() {
+        assert!(!part.is_empty(), "JWT part {} should not be empty", i + 1);
+    }
+
+    info!("Prometheus token generation test passed");
 }
 
 /// Test error cases for the Prometheus token endpoint.
@@ -622,10 +679,7 @@ async fn test_prometheus_token_endpoint_errors() {
 
     // Test 1: Missing access_key
     info!("Testing missing access_key");
-    let url_missing_access_key = format!(
-        "{}/rustfs/admin/v3/prometheus/token?secret_key={}",
-        env.url, env.secret_key
-    );
+    let url_missing_access_key = format!("{}/rustfs/admin/v3/prometheus/token?secret_key={}", env.url, env.secret_key);
 
     let response = client
         .post(&url_missing_access_key)
@@ -638,17 +692,11 @@ async fn test_prometheus_token_endpoint_errors() {
         "Request with missing access_key should fail, got status: {}",
         response.status()
     );
-    info!(
-        "Missing access_key correctly returned error status: {}",
-        response.status()
-    );
+    info!("Missing access_key correctly returned error status: {}", response.status());
 
     // Test 2: Missing secret_key
     info!("Testing missing secret_key");
-    let url_missing_secret_key = format!(
-        "{}/rustfs/admin/v3/prometheus/token?access_key={}",
-        env.url, env.access_key
-    );
+    let url_missing_secret_key = format!("{}/rustfs/admin/v3/prometheus/token?access_key={}", env.url, env.access_key);
 
     let response = client
         .post(&url_missing_secret_key)
@@ -661,10 +709,7 @@ async fn test_prometheus_token_endpoint_errors() {
         "Request with missing secret_key should fail, got status: {}",
         response.status()
     );
-    info!(
-        "Missing secret_key correctly returned error status: {}",
-        response.status()
-    );
+    info!("Missing secret_key correctly returned error status: {}", response.status());
 
     // Test 3: Invalid credentials
     info!("Testing invalid credentials");
@@ -673,21 +718,14 @@ async fn test_prometheus_token_endpoint_errors() {
         env.url
     );
 
-    let response = client
-        .post(&url_invalid_creds)
-        .send()
-        .await
-        .expect("Failed to send request");
+    let response = client.post(&url_invalid_creds).send().await.expect("Failed to send request");
 
     assert!(
         !response.status().is_success(),
         "Request with invalid credentials should fail, got status: {}",
         response.status()
     );
-    info!(
-        "Invalid credentials correctly returned error status: {}",
-        response.status()
-    );
+    info!("Invalid credentials correctly returned error status: {}", response.status());
 
     info!("Prometheus token endpoint error cases test passed");
 }
