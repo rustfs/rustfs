@@ -61,7 +61,7 @@ impl Operation for ListCannedPolicies {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListUserPoliciesAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -120,7 +120,7 @@ impl Operation for AddCannedPolicy {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::CreatePolicyAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -193,7 +193,7 @@ impl Operation for InfoCannedPolicy {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::GetPolicyAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -251,7 +251,7 @@ impl Operation for RemoveCannedPolicy {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DeletePolicyAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -312,7 +312,7 @@ impl Operation for SetPolicyForUserOrGroup {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::AttachPolicyAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 

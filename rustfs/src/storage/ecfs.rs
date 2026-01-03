@@ -4693,7 +4693,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None, remote_addr);
 
         let read_only = PolicySys::is_allowed(&BucketPolicyArgs {

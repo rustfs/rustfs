@@ -125,7 +125,7 @@ impl Operation for AddUser {
             owner,
             deny_only,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -178,7 +178,7 @@ impl Operation for SetUserStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -223,7 +223,7 @@ impl Operation for ListUsers {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListUsersAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -282,7 +282,7 @@ impl Operation for RemoveUser {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -382,7 +382,7 @@ impl Operation for GetUserInfo {
             owner,
             deny_only,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -438,7 +438,7 @@ impl Operation for ExportIam {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ExportIAMAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -652,7 +652,7 @@ impl Operation for ImportIam {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ExportIAMAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
