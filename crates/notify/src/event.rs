@@ -49,7 +49,7 @@ pub struct Object {
     pub size: Option<i64>,
     /// The entity tag (ETag) of the object
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub etag: Option<String>,
+    pub e_tag: Option<String>,
     /// The content type of the object
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
