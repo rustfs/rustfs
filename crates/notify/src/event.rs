@@ -225,7 +225,7 @@ impl Event {
 
         if !is_removed_event {
             s3_metadata.object.size = Some(args.object.size);
-            s3_metadata.object.e_tag = args.object.e_tag.clone();
+            s3_metadata.object.e_tag = args.object.etag.clone();
             s3_metadata.object.content_type = args.object.content_type.clone();
             // Filter out internal reserved metadata
             let mut user_metadata = HashMap::new();
