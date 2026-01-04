@@ -162,7 +162,7 @@ impl Event {
                 object: Object {
                     key: key.to_string(),
                     size: Some(1024),
-                    etag: Some("etag123".to_string()),
+                    e_tag: Some("etag123".to_string()),
                     content_type: Some("application/octet-stream".to_string()),
                     user_metadata: Some(user_metadata),
                     version_id: Some("1".to_string()),
@@ -225,7 +225,7 @@ impl Event {
 
         if !is_removed_event {
             s3_metadata.object.size = Some(args.object.size);
-            s3_metadata.object.etag = args.object.etag.clone();
+            s3_metadata.object.e_tag = args.object.e_tag.clone();
             s3_metadata.object.content_type = args.object.content_type.clone();
             // Filter out internal reserved metadata
             let mut user_metadata = HashMap::new();
