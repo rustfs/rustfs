@@ -35,20 +35,11 @@ use std::collections::HashMap;
 pub struct DataKeyEnvelope {
     pub key_id: String,
     pub master_key_id: String,
-    /// Version of the master key (KEK) used to encrypt this DEK
-    /// This is critical for key rotation: when a KEK is rotated, we need to know
-    /// which version was used to encrypt each DEK so we can use the correct KEK version for decryption.
-    #[serde(default = "default_master_key_version")]
-    pub master_key_version: u32,
     pub key_spec: String,
     pub encrypted_key: Vec<u8>,
     pub nonce: Vec<u8>,
     pub encryption_context: HashMap<String, String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-fn default_master_key_version() -> u32 {
-    1
 }
 
 /// Trait for encrypting and decrypting data encryption keys (DEK)
@@ -280,7 +271,6 @@ mod tests {
         let envelope = DataKeyEnvelope {
             key_id: "test-key-id".to_string(),
             master_key_id: "master-key-id".to_string(),
-            master_key_version: 1,
             key_spec: "AES_256".to_string(),
             encrypted_key: vec![1, 2, 3, 4],
             nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
@@ -301,7 +291,6 @@ mod tests {
             serde_json::from_slice(&serialized).expect("Deserialization should succeed");
         assert_eq!(deserialized.key_id, envelope.key_id);
         assert_eq!(deserialized.master_key_id, envelope.master_key_id);
-        assert_eq!(deserialized.master_key_version, envelope.master_key_version);
         assert_eq!(deserialized.encrypted_key, envelope.encrypted_key);
     }
 
@@ -322,7 +311,6 @@ mod tests {
             serde_json::from_str(old_envelope_json).expect("Should deserialize old format");
         assert_eq!(deserialized.key_id, "test-key-id");
         assert_eq!(deserialized.master_key_id, "master-key-id");
-        assert_eq!(deserialized.master_key_version, 1); // Should default to 1
     }
 }
 

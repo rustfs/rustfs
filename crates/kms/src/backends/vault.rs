@@ -286,11 +286,8 @@ impl VaultKmsClient {
 
 #[async_trait]
 impl KmsClient for VaultKmsClient {
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKey> {
+    async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKey> {
         debug!("Generating data key for master key: {}", request.master_key_id);
-
-        // Verify master key exists and get its version
-        let master_key_info = self.describe_key(&request.master_key_id, context).await?;
 
         // Generate random data key material using the existing method
         let plaintext_key = generate_key_material(&request.key_spec)?;
@@ -302,7 +299,6 @@ impl KmsClient for VaultKmsClient {
         let envelope = DataKeyEnvelope {
             key_id: uuid::Uuid::new_v4().to_string(),
             master_key_id: request.master_key_id.clone(),
-            master_key_version: master_key_info.version,
             key_spec: request.key_spec.clone(),
             encrypted_key: encrypted_key.clone(),
             nonce,
