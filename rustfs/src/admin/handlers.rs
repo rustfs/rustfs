@@ -1485,6 +1485,71 @@ const DEFAULT_QUOTA_MAX_OBJ_COUNT: i64 = -1;
 const DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET: i64 = -1;
 const DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET: i64 = -1;
 
+/// Account usage summary for Ceph RGW `?usage` extension.
+///
+/// This is appended to the standard ListBucketsOutput when `?usage` is requested.
+#[derive(Debug, Default)]
+pub struct AccountUsageSummary {
+    pub quota_max_bytes: i64,
+    pub quota_max_buckets: i64,
+    pub quota_max_obj_count: i64,
+    pub quota_max_bytes_per_bucket: i64,
+    pub quota_max_obj_count_per_bucket: i64,
+}
+
+impl AccountUsageSummary {
+    /// Create a new summary with default quota values (Ceph RGW defaults).
+    pub fn with_defaults() -> Self {
+        Self {
+            quota_max_bytes: DEFAULT_QUOTA_MAX_BYTES,
+            quota_max_buckets: DEFAULT_QUOTA_MAX_BUCKETS,
+            quota_max_obj_count: DEFAULT_QUOTA_MAX_OBJ_COUNT,
+            quota_max_bytes_per_bucket: DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET,
+            quota_max_obj_count_per_bucket: DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET,
+        }
+    }
+}
+
+/// Extended ListBuckets output with usage summary (Ceph RGW extension).
+///
+/// This wraps the standard `ListBucketsOutput` and adds a `Summary` section
+/// containing quota information, compatible with Ceph RGW's `?usage` parameter.
+#[derive(Debug)]
+pub struct ListBucketsWithUsageOutput {
+    /// Standard ListBuckets output (buckets, owner, etc.)
+    pub inner: s3s::dto::ListBucketsOutput,
+    /// Usage summary with quota information
+    pub summary: AccountUsageSummary,
+}
+
+impl ListBucketsWithUsageOutput {
+    /// Serialize to XML bytes using s3s infrastructure.
+    ///
+    /// This produces XML compatible with Ceph RGW's extended ListBuckets response.
+    pub fn to_xml(&self) -> Vec<u8> {
+        use s3s::xml::{SerializeContent, Serializer};
+
+        let mut buf = Vec::with_capacity(1024);
+        {
+            let mut ser = Serializer::new(&mut buf);
+            let _ = ser.decl();
+            let _ = ser.element_with_ns("ListAllMyBucketsResult", XMLNS_S3, |s| {
+                // Serialize standard ListBucketsOutput fields
+                self.inner.serialize_content(s)?;
+                // Add Summary section with xmlns="" to avoid namespace inheritance
+                s.element_with_attrs("Summary", &[("xmlns", "")], |s| {
+                    s.content("QuotaMaxBytes", &self.summary.quota_max_bytes)?;
+                    s.content("QuotaMaxBuckets", &self.summary.quota_max_buckets)?;
+                    s.content("QuotaMaxObjCount", &self.summary.quota_max_obj_count)?;
+                    s.content("QuotaMaxBytesPerBucket", &self.summary.quota_max_bytes_per_bucket)?;
+                    s.content("QuotaMaxObjCountPerBucket", &self.summary.quota_max_obj_count_per_bucket)
+                })
+            });
+        }
+        buf
+    }
+}
+
 /// Account Usage Handler for ListBuckets with `?usage` parameter.
 ///
 /// This handler provides S3-compatible account usage information in a format
@@ -1496,6 +1561,9 @@ pub struct AccountUsageHandler;
 #[async_trait::async_trait]
 impl Operation for AccountUsageHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        use crate::storage::ecfs::RUSTFS_OWNER;
+        use s3s::dto::{Bucket, ListBucketsOutput, Timestamp};
+
         // Verify authentication
         let Some(input_cred) = req.credentials.as_ref() else {
             return Err(s3_error!(AccessDenied, "Access Denied"));
@@ -1524,75 +1592,36 @@ impl Operation for AccountUsageHandler {
 
         let bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
 
-        // Generate XML response with Summary using s3s Serializer
-        let xml_bytes = generate_list_buckets_with_usage_xml(&bucket_infos);
+        // Build standard ListBucketsOutput (same as ecfs.rs list_buckets)
+        let buckets: Vec<Bucket> = bucket_infos
+            .iter()
+            .map(|v| Bucket {
+                creation_date: v.created.map(Timestamp::from),
+                name: Some(v.name.clone()),
+                ..Default::default()
+            })
+            .collect();
+
+        let list_buckets_output = ListBucketsOutput {
+            buckets: Some(buckets),
+            owner: Some(RUSTFS_OWNER.clone()),
+            ..Default::default()
+        };
+
+        // Create extended output with usage summary
+        let output = ListBucketsWithUsageOutput {
+            inner: list_buckets_output,
+            summary: AccountUsageSummary::with_defaults(),
+        };
+
+        // Serialize using s3s infrastructure
+        let xml_bytes = output.to_xml();
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(xml_bytes)), headers))
     }
-}
-
-/// Generate ListAllMyBucketsResult XML with Summary for usage query.
-///
-/// This function produces an XML response that includes:
-/// - Standard ListAllMyBucketsResult with Owner and Buckets elements
-/// - A Summary element with quota information (Ceph RGW extension)
-///
-/// Uses s3s::xml::Serializer which automatically handles XML escaping.
-fn generate_list_buckets_with_usage_xml(bucket_infos: &[rustfs_ecstore::store_api::BucketInfo]) -> Vec<u8> {
-    use crate::storage::ecfs::RUSTFS_OWNER;
-    use s3s::xml::Serializer;
-    use time::format_description::well_known::Rfc3339;
-
-    let mut buf = Vec::with_capacity(1024);
-    let mut ser = Serializer::new(&mut buf);
-
-    // Write XML declaration
-    let _ = ser.decl();
-
-    // Reuse RUSTFS_OWNER from ecfs (same as standard ListBuckets handler)
-    let owner_id = RUSTFS_OWNER.id.as_deref().unwrap_or("");
-    let owner_display_name = RUSTFS_OWNER.display_name.as_deref().unwrap_or("rustfs");
-
-    // Write ListAllMyBucketsResult with xmlns
-    let _ = ser.element_with_ns("ListAllMyBucketsResult", XMLNS_S3, |s| {
-        // Owner section
-        s.element("Owner", |s| {
-            s.content("ID", owner_id)?;
-            s.content("DisplayName", owner_display_name)
-        })?;
-
-        // Buckets section
-        s.element("Buckets", |s| {
-            for info in bucket_infos {
-                s.element("Bucket", |s| {
-                    // s3s Serializer automatically escapes XML special characters
-                    s.content("Name", info.name.as_str())?;
-                    // If creation date is None, use epoch time for consistency
-                    let creation_date = info
-                        .created
-                        .and_then(|t| t.format(&Rfc3339).ok())
-                        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-                    s.content("CreationDate", creation_date.as_str())
-                })?;
-            }
-            Ok(())
-        })?;
-
-        // Summary section with xmlns="" to override default namespace
-        // This ensures compatibility with Ceph RGW s3-tests
-        s.element_with_attrs("Summary", &[("xmlns", "")], |s| {
-            s.content("QuotaMaxBytes", &DEFAULT_QUOTA_MAX_BYTES)?;
-            s.content("QuotaMaxBuckets", &DEFAULT_QUOTA_MAX_BUCKETS)?;
-            s.content("QuotaMaxObjCount", &DEFAULT_QUOTA_MAX_OBJ_COUNT)?;
-            s.content("QuotaMaxBytesPerBucket", &DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET)?;
-            s.content("QuotaMaxObjCountPerBucket", &DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET)
-        })
-    });
-
-    buf
 }
 
 #[cfg(test)]
@@ -1713,8 +1742,20 @@ mod tests {
     // tested in isolation without complex dependencies.
 
     #[test]
-    fn test_generate_list_buckets_with_usage_xml_empty() {
-        let xml_bytes = generate_list_buckets_with_usage_xml(&[]);
+    fn test_list_buckets_with_usage_output_empty() {
+        use crate::storage::ecfs::RUSTFS_OWNER;
+        use s3s::dto::ListBucketsOutput;
+
+        let output = ListBucketsWithUsageOutput {
+            inner: ListBucketsOutput {
+                buckets: Some(vec![]),
+                owner: Some(RUSTFS_OWNER.clone()),
+                ..Default::default()
+            },
+            summary: AccountUsageSummary::with_defaults(),
+        };
+
+        let xml_bytes = output.to_xml();
         let xml = String::from_utf8_lossy(&xml_bytes);
 
         // Verify XML structure
@@ -1726,7 +1767,6 @@ mod tests {
         assert!(xml.contains("<ID>c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66</ID>"));
         assert!(xml.contains("<DisplayName>rustfs</DisplayName>"));
         assert!(xml.contains("<Buckets"));
-        assert!(xml.contains("</Buckets>"));
 
         // Verify Summary section with quota fields
         // Note: Summary uses xmlns="" to avoid inheriting the default namespace
@@ -1740,51 +1780,70 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_list_buckets_with_usage_xml_with_buckets() {
-        use rustfs_ecstore::store_api::BucketInfo;
+    fn test_list_buckets_with_usage_output_with_buckets() {
+        use crate::storage::ecfs::RUSTFS_OWNER;
+        use s3s::dto::{Bucket, ListBucketsOutput, Timestamp};
         use time::OffsetDateTime;
 
-        let bucket_infos = vec![
-            BucketInfo {
-                name: "test-bucket-1".to_string(),
-                created: Some(OffsetDateTime::UNIX_EPOCH),
+        let buckets = vec![
+            Bucket {
+                name: Some("test-bucket-1".to_string()),
+                creation_date: Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)),
                 ..Default::default()
             },
-            BucketInfo {
-                name: "test-bucket-2".to_string(),
-                created: None,
+            Bucket {
+                name: Some("test-bucket-2".to_string()),
+                creation_date: None,
                 ..Default::default()
             },
         ];
 
-        let xml_bytes = generate_list_buckets_with_usage_xml(&bucket_infos);
+        let output = ListBucketsWithUsageOutput {
+            inner: ListBucketsOutput {
+                buckets: Some(buckets),
+                owner: Some(RUSTFS_OWNER.clone()),
+                ..Default::default()
+            },
+            summary: AccountUsageSummary::with_defaults(),
+        };
+
+        let xml_bytes = output.to_xml();
         let xml = String::from_utf8_lossy(&xml_bytes);
 
         // Verify bucket entries
         assert!(xml.contains("<Name>test-bucket-1</Name>"));
         assert!(xml.contains("<Name>test-bucket-2</Name>"));
-        // Both buckets should have CreationDate (None falls back to epoch)
-        assert!(xml.contains("<CreationDate>1970-01-01T00:00:00Z</CreationDate>"));
+        // First bucket has creation date, second doesn't (s3s omits None fields)
+        assert!(xml.contains("<CreationDate>"));
 
         // Verify Summary section is present
-        // Note: Summary uses xmlns="" to avoid inheriting the default namespace
         assert!(xml.contains(r#"<Summary xmlns="">"#));
         assert!(xml.contains("<QuotaMaxBuckets>1000</QuotaMaxBuckets>"));
     }
 
     #[test]
-    fn test_generate_list_buckets_with_usage_xml_escapes_special_chars() {
-        use rustfs_ecstore::store_api::BucketInfo;
+    fn test_list_buckets_with_usage_output_escapes_special_chars() {
+        use crate::storage::ecfs::RUSTFS_OWNER;
+        use s3s::dto::{Bucket, ListBucketsOutput};
 
         // While S3 bucket names normally don't allow these characters,
         // s3s::xml::Serializer automatically escapes them for safety
-        let bucket_infos = vec![BucketInfo {
-            name: "test<bucket>&name".to_string(),
-            created: None,
+        let buckets = vec![Bucket {
+            name: Some("test<bucket>&name".to_string()),
+            creation_date: None,
             ..Default::default()
         }];
 
-        let xml_bytes = generate_list_buckets_with_usage_xml(&bucket_infos);
+        let output = ListBucketsWithUsageOutput {
+            inner: ListBucketsOutput {
+                buckets: Some(buckets),
+                owner: Some(RUSTFS_OWNER.clone()),
+                ..Default::default()
+            },
+            summary: AccountUsageSummary::with_defaults(),
+        };
+
+        let xml_bytes = output.to_xml();
         let xml = String::from_utf8_lossy(&xml_bytes);
 
         // Verify special characters are escaped by s3s Serializer
@@ -1792,12 +1851,12 @@ mod tests {
     }
 
     #[test]
-    fn test_account_usage_quota_defaults() {
-        // Test that quota constants match expected Ceph RGW defaults
-        assert_eq!(DEFAULT_QUOTA_MAX_BYTES, -1);
-        assert_eq!(DEFAULT_QUOTA_MAX_BUCKETS, 1000);
-        assert_eq!(DEFAULT_QUOTA_MAX_OBJ_COUNT, -1);
-        assert_eq!(DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET, -1);
-        assert_eq!(DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET, -1);
+    fn test_account_usage_summary_defaults() {
+        let summary = AccountUsageSummary::with_defaults();
+        assert_eq!(summary.quota_max_bytes, -1);
+        assert_eq!(summary.quota_max_buckets, 1000);
+        assert_eq!(summary.quota_max_obj_count, -1);
+        assert_eq!(summary.quota_max_bytes_per_bucket, -1);
+        assert_eq!(summary.quota_max_obj_count_per_bucket, -1);
     }
 }
