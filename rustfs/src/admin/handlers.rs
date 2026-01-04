@@ -1478,12 +1478,32 @@ impl Operation for ProfileStatusHandler {
 /// S3 XML namespace constant
 const XMLNS_S3: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
+/// Static owner ID (consistent with standard ListBuckets handler)
+const RUSTFS_OWNER_ID: &str = "c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66";
+const RUSTFS_OWNER_DISPLAY_NAME: &str = "rustfs";
+
 /// Default quota values (matching Ceph RGW defaults)
 const DEFAULT_QUOTA_MAX_BYTES: i64 = -1;
 const DEFAULT_QUOTA_MAX_BUCKETS: i64 = 1000;
 const DEFAULT_QUOTA_MAX_OBJ_COUNT: i64 = -1;
 const DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET: i64 = -1;
 const DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET: i64 = -1;
+
+/// Escape XML special characters to prevent XML injection.
+fn xml_escape(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
 
 /// Account Usage Handler for ListBuckets with `?usage` parameter.
 ///
@@ -1497,10 +1517,25 @@ pub struct AccountUsageHandler;
 impl Operation for AccountUsageHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         // Verify authentication
-        let cred = req
-            .credentials
-            .as_ref()
-            .ok_or_else(|| s3_error!(AccessDenied, "Access Denied"))?;
+        let Some(input_cred) = req.credentials.as_ref() else {
+            return Err(s3_error!(AccessDenied, "Access Denied"));
+        };
+
+        // Validate credentials and check if owner
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        // Authorize request for ListAllMyBuckets action
+        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::S3Action(S3Action::ListAllMyBucketsAction)],
+            remote_addr,
+        )
+        .await?;
 
         // Get bucket list from storage
         let Some(store) = new_object_layer_fn() else {
@@ -1510,7 +1545,7 @@ impl Operation for AccountUsageHandler {
         let bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
 
         // Generate XML response with Summary
-        let xml = generate_list_buckets_with_usage_xml(&bucket_infos, &cred.access_key);
+        let xml = generate_list_buckets_with_usage_xml(&bucket_infos);
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
@@ -1524,21 +1559,24 @@ impl Operation for AccountUsageHandler {
 /// This function produces an XML response that includes:
 /// - Standard ListAllMyBucketsResult with Owner and Buckets elements
 /// - A Summary element with quota information (Ceph RGW extension)
-fn generate_list_buckets_with_usage_xml(bucket_infos: &[rustfs_ecstore::store_api::BucketInfo], owner_id: &str) -> String {
+///
+/// All dynamic content is properly XML-escaped to prevent injection.
+fn generate_list_buckets_with_usage_xml(bucket_infos: &[rustfs_ecstore::store_api::BucketInfo]) -> String {
     use time::format_description::well_known::Rfc3339;
 
     let mut buckets_xml = String::new();
     for info in bucket_infos {
-        let creation_date = info.created.and_then(|t| t.format(&Rfc3339).ok()).unwrap_or_default();
+        let escaped_name = xml_escape(&info.name);
+        // If creation date is None, use epoch time for consistency
+        let creation_date = info
+            .created
+            .and_then(|t| t.format(&Rfc3339).ok())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
         buckets_xml.push_str(&format!(
             "        <Bucket>\n            <Name>{}</Name>\n            <CreationDate>{}</CreationDate>\n        </Bucket>\n",
-            info.name, creation_date
+            escaped_name, creation_date
         ));
     }
-
-    // Calculate owner ID hash (similar to how AWS/Ceph does it)
-    let owner_display_name = "rustfs";
-    let owner_id_hash = format!("{:x}", md5::compute(owner_id.as_bytes()));
 
     // Note: The Summary element uses xmlns="" to override the default namespace
     // This ensures compatibility with Ceph RGW s3-tests which expect Summary
@@ -1547,7 +1585,7 @@ fn generate_list_buckets_with_usage_xml(bucket_infos: &[rustfs_ecstore::store_ap
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListAllMyBucketsResult xmlns="{xmlns}">
     <Owner>
-        <ID>{owner_id_hash}</ID>
+        <ID>{owner_id}</ID>
         <DisplayName>{owner_display_name}</DisplayName>
     </Owner>
     <Buckets>
@@ -1561,8 +1599,8 @@ fn generate_list_buckets_with_usage_xml(bucket_infos: &[rustfs_ecstore::store_ap
     </Summary>
 </ListAllMyBucketsResult>"#,
         xmlns = XMLNS_S3,
-        owner_id_hash = owner_id_hash,
-        owner_display_name = owner_display_name,
+        owner_id = RUSTFS_OWNER_ID,
+        owner_display_name = RUSTFS_OWNER_DISPLAY_NAME,
         buckets_xml = buckets_xml,
         quota_max_bytes = DEFAULT_QUOTA_MAX_BYTES,
         quota_max_buckets = DEFAULT_QUOTA_MAX_BUCKETS,
@@ -1691,14 +1729,15 @@ mod tests {
 
     #[test]
     fn test_generate_list_buckets_with_usage_xml_empty() {
-        let xml = generate_list_buckets_with_usage_xml(&[], "testuser");
+        let xml = generate_list_buckets_with_usage_xml(&[]);
 
         // Verify XML structure
         assert!(xml.contains("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
         assert!(xml.contains("<ListAllMyBucketsResult"));
         assert!(xml.contains("xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\""));
         assert!(xml.contains("<Owner>"));
-        assert!(xml.contains("<ID>"));
+        // Verify consistent owner ID (same as standard ListBuckets handler)
+        assert!(xml.contains("<ID>c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66</ID>"));
         assert!(xml.contains("<DisplayName>rustfs</DisplayName>"));
         assert!(xml.contains("<Buckets>"));
         assert!(xml.contains("</Buckets>"));
@@ -1732,17 +1771,49 @@ mod tests {
             },
         ];
 
-        let xml = generate_list_buckets_with_usage_xml(&bucket_infos, "testuser");
+        let xml = generate_list_buckets_with_usage_xml(&bucket_infos);
 
         // Verify bucket entries
         assert!(xml.contains("<Name>test-bucket-1</Name>"));
         assert!(xml.contains("<Name>test-bucket-2</Name>"));
+        // Both buckets should have CreationDate (None falls back to epoch)
         assert!(xml.contains("<CreationDate>1970-01-01T00:00:00Z</CreationDate>"));
 
         // Verify Summary section is present
         // Note: Summary uses xmlns="" to avoid inheriting the default namespace
         assert!(xml.contains(r#"<Summary xmlns="">"#));
         assert!(xml.contains("<QuotaMaxBuckets>1000</QuotaMaxBuckets>"));
+    }
+
+    #[test]
+    fn test_xml_escape() {
+        // Test basic escaping
+        assert_eq!(xml_escape("hello"), "hello");
+        assert_eq!(xml_escape("a&b"), "a&amp;b");
+        assert_eq!(xml_escape("<test>"), "&lt;test&gt;");
+        assert_eq!(xml_escape("\"quoted\""), "&quot;quoted&quot;");
+        assert_eq!(xml_escape("it's"), "it&apos;s");
+
+        // Test combined special characters
+        assert_eq!(xml_escape("<a&b>"), "&lt;a&amp;b&gt;");
+    }
+
+    #[test]
+    fn test_generate_list_buckets_with_usage_xml_escapes_special_chars() {
+        use rustfs_ecstore::store_api::BucketInfo;
+
+        // While S3 bucket names normally don't allow these characters,
+        // we should still escape them for safety
+        let bucket_infos = vec![BucketInfo {
+            name: "test<bucket>&name".to_string(),
+            created: None,
+            ..Default::default()
+        }];
+
+        let xml = generate_list_buckets_with_usage_xml(&bucket_infos);
+
+        // Verify special characters are escaped
+        assert!(xml.contains("<Name>test&lt;bucket&gt;&amp;name</Name>"));
     }
 
     #[test]

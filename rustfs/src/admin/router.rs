@@ -33,6 +33,22 @@ use s3s::s3_error;
 use tower::Service;
 use tracing::error;
 
+/// Check if the URI has a `usage` query parameter.
+///
+/// This function performs a precise check to ensure only requests with the exact
+/// `usage` parameter are matched, avoiding false positives like `?foo=usage` or
+/// `?usage_stats=true`.
+fn has_usage_query_param(uri: &Uri) -> bool {
+    uri.query()
+        .map(|q| {
+            q.split('&').any(|pair| match pair.split_once('=') {
+                Some((name, _)) => name == "usage",
+                None => pair == "usage",
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub struct S3Router<T> {
     router: Router<T>,
     console_enabled: bool,
@@ -108,7 +124,7 @@ where
         }
 
         // Account usage: ListBuckets with ?usage parameter (Ceph RGW extension)
-        if method == Method::GET && path == "/" && uri.query().map(|q| q.contains("usage")).unwrap_or(false) {
+        if method == Method::GET && path == "/" && has_usage_query_param(uri) {
             return true;
         }
 
@@ -169,10 +185,7 @@ where
         }
 
         // Handle ListBuckets with ?usage parameter using a special route key
-        let uri = if req.method == Method::GET
-            && req.uri.path() == "/"
-            && req.uri.query().map(|q| q.contains("usage")).unwrap_or(false)
-        {
+        let uri = if req.method == Method::GET && req.uri.path() == "/" && has_usage_query_param(&req.uri) {
             // Use a special route key for account usage requests
             format!("{}|/?usage", &req.method)
         } else {
