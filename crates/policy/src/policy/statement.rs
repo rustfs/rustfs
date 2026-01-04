@@ -107,23 +107,30 @@ impl Statement {
                 break 'c self.conditions.evaluate_with_resolver(args.conditions, Some(&resolver)).await;
             }
 
-            if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions).await {
-                break 'c false;
-            }
-
-            if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions).await {
-                break 'c false;
-            }
-
-            if !self
-                .resources
-                .is_match_with_resolver(&resource, args.conditions, Some(&resolver))
-                .await
+            if self.resources.is_empty()
+                && self.not_resources.is_empty()
                 && !self.is_admin()
                 && !self.is_sts()
             {
                 break 'c false;
             }
+
+            if !self.resources.is_empty()
+                && !self.resources.is_match_with_resolver(&resource, args.conditions, Some(&resolver)).await
+                && !self.is_admin()
+                && !self.is_sts()
+            {
+                break 'c false;
+            }
+
+            if !self.not_resources.is_empty()
+                && self.not_resources.is_match_with_resolver(&resource, args.conditions, Some(&resolver)).await
+                && !self.is_admin()
+                && !self.is_sts()
+            {
+                break 'c false;
+            }
+
 
             self.conditions.evaluate_with_resolver(args.conditions, Some(&resolver)).await
         };
