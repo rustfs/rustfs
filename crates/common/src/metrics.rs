@@ -18,6 +18,7 @@ use rustfs_madmin::metrics::ScannerMetrics as M_ScannerMetrics;
 use std::{
     collections::HashMap,
     fmt::Display,
+    future::Future,
     pin::Pin,
     sync::{
         Arc, OnceLock,
@@ -115,7 +116,7 @@ pub enum Metric {
 
 impl Metric {
     /// Convert to string representation for metrics
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::ReadMetadata => "read_metadata",
             Self::CheckMissing => "check_missing",
@@ -460,6 +461,11 @@ impl Metrics {
             metrics.current_started = cycle.started;
         }
 
+        // Replace default start time with global init time if it's the placeholder
+        if let Some(init_time) = crate::get_global_init_time().await {
+            metrics.current_started = init_time;
+        }
+
         metrics.collected_at = Utc::now();
         metrics.active_paths = self.get_current_paths().await;
 
@@ -489,8 +495,8 @@ impl Metrics {
 }
 
 // Type aliases for compatibility with existing code
-pub type UpdateCurrentPathFn = Arc<dyn Fn(&str) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
-pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+pub type UpdateCurrentPathFn = Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Create a current path updater for tracking scan progress
 pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
@@ -506,7 +512,7 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
 
     let update_fn = {
         let tracker = Arc::clone(&tracker);
-        Arc::new(move |path: &str| -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Arc::new(move |path: &str| -> Pin<Box<dyn Future<Output = ()> + Send>> {
             let tracker = Arc::clone(&tracker);
             let path = path.to_string();
             Box::pin(async move {
@@ -517,7 +523,7 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
 
     let done_fn = {
         let disk_name = disk_name.clone();
-        Arc::new(move || -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Arc::new(move || -> Pin<Box<dyn Future<Output = ()> + Send>> {
             let disk_name = disk_name.clone();
             Box::pin(async move {
                 global_metrics().current_paths.write().await.remove(&disk_name);
