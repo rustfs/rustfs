@@ -454,58 +454,28 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
-        let head_input = GetObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object_key.clone())
+        let mut builder = GetObjectInput::builder();
+        builder.set_bucket(bucket);
+        builder.set_key(object_key);
+
+        if start_pos > 0
+            && let Ok(range) = s3s::dto::Range::parse(&format!("bytes={}-", start_pos))
+        {
+            builder.set_range(Some(range));
+        }
+
+        let input = builder
             .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build GetObjectInput"))?;
 
-        match s3_client.get_object(head_input).await {
-            Ok(head_output) => {
-                let file_size = head_output.content_length.unwrap_or(0) as u64;
-
-                if start_pos >= file_size {
-                    let empty_reader = tokio::io::empty();
-                    return Ok(Box::new(empty_reader) as Box<dyn AsyncRead + Send + Sync + Unpin>);
-                }
-
-                let range_end = file_size - 1;
-                let input = if start_pos > 0 {
-                    let mut builder = GetObjectInput::builder();
-                    builder.set_bucket(bucket);
-                    builder.set_key(object_key);
-
-                    if let Ok(range) = s3s::dto::Range::parse(&format!("bytes={}-{}", start_pos, range_end)) {
-                        builder.set_range(Some(range));
-                    }
-
-                    builder
-                        .build()
-                        .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build GetObjectInput"))?
+        match s3_client.get_object(input).await {
+            Ok(output) => {
+                if let Some(body) = output.body {
+                    let stream = body.map_err(std::io::Error::other);
+                    let reader = StreamReader::new(stream);
+                    Ok(Box::new(reader))
                 } else {
-                    let mut builder = GetObjectInput::builder();
-                    builder.set_bucket(bucket);
-                    builder.set_key(object_key);
-
-                    builder
-                        .build()
-                        .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build GetObjectInput"))?
-                };
-
-                match s3_client.get_object(input).await {
-                    Ok(output) => {
-                        if let Some(body) = output.body {
-                            let stream = body.map_err(std::io::Error::other);
-                            let reader = StreamReader::new(stream);
-                            Ok(Box::new(reader))
-                        } else {
-                            Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Empty object body"))
-                        }
-                    }
-                    Err(e) => {
-                        let protocol_error = map_s3_error_to_ftps(&e);
-                        Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
-                    }
+                    Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Empty object body"))
                 }
             }
             Err(e) => {

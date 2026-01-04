@@ -21,6 +21,7 @@ use futures::TryStreamExt;
 use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version};
 use russh_sftp::server::Handler;
 use rustfs_utils::path;
+use s3s::S3ErrorCode;
 use s3s::dto::{DeleteBucketInput, DeleteObjectInput, GetObjectInput, ListObjectsV2Input, PutObjectInput, StreamingBlob};
 use std::collections::HashMap;
 use std::future::Future;
@@ -426,49 +427,32 @@ impl Handler for SftpHandler {
             let s3_client = this.create_s3_client();
             let range_end = offset + (len as u64) - 1;
 
-            // First get file metadata to check size
-            let head_input = GetObjectInput::builder()
-                .bucket(bucket.clone())
-                .key(key.clone())
-                .build()
-                .map_err(|_| StatusCode::Failure)?;
+            let mut builder = GetObjectInput::builder();
+            builder.set_bucket(bucket);
+            builder.set_key(key);
 
-            match s3_client.get_object(head_input).await {
-                Ok(head_output) => {
-                    let file_size = head_output.content_length.unwrap_or(0) as u64;
+            if offset > 0
+                && let Ok(range) = s3s::dto::Range::parse(&format!("bytes={}-{}", offset, range_end))
+            {
+                builder.set_range(Some(range));
+            }
 
-                    if offset >= file_size {
-                        return Err(StatusCode::Eof);
+            let input = builder.build().map_err(|_| StatusCode::Failure)?;
+
+            match s3_client.get_object(input).await {
+                Ok(output) => {
+                    let mut data = Vec::new();
+                    if let Some(body) = output.body {
+                        let stream = body.map_err(std::io::Error::other);
+                        let mut reader = StreamReader::new(stream);
+                        reader.read_to_end(&mut data).await.map_err(|_| StatusCode::Failure)?;
                     }
-
-                    let actual_end = std::cmp::min(range_end, file_size - 1);
-
-                    let mut builder = GetObjectInput::builder();
-                    builder.set_bucket(bucket);
-                    builder.set_key(key);
-
-                    if (offset > 0 || actual_end < range_end)
-                        && let Ok(range) = s3s::dto::Range::parse(&format!("bytes={}-{}", offset, actual_end))
-                    {
-                        builder.set_range(Some(range));
-                    }
-
-                    let input = builder.build().map_err(|_| StatusCode::Failure)?;
-
-                    match s3_client.get_object(input).await {
-                        Ok(output) => {
-                            let mut data = Vec::new();
-                            if let Some(body) = output.body {
-                                let stream = body.map_err(std::io::Error::other);
-                                let mut reader = StreamReader::new(stream);
-                                reader.read_to_end(&mut data).await.map_err(|_| StatusCode::Failure)?;
-                            }
-                            Ok(Data { id, data })
-                        }
-                        Err(e) => Err(map_s3_error_to_sftp_status(&e)),
-                    }
+                    Ok(Data { id, data })
                 }
-                Err(e) => Err(map_s3_error_to_sftp_status(&e)),
+                Err(e) => match e.code() {
+                    S3ErrorCode::InvalidRange => Err(StatusCode::Eof),
+                    _ => Err(map_s3_error_to_sftp_status(&e)),
+                },
             }
         }
     }
