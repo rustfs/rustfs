@@ -18,24 +18,32 @@ use nix::sys::{stat::stat, statfs::statfs};
 use std::io::Error;
 use std::path::Path;
 
+// FreeBSD and OpenBSD return a signed integer for blocks_available.
+// Cast to an unsigned integer to use with DiskInfo.
 #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
 fn blocks_available(stat: &Statfs) -> u64 {
     match stat.blocks_available().try_into() {
         Ok(bavail) => bavail,
-        Err(_e) => 0,
+        Err(e) => {
+            eprintln!("warning: blocks_available returned a negative value: Using 0 as fallback.", e);
+        }
     }
 }
 
+// FreeBSD returns a signed integer for files_free. Cast to an unsigned integer
+// to use with DiskInfo
 #[cfg(target_os = "freebsd")]
-pub fn files_free(stat: &Statfs) -> u64 {
+fn files_free(stat: &Statfs) -> u64 {
     match stat.files_free().try_into() {
         Ok(files_free) => files_free,
-        Err(_e) => 0,
+        Err(e) => {
+            eprintln!("warning: files_free returned a negative value: Using 0 as fallback.", e);
+        }
     }
 }
 
 #[cfg(not(target_os = "freebsd"))]
-pub fn files_free(stat: &Statfs) -> u64 {
+fn files_free(stat: &Statfs) -> u64 {
     stat.files_free()
 }
 
@@ -54,7 +62,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let bavail = blocks_available(&stat);
     let blocks = stat.blocks();
 
-    let reserved = match bfree.checked_sub(bavail.into()) {
+    let reserved = match bfree.checked_sub(bavail) {
         Some(reserved) => reserved,
         None => {
             return Err(Error::other(format!(
