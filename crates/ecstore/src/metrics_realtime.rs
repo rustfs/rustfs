@@ -112,7 +112,10 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
 
     if types.contains(&MetricType::SCANNER) {
         debug!("start get scanner metrics");
-        let metrics = global_metrics().report().await;
+        let mut metrics = global_metrics().report().await;
+        if let Some(init_time) = rustfs_common::get_global_init_time().await {
+            metrics.current_started = init_time;
+        }
         real_time_metrics.aggregated.scanner = Some(metrics);
     }
 

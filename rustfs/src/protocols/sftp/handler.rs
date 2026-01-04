@@ -21,6 +21,7 @@ use futures::TryStreamExt;
 use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version};
 use russh_sftp::server::Handler;
 use rustfs_utils::path;
+use s3s::S3ErrorCode;
 use s3s::dto::{DeleteBucketInput, DeleteObjectInput, GetObjectInput, ListObjectsV2Input, PutObjectInput, StreamingBlob};
 use std::collections::HashMap;
 use std::future::Future;
@@ -30,6 +31,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::fs::{File as TokioFile, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
+use tokio_util::io::StreamReader;
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
@@ -74,24 +76,25 @@ pub struct SftpHandler {
     next_handle_id: Arc<AtomicU32>,
     temp_dir: PathBuf,
     current_dir: Arc<RwLock<String>>,
+    fs: crate::storage::ecfs::FS,
 }
 
 impl SftpHandler {
     pub fn new(session_context: SessionContext) -> Self {
+        let fs = crate::storage::ecfs::FS {};
+
         Self {
             session_context,
             handles: Arc::new(RwLock::new(HashMap::new())),
             next_handle_id: Arc::new(AtomicU32::new(INITIAL_HANDLE_ID)),
             temp_dir: std::env::temp_dir(),
             current_dir: Arc::new(RwLock::new(ROOT_PATH.to_string())),
+            fs,
         }
     }
 
-    fn create_s3_client(&self) -> Result<ProtocolS3Client, StatusCode> {
-        // Create FS instance (empty struct that accesses global ECStore)
-        let fs = crate::storage::ecfs::FS {};
-        let client = ProtocolS3Client::new(fs, self.session_context.access_key().to_string());
-        Ok(client)
+    fn create_s3_client(&self) -> ProtocolS3Client {
+        ProtocolS3Client::new(self.fs.clone(), self.session_context.access_key().to_string())
     }
 
     fn parse_path(&self, path_str: &str) -> Result<(String, Option<String>), StatusCode> {
@@ -188,7 +191,7 @@ impl SftpHandler {
             .await
             .map_err(|_| StatusCode::PermissionDenied)?;
 
-        let s3_client = self.create_s3_client()?;
+        let s3_client = self.create_s3_client();
 
         match action {
             S3Action::HeadBucket => {
@@ -365,13 +368,7 @@ impl Handler for SftpHandler {
                         return Err(StatusCode::Failure);
                     }
 
-                    let s3_client = match this.create_s3_client() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let _ = tokio::fs::remove_file(&temp_file_path).await;
-                            return Err(e);
-                        }
-                    };
+                    let s3_client = this.create_s3_client();
 
                     let stream = tokio_util::io::ReaderStream::new(file);
                     let body = StreamingBlob::wrap(stream);
@@ -427,31 +424,35 @@ impl Handler for SftpHandler {
                 }
             };
 
+            let s3_client = this.create_s3_client();
             let range_end = offset + (len as u64) - 1;
+
             let mut builder = GetObjectInput::builder();
             builder.set_bucket(bucket);
             builder.set_key(key);
-            if let Ok(range) = s3s::dto::Range::parse(&format!("bytes={}-{}", offset, range_end)) {
+
+            if offset > 0
+                && let Ok(range) = s3s::dto::Range::parse(&format!("bytes={}-{}", offset, range_end))
+            {
                 builder.set_range(Some(range));
             }
 
-            let s3_client = this.create_s3_client()?;
             let input = builder.build().map_err(|_| StatusCode::Failure)?;
 
             match s3_client.get_object(input).await {
                 Ok(output) => {
-                    let mut data = Vec::with_capacity(len as usize);
+                    let mut data = Vec::new();
                     if let Some(body) = output.body {
                         let stream = body.map_err(std::io::Error::other);
-                        let mut reader = tokio_util::io::StreamReader::new(stream);
-                        let _ = reader.read_to_end(&mut data).await;
+                        let mut reader = StreamReader::new(stream);
+                        reader.read_to_end(&mut data).await.map_err(|_| StatusCode::Failure)?;
                     }
                     Ok(Data { id, data })
                 }
-                Err(e) => {
-                    debug!("S3 Read failed: {}", e);
-                    Ok(Data { id, data: Vec::new() })
-                }
+                Err(e) => match e.code() {
+                    S3ErrorCode::InvalidRange => Err(StatusCode::Eof),
+                    _ => Err(map_s3_error_to_sftp_status(&e)),
+                },
             }
         }
     }
@@ -538,9 +539,7 @@ impl Handler for SftpHandler {
                     .map_err(|_| StatusCode::PermissionDenied)?;
 
                 // List all buckets
-                let s3_client = this.create_s3_client().inspect_err(|&e| {
-                    error!("SFTP Opendir - failed to create S3 client: {}", e);
-                })?;
+                let s3_client = this.create_s3_client();
 
                 let input = s3s::dto::ListBucketsInput::builder()
                     .build()
@@ -604,7 +603,7 @@ impl Handler for SftpHandler {
             }
             builder.set_delimiter(Some("/".to_string()));
 
-            let s3_client = this.create_s3_client()?;
+            let s3_client = this.create_s3_client();
             let input = builder.build().map_err(|_| StatusCode::Failure)?;
 
             let mut files = Vec::new();
@@ -721,7 +720,7 @@ impl Handler for SftpHandler {
                     ..Default::default()
                 };
 
-                let s3_client = this.create_s3_client()?;
+                let s3_client = this.create_s3_client();
                 s3_client.delete_object(input).await.map_err(|e| {
                     error!("SFTP REMOVE - failed to delete object: {}", e);
                     StatusCode::Failure
@@ -742,7 +741,7 @@ impl Handler for SftpHandler {
                     .await
                     .map_err(|_| StatusCode::PermissionDenied)?;
 
-                let s3_client = this.create_s3_client()?;
+                let s3_client = this.create_s3_client();
 
                 // Check if bucket is empty
                 let list_input = ListObjectsV2Input {
@@ -818,7 +817,7 @@ impl Handler for SftpHandler {
                     .await
                     .map_err(|_| StatusCode::PermissionDenied)?;
 
-                let s3_client = this.create_s3_client()?;
+                let s3_client = this.create_s3_client();
                 let empty_stream = futures::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
                 let body = StreamingBlob::wrap(empty_stream);
                 let input = PutObjectInput {
@@ -854,7 +853,7 @@ impl Handler for SftpHandler {
                     .await
                     .map_err(|_| StatusCode::PermissionDenied)?;
 
-                let s3_client = this.create_s3_client()?;
+                let s3_client = this.create_s3_client();
                 let input = s3s::dto::CreateBucketInput {
                     bucket,
                     ..Default::default()

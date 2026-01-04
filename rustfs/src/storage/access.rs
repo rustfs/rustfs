@@ -37,7 +37,7 @@ pub(crate) struct ReqInfo {
 
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
-    let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
 
     let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
 

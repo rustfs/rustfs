@@ -145,13 +145,8 @@ impl Policy {
 
     pub fn parse_config(data: &[u8]) -> Result<Policy> {
         let policy: Policy = serde_json::from_slice(data)?;
-        match policy.validate() {
-            Ok(_) => Ok(policy),
-            Err(e) => {
-                error!("parse policy error: {}", e);
-                Err(Error::other(e))
-            }
-        }
+        policy.validate()?;
+        Ok(policy)
     }
 }
 
