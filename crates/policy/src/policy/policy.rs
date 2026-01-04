@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 /// DEFAULT_VERSION is the default version.
 /// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_version.html
 pub const DEFAULT_VERSION: &str = "2012-10-17";
-use tracing::error;
+
 /// check the data is Validator
 pub trait Validator {
     type Error;
@@ -565,6 +565,29 @@ mod test {
         assert!(!p2.statements.is_empty());
         assert!(!p2.statements[0].actions.is_empty());
         assert!(!p2.statements[0].resources.is_empty());
+
+        // Verify that both formats produce equivalent results
+        assert_eq!(
+            p.statements.len(),
+            p2.statements.len(),
+            "Both policies should have the same number of statements"
+        );
+        assert_eq!(
+            p.statements[0].actions, p2.statements[0].actions,
+            "ActionSet from string format should equal ActionSet from array format"
+        );
+        assert_eq!(
+            p.statements[0].resources, p2.statements[0].resources,
+            "ResourceSet from string format should equal ResourceSet from array format"
+        );
+        assert_eq!(
+            p.statements[0].effect, p2.statements[0].effect,
+            "Effect should be the same in both formats"
+        );
+
+        // Verify specific content
+        assert_eq!(p.statements[0].actions.len(), 1, "ActionSet should contain exactly one action");
+        assert_eq!(p.statements[0].resources.len(), 1, "ResourceSet should contain exactly one resource");
 
         Ok(())
     }
