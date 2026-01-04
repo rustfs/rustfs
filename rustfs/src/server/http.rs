@@ -177,6 +177,9 @@ pub async fn start_http_server(
         TcpListener::from_std(socket.into())?
     };
 
+    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
+    let tls_enabled = tls_acceptor.is_some();
+    let protocol = if tls_enabled { "https" } else { "http" };
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
     let local_ip = match rustfs_utils::get_local_ip() {
@@ -186,11 +189,15 @@ pub async fn start_http_server(
             local_addr.ip()
         }
     };
-    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
-    let tls_enabled = tls_acceptor.is_some();
-    let protocol = if tls_enabled { "https" } else { "http" };
+
+    let local_ip_str = if local_ip.is_ipv6() {
+        format!("[{local_ip}]")
+    } else {
+        local_ip.to_string()
+    };
+
     // Detailed endpoint information (showing all API endpoints)
-    let api_endpoints = format!("{protocol}://{local_ip}:{server_port}");
+    let api_endpoints = format!("{protocol}://{local_ip_str}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
     let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     if opt.console_enable {
@@ -198,7 +205,7 @@ pub async fn start_http_server(
 
         info!(
             target: "rustfs::console::startup",
-            "Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html"
+            "Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html"
         );
         info!(
             target: "rustfs::console::startup",
@@ -207,7 +214,7 @@ pub async fn start_http_server(
         );
 
         println!("Console WebUI Start Time: {now_time}");
-        println!("Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html");
+        println!("Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html");
         println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
     } else {
         info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
