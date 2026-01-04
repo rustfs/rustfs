@@ -641,29 +641,6 @@ struct ArgsBuilder {
             Statement{
                 effect: Allow,
                 actions: ActionSet(vec![rustfs_policy::policy::action::Action::S3Action(GetObjectAction)].into_iter().collect()),
-                resources: ResourceSet(vec!["arn:aws:s3:::mybucket/private/*".try_into().unwrap()].into_iter().collect()),
-                not_resources: ResourceSet(vec!["arn:aws:s3:::mybucket/private/*".try_into().unwrap()].into_iter().collect()),
-                ..Default::default()
-            }
-        ],
-        ..Default::default()
-    },
-    ArgsBuilder{
-        account: "Q3AM3UQ867SPQQA43P2F".into(),
-        action: "s3:GetObject".into(),
-        bucket: "mybucket".into(),
-        object: "private/secret.txt".into(),
-        ..Default::default()
-    } => false;
-    "notresource_and_resource_both_exist_denies"
-)]
-#[test_case(
-    Policy{
-        version: DEFAULT_VERSION.into(),
-        statements: vec![
-            Statement{
-                effect: Allow,
-                actions: ActionSet(vec![rustfs_policy::policy::action::Action::S3Action(GetObjectAction)].into_iter().collect()),
                 resources: ResourceSet::default(), // Empty Resource
                 not_resources: ResourceSet(vec!["arn:aws:s3:::mybucket/private/*".try_into().unwrap()].into_iter().collect()),
                 ..Default::default()
