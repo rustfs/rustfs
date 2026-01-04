@@ -44,31 +44,33 @@ enum AwsValues {
     Multiple(HashSet<String>),
 }
 
-impl From<PrincipalFormat> for Principal {
-    fn from(format: PrincipalFormat) -> Self {
-        match format {
-            PrincipalFormat::Wildcard(s) if s == "*" => Principal {
-                aws: vec!["*".to_string()].into_iter().collect(),
-            },
-            PrincipalFormat::AwsObject(obj) => {
-                let aws = match obj.aws {
-                    AwsValues::Single(s) => vec![s].into_iter().collect(),
-                    AwsValues::Multiple(set) => set,
-                };
-                Principal { aws }
-            }
-            _ => Principal::default(),
-        }
-    }
-}
-
 impl<'de> serde::Deserialize<'de> for Principal {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let format = PrincipalFormat::deserialize(deserializer)?;
-        Ok(format.into())
+        match format {
+            PrincipalFormat::Wildcard(s) => {
+                if s == "*" {
+                    Ok(Principal {
+                        aws: HashSet::from(["*".to_string()]),
+                    })
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "invalid wildcard principal value: expected \"*\", got \"{}\"",
+                        s
+                    )))
+                }
+            }
+            PrincipalFormat::AwsObject(obj) => {
+                let aws = match obj.aws {
+                    AwsValues::Single(s) => HashSet::from([s]),
+                    AwsValues::Multiple(set) => set,
+                };
+                Ok(Principal { aws })
+            }
+        }
     }
 }
 
@@ -97,10 +99,15 @@ impl Validator for Principal {
 mod test {
     use super::*;
     use serde_json;
+    use test_case::test_case;
 
-    #[test_case::test_case(r#""*""#, true ; "wildcard_string")]
-    #[test_case::test_case(r#"{"AWS": "*"}"#, true ; "aws_object_single_string")]
-    #[test_case::test_case(r#"{"AWS": ["*"]}"#, true ; "aws_object_array")]
+    #[test_case(r#""*""#, true ; "wildcard_string")]
+    #[test_case(r#"{"AWS": "*"}"#, true ; "aws_object_single_string")]
+    #[test_case(r#"{"AWS": ["*"]}"#, true ; "aws_object_array")]
+    #[test_case(r#""invalid""#, false ; "invalid_string")]
+    #[test_case(r#""""#, false ; "empty_string")]
+    #[test_case(r#"{"Other": "*"}"#, false ; "wrong_field")]
+    #[test_case(r#"{}"#, false ; "empty_object")]
     fn test_principal_parsing(json: &str, should_succeed: bool) {
         let result = match serde_json::from_str::<Principal>(json) {
             Ok(principal) => {
