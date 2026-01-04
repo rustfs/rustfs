@@ -1489,22 +1489,6 @@ const DEFAULT_QUOTA_MAX_OBJ_COUNT: i64 = -1;
 const DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET: i64 = -1;
 const DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET: i64 = -1;
 
-/// Escape XML special characters to prevent XML injection.
-fn xml_escape(input: &str) -> String {
-    let mut escaped = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&apos;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
 /// Account Usage Handler for ListBuckets with `?usage` parameter.
 ///
 /// This handler provides S3-compatible account usage information in a format
@@ -1544,13 +1528,13 @@ impl Operation for AccountUsageHandler {
 
         let bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
 
-        // Generate XML response with Summary
-        let xml = generate_list_buckets_with_usage_xml(&bucket_infos);
+        // Generate XML response with Summary using s3s Serializer
+        let xml_bytes = generate_list_buckets_with_usage_xml(&bucket_infos);
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(xml)), headers))
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(xml_bytes)), headers))
     }
 }
 
@@ -1560,54 +1544,54 @@ impl Operation for AccountUsageHandler {
 /// - Standard ListAllMyBucketsResult with Owner and Buckets elements
 /// - A Summary element with quota information (Ceph RGW extension)
 ///
-/// All dynamic content is properly XML-escaped to prevent injection.
-fn generate_list_buckets_with_usage_xml(bucket_infos: &[rustfs_ecstore::store_api::BucketInfo]) -> String {
+/// Uses s3s::xml::Serializer which automatically handles XML escaping.
+fn generate_list_buckets_with_usage_xml(bucket_infos: &[rustfs_ecstore::store_api::BucketInfo]) -> Vec<u8> {
+    use s3s::xml::Serializer;
     use time::format_description::well_known::Rfc3339;
 
-    let mut buckets_xml = String::new();
-    for info in bucket_infos {
-        let escaped_name = xml_escape(&info.name);
-        // If creation date is None, use epoch time for consistency
-        let creation_date = info
-            .created
-            .and_then(|t| t.format(&Rfc3339).ok())
-            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-        buckets_xml.push_str(&format!(
-            "        <Bucket>\n            <Name>{}</Name>\n            <CreationDate>{}</CreationDate>\n        </Bucket>\n",
-            escaped_name, creation_date
-        ));
-    }
+    let mut buf = Vec::with_capacity(1024);
+    let mut ser = Serializer::new(&mut buf);
 
-    // Note: The Summary element uses xmlns="" to override the default namespace
-    // This ensures compatibility with Ceph RGW s3-tests which expect Summary
-    // without a namespace prefix when parsing the XML response.
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<ListAllMyBucketsResult xmlns="{xmlns}">
-    <Owner>
-        <ID>{owner_id}</ID>
-        <DisplayName>{owner_display_name}</DisplayName>
-    </Owner>
-    <Buckets>
-{buckets_xml}    </Buckets>
-    <Summary xmlns="">
-        <QuotaMaxBytes>{quota_max_bytes}</QuotaMaxBytes>
-        <QuotaMaxBuckets>{quota_max_buckets}</QuotaMaxBuckets>
-        <QuotaMaxObjCount>{quota_max_obj_count}</QuotaMaxObjCount>
-        <QuotaMaxBytesPerBucket>{quota_max_bytes_per_bucket}</QuotaMaxBytesPerBucket>
-        <QuotaMaxObjCountPerBucket>{quota_max_obj_count_per_bucket}</QuotaMaxObjCountPerBucket>
-    </Summary>
-</ListAllMyBucketsResult>"#,
-        xmlns = XMLNS_S3,
-        owner_id = RUSTFS_OWNER_ID,
-        owner_display_name = RUSTFS_OWNER_DISPLAY_NAME,
-        buckets_xml = buckets_xml,
-        quota_max_bytes = DEFAULT_QUOTA_MAX_BYTES,
-        quota_max_buckets = DEFAULT_QUOTA_MAX_BUCKETS,
-        quota_max_obj_count = DEFAULT_QUOTA_MAX_OBJ_COUNT,
-        quota_max_bytes_per_bucket = DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET,
-        quota_max_obj_count_per_bucket = DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET,
-    )
+    // Write XML declaration
+    let _ = ser.decl();
+
+    // Write ListAllMyBucketsResult with xmlns
+    let _ = ser.element_with_ns("ListAllMyBucketsResult", XMLNS_S3, |s| {
+        // Owner section
+        s.element("Owner", |s| {
+            s.content("ID", RUSTFS_OWNER_ID)?;
+            s.content("DisplayName", RUSTFS_OWNER_DISPLAY_NAME)
+        })?;
+
+        // Buckets section
+        s.element("Buckets", |s| {
+            for info in bucket_infos {
+                s.element("Bucket", |s| {
+                    // s3s Serializer automatically escapes XML special characters
+                    s.content("Name", info.name.as_str())?;
+                    // If creation date is None, use epoch time for consistency
+                    let creation_date = info
+                        .created
+                        .and_then(|t| t.format(&Rfc3339).ok())
+                        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+                    s.content("CreationDate", creation_date.as_str())
+                })?;
+            }
+            Ok(())
+        })?;
+
+        // Summary section with xmlns="" to override default namespace
+        // This ensures compatibility with Ceph RGW s3-tests
+        s.element_with_attrs("Summary", &[("xmlns", "")], |s| {
+            s.content("QuotaMaxBytes", &DEFAULT_QUOTA_MAX_BYTES)?;
+            s.content("QuotaMaxBuckets", &DEFAULT_QUOTA_MAX_BUCKETS)?;
+            s.content("QuotaMaxObjCount", &DEFAULT_QUOTA_MAX_OBJ_COUNT)?;
+            s.content("QuotaMaxBytesPerBucket", &DEFAULT_QUOTA_MAX_BYTES_PER_BUCKET)?;
+            s.content("QuotaMaxObjCountPerBucket", &DEFAULT_QUOTA_MAX_OBJ_COUNT_PER_BUCKET)
+        })
+    });
+
+    buf
 }
 
 #[cfg(test)]
@@ -1729,7 +1713,8 @@ mod tests {
 
     #[test]
     fn test_generate_list_buckets_with_usage_xml_empty() {
-        let xml = generate_list_buckets_with_usage_xml(&[]);
+        let xml_bytes = generate_list_buckets_with_usage_xml(&[]);
+        let xml = String::from_utf8_lossy(&xml_bytes);
 
         // Verify XML structure
         assert!(xml.contains("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
@@ -1739,7 +1724,7 @@ mod tests {
         // Verify consistent owner ID (same as standard ListBuckets handler)
         assert!(xml.contains("<ID>c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66</ID>"));
         assert!(xml.contains("<DisplayName>rustfs</DisplayName>"));
-        assert!(xml.contains("<Buckets>"));
+        assert!(xml.contains("<Buckets"));
         assert!(xml.contains("</Buckets>"));
 
         // Verify Summary section with quota fields
@@ -1771,7 +1756,8 @@ mod tests {
             },
         ];
 
-        let xml = generate_list_buckets_with_usage_xml(&bucket_infos);
+        let xml_bytes = generate_list_buckets_with_usage_xml(&bucket_infos);
+        let xml = String::from_utf8_lossy(&xml_bytes);
 
         // Verify bucket entries
         assert!(xml.contains("<Name>test-bucket-1</Name>"));
@@ -1786,33 +1772,21 @@ mod tests {
     }
 
     #[test]
-    fn test_xml_escape() {
-        // Test basic escaping
-        assert_eq!(xml_escape("hello"), "hello");
-        assert_eq!(xml_escape("a&b"), "a&amp;b");
-        assert_eq!(xml_escape("<test>"), "&lt;test&gt;");
-        assert_eq!(xml_escape("\"quoted\""), "&quot;quoted&quot;");
-        assert_eq!(xml_escape("it's"), "it&apos;s");
-
-        // Test combined special characters
-        assert_eq!(xml_escape("<a&b>"), "&lt;a&amp;b&gt;");
-    }
-
-    #[test]
     fn test_generate_list_buckets_with_usage_xml_escapes_special_chars() {
         use rustfs_ecstore::store_api::BucketInfo;
 
         // While S3 bucket names normally don't allow these characters,
-        // we should still escape them for safety
+        // s3s::xml::Serializer automatically escapes them for safety
         let bucket_infos = vec![BucketInfo {
             name: "test<bucket>&name".to_string(),
             created: None,
             ..Default::default()
         }];
 
-        let xml = generate_list_buckets_with_usage_xml(&bucket_infos);
+        let xml_bytes = generate_list_buckets_with_usage_xml(&bucket_infos);
+        let xml = String::from_utf8_lossy(&xml_bytes);
 
-        // Verify special characters are escaped
+        // Verify special characters are escaped by s3s Serializer
         assert!(xml.contains("<Name>test&lt;bucket&gt;&amp;name</Name>"));
     }
 
