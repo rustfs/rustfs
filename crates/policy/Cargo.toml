@@ -45,7 +45,12 @@ regex = { workspace = true }
 reqwest.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+moka.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+pollster.workspace = true
 
 [dev-dependencies]
+pollster.workspace = true
 test-case.workspace = true
 temp-env = { workspace = true }

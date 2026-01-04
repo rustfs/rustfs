@@ -55,9 +55,10 @@ use futures::future::join_all;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::Rng as _;
-use rustfs_common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
+use rustfs_lock::FastLockGuard;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
@@ -127,11 +128,11 @@ impl ECStore {
         info!("ECStore new address: {}", address.to_string());
         let mut host = address.ip().to_string();
         if host.is_empty() {
-            host = GLOBAL_Rustfs_Host.read().await.to_string()
+            host = GLOBAL_RUSTFS_HOST.read().await.to_string()
         }
         let mut port = address.port().to_string();
         if port.is_empty() {
-            port = GLOBAL_Rustfs_Port.read().await.to_string()
+            port = GLOBAL_RUSTFS_PORT.read().await.to_string()
         }
         info!("ECStore new host: {}, port: {}", host, port);
         init_local_peer(&endpoint_pools, &host, &port).await;
@@ -1151,6 +1152,10 @@ lazy_static! {
 
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
+    #[instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
+        self.pools[0].new_ns_lock(bucket, object).await
+    }
     #[instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
         let (standard_sc_parity, rr_sc_parity) = {
@@ -2329,15 +2334,15 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
 
     if peer_set.is_empty() {
         if !host.is_empty() {
-            *GLOBAL_Local_Node_Name.write().await = format!("{host}:{port}");
+            *GLOBAL_LOCAL_NODE_NAME.write().await = format!("{host}:{port}");
             return;
         }
 
-        *GLOBAL_Local_Node_Name.write().await = format!("127.0.0.1:{port}");
+        *GLOBAL_LOCAL_NODE_NAME.write().await = format!("127.0.0.1:{port}");
         return;
     }
 
-    *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();
+    *GLOBAL_LOCAL_NODE_NAME.write().await = peer_set[0].clone();
 }
 
 pub fn is_valid_object_prefix(_object: &str) -> bool {

@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::ADMIN_PREFIX;
 use crate::admin::console::is_console_path;
 use crate::admin::console::make_console_server;
-use crate::admin::rpc::RPC_PREFIX;
+use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX};
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -86,22 +85,26 @@ where
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
         let path = uri.path();
         // Profiling endpoints
-        if method == Method::GET && (path == "/profile/cpu" || path == "/profile/memory") {
+        if method == Method::GET && (path == PROFILE_CPU_PATH || path == PROFILE_MEMORY_PATH) {
             return true;
         }
 
         // Health check
-        if (method == Method::HEAD || method == Method::GET) && path == "/health" {
+        if (method == Method::HEAD || method == Method::GET) && path == HEALTH_PREFIX {
             return true;
         }
 
         // AssumeRole
-        if method == Method::POST && path == "/" {
-            if let Some(val) = headers.get(header::CONTENT_TYPE) {
-                if val.as_bytes() == b"application/x-www-form-urlencoded" {
-                    return true;
-                }
-            }
+        if method == Method::POST
+            && path == "/"
+            && headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| ct.split(';').next().unwrap_or("").trim().to_lowercase())
+                .map(|ct| ct == "application/x-www-form-urlencoded")
+                .unwrap_or(false)
+        {
+            return true;
         }
 
         path.starts_with(ADMIN_PREFIX) || path.starts_with(RPC_PREFIX) || is_console_path(path)
@@ -113,12 +116,12 @@ where
         let path = req.uri.path();
 
         // Profiling endpoints
-        if req.method == Method::GET && (path == "/profile/cpu" || path == "/profile/memory") {
+        if req.method == Method::GET && (path == PROFILE_CPU_PATH || path == PROFILE_MEMORY_PATH) {
             return Ok(());
         }
 
         // Health check
-        if (req.method == Method::HEAD || req.method == Method::GET) && path == "/health" {
+        if (req.method == Method::HEAD || req.method == Method::GET) && path == HEALTH_PREFIX {
             return Ok(());
         }
 

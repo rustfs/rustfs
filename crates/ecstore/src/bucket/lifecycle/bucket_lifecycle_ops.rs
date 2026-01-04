@@ -953,7 +953,7 @@ impl LifecycleOps for ObjectInfo {
         lifecycle::ObjectOpts {
             name: self.name.clone(),
             user_tags: self.user_tags.clone(),
-            version_id: self.version_id.map(|v| v.to_string()).unwrap_or_default(),
+            version_id: self.version_id.clone(),
             mod_time: self.mod_time,
             size: self.size as usize,
             is_latest: self.is_latest,
@@ -1067,7 +1067,7 @@ pub async fn eval_action_from_lifecycle(
     event
 }
 
-async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     if oi.delete_marker || oi.is_dir {
         return false;
     }
@@ -1161,7 +1161,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     true
 }
 
-async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let mut expiry_state = GLOBAL_ExpiryState.write().await;
     expiry_state.enqueue_by_days(oi, event, src).await;
     true

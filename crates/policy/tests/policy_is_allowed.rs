@@ -612,7 +612,7 @@ struct ArgsBuilder {
     "24"
 )]
 fn policy_is_allowed(policy: Policy, args: ArgsBuilder) -> bool {
-    policy.is_allowed(&Args {
+    pollster::block_on(policy.is_allowed(&Args {
         account: &args.account,
         groups: &{
             if args.groups.is_empty() {
@@ -628,5 +628,5 @@ fn policy_is_allowed(policy: Policy, args: ArgsBuilder) -> bool {
         object: &args.object,
         claims: &args.claims,
         deny_only: args.deny_only,
-    })
+    }))
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod disk_store;
 pub mod endpoint;
 pub mod error;
 pub mod error_conv;
@@ -30,6 +31,8 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
+use crate::disk::disk_store::LocalDiskWrapper;
+use crate::disk::local::ScanGuard;
 use crate::rpc::RemoteDisk;
 use bytes::Bytes;
 use endpoint::Endpoint;
@@ -51,7 +54,7 @@ pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
 #[derive(Debug)]
 pub enum Disk {
-    Local(Box<LocalDisk>),
+    Local(Box<LocalDiskWrapper>),
     Remote(Box<RemoteDisk>),
 }
 
@@ -393,12 +396,26 @@ impl DiskAPI for Disk {
             Disk::Remote(remote_disk) => remote_disk.disk_info(opts).await,
         }
     }
+
+    fn start_scan(&self) -> ScanGuard {
+        match self {
+            Disk::Local(local_disk) => local_disk.start_scan(),
+            Disk::Remote(remote_disk) => remote_disk.start_scan(),
+        }
+    }
+
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        match self {
+            Disk::Local(local_disk) => local_disk.read_metadata(volume, path).await,
+            Disk::Remote(remote_disk) => remote_disk.read_metadata(volume, path).await,
+        }
+    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
     if ep.is_local {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
-        Ok(Arc::new(Disk::Local(Box::new(s))))
+        Ok(Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(s), opt.health_check)))))
     } else {
         let remote_disk = RemoteDisk::new(ep, opt).await?;
         Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
@@ -456,6 +473,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -487,6 +505,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
+    fn start_scan(&self) -> ScanGuard;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -534,7 +553,7 @@ pub struct DiskInfo {
     pub scanning: bool,
     pub endpoint: String,
     pub mount_path: String,
-    pub id: String,
+    pub id: Option<Uuid>,
     pub rotational: bool,
     pub metrics: DiskMetrics,
     pub error: String,
@@ -1015,7 +1034,7 @@ mod tests {
 
         let endpoint = Endpoint::try_from(test_dir).unwrap();
         let local_disk = LocalDisk::new(&endpoint, false).await.unwrap();
-        let disk = Disk::Local(Box::new(local_disk));
+        let disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
 
         // Test basic methods
         assert!(disk.is_local());

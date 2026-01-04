@@ -30,6 +30,7 @@ use rustfs_filemeta::{
     FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision, ReplicationState,
     ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
 };
+use rustfs_lock::FastLockGuard;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
@@ -827,7 +828,12 @@ impl ObjectInfo {
         for entry in entries.entries() {
             if entry.is_object() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    if let Some(idx) = remaining.find(delimiter.as_str()) {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -878,7 +884,14 @@ impl ObjectInfo {
 
             if entry.is_dir() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    if let Some(idx) = {
+                        let remaining = if entry.name.starts_with(prefix) {
+                            &entry.name[prefix.len()..]
+                        } else {
+                            entry.name.as_str()
+                        };
+                        remaining.find(delimiter.as_str())
+                    } {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -914,7 +927,12 @@ impl ObjectInfo {
         for entry in entries.entries() {
             if entry.is_object() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    if let Some(idx) = remaining.find(delimiter.as_str()) {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -951,7 +969,14 @@ impl ObjectInfo {
 
             if entry.is_dir() {
                 if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    if let Some(idx) = {
+                        let remaining = if entry.name.starts_with(prefix) {
+                            &entry.name[prefix.len()..]
+                        } else {
+                            entry.name.as_str()
+                        };
+                        remaining.find(delimiter.as_str())
+                    } {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
                             if curr_prefix == prev_prefix {
@@ -1275,6 +1300,7 @@ pub trait ObjectIO: Send + Sync + Debug + 'static {
 #[allow(clippy::too_many_arguments)]
 pub trait StorageAPI: ObjectIO + Debug {
     // NewNSLock TODO:
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard>;
     // Shutdown TODO:
     // NSScanner TODO:
 

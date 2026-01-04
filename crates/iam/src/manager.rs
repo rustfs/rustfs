@@ -23,6 +23,7 @@ use crate::{
         UpdateServiceAccountOpts,
     },
 };
+use futures::future::join_all;
 use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
@@ -36,6 +37,7 @@ use rustfs_policy::{
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::AtomicU8;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -75,9 +77,19 @@ fn get_iam_format_file_path() -> String {
     path_join_buf(&[&IAM_CONFIG_PREFIX, IAM_FORMAT_FILE])
 }
 
+#[repr(u8)]
+#[derive(Debug, PartialEq)]
+pub enum IamState {
+    Uninitialized = 0,
+    Loading = 1,
+    Ready = 2,
+    Error = 3,
+}
+
 pub struct IamCache<T> {
     pub cache: Cache,
     pub api: T,
+    pub state: Arc<AtomicU8>,
     pub loading: Arc<AtomicBool>,
     pub roles: HashMap<ARN, Vec<String>>,
     pub send_chan: Sender<i64>,
@@ -88,12 +100,19 @@ impl<T> IamCache<T>
 where
     T: Store,
 {
+    /// Create a new IAM system instance
+    /// # Arguments
+    /// * `api` - The storage backend implementing the Store trait
+    ///
+    /// # Returns
+    /// An Arc-wrapped instance of IamSystem
     pub(crate) async fn new(api: T) -> Arc<Self> {
         let (sender, receiver) = mpsc::channel::<i64>(100);
 
         let sys = Arc::new(Self {
             api,
             cache: Cache::default(),
+            state: Arc::new(AtomicU8::new(IamState::Uninitialized as u8)),
             loading: Arc::new(AtomicBool::new(false)),
             send_chan: sender,
             roles: HashMap::new(),
@@ -104,10 +123,32 @@ where
         sys
     }
 
+    /// Initialize the IAM system
     async fn init(self: Arc<Self>, receiver: Receiver<i64>) -> Result<()> {
+        self.state.store(IamState::Loading as u8, Ordering::SeqCst);
+        // Ensure the IAM format file is persisted first
         self.clone().save_iam_formatter().await?;
-        self.clone().load().await?;
 
+        // Critical: Load all existing users/policies into memory cache
+        const MAX_RETRIES: usize = 3;
+        for attempt in 0..MAX_RETRIES {
+            if let Err(e) = self.clone().load().await {
+                if attempt == MAX_RETRIES - 1 {
+                    self.state.store(IamState::Error as u8, Ordering::SeqCst);
+                    error!("IAM fail to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
+                    return Err(e);
+                } else {
+                    warn!("IAM load failed, retrying... attempt {}", attempt + 1);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            } else {
+                break;
+            }
+        }
+        self.state.store(IamState::Ready as u8, Ordering::SeqCst);
+        info!("IAM System successfully initialized and marked as READY");
+
+        // Background ticker for synchronization
         // Check if environment variable is set
         let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK").is_ok();
 
@@ -149,6 +190,11 @@ where
         }
 
         Ok(())
+    }
+
+    /// Check if IAM system is ready
+    pub fn is_ready(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == IamState::Ready as u8
     }
 
     async fn _notify(&self) {
@@ -402,13 +448,25 @@ where
 
         self.cache.policy_docs.store(Arc::new(cache));
 
-        let ret = m
+        let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.policy.clone())).collect();
+
+        let futures: Vec<_> = items.iter().map(|(_, policy)| policy.match_resource(bucket_name)).collect();
+
+        let results = join_all(futures).await;
+
+        let filtered = items
             .into_iter()
-            .filter(|(_, v)| bucket_name.is_empty() || v.policy.match_resource(bucket_name))
-            .map(|(k, v)| (k, v.policy))
+            .zip(results)
+            .filter_map(|((k, policy), matches)| {
+                if bucket_name.is_empty() || matches {
+                    Some((k, policy))
+                } else {
+                    None
+                }
+            })
             .collect();
 
-        Ok(ret)
+        Ok(filtered)
     }
 
     pub async fn merge_policies(&self, name: &str) -> (String, Policy) {
@@ -456,22 +514,51 @@ where
 
         self.cache.policy_docs.store(Arc::new(cache));
 
-        let ret = m
-            .into_iter()
-            .filter(|(_, v)| bucket_name.is_empty() || v.policy.match_resource(bucket_name))
+        let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.clone())).collect();
+
+        let futures: Vec<_> = items
+            .iter()
+            .map(|(_, policy_doc)| policy_doc.policy.match_resource(bucket_name))
             .collect();
 
-        Ok(ret)
+        let results = join_all(futures).await;
+
+        let filtered = items
+            .into_iter()
+            .zip(results)
+            .filter_map(|((k, policy_doc), matches)| {
+                if bucket_name.is_empty() || matches {
+                    Some((k, policy_doc))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(filtered)
     }
 
     pub async fn list_policy_docs_internal(&self, bucket_name: &str) -> Result<HashMap<String, PolicyDoc>> {
-        let ret = self
-            .cache
-            .policy_docs
-            .load()
+        let cache = self.cache.policy_docs.load();
+        let items: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        let futures: Vec<_> = items
             .iter()
-            .filter(|(_, v)| bucket_name.is_empty() || v.policy.match_resource(bucket_name))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(_, policy_doc)| policy_doc.policy.match_resource(bucket_name))
+            .collect();
+
+        let results = join_all(futures).await;
+
+        let ret = items
+            .into_iter()
+            .zip(results)
+            .filter_map(|((k, policy_doc), matches)| {
+                if bucket_name.is_empty() || matches {
+                    Some((k, policy_doc))
+                } else {
+                    None
+                }
+            })
             .collect();
 
         Ok(ret)
@@ -1753,7 +1840,7 @@ fn filter_policies(cache: &Cache, policy_name: &str, bucket_name: &str) -> (Stri
         }
 
         if let Some(p) = cache.policy_docs.load().get(&policy) {
-            if bucket_name.is_empty() || p.policy.match_resource(bucket_name) {
+            if bucket_name.is_empty() || pollster::block_on(p.policy.match_resource(bucket_name)) {
                 policies.push(policy);
                 to_merge.push(p.policy.clone());
             }

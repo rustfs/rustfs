@@ -67,6 +67,13 @@ pub struct IamSys<T> {
 }
 
 impl<T: Store> IamSys<T> {
+    /// Create a new IamSys instance with the given IamCache store
+    ///
+    /// # Arguments
+    /// * `store` - An Arc to the IamCache instance
+    ///
+    /// # Returns
+    /// A new instance of IamSys
     pub fn new(store: Arc<IamCache<T>>) -> Self {
         tokio::spawn(async move {
             match opa::lookup_config().await {
@@ -87,6 +94,11 @@ impl<T: Store> IamSys<T> {
             roles_map: HashMap::new(),
         }
     }
+
+    /// Check if the IamSys has a watcher configured
+    ///
+    /// # Returns
+    /// `true` if a watcher is configured, `false` otherwise
     pub fn has_watcher(&self) -> bool {
         self.store.api.has_watcher()
     }
@@ -755,10 +767,10 @@ impl<T: Store> IamSys<T> {
 
         let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
         if has_session_policy {
-            return is_allowed_sp && (is_owner || combined_policy.is_allowed(args));
+            return is_allowed_sp && (is_owner || combined_policy.is_allowed(args).await);
         }
 
-        is_owner || combined_policy.is_allowed(args)
+        is_owner || combined_policy.is_allowed(args).await
     }
 
     pub async fn is_allowed_service_account(&self, args: &Args<'_>, parent_user: &str) -> bool {
@@ -814,15 +826,15 @@ impl<T: Store> IamSys<T> {
         };
 
         if sa_str == INHERITED_POLICY_TYPE {
-            return is_owner || combined_policy.is_allowed(&parent_args);
+            return is_owner || combined_policy.is_allowed(&parent_args).await;
         }
 
         let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy_for_service_account(args);
         if has_session_policy {
-            return is_allowed_sp && (is_owner || combined_policy.is_allowed(&parent_args));
+            return is_allowed_sp && (is_owner || combined_policy.is_allowed(&parent_args).await);
         }
 
-        is_owner || combined_policy.is_allowed(&parent_args)
+        is_owner || combined_policy.is_allowed(&parent_args).await
     }
 
     pub async fn get_combined_policy(&self, policies: &[String]) -> Policy {
@@ -857,7 +869,12 @@ impl<T: Store> IamSys<T> {
             return false;
         }
 
-        self.get_combined_policy(&policies).await.is_allowed(args)
+        self.get_combined_policy(&policies).await.is_allowed(args).await
+    }
+
+    /// Check if the underlying store is ready
+    pub fn is_ready(&self) -> bool {
+        self.store.is_ready()
     }
 }
 
@@ -883,7 +900,7 @@ fn is_allowed_by_session_policy(args: &Args<'_>) -> (bool, bool) {
     let mut session_policy_args = args.clone();
     session_policy_args.is_owner = false;
 
-    (has_session_policy, sub_policy.is_allowed(&session_policy_args))
+    (has_session_policy, pollster::block_on(sub_policy.is_allowed(&session_policy_args)))
 }
 
 fn is_allowed_by_session_policy_for_service_account(args: &Args<'_>) -> (bool, bool) {
@@ -909,7 +926,7 @@ fn is_allowed_by_session_policy_for_service_account(args: &Args<'_>) -> (bool, b
     let mut session_policy_args = args.clone();
     session_policy_args.is_owner = false;
 
-    (has_session_policy, sub_policy.is_allowed(&session_policy_args))
+    (has_session_policy, pollster::block_on(sub_policy.is_allowed(&session_policy_args)))
 }
 
 #[derive(Debug, Clone, Default)]

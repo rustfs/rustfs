@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::pattern;
+use crate::rules::pattern;
 use hashbrown::HashSet;
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{ARN, ArnError, TargetIDError};

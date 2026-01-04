@@ -60,6 +60,7 @@ rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
+rustfs-scanner = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
@@ -72,6 +73,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
+http-body-util.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
@@ -144,6 +146,7 @@ pprof = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
+serial_test = { workspace = true }
 
 [build-dependencies]
 http.workspace = true

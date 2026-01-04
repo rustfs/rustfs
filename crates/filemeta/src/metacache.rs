@@ -831,10 +831,16 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
         }
     }
 
+    #[allow(unsafe_code)]
     async fn update(&self) -> std::io::Result<()> {
         match (self.update_fn)().await {
             Ok(val) => {
-                self.val.store(Box::into_raw(Box::new(val)), AtomicOrdering::SeqCst);
+                let old = self.val.swap(Box::into_raw(Box::new(val)), AtomicOrdering::SeqCst);
+                if !old.is_null() {
+                    unsafe {
+                        drop(Box::from_raw(old));
+                    }
+                }
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards")

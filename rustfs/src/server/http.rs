@@ -13,10 +13,11 @@
 // limitations under the License.
 
 // Ensure the correct path for parse_license is imported
+use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::{ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
+use crate::server::{ReadinessGateLayer, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -28,6 +29,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
+use rustfs_common::GlobalReadiness;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -43,7 +45,7 @@ use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::compression::{CompressionLayer, predicate::Predicate};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
@@ -108,63 +110,10 @@ fn get_cors_allowed_origins() -> String {
         .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
 }
 
-/// Predicate to determine if a response should be compressed.
-///
-/// This predicate implements intelligent compression selection to avoid issues
-/// with error responses and small payloads. It excludes:
-/// - Client error responses (4xx status codes) - typically small XML/JSON error messages
-/// - Server error responses (5xx status codes) - ensures error details are preserved
-/// - Very small responses (< 256 bytes) - compression overhead outweighs benefits
-///
-/// # Rationale
-/// The CompressionLayer can cause Content-Length header mismatches with error responses,
-/// particularly when the s3s library generates XML error responses (~119 bytes for NoSuchKey).
-/// By excluding these responses from compression, we ensure:
-/// 1. Error responses are sent with accurate Content-Length headers
-/// 2. Clients receive complete error bodies without truncation
-/// 3. Small responses avoid compression overhead
-///
-/// # Performance
-/// This predicate is evaluated per-response and has O(1) complexity.
-#[derive(Clone, Copy, Debug)]
-struct ShouldCompress;
-
-impl Predicate for ShouldCompress {
-    fn should_compress<B>(&self, response: &Response<B>) -> bool
-    where
-        B: http_body::Body,
-    {
-        let status = response.status();
-
-        // Never compress error responses (4xx and 5xx status codes)
-        // This prevents Content-Length mismatch issues with error responses
-        if status.is_client_error() || status.is_server_error() {
-            debug!("Skipping compression for error response: status={}", status.as_u16());
-            return false;
-        }
-
-        // Check Content-Length header to avoid compressing very small responses
-        // Responses smaller than 256 bytes typically don't benefit from compression
-        // and may actually increase in size due to compression overhead
-        if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH) {
-            if let Ok(length_str) = content_length.to_str() {
-                if let Ok(length) = length_str.parse::<u64>() {
-                    if length < 256 {
-                        debug!("Skipping compression for small response: size={} bytes", length);
-                        return false;
-                    }
-                }
-            }
-        }
-
-        // Compress successful responses with sufficient size
-        true
-    }
-}
-
 pub async fn start_http_server(
     opt: &config::Opt,
     worker_state_manager: ServiceStateManager,
+    readiness: Arc<GlobalReadiness>,
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
@@ -172,16 +121,26 @@ pub async fn start_http_server(
     // The listening address and port are obtained from the parameters
     let listener = {
         let mut server_addr = server_addr;
-        let mut socket = socket2::Socket::new(
+
+        // Try to create a socket for the address family; if that fails, fallback to IPv4.
+        let mut socket = match socket2::Socket::new(
             socket2::Domain::for_address(server_addr),
             socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
-        )?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to create socket for {:?}: {}, falling back to IPv4", server_addr, e);
+                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+                server_addr = ipv4_addr;
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?
+            }
+        };
 
+        // If address is IPv6 try to enable dual-stack; on failure, switch to IPv4 socket.
         if server_addr.is_ipv6() {
             if let Err(e) = socket.set_only_v6(false) {
-                warn!("Failed to set IPV6_V6ONLY=false, falling back to IPv4-only: {}", e);
-                // Fallback to a new IPv4 socket if setting dual-stack fails.
+                warn!("Failed to set IPV6_V6ONLY=false, attempting IPv4 fallback: {}", e);
                 let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
                 server_addr = ipv4_addr;
                 socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
@@ -193,8 +152,27 @@ pub async fn start_http_server(
         socket.set_reuse_address(true)?;
         // Set the socket to non-blocking before passing it to Tokio.
         socket.set_nonblocking(true)?;
-        socket.bind(&server_addr.into())?;
-        socket.listen(backlog)?;
+
+        // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
+        if let Err(bind_err) = socket.bind(&server_addr.into()) {
+            warn!("Failed to bind to {}: {}.", server_addr, bind_err);
+            if server_addr.is_ipv6() {
+                // Try IPv4 fallback
+                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+                server_addr = ipv4_addr;
+                socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+                socket.set_reuse_address(true)?;
+                socket.set_nonblocking(true)?;
+                socket.bind(&server_addr.into())?;
+                // [FIX] Ensure fallback socket is moved to listening state as well.
+                socket.listen(backlog)?;
+            } else {
+                return Err(bind_err);
+            }
+        } else {
+            // Listen on the socket when initial bind succeeded
+            socket.listen(backlog)?;
+        }
         TcpListener::from_std(socket.into())?
     };
 
@@ -232,7 +210,7 @@ pub async fn start_http_server(
         println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
     } else {
         info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
-        println!("RustFS API: {api_endpoints}  {localhost_endpoint}");
+        println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Start Time: {now_time}");
         if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
             warn!(
@@ -289,6 +267,17 @@ pub async fn start_http_server(
     } else {
         Some(cors_allowed_origins)
     };
+
+    // Create compression configuration from environment variables
+    let compression_config = CompressionConfig::from_env();
+    if compression_config.enabled {
+        info!(
+            "HTTP response compression enabled: extensions={:?}, mime_patterns={:?}, min_size={} bytes",
+            compression_config.extensions, compression_config.mime_patterns, compression_config.min_size
+        );
+    } else {
+        debug!("HTTP response compression is disabled");
+    }
 
     let is_console = opt.console_enable;
     tokio::spawn(async move {
@@ -395,15 +384,16 @@ pub async fn start_http_server(
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
 
-            process_connection(
-                socket,
-                tls_acceptor.clone(),
-                http_server.clone(),
-                s3_service.clone(),
-                graceful.clone(),
-                cors_layer.clone(),
+            let connection_ctx = ConnectionContext {
+                http_server: http_server.clone(),
+                s3_service: s3_service.clone(),
+                cors_layer: cors_layer.clone(),
+                compression_config: compression_config.clone(),
                 is_console,
-            );
+                readiness: readiness.clone(),
+            };
+
+            process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.clone());
         }
 
         worker_state_manager.update(ServiceState::Stopping);
@@ -496,6 +486,16 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
     Ok(None)
 }
 
+#[derive(Clone)]
+struct ConnectionContext {
+    http_server: Arc<ConnBuilder<TokioExecutor>>,
+    s3_service: S3Service,
+    cors_layer: CorsLayer,
+    compression_config: CompressionConfig,
+    is_console: bool,
+    readiness: Arc<GlobalReadiness>,
+}
+
 /// Process a single incoming TCP connection.
 ///
 /// This function is executed in a new Tokio task and it will:
@@ -507,13 +507,19 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 fn process_connection(
     socket: TcpStream,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
-    http_server: Arc<ConnBuilder<TokioExecutor>>,
-    s3_service: S3Service,
+    context: ConnectionContext,
     graceful: Arc<GracefulShutdown>,
-    cors_layer: CorsLayer,
-    is_console: bool,
 ) {
     tokio::spawn(async move {
+        let ConnectionContext {
+            http_server,
+            s3_service,
+            cors_layer,
+            compression_config,
+            is_console,
+            readiness,
+        } = context;
+
         // Build services inside each connected task to avoid passing complex service types across tasks,
         // It also ensures that each connection has an independent service instance.
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
@@ -522,6 +528,9 @@ fn process_connection(
         let hybrid_service = ServiceBuilder::new()
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
+            // CRITICAL: Insert ReadinessGateLayer before business logic
+            // This stops requests from hitting IAMAuth or Storage if they are not ready.
+            .layer(ReadinessGateLayer::new(readiness))
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
@@ -577,8 +586,9 @@ fn process_connection(
             )
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(cors_layer)
-            // Compress responses, but exclude error responses to avoid Content-Length mismatch issues
-            .layer(CompressionLayer::new().compress_when(ShouldCompress))
+            // Compress responses based on whitelist configuration
+            // Only compresses when enabled and matches configured extensions/MIME types
+            .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
 

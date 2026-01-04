@@ -15,18 +15,23 @@
 #[allow(unsafe_code)]
 mod generated;
 
-use std::{error::Error, time::Duration};
-
-pub use generated::*;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::globals::{GLOBAL_Conn_Map, evict_connection};
+use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_ROOT_CERT, evict_connection};
+use std::{error::Error, time::Duration};
 use tonic::{
     Request, Status,
     metadata::MetadataValue,
     service::interceptor::InterceptedService,
-    transport::{Channel, Endpoint},
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
 use tracing::{debug, warn};
+
+// Type alias for the complex client type
+pub type NodeServiceClientType = NodeServiceClient<
+    InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
+>;
+
+pub use generated::*;
 
 // Default 100 MB
 pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
@@ -46,6 +51,12 @@ const HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 3;
 /// Overall RPC timeout - maximum time for any single RPC operation
 const RPC_TIMEOUT_SECS: u64 = 30;
 
+/// Default HTTPS prefix for rustfs
+/// This is the default HTTPS prefix for rustfs.
+/// It is used to identify HTTPS URLs.
+/// Default value: https://
+const RUSTFS_HTTPS_PREFIX: &str = "https://";
+
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
 ///
 /// This function is designed to detect dead peers quickly:
@@ -56,7 +67,7 @@ const RPC_TIMEOUT_SECS: u64 = 30;
 async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {}", addr);
 
-    let connector = Endpoint::from_shared(addr.to_string())?
+    let mut connector = Endpoint::from_shared(addr.to_string())?
         // Fast connection timeout for dead peer detection
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         // TCP-level keepalive - OS will probe connection
@@ -70,11 +81,42 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         // Overall timeout for any RPC - fail fast on unresponsive peers
         .timeout(Duration::from_secs(RPC_TIMEOUT_SECS));
 
+    let root_cert = GLOBAL_ROOT_CERT.read().await;
+    if addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        if let Some(cert_pem) = root_cert.as_ref() {
+            let ca = Certificate::from_pem(cert_pem);
+            // Derive the hostname from the HTTPS URL for TLS hostname verification.
+            let domain = addr
+                .trim_start_matches(RUSTFS_HTTPS_PREFIX)
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("");
+            let tls = if !domain.is_empty() {
+                ClientTlsConfig::new().ca_certificate(ca).domain_name(domain)
+            } else {
+                // Fallback: configure TLS without explicit domain if parsing fails.
+                ClientTlsConfig::new().ca_certificate(ca)
+            };
+            connector = connector.tls_config(tls)?;
+            debug!("Configured TLS with custom root certificate for: {}", addr);
+        } else {
+            debug!("Using system root certificates for TLS: {}", addr);
+        }
+    } else {
+        // Custom root certificates are configured but will be ignored for non-HTTPS addresses.
+        if root_cert.is_some() {
+            warn!("Custom root certificates are configured but not used because the address does not use HTTPS: {addr}");
+        }
+    }
+
     let channel = connector.connect().await?;
 
     // Cache the new connection
     {
-        GLOBAL_Conn_Map.write().await.insert(addr.to_string(), channel.clone());
+        GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel.clone());
     }
 
     debug!("Successfully created and cached gRPC channel to: {}", addr);
@@ -111,7 +153,7 @@ pub async fn node_service_time_out_client(
     let token: MetadataValue<_> = "rustfs rpc".parse()?;
 
     // Try to get cached channel
-    let cached_channel = { GLOBAL_Conn_Map.read().await.get(addr).cloned() };
+    let cached_channel = { GLOBAL_CONN_MAP.read().await.get(addr).cloned() };
 
     let channel = match cached_channel {
         Some(channel) => {

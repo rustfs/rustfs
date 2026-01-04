@@ -73,6 +73,7 @@ use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
     RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
 };
+use rustfs_lock::FastLockGuard;
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
@@ -174,56 +175,56 @@ impl SetDisks {
         })
     }
 
-    async fn cached_disk_health(&self, index: usize) -> Option<bool> {
-        let cache = self.disk_health_cache.read().await;
-        cache
-            .get(index)
-            .and_then(|entry| entry.as_ref().and_then(|state| state.cached_value()))
-    }
+    // async fn cached_disk_health(&self, index: usize) -> Option<bool> {
+    //     let cache = self.disk_health_cache.read().await;
+    //     cache
+    //         .get(index)
+    //         .and_then(|entry| entry.as_ref().and_then(|state| state.cached_value()))
+    // }
 
-    async fn update_disk_health(&self, index: usize, online: bool) {
-        let mut cache = self.disk_health_cache.write().await;
-        if cache.len() <= index {
-            cache.resize(index + 1, None);
-        }
-        cache[index] = Some(DiskHealthEntry {
-            last_check: Instant::now(),
-            online,
-        });
-    }
+    // async fn update_disk_health(&self, index: usize, online: bool) {
+    //     let mut cache = self.disk_health_cache.write().await;
+    //     if cache.len() <= index {
+    //         cache.resize(index + 1, None);
+    //     }
+    //     cache[index] = Some(DiskHealthEntry {
+    //         last_check: Instant::now(),
+    //         online,
+    //     });
+    // }
 
-    async fn is_disk_online_cached(&self, index: usize, disk: &DiskStore) -> bool {
-        if let Some(online) = self.cached_disk_health(index).await {
-            return online;
-        }
+    // async fn is_disk_online_cached(&self, index: usize, disk: &DiskStore) -> bool {
+    //     if let Some(online) = self.cached_disk_health(index).await {
+    //         return online;
+    //     }
 
-        let disk_clone = disk.clone();
-        let online = timeout(DISK_ONLINE_TIMEOUT, async move { disk_clone.is_online().await })
-            .await
-            .unwrap_or(false);
-        self.update_disk_health(index, online).await;
-        online
-    }
+    //     let disk_clone = disk.clone();
+    //     let online = timeout(DISK_ONLINE_TIMEOUT, async move { disk_clone.is_online().await })
+    //         .await
+    //         .unwrap_or(false);
+    //     self.update_disk_health(index, online).await;
+    //     online
+    // }
 
-    async fn filter_online_disks(&self, disks: Vec<Option<DiskStore>>) -> (Vec<Option<DiskStore>>, usize) {
-        let mut filtered = Vec::with_capacity(disks.len());
-        let mut online_count = 0;
+    // async fn filter_online_disks(&self, disks: Vec<Option<DiskStore>>) -> (Vec<Option<DiskStore>>, usize) {
+    //     let mut filtered = Vec::with_capacity(disks.len());
+    //     let mut online_count = 0;
 
-        for (idx, disk) in disks.into_iter().enumerate() {
-            if let Some(disk_store) = disk {
-                if self.is_disk_online_cached(idx, &disk_store).await {
-                    filtered.push(Some(disk_store));
-                    online_count += 1;
-                } else {
-                    filtered.push(None);
-                }
-            } else {
-                filtered.push(None);
-            }
-        }
+    //     for (idx, disk) in disks.into_iter().enumerate() {
+    //         if let Some(disk_store) = disk {
+    //             if self.is_disk_online_cached(idx, &disk_store).await {
+    //                 filtered.push(Some(disk_store));
+    //                 online_count += 1;
+    //             } else {
+    //                 filtered.push(None);
+    //             }
+    //         } else {
+    //             filtered.push(None);
+    //         }
+    //     }
 
-        (filtered, online_count)
-    }
+    //     (filtered, online_count)
+    // }
     fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
         match err {
             LockResult::Timeout => {
@@ -259,9 +260,28 @@ impl SetDisks {
     }
 
     async fn get_online_disks(&self) -> Vec<Option<DiskStore>> {
-        let disks = self.get_disks_internal().await;
-        let (filtered, _) = self.filter_online_disks(disks).await;
-        filtered.into_iter().filter(|disk| disk.is_some()).collect()
+        let mut disks = self.get_disks_internal().await;
+
+        // TODO: diskinfo filter online
+
+        let mut new_disk = Vec::with_capacity(disks.len());
+
+        for disk in disks.iter() {
+            if let Some(d) = disk {
+                if d.is_online().await {
+                    new_disk.push(disk.clone());
+                }
+            }
+        }
+
+        let mut rng = rand::rng();
+
+        disks.shuffle(&mut rng);
+
+        new_disk
+        // let disks = self.get_disks_internal().await;
+        // let (filtered, _) = self.filter_online_disks(disks).await;
+        // filtered.into_iter().filter(|disk| disk.is_some()).collect()
     }
     async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
         let mut disks = self.get_online_disks().await;
@@ -1468,17 +1488,7 @@ impl SetDisks {
             let version_id = version_id.clone();
             tokio::spawn(async move {
                 if let Some(disk) = disk {
-                    if version_id.is_empty() {
-                        match disk.read_xl(&bucket, &object, read_data).await {
-                            Ok(info) => {
-                                let fi = file_info_from_raw(info, &bucket, &object, read_data).await?;
-                                Ok(fi)
-                            }
-                            Err(err) => Err(err),
-                        }
-                    } else {
-                        disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
-                    }
+                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
                 }
@@ -1799,14 +1809,14 @@ impl SetDisks {
     }
 
     pub async fn renew_disk(&self, ep: &Endpoint) {
-        debug!("renew_disk start {:?}", ep);
+        debug!("renew_disk: start {:?}", ep);
 
         let (new_disk, fm) = match Self::connect_endpoint(ep).await {
             Ok(res) => res,
             Err(e) => {
-                warn!("connect_endpoint err {:?}", &e);
+                warn!("renew_disk: connect_endpoint err {:?}", &e);
                 if ep.is_local && e == DiskError::UnformattedDisk {
-                    info!("unformatteddisk will trigger heal_disk, {:?}", ep);
+                    info!("renew_disk unformatteddisk will trigger heal_disk, {:?}", ep);
                     let set_disk_id = format!("pool_{}_set_{}", ep.pool_idx, ep.set_idx);
                     let _ = send_heal_disk(set_disk_id, Some(HealChannelPriority::Normal)).await;
                 }
@@ -1817,7 +1827,7 @@ impl SetDisks {
         let (set_idx, disk_idx) = match self.find_disk_index(&fm) {
             Ok(res) => res,
             Err(e) => {
-                warn!("find_disk_index err {:?}", e);
+                warn!("renew_disk: find_disk_index err {:?}", e);
                 return;
             }
         };
@@ -1837,7 +1847,7 @@ impl SetDisks {
             }
         }
 
-        debug!("renew_disk update {:?}", fm.erasure.this);
+        debug!("renew_disk: update {:?}", fm.erasure.this);
 
         let mut disk_lock = self.disks.write().await;
         disk_lock[disk_idx] = Some(new_disk);
@@ -2672,7 +2682,7 @@ impl SetDisks {
         let (mut parts_metadata, errs) = {
             let mut retry_count = 0;
             loop {
-                let (parts, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
+                let (parts, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false).await?;
 
                 // Check if we have enough valid metadata to proceed
                 // If we have too many errors, and we haven't exhausted retries, try again
@@ -2699,7 +2709,14 @@ impl SetDisks {
                 retry_count += 1;
             }
         };
-        info!(parts_count = parts_metadata.len(), ?errs, "File info read complete");
+        info!(
+            parts_count = parts_metadata.len(),
+            bucket = bucket,
+            object = object,
+            version_id = version_id,
+            ?errs,
+            "File info read complete"
+        );
         if DiskError::is_all_not_found(&errs) {
             warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
@@ -3051,7 +3068,7 @@ impl SetDisks {
                                 for (index, disk) in latest_disks.iter().enumerate() {
                                     if let Some(outdated_disk) = &out_dated_disks[index] {
                                         info!(disk_index = index, "Creating writer for outdated disk");
-                                        let writer = create_bitrot_writer(
+                                        let writer = match create_bitrot_writer(
                                             is_inline_buffer,
                                             Some(outdated_disk),
                                             RUSTFS_META_TMP_BUCKET,
@@ -3060,7 +3077,19 @@ impl SetDisks {
                                             erasure.shard_size(),
                                             HashAlgorithm::HighwayHash256,
                                         )
-                                        .await?;
+                                        .await
+                                        {
+                                            Ok(writer) => writer,
+                                            Err(err) => {
+                                                warn!(
+                                                    "create_bitrot_writer  disk {}, err {:?}, skipping operation",
+                                                    outdated_disk.to_string(),
+                                                    err
+                                                );
+                                                writers.push(None);
+                                                continue;
+                                            }
+                                        };
                                         writers.push(Some(writer));
                                     } else {
                                         info!(disk_index = index, "Skipping writer (disk not outdated)");
@@ -3790,8 +3819,8 @@ impl ObjectIO for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self, data,))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let disks_snapshot = self.get_disks_internal().await;
-        let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
+        let disks = self.get_disks_internal().await;
+        // let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
 
         // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
         let _object_lock_guard = if !opts.no_lock {
@@ -3832,13 +3861,13 @@ impl ObjectIO for SetDisks {
             write_quorum += 1
         }
 
-        if filtered_online < write_quorum {
-            warn!(
-                "online disk snapshot {} below write quorum {} for {}/{}; returning erasure write quorum error",
-                filtered_online, write_quorum, bucket, object
-            );
-            return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
-        }
+        // if filtered_online < write_quorum {
+        //     warn!(
+        //         "online disk snapshot {} below write quorum {} for {}/{}; returning erasure write quorum error",
+        //         filtered_online, write_quorum, bucket, object
+        //     );
+        //     return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
+        // }
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
 
@@ -3877,8 +3906,10 @@ impl ObjectIO for SetDisks {
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
-            if let Some(disk) = disk_op {
-                let writer = create_bitrot_writer(
+            if let Some(disk) = disk_op
+                && disk.is_online().await
+            {
+                let writer = match create_bitrot_writer(
                     is_inline_buffer,
                     Some(disk),
                     RUSTFS_META_TMP_BUCKET,
@@ -3887,29 +3918,16 @@ impl ObjectIO for SetDisks {
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,
                 )
-                .await?;
-
-                // let writer = if is_inline_buffer {
-                //     BitrotWriter::new(
-                //         Writer::from_cursor(Cursor::new(Vec::new())),
-                //         erasure.shard_size(),
-                //         HashAlgorithm::HighwayHash256,
-                //     )
-                // } else {
-                //     let f = match disk
-                //         .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_object, erasure.shard_file_size(data.content_length))
-                //         .await
-                //     {
-                //         Ok(f) => f,
-                //         Err(e) => {
-                //             errors.push(Some(e));
-                //             writers.push(None);
-                //             continue;
-                //         }
-                //     };
-
-                //     BitrotWriter::new(Writer::from_tokio_writer(f), erasure.shard_size(), HashAlgorithm::HighwayHash256)
-                // };
+                .await
+                {
+                    Ok(writer) => writer,
+                    Err(err) => {
+                        warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                        errors.push(Some(err));
+                        writers.push(None);
+                        continue;
+                    }
+                };
 
                 writers.push(Some(writer));
                 errors.push(None);
@@ -4059,6 +4077,14 @@ impl ObjectIO for SetDisks {
 #[async_trait::async_trait]
 impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
+        self.fast_lock_manager
+            .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+            .await
+            .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
         unimplemented!()
     }
@@ -4072,7 +4098,7 @@ impl StorageAPI for SetDisks {
     async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
         let disks = self.get_disks_internal().await;
 
-        let mut local_disks: Vec<Option<Arc<disk::Disk>>> = Vec::new();
+        let mut local_disks: Vec<Option<DiskStore>> = Vec::new();
         let mut local_endpoints = Vec::new();
 
         for (i, ep) in self.set_endpoints.iter().enumerate() {
@@ -4908,9 +4934,7 @@ impl StorageAPI for SetDisks {
 
         for disk in disks.iter() {
             if let Some(disk) = disk {
-                if disk.is_online().await {
-                    continue;
-                }
+                continue;
             }
             let _ = self.add_partial(bucket, object, opts.version_id.as_ref().expect("err")).await;
             break;
@@ -5129,16 +5153,16 @@ impl StorageAPI for SetDisks {
             return Err(Error::other(format!("checksum mismatch: {checksum}")));
         }
 
-        let disks_snapshot = self.get_disks_internal().await;
-        let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
+        let disks = self.get_disks_internal().await;
+        // let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
 
-        if filtered_online < write_quorum {
-            warn!(
-                "online disk snapshot {} below write quorum {} for multipart {}/{}; returning erasure write quorum error",
-                filtered_online, write_quorum, bucket, object
-            );
-            return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
-        }
+        // if filtered_online < write_quorum {
+        //     warn!(
+        //         "online disk snapshot {} below write quorum {} for multipart {}/{}; returning erasure write quorum error",
+        //         filtered_online, write_quorum, bucket, object
+        //     );
+        //     return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
+        // }
 
         let shuffle_disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
@@ -5152,7 +5176,7 @@ impl StorageAPI for SetDisks {
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
             if let Some(disk) = disk_op {
-                let writer = create_bitrot_writer(
+                let writer = match create_bitrot_writer(
                     false,
                     Some(disk),
                     RUSTFS_META_TMP_BUCKET,
@@ -5161,23 +5185,16 @@ impl StorageAPI for SetDisks {
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,
                 )
-                .await?;
-
-                // let writer = {
-                //     let f = match disk
-                //         .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, erasure.shard_file_size(data.content_length))
-                //         .await
-                //     {
-                //         Ok(f) => f,
-                //         Err(e) => {
-                //             errors.push(Some(e));
-                //             writers.push(None);
-                //             continue;
-                //         }
-                //     };
-
-                //     BitrotWriter::new(Writer::from_tokio_writer(f), erasure.shard_size(), HashAlgorithm::HighwayHash256)
-                // };
+                .await
+                {
+                    Ok(writer) => writer,
+                    Err(err) => {
+                        warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                        errors.push(Some(err));
+                        writers.push(None);
+                        continue;
+                    }
+                };
 
                 writers.push(Some(writer));
                 errors.push(None);
@@ -6521,6 +6538,10 @@ async fn disks_with_all_parts(
         let corrupted = !meta.mod_time.eq(&latest_meta.mod_time) || !meta.data_dir.eq(&latest_meta.data_dir);
 
         if corrupted {
+            warn!(
+                "disks_with_all_partsv2: metadata is corrupted, object_name={}, index: {index}",
+                object_name
+            );
             meta_errs[index] = Some(DiskError::FileCorrupt);
             parts_metadata[index] = FileInfo::default();
             continue;
@@ -6528,6 +6549,10 @@ async fn disks_with_all_parts(
 
         if erasure_distribution_reliable {
             if !meta.is_valid() {
+                warn!(
+                    "disks_with_all_partsv2: metadata is not valid, object_name={}, index: {index}",
+                    object_name
+                );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
                 continue;
@@ -6538,6 +6563,10 @@ async fn disks_with_all_parts(
                 // Erasure distribution is not the same as onlineDisks
                 // attempt a fix if possible, assuming other entries
                 // might have the right erasure distribution.
+                warn!(
+                    "disks_with_all_partsv2: erasure distribution is not the same as onlineDisks, object_name={}, index: {index}",
+                    object_name
+                );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
                 continue;
@@ -6769,7 +6798,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                     healing: res.healing,
                     scanning: res.scanning,
 
-                    uuid: res.id.clone(),
+                    uuid: res.id.map_or("".to_string(), |id| id.to_string()),
                     major: res.major as u32,
                     minor: res.minor as u32,
                     model: None,

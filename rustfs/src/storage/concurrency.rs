@@ -1165,12 +1165,12 @@ impl HotObjectCache {
     #[allow(dead_code)]
     async fn invalidate_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
         // Always invalidate the latest version key
-        let base_key = format!("{}/{}", bucket, key);
+        let base_key = format!("{bucket}/{key}");
         self.invalidate(&base_key).await;
 
         // Also invalidate the specific version if provided
         if let Some(vid) = version_id {
-            let versioned_key = format!("{}?versionId={}", base_key, vid);
+            let versioned_key = format!("{base_key}?versionId={vid}");
             self.invalidate(&versioned_key).await;
         }
     }
@@ -1625,8 +1625,8 @@ impl ConcurrencyManager {
     /// Cache key string
     pub fn make_cache_key(bucket: &str, key: &str, version_id: Option<&str>) -> String {
         match version_id {
-            Some(vid) => format!("{}/{}?versionId={}", bucket, key, vid),
-            None => format!("{}/{}", bucket, key),
+            Some(vid) => format!("{bucket}/{key}?versionId={vid}"),
+            None => format!("{bucket}/{key}"),
         }
     }
 
@@ -1650,13 +1650,19 @@ pub fn get_concurrency_manager() -> &'static ConcurrencyManager {
     &CONCURRENCY_MANAGER
 }
 
+/// Testing helper to reset the global request counter.
+#[allow(dead_code)]
+pub(crate) fn reset_active_get_requests() {
+    ACTIVE_GET_REQUESTS.store(0, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_concurrent_request_tracking() {
-        // Ensure we start from a clean state
+        reset_active_get_requests();
         assert_eq!(GetObjectGuard::concurrent_requests(), 0);
 
         let _guard1 = GetObjectGuard::new();
@@ -1722,7 +1728,7 @@ mod tests {
         // Fill cache with objects
         for i in 0..200 {
             let data = vec![0u8; 64 * KI_B];
-            cache.put(format!("key_{}", i), data).await;
+            cache.put(format!("key_{i}"), data).await;
         }
 
         let stats = cache.stats().await;
@@ -1779,8 +1785,7 @@ mod tests {
         let result = get_advanced_buffer_size(32 * KI_B as i64, 256 * KI_B, true);
         assert!(
             (16 * KI_B..=64 * KI_B).contains(&result),
-            "Small files should use reduced buffer: {}",
-            result
+            "Small files should use reduced buffer: {result}"
         );
     }
 

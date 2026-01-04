@@ -24,6 +24,7 @@ use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
+use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_HEAL_REQUEST_SIZE};
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
@@ -71,7 +72,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 use tracing::{error, info, warn};
 use url::Host;
-// use url::UrlQuery;
 
 pub mod bucket_meta;
 pub mod event;
@@ -158,14 +158,15 @@ impl Operation for IsAdminHandler {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (_cred, _owner) =
+        let (cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         let access_key_to_check = input_cred.access_key.clone();
 
         // Check if the user is admin by comparing with global credentials
         let is_admin = if let Some(sys_cred) = get_global_action_cred() {
-            sys_cred.access_key == access_key_to_check
+            crate::auth::constant_time_eq(&access_key_to_check, &sys_cred.access_key)
+                || crate::auth::constant_time_eq(&cred.parent_user, &sys_cred.access_key)
         } else {
             false
         };
@@ -686,7 +687,6 @@ impl Stream for MetricsStream {
     type Item = Result<Bytes, StdError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        info!("MetricsStream poll_next");
         let this = Pin::into_inner(self);
         this.inner.poll_next_unpin(cx)
     }
@@ -748,7 +748,6 @@ impl Operation for MetricsHandler {
         let body = Body::from(in_stream);
         spawn(async move {
             while n > 0 {
-                info!("loop, n: {n}");
                 let mut m = RealtimeMetrics::default();
                 let m_local = collect_local_metrics(types, &opts).await;
                 m.merge(m_local);
@@ -765,7 +764,6 @@ impl Operation for MetricsHandler {
                 // todo write resp
                 match serde_json::to_vec(&m) {
                     Ok(re) => {
-                        info!("got metrics, send it to client, m: {m:?}");
                         let _ = tx.send(Ok(Bytes::from(re))).await;
                     }
                     Err(e) => {
@@ -859,11 +857,11 @@ impl Operation for HealHandler {
         let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
         info!("cred: {:?}", cred);
         let mut input = req.input;
-        let bytes = match input.store_all_unlimited().await {
+        let bytes = match input.store_all_limited(MAX_HEAL_REQUEST_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "heal request body too large or failed to read"));
             }
         };
         info!("bytes: {:?}", bytes);
@@ -1051,11 +1049,11 @@ impl Operation for SetRemoteTargetHandler {
             .map_err(ApiError::from)?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "remote target configuration body too large or failed to read"));
             }
         };
 
@@ -1326,8 +1324,7 @@ impl Operation for ProfileHandler {
             let target_arch = std::env::consts::ARCH;
             let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
             let msg = format!(
-                "CPU profiling is not supported on this platform. target_os={}, target_env={}, target_arch={}, requested_url={}",
-                target_os, target_env, target_arch, requested_url
+                "CPU profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}, requested_url={requested_url}"
             );
             return Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(msg))));
         }

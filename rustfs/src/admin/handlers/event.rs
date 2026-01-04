@@ -17,7 +17,7 @@ use crate::auth::{check_key_valid, get_session_token};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
-use rustfs_config::{ENABLE_KEY, EnableState};
+use rustfs_config::{ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_targets::check_mqtt_broker_available;
 use s3s::header::CONTENT_LENGTH;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
@@ -140,7 +140,7 @@ impl Operation for NotificationTarget {
 
         // 4. The parsing request body is KVS (Key-Value Store)
         let mut input = req.input;
-        let body = input.store_all_unlimited().await.map_err(|e| {
+        let body = input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|e| {
             warn!("failed to read request body: {:?}", e);
             s3_error!(InvalidRequest, "failed to read request body")
         })?;

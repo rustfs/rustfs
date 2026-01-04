@@ -12,4 +12,6 @@ WORKDIR /app
 
 COPY --from=builder /build/target/release/rustfs-mcp /app/
 
+RUN apt-get update && apt-get install -y ca-certificates && update-ca-certificates
+
 ENTRYPOINT ["/app/rustfs-mcp"]

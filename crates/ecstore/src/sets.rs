@@ -40,11 +40,12 @@ use futures::future::join_all;
 use http::HeaderMap;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_common::{
-    globals::GLOBAL_Local_Node_Name,
+    GLOBAL_LOCAL_NODE_NAME,
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
 
+use rustfs_lock::FastLockGuard;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
@@ -170,7 +171,7 @@ impl Sets {
 
             let set_disks = SetDisks::new(
                 fast_lock_manager.clone(),
-                GLOBAL_Local_Node_Name.read().await.to_string(),
+                GLOBAL_LOCAL_NODE_NAME.read().await.to_string(),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
                 parity_count,
@@ -255,7 +256,7 @@ impl Sets {
         self.connect_disks().await;
 
         // TODO: config interval
-        let mut interval = tokio::time::interval(Duration::from_secs(15 * 3));
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
                _= interval.tick()=>{
@@ -366,6 +367,10 @@ impl ObjectIO for Sets {
 
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
+    #[tracing::instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
+        self.disk_set[0].new_ns_lock(bucket, object).await
+    }
     #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
         unimplemented!()

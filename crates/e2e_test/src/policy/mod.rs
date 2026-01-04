@@ -11,3 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+//! Policy-specific tests for RustFS
+//!
+//! This module provides comprehensive tests for AWS IAM policy variables
+//! including single-value, multi-value, and nested variable scenarios.
+
+mod policy_variables_test;
+mod test_env;
+mod test_runner;

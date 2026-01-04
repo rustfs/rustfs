@@ -212,6 +212,8 @@ pub struct HealChannelRequest {
     pub bucket: String,
     /// Object prefix (optional)
     pub object_prefix: Option<String>,
+    /// Object version ID (optional)
+    pub object_version_id: Option<String>,
     /// Force start heal
     pub force_start: bool,
     /// Priority
@@ -346,6 +348,7 @@ pub fn create_heal_request(
         id: Uuid::new_v4().to_string(),
         bucket,
         object_prefix,
+        object_version_id: None,
         force_start,
         priority: priority.unwrap_or_default(),
         pool_index: None,
@@ -374,6 +377,7 @@ pub fn create_heal_request_with_options(
         id: Uuid::new_v4().to_string(),
         bucket,
         object_prefix,
+        object_version_id: None,
         force_start,
         priority: priority.unwrap_or_default(),
         pool_index,
@@ -503,6 +507,7 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
         bucket: "".to_string(),
         object_prefix: None,
         disk: Some(set_disk_id),
+        object_version_id: None,
         force_start: false,
         priority: priority.unwrap_or_default(),
         pool_index: None,
