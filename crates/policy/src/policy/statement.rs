@@ -151,7 +151,7 @@ impl Validator for Statement {
             return Err(IamError::NonAction.into());
         }
 
-        // policy must contain either Resource or NotResource, and cannot have both empty.
+        // policy must contain either Resource or NotResource (but not both), and cannot have both empty.
         if self.resources.is_empty() && self.not_resources.is_empty() {
             return Err(IamError::NonResource.into());
         }
