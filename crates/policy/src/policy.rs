@@ -51,6 +51,9 @@ pub enum Error {
     #[error("'Resource' is empty")]
     NonResource,
 
+    #[error("'Resource' and 'NotResource' cannot both be specified in the same statement")]
+    BothResourceAndNotResource,
+
     #[error("invalid key name: '{0}'")]
     InvalidKeyName(String),
 

@@ -156,6 +156,10 @@ impl Validator for Statement {
             return Err(IamError::NonResource.into());
         }
 
+        if !self.resources.is_empty() && !self.not_resources.is_empty() {
+            return Err(IamError::BothResourceAndNotResource.into());
+        }
+
         self.actions.is_valid()?;
         self.not_actions.is_valid()?;
         self.resources.is_valid()?;
@@ -248,6 +252,10 @@ impl Validator for BPStatement {
 
         if self.resources.is_empty() && self.not_resources.is_empty() {
             return Err(IamError::NonResource.into());
+        }
+
+        if !self.resources.is_empty() && !self.not_resources.is_empty() {
+            return Err(IamError::BothResourceAndNotResource.into());
         }
 
         self.actions.is_valid()?;
