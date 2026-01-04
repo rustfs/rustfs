@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 pub struct LocalKmsClient {
     config: LocalConfig,
     /// In-memory cache of loaded keys for performance
-    key_cache: RwLock<HashMap<String, MasterKey>>,
+    key_cache: RwLock<HashMap<String, MasterKeyInfo>>,
     /// Master encryption key for encrypting stored keys
     master_cipher: Option<Aes256Gcm>,
     /// DEK encryption implementation
@@ -109,7 +109,7 @@ impl LocalKmsClient {
     }
 
     /// Load a master key from disk
-    async fn load_master_key(&self, key_id: &str) -> Result<MasterKey> {
+    async fn load_master_key(&self, key_id: &str) -> Result<MasterKeyInfo> {
         let key_path = self.master_key_path(key_id);
         if !key_path.exists() {
             return Err(KmsError::key_not_found(key_id));
@@ -135,7 +135,7 @@ impl LocalKmsClient {
             stored_key.encrypted_key_material
         };
 
-        Ok(MasterKey {
+        Ok(MasterKeyInfo {
             key_id: stored_key.key_id,
             version: stored_key.version,
             algorithm: stored_key.algorithm,
@@ -150,7 +150,7 @@ impl LocalKmsClient {
     }
 
     /// Save a master key to disk
-    async fn save_master_key(&self, master_key: &MasterKey, key_material: &[u8]) -> Result<()> {
+    async fn save_master_key(&self, master_key: &MasterKeyInfo, key_material: &[u8]) -> Result<()> {
         let key_path = self.master_key_path(&master_key.key_id);
 
         // Encrypt key material if master cipher is available
@@ -249,7 +249,7 @@ impl LocalKmsClient {
 
 #[async_trait]
 impl KmsClient for LocalKmsClient {
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKey> {
+    async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKeyInfo> {
         debug!("Generating data key for master key: {}", request.master_key_id);
 
         // Generate random data key material
@@ -279,7 +279,7 @@ impl KmsClient for LocalKmsClient {
         // Serialize the envelope as the ciphertext
         let ciphertext = serde_json::to_vec(&envelope)?;
 
-        let data_key = DataKey::new(envelope.key_id, 1, Some(plaintext_key), ciphertext, request.key_spec.clone());
+        let data_key = DataKeyInfo::new(envelope.key_id, 1, Some(plaintext_key), ciphertext, request.key_spec.clone());
 
         info!("Generated data key for master key: {}", request.master_key_id);
         Ok(data_key)
@@ -341,7 +341,7 @@ impl KmsClient for LocalKmsClient {
         Ok(plaintext)
     }
 
-    async fn create_key(&self, key_id: &str, algorithm: &str, context: Option<&OperationContext>) -> Result<MasterKey> {
+    async fn create_key(&self, key_id: &str, algorithm: &str, context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         debug!("Creating master key: {}", key_id);
 
         // Check if key already exists
@@ -361,7 +361,7 @@ impl KmsClient for LocalKmsClient {
             .map(|ctx| ctx.principal.clone())
             .unwrap_or_else(|| "local-kms".to_string());
 
-        let master_key = MasterKey::new_with_description(key_id.to_string(), algorithm.to_string(), Some(created_by), None);
+        let master_key = MasterKeyInfo::new_with_description(key_id.to_string(), algorithm.to_string(), Some(created_by), None);
 
         // Save to disk
         self.save_master_key(&master_key, &key_material).await?;
@@ -516,7 +516,7 @@ impl KmsClient for LocalKmsClient {
         Ok(())
     }
 
-    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKey> {
+    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         debug!("Rotating key: {}", key_id);
 
         let mut master_key = self.load_master_key(key_id).await?;
@@ -588,7 +588,7 @@ impl KmsBackend for LocalKmsBackend {
             // Generate key material
             let key_material = generate_key_material(algorithm)?;
 
-            let master_key = MasterKey::new_with_description(
+            let master_key = MasterKeyInfo::new_with_description(
                 key_id.clone(),
                 algorithm.to_string(),
                 Some("local-kms".to_string()),

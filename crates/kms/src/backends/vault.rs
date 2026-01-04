@@ -286,7 +286,7 @@ impl VaultKmsClient {
 
 #[async_trait]
 impl KmsClient for VaultKmsClient {
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKey> {
+    async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKeyInfo> {
         debug!("Generating data key for master key: {}", request.master_key_id);
 
         // Generate random data key material using the existing method
@@ -309,7 +309,7 @@ impl KmsClient for VaultKmsClient {
         // Serialize the envelope as the ciphertext
         let ciphertext = serde_json::to_vec(&envelope)?;
 
-        let data_key = DataKey::new(envelope.key_id, 1, Some(plaintext_key), ciphertext, request.key_spec.clone());
+        let data_key = DataKeyInfo::new(envelope.key_id, 1, Some(plaintext_key), ciphertext, request.key_spec.clone());
 
         info!("Generated data key for master key: {}", request.master_key_id);
         Ok(data_key)
@@ -372,7 +372,7 @@ impl KmsClient for VaultKmsClient {
         Ok(plaintext)
     }
 
-    async fn create_key(&self, key_id: &str, algorithm: &str, _context: Option<&OperationContext>) -> Result<MasterKey> {
+    async fn create_key(&self, key_id: &str, algorithm: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         debug!("Creating master key: {} with algorithm: {}", key_id, algorithm);
 
         // Check if key already exists
@@ -400,7 +400,7 @@ impl KmsClient for VaultKmsClient {
         // Store in Vault
         self.store_key_data(key_id, &key_data).await?;
 
-        let master_key = MasterKey {
+        let master_key = MasterKeyInfo {
             key_id: key_id.to_string(),
             version: key_data.version,
             algorithm: key_data.algorithm.clone(),
@@ -523,7 +523,7 @@ impl KmsClient for VaultKmsClient {
         Ok(())
     }
 
-    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKey> {
+    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         debug!("Rotating key: {}", key_id);
 
         let mut key_data = self.get_key_data(key_id).await?;
@@ -535,7 +535,7 @@ impl KmsClient for VaultKmsClient {
 
         self.store_key_data(key_id, &key_data).await?;
 
-        let master_key = MasterKey {
+        let master_key = MasterKeyInfo {
             key_id: key_id.to_string(),
             version: key_data.version,
             algorithm: key_data.algorithm,
