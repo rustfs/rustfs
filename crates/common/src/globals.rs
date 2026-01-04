@@ -44,7 +44,7 @@ pub async fn set_global_init_time_now() {
     *GLOBAL_INIT_TIME.write().await = Some(now);
 }
 
-/// get the global RustFS initialization time.
+/// Get the global RustFS initialization time.
 ///
 /// # Returns
 /// * `Option<DateTime<Utc>>` - The initialization time if set.

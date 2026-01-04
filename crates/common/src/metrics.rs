@@ -18,6 +18,7 @@ use rustfs_madmin::metrics::ScannerMetrics as M_ScannerMetrics;
 use std::{
     collections::HashMap,
     fmt::Display,
+    future::Future,
     pin::Pin,
     sync::{
         Arc, OnceLock,
