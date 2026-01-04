@@ -14,6 +14,7 @@
 
 #![allow(non_upper_case_globals)] // FIXME
 
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tokio::sync::RwLock;
@@ -26,6 +27,30 @@ pub static GLOBAL_RUSTFS_ADDR: LazyLock<RwLock<String>> = LazyLock::new(|| RwLoc
 pub static GLOBAL_CONN_MAP: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 pub static GLOBAL_ROOT_CERT: LazyLock<RwLock<Option<Vec<u8>>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_MTLS_IDENTITY: LazyLock<RwLock<Option<MtlsIdentityPem>>> = LazyLock::new(|| RwLock::new(None));
+/// Global initialization time of the RustFS node.
+pub static GLOBAL_INIT_TIME: LazyLock<RwLock<Option<DateTime<Utc>>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Set the global local node name.
+///
+/// # Arguments
+/// * `name` - A string slice representing the local node name.
+pub async fn set_global_local_node_name(name: &str) {
+    *GLOBAL_LOCAL_NODE_NAME.write().await = name.to_string();
+}
+
+/// Set the global RustFS initialization time to the current UTC time.
+pub async fn set_global_init_time_now() {
+    let now = Utc::now();
+    *GLOBAL_INIT_TIME.write().await = Some(now);
+}
+
+/// get the global RustFS initialization time.
+///
+/// # Returns
+/// * `Option<DateTime<Utc>>` - The initialization time if set.
+pub async fn get_global_init_time() -> Option<DateTime<Utc>> {
+    *GLOBAL_INIT_TIME.read().await
+}
 
 /// Set the global RustFS address used for gRPC connections.
 ///
