@@ -111,6 +111,16 @@ pub async fn test_ftps_core_operations() -> Result<()> {
         ftp_stream.put_file(filename, &mut Cursor::new(content.as_bytes()))?;
         info!("PASS: put file '{}' ({} bytes) successful", filename, content.len());
 
+        info!("Testing FTPS: download file");
+        let downloaded_content = ftp_stream.retr(filename, |stream| {
+            let mut buffer = Vec::new();
+            stream.read_to_end(&mut buffer).map_err(suppaftp::FtpError::ConnectionError)?;
+            Ok(buffer)
+        })?;
+        let downloaded_str = String::from_utf8(downloaded_content)?;
+        assert_eq!(downloaded_str, content, "Downloaded content should match uploaded content");
+        info!("PASS: download file '{}' successful, content matches", filename);
+
         info!("Testing FTPS: ls list objects in bucket");
         let list = ftp_stream.list(None)?;
         assert!(list.iter().any(|line| line.contains(filename)), "File should appear in list");
