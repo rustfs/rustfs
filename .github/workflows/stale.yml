@@ -1,0 +1,20 @@
+name: "Mark stale issues"
+on:
+  schedule:
+    - cron: "30 1 * * *"
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          stale-issue-message: 'This issue has been automatically marked as stale because it has not had recent activity. It will be closed if no further activity occurs.'
+          stale-issue-label: 'stale'
+          ## Mark if there is no activity for more than 7 days
+          days-before-stale: 7  
+          # If no one responds after 3 days, the tag will be closed.
+          days-before-close: 3   
+          # These tags are exempt and will not close automatically.
+          exempt-issue-labels: 'pinned,security'

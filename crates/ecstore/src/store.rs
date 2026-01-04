@@ -78,8 +78,8 @@ use uuid::Uuid;
 /// Check if a directory contains any xl.meta files (indicating actual S3 objects)
 /// This is used to determine if a bucket is empty for deletion purposes.
 async fn has_xlmeta_files(path: &std::path::Path) -> bool {
-    use tokio::fs;
     use crate::disk::STORAGE_FORMAT_FILE;
+    use tokio::fs;
 
     let mut stack = vec![path.to_path_buf()];
 
@@ -104,10 +104,10 @@ async fn has_xlmeta_files(path: &std::path::Path) -> bool {
             }
 
             // If it's a directory, add to stack for further exploration
-            if let Ok(file_type) = entry.file_type().await {
-                if file_type.is_dir() {
-                    stack.push(entry.path());
-                }
+            if let Ok(file_type) = entry.file_type().await
+                && file_type.is_dir()
+            {
+                stack.push(entry.path());
             }
         }
     }

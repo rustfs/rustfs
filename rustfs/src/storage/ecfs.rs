@@ -1588,7 +1588,9 @@ impl S3 for FS {
 
             let mut object = ObjectToDelete {
                 object_name: obj_id.key.clone(),
-                version_id: version_id.clone().map(|v| Uuid::parse_str(&v).unwrap()),
+                version_id: version_id
+                    .clone()
+                    .map(|v| Uuid::parse_str(&v).expect("version_id validated as UUID earlier")),
                 ..Default::default()
             };
 
@@ -4719,7 +4721,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None, remote_addr);
 
         let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
