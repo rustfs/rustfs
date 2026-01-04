@@ -107,6 +107,14 @@ impl Statement {
                 break 'c self.conditions.evaluate_with_resolver(args.conditions, Some(&resolver)).await;
             }
 
+            if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions).await {
+                break 'c false;
+            }
+
+            if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions).await {
+                break 'c false;
+            }
+
             if !self
                 .resources
                 .is_match_with_resolver(&resource, args.conditions, Some(&resolver))
@@ -135,13 +143,15 @@ impl Validator for Statement {
             return Err(IamError::NonAction.into());
         }
 
-        if self.resources.is_empty() {
+        // policy must contain either Resource or NotResource, and cannot have both empty.
+        if self.resources.is_empty() && self.not_resources.is_empty() {
             return Err(IamError::NonResource.into());
         }
 
         self.actions.is_valid()?;
         self.not_actions.is_valid()?;
         self.resources.is_valid()?;
+        self.not_resources.is_valid()?;
 
         Ok(())
     }
@@ -228,13 +238,14 @@ impl Validator for BPStatement {
             return Err(IamError::NonAction.into());
         }
 
-        if self.resources.is_empty() {
+        if self.resources.is_empty() && self.not_resources.is_empty() {
             return Err(IamError::NonResource.into());
         }
 
         self.actions.is_valid()?;
         self.not_actions.is_valid()?;
         self.resources.is_valid()?;
+        self.not_resources.is_valid()?;
 
         Ok(())
     }
