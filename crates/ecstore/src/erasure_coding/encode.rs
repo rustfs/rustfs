@@ -150,10 +150,10 @@ impl Erasure {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         // Check if the inner error is a checksum mismatch - if so, propagate it
-                        if let Some(inner) = e.get_ref() {
-                            if rustfs_rio::is_checksum_mismatch(inner) {
-                                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
-                            }
+                        if let Some(inner) = e.get_ref()
+                            && rustfs_rio::is_checksum_mismatch(inner)
+                        {
+                            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
                         }
                         break;
                     }

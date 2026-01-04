@@ -635,10 +635,10 @@ fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
 }
 
 pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
-    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str()) {
-        if let Ok(restore_status) = parse_restore_obj_status(restore_hdr) {
-            return restore_status.on_disk();
-        }
+    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str())
+        && let Ok(restore_status) = parse_restore_obj_status(restore_hdr)
+    {
+        return restore_status.on_disk();
     }
     false
 }

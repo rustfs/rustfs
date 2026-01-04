@@ -56,7 +56,7 @@ jobs:
           helm package ./helm/rustfs --destination helm/rustfs/ --version "0.0.$package_version"
 
       - name: Upload helm package as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: helm-package
           path: helm/rustfs/*.tgz
@@ -74,7 +74,7 @@ jobs:
           token: ${{ secrets.RUSTFS_HELM_PACKAGE }}
 
       - name: Download helm package
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: helm-package
           path: ./

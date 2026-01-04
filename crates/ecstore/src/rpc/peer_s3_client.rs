@@ -101,10 +101,10 @@ impl S3PeerSys {
         for pool_idx in 0..self.pools_count {
             let mut per_pool_errs = vec![None; self.clients.len()];
             for (i, client) in self.clients.iter().enumerate() {
-                if let Some(v) = client.get_pools() {
-                    if v.contains(&pool_idx) {
-                        per_pool_errs[i] = errs[i].clone();
-                    }
+                if let Some(v) = client.get_pools()
+                    && v.contains(&pool_idx)
+                {
+                    per_pool_errs[i] = errs[i].clone();
                 }
             }
             let qu = per_pool_errs.len() / 2;
@@ -136,10 +136,10 @@ impl S3PeerSys {
         for pool_idx in 0..self.pools_count {
             let mut per_pool_errs = vec![None; self.clients.len()];
             for (i, client) in self.clients.iter().enumerate() {
-                if let Some(v) = client.get_pools() {
-                    if v.contains(&pool_idx) {
-                        per_pool_errs[i] = errs[i].clone();
-                    }
+                if let Some(v) = client.get_pools()
+                    && v.contains(&pool_idx)
+                {
+                    per_pool_errs[i] = errs[i].clone();
                 }
             }
             let qu = per_pool_errs.len() / 2;

@@ -436,10 +436,10 @@ impl NodeScanner {
     /// create a new node scanner
     pub fn new(node_id: String, config: NodeScannerConfig) -> Self {
         // Ensure data directory exists
-        if !config.data_dir.exists() {
-            if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
-                error!("create data directory failed {:?}: {}", config.data_dir, e);
-            }
+        if !config.data_dir.exists()
+            && let Err(e) = std::fs::create_dir_all(&config.data_dir)
+        {
+            error!("create data directory failed {:?}: {}", config.data_dir, e);
         }
 
         let stats_manager = Arc::new(LocalStatsManager::new(&node_id, &config.data_dir));

@@ -41,7 +41,7 @@ use crate::{
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
 pub struct RemoveBucketOptions {
-    _forced_elete: bool,
+    _forced_delete: bool,
 }
 
 #[derive(Debug)]

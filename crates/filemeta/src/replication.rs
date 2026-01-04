@@ -270,14 +270,12 @@ impl ReplicationState {
                         return repl_status;
                     }
 
-                    if repl_status == ReplicationStatusType::Completed {
-                        if let (Some(replica_timestamp), Some(replication_timestamp)) =
+                    if repl_status == ReplicationStatusType::Completed
+                        && let (Some(replica_timestamp), Some(replication_timestamp)) =
                             (self.replica_timestamp, self.replication_timestamp)
-                        {
-                            if replica_timestamp > replication_timestamp {
-                                return self.replica_status.clone();
-                            }
-                        }
+                        && replica_timestamp > replication_timestamp
+                    {
+                        return self.replica_status.clone();
                     }
 
                     return repl_status;
