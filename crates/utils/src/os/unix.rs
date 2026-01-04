@@ -25,7 +25,8 @@ fn blocks_available(stat: &Statfs) -> u64 {
     match stat.blocks_available().try_into() {
         Ok(bavail) => bavail,
         Err(e) => {
-            eprintln!("warning: blocks_available returned a negative value: Using 0 as fallback.", e);
+            eprintln!("warning: blocks_available returned a negative value: Using 0 as fallback. {}", e);
+            0
         }
     }
 }
@@ -37,7 +38,8 @@ fn files_free(stat: &Statfs) -> u64 {
     match stat.files_free().try_into() {
         Ok(files_free) => files_free,
         Err(e) => {
-            eprintln!("warning: files_free returned a negative value: Using 0 as fallback.", e);
+            eprintln!("warning: files_free returned a negative value: Using 0 as fallback. {}", e);
+            0
         }
     }
 }
