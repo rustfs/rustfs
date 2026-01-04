@@ -156,7 +156,9 @@ macro_rules! try_ {
     };
 }
 
-static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
+/// Static owner information for RustFS buckets.
+/// Used in ListBuckets and other S3 operations that return owner information.
+pub static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
     display_name: Some("rustfs".to_owned()),
     id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
 });

@@ -1478,10 +1478,6 @@ impl Operation for ProfileStatusHandler {
 /// S3 XML namespace constant
 const XMLNS_S3: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
-/// Static owner ID (consistent with standard ListBuckets handler)
-const RUSTFS_OWNER_ID: &str = "c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66";
-const RUSTFS_OWNER_DISPLAY_NAME: &str = "rustfs";
-
 /// Default quota values (matching Ceph RGW defaults)
 const DEFAULT_QUOTA_MAX_BYTES: i64 = -1;
 const DEFAULT_QUOTA_MAX_BUCKETS: i64 = 1000;
@@ -1546,6 +1542,7 @@ impl Operation for AccountUsageHandler {
 ///
 /// Uses s3s::xml::Serializer which automatically handles XML escaping.
 fn generate_list_buckets_with_usage_xml(bucket_infos: &[rustfs_ecstore::store_api::BucketInfo]) -> Vec<u8> {
+    use crate::storage::ecfs::RUSTFS_OWNER;
     use s3s::xml::Serializer;
     use time::format_description::well_known::Rfc3339;
 
@@ -1555,12 +1552,16 @@ fn generate_list_buckets_with_usage_xml(bucket_infos: &[rustfs_ecstore::store_ap
     // Write XML declaration
     let _ = ser.decl();
 
+    // Reuse RUSTFS_OWNER from ecfs (same as standard ListBuckets handler)
+    let owner_id = RUSTFS_OWNER.id.as_deref().unwrap_or("");
+    let owner_display_name = RUSTFS_OWNER.display_name.as_deref().unwrap_or("rustfs");
+
     // Write ListAllMyBucketsResult with xmlns
     let _ = ser.element_with_ns("ListAllMyBucketsResult", XMLNS_S3, |s| {
         // Owner section
         s.element("Owner", |s| {
-            s.content("ID", RUSTFS_OWNER_ID)?;
-            s.content("DisplayName", RUSTFS_OWNER_DISPLAY_NAME)
+            s.content("ID", owner_id)?;
+            s.content("DisplayName", owner_display_name)
         })?;
 
         // Buckets section
