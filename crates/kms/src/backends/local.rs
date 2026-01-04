@@ -40,6 +40,7 @@ pub struct LocalKmsClient {
     config: LocalConfig,
     /// In-memory cache of loaded keys for performance
     key_cache: RwLock<HashMap<String, MasterKeyInfo>>,
+    key_cache: RwLock<HashMap<String, MasterKeyInfo>>,
     /// Master encryption key for encrypting stored keys
     master_cipher: Option<Aes256Gcm>,
     /// DEK encryption implementation
@@ -110,8 +111,8 @@ impl LocalKmsClient {
         self.config.key_dir.join(format!("{key_id}.key"))
     }
 
-    /// Decode and decrypt a stored key file, returning both the metadata and decrypted key material
-    async fn decode_stored_key(&self, key_id: &str) -> Result<(StoredMasterKey, Vec<u8>)> {
+    /// Load a master key from disk
+    async fn load_master_key(&self, key_id: &str) -> Result<MasterKeyInfo> {
         let key_path = self.master_key_path(key_id);
         if !key_path.exists() {
             return Err(KmsError::key_not_found(key_id));
@@ -144,13 +145,6 @@ impl LocalKmsClient {
                 .decode(&stored_key.encrypted_key_material)
                 .map_err(|e| KmsError::cryptographic_error("base64_decode", e.to_string()))?
         };
-
-        Ok((stored_key, key_material))
-    }
-
-    /// Load a master key from disk
-    async fn load_master_key(&self, key_id: &str) -> Result<MasterKeyInfo> {
-        let (stored_key, _key_material) = self.decode_stored_key(key_id).await?;
 
         Ok(MasterKeyInfo {
             key_id: stored_key.key_id,

@@ -317,7 +317,7 @@ impl KmsClient for VaultKmsClient {
         // Serialize the envelope as the ciphertext
         let ciphertext = serde_json::to_vec(&envelope)?;
 
-        let data_key = DataKey::new(envelope.key_id, 1, Some(plaintext_key), ciphertext, request.key_spec.clone());
+        let data_key = DataKeyInfo::new(envelope.key_id, 1, Some(plaintext_key), ciphertext, request.key_spec.clone());
 
         info!("Generated data key for master key: {}", request.master_key_id);
         Ok(data_key)
