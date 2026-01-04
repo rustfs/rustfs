@@ -23,8 +23,8 @@ use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
 use crate::error::{
-    StorageError, is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_read_quorum,
-    is_err_version_not_found, to_object_err,
+    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
+    is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
 use crate::global::{
     DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
@@ -74,6 +74,46 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+/// Check if a directory contains any xl.meta files (indicating actual S3 objects)
+/// This is used to determine if a bucket is empty for deletion purposes.
+async fn has_xlmeta_files(path: &std::path::Path) -> bool {
+    use tokio::fs;
+    use crate::disk::STORAGE_FORMAT_FILE;
+
+    let mut stack = vec![path.to_path_buf()];
+
+    while let Some(current_path) = stack.pop() {
+        let mut entries = match fs::read_dir(&current_path).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            // Skip hidden files/directories (like .rustfs.sys)
+            if file_name_str.starts_with('.') {
+                continue;
+            }
+
+            // Check if this is an xl.meta file
+            if file_name_str == STORAGE_FORMAT_FILE {
+                return true;
+            }
+
+            // If it's a directory, add to stack for further exploration
+            if let Ok(file_type) = entry.file_type().await {
+                if file_type.is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+    }
+
+    false
+}
 
 const MAX_UPLOADS_LIST: usize = 10000;
 
@@ -1312,14 +1352,36 @@ impl StorageAPI for ECStore {
 
         // TODO: nslock
 
-        let mut opts = opts.clone();
+        // Check bucket exists before deletion (per S3 API spec)
+        // If bucket doesn't exist, return NoSuchBucket error
+        if let Err(err) = self.peer_sys.get_bucket_info(bucket, &BucketOptions::default()).await {
+            // Convert DiskError to StorageError for comparison
+            let storage_err: StorageError = err.into();
+            if is_err_bucket_not_found(&storage_err) {
+                return Err(StorageError::BucketNotFound(bucket.to_string()));
+            }
+            return Err(to_object_err(storage_err, vec![bucket]));
+        }
+
+        // Check bucket is empty before deletion (per S3 API spec)
+        // If bucket is not empty (contains actual objects with xl.meta files) and force
+        // is not set, return BucketNotEmpty error.
+        // Note: Empty directories (left after object deletion) should NOT count as objects.
         if !opts.force {
-            // FIXME: check bucket exists
-            opts.force = true
+            let local_disks = all_local_disk().await;
+            for disk in local_disks.iter() {
+                // Check if bucket directory contains any xl.meta files (actual objects)
+                // We recursively scan for xl.meta files to determine if bucket has objects
+                // Use the disk's root path to construct bucket path
+                let bucket_path = disk.path().join(bucket);
+                if has_xlmeta_files(&bucket_path).await {
+                    return Err(StorageError::BucketNotEmpty(bucket.to_string()));
+                }
+            }
         }
 
         self.peer_sys
-            .delete_bucket(bucket, &opts)
+            .delete_bucket(bucket, opts)
             .await
             .map_err(|e| to_object_err(e.into(), vec![bucket]))?;
 

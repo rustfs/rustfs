@@ -1548,16 +1548,19 @@ impl S3 for FS {
 
         let mut object_to_delete = Vec::new();
         let mut object_to_delete_index = HashMap::new();
-        for (idx, object) in delete.objects.iter().enumerate() {
-            if let Some(version_id) = object.version_id.clone() {
-                let _vid = match Uuid::parse_str(&version_id) {
+        for (idx, obj_id) in delete.objects.iter().enumerate() {
+            // Per S3 API spec, "null" string means non-versioned object
+            // Filter out "null" version_id to treat as unversioned
+            let version_id = obj_id.version_id.clone().filter(|v| v != "null");
+            if let Some(ref vid) = version_id {
+                let _vid = match Uuid::parse_str(vid) {
                     Ok(v) => v,
                     Err(err) => {
                         delete_results[idx].error = Some(Error {
                             code: Some("NoSuchVersion".to_string()),
-                            key: Some(object.key.clone()),
+                            key: Some(obj_id.key.clone()),
                             message: Some(err.to_string()),
-                            version_id: Some(version_id),
+                            version_id: Some(vid.clone()),
                         });
 
                         continue;
@@ -1568,24 +1571,24 @@ impl S3 for FS {
             {
                 let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
                 req_info.bucket = Some(bucket.clone());
-                req_info.object = Some(object.key.clone());
-                req_info.version_id = object.version_id.clone();
+                req_info.object = Some(obj_id.key.clone());
+                req_info.version_id = version_id.clone();
             }
 
             let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::DeleteObjectAction)).await;
             if let Err(e) = auth_res {
                 delete_results[idx].error = Some(Error {
                     code: Some("AccessDenied".to_string()),
-                    key: Some(object.key.clone()),
+                    key: Some(obj_id.key.clone()),
                     message: Some(e.to_string()),
-                    version_id: object.version_id.clone(),
+                    version_id: version_id.clone(),
                 });
                 continue;
             }
 
             let mut object = ObjectToDelete {
-                object_name: object.key.clone(),
-                version_id: object.version_id.clone().map(|v| Uuid::parse_str(&v).unwrap()),
+                object_name: obj_id.key.clone(),
+                version_id: version_id.clone().map(|v| Uuid::parse_str(&v).unwrap()),
                 ..Default::default()
             };
 
@@ -2689,10 +2692,21 @@ impl S3 for FS {
             }
         }
 
+        // Extract standard HTTP headers from user_defined metadata
+        // Note: These headers are stored with lowercase keys by extract_metadata_from_mime
+        let cache_control = metadata_map.get("cache-control").cloned();
+        let content_disposition = metadata_map.get("content-disposition").cloned();
+        let content_language = metadata_map.get("content-language").cloned();
+        let expires = info.expires.map(Timestamp::from);
+
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
             content_encoding: info.content_encoding.clone(),
+            cache_control,
+            content_disposition,
+            content_language,
+            expires,
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&metadata_map),
@@ -2790,6 +2804,10 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
+        // Capture the original marker from the request before conversion
+        // S3 API requires the marker field to be echoed back in the response
+        let request_marker = req.input.marker.clone();
+
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
         Ok(v2_resp.map_output(|v2| {
@@ -2812,7 +2830,7 @@ impl S3 for FS {
                     .cloned();
 
                 // NextMarker should be the lexicographically last item
-                // This matches Ceph S3 behavior used by s3-tests
+                // This matches S3 standard behavior
                 match (last_key, last_prefix) {
                     (Some(k), Some(p)) => {
                         // Return the lexicographically greater one
@@ -2826,6 +2844,10 @@ impl S3 for FS {
                 None
             };
 
+            // S3 API requires marker field in response, echoing back the request marker
+            // If no marker was provided in request, return empty string per S3 standard
+            let marker = Some(request_marker.unwrap_or_default());
+
             ListObjectsOutput {
                 contents: v2.contents,
                 delimiter: v2.delimiter,
@@ -2835,6 +2857,7 @@ impl S3 for FS {
                 max_keys: v2.max_keys,
                 common_prefixes: v2.common_prefixes,
                 is_truncated: v2.is_truncated,
+                marker,
                 next_marker,
                 ..Default::default()
             }
@@ -2872,15 +2895,17 @@ impl S3 for FS {
 
         validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
 
-        let start_after = start_after.filter(|v| !v.is_empty());
+        // Save original start_after for response (per S3 API spec, must echo back if provided)
+        let response_start_after = start_after.clone();
+        let start_after_for_query = start_after.filter(|v| !v.is_empty());
 
-        let continuation_token = continuation_token.filter(|v| !v.is_empty());
-
-        // Save the original encoded continuation_token for response
-        let encoded_continuation_token = continuation_token.clone();
+        // Save original continuation_token for response (per S3 API spec, must echo back if provided)
+        // Note: empty string should still be echoed back in the response
+        let response_continuation_token = continuation_token.clone();
+        let continuation_token_for_query = continuation_token.filter(|v| !v.is_empty());
 
         // Decode continuation_token from base64 for internal use
-        let continuation_token = continuation_token
+        let decoded_continuation_token = continuation_token_for_query
             .map(|token| {
                 base64_simd::STANDARD
                     .decode_to_vec(token.as_bytes())
@@ -2902,11 +2927,11 @@ impl S3 for FS {
             .list_objects_v2(
                 &bucket,
                 &prefix,
-                continuation_token,
+                decoded_continuation_token,
                 delimiter.clone(),
                 max_keys,
                 fetch_owner.unwrap_or_default(),
-                start_after,
+                start_after_for_query,
                 incl_deleted,
             )
             .await
@@ -2975,8 +3000,9 @@ impl S3 for FS {
 
         let output = ListObjectsV2Output {
             is_truncated: Some(object_infos.is_truncated),
-            continuation_token: encoded_continuation_token,
+            continuation_token: response_continuation_token,
             next_continuation_token,
+            start_after: response_start_after,
             key_count: Some(key_count),
             max_keys: Some(max_keys),
             contents: Some(objects),
