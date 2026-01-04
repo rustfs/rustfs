@@ -25,6 +25,10 @@ spec:
       imagePullSecrets:
         {{- . | nindent 8 }}
       {{- end }}
+      {{- if and .Values.nodeSelector (not .Values.affinity.nodeAffinity) }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      {{- end }}
       {{- if .Values.affinity }}
       affinity:
         {{- if .Values.affinity.nodeAffinity }}
