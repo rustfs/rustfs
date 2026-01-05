@@ -115,7 +115,6 @@ md5.workspace = true
 mime_guess = { workspace = true }
 moka = { workspace = true }
 pin-project-lite.workspace = true
-rand = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
