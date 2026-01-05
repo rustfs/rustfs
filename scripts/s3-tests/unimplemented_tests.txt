@@ -18,7 +18,7 @@
 # - Conditional writes: If-Match/If-None-Match for writes
 # - Object ownership: BucketOwnerEnforced/Preferred
 #
-# Total: 83 tests
+# Total: all unimplemented S3 feature tests listed below (keep this comment in sync with the list)
 
 test_bucket_create_delete_bucket_ownership
 test_bucket_logging_owner
