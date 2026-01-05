@@ -13,7 +13,7 @@
 # - POST Object: HTML form upload not implemented
 # - Error format differences: Minor response format variations
 #
-# Total: 488 tests
+# Total: non-standard tests listed below
 
 test_100_continue
 test_100_continue_error_retry
