@@ -376,20 +376,20 @@ pub async fn start_http_server(
             let socket_ref = SockRef::from(&socket);
 
             // Enable TCP Keepalive to detect dead clients (e.g. power loss)
-            // Idle: 10s, Interval: 5s, Retries: 3
+            // Idle: 10s, Interval: 5s, Retries: 3 (where supported)
 
             #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
             let ka = TcpKeepalive::new()
                 .with_time(Duration::from_secs(10))
                 .with_interval(Duration::from_secs(5));
 
-            // OpenBSD and NetBSD do not support TcpKeepalive intervals.
+            // On OpenBSD and NetBSD, socket2 only supports configuring the initial
+            // TCP keepalive timeout; intervals and retries cannot be set.
             #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
             let ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
 
             #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
             let ka = ka.with_retries(3);
-
             if let Err(err) = socket_ref.set_tcp_keepalive(&ka) {
                 warn!(?err, "Failed to set TCP_KEEPALIVE");
             }
