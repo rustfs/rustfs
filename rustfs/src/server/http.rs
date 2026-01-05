@@ -750,10 +750,10 @@ fn get_conn_queue_len() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
 
     #[cfg(target_os = "openbsd")]
-    let mut name = vec![libc::CTL_KERN, libc::KERN_SOMAXCONN];
+    let mut name = [libc::CTL_KERN, libc::KERN_SOMAXCONN];
     #[cfg(any(target_os = "netbsd", target_os = "macos", target_os = "freebsd"))]
-    let mut name = vec![libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
-    let mut buf = [0; 1 as usize];
+    let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
+    let mut buf = [0; 1];
     let mut buf_len = std::mem::size_of_val(&buf);
 
     if unsafe {
@@ -770,7 +770,7 @@ fn get_conn_queue_len() -> i32 {
         return DEFAULT_BACKLOG;
     }
 
-    *buf.first().unwrap_or(&DEFAULT_BACKLOG)
+    buf[0]
 }
 
 /// Determines the listen backlog size.

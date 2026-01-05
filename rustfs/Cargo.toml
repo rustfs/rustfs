@@ -125,7 +125,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
-libc = { workspace = true}
+libc = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
