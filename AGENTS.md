@@ -1,5 +1,14 @@
 # Repository Guidelines
 
+## ⚠️ Pre-Commit Checklist (MANDATORY)
+**Before EVERY commit, you MUST run and pass ALL of the following:**
+```bash
+cargo fmt --all --check    # Code formatting
+cargo clippy --all-targets --all-features -- -D warnings  # Lints
+cargo test --workspace --exclude e2e_test  # Unit tests
+```
+Or simply run `make pre-commit` which covers all checks. **DO NOT commit if any check fails.**
+
 ## Communication Rules
 - Respond to the user in Chinese; use English in all other contexts.
 - Code and documentation must be written in English only. Chinese text is allowed solely as test data/fixtures when a case explicitly requires Chinese-language content for validation.

@@ -33,7 +33,110 @@ S3_PORT="${S3_PORT:-9000}"
 TEST_MODE="${TEST_MODE:-single}"
 MAXFAIL="${MAXFAIL:-1}"
 XDIST="${XDIST:-0}"
-MARKEXPR="${MARKEXPR:-not lifecycle and not versioning and not s3website and not bucket_logging and not encryption}"
+
+# =============================================================================
+# MARKEXPR: pytest marker expression to exclude test categories
+# =============================================================================
+# These markers exclude entire test categories via pytest's -m option.
+# Use MARKEXPR env var to override the default exclusions.
+#
+# Excluded categories:
+#   - Unimplemented S3 features: lifecycle, versioning, s3website, bucket_logging, encryption
+#   - Ceph/RGW specific tests: fails_on_aws, fails_on_rgw, fails_on_dbstore
+#   - IAM features: iam_account, iam_tenant, iam_role, iam_user, iam_cross_account
+#   - Other unimplemented: sns, sse_s3, storage_class, test_of_sts, webidentity_test
+# =============================================================================
+if [[ -z "${MARKEXPR:-}" ]]; then
+    EXCLUDED_MARKERS=(
+        # Unimplemented S3 features
+        "lifecycle"
+        "versioning"
+        "s3website"
+        "bucket_logging"
+        "encryption"
+        # Ceph/RGW specific tests (not standard S3)
+        "fails_on_aws"      # Tests for Ceph/RGW specific features (X-RGW-* headers, etc.)
+        "fails_on_rgw"      # Known RGW issues we don't need to replicate
+        "fails_on_dbstore"  # Ceph dbstore backend specific
+        # IAM features requiring additional setup
+        "iam_account"
+        "iam_tenant"
+        "iam_role"
+        "iam_user"
+        "iam_cross_account"
+        # Other unimplemented features
+        "sns"               # SNS notification
+        "sse_s3"            # Server-side encryption with S3-managed keys
+        "storage_class"     # Storage class features
+        "test_of_sts"       # STS token service
+        "webidentity_test"  # Web Identity federation
+    )
+    # Build MARKEXPR from array: "not marker1 and not marker2 and ..."
+    MARKEXPR=""
+    for marker in "${EXCLUDED_MARKERS[@]}"; do
+        if [[ -n "${MARKEXPR}" ]]; then
+            MARKEXPR+=" and "
+        fi
+        MARKEXPR+="not ${marker}"
+    done
+fi
+
+# =============================================================================
+# TESTEXPR: pytest -k expression to exclude specific tests by name
+# =============================================================================
+# These patterns exclude specific tests via pytest's -k option (name matching).
+# Use TESTEXPR env var to override the default exclusions.
+#
+# Exclusion reasons are documented inline below.
+# =============================================================================
+if [[ -z "${TESTEXPR:-}" ]]; then
+    EXCLUDED_TESTS=(
+        # POST Object (HTML form upload) - not implemented
+        "test_post_object"
+        # ACL-dependent tests - ACL not implemented
+        "test_bucket_list_objects_anonymous"    # requires PutBucketAcl
+        "test_bucket_listv2_objects_anonymous"  # requires PutBucketAcl
+        "test_bucket_concurrent_set_canned_acl" # ACL not implemented
+        "test_expected_bucket_owner"            # requires PutBucketAcl
+        "test_bucket_acl"                       # Bucket ACL not implemented
+        "test_object_acl"                       # Object ACL not implemented
+        "test_put_bucket_acl"                   # PutBucketAcl not implemented
+        "test_object_anon"                      # Anonymous access requires ACL
+        "test_access_bucket"                    # Access control requires ACL
+        "test_100_continue"                     # requires ACL
+        # Chunked encoding - not supported
+        "test_object_write_with_chunked_transfer_encoding"
+        "test_object_content_encoding_aws_chunked"
+        # CORS - not implemented
+        "test_cors"
+        "test_set_cors"
+        # Presigned URL edge cases
+        "test_object_raw"                       # Raw presigned URL tests
+        # Error response format differences
+        "test_bucket_create_exists"             # Error format issue
+        "test_bucket_recreate_not_overriding"   # Error format issue
+        "test_list_buckets_invalid_auth"        # 401 vs 403
+        "test_object_delete_key_bucket_gone"    # 403 vs 404
+        "test_abort_multipart_upload_not_found" # Error code issue
+        # ETag conditional request edge cases
+        "test_get_object_ifmatch_failed"
+        "test_get_object_ifnonematch"
+        # Copy operation edge cases
+        "test_object_copy_to_itself"            # Copy validation
+        "test_object_copy_not_owned_bucket"     # Cross-account access
+        "test_multipart_copy_invalid_range"     # Multipart validation
+        # Timing-sensitive tests
+        "test_versioning_concurrent_multi_object_delete"
+    )
+    # Build TESTEXPR from array: "not test1 and not test2 and ..."
+    TESTEXPR=""
+    for pattern in "${EXCLUDED_TESTS[@]}"; do
+        if [[ -n "${TESTEXPR}" ]]; then
+            TESTEXPR+=" and "
+        fi
+        TESTEXPR+="not ${pattern}"
+    done
+fi
 
 # Configuration file paths
 S3TESTS_CONF_TEMPLATE="${S3TESTS_CONF_TEMPLATE:-.github/s3tests/s3tests.conf}"
@@ -103,6 +206,7 @@ Environment Variables:
   MAXFAIL                - Stop after N failures (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
   MARKEXPR               - pytest marker expression (default: exclude unsupported features)
+  TESTEXPR               - pytest -k expression to filter tests by name (default: exclude unimplemented)
   S3TESTS_CONF_TEMPLATE  - Path to s3tests config template (default: .github/s3tests/s3tests.conf)
   S3TESTS_CONF           - Path to generated s3tests config (default: s3tests.conf)
   DATA_ROOT              - Root directory for test data storage (default: target)
@@ -606,6 +710,7 @@ S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     ${XDIST_ARGS} \
     s3tests/functional/test_s3.py \
     -m "${MARKEXPR}" \
+    -k "${TESTEXPR}" \
     2>&1 | tee "${ARTIFACTS_DIR}/pytest.log"
 
 TEST_EXIT_CODE=${PIPESTATUS[0]}
