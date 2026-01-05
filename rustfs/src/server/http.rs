@@ -30,9 +30,9 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use rustfs_common::GlobalReadiness;
-#[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
+#[cfg(not(target_os = "openbsd"))]
 use rustfs_config::{MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-#[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+#[cfg(target_os = "openbsd")]
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -378,17 +378,17 @@ pub async fn start_http_server(
             // Enable TCP Keepalive to detect dead clients (e.g. power loss)
             // Idle: 10s, Interval: 5s, Retries: 3 (where supported)
 
-            #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
+            #[cfg(not(target_os = "openbsd"))]
             let ka = TcpKeepalive::new()
                 .with_time(Duration::from_secs(10))
                 .with_interval(Duration::from_secs(5));
 
-            // On OpenBSD and NetBSD, socket2 only supports configuring the initial
+            // On OpenBSD socket2 only supports configuring the initial
             // TCP keepalive timeout; intervals and retries cannot be set.
-            #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+            #[cfg(any(target_os = "openbsd"))]
             let ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
 
-            #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
+            #[cfg(not(target_os = "openbsd"))]
             let ka = ka.with_retries(3);
             if let Err(err) = socket_ref.set_tcp_keepalive(&ka) {
                 warn!(?err, "Failed to set TCP_KEEPALIVE");
@@ -397,11 +397,11 @@ pub async fn start_http_server(
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
-            #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
+            #[cfg(not(any(target_os = "openbsd")))]
             if let Err(err) = socket_ref.set_recv_buffer_size(4 * MI_B) {
                 warn!(?err, "Failed to set set_recv_buffer_size");
             }
-            #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
+            #[cfg(not(any(target_os = "openbsd")))]
             if let Err(err) = socket_ref.set_send_buffer_size(4 * MI_B) {
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
@@ -744,6 +744,10 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         Some(t) if token == t => Ok(req),
         _ => Err(Status::unauthenticated("No valid auth token")),
     }
+}
+
+fn sysctl(name: &str) -> i32 {
+
 }
 
 /// Determines the listen backlog size.
