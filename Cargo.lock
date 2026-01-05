@@ -8118,11 +8118,9 @@ name = "rustfs-lock"
 version = "0.0.5"
 dependencies = [
  "async-trait",
- "bytes",
  "crossbeam-queue",
  "futures",
  "parking_lot",
- "rustfs-protos",
  "serde",
  "serde_json",
  "smallvec",
@@ -8131,7 +8129,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
- "url",
  "uuid",
 ]
 
@@ -8257,7 +8254,6 @@ dependencies = [
  "flatbuffers",
  "prost 0.14.1",
  "rustfs-common",
- "rustfs-credentials",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

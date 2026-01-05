@@ -15,11 +15,8 @@
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use hmac::{Hmac, KeyInit, Mac};
-use http::HeaderMap;
-use http::HeaderValue;
-use http::Method;
-use http::Uri;
-use rustfs_credentials::get_global_action_cred;
+use http::{HeaderMap, HeaderValue, Method, Uri};
+use rustfs_credentials::{DEFAULT_SECRET_KEY, ENV_RPC_SECRET, get_global_secret_key_opt};
 use sha2::Sha256;
 use time::OffsetDateTime;
 use tracing::error;
@@ -33,12 +30,16 @@ pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
 
 /// Get the shared secret for HMAC signing
 fn get_shared_secret() -> String {
-    if let Some(cred) = get_global_action_cred() {
-        cred.secret_key
-    } else {
-        // Fallback to environment variable if global credentials are not available
-        std::env::var("RUSTFS_RPC_SECRET").unwrap_or_else(|_| "rustfs-default-secret".to_string())
-    }
+    rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET
+        .get_or_init(|| {
+            rustfs_utils::get_env_str(
+                ENV_RPC_SECRET,
+                get_global_secret_key_opt()
+                    .unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string())
+                    .as_str(),
+            )
+        })
+        .clone()
 }
 
 /// Generate HMAC-SHA256 signature for the given data
