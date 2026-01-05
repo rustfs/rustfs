@@ -426,16 +426,10 @@ impl LocalDisk {
         let cache_key = if key.is_empty() {
             bucket.to_string()
         } else {
-            // Use with_capacity to pre-allocate, reducing memory reallocations
-            let mut path_str = String::with_capacity(bucket.len() + key.len() + 1);
-            path_str.push_str(bucket);
-            path_str.push('/');
-            path_str.push_str(key);
-            path_str
+            path_join_buf(&[bucket, key])
         };
 
-        // Fast path: directly calculate based on root, avoiding cache lookup overhead for simple cases
-        Ok(self.root.join(&cache_key))
+        Ok(self.root.join(cache_key))
     }
 
     pub fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
@@ -451,7 +445,7 @@ impl LocalDisk {
         {
             let cache = self.path_cache.read();
             for (i, (bucket, key)) in requests.iter().enumerate() {
-                let cache_key = format!("{bucket}/{key}");
+                let cache_key = path_join_buf(&[bucket, key]);
                 if let Some(cached_path) = cache.get(&cache_key) {
                     results.push((i, cached_path.clone()));
                 } else {
@@ -673,7 +667,7 @@ impl LocalDisk {
             return Err(DiskError::FileNotFound);
         }
 
-        let meta_path = file_path.as_ref().join(Path::new(STORAGE_FORMAT_FILE));
+        let meta_path = path_join(&[file_path.as_ref(), Path::new(STORAGE_FORMAT_FILE)]);
 
         let res = {
             if read_data {
@@ -853,11 +847,11 @@ impl LocalDisk {
 
     async fn write_all_meta(&self, volume: &str, path: &str, buf: &[u8], sync: bool) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
-        let file_path = volume_dir.join(Path::new(&path));
+        let file_path = path_join(&[volume_dir.as_path(), Path::new(path)]);
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         let tmp_volume_dir = self.get_bucket_path(super::RUSTFS_META_TMP_BUCKET)?;
-        let tmp_file_path = tmp_volume_dir.join(Path::new(Uuid::new_v4().to_string().as_str()));
+        let tmp_file_path = path_join(&[tmp_volume_dir.as_path(), Path::new(Uuid::new_v4().to_string().as_str())]);
 
         self.write_all_internal(&tmp_file_path, InternalBuf::Ref(buf), sync, &tmp_volume_dir)
             .await?;
@@ -883,7 +877,7 @@ impl LocalDisk {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: bool, skip_parent: &Path) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
-        let file_path = volume_dir.join(Path::new(&path));
+        let file_path = path_join(&[volume_dir.as_path(), Path::new(path)]);
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         self.write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
@@ -1424,7 +1418,7 @@ impl DiskAPI for LocalDisk {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
-        let file_path = volume_dir.join(Path::new(&path));
+        let file_path = path_join(&[volume_dir.as_path(), Path::new(path)]);
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
         self.delete_file(&volume_dir, &file_path, opt.recursive, opt.immediate)
@@ -1449,10 +1443,12 @@ impl DiskAPI for LocalDisk {
         let erasure = &fi.erasure;
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
-            let part_path = Path::new(&volume_dir)
-                .join(path)
-                .join(fi.data_dir.map_or("".to_string(), |dir| dir.to_string()))
-                .join(format!("part.{}", part.number));
+            let part_path = path_join(&[
+                volume_dir.as_path(),
+                Path::new(path),
+                Path::new(&fi.data_dir.map_or("".to_string(), |dir| dir.to_string())),
+                Path::new(&format!("part.{}", part.number)),
+            ]);
             let err = self
                 .bitrot_verify(
                     &part_path,
@@ -1493,11 +1489,11 @@ impl DiskAPI for LocalDisk {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or_default();
 
-            if let Err(err) = access(
-                volume_dir
-                    .clone()
-                    .join(path.parent().unwrap_or(Path::new("")).join(format!("part.{num}"))),
-            )
+            if let Err(err) = access(path_join(&[
+                volume_dir.as_path(),
+                Path::new(path.parent().unwrap_or(Path::new("")).to_string_lossy().as_ref()),
+                Path::new(&format!("part.{num}")),
+            ]))
             .await
             {
                 ret[i] = ObjectPartInfo {
@@ -1509,7 +1505,7 @@ impl DiskAPI for LocalDisk {
             }
 
             let data = match self
-                .read_all_data(bucket, volume_dir.clone(), volume_dir.clone().join(path))
+                .read_all_data(bucket, volume_dir.clone(), path_join(&[volume_dir.as_path(), path]))
                 .await
             {
                 Ok(data) => data,
@@ -1542,16 +1538,18 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(skip(self))]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         let volume_dir = self.get_bucket_path(volume)?;
-        check_path_length(volume_dir.join(path).to_string_lossy().as_ref())?;
+        check_path_length(path_join(&[volume_dir.as_path(), Path::new(path)]).to_string_lossy().as_ref())?;
         let mut resp = CheckPartsResp {
             results: vec![0; fi.parts.len()],
         };
 
         for (i, part) in fi.parts.iter().enumerate() {
-            let file_path = Path::new(&volume_dir)
-                .join(path)
-                .join(fi.data_dir.map_or("".to_string(), |dir| dir.to_string()))
-                .join(format!("part.{}", part.number));
+            let file_path = path_join(&[
+                volume_dir.as_path(),
+                Path::new(path),
+                Path::new(&fi.data_dir.map_or("".to_string(), |dir| dir.to_string())),
+                Path::new(&format!("part.{}", part.number)),
+            ]);
 
             match lstat(&file_path).await {
                 Ok(st) => {
@@ -1611,8 +1609,8 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileAccessDenied);
         }
 
-        let src_file_path = src_volume_dir.join(Path::new(src_path));
-        let dst_file_path = dst_volume_dir.join(Path::new(dst_path));
+        let src_file_path = path_join(&[src_volume_dir.as_path(), Path::new(src_path)]);
+        let dst_file_path = path_join(&[dst_volume_dir.as_path(), Path::new(dst_path)]);
 
         // warn!("rename_part src_file_path:{:?}, dst_file_path:{:?}", &src_file_path, &dst_file_path);
 
@@ -1673,10 +1671,10 @@ impl DiskAPI for LocalDisk {
             return Err(Error::from(DiskError::FileAccessDenied));
         }
 
-        let src_file_path = src_volume_dir.join(Path::new(&src_path));
+        let src_file_path = path_join(&[src_volume_dir.as_path(), Path::new(&src_path)]);
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
 
-        let dst_file_path = dst_volume_dir.join(Path::new(&dst_path));
+        let dst_file_path = path_join(&[dst_volume_dir.as_path(), Path::new(dst_path)]);
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
         if src_is_dir {
@@ -1722,7 +1720,7 @@ impl DiskAPI for LocalDisk {
         }
 
         let volume_dir = self.get_bucket_path(volume)?;
-        let file_path = volume_dir.join(Path::new(&path));
+        let file_path = path_join(&[volume_dir.as_path(), Path::new(path)]);
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
         //  TODO: writeAllDirect io.copy
@@ -1749,7 +1747,7 @@ impl DiskAPI for LocalDisk {
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
-        let file_path = volume_dir.join(Path::new(&path));
+        let file_path = path_join(&[volume_dir.as_path(), Path::new(path)]);
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
         let f = self.open_file(file_path, O_CREATE | O_APPEND | O_WRONLY, volume_dir).await?;
@@ -1768,7 +1766,7 @@ impl DiskAPI for LocalDisk {
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
-        let file_path = volume_dir.join(Path::new(&path));
+        let file_path = path_join(&[volume_dir.as_path(), Path::new(path)]);
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
         let f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
@@ -1785,7 +1783,7 @@ impl DiskAPI for LocalDisk {
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
-        let file_path = volume_dir.join(Path::new(&path));
+        let file_path = path_join(&[volume_dir.as_path(), Path::new(path)]);
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
         let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
@@ -1819,7 +1817,7 @@ impl DiskAPI for LocalDisk {
         }
 
         let volume_dir = self.get_bucket_path(volume)?;
-        let dir_path_abs = volume_dir.join(Path::new(&dir_path.trim_start_matches(SLASH_SEPARATOR)));
+        let dir_path_abs = path_join(&[volume_dir.as_path(), Path::new(&dir_path.trim_start_matches(SLASH_SEPARATOR))]);
 
         let entries = match os::read_dir(&dir_path_abs, count).await {
             Ok(res) => res,
@@ -1923,8 +1921,14 @@ impl DiskAPI for LocalDisk {
         }
 
         // xl.meta path
-        let src_file_path = src_volume_dir.join(Path::new(format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str()));
-        let dst_file_path = dst_volume_dir.join(Path::new(format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str()));
+        let src_file_path = path_join(&[
+            src_volume_dir.as_path(),
+            Path::new(format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str()),
+        ]);
+        let dst_file_path = path_join(&[
+            dst_volume_dir.as_path(),
+            Path::new(format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str()),
+        ]);
 
         // data_dir path
         let has_data_dir_path = {
@@ -1938,12 +1942,14 @@ impl DiskAPI for LocalDisk {
             };
 
             if let Some(data_dir) = has_data_dir {
-                let src_data_path = src_volume_dir.join(Path::new(
-                    rustfs_utils::path::retain_slash(format!("{}/{}", &src_path, data_dir).as_str()).as_str(),
-                ));
-                let dst_data_path = dst_volume_dir.join(Path::new(
-                    rustfs_utils::path::retain_slash(format!("{}/{}", &dst_path, data_dir).as_str()).as_str(),
-                ));
+                let src_data_path = path_join(&[
+                    src_volume_dir.as_path(),
+                    Path::new(rustfs_utils::path::retain_slash(format!("{}/{}", &src_path, data_dir).as_str()).as_str()),
+                ]);
+                let dst_data_path = path_join(&[
+                    dst_volume_dir.as_path(),
+                    Path::new(rustfs_utils::path::retain_slash(format!("{}/{}", &dst_path, data_dir).as_str()).as_str()),
+                ]);
 
                 Some((src_data_path, dst_data_path))
             } else {
@@ -2146,7 +2152,7 @@ impl DiskAPI for LocalDisk {
         }
 
         for path in paths.iter() {
-            let file_path = volume_dir.join(Path::new(path));
+            let file_path = path_join(&[volume_dir.as_path(), Path::new(path)]);
 
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -2160,7 +2166,7 @@ impl DiskAPI for LocalDisk {
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         if !fi.metadata.is_empty() {
             let volume_dir = self.get_bucket_path(volume)?;
-            let file_path = volume_dir.join(Path::new(&path));
+            let file_path = path_join(&[volume_dir.as_path(), Path::new(&path)]);
 
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -2273,11 +2279,11 @@ impl DiskAPI for LocalDisk {
 
         let volume_dir = self.get_bucket_path(volume)?;
 
-        let file_path = volume_dir.join(Path::new(&path));
+        let file_path = path_join(&[volume_dir.as_path(), Path::new(&path)]);
 
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let xl_path = file_path.join(Path::new(STORAGE_FORMAT_FILE));
+        let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
         let buf = match self.read_all_data(volume, &volume_dir, &xl_path).await {
             Ok(res) => res,
             Err(err) => {
@@ -2304,7 +2310,7 @@ impl DiskAPI for LocalDisk {
             let vid = fi.version_id.unwrap_or_default();
             let _ = meta.data.remove(vec![vid, uuid])?;
 
-            let old_path = file_path.join(Path::new(uuid.to_string().as_str()));
+            let old_path = path_join(&[file_path.as_path(), Path::new(uuid.to_string().as_str())]);
             check_path_length(old_path.to_string_lossy().as_ref())?;
 
             if let Err(err) = self.move_to_trash(&old_path, true, false).await
@@ -2326,9 +2332,14 @@ impl DiskAPI for LocalDisk {
         if let Some(old_data_dir) = opts.old_data_dir
             && opts.undo_write
         {
-            let src_path =
-                file_path.join(Path::new(format!("{old_data_dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()));
-            let dst_path = file_path.join(Path::new(format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str()));
+            let src_path = path_join(&[
+                file_path.as_path(),
+                Path::new(format!("{old_data_dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()),
+            ]);
+            let dst_path = path_join(&[
+                file_path.as_path(),
+                Path::new(format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str()),
+            ]);
             return rename_all(src_path, dst_path, file_path).await;
         }
 
@@ -2480,7 +2491,7 @@ mod test {
             RUSTFS_META_BUCKET,
         ];
 
-        let paths: Vec<_> = vols.iter().map(|v| Path::new(v).join("test")).collect();
+        let paths: Vec<_> = vols.iter().map(|v| path_join(&[Path::new(v), Path::new("test")])).collect();
 
         for p in paths.iter() {
             assert!(skip_access_checks(p.to_str().unwrap()));

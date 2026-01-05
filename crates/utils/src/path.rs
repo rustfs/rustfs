@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Path;
 use std::path::PathBuf;
 
 pub const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
@@ -73,10 +74,10 @@ pub fn has_prefix(s: &str, prefix: &str) -> bool {
     s.starts_with(prefix)
 }
 
-pub fn path_join(elem: &[PathBuf]) -> PathBuf {
+pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
     path_join_buf(
         elem.iter()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| p.as_ref().to_string_lossy().into_owned())
             .collect::<Vec<String>>()
             .iter()
             .map(|s| s.as_str())
@@ -587,7 +588,7 @@ mod tests {
     #[test]
     fn test_path_join() {
         // Test empty input
-        let result = path_join(&[]);
+        let result = path_join::<&str>(&[]);
         assert_eq!(result, PathBuf::from("."));
 
         // Test single path
