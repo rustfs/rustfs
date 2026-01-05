@@ -958,7 +958,6 @@ mod test {
         use crate::policy::action::{Action, ActionSet, S3Action};
         use crate::policy::resource::{Resource, ResourceSet};
         use crate::policy::{Effect, Functions, Principal};
-        use std::collections::HashSet;
 
         // Create a BucketPolicy with empty optional fields
         // Use JSON deserialization to create Principal (since aws field is private)
@@ -1021,7 +1020,6 @@ mod test {
         use crate::policy::action::{Action, ActionSet, S3Action};
         use crate::policy::resource::{Resource, ResourceSet};
         use crate::policy::{Effect, Principal};
-        use std::collections::HashSet;
 
         // Use JSON deserialization to create Principal (since aws field is private)
         let principal: Principal = serde_json::from_str(r#"{"AWS": "*"}"#).expect("Should parse principal");
