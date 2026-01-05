@@ -19,6 +19,7 @@ mod error;
 mod init;
 mod license;
 mod profiling;
+mod protocols;
 mod server;
 mod storage;
 mod update;
@@ -26,7 +27,8 @@ mod version;
 
 // Ensure the correct path for parse_license is imported
 use crate::init::{
-    add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
+    add_bucket_notification_configuration, init_buffer_profile_system, init_ftp_system, init_kms_system, init_sftp_system,
+    init_update_check, print_server_info,
 };
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
@@ -36,6 +38,7 @@ use clap::Parser;
 use license::init_license;
 use rustfs_ahm::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
+use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::{
     StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
@@ -92,7 +95,9 @@ async fn async_main() -> Result<()> {
 
     // Store in global storage
     match set_global_guard(guard).map_err(Error::other) {
-        Ok(_) => (),
+        Ok(_) => {
+            info!(target: "rustfs::main", "Global observability guard set successfully.");
+        }
         Err(e) => {
             error!("Failed to set global observability guard: {}", e);
             return Err(e);
@@ -107,7 +112,15 @@ async fn async_main() -> Result<()> {
 
     // Initialize TLS if a certificate path is provided
     if let Some(tls_path) = &opt.tls_path {
-        init_cert(tls_path).await
+        match init_cert(tls_path).await {
+            Ok(_) => {
+                info!(target: "rustfs::main", "TLS initialized successfully with certs from {}", tls_path);
+            }
+            Err(e) => {
+                error!("Failed to initialize TLS from {}: {}", tls_path, e);
+                return Err(Error::other(e));
+            }
+        }
     }
 
     // Run parameters
@@ -145,7 +158,16 @@ async fn run(opt: config::Opt) -> Result<()> {
     );
 
     // Set up AK and SK
-    rustfs_ecstore::global::init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
+    match init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone())) {
+        Ok(_) => {
+            info!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
+        }
+        Err(e) => {
+            let msg = format!("init_global_action_credentials failed: {e:?}");
+            error!("{msg}");
+            return Err(Error::other(msg));
+        }
+    };
 
     set_global_rustfs_port(server_port);
 
@@ -243,6 +265,15 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_background_replication(store.clone()).await;
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
+
+    // Create a shutdown channel for FTP/SFTP services
+    let (ftp_sftp_shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+
+    // Initialize FTP system if enabled
+    init_ftp_system(ftp_sftp_shutdown_tx.clone()).await.map_err(Error::other)?;
+
+    // Initialize SFTP system if enabled
+    init_sftp_system(ftp_sftp_shutdown_tx.clone()).await.map_err(Error::other)?;
 
     // Initialize buffer profiling system
     init_buffer_profile_system(&opt);
@@ -342,17 +373,20 @@ async fn run(opt: config::Opt) -> Result<()> {
     // 4. Mark as Full Ready now that critical components are warm
     readiness.mark_stage(SystemStage::FullReady);
 
+    // Set the global RustFS initialization time to now
+    rustfs_common::set_global_init_time_now().await;
+
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
     // listen to the shutdown signal
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ftp_sftp_shutdown_tx, ctx.clone()).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ftp_sftp_shutdown_tx, ctx.clone()).await;
         }
     }
 
@@ -365,6 +399,7 @@ async fn handle_shutdown(
     state_manager: &ServiceStateManager,
     s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    ftp_sftp_shutdown_tx: tokio::sync::broadcast::Sender<()>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -430,6 +465,9 @@ async fn handle_shutdown(
 
     // Wait for the worker thread to complete the cleaning work
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+
+    // Send shutdown signal to FTP/SFTP services
+    let _ = ftp_sftp_shutdown_tx.send(());
 
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);

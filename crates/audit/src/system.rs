@@ -573,10 +573,10 @@ impl AuditSystem {
         }
 
         // Remove existing target if present
-        if let Some(old_target) = registry.remove_target(&target_id) {
-            if let Err(e) = old_target.close().await {
-                error!(target_id = %target_id, error = %e, "Failed to close old target during upsert");
-            }
+        if let Some(old_target) = registry.remove_target(&target_id)
+            && let Err(e) = old_target.close().await
+        {
+            error!(target_id = %target_id, error = %e, "Failed to close old target during upsert");
         }
 
         registry.add_target(target_id.clone(), target);

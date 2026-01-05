@@ -25,6 +25,10 @@ spec:
       imagePullSecrets:
         {{- . | nindent 8 }}
       {{- end }}
+      {{- if and .Values.nodeSelector (not .Values.affinity.nodeAffinity) }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      {{- end }}
       {{- if .Values.affinity }}
       affinity:
         {{- if .Values.affinity.nodeAffinity }}
@@ -66,7 +70,7 @@ spec:
             - -c
             - |
               mkdir -p /data /logs
-              chown -R 10001:10001 /data /logs
+              chown 10001:10001 /data /logs
           volumeMounts:
             - name: data
               mountPath: /data
@@ -74,7 +78,7 @@ spec:
               mountPath: /logs
       containers:
         - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           command: ["/usr/bin/rustfs"]
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if .Values.containerSecurityContext }}
@@ -92,12 +96,7 @@ spec:
             - secretRef:
                 name: {{ include "rustfs.secretName" . }}
           resources:
-            requests:
-              memory: {{ .Values.resources.requests.memory }}
-              cpu: {{ .Values.resources.requests.cpu }}
-            limits:
-              memory: {{ .Values.resources.limits.memory }}
-              cpu: {{ .Values.resources.limits.cpu }}
+            {{- toYaml .Values.resources | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /health

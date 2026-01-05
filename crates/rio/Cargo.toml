@@ -41,7 +41,8 @@ reqwest.workspace = true
 tokio-util.workspace = true
 faster-hex.workspace = true
 futures.workspace = true
-rustfs-utils = { workspace = true, features = ["io", "hash", "compress"] }
+rustfs-config = { workspace = true, features = ["constants"] }
+rustfs-utils = { workspace = true, features = ["io", "hash", "compress", "tls"] }
 serde_json.workspace = true
 md-5 = { workspace = true }
 tracing.workspace = true

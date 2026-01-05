@@ -242,11 +242,10 @@ impl ReplicationResyncer {
 
 
 
-                        if let Some(last_update) = status.last_update {
-                            if last_update > *last_update_times.get(bucket).unwrap_or(&OffsetDateTime::UNIX_EPOCH) {
+                        if let Some(last_update) = status.last_update
+                            && last_update > *last_update_times.get(bucket).unwrap_or(&OffsetDateTime::UNIX_EPOCH) {
                                 update = true;
                             }
-                        }
 
                         if update {
                             if let Err(err) = save_resync_status(bucket, status, api.clone()).await {
@@ -345,13 +344,12 @@ impl ReplicationResyncer {
             return;
         };
 
-        if !heal {
-            if let Err(e) = self
+        if !heal
+            && let Err(e) = self
                 .mark_status(ResyncStatusType::ResyncStarted, opts.clone(), storage.clone())
                 .await
-            {
-                error!("Failed to mark resync status: {}", e);
-            }
+        {
+            error!("Failed to mark resync status: {}", e);
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -1463,21 +1461,18 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         Some(version_id.to_string())
     };
 
-    if dobj.delete_object.delete_marker_version_id.is_some() {
-        if let Err(e) = tgt_client
+    if dobj.delete_object.delete_marker_version_id.is_some()
+        && let Err(e) = tgt_client
             .head_object(&tgt_client.bucket, &dobj.delete_object.object_name, version_id.clone())
             .await
-        {
-            if let SdkError::ServiceError(service_err) = &e {
-                if !service_err.err().is_not_found() {
-                    rinfo.replication_status = ReplicationStatusType::Failed;
-                    rinfo.error = Some(e.to_string());
+        && let SdkError::ServiceError(service_err) = &e
+        && !service_err.err().is_not_found()
+    {
+        rinfo.replication_status = ReplicationStatusType::Failed;
+        rinfo.error = Some(e.to_string());
 
-                    return rinfo;
-                }
-            }
-        };
-    }
+        return rinfo;
+    };
 
     match tgt_client
         .remove_object(

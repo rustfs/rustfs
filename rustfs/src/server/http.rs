@@ -17,7 +17,7 @@ use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::{ReadinessGateLayer, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
+use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -30,7 +30,7 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use rustfs_common::GlobalReadiness;
-use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_config::{MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
@@ -44,6 +44,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status, metadata::MetadataValue};
 use tower::ServiceBuilder;
+use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -138,13 +139,13 @@ pub async fn start_http_server(
         };
 
         // If address is IPv6 try to enable dual-stack; on failure, switch to IPv4 socket.
-        if server_addr.is_ipv6() {
-            if let Err(e) = socket.set_only_v6(false) {
-                warn!("Failed to set IPV6_V6ONLY=false, attempting IPv4 fallback: {}", e);
-                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
-                server_addr = ipv4_addr;
-                socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-            }
+        if server_addr.is_ipv6()
+            && let Err(e) = socket.set_only_v6(false)
+        {
+            warn!("Failed to set IPV6_V6ONLY=false, attempting IPv4 fallback: {}", e);
+            let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+            server_addr = ipv4_addr;
+            socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
         }
 
         // Common setup for both IPv4 and successful dual-stack IPv6
@@ -176,6 +177,9 @@ pub async fn start_http_server(
         TcpListener::from_std(socket.into())?
     };
 
+    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
+    let tls_enabled = tls_acceptor.is_some();
+    let protocol = if tls_enabled { "https" } else { "http" };
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
     let local_ip = match rustfs_utils::get_local_ip() {
@@ -185,11 +189,15 @@ pub async fn start_http_server(
             local_addr.ip()
         }
     };
-    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
-    let tls_enabled = tls_acceptor.is_some();
-    let protocol = if tls_enabled { "https" } else { "http" };
+
+    let local_ip_str = if local_ip.is_ipv6() {
+        format!("[{local_ip}]")
+    } else {
+        local_ip.to_string()
+    };
+
     // Detailed endpoint information (showing all API endpoints)
-    let api_endpoints = format!("{protocol}://{local_ip}:{server_port}");
+    let api_endpoints = format!("{protocol}://{local_ip_str}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
     let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     if opt.console_enable {
@@ -197,7 +205,7 @@ pub async fn start_http_server(
 
         info!(
             target: "rustfs::console::startup",
-            "Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html"
+            "Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html"
         );
         info!(
             target: "rustfs::console::startup",
@@ -206,16 +214,19 @@ pub async fn start_http_server(
         );
 
         println!("Console WebUI Start Time: {now_time}");
-        println!("Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html");
+        println!("Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html");
         println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
     } else {
         info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Start Time: {now_time}");
-        if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
+        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&opt.access_key)
+            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&opt.secret_key)
+        {
             warn!(
                 "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
-                DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
+                rustfs_credentials::DEFAULT_ACCESS_KEY,
+                rustfs_credentials::DEFAULT_SECRET_KEY
             );
         }
         info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
@@ -427,35 +438,41 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         debug!("TLS path is not provided or does not exist, starting with HTTP");
         return Ok(None);
     }
-
     debug!("Found TLS directory, checking for certificates");
 
     // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mtls_verifier = rustfs_utils::build_webpki_client_verifier(tls_path)?;
 
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
-    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
-        if !cert_key_pairs.is_empty() {
-            debug!("Found {} certificates, creating SNI-aware multi-cert resolver", cert_key_pairs.len());
+    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path)
+        && !cert_key_pairs.is_empty()
+    {
+        debug!("Found {} certificates, creating SNI-aware multi-cert resolver", cert_key_pairs.len());
 
-            // Create an SNI-enabled certificate resolver
-            let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
+        // Create an SNI-enabled certificate resolver
+        let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
 
-            // Configure the server to enable SNI support
-            let mut server_config = ServerConfig::builder()
+        // Configure the server to enable SNI support
+        let mut server_config = if let Some(verifier) = mtls_verifier.clone() {
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(Arc::new(resolver))
+        } else {
+            ServerConfig::builder()
                 .with_no_client_auth()
-                .with_cert_resolver(Arc::new(resolver));
+                .with_cert_resolver(Arc::new(resolver))
+        };
 
-            // Configure ALPN protocol priority
-            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+        // Configure ALPN protocol priority
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
-            // Log SNI requests
-            if rustfs_utils::tls_key_log() {
-                server_config.key_log = Arc::new(rustls::KeyLogFile::new());
-            }
-
-            return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
+        // Log SNI requests
+        if rustfs_utils::tls_key_log() {
+            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
+
+        return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
     }
 
     // 2. Revert to the traditional single-certificate mode
@@ -466,10 +483,17 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         let certs = rustfs_utils::load_certs(&cert_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
         let key = rustfs_utils::load_private_key(&key_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
 
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+        let mut server_config = if let Some(verifier) = mtls_verifier {
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+                .map_err(|e| rustfs_utils::certs_error(e.to_string()))?
+        } else {
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| rustfs_utils::certs_error(e.to_string()))?
+        };
 
         // Configure ALPN protocol priority
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
@@ -503,7 +527,8 @@ struct ConnectionContext {
 /// 2. Build a complete service stack for this connection, including S3, RPC services, and all middleware.
 /// 3. Use Hyper to handle HTTP requests on this connection.
 /// 4. Incorporate connections into the management of elegant closures.
-#[instrument(skip_all, fields(peer_addr = %socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string())))]
+#[instrument(skip_all, fields(peer_addr = %socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string())
+))]
 fn process_connection(
     socket: TcpStream,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
@@ -525,9 +550,21 @@ fn process_connection(
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
         let service = hybrid(s3_service, rpc_service);
 
+        let remote_addr = match socket.peer_addr() {
+            Ok(addr) => Some(RemoteAddr(addr)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to obtain peer address; policy evaluation may fall back to a default source IP"
+                );
+                None
+            }
+        };
+
         let hybrid_service = ServiceBuilder::new()
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
+            .layer(AddExtensionLayer::new(remote_addr))
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
             .layer(ReadinessGateLayer::new(readiness))
@@ -685,7 +722,12 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
-    let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
+    let token_str = rustfs_credentials::get_grpc_token();
+
+    let token: MetadataValue<_> = token_str.parse().map_err(|e| {
+        error!("Failed to parse RUSTFS_GRPC_AUTH_TOKEN into gRPC metadata value: {}", e);
+        Status::internal("Invalid auth token configuration")
+    })?;
 
     match req.metadata().get("authorization") {
         Some(t) if token == t => Ok(req),

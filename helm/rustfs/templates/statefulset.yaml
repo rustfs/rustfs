@@ -26,6 +26,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      enableServiceLinks: {{ .Values.enableServiceLinks }}
       {{- with include "chart.imagePullSecrets" . }}
       imagePullSecrets:
         {{- . | nindent 8 }}
@@ -41,8 +42,8 @@ spec:
           {{- toYaml .Values.affinity.nodeAffinity | nindent 10 }}
         {{- else }}
           {}
-        {{- if .Values.affinity.podAntiAffinity.enabled }}
         {{- end }}
+        {{- if .Values.affinity.podAntiAffinity.enabled }}
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -87,7 +88,7 @@ spec:
                 mkdir -p /data
               fi
               mkdir -p {{ $logDir }}
-              chown -R 10001:10001 /data {{ $logDir }}
+              chown 10001:10001 /data {{ $logDir }}
           volumeMounts:
             {{- if eq (int .Values.replicaCount) 4 }}
             {{- range $i := until (int .Values.replicaCount) }}
@@ -102,7 +103,7 @@ spec:
               mountPath: {{ $logDir }}
       containers:
         - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           command: ["/usr/bin/rustfs"]
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if .Values.containerSecurityContext }}
@@ -120,12 +121,7 @@ spec:
             - secretRef:
                 name: {{ include "rustfs.secretName" . }}
           resources:
-            requests:
-              memory: {{ .Values.resources.requests.memory }}
-              cpu: {{ .Values.resources.requests.cpu }}
-            limits:
-              memory: {{ .Values.resources.limits.memory }}
-              cpu: {{ .Values.resources.limits.cpu }}
+            {{- toYaml .Values.resources | nindent 12 }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:

@@ -29,7 +29,8 @@ documentation = "https://docs.rs/rustfs-policy/latest/rustfs_policy/"
 workspace = true
 
 [dependencies]
-rustfs-config = { workspace = true, features = ["constants","opa"] }
+rustfs-credentials = { workspace = true }
+rustfs-config = { workspace = true, features = ["constants", "opa"] }
 tokio = { workspace = true, features = ["full"] }
 time = { workspace = true, features = ["serde-human-readable"] }
 serde = { workspace = true, features = ["derive", "rc"] }
@@ -38,7 +39,6 @@ thiserror.workspace = true
 strum = { workspace = true, features = ["derive"] }
 rustfs-crypto = { workspace = true }
 ipnetwork = { workspace = true, features = ["serde"] }
-rand.workspace = true
 base64-simd = { workspace = true }
 jsonwebtoken = { workspace = true }
 regex = { workspace = true }

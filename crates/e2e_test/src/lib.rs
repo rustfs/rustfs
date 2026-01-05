@@ -18,6 +18,9 @@ mod reliant;
 #[cfg(test)]
 pub mod common;
 
+#[cfg(test)]
+mod version_id_regression_test;
+
 // Data usage regression tests
 #[cfg(test)]
 mod data_usage_test;
@@ -37,3 +40,6 @@ mod content_encoding_test;
 // Policy variables tests
 #[cfg(test)]
 mod policy;
+
+#[cfg(test)]
+mod protocols;

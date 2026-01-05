@@ -11,7 +11,7 @@ image:
   # This sets the pull policy for images.
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "1.0.0-alpha.73"
+  tag: "latest"
 
 # This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
 imagePullSecrets: []
@@ -110,6 +110,7 @@ ingress:
     traefik.ingress.kubernetes.io/service.sticky.cookie.secure: "true"
   nginxAnnotations:
     nginx.ingress.kubernetes.io/affinity: cookie
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
     nginx.ingress.kubernetes.io/session-cookie-expires: "3600"
     nginx.ingress.kubernetes.io/session-cookie-hash: sha1
     nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
@@ -187,6 +188,14 @@ initStep:
     runAsUser: 0
     runAsGroup: 0
 
+pdb:
+  create: false
+  # Minimum number/percentage of pods that should remain scheduled
+  minAvailable: ""
+  # Maximum number/percentage of pods that may be made unavailable
+  maxUnavailable: 1
 
+# Whether information about services should be injected into pod's environment variable
+enableServiceLinks: false
 
 extraManifests: []

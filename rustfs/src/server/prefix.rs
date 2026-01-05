@@ -45,6 +45,11 @@ pub(crate) const CONSOLE_PREFIX: &str = "/rustfs/console";
 /// This prefix is used for endpoints that handle remote procedure calls (RPC).
 pub(crate) const RPC_PREFIX: &str = "/rustfs/rpc";
 
+/// Predefined gRPC service prefix for RustFS server.
+/// This prefix is used for gRPC service endpoints.
+/// For example, the full gRPC method path would be "/node_service.NodeService/MethodName".
+pub(crate) const TONIC_PREFIX: &str = "/node_service.NodeService";
+
 /// LOGO art for RustFS server.
 pub(crate) const LOGO: &str = r#"
 

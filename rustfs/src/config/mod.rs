@@ -73,11 +73,11 @@ pub struct Opt {
     pub server_domains: Vec<String>,
 
     /// Access key used for authentication.
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
+    #[arg(long, default_value_t = rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
     pub access_key: String,
 
     /// Secret key used for authentication.
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
+    #[arg(long, default_value_t = rustfs_credentials::DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
     pub secret_key: String,
 
     /// Enable console server

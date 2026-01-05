@@ -605,13 +605,12 @@ impl DataUsageCache {
 
     pub fn search_parent(&self, hash: &DataUsageHash) -> Option<DataUsageHash> {
         let want = hash.key();
-        if let Some(last_index) = want.rfind('/') {
-            if let Some(v) = self.find(&want[0..last_index]) {
-                if v.children.contains(&want) {
-                    let found = hash_path(&want[0..last_index]);
-                    return Some(found);
-                }
-            }
+        if let Some(last_index) = want.rfind('/')
+            && let Some(v) = self.find(&want[0..last_index])
+            && v.children.contains(&want)
+        {
+            let found = hash_path(&want[0..last_index]);
+            return Some(found);
         }
 
         for (k, v) in self.cache.iter() {
@@ -1150,10 +1149,10 @@ impl DataUsageInfo {
         self.buckets_count = self.buckets_usage.len() as u64;
 
         // Update last update time
-        if let Some(other_update) = other.last_update {
-            if self.last_update.is_none() || other_update > self.last_update.unwrap() {
-                self.last_update = Some(other_update);
-            }
+        if let Some(other_update) = other.last_update
+            && (self.last_update.is_none() || other_update > self.last_update.unwrap())
+        {
+            self.last_update = Some(other_update);
         }
     }
 }

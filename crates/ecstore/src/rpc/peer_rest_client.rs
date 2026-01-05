@@ -66,13 +66,13 @@ impl PeerRestClient {
         let mut remote = Vec::with_capacity(hosts.len());
         let mut all = vec![None; hosts.len()];
         for (i, hs_host) in hosts.iter().enumerate() {
-            if let Some(host) = hs_host {
-                if let Some(grid_host) = eps.find_grid_hosts_from_peer(host) {
-                    let client = PeerRestClient::new(host.clone(), grid_host);
+            if let Some(host) = hs_host
+                && let Some(grid_host) = eps.find_grid_hosts_from_peer(host)
+            {
+                let client = PeerRestClient::new(host.clone(), grid_host);
 
-                    all[i] = Some(client.clone());
-                    remote.push(Some(client));
-                }
+                all[i] = Some(client.clone());
+                remote.push(Some(client));
             }
         }
 

@@ -327,16 +327,16 @@ impl DecentralizedStatsAggregator {
         );
 
         // Check cache validity if timestamp is not initial value (UNIX_EPOCH)
-        if cache_timestamp != SystemTime::UNIX_EPOCH {
-            if let Ok(elapsed) = now.duration_since(cache_timestamp) {
-                if elapsed < cache_ttl {
-                    if let Some(cached) = self.cached_stats.read().await.as_ref() {
-                        debug!("Returning cached aggregated stats, remaining TTL: {:?}", cache_ttl - elapsed);
-                        return Ok(cached.clone());
-                    }
-                } else {
-                    debug!("Cache expired: elapsed={:?} >= ttl={:?}", elapsed, cache_ttl);
+        if cache_timestamp != SystemTime::UNIX_EPOCH
+            && let Ok(elapsed) = now.duration_since(cache_timestamp)
+        {
+            if elapsed < cache_ttl {
+                if let Some(cached) = self.cached_stats.read().await.as_ref() {
+                    debug!("Returning cached aggregated stats, remaining TTL: {:?}", cache_ttl - elapsed);
+                    return Ok(cached.clone());
                 }
+            } else {
+                debug!("Cache expired: elapsed={:?} >= ttl={:?}", elapsed, cache_ttl);
             }
         }
 

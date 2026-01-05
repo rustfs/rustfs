@@ -225,17 +225,20 @@ where
 
         match tokio::time::timeout(DEFAULT_CONNECTION_TIMEOUT, async {
             while !self.connected.load(Ordering::SeqCst) {
-                if let Some(handle) = self.bg_task_manager.init_cell.get() {
-                    if handle.is_finished() && !self.connected.load(Ordering::SeqCst) {
-                        error!(target_id = %self.id, "MQTT background task exited prematurely before connection was established.");
-                        return Err(TargetError::Network("MQTT background task exited prematurely".to_string()));
-                    }
+                if let Some(handle) = self.bg_task_manager.init_cell.get()
+                    && handle.is_finished()
+                    && !self.connected.load(Ordering::SeqCst)
+                {
+                    error!(target_id = %self.id, "MQTT background task exited prematurely before connection was established.");
+                    return Err(TargetError::Network("MQTT background task exited prematurely".to_string()));
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             debug!(target_id = %self.id, "MQTT target connected successfully.");
             Ok(())
-        }).await {
+        })
+        .await
+        {
             Ok(Ok(_)) => {
                 info!(target_id = %self.id, "MQTT target initialized and connected.");
                 Ok(())
@@ -243,9 +246,7 @@ where
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 error!(target_id = %self.id, "Timeout waiting for MQTT connection after task spawn.");
-                Err(TargetError::Network(
-                    "Timeout waiting for MQTT connection".to_string(),
-                ))
+                Err(TargetError::Network("Timeout waiting for MQTT connection".to_string()))
             }
         }
     }
@@ -470,11 +471,11 @@ where
         debug!(target_id = %self.id, "Checking if MQTT target is active.");
         if self.client.lock().await.is_none() && !self.connected.load(Ordering::SeqCst) {
             // Check if the background task is running and has not panicked
-            if let Some(handle) = self.bg_task_manager.init_cell.get() {
-                if handle.is_finished() {
-                    error!(target_id = %self.id, "MQTT background task has finished, possibly due to an error. Target is not active.");
-                    return Err(TargetError::Network("MQTT background task terminated".to_string()));
-                }
+            if let Some(handle) = self.bg_task_manager.init_cell.get()
+                && handle.is_finished()
+            {
+                error!(target_id = %self.id, "MQTT background task has finished, possibly due to an error. Target is not active.");
+                return Err(TargetError::Network("MQTT background task terminated".to_string()));
             }
             debug!(target_id = %self.id, "MQTT client not yet initialized or task not running/connected.");
             return Err(TargetError::Configuration(

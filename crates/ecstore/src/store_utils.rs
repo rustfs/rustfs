@@ -15,8 +15,7 @@
 use crate::config::storageclass::STANDARD;
 use crate::disk::RUSTFS_META_BUCKET;
 use regex::Regex;
-use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
-use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
+use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS};
 use std::collections::HashMap;
 use std::io::{Error, Result};
 

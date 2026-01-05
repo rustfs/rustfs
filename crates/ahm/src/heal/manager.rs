@@ -492,12 +492,11 @@ impl HealManager {
                         for (_, disk_opt) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {
                             if let Some(disk) = disk_opt {
                                 // detect unformatted disk via get_disk_id()
-                                if let Err(err) = disk.get_disk_id().await {
-                                    if err == DiskError::UnformattedDisk {
+                                if let Err(err) = disk.get_disk_id().await
+                                    && err == DiskError::UnformattedDisk {
                                         endpoints.push(disk.endpoint());
                                         continue;
                                     }
-                                }
                             }
                         }
 

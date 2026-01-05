@@ -51,3 +51,8 @@ base64 = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 md5 = { workspace = true }
+suppaftp.workspace = true
+rcgen.workspace = true
+anyhow.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true

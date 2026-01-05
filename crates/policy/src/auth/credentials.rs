@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::Error as IamError;
 use crate::error::{Error, Result};
-use crate::policy::{INHERITED_POLICY_TYPE, Policy, Validator, iam_policy_claim_name_sa};
+use crate::policy::{Policy, Validator};
 use crate::utils;
-use serde::{Deserialize, Serialize};
+use rustfs_credentials::Credentials;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use time::OffsetDateTime;
 use tracing::warn;
 
@@ -32,178 +33,82 @@ pub const ACCOUNT_OFF: &str = "off";
 
 const RESERVED_CHARS: &str = "=,";
 
-// ContainsReservedChars - returns whether the input string contains reserved characters.
+/// ContainsReservedChars - returns whether the input string contains reserved characters.
+///
+/// # Arguments
+/// * `s` - input string to check.
+///
+/// # Returns
+/// * `bool` - true if contains reserved characters, false otherwise.
+///
 pub fn contains_reserved_chars(s: &str) -> bool {
     s.contains(RESERVED_CHARS)
 }
 
-// IsAccessKeyValid - validate access key for right length.
+/// IsAccessKeyValid - validate access key for right length.
+///
+/// # Arguments
+/// * `access_key` - access key to validate.
+///
+/// # Returns
+/// * `bool` - true if valid, false otherwise.
+///
 pub fn is_access_key_valid(access_key: &str) -> bool {
     access_key.len() >= ACCESS_KEY_MIN_LEN
 }
 
-// IsSecretKeyValid - validate secret key for right length.
+/// IsSecretKeyValid - validate secret key for right length.
+///
+/// # Arguments
+/// * `secret_key` - secret key to validate.
+///
+/// # Returns
+/// * `bool` - true if valid, false otherwise.
+///
 pub fn is_secret_key_valid(secret_key: &str) -> bool {
     secret_key.len() >= SECRET_KEY_MIN_LEN
 }
 
-// #[cfg_attr(test, derive(PartialEq, Eq, Debug))]
-// struct CredentialHeader {
-//     access_key: String,
-//     scop: CredentialHeaderScope,
-// }
-
-// #[cfg_attr(test, derive(PartialEq, Eq, Debug))]
-// struct CredentialHeaderScope {
-//     date: Date,
-//     region: String,
-//     service: ServiceType,
-//     request: String,
-// }
-
-// impl TryFrom<&str> for CredentialHeader {
-//     type Error = Error;
-//     fn try_from(value: &str) -> Result<Self, Self::Error> {
-//         let mut elem = value.trim().splitn(2, '=');
-//         let (Some(h), Some(cred_elems)) = (elem.next(), elem.next()) else {
-//             return Err(IamError::ErrCredMalformed));
-//         };
-
-//         if h != "Credential" {
-//             return Err(IamError::ErrCredMalformed));
-//         }
-
-//         let mut cred_elems = cred_elems.trim().rsplitn(5, '/');
-
-//         let Some(request) = cred_elems.next() else {
-//             return Err(IamError::ErrCredMalformed));
-//         };
-
-//         let Some(service) = cred_elems.next() else {
-//             return Err(IamError::ErrCredMalformed));
-//         };
-
-//         let Some(region) = cred_elems.next() else {
-//             return Err(IamError::ErrCredMalformed));
-//         };
-
-//         let Some(date) = cred_elems.next() else {
-//             return Err(IamError::ErrCredMalformed));
-//         };
-
-//         let Some(ak) = cred_elems.next() else {
-//             return Err(IamError::ErrCredMalformed));
-//         };
-
-//         if ak.len() < 3 {
-//             return Err(IamError::ErrCredMalformed));
-//         }
-
-//         if request != "aws4_request" {
-//             return Err(IamError::ErrCredMalformed));
-//         }
-
-//         Ok(CredentialHeader {
-//             access_key: ak.to_owned(),
-//             scop: CredentialHeaderScope {
-//                 date: {
-//                     const FORMATTER: LazyCell<Vec<BorrowedFormatItem<'static>>> =
-//                         LazyCell::new(|| time::format_description::parse("[year][month][day]").unwrap());
-
-//                     Date::parse(date, &FORMATTER).map_err(|_| IamError::ErrCredMalformed))?
-//                 },
-//                 region: region.to_owned(),
-//                 service: service.try_into()?,
-//                 request: request.to_owned(),
-//             },
-//         })
-//     }
-// }
-
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
-pub struct Credentials {
-    pub access_key: String,
-    pub secret_key: String,
-    pub session_token: String,
-    pub expiration: Option<OffsetDateTime>,
-    pub status: String,
-    pub parent_user: String,
-    pub groups: Option<Vec<String>>,
-    pub claims: Option<HashMap<String, Value>>,
-    pub name: Option<String>,
-    pub description: Option<String>,
-}
-
-impl Credentials {
-    // pub fn new(elem: &str) -> Result<Self> {
-    //     let header: CredentialHeader = elem.try_into()?;
-    //     Self::check_key_value(header)
-    // }
-
-    // pub fn check_key_value(_header: CredentialHeader) -> Result<Self> {
-    //     todo!()
-    // }
-
-    pub fn is_expired(&self) -> bool {
-        if self.expiration.is_none() {
-            return false;
-        }
-
-        self.expiration
-            .as_ref()
-            .map(|e| time::OffsetDateTime::now_utc() > *e)
-            .unwrap_or(false)
-    }
-
-    pub fn is_temp(&self) -> bool {
-        !self.session_token.is_empty() && !self.is_expired()
-    }
-
-    pub fn is_service_account(&self) -> bool {
-        const IAM_POLICY_CLAIM_NAME_SA: &str = "sa-policy";
-        self.claims
-            .as_ref()
-            .map(|x| x.get(IAM_POLICY_CLAIM_NAME_SA).is_some_and(|_| !self.parent_user.is_empty()))
-            .unwrap_or_default()
-    }
-
-    pub fn is_implied_policy(&self) -> bool {
-        if self.is_service_account() {
-            return self
-                .claims
-                .as_ref()
-                .map(|x| x.get(&iam_policy_claim_name_sa()).is_some_and(|v| v == INHERITED_POLICY_TYPE))
-                .unwrap_or_default();
-        }
-
-        false
-    }
-
-    pub fn is_valid(&self) -> bool {
-        if self.status == "off" {
-            return false;
-        }
-
-        self.access_key.len() >= 3 && self.secret_key.len() >= 8 && !self.is_expired()
-    }
-
-    pub fn is_owner(&self) -> bool {
-        false
-    }
-}
-
+/// GenerateCredentials - generate a new access key and secret key pair.
+///
+/// # Returns
+/// * `Ok((String, String))` - access key and secret key pair.
+/// * `Err(Error)` - if an error occurs during generation.
+///
 pub fn generate_credentials() -> Result<(String, String)> {
-    let ak = utils::gen_access_key(20)?;
-    let sk = utils::gen_secret_key(40)?;
+    let ak = rustfs_credentials::gen_access_key(20)?;
+    let sk = rustfs_credentials::gen_secret_key(40)?;
     Ok((ak, sk))
 }
 
+/// GetNewCredentialsWithMetadata - generate new credentials with metadata claims and token secret.
+///
+/// # Arguments
+/// * `claims` - metadata claims to be included in the token.
+/// * `token_secret` - secret used to sign the token.
+///
+/// # Returns
+/// * `Ok(Credentials)` - newly generated credentials.
+/// * `Err(Error)` - if an error occurs during generation.
+///
 pub fn get_new_credentials_with_metadata(claims: &HashMap<String, Value>, token_secret: &str) -> Result<Credentials> {
     let (ak, sk) = generate_credentials()?;
 
     create_new_credentials_with_metadata(&ak, &sk, claims, token_secret)
 }
 
+/// CreateNewCredentialsWithMetadata - create new credentials with provided access key, secret key, metadata claims, and token secret.
+///
+/// # Arguments
+/// * `ak` - access key.
+/// * `sk` - secret key.
+/// * `claims` - metadata claims to be included in the token.
+/// * `token_secret` - secret used to sign the token.
+///
+/// # Returns
+/// * `Ok(Credentials)` - newly created credentials.
+/// * `Err(Error)` - if an error occurs during creation.
+///
 pub fn create_new_credentials_with_metadata(
     ak: &str,
     sk: &str,
@@ -211,11 +116,11 @@ pub fn create_new_credentials_with_metadata(
     token_secret: &str,
 ) -> Result<Credentials> {
     if ak.len() < ACCESS_KEY_MIN_LEN || ak.len() > ACCESS_KEY_MAX_LEN {
-        return Err(IamError::InvalidAccessKeyLength);
+        return Err(Error::InvalidAccessKeyLength);
     }
 
     if sk.len() < SECRET_KEY_MIN_LEN || sk.len() > SECRET_KEY_MAX_LEN {
-        return Err(IamError::InvalidAccessKeyLength);
+        return Err(Error::InvalidAccessKeyLength);
     }
 
     if token_secret.is_empty() {
@@ -253,6 +158,16 @@ pub fn create_new_credentials_with_metadata(
     })
 }
 
+/// JWTSign - sign the provided claims with the given token secret to generate a JWT token.
+///
+/// # Arguments
+/// * `claims` - claims to be included in the token.
+/// * `token_secret` - secret used to sign the token.
+///
+/// # Returns
+/// * `Ok(String)` - generated JWT token.
+/// * `Err(Error)` - if an error occurs during signing.
+///
 pub fn jwt_sign<T: Serialize>(claims: &T, token_secret: &str) -> Result<String> {
     let token = utils::generate_jwt(claims, token_secret)?;
     Ok(token)
@@ -267,16 +182,29 @@ pub struct CredentialsBuilder {
     description: Option<String>,
     expiration: Option<OffsetDateTime>,
     allow_site_replicator_account: bool,
-    claims: Option<serde_json::Value>,
+    claims: Option<Value>,
     parent_user: String,
     groups: Option<Vec<String>>,
 }
 
 impl CredentialsBuilder {
+    /// Create a new CredentialsBuilder instance.
+    ///
+    /// # Returns
+    /// * `CredentialsBuilder` - a new instance of CredentialsBuilder.
+    ///
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Set the session policy for the credentials.
+    ///
+    /// # Arguments
+    /// * `policy` - an optional Policy to set as the session policy.
+    ///
+    /// # Returns
+    /// * `Self` - the updated CredentialsBuilder instance.
+    ///
     pub fn session_policy(mut self, policy: Option<Policy>) -> Self {
         self.session_policy = policy;
         self
@@ -312,7 +240,7 @@ impl CredentialsBuilder {
         self
     }
 
-    pub fn claims(mut self, claims: serde_json::Value) -> Self {
+    pub fn claims(mut self, claims: Value) -> Self {
         self.claims = Some(claims);
         self
     }
@@ -336,7 +264,7 @@ impl TryFrom<CredentialsBuilder> for Credentials {
     type Error = Error;
     fn try_from(mut value: CredentialsBuilder) -> std::result::Result<Self, Self::Error> {
         if value.parent_user.is_empty() {
-            return Err(IamError::InvalidArgument);
+            return Err(Error::InvalidArgument);
         }
 
         if (value.access_key.is_empty() && !value.secret_key.is_empty())
@@ -346,27 +274,27 @@ impl TryFrom<CredentialsBuilder> for Credentials {
         }
 
         if value.parent_user == value.access_key.as_str() {
-            return Err(IamError::InvalidArgument);
+            return Err(Error::InvalidArgument);
         }
 
         if value.access_key == "site-replicator-0" && !value.allow_site_replicator_account {
-            return Err(IamError::InvalidArgument);
+            return Err(Error::InvalidArgument);
         }
 
-        let mut claim = serde_json::json!({
+        let mut claim = json!({
             "parent": value.parent_user
         });
 
         if let Some(p) = value.session_policy {
             p.is_valid()?;
-            let policy_buf = serde_json::to_vec(&p).map_err(|_| IamError::InvalidArgument)?;
+            let policy_buf = serde_json::to_vec(&p).map_err(|_| Error::InvalidArgument)?;
             if policy_buf.len() > 4096 {
                 return Err(Error::other("session policy is too large"));
             }
-            claim["sessionPolicy"] = serde_json::json!(base64_simd::STANDARD.encode_to_string(&policy_buf));
-            claim["sa-policy"] = serde_json::json!("embedded-policy");
+            claim["sessionPolicy"] = json!(base64_simd::STANDARD.encode_to_string(&policy_buf));
+            claim[rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA] = json!(rustfs_credentials::EMBEDDED_POLICY_TYPE);
         } else {
-            claim["sa-policy"] = serde_json::json!("inherited-policy");
+            claim[rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA] = json!(rustfs_credentials::INHERITED_POLICY_TYPE);
         }
 
         if let Some(Value::Object(obj)) = value.claims {
@@ -379,11 +307,11 @@ impl TryFrom<CredentialsBuilder> for Credentials {
         }
 
         if value.access_key.is_empty() {
-            value.access_key = utils::gen_access_key(20)?;
+            value.access_key = rustfs_credentials::gen_access_key(20)?;
         }
 
         if value.secret_key.is_empty() {
-            value.access_key = utils::gen_secret_key(40)?;
+            value.secret_key = rustfs_credentials::gen_secret_key(40)?;
         }
 
         claim["accessKey"] = json!(&value.access_key);

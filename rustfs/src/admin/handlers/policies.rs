@@ -15,11 +15,12 @@
 use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
     auth::{check_key_valid, get_session_token},
+    server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::is_err_no_such_user;
 use rustfs_iam::store::MappedPolicy;
 use rustfs_policy::policy::{
@@ -60,6 +61,7 @@ impl Operation for ListCannedPolicies {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListUserPoliciesAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -118,6 +120,7 @@ impl Operation for AddCannedPolicy {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::CreatePolicyAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -190,6 +193,7 @@ impl Operation for InfoCannedPolicy {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::GetPolicyAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -247,6 +251,7 @@ impl Operation for RemoveCannedPolicy {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DeletePolicyAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -307,6 +312,7 @@ impl Operation for SetPolicyForUserOrGroup {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::AttachPolicyAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 

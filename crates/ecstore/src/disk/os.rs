@@ -147,11 +147,11 @@ async fn reliable_rename(
     dst_file_path: impl AsRef<Path>,
     base_dir: impl AsRef<Path>,
 ) -> io::Result<()> {
-    if let Some(parent) = dst_file_path.as_ref().parent() {
-        if !file_exists(parent) {
-            // info!("reliable_rename reliable_mkdir_all parent: {:?}", parent);
-            reliable_mkdir_all(parent, base_dir.as_ref()).await?;
-        }
+    if let Some(parent) = dst_file_path.as_ref().parent()
+        && !file_exists(parent)
+    {
+        // info!("reliable_rename reliable_mkdir_all parent: {:?}", parent);
+        reliable_mkdir_all(parent, base_dir.as_ref()).await?;
     }
 
     let mut i = 0;
@@ -190,12 +190,11 @@ pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Pat
             if e.kind() == io::ErrorKind::NotFound && i == 0 {
                 i += 1;
 
-                if let Some(base_parent) = base_dir.parent() {
-                    if let Some(c) = base_parent.components().next() {
-                        if c != Component::RootDir {
-                            base_dir = base_parent
-                        }
-                    }
+                if let Some(base_parent) = base_dir.parent()
+                    && let Some(c) = base_parent.components().next()
+                    && c != Component::RootDir
+                {
+                    base_dir = base_parent
                 }
                 continue;
             }

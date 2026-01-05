@@ -167,7 +167,10 @@ impl Operation for AssumeRoleHandle {
 pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str) -> S3Result<()> {
     if !policy.is_empty() {
         let session_policy = Policy::parse_config(policy.as_bytes())
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse policy err {e}")))?;
+            .map_err(|e| {
+                let error_msg = format!("Failed to parse session policy: {}. Please check that the policy is valid JSON format with standard brackets [] for arrays.", e);
+                S3Error::with_message(S3ErrorCode::InvalidRequest, error_msg)
+            })?;
         if session_policy.version.is_empty() {
             return Err(s3_error!(InvalidRequest, "invalid policy"));
         }

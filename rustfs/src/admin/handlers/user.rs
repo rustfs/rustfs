@@ -15,11 +15,12 @@
 use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
     auth::{check_key_valid, constant_time_eq, get_session_token},
+    server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
     sys::NewServiceAccountOpts,
@@ -95,10 +96,10 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        if let Some(sys_cred) = get_global_action_cred() {
-            if constant_time_eq(&sys_cred.access_key, ak) {
-                return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
-            }
+        if let Some(sys_cred) = get_global_action_cred()
+            && constant_time_eq(&sys_cred.access_key, ak)
+        {
+            return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
         }
 
         let Ok(iam_store) = rustfs_iam::get() else {
@@ -124,6 +125,7 @@ impl Operation for AddUser {
             owner,
             deny_only,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -176,6 +178,7 @@ impl Operation for SetUserStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -220,6 +223,7 @@ impl Operation for ListUsers {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListUsersAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -278,6 +282,7 @@ impl Operation for RemoveUser {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -377,6 +382,7 @@ impl Operation for GetUserInfo {
             owner,
             deny_only,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -426,8 +432,15 @@ impl Operation for ExportIam {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ExportIAMAction)])
-            .await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
 
         let Ok(iam_store) = rustfs_iam::get() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -633,8 +646,15 @@ impl Operation for ImportIam {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ExportIAMAction)])
-            .await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
 
         let mut input = req.input;
         let body = match input.store_all_limited(MAX_IAM_IMPORT_SIZE).await {
@@ -757,10 +777,10 @@ impl Operation for ImportIam {
                 let groups: HashMap<String, GroupInfo> = serde_json::from_slice(&file_content)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                 for (group_name, group_info) in groups {
-                    if let Err(e) = iam_store.get_group_description(&group_name).await {
-                        if matches!(e, rustfs_iam::error::Error::NoSuchGroup(_)) || has_space_be(&group_name) {
-                            return Err(s3_error!(InvalidArgument, "group not found or has space be"));
-                        }
+                    if let Err(e) = iam_store.get_group_description(&group_name).await
+                        && (matches!(e, rustfs_iam::error::Error::NoSuchGroup(_)) || has_space_be(&group_name))
+                    {
+                        return Err(s3_error!(InvalidArgument, "group not found or has space be"));
                     }
 
                     if let Err(e) = iam_store.add_users_to_group(&group_name, group_info.members.clone()).await {
