@@ -17,11 +17,33 @@ use crate::error::Error;
 use serde::Serialize;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "PascalCase", default)]
+/// Principal that serializes AWS field as single string when containing only "*",
+/// or as an array otherwise (matching AWS S3 API format).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Principal {
-    #[serde(rename = "AWS")]
     aws: HashSet<String>,
+}
+
+impl Serialize for Principal {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(1))?;
+
+        // If single element, serialize as string; otherwise as array
+        if self.aws.len() == 1 {
+            if let Some(val) = self.aws.iter().next() {
+                map.serialize_entry("AWS", val)?;
+            }
+        } else {
+            map.serialize_entry("AWS", &self.aws)?;
+        }
+
+        map.end()
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -117,5 +139,31 @@ mod test {
             Err(_) => !should_succeed,
         };
         assert!(result);
+    }
+
+    #[test]
+    fn test_principal_serialize_single_element() {
+        // Single element should serialize as string (AWS format)
+        let principal = Principal {
+            aws: HashSet::from(["*".to_string()]),
+        };
+
+        let json = serde_json::to_string(&principal).expect("Should serialize");
+        assert_eq!(json, r#"{"AWS":"*"}"#);
+    }
+
+    #[test]
+    fn test_principal_serialize_multiple_elements() {
+        // Multiple elements should serialize as array
+        let principal = Principal {
+            aws: HashSet::from(["*".to_string(), "arn:aws:iam::123456789012:root".to_string()]),
+        };
+
+        let json = serde_json::to_string(&principal).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        let aws_value = parsed.get("AWS").expect("Should have AWS field");
+        assert!(aws_value.is_array());
+        let arr = aws_value.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 2);
     }
 }
