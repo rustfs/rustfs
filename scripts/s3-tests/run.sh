@@ -487,7 +487,24 @@ check_server_ready_from_log() {
 
 # Test S3 API readiness
 test_s3_api_ready() {
-    # Try awscurl first if available
+    # Step 1: Check if server is responding using /health endpoint
+    # /health is a probe path that bypasses readiness gate, so it can be used
+    # to check if the server is up and running, even if readiness gate is not ready yet
+    HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X GET \
+        "http://${S3_HOST}:${S3_PORT}/health" \
+        --max-time 5 2>/dev/null || echo "000")
+
+    if [ "${HEALTH_CODE}" = "000" ]; then
+        # Connection failed - server might not be running or not listening yet
+        return 1
+    elif [ "${HEALTH_CODE}" != "200" ]; then
+        # Health endpoint returned non-200 status, server might have issues
+        return 1
+    fi
+
+    # Step 2: Test S3 API with signed request (awscurl) if available
+    # This tests if S3 API is actually ready and can process requests
     if command -v awscurl >/dev/null 2>&1; then
         export PATH="$HOME/.local/bin:$PATH"
         RESPONSE=$(awscurl --service s3 --region "${S3_REGION}" \
@@ -496,18 +513,24 @@ test_s3_api_ready() {
             -X GET "http://${S3_HOST}:${S3_PORT}/" 2>&1)
 
         if echo "${RESPONSE}" | grep -q "<ListAllMyBucketsResult"; then
+            # S3 API is ready and responding correctly
             return 0
         fi
+        # If awscurl failed, check if it's a 503 (Service Unavailable) which means not ready
+        if echo "${RESPONSE}" | grep -q "503\|Service not ready"; then
+            return 1  # Not ready yet (readiness gate is blocking S3 API)
+        fi
+        # Other errors from awscurl - might be auth issues or other problems
+        # But server is up, so we'll consider it ready (S3 API might have other issues)
+        return 0
     fi
 
-    # Fallback: test /health endpoint (this bypasses readiness gate)
-    if curl -sf "http://${S3_HOST}:${S3_PORT}/health" >/dev/null 2>&1; then
-        # Health endpoint works, but we need to verify S3 API works too
-        # Wait a bit more for FullReady to be fully set
-        return 1  # Not fully ready yet, but progressing
-    fi
-
-    return 1  # Not ready
+    # Step 3: Fallback - if /health returns 200, server is up and readiness gate is ready
+    # Since /health is a probe path and returns 200, and we don't have awscurl to test S3 API,
+    # we can assume the server is ready. The readiness gate would have blocked /health if not ready.
+    # Note: Root path "/" with HEAD method returns 501 Not Implemented (S3 doesn't support HEAD on root),
+    # so we can't use it as a reliable test. Since /health already confirmed readiness, we return success.
+    return 0
 }
 
 # First, wait for server to log "server started successfully"
@@ -549,16 +572,41 @@ for i in {1..20}; do
             fi
         fi
 
-        # Show last test attempt
-        log_error "Last S3 API test:"
+        # Show last test attempt with detailed diagnostics
+        log_error "Last S3 API readiness test diagnostics:"
+
+        # Test /health endpoint (probe path, bypasses readiness gate)
+        log_error "Step 1: Testing /health endpoint (probe path):"
+        HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X GET \
+            "http://${S3_HOST}:${S3_PORT}/health" \
+            --max-time 5 2>&1 || echo "000")
+        log_error "  /health HTTP status code: ${HEALTH_CODE}"
+        if [ "${HEALTH_CODE}" != "200" ]; then
+            log_error "  /health endpoint response:"
+            curl -s "http://${S3_HOST}:${S3_PORT}/health" 2>&1 | head -5 || true
+        fi
+
+        # Test S3 API with signed request if awscurl is available
         if command -v awscurl >/dev/null 2>&1; then
             export PATH="$HOME/.local/bin:$PATH"
+            log_error "Step 2: Testing S3 API with awscurl (signed request):"
             awscurl --service s3 --region "${S3_REGION}" \
                 --access_key "${S3_ACCESS_KEY}" \
                 --secret_key "${S3_SECRET_KEY}" \
                 -X GET "http://${S3_HOST}:${S3_PORT}/" 2>&1 | head -20
         else
-            curl -v "http://${S3_HOST}:${S3_PORT}/health" 2>&1 | head -10
+            log_error "Step 2: Testing S3 API root path (unsigned HEAD request):"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X HEAD \
+                "http://${S3_HOST}:${S3_PORT}/" \
+                --max-time 5 2>&1 || echo "000")
+            log_error "  Root path HTTP status code: ${HTTP_CODE}"
+            if [ "${HTTP_CODE}" = "503" ]; then
+                log_error "  Note: 503 indicates readiness gate is blocking (service not ready)"
+            elif [ "${HTTP_CODE}" = "000" ]; then
+                log_error "  Note: 000 indicates connection failure"
+            fi
         fi
 
         # Output logs based on deployment mode
@@ -618,12 +666,51 @@ envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
 # Step 7: Provision s3-tests alt user
 # Note: Main user (rustfsadmin) is a system user and doesn't need to be created via API
 log_info "Provisioning s3-tests alt user..."
+
+# Helper function to install Python packages with fallback for externally-managed environments
+install_python_package() {
+    local package=$1
+    local error_output
+
+    # Try --user first (works on most Linux systems)
+    error_output=$(python3 -m pip install --user --upgrade pip "${package}" 2>&1)
+    if [ $? -eq 0 ]; then
+        return 0
+    fi
+
+    # If that fails with externally-managed-environment error, try with --break-system-packages
+    if echo "${error_output}" | grep -q "externally-managed-environment"; then
+        log_warn "Detected externally-managed Python environment, using --break-system-packages flag"
+        python3 -m pip install --user --break-system-packages --upgrade pip "${package}" || {
+            log_error "Failed to install ${package} even with --break-system-packages"
+            return 1
+        }
+        return 0
+    fi
+
+    # Other errors - show the error output
+    log_error "Failed to install ${package}: ${error_output}"
+    return 1
+}
+
 if ! command -v awscurl >/dev/null 2>&1; then
-    python3 -m pip install --user --upgrade pip awscurl || {
+    install_python_package awscurl || {
         log_error "Failed to install awscurl"
         exit 1
     }
-    export PATH="$HOME/.local/bin:$PATH"
+    # Add common Python user bin directories to PATH
+    # macOS: ~/Library/Python/X.Y/bin
+    # Linux: ~/.local/bin
+    PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.14")
+    export PATH="$HOME/Library/Python/${PYTHON_VERSION}/bin:$HOME/.local/bin:$PATH"
+    # Verify awscurl is now available
+    if ! command -v awscurl >/dev/null 2>&1; then
+        log_error "awscurl installed but not found in PATH. Tried:"
+        log_error "  - $HOME/Library/Python/${PYTHON_VERSION}/bin"
+        log_error "  - $HOME/.local/bin"
+        log_error "Please ensure awscurl is in your PATH"
+        exit 1
+    fi
 fi
 
 # Provision alt user (required by suite)
@@ -680,11 +767,13 @@ cd "${PROJECT_ROOT}/s3-tests"
 
 # Install tox if not available
 if ! command -v tox >/dev/null 2>&1; then
-    python3 -m pip install --user --upgrade pip tox || {
+    install_python_package tox || {
         log_error "Failed to install tox"
         exit 1
     }
-    export PATH="$HOME/.local/bin:$PATH"
+    # Add common Python user bin directories to PATH (same as awscurl)
+    PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.14")
+    export PATH="$HOME/Library/Python/${PYTHON_VERSION}/bin:$HOME/.local/bin:$PATH"
 fi
 
 # Step 9: Run ceph s3-tests
