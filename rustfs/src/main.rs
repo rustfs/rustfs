@@ -369,6 +369,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     // 4. Mark as Full Ready now that critical components are warm
     readiness.mark_stage(SystemStage::FullReady);
 
+    // Set the global RustFS initialization time to now
+    rustfs_common::set_global_init_time_now().await;
+
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
     // listen to the shutdown signal
