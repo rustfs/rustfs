@@ -14,7 +14,7 @@
 
 use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend};
 use crate::error::{Error, Result};
-use crate::rpc::node_service_time_out_client_no_auth;
+use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::{
     disk::endpoint::Endpoint,
     global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints},
@@ -101,9 +101,9 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
         let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
         assert!(decoded_payload.is_ok());
 
-        let mut client = node_service_time_out_client_no_auth(&addr)
+        let mut client = node_service_time_out_client(&addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
-            .map_err(|err| Error::other(err.to_string()))?;
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
 
         let request = Request::new(PingRequest {
             version: 1,

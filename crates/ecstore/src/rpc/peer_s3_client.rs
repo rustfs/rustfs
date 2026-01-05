@@ -18,9 +18,7 @@ use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
-use crate::rpc::client::{
-    TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
-};
+use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
@@ -675,7 +673,7 @@ impl RemotePeerS3Client {
     async fn perform_connectivity_check(addr: &str) -> Result<()> {
         use tokio::time::timeout;
 
-        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {}", e)))?;
+        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {e}")))?;
 
         let Some(host) = url.host_str() else {
             return Err(Error::other("No host in URL".to_string()));
@@ -686,7 +684,7 @@ impl RemotePeerS3Client {
         // Try to establish TCP connection
         match timeout(CHECK_TIMEOUT_DURATION, TcpStream::connect((host, port))).await {
             Ok(Ok(_)) => Ok(()),
-            _ => Err(Error::other(format!("Cannot connect to {}:{}", host, port))),
+            _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
         }
     }
 
@@ -725,7 +723,7 @@ impl RemotePeerS3Client {
                 // Timeout occurred, mark peer as potentially faulty
                 self.health.decrement_waiting();
                 warn!("Remote peer operation timeout after {:?}", timeout_duration);
-                Err(Error::other(format!("Remote peer operation timeout after {:?}", timeout_duration)))
+                Err(Error::other(format!("Remote peer operation timeout after {timeout_duration:?}")))
             }
         }
     }
@@ -823,9 +821,7 @@ impl PeerS3Client for RemotePeerS3Client {
         self.execute_with_timeout(
             || async {
                 let options = serde_json::to_string(opts)?;
-                let mut client = node_service_time_out_client_no_auth(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(GetBucketInfoRequest {
                     bucket: bucket.to_string(),
                     options,
