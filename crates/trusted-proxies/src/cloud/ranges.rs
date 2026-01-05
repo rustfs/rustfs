@@ -855,7 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cloud_metadata_fallback() {
-        use crate::cloud::metadata::CloudMetadataDetector;
+        use crate::cloud::ranges::CloudMetadataDetector;
 
         // In a test environment, the metadata service should not be available
         let detector = CloudMetadataDetector::new();

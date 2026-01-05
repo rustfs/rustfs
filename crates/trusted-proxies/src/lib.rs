@@ -12,21 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod advanced;
-mod cache;
+mod api;
 mod cloud;
 mod config;
-mod globals;
-mod metrics;
+mod errors;
+mod logging;
 mod middleware;
-mod processor;
 mod proxy;
+mod utils;
 
-pub use advanced::*;
-pub use cache::*;
 pub use cloud::*;
 pub use config::*;
-pub use globals::*;
-pub use middleware::*;
-pub use processor::*;
 pub use proxy::*;

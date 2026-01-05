@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod detector;
-mod metadata;
-mod ranges;
-
-pub use ranges::*;
+mod cache;
+mod chain;
+mod metrics;
