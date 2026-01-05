@@ -21,7 +21,7 @@ use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateMa
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
-use http::{HeaderMap, Request as HttpRequest, Response};
+use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
@@ -31,6 +31,7 @@ use hyper_util::{
 use metrics::{counter, histogram};
 use rustfs_common::GlobalReadiness;
 use rustfs_config::{MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_trusted_proxies::{ClientInfo, TrustedProxiesLayer};
 use rustfs_utils::net::parse_and_resolve_address;
@@ -43,7 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
-use tonic::{Request, Status, metadata::MetadataValue};
+use tonic::{Request, Status};
 use tower::ServiceBuilder;
 use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -729,17 +730,11 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
-    let token_str = rustfs_credentials::get_grpc_token();
-
-    let token: MetadataValue<_> = token_str.parse().map_err(|e| {
-        error!("Failed to parse RUSTFS_GRPC_AUTH_TOKEN into gRPC metadata value: {}", e);
-        Status::internal("Invalid auth token configuration")
+    verify_rpc_signature(TONIC_RPC_PREFIX, &Method::GET, req.metadata().as_ref()).map_err(|e| {
+        error!("RPC signature verification failed: {}", e);
+        Status::unauthenticated("No valid auth token")
     })?;
-
-    match req.metadata().get("authorization") {
-        Some(t) if token == t => Ok(req),
-        _ => Err(Status::unauthenticated("No valid auth token")),
-    }
+    Ok(req)
 }
 
 /// Determines the listen backlog size.

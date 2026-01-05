@@ -20,11 +20,10 @@ use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evi
 use std::{error::Error, time::Duration};
 use tonic::{
     Request, Status,
-    metadata::MetadataValue,
     service::interceptor::InterceptedService,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 // Type alias for the complex client type
 pub type NodeServiceClientType = NodeServiceClient<
@@ -64,7 +63,7 @@ const RUSTFS_HTTPS_PREFIX: &str = "https://";
 /// - Aggressive TCP keepalive (10s)
 /// - HTTP/2 PING every 5s, timeout at 3s
 /// - Overall RPC timeout of 30s (reduced from 60s)
-async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
+pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {}", addr);
 
     let mut connector = Endpoint::from_shared(addr.to_string())?
@@ -129,90 +128,6 @@ async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 
     debug!("Successfully created and cached gRPC channel to: {}", addr);
     Ok(channel)
-}
-
-/// Get a gRPC client for the NodeService with robust connection handling.
-///
-/// This function implements several resilience features:
-/// 1. Connection caching for performance
-/// 2. Automatic eviction of stale/dead connections on error
-/// 3. Optimized keepalive settings for fast dead peer detection
-/// 4. Reduced timeouts to fail fast when peers are unresponsive
-///
-/// # Connection Lifecycle
-/// - Cached connections are reused for subsequent calls
-/// - On any connection error, the cached connection is evicted
-/// - Fresh connections are established with aggressive keepalive settings
-///
-/// # Cluster Power-Off Recovery
-/// When a node experiences abrupt power-off:
-/// 1. The cached connection will fail on next use
-/// 2. The connection is automatically evicted from cache
-/// 3. Subsequent calls will attempt fresh connections
-/// 4. If node is still down, connection will fail fast (3s timeout)
-pub async fn node_service_time_out_client(
-    addr: &String,
-) -> Result<
-    NodeServiceClient<
-        InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
-    >,
-    Box<dyn Error>,
-> {
-    debug!("Obtaining gRPC client for NodeService at: {}", addr);
-    let token_str = rustfs_credentials::get_grpc_token();
-    let token: MetadataValue<_> = token_str.parse().map_err(|e| {
-        error!(
-            "Failed to parse gRPC auth token into MetadataValue: {:?}; env={} token_len={} token_prefix={}",
-            e,
-            rustfs_credentials::ENV_GRPC_AUTH_TOKEN,
-            token_str.len(),
-            token_str.chars().take(2).collect::<String>(),
-        );
-        e
-    })?;
-
-    // Try to get cached channel
-    let cached_channel = { GLOBAL_CONN_MAP.read().await.get(addr).cloned() };
-
-    let channel = match cached_channel {
-        Some(channel) => {
-            debug!("Using cached gRPC channel for: {}", addr);
-            channel
-        }
-        None => {
-            // No cached connection, create new one
-            create_new_channel(addr).await?
-        }
-    };
-
-    Ok(NodeServiceClient::with_interceptor(
-        channel,
-        Box::new(move |mut req: Request<()>| {
-            req.metadata_mut().insert("authorization", token.clone());
-            Ok(req)
-        }),
-    ))
-}
-
-/// Get a gRPC client with automatic connection eviction on failure.
-///
-/// This is the preferred method for cluster operations as it ensures
-/// that failed connections are automatically cleaned up from the cache.
-///
-/// Returns the client and the address for later eviction if needed.
-pub async fn node_service_client_with_eviction(
-    addr: &String,
-) -> Result<
-    (
-        NodeServiceClient<
-            InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
-        >,
-        String,
-    ),
-    Box<dyn Error>,
-> {
-    let client = node_service_time_out_client(addr).await?;
-    Ok((client, addr.clone()))
 }
 
 /// Evict a connection from the cache after a failure.

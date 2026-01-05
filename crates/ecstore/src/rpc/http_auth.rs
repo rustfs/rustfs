@@ -29,6 +29,7 @@ type HmacSha256 = Hmac<Sha256>;
 const SIGNATURE_HEADER: &str = "x-rustfs-signature";
 const TIMESTAMP_HEADER: &str = "x-rustfs-timestamp";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
+pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
 
 /// Get the shared secret for HMAC signing
 fn get_shared_secret() -> String {
@@ -57,13 +58,25 @@ fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) 
 
 /// Build headers with authentication signature
 pub fn build_auth_headers(url: &str, method: &Method, headers: &mut HeaderMap) {
+    let auth_headers = gen_signature_headers(url, method);
+
+    headers.extend(auth_headers);
+}
+
+pub fn gen_signature_headers(url: &str, method: &Method) -> HeaderMap {
     let secret = get_shared_secret();
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
 
     let signature = generate_signature(&secret, url, method, timestamp);
 
-    headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).unwrap());
-    headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&timestamp.to_string()).unwrap());
+    let mut headers = HeaderMap::new();
+    headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).expect("Invalid header value"));
+    headers.insert(
+        TIMESTAMP_HEADER,
+        HeaderValue::from_str(&timestamp.to_string()).expect("Invalid header value"),
+    );
+
+    headers
 }
 
 /// Verify the request signature for RPC requests
