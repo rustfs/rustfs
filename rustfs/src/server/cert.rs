@@ -26,7 +26,7 @@ pub enum RustFSError {
 impl std::fmt::Display for RustFSError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RustFSError::Cert(msg) => write!(f, "Certificate error: {}", msg),
+            RustFSError::Cert(msg) => write!(f, "Certificate error: {msg}"),
         }
     }
 }
@@ -78,7 +78,7 @@ fn parse_pem_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, RustFSErr
 async fn read_file(path: &PathBuf, desc: &str) -> Result<Vec<u8>, RustFSError> {
     tokio::fs::read(path)
         .await
-        .map_err(|e| RustFSError::Cert(format!("read {} {:?}: {e}", desc, path)))
+        .map_err(|e| RustFSError::Cert(format!("read {desc} {path:?}: {e}")))
 }
 
 /// Initialize TLS material for both server and outbound client connections.

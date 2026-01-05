@@ -206,7 +206,7 @@ impl RemoteDisk {
 
     /// Perform basic connectivity check for remote disk
     async fn perform_connectivity_check(addr: &str) -> Result<()> {
-        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {}", e)))?;
+        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {e}")))?;
 
         let Some(host) = url.host_str() else {
             return Err(Error::other("No host in URL".to_string()));
@@ -220,7 +220,7 @@ impl RemoteDisk {
                 drop(stream);
                 Ok(())
             }
-            _ => Err(Error::other(format!("Cannot connect to {}:{}", host, port))),
+            _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
         }
     }
 
@@ -260,7 +260,7 @@ impl RemoteDisk {
                 // Timeout occurred, mark disk as potentially faulty
                 self.health.decrement_waiting();
                 warn!("Remote disk operation timeout after {:?}", timeout_duration);
-                Err(Error::other(format!("Remote disk operation timeout after {:?}", timeout_duration)))
+                Err(Error::other(format!("Remote disk operation timeout after {timeout_duration:?}")))
             }
         }
     }

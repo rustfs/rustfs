@@ -336,7 +336,7 @@ pub async fn init_ftp_system(
     let ftps_address_str = rustfs_utils::get_env_str(rustfs_config::ENV_FTPS_ADDRESS, rustfs_config::DEFAULT_FTPS_ADDRESS);
     let addr: SocketAddr = ftps_address_str
         .parse()
-        .map_err(|e| format!("Invalid FTPS address '{}': {}", ftps_address_str, e))?;
+        .map_err(|e| format!("Invalid FTPS address '{ftps_address_str}': {e}"))?;
 
     // Get FTPS configuration from environment variables
     let cert_file = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_CERTS_FILE);
@@ -402,7 +402,7 @@ pub async fn init_sftp_system(
     let sftp_address_str = rustfs_utils::get_env_str(rustfs_config::ENV_SFTP_ADDRESS, rustfs_config::DEFAULT_SFTP_ADDRESS);
     let addr: SocketAddr = sftp_address_str
         .parse()
-        .map_err(|e| format!("Invalid SFTP address '{}': {}", sftp_address_str, e))?;
+        .map_err(|e| format!("Invalid SFTP address '{sftp_address_str}': {e}"))?;
 
     // Get SFTP configuration from environment variables
     let host_key = rustfs_utils::get_env_opt_str(rustfs_config::ENV_SFTP_HOST_KEY);
