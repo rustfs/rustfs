@@ -15,11 +15,12 @@
 
 use async_trait::async_trait;
 use rustfs_ecstore::disk::endpoint::Endpoint;
-use rustfs_lock::client::{LockClient, local::LocalClient, remote::RemoteClient};
+use rustfs_ecstore::rpc::RemoteClient;
+use rustfs_lock::client::{LockClient, local::LocalClient};
 use rustfs_lock::types::{LockInfo, LockResponse, LockStats};
 use rustfs_lock::{LockId, LockMetadata, LockPriority, LockType};
 use rustfs_lock::{LockRequest, NamespaceLock, NamespaceLockManager};
-use rustfs_protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
+use rustfs_protos::proto_gen::node_service::GenerallyLockRequest;
 use serial_test::serial;
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 use tokio::time::sleep;
@@ -156,7 +157,7 @@ async fn test_lock_unlock_rpc() -> Result<(), Box<dyn Error>> {
     };
     let args = serde_json::to_string(&args)?;
 
-    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
+    let mut client = RemoteClient::new(CLUSTER_ADDR.to_string()).get_client().await?;
     println!("got client");
     let request = Request::new(GenerallyLockRequest { args: args.clone() });
 
@@ -614,7 +615,7 @@ async fn test_rpc_read_lock() -> Result<(), Box<dyn Error>> {
     };
     let args_str = serde_json::to_string(&args)?;
 
-    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
+    let mut client = RemoteClient::new(CLUSTER_ADDR.to_string()).get_client().await?;
 
     // First read lock
     let request = Request::new(GenerallyLockRequest { args: args_str.clone() });
@@ -669,7 +670,7 @@ async fn test_lock_refresh() -> Result<(), Box<dyn Error>> {
     };
     let args_str = serde_json::to_string(&args)?;
 
-    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
+    let mut client = RemoteClient::new(CLUSTER_ADDR.to_string()).get_client().await?;
 
     // Acquire lock
     let request = Request::new(GenerallyLockRequest { args: args_str.clone() });
@@ -713,7 +714,7 @@ async fn test_force_unlock() -> Result<(), Box<dyn Error>> {
     };
     let args_str = serde_json::to_string(&args)?;
 
-    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
+    let mut client = RemoteClient::new(CLUSTER_ADDR.to_string()).get_client().await?;
 
     // Acquire lock
     let request = Request::new(GenerallyLockRequest { args: args_str.clone() });

@@ -18,6 +18,9 @@ use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
+use crate::rpc::client::{
+    TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
+};
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
@@ -32,7 +35,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use rustfs_common::heal_channel::{DriveState, HealItemType, HealOpts, RUSTFS_RESERVED_BUCKET};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_protos::node_service_time_out_client;
+use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_protos::proto_gen::node_service::{
     DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
 };
@@ -40,6 +43,8 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, sync::RwLock, time};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
@@ -587,6 +592,12 @@ impl RemotePeerS3Client {
         client
     }
 
+    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+            .await
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))
+    }
+
     pub fn get_addr(&self) -> String {
         self.addr.clone()
     }
@@ -730,9 +741,7 @@ impl PeerS3Client for RemotePeerS3Client {
         self.execute_with_timeout(
             || async {
                 let options: String = serde_json::to_string(opts)?;
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(HealBucketRequest {
                     bucket: bucket.to_string(),
                     options,
@@ -762,9 +771,7 @@ impl PeerS3Client for RemotePeerS3Client {
         self.execute_with_timeout(
             || async {
                 let options = serde_json::to_string(opts)?;
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(ListBucketRequest { options });
                 let response = client.list_bucket(request).await?.into_inner();
                 if !response.success {
@@ -790,9 +797,7 @@ impl PeerS3Client for RemotePeerS3Client {
         self.execute_with_timeout(
             || async {
                 let options = serde_json::to_string(opts)?;
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(MakeBucketRequest {
                     name: bucket.to_string(),
                     options,
@@ -818,7 +823,7 @@ impl PeerS3Client for RemotePeerS3Client {
         self.execute_with_timeout(
             || async {
                 let options = serde_json::to_string(opts)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = node_service_time_out_client_no_auth(&self.addr)
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(GetBucketInfoRequest {
@@ -845,9 +850,7 @@ impl PeerS3Client for RemotePeerS3Client {
     async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
 
                 let request = Request::new(DeleteBucketRequest {
                     bucket: bucket.to_string(),
