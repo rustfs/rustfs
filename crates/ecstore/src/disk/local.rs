@@ -865,8 +865,6 @@ impl LocalDisk {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        warn!("write_all_private: volume: {}, path: {:?}, buf: {:?}", volume, file_path, buf.len());
-
         self.write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
             .await
     }
@@ -1406,9 +1404,9 @@ impl DiskAPI for LocalDisk {
                 return Ok(format_info.data.clone());
             }
         }
-        // TOFIX:
+
         let p = self.get_object_path(volume, path)?;
-        warn!("read_all: volume: {}, path: {:?}", volume, p);
+
         let (data, _) = read_file_all(&p).await?;
 
         Ok(data)
@@ -1808,11 +1806,6 @@ impl DiskAPI for LocalDisk {
 
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        warn!(
-            "read_file_stream: volume: {}, path: {:?}, offset: {}, length: {}",
-            volume, file_path, offset, length
-        );
 
         let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
 
