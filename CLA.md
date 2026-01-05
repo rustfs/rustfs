@@ -83,6 +83,3 @@ that body of laws known as conflict of laws. The parties expressly agree that th
 for the International Sale of Goods will not apply. Any legal action or proceeding arising under this Agreement will be
 brought exclusively in the courts located in Beijing, China, and the parties hereby irrevocably consent to the personal
 jurisdiction and venue therein.
-
-For your reading convenience, this Agreement is written in parallel English and Chinese sections. To the extent there is
-a conflict between the English and Chinese sections, the English sections shall govern.
