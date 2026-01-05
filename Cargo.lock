@@ -3420,18 +3420,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "enum-as-inner"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.113",
-]
-
-[[package]]
 name = "enum_dispatch"
 version = "0.3.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7767,6 +7755,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jemalloc_pprof",
+ "libc",
  "libsystemd",
  "libunftp",
  "matchit 0.9.1",
@@ -7815,7 +7804,6 @@ dependencies = [
  "socket2",
  "ssh-key",
  "subtle",
- "sysctl",
  "sysinfo",
  "thiserror 2.0.17",
  "tikv-jemalloc-ctl",
@@ -9682,20 +9670,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.113",
-]
-
-[[package]]
-name = "sysctl"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cca424247104946a59dacd27eaad296223b7feec3d168a6dd04585183091eb0b"
-dependencies = [
- "bitflags 2.10.0",
- "byteorder",
- "enum-as-inner",
- "libc",
- "thiserror 2.0.17",
- "walkdir",
 ]
 
 [[package]]
