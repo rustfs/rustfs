@@ -37,6 +37,8 @@ datas = "datas"
 bre = "bre"
 abd = "abd"
 mak = "mak"
+# s3-tests original test names (cannot be changed)
+nonexisted = "nonexisted"
 
 [files]
 extend-exclude = []
