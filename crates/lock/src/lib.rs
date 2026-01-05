@@ -37,7 +37,7 @@ pub mod types;
 // Re-export main types for easy access
 pub use crate::{
     // Client interfaces
-    client::{LockClient, local::LocalClient, remote::RemoteClient},
+    client::{LockClient, local::LocalClient},
     // Error types
     error::{LockError, Result},
     // Fast Lock System exports

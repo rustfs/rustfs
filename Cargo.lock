@@ -2037,9 +2037,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.0-rc.13"
+version = "0.7.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2bb4138de6db76c8155b4423e967049fbef2cf84ad6af7f552f73a161941b72"
+checksum = "c9c6daa2049db6a5fad90a981b8c63f023dbaf75a0fae73db4dcf234556fc957"
 dependencies = [
  "ctutils",
  "num-traits",
@@ -2075,7 +2075,7 @@ version = "0.7.0-pre.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da0b07a7a616370e8b6efca0c6a25e5f4c6d02fde11f3d570e4af64d8ed7e2e9"
 dependencies = [
- "crypto-bigint 0.7.0-rc.13",
+ "crypto-bigint 0.7.0-rc.14",
  "libm",
  "rand_core 0.10.0-rc-3",
 ]
@@ -3274,7 +3274,6 @@ dependencies = [
  "rustfs-common",
  "rustfs-ecstore",
  "rustfs-filemeta",
- "rustfs-iam",
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-protos",
@@ -7520,7 +7519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d27d813937fdf8e9ad15e3e422a55da4021d29639000139ca19d99f3949060da"
 dependencies = [
  "const-oid 0.10.1",
- "crypto-bigint 0.7.0-rc.13",
+ "crypto-bigint 0.7.0-rc.14",
  "crypto-primes",
  "digest 0.11.0-rc.5",
  "pkcs1 0.8.0-rc.4",
@@ -7778,7 +7777,6 @@ dependencies = [
  "moka",
  "pin-project-lite",
  "pprof",
- "rand 0.10.0-rc.6",
  "reqwest",
  "rmp-serde",
  "russh",
@@ -8132,11 +8130,9 @@ name = "rustfs-lock"
 version = "0.0.5"
 dependencies = [
  "async-trait",
- "bytes",
  "crossbeam-queue",
  "futures",
  "parking_lot",
- "rustfs-protos",
  "serde",
  "serde_json",
  "smallvec",
@@ -8145,7 +8141,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
- "url",
  "uuid",
 ]
 
@@ -8271,7 +8266,6 @@ dependencies = [
  "flatbuffers",
  "prost 0.14.1",
  "rustfs-common",
- "rustfs-credentials",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -8968,11 +8962,12 @@ dependencies = [
 
 [[package]]
 name = "serial_test"
-version = "3.2.0"
+version = "3.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b258109f244e1d6891bf1053a55d63a5cd4f8f4c30cf9a1280989f80e7a1fa9"
+checksum = "0d0b343e184fc3b7bb44dff0705fffcf4b3756ba6aff420dddd8b24ca145e555"
 dependencies = [
- "futures",
+ "futures-executor",
+ "futures-util",
  "log",
  "once_cell",
  "parking_lot",
@@ -8982,9 +8977,9 @@ dependencies = [
 
 [[package]]
 name = "serial_test_derive"
-version = "3.2.0"
+version = "3.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d69265a08751de7844521fd15003ae0a888e035773ba05695c5c759a6f89eef"
+checksum = "6f50427f258fb77356e4cd4aa0e87e2bd2c66dbcee41dc405282cae2bfc26c83"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9384,7 +9379,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ad6a09263583e83e934fcd436b7e3bb9d69602e2feef3787adb615c1fe3a343"
 dependencies = [
  "base64ct",
- "crypto-bigint 0.7.0-rc.13",
+ "crypto-bigint 0.7.0-rc.14",
  "digest 0.11.0-rc.5",
  "pem-rfc7468 1.0.0",
  "subtle",

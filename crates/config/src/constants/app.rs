@@ -170,12 +170,6 @@ pub const KI_B: usize = 1024;
 /// Default value: 1048576
 pub const MI_B: usize = 1024 * 1024;
 
-/// Environment variable for gRPC authentication token
-/// Used to set the authentication token for gRPC communication
-/// Example: RUSTFS_GRPC_AUTH_TOKEN=your_token_here
-/// Default value: No default value. RUSTFS_SECRET_KEY value is recommended.
-pub const ENV_GRPC_AUTH_TOKEN: &str = "RUSTFS_GRPC_AUTH_TOKEN";
-
 #[cfg(test)]
 mod tests {
     use super::*;
