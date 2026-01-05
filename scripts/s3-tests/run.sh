@@ -34,132 +34,9 @@ TEST_MODE="${TEST_MODE:-single}"
 MAXFAIL="${MAXFAIL:-1}"
 XDIST="${XDIST:-0}"
 
-# =============================================================================
-# MARKEXPR: pytest marker expression to exclude test categories
-# =============================================================================
-# These markers exclude entire test categories via pytest's -m option.
-# Use MARKEXPR env var to override the default exclusions.
-#
-# Excluded categories:
-#   - Unimplemented S3 features: lifecycle, versioning, s3website, bucket_logging, encryption
-#   - Ceph/RGW specific tests: fails_on_aws, fails_on_rgw, fails_on_dbstore
-#   - IAM features: iam_account, iam_tenant, iam_role, iam_user, iam_cross_account
-#   - Other unimplemented: sns, sse_s3, storage_class, test_of_sts, webidentity_test
-# =============================================================================
-if [[ -z "${MARKEXPR:-}" ]]; then
-    EXCLUDED_MARKERS=(
-        # Unimplemented S3 features
-        "lifecycle"
-        "versioning"
-        "s3website"
-        "bucket_logging"
-        "encryption"
-        # Ceph/RGW specific tests (not standard S3)
-        "fails_on_aws"      # Tests for Ceph/RGW specific features (X-RGW-* headers, etc.)
-        "fails_on_rgw"      # Known RGW issues we don't need to replicate
-        "fails_on_dbstore"  # Ceph dbstore backend specific
-        # IAM features requiring additional setup
-        "iam_account"
-        "iam_tenant"
-        "iam_role"
-        "iam_user"
-        "iam_cross_account"
-        # Other unimplemented features
-        "sns"               # SNS notification
-        "sse_s3"            # Server-side encryption with S3-managed keys
-        "storage_class"     # Storage class features
-        "test_of_sts"       # STS token service
-        "webidentity_test"  # Web Identity federation
-    )
-    # Build MARKEXPR from array: "not marker1 and not marker2 and ..."
-    MARKEXPR=""
-    for marker in "${EXCLUDED_MARKERS[@]}"; do
-        if [[ -n "${MARKEXPR}" ]]; then
-            MARKEXPR+=" and "
-        fi
-        MARKEXPR+="not ${marker}"
-    done
-fi
-
-# =============================================================================
-# TESTEXPR: pytest -k expression to exclude specific tests by name
-# =============================================================================
-# These patterns exclude specific tests via pytest's -k option (name matching).
-# Use TESTEXPR env var to override the default exclusions.
-#
-# Exclusion reasons are documented inline below.
-# =============================================================================
-if [[ -z "${TESTEXPR:-}" ]]; then
-    EXCLUDED_TESTS=(
-        # POST Object (HTML form upload) - not implemented
-        "test_post_object"
-        # ACL-dependent tests - ACL not implemented
-        "test_bucket_list_objects_anonymous"    # requires PutBucketAcl
-        "test_bucket_listv2_objects_anonymous"  # requires PutBucketAcl
-        "test_bucket_concurrent_set_canned_acl" # ACL not implemented
-        "test_expected_bucket_owner"            # requires PutBucketAcl
-        "test_bucket_acl"                       # Bucket ACL not implemented
-        "test_object_acl"                       # Object ACL not implemented
-        "test_put_bucket_acl"                   # PutBucketAcl not implemented
-        "test_object_anon"                      # Anonymous access requires ACL
-        "test_access_bucket"                    # Access control requires ACL
-        "test_100_continue"                     # requires ACL
-        # Chunked encoding - not supported
-        "test_object_write_with_chunked_transfer_encoding"
-        "test_object_content_encoding_aws_chunked"
-        # CORS - not implemented
-        "test_cors"
-        "test_set_cors"
-        # Presigned URL edge cases
-        "test_object_raw"                       # Raw presigned URL tests
-        # Error response format differences
-        "test_bucket_create_exists"             # Error format issue
-        "test_bucket_recreate_not_overriding"   # Error format issue
-        "test_list_buckets_invalid_auth"        # 401 vs 403
-        "test_object_delete_key_bucket_gone"    # 403 vs 404
-        "test_abort_multipart_upload_not_found" # Error code issue
-        # ETag conditional request edge cases
-        "test_get_object_ifmatch_failed"
-        "test_get_object_ifnonematch"
-        # Copy operation edge cases
-        "test_object_copy_to_itself"            # Copy validation
-        "test_object_copy_not_owned_bucket"     # Cross-account access
-        "test_multipart_copy_invalid_range"     # Multipart validation
-        # Timing-sensitive tests
-        "test_versioning_concurrent_multi_object_delete"
-    )
-    # Build TESTEXPR from array: "not test1 and not test2 and ..."
-    TESTEXPR=""
-    for pattern in "${EXCLUDED_TESTS[@]}"; do
-        if [[ -n "${TESTEXPR}" ]]; then
-            TESTEXPR+=" and "
-        fi
-        TESTEXPR+="not ${pattern}"
-    done
-fi
-
-# Configuration file paths
-S3TESTS_CONF_TEMPLATE="${S3TESTS_CONF_TEMPLATE:-.github/s3tests/s3tests.conf}"
-S3TESTS_CONF="${S3TESTS_CONF:-s3tests.conf}"
-
-# Service deployment mode: "build", "binary", "docker", or "existing"
-# - "build": Compile with cargo build --release and run (default)
-# - "binary": Use pre-compiled binary (RUSTFS_BINARY path or default)
-# - "docker": Build Docker image and run in container
-# - "existing": Use already running service (skip start, use S3_HOST and S3_PORT)
-DEPLOY_MODE="${DEPLOY_MODE:-build}"
-RUSTFS_BINARY="${RUSTFS_BINARY:-}"
-NO_CACHE="${NO_CACHE:-false}"
-
-# Directories
+# Directories (define early for use in test list loading)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-ARTIFACTS_DIR="${PROJECT_ROOT}/artifacts/s3tests-${TEST_MODE}"
-CONTAINER_NAME="rustfs-${TEST_MODE}"
-NETWORK_NAME="rustfs-net"
-DATA_ROOT="${DATA_ROOT:-target}"
-DATA_DIR="${PROJECT_ROOT}/${DATA_ROOT}/test-data/${CONTAINER_NAME}"
-RUSTFS_PID=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -179,6 +56,137 @@ log_warn() {
 log_error() {
     echo -e "${RED}[ERROR]${NC} $*"
 }
+
+# =============================================================================
+# Test Classification Files
+# =============================================================================
+# Tests are classified into three categories stored in text files:
+#   - non_standard_tests.txt:  Ceph/RGW specific tests (permanently excluded)
+#   - unimplemented_tests.txt: Standard S3 features not yet implemented
+#   - implemented_tests.txt:   Tests that should pass on RustFS
+#
+# By default, only tests listed in implemented_tests.txt are run.
+# Use TESTEXPR env var to override and run custom test selection.
+# =============================================================================
+
+# Test list files location
+TEST_LISTS_DIR="${SCRIPT_DIR}"
+IMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/implemented_tests.txt"
+NON_STANDARD_TESTS_FILE="${TEST_LISTS_DIR}/non_standard_tests.txt"
+UNIMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/unimplemented_tests.txt"
+
+# =============================================================================
+# build_testexpr_from_file: Read test names from file and build pytest -k expr
+# =============================================================================
+# Reads test names from a file (one per line, ignoring comments and empty lines)
+# and builds a pytest -k expression to include only those tests.
+# =============================================================================
+build_testexpr_from_file() {
+    local file="$1"
+    local expr=""
+
+    if [[ ! -f "${file}" ]]; then
+        log_error "Test list file not found: ${file}"
+        return 1
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        # Trim whitespace
+        line=$(echo "$line" | xargs)
+        [[ -z "$line" ]] && continue
+
+        if [[ -n "${expr}" ]]; then
+            expr+=" or "
+        fi
+        expr+="${line}"
+    done < "${file}"
+
+    echo "${expr}"
+}
+
+# =============================================================================
+# MARKEXPR: pytest marker expression (safety net for marker-based filtering)
+# =============================================================================
+# Even though we use file-based test selection, we keep marker exclusions
+# as a safety net to ensure no non-standard tests slip through.
+# =============================================================================
+if [[ -z "${MARKEXPR:-}" ]]; then
+    # Minimal marker exclusions as safety net (file-based filtering is primary)
+    MARKEXPR="not fails_on_aws and not fails_on_rgw and not fails_on_dbstore"
+fi
+
+# =============================================================================
+# TESTEXPR: pytest -k expression to select specific tests
+# =============================================================================
+# By default, builds an inclusion expression from implemented_tests.txt.
+# Use TESTEXPR env var to override with custom selection.
+#
+# The file-based approach provides:
+#   1. Clear visibility of which tests are run
+#   2. Easy maintenance - edit txt files to add/remove tests
+#   3. Separation of concerns - test classification vs test execution
+# =============================================================================
+if [[ -z "${TESTEXPR:-}" ]]; then
+    if [[ -f "${IMPLEMENTED_TESTS_FILE}" ]]; then
+        log_info "Loading test list from: ${IMPLEMENTED_TESTS_FILE}"
+        TESTEXPR=$(build_testexpr_from_file "${IMPLEMENTED_TESTS_FILE}")
+        if [[ -z "${TESTEXPR}" ]]; then
+            log_error "No tests found in ${IMPLEMENTED_TESTS_FILE}"
+            exit 1
+        fi
+        # Count tests for logging
+        TEST_COUNT=$(grep -v '^#' "${IMPLEMENTED_TESTS_FILE}" | grep -v '^[[:space:]]*$' | wc -l | xargs)
+        log_info "Loaded ${TEST_COUNT} tests from implemented_tests.txt"
+    else
+        log_warn "Test list file not found: ${IMPLEMENTED_TESTS_FILE}"
+        log_warn "Falling back to exclusion-based filtering"
+        # Fallback to exclusion-based filtering if file doesn't exist
+        EXCLUDED_TESTS=(
+            "test_post_object"
+            "test_bucket_list_objects_anonymous"
+            "test_bucket_listv2_objects_anonymous"
+            "test_bucket_concurrent_set_canned_acl"
+            "test_bucket_acl"
+            "test_object_acl"
+            "test_access_bucket"
+            "test_100_continue"
+            "test_cors"
+            "test_object_raw"
+            "test_versioning"
+            "test_versioned"
+        )
+        TESTEXPR=""
+        for pattern in "${EXCLUDED_TESTS[@]}"; do
+            if [[ -n "${TESTEXPR}" ]]; then
+                TESTEXPR+=" and "
+            fi
+            TESTEXPR+="not ${pattern}"
+        done
+    fi
+fi
+
+# Configuration file paths
+S3TESTS_CONF_TEMPLATE="${S3TESTS_CONF_TEMPLATE:-.github/s3tests/s3tests.conf}"
+S3TESTS_CONF="${S3TESTS_CONF:-s3tests.conf}"
+
+# Service deployment mode: "build", "binary", "docker", or "existing"
+# - "build": Compile with cargo build --release and run (default)
+# - "binary": Use pre-compiled binary (RUSTFS_BINARY path or default)
+# - "docker": Build Docker image and run in container
+# - "existing": Use already running service (skip start, use S3_HOST and S3_PORT)
+DEPLOY_MODE="${DEPLOY_MODE:-build}"
+RUSTFS_BINARY="${RUSTFS_BINARY:-}"
+NO_CACHE="${NO_CACHE:-false}"
+
+# Additional directories (SCRIPT_DIR and PROJECT_ROOT defined earlier)
+ARTIFACTS_DIR="${PROJECT_ROOT}/artifacts/s3tests-${TEST_MODE}"
+CONTAINER_NAME="rustfs-${TEST_MODE}"
+NETWORK_NAME="rustfs-net"
+DATA_ROOT="${DATA_ROOT:-target}"
+DATA_DIR="${PROJECT_ROOT}/${DATA_ROOT}/test-data/${CONTAINER_NAME}"
+RUSTFS_PID=""
 
 show_usage() {
     cat << EOF
@@ -205,15 +213,22 @@ Environment Variables:
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
   MAXFAIL                - Stop after N failures (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
-  MARKEXPR               - pytest marker expression (default: exclude unsupported features)
-  TESTEXPR               - pytest -k expression to filter tests by name (default: exclude unimplemented)
+  MARKEXPR               - pytest marker expression (default: safety net exclusions)
+  TESTEXPR               - pytest -k expression (default: from implemented_tests.txt)
   S3TESTS_CONF_TEMPLATE  - Path to s3tests config template (default: .github/s3tests/s3tests.conf)
   S3TESTS_CONF           - Path to generated s3tests config (default: s3tests.conf)
   DATA_ROOT              - Root directory for test data storage (default: target)
-                            Final path: ${DATA_ROOT}/test-data/${CONTAINER_NAME}
+                            Final path: \${DATA_ROOT}/test-data/\${CONTAINER_NAME}
+
+Test Classification Files (in scripts/s3-tests/):
+  implemented_tests.txt    - Tests that should pass (run by default)
+  unimplemented_tests.txt  - Standard S3 features not yet implemented
+  non_standard_tests.txt   - Ceph/RGW specific tests (permanently excluded)
 
 Notes:
-  - In build mode, if the binary exists and was compiled less than 5 minutes ago,
+  - Tests are loaded from implemented_tests.txt by default
+  - Set TESTEXPR to override with custom test selection
+  - In build mode, if the binary exists and was compiled less than 30 minutes ago,
     compilation will be skipped unless --no-cache is specified.
 
 Examples:
