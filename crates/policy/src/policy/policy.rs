@@ -177,9 +177,11 @@ pub struct BucketPolicyArgs<'a> {
     pub object: &'a str,
 }
 
+/// Bucket Policy with AWS S3-compatible JSON serialization.
+/// Empty optional fields are omitted from output to match AWS format.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct BucketPolicy {
-    #[serde(default, rename = "ID")]
+    #[serde(default, rename = "ID", skip_serializing_if = "ID::is_empty")]
     pub id: ID,
     #[serde(rename = "Version")]
     pub version: String,

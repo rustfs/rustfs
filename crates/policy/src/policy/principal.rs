@@ -17,11 +17,33 @@ use crate::error::Error;
 use serde::Serialize;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "PascalCase", default)]
+/// Principal that serializes AWS field as single string when containing only "*",
+/// or as an array otherwise (matching AWS S3 API format).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Principal {
-    #[serde(rename = "AWS")]
     aws: HashSet<String>,
+}
+
+impl Serialize for Principal {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(1))?;
+
+        // If single element, serialize as string; otherwise as array
+        if self.aws.len() == 1 {
+            if let Some(val) = self.aws.iter().next() {
+                map.serialize_entry("AWS", val)?;
+            }
+        } else {
+            map.serialize_entry("AWS", &self.aws)?;
+        }
+
+        map.end()
+    }
 }
 
 #[derive(serde::Deserialize)]
