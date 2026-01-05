@@ -21,6 +21,13 @@ use super::Validator;
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ID(pub String);
 
+impl ID {
+    /// Returns true if the ID is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 impl Validator for ID {
     type Error = Error;
     /// if id is a valid utf string, then it is valid.
