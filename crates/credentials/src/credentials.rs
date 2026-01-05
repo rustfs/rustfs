@@ -181,10 +181,10 @@ pub fn gen_secret_key(length: usize) -> std::io::Result<String> {
     Ok(key_str)
 }
 
-/// Get the gRPC authentication token from environment variable
+/// Get the RPC authentication token from environment variable
 ///
 /// # Returns
-/// * `String` - The gRPC authentication token
+/// * `String` - The RPC authentication token
 ///
 pub fn get_rpc_token() -> String {
     GLOBAL_RUSTFS_RPC_SECRET
