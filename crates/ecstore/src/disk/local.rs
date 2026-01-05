@@ -372,7 +372,7 @@ impl LocalDisk {
         };
 
         // Normalize path components to avoid filesystem calls
-        let normalized = self.normalize_path_components(&abs_path);
+        let normalized = normalize_path_components(abs_path.as_path());
 
         // Cache the result
         {
@@ -391,33 +391,6 @@ impl LocalDisk {
         }
 
         Ok(normalized)
-    }
-
-    // Lightweight path normalization without filesystem calls
-    fn normalize_path_components(&self, path: &Path) -> PathBuf {
-        let mut result = PathBuf::new();
-
-        for component in path.components() {
-            match component {
-                std::path::Component::Normal(name) => {
-                    result.push(name);
-                }
-                std::path::Component::ParentDir => {
-                    result.pop();
-                }
-                std::path::Component::CurDir => {
-                    // Ignore current directory components
-                }
-                std::path::Component::RootDir => {
-                    result.push(component);
-                }
-                std::path::Component::Prefix(_prefix) => {
-                    result.push(component);
-                }
-            }
-        }
-
-        result
     }
 
     // Get the absolute path of an object
@@ -443,7 +416,7 @@ impl LocalDisk {
 
     // Check if a path is valid
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = self.normalize_path_components(path.as_ref());
+        let path = normalize_path_components(path);
         if path.starts_with(&self.root) {
             Ok(())
         } else {
@@ -1267,6 +1240,34 @@ fn skip_access_checks(p: impl AsRef<str>) -> bool {
     }
 
     false
+}
+
+// Lightweight path normalization without filesystem calls
+fn normalize_path_components(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    let mut result = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                result.push(name);
+            }
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::CurDir => {
+                // Ignore current directory components
+            }
+            std::path::Component::RootDir => {
+                result.push(component);
+            }
+            std::path::Component::Prefix(_prefix) => {
+                result.push(component);
+            }
+        }
+    }
+
+    result
 }
 
 #[async_trait::async_trait]
@@ -2812,5 +2813,67 @@ mod test {
         // On non-Windows systems, backslash is not a root path
         #[cfg(not(windows))]
         assert!(!is_root_path("\\"));
+    }
+
+    #[test]
+    fn test_normalize_path_components() {
+        // Test basic relative path
+        assert_eq!(normalize_path_components("a/b/c"), PathBuf::from("a/b/c"));
+
+        // Test path with current directory components (should be ignored)
+        assert_eq!(normalize_path_components("a/./b/./c"), PathBuf::from("a/b/c"));
+
+        // Test path with parent directory components
+        assert_eq!(normalize_path_components("a/b/../c"), PathBuf::from("a/c"));
+
+        // Test path with multiple parent directory components
+        assert_eq!(normalize_path_components("a/b/c/../../d"), PathBuf::from("a/d"));
+
+        // Test path that goes beyond root
+        assert_eq!(normalize_path_components("a/../../../b"), PathBuf::from("b"));
+
+        // Test absolute path
+        assert_eq!(normalize_path_components("/a/b/c"), PathBuf::from("/a/b/c"));
+
+        // Test absolute path with parent components
+        assert_eq!(normalize_path_components("/a/b/../c"), PathBuf::from("/a/c"));
+
+        // Test complex path with mixed components
+        assert_eq!(normalize_path_components("a/./b/../c/./d/../e"), PathBuf::from("a/c/e"));
+
+        // Test path with only current directory
+        assert_eq!(normalize_path_components("."), PathBuf::from(""));
+
+        // Test path with only parent directory
+        assert_eq!(normalize_path_components(".."), PathBuf::from(""));
+
+        // Test path with multiple current directories
+        assert_eq!(normalize_path_components("./././a"), PathBuf::from("a"));
+
+        // Test path with multiple parent directories
+        assert_eq!(normalize_path_components("../../a"), PathBuf::from("a"));
+
+        // Test empty path
+        assert_eq!(normalize_path_components(""), PathBuf::from(""));
+
+        // Test path starting with current directory
+        assert_eq!(normalize_path_components("./a/b"), PathBuf::from("a/b"));
+
+        // Test path starting with parent directory
+        assert_eq!(normalize_path_components("../a/b"), PathBuf::from("a/b"));
+
+        // Test complex case with multiple levels of parent navigation
+        assert_eq!(normalize_path_components("a/b/c/../../../d/e/f/../../g"), PathBuf::from("d/g"));
+
+        // Test path that completely cancels out
+        assert_eq!(normalize_path_components("a/b/../../../c/d/../../.."), PathBuf::from(""));
+
+        // Test Windows-style paths (if applicable)
+        #[cfg(windows)]
+        {
+            assert_eq!(normalize_path_components("C:\\a\\b\\c"), PathBuf::from("C:\\a\\b\\c"));
+
+            assert_eq!(normalize_path_components("C:\\a\\..\\b"), PathBuf::from("C:\\b"));
+        }
     }
 }
