@@ -731,6 +731,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
 }
 
 // For macOS and BSD variants use the syscall way of getting the connection queue length.
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
 #[allow(unsafe_code)]
 fn get_conn_queue_len() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
