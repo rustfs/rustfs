@@ -741,10 +741,6 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
     Ok(req)
 }
 
-fn sysctl(name: &str) -> i32 {
-
-}
-
 /// Determines the listen backlog size.
 ///
 /// It tries to read the system's maximum connection queue length (`somaxconn`).
