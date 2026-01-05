@@ -14,6 +14,7 @@
 
 use crate::StorageAPI;
 use crate::bucket::metadata_sys::get_versioning_config;
+use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::disk::error::DiskError;
@@ -22,7 +23,6 @@ use crate::error::{
     Error, Result, StorageError, is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found, to_object_err,
 };
 use crate::set_disk::SetDisks;
-use crate::store::check_list_objs_args;
 use crate::store_api::{
     ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOptions, WalkOptions, WalkVersionsSortOrder,
 };

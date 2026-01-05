@@ -13,9 +13,13 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, Error as DeError, Visitor},
+};
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     hash::Hash,
     ops::Deref,
 };
@@ -27,7 +31,7 @@ use super::{
     variables::PolicyVariableResolver,
 };
 
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[derive(Serialize, Clone, Default, Debug)]
 pub struct ResourceSet(pub HashSet<Resource>);
 
 impl ResourceSet {
@@ -83,6 +87,54 @@ impl Validator for ResourceSet {
 impl PartialEq for ResourceSet {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len() && self.0.iter().all(|x| other.0.contains(x))
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourceSet {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ResourceOrVecVisitor;
+
+        impl<'de> Visitor<'de> for ResourceOrVecVisitor {
+            type Value = ResourceSet;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string or an array of strings")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let resource = Resource::try_from(value).map_err(|e| E::custom(format!("invalid resource: {}", e)))?;
+                let mut set = HashSet::new();
+                set.insert(resource);
+                Ok(ResourceSet(set))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+                A::Error: DeError,
+            {
+                let mut set = HashSet::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(value) = seq.next_element::<String>()? {
+                    match Resource::try_from(value.as_str()) {
+                        Ok(resource) => {
+                            set.insert(resource);
+                        }
+                        Err(e) => {
+                            return Err(A::Error::custom(format!("invalid resource: {}", e)));
+                        }
+                    }
+                }
+                Ok(ResourceSet(set))
+            }
+        }
+
+        deserializer.deserialize_any(ResourceOrVecVisitor)
     }
 }
 

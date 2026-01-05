@@ -25,6 +25,10 @@ spec:
       imagePullSecrets:
         {{- . | nindent 8 }}
       {{- end }}
+      {{- if and .Values.nodeSelector (not .Values.affinity.nodeAffinity) }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      {{- end }}
       {{- if .Values.affinity }}
       affinity:
         {{- if .Values.affinity.nodeAffinity }}
@@ -92,12 +96,7 @@ spec:
             - secretRef:
                 name: {{ include "rustfs.secretName" . }}
           resources:
-            requests:
-              memory: {{ .Values.resources.requests.memory }}
-              cpu: {{ .Values.resources.requests.cpu }}
-            limits:
-              memory: {{ .Values.resources.limits.memory }}
-              cpu: {{ .Values.resources.limits.cpu }}
+            {{- toYaml .Values.resources | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /health

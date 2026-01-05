@@ -32,6 +32,7 @@ use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::target::BucketTarget;
+use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::data_usage::{
     aggregate_local_snapshots, compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend,
@@ -41,7 +42,6 @@ use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
-use rustfs_ecstore::store::is_valid_object_prefix;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
@@ -211,7 +211,7 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         let conditions = get_condition_values(&req.headers, &cred_clone, None, None, remote_addr);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
@@ -407,7 +407,7 @@ impl Operation for ServerInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
@@ -455,7 +455,7 @@ impl Operation for StorageInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
@@ -498,7 +498,7 @@ impl Operation for DataUsageInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,

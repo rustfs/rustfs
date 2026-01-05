@@ -527,6 +527,72 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_parse_policy_with_single_string_action_and_resource() -> Result<()> {
+        // Test policy with single string Action and Resource (AWS IAM allows both formats)
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::test/analytics/customers/*"
+    }
+  ]
+}
+"#;
+
+        let p = Policy::parse_config(data.as_bytes())?;
+        assert!(!p.statements.is_empty());
+        assert!(!p.statements[0].actions.is_empty());
+        assert!(!p.statements[0].resources.is_empty());
+
+        // Test with array format (should still work)
+        let data_array = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::test/analytics/customers/*"]
+    }
+  ]
+}
+"#;
+
+        let p2 = Policy::parse_config(data_array.as_bytes())?;
+        assert!(!p2.statements.is_empty());
+        assert!(!p2.statements[0].actions.is_empty());
+        assert!(!p2.statements[0].resources.is_empty());
+
+        // Verify that both formats produce equivalent results
+        assert_eq!(
+            p.statements.len(),
+            p2.statements.len(),
+            "Both policies should have the same number of statements"
+        );
+        assert_eq!(
+            p.statements[0].actions, p2.statements[0].actions,
+            "ActionSet from string format should equal ActionSet from array format"
+        );
+        assert_eq!(
+            p.statements[0].resources, p2.statements[0].resources,
+            "ResourceSet from string format should equal ResourceSet from array format"
+        );
+        assert_eq!(
+            p.statements[0].effect, p2.statements[0].effect,
+            "Effect should be the same in both formats"
+        );
+
+        // Verify specific content
+        assert_eq!(p.statements[0].actions.len(), 1, "ActionSet should contain exactly one action");
+        assert_eq!(p.statements[0].resources.len(), 1, "ResourceSet should contain exactly one resource");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_aws_username_policy_variable() -> Result<()> {
         let data = r#"
 {
@@ -801,5 +867,87 @@ mod test {
         assert!(pollster::block_on(policy.is_allowed(&args1)) || pollster::block_on(policy.is_allowed(&args2)));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_statement_with_only_notresource_is_valid() {
+        // Test: A statement with only NotResource (and no Resource) is valid
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "NotResource": ["arn:aws:s3:::mybucket/private/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_ok(), "Statement with only NotResource should be valid");
+    }
+
+    #[test]
+    fn test_statement_with_both_resource_and_notresource_is_invalid() {
+        // Test: A statement with both Resource and NotResource returns BothResourceAndNotResource error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::mybucket/public/*"],
+      "NotResource": ["arn:aws:s3:::mybucket/private/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with both Resource and NotResource should be invalid");
+
+        // Verify the specific error type
+        if let Err(e) = result {
+            let error_msg = format!("{}", e);
+            assert!(
+                error_msg.contains("Resource")
+                    && error_msg.contains("NotResource")
+                    && error_msg.contains("cannot both be specified"),
+                "Error should be BothResourceAndNotResource, got: {}",
+                error_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_statement_with_neither_resource_nor_notresource_is_invalid() {
+        // Test: A statement with neither Resource nor NotResource returns NonResource error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with neither Resource nor NotResource should be invalid");
+
+        // Verify the specific error type
+        if let Err(e) = result {
+            let error_msg = format!("{}", e);
+            assert!(
+                error_msg.contains("Resource") && error_msg.contains("empty"),
+                "Error should be NonResource, got: {}",
+                error_msg
+            );
+        }
     }
 }
