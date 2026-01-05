@@ -952,4 +952,87 @@ mod test {
             );
         }
     }
+
+    #[test]
+    fn test_bucket_policy_serialize_omits_empty_fields() {
+        use crate::policy::action::{Action, ActionSet, S3Action};
+        use crate::policy::resource::{Resource, ResourceSet};
+        use crate::policy::{Effect, Principal, Functions};
+        use std::collections::HashSet;
+
+        // Create a BucketPolicy with empty optional fields
+        // Use JSON deserialization to create Principal (since aws field is private)
+        let principal: Principal = serde_json::from_str(r#"{"AWS": "*"}"#).expect("Should parse principal");
+        
+        let mut policy = BucketPolicy {
+            id: ID::default(), // Empty ID
+            version: "2012-10-17".to_string(),
+            statements: vec![BPStatement {
+                sid: ID::default(), // Empty Sid
+                effect: Effect::Allow,
+                principal,
+                actions: ActionSet::default(),
+                not_actions: ActionSet::default(), // Empty NotAction
+                resources: ResourceSet::default(),
+                not_resources: ResourceSet::default(), // Empty NotResource
+                conditions: Functions::default(), // Empty Condition
+            }],
+        };
+
+        // Set actions and resources (required fields)
+        policy.statements[0].actions.0.insert(Action::S3Action(S3Action::ListBucketAction));
+        policy.statements[0].resources.0.insert(Resource::try_from("arn:aws:s3:::test/*").unwrap());
+
+        let json = serde_json::to_string(&policy).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+
+        // Verify empty fields are omitted
+        assert!(!parsed.as_object().unwrap().contains_key("ID"), "Empty ID should be omitted");
+        
+        let statement = &parsed["Statement"][0];
+        assert!(!statement.as_object().unwrap().contains_key("Sid"), "Empty Sid should be omitted");
+        assert!(!statement.as_object().unwrap().contains_key("NotAction"), "Empty NotAction should be omitted");
+        assert!(!statement.as_object().unwrap().contains_key("NotResource"), "Empty NotResource should be omitted");
+        assert!(!statement.as_object().unwrap().contains_key("Condition"), "Empty Condition should be omitted");
+
+        // Verify required fields are present
+        assert_eq!(parsed["Version"], "2012-10-17");
+        assert_eq!(statement["Effect"], "Allow");
+        assert_eq!(statement["Principal"]["AWS"], "*");
+    }
+
+    #[test]
+    fn test_bucket_policy_serialize_single_action_as_string() {
+        use crate::policy::action::{Action, ActionSet, S3Action};
+        use crate::policy::resource::{Resource, ResourceSet};
+        use crate::policy::{Effect, Principal};
+        use std::collections::HashSet;
+
+        // Use JSON deserialization to create Principal (since aws field is private)
+        let principal: Principal = serde_json::from_str(r#"{"AWS": "*"}"#).expect("Should parse principal");
+        
+        let mut policy = BucketPolicy {
+            version: "2012-10-17".to_string(),
+            statements: vec![BPStatement {
+                effect: Effect::Allow,
+                principal,
+                actions: ActionSet::default(),
+                resources: ResourceSet::default(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Single action
+        policy.statements[0].actions.0.insert(Action::S3Action(S3Action::ListBucketAction));
+        policy.statements[0].resources.0.insert(Resource::try_from("arn:aws:s3:::test/*").unwrap());
+
+        let json = serde_json::to_string(&policy).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        let action = &parsed["Statement"][0]["Action"];
+
+        // Single action should be serialized as string
+        assert!(action.is_string(), "Single action should serialize as string");
+        assert_eq!(action.as_str().unwrap(), "s3:ListBucket");
+    }
 }

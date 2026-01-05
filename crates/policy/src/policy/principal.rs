@@ -140,4 +140,30 @@ mod test {
         };
         assert!(result);
     }
+
+    #[test]
+    fn test_principal_serialize_single_element() {
+        // Single element should serialize as string (AWS format)
+        let principal = Principal {
+            aws: HashSet::from(["*".to_string()]),
+        };
+
+        let json = serde_json::to_string(&principal).expect("Should serialize");
+        assert_eq!(json, r#"{"AWS":"*"}"#);
+    }
+
+    #[test]
+    fn test_principal_serialize_multiple_elements() {
+        // Multiple elements should serialize as array
+        let principal = Principal {
+            aws: HashSet::from(["*".to_string(), "arn:aws:iam::123456789012:root".to_string()]),
+        };
+
+        let json = serde_json::to_string(&principal).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        let aws_value = parsed.get("AWS").expect("Should have AWS field");
+        assert!(aws_value.is_array());
+        let arr = aws_value.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 2);
+    }
 }

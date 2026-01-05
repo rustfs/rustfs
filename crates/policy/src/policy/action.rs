@@ -595,3 +595,53 @@ pub enum KmsAction {
     #[strum(serialize = "kms:*")]
     AllActions,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_action_wildcard_parsing() {
+        // Test that "*" parses to S3Action::AllActions
+        let action = Action::try_from("*").expect("Should parse wildcard");
+        assert!(matches!(action, Action::S3Action(S3Action::AllActions)));
+    }
+
+    #[test]
+    fn test_actionset_serialize_single_element() {
+        // Single element should serialize as string
+        let mut set = HashSet::new();
+        set.insert(Action::S3Action(S3Action::GetObjectAction));
+        let actionset = ActionSet(set);
+
+        let json = serde_json::to_string(&actionset).expect("Should serialize");
+        assert_eq!(json, "\"s3:GetObject\"");
+    }
+
+    #[test]
+    fn test_actionset_serialize_multiple_elements() {
+        // Multiple elements should serialize as array
+        let mut set = HashSet::new();
+        set.insert(Action::S3Action(S3Action::GetObjectAction));
+        set.insert(Action::S3Action(S3Action::PutObjectAction));
+        let actionset = ActionSet(set);
+
+        let json = serde_json::to_string(&actionset).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        assert!(parsed.is_array());
+        let arr = parsed.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn test_actionset_wildcard_serialization() {
+        // Wildcard action should serialize correctly
+        let mut set = HashSet::new();
+        set.insert(Action::try_from("*").expect("Should parse wildcard"));
+        let actionset = ActionSet(set);
+
+        let json = serde_json::to_string(&actionset).expect("Should serialize");
+        assert_eq!(json, "\"s3:*\"");
+    }
+}
