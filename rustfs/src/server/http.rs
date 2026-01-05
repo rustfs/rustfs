@@ -387,7 +387,7 @@ pub async fn start_http_server(
 
                 // On OpenBSD socket2 only supports configuring the initial
                 // TCP keepalive timeout; intervals and retries cannot be set.
-                #[cfg(any(target_os = "openbsd"))]
+                #[cfg(target_os = "openbsd")]
                 let ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
 
                 ka
