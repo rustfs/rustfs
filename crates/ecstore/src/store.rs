@@ -16,6 +16,17 @@
 
 use crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry;
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
+use crate::bucket::utils::check_abort_multipart_args;
+use crate::bucket::utils::check_complete_multipart_args;
+use crate::bucket::utils::check_copy_obj_args;
+use crate::bucket::utils::check_del_obj_args;
+use crate::bucket::utils::check_get_obj_args;
+use crate::bucket::utils::check_list_multipart_args;
+use crate::bucket::utils::check_list_parts_args;
+use crate::bucket::utils::check_new_multipart_args;
+use crate::bucket::utils::check_object_args;
+use crate::bucket::utils::check_put_object_args;
+use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::config::GLOBAL_STORAGE_CLASS;
 use crate::config::storageclass;
@@ -59,7 +70,7 @@ use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
 use rustfs_madmin::heal_commands::HealResultItem;
-use rustfs_utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
+use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::cmp::Ordering;
 use std::net::SocketAddr;
@@ -2341,172 +2352,6 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
     *GLOBAL_LOCAL_NODE_NAME.write().await = peer_set[0].clone();
 }
 
-pub fn is_valid_object_prefix(_object: &str) -> bool {
-    // Implement object prefix validation
-    // !object.is_empty() // Placeholder
-    // FIXME: TODO:
-    true
-}
-
-fn is_valid_object_name(object: &str) -> bool {
-    // Implement object name validation
-    !object.is_empty() // Placeholder
-}
-
-fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Result<()> {
-    if object.len() > 1024 {
-        return Err(StorageError::ObjectNameTooLong(bucket.to_owned(), object.to_owned()));
-    }
-
-    if object.starts_with(SLASH_SEPARATOR) {
-        return Err(StorageError::ObjectNamePrefixAsSlash(bucket.to_owned(), object.to_owned()));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if object.contains(':')
-            || object.contains('*')
-            || object.contains('?')
-            || object.contains('"')
-            || object.contains('|')
-            || object.contains('<')
-            || object.contains('>')
-        // || object.contains('\\')
-        {
-            return Err(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned()));
-        }
-    }
-
-    Ok(())
-}
-
-fn check_copy_obj_args(bucket: &str, object: &str) -> Result<()> {
-    check_bucket_and_object_names(bucket, object)
-}
-
-fn check_get_obj_args(bucket: &str, object: &str) -> Result<()> {
-    check_bucket_and_object_names(bucket, object)
-}
-
-fn check_del_obj_args(bucket: &str, object: &str) -> Result<()> {
-    check_bucket_and_object_names(bucket, object)
-}
-
-fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
-    if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
-        return Err(StorageError::BucketNameInvalid(bucket.to_string()));
-    }
-
-    if object.is_empty() {
-        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
-    }
-
-    if !is_valid_object_prefix(object) {
-        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
-    }
-
-    // if cfg!(target_os = "windows") && object.contains('\\') {
-    //     return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
-    // }
-
-    Ok(())
-}
-
-pub fn check_list_objs_args(bucket: &str, prefix: &str, _marker: &Option<String>) -> Result<()> {
-    if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
-        return Err(StorageError::BucketNameInvalid(bucket.to_string()));
-    }
-
-    if !is_valid_object_prefix(prefix) {
-        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), prefix.to_string()));
-    }
-
-    Ok(())
-}
-
-fn check_list_multipart_args(
-    bucket: &str,
-    prefix: &str,
-    key_marker: &Option<String>,
-    upload_id_marker: &Option<String>,
-    _delimiter: &Option<String>,
-) -> Result<()> {
-    check_list_objs_args(bucket, prefix, key_marker)?;
-
-    if let Some(upload_id_marker) = upload_id_marker {
-        if let Some(key_marker) = key_marker
-            && key_marker.ends_with('/')
-        {
-            return Err(StorageError::InvalidUploadIDKeyCombination(
-                upload_id_marker.to_string(),
-                key_marker.to_string(),
-            ));
-        }
-
-        if let Err(_e) = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(upload_id_marker.as_bytes()) {
-            return Err(StorageError::MalformedUploadID(upload_id_marker.to_owned()));
-        }
-    }
-
-    Ok(())
-}
-
-fn check_object_args(bucket: &str, object: &str) -> Result<()> {
-    if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
-        return Err(StorageError::BucketNameInvalid(bucket.to_string()));
-    }
-
-    check_object_name_for_length_and_slash(bucket, object)?;
-
-    if !is_valid_object_name(object) {
-        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
-    }
-
-    Ok(())
-}
-
-fn check_new_multipart_args(bucket: &str, object: &str) -> Result<()> {
-    check_object_args(bucket, object)
-}
-
-fn check_multipart_object_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
-    if let Err(e) = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(upload_id.as_bytes()) {
-        return Err(StorageError::MalformedUploadID(format!("{bucket}/{object}-{upload_id},err:{e}")));
-    };
-    check_object_args(bucket, object)
-}
-
-fn check_put_object_part_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
-    check_multipart_object_args(bucket, object, upload_id)
-}
-
-fn check_list_parts_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
-    check_multipart_object_args(bucket, object, upload_id)
-}
-
-fn check_complete_multipart_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
-    check_multipart_object_args(bucket, object, upload_id)
-}
-
-fn check_abort_multipart_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
-    check_multipart_object_args(bucket, object, upload_id)
-}
-
-#[instrument(level = "debug")]
-fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
-    if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
-        return Err(StorageError::BucketNameInvalid(bucket.to_string()));
-    }
-
-    check_object_name_for_length_and_slash(bucket, object)?;
-
-    if object.is_empty() || !is_valid_object_prefix(object) {
-        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
-    }
-
-    Ok(())
-}
-
 pub async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>> {
     let opts = &DiskInfoOptions::default();
     let mut res = vec![None; disks.len()];
@@ -2622,59 +2467,6 @@ pub async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> 
 mod tests {
     use super::*;
 
-    // Test validation functions
-    #[test]
-    fn test_is_valid_object_name() {
-        assert!(is_valid_object_name("valid-object-name"));
-        assert!(!is_valid_object_name(""));
-        assert!(is_valid_object_name("object/with/slashes"));
-        assert!(is_valid_object_name("object with spaces"));
-    }
-
-    #[test]
-    fn test_is_valid_object_prefix() {
-        assert!(is_valid_object_prefix("valid-prefix"));
-        assert!(is_valid_object_prefix(""));
-        assert!(is_valid_object_prefix("prefix/with/slashes"));
-    }
-
-    #[test]
-    fn test_check_bucket_and_object_names() {
-        // Valid names
-        assert!(check_bucket_and_object_names("valid-bucket", "valid-object").is_ok());
-
-        // Invalid bucket names
-        assert!(check_bucket_and_object_names("", "valid-object").is_err());
-        assert!(check_bucket_and_object_names("INVALID", "valid-object").is_err());
-
-        // Invalid object names
-        assert!(check_bucket_and_object_names("valid-bucket", "").is_err());
-    }
-
-    #[test]
-    fn test_check_list_objs_args() {
-        assert!(check_list_objs_args("valid-bucket", "", &None).is_ok());
-        assert!(check_list_objs_args("", "", &None).is_err());
-        assert!(check_list_objs_args("INVALID", "", &None).is_err());
-    }
-
-    #[test]
-    fn test_check_multipart_args() {
-        assert!(check_new_multipart_args("valid-bucket", "valid-object").is_ok());
-        assert!(check_new_multipart_args("", "valid-object").is_err());
-        assert!(check_new_multipart_args("valid-bucket", "").is_err());
-
-        // Use valid base64 encoded upload_id
-        let valid_upload_id = "dXBsb2FkLWlk"; // base64 encoded "upload-id"
-        assert!(check_multipart_object_args("valid-bucket", "valid-object", valid_upload_id).is_ok());
-        assert!(check_multipart_object_args("", "valid-object", valid_upload_id).is_err());
-        assert!(check_multipart_object_args("valid-bucket", "", valid_upload_id).is_err());
-        // Empty string is valid base64 (decodes to empty vec), so this should pass bucket/object validation
-        // but fail on empty upload_id check in the function logic
-        assert!(check_multipart_object_args("valid-bucket", "valid-object", "").is_ok());
-        assert!(check_multipart_object_args("valid-bucket", "valid-object", "invalid-base64!").is_err());
-    }
-
     #[tokio::test]
     async fn test_get_disk_infos() {
         let disks = vec![None, None]; // Empty disks for testing
@@ -2767,44 +2559,5 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn test_validation_functions_comprehensive() {
-        // Test object name validation edge cases
-        assert!(!is_valid_object_name(""));
-        assert!(is_valid_object_name("a"));
-        assert!(is_valid_object_name("test.txt"));
-        assert!(is_valid_object_name("folder/file.txt"));
-        assert!(is_valid_object_name("very-long-object-name-with-many-characters"));
-
-        // Test prefix validation
-        assert!(is_valid_object_prefix(""));
-        assert!(is_valid_object_prefix("prefix"));
-        assert!(is_valid_object_prefix("prefix/"));
-        assert!(is_valid_object_prefix("deep/nested/prefix/"));
-    }
-
-    #[test]
-    fn test_argument_validation_comprehensive() {
-        // Test bucket and object name validation
-        assert!(check_bucket_and_object_names("test-bucket", "test-object").is_ok());
-        assert!(check_bucket_and_object_names("test-bucket", "folder/test-object").is_ok());
-
-        // Test list objects arguments
-        assert!(check_list_objs_args("test-bucket", "prefix", &Some("marker".to_string())).is_ok());
-        assert!(check_list_objs_args("test-bucket", "", &None).is_ok());
-
-        // Test multipart upload arguments with valid base64 upload_id
-        let valid_upload_id = "dXBsb2FkLWlk"; // base64 encoded "upload-id"
-        assert!(check_put_object_part_args("test-bucket", "test-object", valid_upload_id).is_ok());
-        assert!(check_list_parts_args("test-bucket", "test-object", valid_upload_id).is_ok());
-        assert!(check_complete_multipart_args("test-bucket", "test-object", valid_upload_id).is_ok());
-        assert!(check_abort_multipart_args("test-bucket", "test-object", valid_upload_id).is_ok());
-
-        // Test put object arguments
-        assert!(check_put_object_args("test-bucket", "test-object").is_ok());
-        assert!(check_put_object_args("", "test-object").is_err());
-        assert!(check_put_object_args("test-bucket", "").is_err());
     }
 }
