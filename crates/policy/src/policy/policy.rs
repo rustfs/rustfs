@@ -868,4 +868,86 @@ mod test {
 
         Ok(())
     }
+
+    #[test]
+    fn test_statement_with_only_notresource_is_valid() {
+        // Test: A statement with only NotResource (and no Resource) is valid
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "NotResource": ["arn:aws:s3:::mybucket/private/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_ok(), "Statement with only NotResource should be valid");
+    }
+
+    #[test]
+    fn test_statement_with_both_resource_and_notresource_is_invalid() {
+        // Test: A statement with both Resource and NotResource returns BothResourceAndNotResource error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::mybucket/public/*"],
+      "NotResource": ["arn:aws:s3:::mybucket/private/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with both Resource and NotResource should be invalid");
+
+        // Verify the specific error type
+        if let Err(e) = result {
+            let error_msg = format!("{}", e);
+            assert!(
+                error_msg.contains("Resource")
+                    && error_msg.contains("NotResource")
+                    && error_msg.contains("cannot both be specified"),
+                "Error should be BothResourceAndNotResource, got: {}",
+                error_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_statement_with_neither_resource_nor_notresource_is_invalid() {
+        // Test: A statement with neither Resource nor NotResource returns NonResource error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with neither Resource nor NotResource should be invalid");
+
+        // Verify the specific error type
+        if let Err(e) = result {
+            let error_msg = format!("{}", e);
+            assert!(
+                error_msg.contains("Resource") && error_msg.contains("empty"),
+                "Error should be NonResource, got: {}",
+                error_msg
+            );
+        }
+    }
 }
