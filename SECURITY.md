@@ -23,8 +23,8 @@ If you discover a security vulnerability in RustFS, we appreciate your help in d
 
 ### How to Report
 
-Please email us directly at:  
-**security@rustfs.com**
+1. https://github.com/rustfs/rustfs/security/advisories/new
+2. Please email us directly at: **security@rustfs.com**
 
 In your email, please include:
 1.  **Description**: A detailed description of the vulnerability.
