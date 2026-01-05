@@ -30,7 +30,7 @@ use std::{
 };
 use tokio::{sync::RwLock, time};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Disk health status constants
@@ -44,7 +44,6 @@ pub const SKIP_IF_SUCCESS_BEFORE: Duration = Duration::from_secs(5);
 pub const CHECK_TIMEOUT_DURATION: Duration = Duration::from_secs(5);
 
 lazy_static::lazy_static! {
-    static ref TEST_OBJ: String = format!("health-check-{}", Uuid::new_v4());
     static ref TEST_DATA: Bytes = Bytes::from(vec![42u8; 2048]);
     static ref TEST_BUCKET: String = ".rustfs.sys/tmp".to_string();
 }
@@ -256,8 +255,9 @@ impl LocalDiskWrapper {
                     tokio::time::sleep(Duration::from_secs(1)).await;
 
 
-                    debug!("health check: performing health check");
-                    if Self::perform_health_check(disk.clone(), &TEST_BUCKET, &TEST_OBJ, &TEST_DATA, true, CHECK_TIMEOUT_DURATION).await.is_err() && health.swap_ok_to_faulty() {
+
+                    let test_obj = format!("health-check-{}", Uuid::new_v4());
+                    if Self::perform_health_check(disk.clone(), &TEST_BUCKET, &test_obj, &TEST_DATA, true, CHECK_TIMEOUT_DURATION).await.is_err() && health.swap_ok_to_faulty() {
                         // Health check failed, disk is considered faulty
 
                         health.increment_waiting(); // Balance the increment from failed operation
@@ -326,7 +326,7 @@ impl LocalDiskWrapper {
             Ok(result) => match result {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    debug!("health check: failed: {:?}", e);
+                    warn!("health check: failed: {:?}", e);
 
                     if e == DiskError::FaultyDisk {
                         return Err(e);
@@ -359,7 +359,8 @@ impl LocalDiskWrapper {
                         return;
                     }
 
-                    match Self::perform_health_check(disk.clone(), &TEST_BUCKET, &TEST_OBJ, &TEST_DATA, false, CHECK_TIMEOUT_DURATION).await {
+                    let test_obj = format!("health-check-{}", Uuid::new_v4());
+                    match Self::perform_health_check(disk.clone(), &TEST_BUCKET, &test_obj, &TEST_DATA, false, CHECK_TIMEOUT_DURATION).await {
                         Ok(_) => {
                             info!("Disk {} is back online", disk.to_string());
                             health.set_ok();
@@ -484,11 +485,15 @@ impl DiskAPI for LocalDiskWrapper {
             return false;
         };
 
-        let Some(current_disk_id) = *self.disk_id.read().await else {
-            return false;
-        };
+        // if disk_id is not set use the current disk_id
+        if let Some(current_disk_id) = *self.disk_id.read().await {
+            return current_disk_id == disk_id;
+        } else {
+            // if disk_id is not set, update the disk_id
+            let _ = self.set_disk_id_internal(Some(disk_id)).await;
+        }
 
-        current_disk_id == disk_id
+        return true;
     }
 
     fn is_local(&self) -> bool {

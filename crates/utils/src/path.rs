@@ -74,18 +74,21 @@ pub fn has_prefix(s: &str, prefix: &str) -> bool {
     s.starts_with(prefix)
 }
 
-pub fn path_join(elem: &[PathBuf]) -> PathBuf {
-    let mut joined_path = PathBuf::new();
-
-    for path in elem {
-        joined_path.push(path);
-    }
-
-    joined_path
+pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
+    path_join_buf(
+        elem.iter()
+            .map(|p| p.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<String>>()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<&str>>()
+            .as_slice(),
+    )
+    .into()
 }
 
 pub fn path_join_buf(elements: &[&str]) -> String {
-    let trailing_slash = !elements.is_empty() && elements.last().unwrap().ends_with(SLASH_SEPARATOR);
+    let trailing_slash = !elements.is_empty() && elements.last().is_some_and(|last| last.ends_with(SLASH_SEPARATOR));
 
     let mut dst = String::new();
     let mut added = 0;
@@ -100,14 +103,87 @@ pub fn path_join_buf(elements: &[&str]) -> String {
         }
     }
 
-    let result = dst.to_string();
-    let cpath = Path::new(&result).components().collect::<PathBuf>();
-    let clean_path = cpath.to_string_lossy();
+    if path_needs_clean(dst.as_bytes()) {
+        let mut clean_path = clean(&dst);
+        if trailing_slash {
+            clean_path.push_str(SLASH_SEPARATOR);
+        }
+        return clean_path;
+    }
 
     if trailing_slash {
-        return format!("{clean_path}{SLASH_SEPARATOR}");
+        dst.push_str(SLASH_SEPARATOR);
     }
-    clean_path.to_string()
+
+    dst
+}
+
+/// path_needs_clean returns whether path cleaning may change the path.
+/// Will detect all cases that will be cleaned,
+/// but may produce false positives on non-trivial paths.
+fn path_needs_clean(path: &[u8]) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+
+    let rooted = path[0] == b'/';
+    let n = path.len();
+
+    let (mut r, mut w) = if rooted { (1, 1) } else { (0, 0) };
+
+    while r < n {
+        match path[r] {
+            b if b > 127 => {
+                // Non ascii.
+                return true;
+            }
+            b'/' => {
+                // multiple / elements
+                return true;
+            }
+            b'.' => {
+                if r + 1 == n || path[r + 1] == b'/' {
+                    // . element - assume it has to be cleaned.
+                    return true;
+                }
+                if r + 1 < n && path[r + 1] == b'.' && (r + 2 == n || path[r + 2] == b'/') {
+                    // .. element: remove to last / - assume it has to be cleaned.
+                    return true;
+                }
+                // Handle single dot case
+                if r + 1 == n {
+                    // . element - assume it has to be cleaned.
+                    return true;
+                }
+                // Copy the dot
+                w += 1;
+                r += 1;
+            }
+            _ => {
+                // real path element.
+                // add slash if needed
+                if (rooted && w != 1) || (!rooted && w != 0) {
+                    w += 1;
+                }
+                // copy element
+                while r < n && path[r] != b'/' {
+                    w += 1;
+                    r += 1;
+                }
+                // allow one slash, not at end
+                if r < n - 1 && path[r] == b'/' {
+                    r += 1;
+                }
+            }
+        }
+    }
+
+    // Turn empty string into "."
+    if w == 0 {
+        return true;
+    }
+
+    false
 }
 
 pub fn path_to_bucket_object_with_base_path(bash_path: &str, path: &str) -> (String, String) {
@@ -344,5 +420,230 @@ mod tests {
         assert_eq!(clean("abc/def/../../.."), "..");
         assert_eq!(clean("/abc/def/../../.."), "/");
         assert_eq!(clean("abc/def/../../../ghi/jkl/../../../mno"), "../../mno");
+    }
+
+    #[test]
+    fn test_path_needs_clean() {
+        struct PathTest {
+            path: &'static str,
+            result: &'static str,
+        }
+
+        let cleantests = vec![
+            // Already clean
+            PathTest { path: "", result: "." },
+            PathTest {
+                path: "abc",
+                result: "abc",
+            },
+            PathTest {
+                path: "abc/def",
+                result: "abc/def",
+            },
+            PathTest {
+                path: "a/b/c",
+                result: "a/b/c",
+            },
+            PathTest { path: ".", result: "." },
+            PathTest {
+                path: "..",
+                result: "..",
+            },
+            PathTest {
+                path: "../..",
+                result: "../..",
+            },
+            PathTest {
+                path: "../../abc",
+                result: "../../abc",
+            },
+            PathTest {
+                path: "/abc",
+                result: "/abc",
+            },
+            PathTest {
+                path: "/abc/def",
+                result: "/abc/def",
+            },
+            PathTest { path: "/", result: "/" },
+            // Remove trailing slash
+            PathTest {
+                path: "abc/",
+                result: "abc",
+            },
+            PathTest {
+                path: "abc/def/",
+                result: "abc/def",
+            },
+            PathTest {
+                path: "a/b/c/",
+                result: "a/b/c",
+            },
+            PathTest { path: "./", result: "." },
+            PathTest {
+                path: "../",
+                result: "..",
+            },
+            PathTest {
+                path: "../../",
+                result: "../..",
+            },
+            PathTest {
+                path: "/abc/",
+                result: "/abc",
+            },
+            // Remove doubled slash
+            PathTest {
+                path: "abc//def//ghi",
+                result: "abc/def/ghi",
+            },
+            PathTest {
+                path: "//abc",
+                result: "/abc",
+            },
+            PathTest {
+                path: "///abc",
+                result: "/abc",
+            },
+            PathTest {
+                path: "//abc//",
+                result: "/abc",
+            },
+            PathTest {
+                path: "abc//",
+                result: "abc",
+            },
+            // Remove . elements
+            PathTest {
+                path: "abc/./def",
+                result: "abc/def",
+            },
+            PathTest {
+                path: "/./abc/def",
+                result: "/abc/def",
+            },
+            PathTest {
+                path: "abc/.",
+                result: "abc",
+            },
+            // Remove .. elements
+            PathTest {
+                path: "abc/def/ghi/../jkl",
+                result: "abc/def/jkl",
+            },
+            PathTest {
+                path: "abc/def/../ghi/../jkl",
+                result: "abc/jkl",
+            },
+            PathTest {
+                path: "abc/def/..",
+                result: "abc",
+            },
+            PathTest {
+                path: "abc/def/../..",
+                result: ".",
+            },
+            PathTest {
+                path: "/abc/def/../..",
+                result: "/",
+            },
+            PathTest {
+                path: "abc/def/../../..",
+                result: "..",
+            },
+            PathTest {
+                path: "/abc/def/../../..",
+                result: "/",
+            },
+            PathTest {
+                path: "abc/def/../../../ghi/jkl/../../../mno",
+                result: "../../mno",
+            },
+            // Combinations
+            PathTest {
+                path: "abc/./../def",
+                result: "def",
+            },
+            PathTest {
+                path: "abc//./../def",
+                result: "def",
+            },
+            PathTest {
+                path: "abc/../../././../def",
+                result: "../../def",
+            },
+        ];
+
+        for test in cleantests {
+            let want = test.path != test.result;
+            let got = path_needs_clean(test.path.as_bytes());
+            if want && !got {
+                panic!("input: {:?}, want {}, got {}", test.path, want, got);
+            }
+
+            assert_eq!(clean(test.path), test.result);
+        }
+    }
+
+    #[test]
+    fn test_path_join() {
+        // Test empty input
+        let result = path_join::<&str>(&[]);
+        assert_eq!(result, PathBuf::from("."));
+
+        // Test single path
+        let result = path_join(&[PathBuf::from("abc")]);
+        assert_eq!(result, PathBuf::from("abc"));
+
+        // Test single absolute path
+        let result = path_join(&[PathBuf::from("/abc")]);
+        assert_eq!(result, PathBuf::from("/abc"));
+
+        // Test multiple relative paths
+        let result = path_join(&[PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]);
+        assert_eq!(result, PathBuf::from("a/b/c"));
+
+        // Test absolute path with relative paths
+        let result = path_join(&[PathBuf::from("/a"), PathBuf::from("b"), PathBuf::from("c")]);
+        assert_eq!(result, PathBuf::from("/a/b/c"));
+
+        // Test paths with dots
+        let result = path_join(&[PathBuf::from("a"), PathBuf::from("."), PathBuf::from("b")]);
+        assert_eq!(result, PathBuf::from("a/b"));
+
+        // Test paths with double dots
+        let result = path_join(&[
+            PathBuf::from("a"),
+            PathBuf::from("b"),
+            PathBuf::from(".."),
+            PathBuf::from("c"),
+        ]);
+        assert_eq!(result, PathBuf::from("a/c"));
+
+        // Test paths that need cleaning
+        let result = path_join(&[PathBuf::from("a//b"), PathBuf::from("c")]);
+        assert_eq!(result, PathBuf::from("a/b/c"));
+
+        // Test trailing slash preservation
+        let result = path_join(&[PathBuf::from("a"), PathBuf::from("b/")]);
+        assert_eq!(result, PathBuf::from("a/b/"));
+
+        // Test empty path in middle
+        let result = path_join(&[PathBuf::from("a"), PathBuf::from(""), PathBuf::from("b")]);
+        assert_eq!(result, PathBuf::from("a/b"));
+
+        // Test multiple absolute paths (should concatenate)
+        let result = path_join(&[PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("c")]);
+        assert_eq!(result, PathBuf::from("/a/b/c"));
+
+        // Test complex case with various path elements
+        let result = path_join(&[
+            PathBuf::from("a"),
+            PathBuf::from(".."),
+            PathBuf::from("b"),
+            PathBuf::from("."),
+            PathBuf::from("c"),
+        ]);
+        assert_eq!(result, PathBuf::from("b/c"));
     }
 }

@@ -14,6 +14,7 @@
 
 use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend};
 use crate::error::{Error, Result};
+use crate::rpc::node_service_time_out_client_no_auth;
 use crate::{
     disk::endpoint::Endpoint,
     global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints},
@@ -29,7 +30,6 @@ use rustfs_madmin::{
 };
 use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
-    node_service_time_out_client,
     proto_gen::node_service::{PingRequest, PingResponse},
 };
 use std::{
@@ -101,7 +101,7 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
         let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
         assert!(decoded_payload.is_ok());
 
-        let mut client = node_service_time_out_client(&addr)
+        let mut client = node_service_time_out_client_no_auth(&addr)
             .await
             .map_err(|err| Error::other(err.to_string()))?;
 

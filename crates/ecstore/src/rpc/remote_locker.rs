@@ -12,23 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use async_trait::async_trait;
-use rustfs_protos::{
-    node_service_time_out_client, node_service_time_out_client_no_auth,
-    proto_gen::node_service::{GenerallyLockRequest, PingRequest},
-};
+use rustfs_lock::types::{LockId, LockMetadata, LockPriority};
+use rustfs_lock::{LockClient, LockError, LockInfo, LockResponse, LockStats, LockStatus, Result};
+use rustfs_lock::{LockRequest, LockType};
+use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
+use rustfs_protos::proto_gen::node_service::{GenerallyLockRequest, PingRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::Request;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
 use tracing::info;
-
-use crate::{
-    error::{LockError, Result},
-    types::{LockId, LockInfo, LockRequest, LockResponse, LockStats},
-};
-
-use super::LockClient;
 
 /// Remote lock client implementation
 #[derive(Debug)]
@@ -67,14 +64,20 @@ impl RemoteClient {
         LockRequest {
             lock_id: lock_id.clone(),
             resource: lock_id.resource.clone(),
-            lock_type: crate::types::LockType::Exclusive, // Type doesn't matter for unlock
+            lock_type: LockType::Exclusive, // Type doesn't matter for unlock
             owner: owner.to_string(),
             acquire_timeout: std::time::Duration::from_secs(30),
             ttl: std::time::Duration::from_secs(300),
-            metadata: crate::types::LockMetadata::default(),
-            priority: crate::types::LockPriority::Normal,
+            metadata: LockMetadata::default(),
+            priority: LockPriority::Normal,
             deadlock_detection: false,
         }
+    }
+
+    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+            .await
+            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))
     }
 }
 
@@ -82,9 +85,7 @@ impl RemoteClient {
 impl LockClient for RemoteClient {
     async fn acquire_exclusive(&self, request: &LockRequest) -> Result<LockResponse> {
         info!("remote acquire_exclusive for {}", request.resource);
-        let mut client = node_service_time_out_client_no_auth(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
+        let mut client = self.get_client().await?;
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
@@ -111,7 +112,7 @@ impl LockClient for RemoteClient {
                     id: request.lock_id.clone(),
                     resource: request.resource.clone(),
                     lock_type: request.lock_type,
-                    status: crate::types::LockStatus::Acquired,
+                    status: LockStatus::Acquired,
                     owner: request.owner.clone(),
                     acquired_at: std::time::SystemTime::now(),
                     expires_at: std::time::SystemTime::now() + request.ttl,
@@ -133,9 +134,7 @@ impl LockClient for RemoteClient {
 
     async fn acquire_shared(&self, request: &LockRequest) -> Result<LockResponse> {
         info!("remote acquire_shared for {}", request.resource);
-        let mut client = node_service_time_out_client_no_auth(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
+        let mut client = self.get_client().await?;
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
@@ -162,7 +161,7 @@ impl LockClient for RemoteClient {
                     id: request.lock_id.clone(),
                     resource: request.resource.clone(),
                     lock_type: request.lock_type,
-                    status: crate::types::LockStatus::Acquired,
+                    status: LockStatus::Acquired,
                     owner: request.owner.clone(),
                     acquired_at: std::time::SystemTime::now(),
                     expires_at: std::time::SystemTime::now() + request.ttl,
@@ -195,9 +194,7 @@ impl LockClient for RemoteClient {
 
         let request_string = serde_json::to_string(&unlock_request)
             .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?;
-        let mut client = node_service_time_out_client_no_auth(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
+        let mut client = self.get_client().await?;
 
         // Try UnLock first (for exclusive locks)
         let req = Request::new(GenerallyLockRequest {
@@ -238,9 +235,7 @@ impl LockClient for RemoteClient {
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
         info!("remote refresh for {}", lock_id);
         let refresh_request = self.create_unlock_request(lock_id, "remote");
-        let mut client = node_service_time_out_client_no_auth(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
+        let mut client = self.get_client().await?;
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&refresh_request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
@@ -259,9 +254,7 @@ impl LockClient for RemoteClient {
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
         info!("remote force_release for {}", lock_id);
         let force_request = self.create_unlock_request(lock_id, "remote");
-        let mut client = node_service_time_out_client_no_auth(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
+        let mut client = self.get_client().await?;
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&force_request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
@@ -283,9 +276,7 @@ impl LockClient for RemoteClient {
         // Since there's no direct status query in the gRPC service,
         // we attempt a non-blocking lock acquisition to check if the resource is available
         let status_request = self.create_unlock_request(lock_id, "remote");
-        let mut client = node_service_time_out_client_no_auth(&self.addr)
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))?;
+        let mut client = self.get_client().await?;
 
         // Try to acquire a very short-lived lock to test availability
         let req = Request::new(GenerallyLockRequest {
@@ -316,14 +307,14 @@ impl LockClient for RemoteClient {
                     Ok(Some(LockInfo {
                         id: lock_id.clone(),
                         resource: lock_id.as_str().to_string(),
-                        lock_type: crate::types::LockType::Exclusive, // We can't know the exact type
-                        status: crate::types::LockStatus::Acquired,
+                        lock_type: LockType::Exclusive, // We can't know the exact type
+                        status: LockStatus::Acquired,
                         owner: "unknown".to_string(), // Remote client can't determine owner
                         acquired_at: std::time::SystemTime::now(),
                         expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
                         last_refreshed: std::time::SystemTime::now(),
-                        metadata: crate::types::LockMetadata::default(),
-                        priority: crate::types::LockPriority::Normal,
+                        metadata: LockMetadata::default(),
+                        priority: LockPriority::Normal,
                         wait_start_time: None,
                     }))
                 }
@@ -333,14 +324,14 @@ impl LockClient for RemoteClient {
                 Ok(Some(LockInfo {
                     id: lock_id.clone(),
                     resource: lock_id.as_str().to_string(),
-                    lock_type: crate::types::LockType::Exclusive,
-                    status: crate::types::LockStatus::Acquired,
+                    lock_type: LockType::Exclusive,
+                    status: LockStatus::Acquired,
                     owner: "unknown".to_string(),
                     acquired_at: std::time::SystemTime::now(),
                     expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
                     last_refreshed: std::time::SystemTime::now(),
-                    metadata: crate::types::LockMetadata::default(),
-                    priority: crate::types::LockPriority::Normal,
+                    metadata: LockMetadata::default(),
+                    priority: LockPriority::Normal,
                     wait_start_time: None,
                 }))
             }

@@ -1,8 +1,18 @@
 # Repository Guidelines
 
+## ⚠️ Pre-Commit Checklist (MANDATORY)
+**Before EVERY commit, you MUST run and pass ALL of the following:**
+```bash
+cargo fmt --all --check    # Code formatting
+cargo clippy --all-targets --all-features -- -D warnings  # Lints
+cargo test --workspace --exclude e2e_test  # Unit tests
+```
+Or simply run `make pre-commit` which covers all checks. **DO NOT commit if any check fails.**
+
 ## Communication Rules
 - Respond to the user in Chinese; use English in all other contexts.
 - Code and documentation must be written in English only. Chinese text is allowed solely as test data/fixtures when a case explicitly requires Chinese-language content for validation.
+- **Pull Request titles and descriptions must be written in English** to ensure consistency and accessibility for all contributors.
 
 ## Project Structure & Module Organization
 The workspace root hosts shared dependencies in `Cargo.toml`. The service binary lives under `rustfs/src/main.rs`, while reusable crates sit in `crates/` (`crypto`, `iam`, `kms`, and `e2e_test`). Local fixtures for standalone flows reside in `test_standalone/`, deployment manifests are under `deploy/`, Docker assets sit at the root, and automation lives in `scripts/`. Skim each crate’s README or module docs before contributing changes.
@@ -19,7 +29,13 @@ Co-locate unit tests with their modules and give behavior-led names such as `han
 When fixing bugs or adding features, include regression tests that capture the new behavior so future changes cannot silently break it.
 
 ## Commit & Pull Request Guidelines
-Work on feature branches (e.g., `feat/...`) after syncing `main`. Follow Conventional Commits under 72 characters (e.g., `feat: add kms key rotation`). Each commit must compile, format cleanly, and pass `make pre-commit`. Open PRs with a concise summary, note verification commands, link relevant issues, and wait for reviewer approval.
+Work on feature branches (e.g., `feat/...`) after syncing `main`. Follow Conventional Commits under 72 characters (e.g., `feat: add kms key rotation`). Each commit must compile, format cleanly, and pass `make pre-commit`. 
+
+**Pull Request Requirements:**
+- PR titles and descriptions **MUST be written in English**
+- Open PRs with a concise summary, note verification commands, link relevant issues
+- Follow the PR template format and fill in all required sections
+- Wait for reviewer approval before merging
 
 ## Security & Configuration Tips
 Do not commit secrets or cloud credentials; prefer environment variables or vault tooling. Review IAM- and KMS-related changes with a second maintainer. Confirm proxy settings before running sensitive tests to avoid leaking traffic outside localhost.
