@@ -590,7 +590,7 @@ impl RestoreStatusOps for RestoreStatus {
     }
 }
 
-fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
+pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
     let tokens: Vec<&str> = restore_hdr.splitn(2, ",").collect();
     let progress_tokens: Vec<&str> = tokens[0].splitn(2, "=").collect();
     if progress_tokens.len() != 2 {
