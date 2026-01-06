@@ -505,6 +505,10 @@ impl FileInfo {
             ReplicationStatusType::Empty
         }
     }
+
+    pub fn shard_file_size(&self, total_length: i64) -> i64 {
+        self.erasure.shard_file_size(total_length)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
