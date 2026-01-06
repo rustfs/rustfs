@@ -63,16 +63,23 @@ pub struct Policy {
 
 impl Policy {
     pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
+        // First, check all Deny statements - if any Deny matches, deny the request
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
             if !statement.is_allowed(args).await {
                 return false;
             }
         }
 
-        if args.deny_only || args.is_owner {
+        // Owner has all permissions
+        if args.is_owner {
             return true;
         }
 
+        if args.deny_only {
+            return false;
+        }
+
+        // Check Allow statements
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Allow)) {
             if statement.is_allowed(args).await {
                 return true;
@@ -590,6 +597,102 @@ mod test {
         // Verify specific content
         assert_eq!(p.statements[0].actions.len(), 1, "ActionSet should contain exactly one action");
         assert_eq!(p.statements[0].resources.len(), 1, "ResourceSet should contain exactly one resource");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deny_only_security_fix() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::bucket1/*"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        // Test with deny_only=true but no matching Allow statement
+        let args_deny_only = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket2",
+            conditions: &conditions,
+            is_owner: false,
+            object: "test.txt",
+            claims: &claims,
+            deny_only: true, // Should NOT automatically allow
+        };
+
+        // Should return false because deny_only=true, regardless of whether there's a matching Allow statement
+        assert!(
+            !policy.is_allowed(&args_deny_only).await,
+            "deny_only should return false when deny_only=true, regardless of Allow statements"
+        );
+
+        // Test with deny_only=true and matching Allow statement
+        let args_deny_only_allowed = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::GetObjectAction),
+            bucket: "bucket1",
+            conditions: &conditions,
+            is_owner: false,
+            object: "test.txt",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        // Should return false because deny_only=true prevents checking Allow statements (unless is_owner=true)
+        assert!(
+            !policy.is_allowed(&args_deny_only_allowed).await,
+            "deny_only should return false even with matching Allow statement"
+        );
+
+        // Test with deny_only=false (normal case)
+        let args_normal = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::GetObjectAction),
+            bucket: "bucket1",
+            conditions: &conditions,
+            is_owner: false,
+            object: "test.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Should return true because there's an Allow statement
+        assert!(
+            policy.is_allowed(&args_normal).await,
+            "normal policy evaluation should allow with matching Allow statement"
+        );
+
+        let args_owner_deny_only = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket2",
+            conditions: &conditions,
+            is_owner: true, // Owner has all permissions
+            object: "test.txt",
+            claims: &claims,
+            deny_only: true, // Even with deny_only=true, owner should be allowed
+        };
+
+        assert!(
+            policy.is_allowed(&args_owner_deny_only).await,
+            "owner should retain all permissions even when deny_only=true"
+        );
 
         Ok(())
     }
