@@ -125,6 +125,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
+libc = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
@@ -134,9 +135,6 @@ libunftp = { workspace = true }
 russh = { workspace = true }
 russh-sftp = { workspace = true }
 ssh-key = { workspace = true }
-
-[target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-sysctl = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true

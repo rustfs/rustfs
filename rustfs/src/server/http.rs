@@ -734,34 +734,58 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
     Ok(req)
 }
 
+// For macOS and BSD variants use the syscall way of getting the connection queue length.
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+#[allow(unsafe_code)]
+fn get_conn_queue_len() -> i32 {
+    const DEFAULT_BACKLOG: i32 = 1024;
+
+    #[cfg(target_os = "openbsd")]
+    let mut name = [libc::CTL_KERN, libc::KERN_SOMAXCONN];
+    #[cfg(any(target_os = "netbsd", target_os = "macos", target_os = "freebsd"))]
+    let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
+    let mut buf = [0; 1];
+    let mut buf_len = std::mem::size_of_val(&buf);
+
+    if unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            name.len() as u32,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut buf_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return DEFAULT_BACKLOG;
+    }
+
+    buf[0]
+}
+
 /// Determines the listen backlog size.
 ///
 /// It tries to read the system's maximum connection queue length (`somaxconn`).
 /// If reading fails, it falls back to a default value (e.g., 1024).
 /// This makes the backlog size adaptive to the system configuration.
 fn get_listen_backlog() -> i32 {
-    const DEFAULT_BACKLOG: i32 = 1024;
-
     #[cfg(target_os = "linux")]
     {
+        const DEFAULT_BACKLOG: i32 = 1024;
+
         // For Linux, read from /proc/sys/net/core/somaxconn
         match std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
             Ok(s) => s.trim().parse().unwrap_or(DEFAULT_BACKLOG),
             Err(_) => DEFAULT_BACKLOG,
         }
     }
+
     #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
     {
-        // For macOS and BSD variants, use sysctl
-        use sysctl::Sysctl;
-        match sysctl::Ctl::new("kern.ipc.somaxconn") {
-            Ok(ctl) => match ctl.value() {
-                Ok(sysctl::CtlValue::Int(val)) => val,
-                _ => DEFAULT_BACKLOG,
-            },
-            Err(_) => DEFAULT_BACKLOG,
-        }
+        get_conn_queue_len()
     }
+
     #[cfg(not(any(
         target_os = "linux",
         target_os = "macos",
