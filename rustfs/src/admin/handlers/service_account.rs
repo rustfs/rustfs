@@ -112,8 +112,6 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        let deny_only = constant_time_eq(&cred.access_key, &target_user) || constant_time_eq(&cred.parent_user, &target_user);
-
         if !iam_store
             .is_allowed(&Args {
                 account: &cred.access_key,
@@ -130,7 +128,7 @@ impl Operation for AddServiceAccount {
                 is_owner: owner,
                 object: "",
                 claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
-                deny_only,
+                deny_only: false, // Always require explicit Allow permission
             })
             .await
         {
