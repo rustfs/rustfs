@@ -743,10 +743,26 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
     Ok(req)
 }
 
+/// Determines the listen backlog size.
+///
+/// It tries to read the system's maximum connection queue length (`somaxconn`).
+/// If reading fails, it falls back to a default value (e.g., 1024).
+/// This makes the backlog size adaptive to the system configuration.
+#[cfg(target_os = "linux")]
+fn get_listen_backlog() -> i32 {
+    const DEFAULT_BACKLOG: i32 = 1024;
+
+    // For Linux, read from /proc/sys/net/core/somaxconn
+    match std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
+        Ok(s) => s.trim().parse().unwrap_or(DEFAULT_BACKLOG),
+        Err(_) => DEFAULT_BACKLOG,
+    }
+}
+
 // For macOS and BSD variants use the syscall way of getting the connection queue length.
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
 #[allow(unsafe_code)]
-fn get_conn_queue_len() -> i32 {
+fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
 
     #[cfg(target_os = "openbsd")]
@@ -773,37 +789,15 @@ fn get_conn_queue_len() -> i32 {
     buf[0]
 }
 
-/// Determines the listen backlog size.
-///
-/// It tries to read the system's maximum connection queue length (`somaxconn`).
-/// If reading fails, it falls back to a default value (e.g., 1024).
-/// This makes the backlog size adaptive to the system configuration.
+// Fallback for Windows and other operating systems
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
 fn get_listen_backlog() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        const DEFAULT_BACKLOG: i32 = 1024;
-
-        // For Linux, read from /proc/sys/net/core/somaxconn
-        match std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
-            Ok(s) => s.trim().parse().unwrap_or(DEFAULT_BACKLOG),
-            Err(_) => DEFAULT_BACKLOG,
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
-    {
-        get_conn_queue_len()
-    }
-
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    )))]
-    {
-        // Fallback for Windows and other operating systems
-        DEFAULT_BACKLOG
-    }
+    const DEFAULT_BACKLOG: i32 = 1024;
+    DEFAULT_BACKLOG
 }
