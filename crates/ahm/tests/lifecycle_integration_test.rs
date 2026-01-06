@@ -620,8 +620,9 @@ mod serial_tests {
         let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
         let test_data = b"Hello, this is test data for lifecycle expiry!";
 
-        //create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
-        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, b"Hello, this is test data for lifecycle expiry 1111-11111111-1111 !").await;
+        //create_test_bucket(&ecstore, bucket_name.as_str()).await;
         upload_test_object(&ecstore, bucket_name.as_str(), object_name, test_data).await;
 
         // Verify object exists initially

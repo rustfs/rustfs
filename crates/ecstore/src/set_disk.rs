@@ -4852,10 +4852,18 @@ impl StorageAPI for SetDisks {
         // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
         let transition_etag = rustfs_utils::path::trim_etag(&opts.transition.etag);
         let stored_etag = rustfs_utils::path::trim_etag(&get_raw_etag(&fi.metadata));
-        if opts.mod_time.expect("err").unix_timestamp() != fi.mod_time.as_ref().expect("err").unix_timestamp()
-            || transition_etag != stored_etag
-        {
-            return Err(to_object_err(Error::other(DiskError::FileNotFound), vec![bucket, object]));
+        if let Some(mod_time1) = opts.mod_time {
+            if let Some(mod_time2) = fi.mod_time.as_ref() {
+                if mod_time1.unix_timestamp() != mod_time2.unix_timestamp()
+                /*|| transition_etag != stored_etag*/
+                {
+                    return Err(to_object_err(Error::other(DiskError::FileNotFound), vec![bucket, object]));
+                }
+            } else {
+                return Err(Error::other("mod_time 2 error.".to_string()));
+            }
+        } else {
+            return Err(Error::other("mod_time 1 error.".to_string()));
         }
         if fi.transition_status == TRANSITION_COMPLETE {
             return Ok(());
