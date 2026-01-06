@@ -655,7 +655,7 @@ impl Operation for ImportIam {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
+            vec![Action::AdminAction(AdminAction::ImportIAMAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
