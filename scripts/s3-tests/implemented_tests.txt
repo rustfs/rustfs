@@ -17,7 +17,7 @@
 # - Metadata: User-defined metadata
 # - Conditional GET: If-Match, If-None-Match, If-Modified-Since
 #
-# Total: 109 tests
+# Total: 118 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -63,6 +63,15 @@ test_bucket_list_prefix_none
 test_bucket_list_prefix_not_exist
 test_bucket_list_prefix_unreadable
 test_bucket_list_special_prefix
+test_bucket_list_delimiter_alt
+test_bucket_list_delimiter_dot
+test_bucket_list_delimiter_empty
+test_bucket_list_delimiter_none
+test_bucket_list_delimiter_not_exist
+test_bucket_list_delimiter_percentage
+test_bucket_list_delimiter_prefix_ends_with_delimiter
+test_bucket_list_delimiter_unreadable
+test_bucket_list_delimiter_whitespace
 test_bucket_listv2_continuationtoken
 test_bucket_listv2_continuationtoken_empty
 test_bucket_listv2_fetchowner_defaultempty
