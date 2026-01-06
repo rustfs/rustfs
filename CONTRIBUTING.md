@@ -186,6 +186,39 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --fix --all-targets --all-features
 ```
 
+## 📝 Pull Request Guidelines
+
+### Language Requirements
+
+**All Pull Request titles and descriptions MUST be written in English.**
+
+This ensures:
+- Consistency across all contributions
+- Accessibility for international contributors
+- Better integration with automated tools and CI/CD systems
+- Clear communication in a globally understood language
+
+#### PR Description Requirements
+
+When creating a Pull Request, ensure:
+
+1. **Title**: Use English and follow Conventional Commits format (e.g., `fix: improve s3-tests readiness detection`)
+2. **Description**: Write in English, following the PR template format
+3. **Code Comments**: Must be in English (as per coding standards)
+4. **Commit Messages**: Must be in English (as per commit guidelines)
+
+#### PR Template
+
+Always use the PR template (`.github/pull_request_template.md`) and fill in all sections:
+- Type of Change
+- Related Issues
+- Summary of Changes
+- Checklist
+- Impact
+- Additional Notes
+
+**Note**: While you may communicate with reviewers in Chinese during discussions, the PR itself (title, description, and all formal documentation) must be in English.
+
 ---
 
 Following these guidelines ensures high code quality and smooth collaboration across the RustFS project! 🚀

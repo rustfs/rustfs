@@ -15,11 +15,8 @@
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use hmac::{Hmac, KeyInit, Mac};
-use http::HeaderMap;
-use http::HeaderValue;
-use http::Method;
-use http::Uri;
-use rustfs_credentials::get_global_action_cred;
+use http::{HeaderMap, HeaderValue, Method, Uri};
+use rustfs_credentials::{DEFAULT_SECRET_KEY, ENV_RPC_SECRET, get_global_secret_key_opt};
 use sha2::Sha256;
 use time::OffsetDateTime;
 use tracing::error;
@@ -29,15 +26,20 @@ type HmacSha256 = Hmac<Sha256>;
 const SIGNATURE_HEADER: &str = "x-rustfs-signature";
 const TIMESTAMP_HEADER: &str = "x-rustfs-timestamp";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
+pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
 
 /// Get the shared secret for HMAC signing
 fn get_shared_secret() -> String {
-    if let Some(cred) = get_global_action_cred() {
-        cred.secret_key
-    } else {
-        // Fallback to environment variable if global credentials are not available
-        std::env::var("RUSTFS_RPC_SECRET").unwrap_or_else(|_| "rustfs-default-secret".to_string())
-    }
+    rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET
+        .get_or_init(|| {
+            rustfs_utils::get_env_str(
+                ENV_RPC_SECRET,
+                get_global_secret_key_opt()
+                    .unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string())
+                    .as_str(),
+            )
+        })
+        .clone()
 }
 
 /// Generate HMAC-SHA256 signature for the given data
@@ -57,13 +59,25 @@ fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) 
 
 /// Build headers with authentication signature
 pub fn build_auth_headers(url: &str, method: &Method, headers: &mut HeaderMap) {
+    let auth_headers = gen_signature_headers(url, method);
+
+    headers.extend(auth_headers);
+}
+
+pub fn gen_signature_headers(url: &str, method: &Method) -> HeaderMap {
     let secret = get_shared_secret();
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
 
     let signature = generate_signature(&secret, url, method, timestamp);
 
-    headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).unwrap());
-    headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&timestamp.to_string()).unwrap());
+    let mut headers = HeaderMap::new();
+    headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).expect("Invalid header value"));
+    headers.insert(
+        TIMESTAMP_HEADER,
+        HeaderValue::from_str(&timestamp.to_string()).expect("Invalid header value"),
+    );
+
+    headers
 }
 
 /// Verify the request signature for RPC requests

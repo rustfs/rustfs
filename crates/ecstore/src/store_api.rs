@@ -742,7 +742,21 @@ impl ObjectInfo {
 
         let inlined = fi.inline_data();
 
-        // TODO:expires
+        // Parse expires from metadata (HTTP date format RFC 7231 or ISO 8601)
+        let expires = fi.metadata.get("expires").and_then(|s| {
+            // Try parsing as ISO 8601 first
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
+                .or_else(|_| {
+                    // Try RFC 2822 format
+                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc2822)
+                })
+                .or_else(|_| {
+                    // Try RFC 3339 format
+                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                })
+                .ok()
+        });
+
         // TODO:ReplicationState
 
         let transitioned_object = TransitionedObject {
@@ -800,6 +814,7 @@ impl ObjectInfo {
             user_tags,
             content_type,
             content_encoding,
+            expires,
             num_versions: fi.num_versions,
             successor_mod_time: fi.successor_mod_time,
             etag,

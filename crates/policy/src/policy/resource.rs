@@ -35,6 +35,11 @@ use super::{
 pub struct ResourceSet(pub HashSet<Resource>);
 
 impl ResourceSet {
+    /// Returns true if the resource set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub async fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
         self.is_match_with_resolver(resource, conditions, None).await
     }

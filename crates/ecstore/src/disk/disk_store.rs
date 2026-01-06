@@ -386,7 +386,7 @@ impl LocalDiskWrapper {
         let stored_disk_id = self.disk.get_disk_id().await?;
 
         if stored_disk_id != want_id {
-            return Err(Error::other(format!("Disk ID mismatch wanted {:?}, got {:?}", want_id, stored_disk_id)));
+            return Err(Error::other(format!("Disk ID mismatch wanted {want_id:?}, got {stored_disk_id:?}")));
         }
 
         Ok(())
@@ -470,7 +470,7 @@ impl LocalDiskWrapper {
                 // Timeout occurred, mark disk as potentially faulty and decrement waiting counter
                 self.health.decrement_waiting();
                 warn!("disk operation timeout after {:?}", timeout_duration);
-                Err(DiskError::other(format!("disk operation timeout after {:?}", timeout_duration)))
+                Err(DiskError::other(format!("disk operation timeout after {timeout_duration:?}")))
             }
         }
     }

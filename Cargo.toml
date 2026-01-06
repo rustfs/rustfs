@@ -236,7 +236,6 @@ snafu = "0.8.9"
 snap = "1.1.1"
 starshard = { version = "0.6.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.27.2", features = ["derive"] }
-sysctl = "0.7.1"
 sysinfo = "0.37.2"
 temp-env = "0.3.6"
 tempfile = "3.24.0"
