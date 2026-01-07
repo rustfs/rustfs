@@ -402,9 +402,9 @@ impl AuditRegistry {
     ///
     /// # Returns
     /// * `String` - The unique key for the target.
-    pub fn crate_key(&self, target_type: &str, target_id: &str) -> String {
+    pub fn create_key(&self, target_type: &str, target_id: &str) -> String {
         let key = TargetID::new(target_id.to_string(), target_type.to_string());
-        info!(target_type = %target_type, "Crate key for {}", key);
+        info!(target_type = %target_type, "Create key for {}", key);
         key.to_string()
     }
 
@@ -417,7 +417,7 @@ impl AuditRegistry {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure.
     pub fn enable_target(&self, target_type: &str, target_id: &str) -> AuditResult<()> {
-        let key = self.crate_key(target_type, target_id);
+        let key = self.create_key(target_type, target_id);
         if self.get_target(&key).is_some() {
             info!("Target {}-{} enabled", target_type, target_id);
             Ok(())
@@ -438,7 +438,7 @@ impl AuditRegistry {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure.
     pub fn disable_target(&self, target_type: &str, target_id: &str) -> AuditResult<()> {
-        let key = self.crate_key(target_type, target_id);
+        let key = self.create_key(target_type, target_id);
         if self.get_target(&key).is_some() {
             info!("Target {}-{} disabled", target_type, target_id);
             Ok(())
@@ -465,7 +465,7 @@ impl AuditRegistry {
         target_id: &str,
         target: Box<dyn Target<AuditEntry> + Send + Sync>,
     ) -> AuditResult<()> {
-        let key = self.crate_key(target_type, target_id);
+        let key = self.create_key(target_type, target_id);
         self.targets.insert(key, target);
         Ok(())
     }
