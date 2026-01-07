@@ -21,6 +21,7 @@ use super::{
 };
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 
+use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::error::FileAccessDeniedWithContext;
 use crate::disk::error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error};
@@ -489,9 +490,17 @@ impl LocalDisk {
         let file_dir = self.get_bucket_path(volume)?;
         let (data, _) = self.read_raw(volume, file_dir, file_path, opts.read_data).await?;
 
-        get_file_info(&data, volume, path, version_id, FileInfoOpts { data: opts.read_data })
-            .await
-            .map_err(|_e| DiskError::Unexpected)
+        get_file_info(
+            &data,
+            volume,
+            path,
+            version_id,
+            FileInfoOpts {
+                data: opts.read_data,
+                include_free_versions: false,
+            },
+        )
+        .map_err(|_e| DiskError::Unexpected)
     }
 
     // Batch metadata reading for multiple objects
@@ -2240,20 +2249,93 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_version(
         &self,
-        _org_volume: &str,
+        org_volume: &str,
         volume: &str,
         path: &str,
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
+        if !org_volume.is_empty() {
+            let org_volume_path = self.get_bucket_path(org_volume)?;
+            if !skip_access_checks(org_volume) {
+                access(&org_volume_path)
+                    .await
+                    .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+            }
+        }
+
         let file_path = self.get_object_path(volume, path)?;
-        let file_dir = self.get_bucket_path(volume)?;
+        let volume_dir = self.get_bucket_path(volume)?;
+
+        check_path_length(file_path.to_string_lossy().as_ref())?;
 
         let read_data = opts.read_data;
 
-        let (data, _) = self.read_raw(volume, file_dir, file_path, read_data).await?;
+        let (data, _) = self
+            .read_raw(volume, volume_dir.clone(), file_path, read_data)
+            .await
+            .map_err(|e| {
+                if e == DiskError::FileNotFound && !version_id.is_empty() {
+                    DiskError::FileVersionNotFound
+                } else {
+                    e
+                }
+            })?;
 
-        let fi = get_file_info(&data, volume, path, version_id, FileInfoOpts { data: read_data }).await?;
+        let mut fi = get_file_info(
+            &data,
+            volume,
+            path,
+            version_id,
+            FileInfoOpts {
+                data: read_data,
+                include_free_versions: opts.incl_free_versions,
+            },
+        )?;
+
+        if opts.read_data {
+            if fi.data.as_ref().is_some_and(|d| !d.is_empty()) || fi.size == 0 {
+                if fi.inline_data() {
+                    return Ok(fi);
+                }
+
+                if fi.size == 0 || fi.version_id.is_none_or(|v| v.is_nil()) {
+                    fi.set_inline_data();
+                    return Ok(fi);
+                };
+                if let Some(part) = fi.parts.first() {
+                    let part_path = format!("part.{}", part.number);
+                    let part_path = path_join_buf(&[
+                        path,
+                        fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
+                        part_path.as_str(),
+                    ]);
+                    let part_path = self.get_object_path(volume, part_path.as_str())?;
+                    if lstat(&part_path).await.is_err() {
+                        fi.set_inline_data();
+                        return Ok(fi);
+                    }
+                }
+
+                fi.data = None;
+            }
+
+            let inline = fi.transition_status.is_empty() && fi.data_dir.is_some() && fi.parts.len() == 1;
+            if inline && fi.shard_file_size(fi.parts[0].actual_size) < DEFAULT_INLINE_BLOCK as i64 {
+                let part_path = path_join_buf(&[
+                    path,
+                    fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
+                    format!("part.{}", fi.parts[0].number).as_str(),
+                ]);
+                let part_path = self.get_object_path(volume, part_path.as_str())?;
+
+                let data = self.read_all_data(volume, volume_dir, part_path.clone()).await.map_err(|e| {
+                    warn!("read_version read_all_data {:?} failed: {e}", part_path);
+                    e
+                })?;
+                fi.data = Some(Bytes::from(data));
+            }
+        }
 
         Ok(fi)
     }

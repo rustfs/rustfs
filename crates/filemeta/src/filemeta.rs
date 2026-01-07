@@ -14,7 +14,8 @@
 
 use crate::{
     ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, ObjectPartInfo, RawFileInfo, ReplicationState,
-    ReplicationStatusType, Result, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
+    ReplicationStatusType, Result, TIER_FV_ID, TIER_FV_MARKER, VersionPurgeStatusType, replication_statuses_map,
+    version_purge_statuses_map,
 };
 use byteorder::ByteOrder;
 use bytes::Bytes;
@@ -909,6 +910,7 @@ impl FileMeta {
         path: &str,
         version_id: &str,
         read_data: bool,
+        include_free_versions: bool,
         all_parts: bool,
     ) -> Result<FileInfo> {
         let vid = {
@@ -921,17 +923,43 @@ impl FileMeta {
 
         let mut is_latest = true;
         let mut succ_mod_time = None;
+        let mut non_free_versions = self.versions.len();
+
+        let mut found = false;
+        let mut found_free_version = None;
+        let mut found_fi = None;
 
         for ver in self.versions.iter() {
             let header = &ver.header;
 
             // TODO: freeVersion
+            if header.free_version() {
+                non_free_versions -= 1;
+                if include_free_versions && found_free_version.is_none() {
+                    let mut found_free_fi = FileMetaVersion::default();
+                    if found_free_fi.unmarshal_msg(&ver.meta).is_ok() && found_free_fi.version_type != VersionType::Invalid {
+                        let mut free_fi = found_free_fi.into_fileinfo(volume, path, all_parts);
+                        free_fi.is_latest = true;
+                        found_free_version = Some(free_fi);
+                    }
+                }
+
+                if header.version_id != Some(vid) {
+                    continue;
+                }
+            }
+
+            if found {
+                continue;
+            }
 
             if !version_id.is_empty() && header.version_id != Some(vid) {
                 is_latest = false;
                 succ_mod_time = header.mod_time;
                 continue;
             }
+
+            found = true;
 
             let mut fi = ver.into_fileinfo(volume, path, all_parts)?;
             fi.is_latest = is_latest;
@@ -947,7 +975,25 @@ impl FileMeta {
                     .map(bytes::Bytes::from);
             }
 
-            fi.num_versions = self.versions.len();
+            found_fi = Some(fi);
+        }
+
+        if !found {
+            if version_id.is_empty() {
+                if include_free_versions
+                    && non_free_versions == 0
+                    && let Some(free_version) = found_free_version
+                {
+                    return Ok(free_version);
+                }
+                return Err(Error::FileNotFound);
+            } else {
+                return Err(Error::FileVersionNotFound);
+            }
+        }
+
+        if let Some(mut fi) = found_fi {
+            fi.num_versions = non_free_versions;
 
             return Ok(fi);
         }
@@ -1767,14 +1813,27 @@ impl MetaObject {
             metadata.insert(k.to_owned(), v.to_owned());
         }
 
+        let tier_fvidkey = format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_ID}").to_lowercase();
+        let tier_fvmarker_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_MARKER}").to_lowercase();
+
         for (k, v) in &self.meta_sys {
-            if k == AMZ_STORAGE_CLASS && v == b"STANDARD" {
+            let lower_k = k.to_lowercase();
+
+            if lower_k == tier_fvidkey || lower_k == tier_fvmarker_key {
+                continue;
+            }
+
+            if lower_k == VERSION_PURGE_STATUS_KEY.to_lowercase() {
+                continue;
+            }
+
+            if lower_k == AMZ_STORAGE_CLASS.to_lowercase() && v == b"STANDARD" {
                 continue;
             }
 
             if k.starts_with(RESERVED_METADATA_PREFIX)
                 || k.starts_with(RESERVED_METADATA_PREFIX_LOWER)
-                || k == VERSION_PURGE_STATUS_KEY
+                || lower_k == VERSION_PURGE_STATUS_KEY.to_lowercase()
             {
                 metadata.insert(k.to_owned(), String::from_utf8(v.to_owned()).unwrap_or_default());
             }
@@ -2511,15 +2570,31 @@ pub fn merge_file_meta_versions(
     merged
 }
 
-pub async fn file_info_from_raw(ri: RawFileInfo, bucket: &str, object: &str, read_data: bool) -> Result<FileInfo> {
-    get_file_info(&ri.buf, bucket, object, "", FileInfoOpts { data: read_data }).await
+pub fn file_info_from_raw(
+    ri: RawFileInfo,
+    bucket: &str,
+    object: &str,
+    read_data: bool,
+    include_free_versions: bool,
+) -> Result<FileInfo> {
+    get_file_info(
+        &ri.buf,
+        bucket,
+        object,
+        "",
+        FileInfoOpts {
+            data: read_data,
+            include_free_versions,
+        },
+    )
 }
 
 pub struct FileInfoOpts {
     pub data: bool,
+    pub include_free_versions: bool,
 }
 
-pub async fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, opts: FileInfoOpts) -> Result<FileInfo> {
+pub fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, opts: FileInfoOpts) -> Result<FileInfo> {
     let vid = {
         if version_id.is_empty() {
             None
@@ -2541,7 +2616,7 @@ pub async fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &st
         });
     }
 
-    let fi = meta.into_fileinfo(volume, path, version_id, opts.data, true)?;
+    let fi = meta.into_fileinfo(volume, path, version_id, opts.data, opts.include_free_versions, true)?;
     Ok(fi)
 }
 

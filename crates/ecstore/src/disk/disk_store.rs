@@ -95,22 +95,22 @@ impl DiskHealthTracker {
 
     /// Check if disk is faulty
     pub fn is_faulty(&self) -> bool {
-        self.status.load(Ordering::Relaxed) == DISK_HEALTH_FAULTY
+        self.status.load(Ordering::Acquire) == DISK_HEALTH_FAULTY
     }
 
     /// Set disk as faulty
     pub fn set_faulty(&self) {
-        self.status.store(DISK_HEALTH_FAULTY, Ordering::Relaxed);
+        self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
     }
 
     /// Set disk as OK
     pub fn set_ok(&self) {
-        self.status.store(DISK_HEALTH_OK, Ordering::Relaxed);
+        self.status.store(DISK_HEALTH_OK, Ordering::Release);
     }
 
     pub fn swap_ok_to_faulty(&self) -> bool {
         self.status
-            .compare_exchange(DISK_HEALTH_OK, DISK_HEALTH_FAULTY, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(DISK_HEALTH_OK, DISK_HEALTH_FAULTY, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
     }
 
@@ -131,7 +131,7 @@ impl DiskHealthTracker {
 
     /// Get last success timestamp
     pub fn last_success(&self) -> i64 {
-        self.last_success.load(Ordering::Relaxed)
+        self.last_success.load(Ordering::Acquire)
     }
 }
 
@@ -384,7 +384,7 @@ impl LocalDiskWrapper {
         let stored_disk_id = self.disk.get_disk_id().await?;
 
         if stored_disk_id != want_id {
-            return Err(Error::other(format!("Disk ID mismatch wanted {:?}, got {:?}", want_id, stored_disk_id)));
+            return Err(Error::other(format!("Disk ID mismatch wanted {want_id:?}, got {stored_disk_id:?}")));
         }
 
         Ok(())
@@ -468,7 +468,7 @@ impl LocalDiskWrapper {
                 // Timeout occurred, mark disk as potentially faulty and decrement waiting counter
                 self.health.decrement_waiting();
                 warn!("disk operation timeout after {:?}", timeout_duration);
-                Err(DiskError::other(format!("disk operation timeout after {:?}", timeout_duration)))
+                Err(DiskError::other(format!("disk operation timeout after {timeout_duration:?}")))
             }
         }
     }

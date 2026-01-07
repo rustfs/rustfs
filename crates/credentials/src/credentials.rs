@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{DEFAULT_SECRET_KEY, ENV_GRPC_AUTH_TOKEN, IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
+use crate::{DEFAULT_SECRET_KEY, ENV_RPC_SECRET, IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
 use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,8 +25,8 @@ use time::OffsetDateTime;
 /// Global active credentials
 static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
 
-/// Global gRPC authentication token
-static GLOBAL_GRPC_AUTH_TOKEN: OnceLock<String> = OnceLock::new();
+/// Global RPC authentication token
+pub static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
 
 /// Initialize the global action credentials
 ///
@@ -181,15 +181,15 @@ pub fn gen_secret_key(length: usize) -> std::io::Result<String> {
     Ok(key_str)
 }
 
-/// Get the gRPC authentication token from environment variable
+/// Get the RPC authentication token from environment variable
 ///
 /// # Returns
-/// * `String` - The gRPC authentication token
+/// * `String` - The RPC authentication token
 ///
-pub fn get_grpc_token() -> String {
-    GLOBAL_GRPC_AUTH_TOKEN
+pub fn get_rpc_token() -> String {
+    GLOBAL_RUSTFS_RPC_SECRET
         .get_or_init(|| {
-            env::var(ENV_GRPC_AUTH_TOKEN)
+            env::var(ENV_RPC_SECRET)
                 .unwrap_or_else(|_| get_global_secret_key_opt().unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string()))
         })
         .clone()

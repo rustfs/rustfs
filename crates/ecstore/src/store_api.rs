@@ -28,14 +28,15 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{
     FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision, ReplicationState,
-    ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
+    ReplicationStatusType, RestoreStatusOps as _, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
+    version_purge_statuses_map,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
-use rustfs_utils::http::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
+use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_RESTORE, AMZ_STORAGE_CLASS};
 use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -756,7 +757,24 @@ impl ObjectInfo {
                 .ok()
         });
 
-        // TODO:ReplicationState
+        let replication_status_internal = fi
+            .replication_state_internal
+            .as_ref()
+            .and_then(|v| v.replication_status_internal.clone());
+        let version_purge_status_internal = fi
+            .replication_state_internal
+            .as_ref()
+            .and_then(|v| v.version_purge_status_internal.clone());
+
+        let mut replication_status = fi.replication_status();
+        if replication_status.is_empty()
+            && let Some(status) = fi.metadata.get(AMZ_BUCKET_REPLICATION_STATUS).cloned()
+            && status == ReplicationStatusType::Replica.as_str()
+        {
+            replication_status = ReplicationStatusType::Replica;
+        }
+
+        let version_purge_status = fi.version_purge_status();
 
         let transitioned_object = TransitionedObject {
             name: fi.transitioned_objname.clone(),
@@ -777,10 +795,24 @@ impl ObjectInfo {
         };
 
         // Extract storage class from metadata, default to STANDARD if not found
-        let storage_class = metadata
-            .get(AMZ_STORAGE_CLASS)
-            .cloned()
-            .or_else(|| Some(storageclass::STANDARD.to_string()));
+        let storage_class = if !fi.transition_tier.is_empty() {
+            Some(fi.transition_tier.clone())
+        } else {
+            fi.metadata
+                .get(AMZ_STORAGE_CLASS)
+                .cloned()
+                .or_else(|| Some(storageclass::STANDARD.to_string()))
+        };
+
+        let mut restore_ongoing = false;
+        let mut restore_expires = None;
+        if let Some(restore_status) = fi.metadata.get(AMZ_RESTORE).cloned() {
+            //
+            if let Ok(restore_status) = parse_restore_obj_status(&restore_status) {
+                restore_ongoing = restore_status.on_going();
+                restore_expires = restore_status.expiry();
+            }
+        }
 
         // Convert parts from rustfs_filemeta::ObjectPartInfo to store_api::ObjectPartInfo
         let parts = fi
@@ -797,6 +829,8 @@ impl ObjectInfo {
                 error: part.error.clone(),
             })
             .collect();
+
+        // TODO: part checksums
 
         ObjectInfo {
             bucket: bucket.to_string(),
@@ -822,6 +856,12 @@ impl ObjectInfo {
             transitioned_object,
             checksum: fi.checksum.clone(),
             storage_class,
+            restore_ongoing,
+            restore_expires,
+            replication_status_internal,
+            replication_status,
+            version_purge_status_internal,
+            version_purge_status,
             ..Default::default()
         }
     }
