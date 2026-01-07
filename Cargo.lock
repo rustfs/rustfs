@@ -7614,6 +7614,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "heed",
  "http 1.4.0",
  "path-clean",
  "rand 0.10.0-rc.5",

@@ -19,10 +19,7 @@
 #![allow(clippy::all)]
 
 use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
-use s3s::dto::{
-    BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
-    ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
-};
+use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, Prefix, RestoreRequest, Transition};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::env;
@@ -173,44 +170,49 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 continue;
             }
 
-            let rule_prefix = rule.prefix.as_ref().expect("err!");
+            let rule_prefix = &rule.prefix.clone().unwrap_or_default();
             if prefix.len() > 0 && rule_prefix.len() > 0 && !prefix.starts_with(rule_prefix) && !rule_prefix.starts_with(&prefix)
             {
                 continue;
             }
 
-            let rule_noncurrent_version_expiration = rule.noncurrent_version_expiration.as_ref().expect("err!");
-            if rule_noncurrent_version_expiration.noncurrent_days.expect("err!") > 0 {
+            if let Some(rule_noncurrent_version_expiration) = &rule.noncurrent_version_expiration {
+                if let Some(noncurrent_days) = rule_noncurrent_version_expiration.noncurrent_days {
+                    if noncurrent_days > 0 {
+                        return true;
+                    }
+                }
+                if let Some(newer_noncurrent_versions) = rule_noncurrent_version_expiration.newer_noncurrent_versions {
+                    if newer_noncurrent_versions > 0 {
+                        return true;
+                    }
+                }
+            }
+            if rule.noncurrent_version_transitions.is_some() {
                 return true;
             }
-            if rule_noncurrent_version_expiration.newer_noncurrent_versions.expect("err!") > 0 {
-                return true;
+            if let Some(rule_expiration) = &rule.expiration {
+                if let Some(date1) = rule_expiration.date.clone() {
+                    if OffsetDateTime::from(date1).unix_timestamp() < OffsetDateTime::now_utc().unix_timestamp() {
+                        return true;
+                    }
+                }
+                if rule_expiration.date.is_some() {
+                    return true;
+                }
+                if let Some(expired_object_delete_marker) = rule_expiration.expired_object_delete_marker && expired_object_delete_marker {
+                    return true;
+                }
             }
-            if !rule.noncurrent_version_transitions.is_none() {
-                return true;
+            if let Some(rule_transitions) = &rule.transitions {
+                let rule_transitions_0 = rule_transitions[0].clone();
+                if let Some(date1) = rule_transitions_0.date {
+                    if OffsetDateTime::from(date1).unix_timestamp() < OffsetDateTime::now_utc().unix_timestamp() {
+                        return true;
+                    }
+                }
             }
-            let rule_expiration = rule.expiration.as_ref().expect("err!");
-            if !rule_expiration.date.is_none()
-                && OffsetDateTime::from(rule_expiration.date.clone().expect("err!")).unix_timestamp()
-                    < OffsetDateTime::now_utc().unix_timestamp()
-            {
-                return true;
-            }
-            if !rule_expiration.date.is_none() {
-                return true;
-            }
-            if rule_expiration.expired_object_delete_marker.expect("err!") {
-                return true;
-            }
-            let rule_transitions: &[Transition] = &rule.transitions.as_ref().expect("err!");
-            let rule_transitions_0 = rule_transitions[0].clone();
-            if !rule_transitions_0.date.is_none()
-                && OffsetDateTime::from(rule_transitions_0.date.expect("err!")).unix_timestamp()
-                    < OffsetDateTime::now_utc().unix_timestamp()
-            {
-                return true;
-            }
-            if !rule.transitions.is_none() {
+            if rule.transitions.is_some() {
                 return true;
             }
         }
