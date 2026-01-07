@@ -1615,7 +1615,7 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         read_data: bool,
-        _incl_free_vers: bool,
+        incl_free_vers: bool,
     ) -> (Vec<FileInfo>, Vec<Option<DiskError>>) {
         let mut metadata_array = vec![None; fileinfos.len()];
         let mut meta_file_infos = vec![FileInfo::default(); fileinfos.len()];
@@ -1665,7 +1665,7 @@ impl SetDisks {
             ..Default::default()
         };
 
-        let finfo = match meta.into_fileinfo(bucket, object, "", true, true) {
+        let finfo = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
             Ok(res) => res,
             Err(err) => {
                 for item in errs.iter_mut() {
@@ -1692,7 +1692,7 @@ impl SetDisks {
 
         for (idx, meta_op) in metadata_array.iter().enumerate() {
             if let Some(meta) = meta_op {
-                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, true) {
+                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, incl_free_vers, true) {
                     Ok(res) => meta_file_infos[idx] = res,
                     Err(err) => errs[idx] = Some(err.into()),
                 }
