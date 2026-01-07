@@ -21,6 +21,7 @@ use futures::stream::FuturesUnordered;
 use hashbrown::{HashMap, HashSet};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, EnableState, audit::AUDIT_ROUTE_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
+use rustfs_targets::arn::TargetID;
 use rustfs_targets::{Target, TargetError, target::ChannelTargetType};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -390,6 +391,82 @@ impl AuditRegistry {
             return Err(AuditError::Target(errors.into_iter().next().unwrap()));
         }
 
+        Ok(())
+    }
+
+    /// Creates a unique key for a target based on its type and ID
+    ///
+    /// # Arguments
+    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
+    /// * `target_id` - The identifier for the target instance.
+    ///
+    /// # Returns
+    /// * `String` - The unique key for the target.
+    pub fn crate_key(&self, target_type: &str, target_id: &str) -> String {
+        let key = TargetID::new(target_id.to_string(), target_type.to_string());
+        info!(target_type = %target_type, "Crate key for {}", key);
+        key.to_string()
+    }
+
+    /// Enables a target (placeholder, assumes target exists)
+    ///
+    /// # Arguments
+    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
+    /// * `target_id` - The identifier for the target instance.
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure.
+    pub fn enable_target(&self, target_type: &str, target_id: &str) -> AuditResult<()> {
+        let key = self.crate_key(target_type, target_id);
+        if self.get_target(&key).is_some() {
+            info!("Target {}-{} enabled", target_type, target_id);
+            Ok(())
+        } else {
+            Err(AuditError::Configuration(
+                format!("Target not found: {}-{}", target_type, target_id),
+                None,
+            ))
+        }
+    }
+
+    /// Disables a target (placeholder, assumes target exists)
+    ///
+    /// # Arguments
+    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
+    /// * `target_id` - The identifier for the target instance.
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure.
+    pub fn disable_target(&self, target_type: &str, target_id: &str) -> AuditResult<()> {
+        let key = self.crate_key(target_type, target_id);
+        if self.get_target(&key).is_some() {
+            info!("Target {}-{} disabled", target_type, target_id);
+            Ok(())
+        } else {
+            Err(AuditError::Configuration(
+                format!("Target not found: {}-{}", target_type, target_id),
+                None,
+            ))
+        }
+    }
+
+    /// Upserts a target into the registry
+    ///
+    /// # Arguments
+    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
+    /// * `target_id` - The identifier for the target instance.
+    /// * `target` - The target instance to be upserted.
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure.
+    pub fn upsert_target(
+        &mut self,
+        target_type: &str,
+        target_id: &str,
+        target: Box<dyn Target<AuditEntry> + Send + Sync>,
+    ) -> AuditResult<()> {
+        let key = self.crate_key(target_type, target_id);
+        self.targets.insert(key, target);
         Ok(())
     }
 }
