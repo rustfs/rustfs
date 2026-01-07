@@ -21,6 +21,7 @@ use super::{
 };
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 
+use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::error::FileAccessDeniedWithContext;
 use crate::disk::error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error};
@@ -2274,6 +2275,7 @@ impl DiskAPI for LocalDisk {
             .read_raw(volume, volume_dir.clone(), file_path, read_data)
             .await
             .map_err(|e| {
+                warn!("read_version read_raw {:?} failed: {e}", file_path);
                 if e == DiskError::FileNotFound && !version_id.is_empty() {
                     DiskError::FileVersionNotFound
                 } else {
@@ -2320,15 +2322,18 @@ impl DiskAPI for LocalDisk {
             }
 
             let inline = fi.transition_status.is_empty() && fi.data_dir.is_some() && fi.parts.len() == 1;
-            if inline && fi.shard_file_size(fi.parts[0].actual_size) < 12 * 1024 * 1024 {
+            if inline && fi.shard_file_size(fi.parts[0].actual_size) < DEFAULT_INLINE_BLOCK as i64 {
                 let part_path = path_join_buf(&[
                     path,
                     fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
-                    fi.parts[0].number.to_string().as_str(),
+                    format!("part.{}", fi.parts[0].number).as_str(),
                 ]);
                 let part_path = self.get_object_path(volume, part_path.as_str())?;
 
-                let data = self.read_all_data(volume, volume_dir, part_path).await?;
+                let data = self.read_all_data(volume, volume_dir, part_path.clone()).await.map_err(|e| {
+                    warn!("read_version read_all_data {:?} failed: {e}", part_path);
+                    e
+                })?;
                 fi.data = Some(Bytes::from(data));
             }
         }
