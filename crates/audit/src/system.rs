@@ -597,7 +597,7 @@ impl AuditSystem {
     /// Gets information about a specific target
     ///
     /// # Arguments
-    /// * `target_id` - The ID of the target to retrieve,TargetID to string
+    /// * `target_id` - The ID of the target to retrieve, TargetID to string
     ///
     /// # Returns
     /// * `Option<String>` - Target ID if found
