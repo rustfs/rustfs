@@ -293,7 +293,7 @@ impl AuditSystem {
                 let entity_target = EntityTarget {
                     object_name: entry.api.name.clone().unwrap_or_default(),
                     bucket_name: entry.api.bucket.clone().unwrap_or_default(),
-                    event_name: entry.event.clone(), // Default, should be derived from entry
+                    event_name: entry.event, // Default, should be derived from entry
                     data: (*entry_clone).clone(),
                 };
 
@@ -380,7 +380,7 @@ impl AuditSystem {
                         let entity_target = EntityTarget {
                             object_name: entry.api.name.clone().unwrap_or_default(),
                             bucket_name: entry.api.bucket.clone().unwrap_or_default(),
-                            event_name: entry.event.clone(),
+                            event_name: entry.event,
                             data: (*entry).clone(),
                         };
                         match target.save(Arc::new(entity_target)).await {
