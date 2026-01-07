@@ -125,7 +125,7 @@ impl ARN {
         if self.target_id.id.is_empty() && self.target_id.name.is_empty() && self.region.is_empty() {
             return String::new();
         }
-        format!("{}:{}:{}", ARN_PREFIX, self.region, self.target_id.to_string())
+        format!("{}:{}:{}", ARN_PREFIX, self.region, self.target_id)
     }
 
     /// Parsing ARN from string
