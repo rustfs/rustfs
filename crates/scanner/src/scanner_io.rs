@@ -272,7 +272,7 @@ impl ScannerIOCache for SetDisks {
         let store_clone = self.clone();
         let ctx_clone = ctx.clone();
         let send_update_fut = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(30 + rand::random::<u64>() % 10));
+            let mut ticker = tokio::time::interval(Duration::from_secs(3 + rand::random::<u64>() % 10));
 
             let mut last_update = None;
 

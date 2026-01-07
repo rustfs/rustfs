@@ -452,6 +452,8 @@ pub fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (Strin
         .strip_prefix(SLASH_SEPARATOR)
         .unwrap_or(path);
     // Find the position of the first '/'
+    #[cfg(windows)]
+    let trimmed_path = trimmed_path.replace('\\', "/");
     let Some(pos) = trimmed_path.find(SLASH_SEPARATOR) else {
         return (trimmed_path.to_string(), "".to_string());
     };
