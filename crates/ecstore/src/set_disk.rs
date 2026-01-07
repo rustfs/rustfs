@@ -1488,17 +1488,7 @@ impl SetDisks {
                 if let Some(disk) = disk
                     && disk.is_online().await
                 {
-                    if version_id.is_empty() {
-                        match disk.read_xl(&bucket, &object, read_data).await {
-                            Ok(info) => {
-                                let fi = file_info_from_raw(info, &bucket, &object, read_data).await?;
-                                Ok(fi)
-                            }
-                            Err(err) => Err(err),
-                        }
-                    } else {
-                        disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
-                    }
+                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
                 }
@@ -1626,7 +1616,7 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         read_data: bool,
-        _incl_free_vers: bool,
+        incl_free_vers: bool,
     ) -> (Vec<FileInfo>, Vec<Option<DiskError>>) {
         let mut metadata_array = vec![None; fileinfos.len()];
         let mut meta_file_infos = vec![FileInfo::default(); fileinfos.len()];
@@ -1676,7 +1666,7 @@ impl SetDisks {
             ..Default::default()
         };
 
-        let finfo = match meta.into_fileinfo(bucket, object, "", true, true) {
+        let finfo = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
             Ok(res) => res,
             Err(err) => {
                 for item in errs.iter_mut() {
@@ -1703,7 +1693,7 @@ impl SetDisks {
 
         for (idx, meta_op) in metadata_array.iter().enumerate() {
             if let Some(meta) = meta_op {
-                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, true) {
+                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, incl_free_vers, true) {
                     Ok(res) => meta_file_infos[idx] = res,
                     Err(err) => errs[idx] = Some(err.into()),
                 }

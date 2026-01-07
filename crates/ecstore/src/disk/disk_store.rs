@@ -95,22 +95,22 @@ impl DiskHealthTracker {
 
     /// Check if disk is faulty
     pub fn is_faulty(&self) -> bool {
-        self.status.load(Ordering::Relaxed) == DISK_HEALTH_FAULTY
+        self.status.load(Ordering::Acquire) == DISK_HEALTH_FAULTY
     }
 
     /// Set disk as faulty
     pub fn set_faulty(&self) {
-        self.status.store(DISK_HEALTH_FAULTY, Ordering::Relaxed);
+        self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
     }
 
     /// Set disk as OK
     pub fn set_ok(&self) {
-        self.status.store(DISK_HEALTH_OK, Ordering::Relaxed);
+        self.status.store(DISK_HEALTH_OK, Ordering::Release);
     }
 
     pub fn swap_ok_to_faulty(&self) -> bool {
         self.status
-            .compare_exchange(DISK_HEALTH_OK, DISK_HEALTH_FAULTY, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(DISK_HEALTH_OK, DISK_HEALTH_FAULTY, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
     }
 
@@ -131,7 +131,7 @@ impl DiskHealthTracker {
 
     /// Get last success timestamp
     pub fn last_success(&self) -> i64 {
-        self.last_success.load(Ordering::Relaxed)
+        self.last_success.load(Ordering::Acquire)
     }
 }
 
