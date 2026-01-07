@@ -84,6 +84,13 @@ where
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
         let path = uri.path();
+
+        // Handle OPTIONS requests for CORS preflight (all paths)
+        // This ensures OPTIONS requests are handled by our router before default S3 implementation
+        if method == Method::OPTIONS && headers.contains_key("origin") {
+            return true;
+        }
+
         // Profiling endpoints
         if method == Method::GET && (path == PROFILE_CPU_PATH || path == PROFILE_MEMORY_PATH) {
             return true;
@@ -114,6 +121,12 @@ where
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
         // Allow unauthenticated access to health check
         let path = req.uri.path();
+
+        // Allow OPTIONS requests for CORS preflight (no authentication required)
+        // CORS preflight requests are sent by browsers and don't include authentication
+        if req.method == Method::OPTIONS && req.headers.contains_key("origin") {
+            return Ok(());
+        }
 
         // Profiling endpoints
         if req.method == Method::GET && (path == PROFILE_CPU_PATH || path == PROFILE_MEMORY_PATH) {
@@ -150,6 +163,8 @@ where
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        // Console requests should be handled by console router first (including OPTIONS)
+        // Console has its own CORS layer configured
         if self.console_enabled && is_console_path(req.uri.path()) {
             if let Some(console_router) = &self.console_router {
                 let mut console_router = console_router.clone();
@@ -161,6 +176,28 @@ where
                 };
             }
             return Err(s3_error!(InternalError, "console is not enabled"));
+        }
+
+        // Handle OPTIONS preflight requests for S3 bucket CORS
+        // This only handles S3 bucket paths, not console paths
+        if req.method == Method::OPTIONS && req.headers.contains_key("origin") {
+            let path = req.uri.path().trim_start_matches('/');
+            let bucket = path.split('/').next().unwrap_or("").to_string();
+
+            if !bucket.is_empty() {
+                // Handle CORS preflight using existing function
+                if let Some(cors_headers) = crate::storage::ecfs::apply_cors_headers(&bucket, &req.method, &req.headers).await {
+                    let mut response = S3Response::new(Body::empty());
+                    for (key, value) in cors_headers.iter() {
+                        response.headers.insert(key, value.clone());
+                    }
+                    return Ok(response);
+                }
+            }
+
+            // If no CORS rule matched, return 200 OK without CORS headers
+            // This is the correct behavior per S3 CORS spec
+            return Ok(S3Response::new(Body::empty()));
         }
 
         let uri = format!("{}|{}", &req.method, req.uri.path());

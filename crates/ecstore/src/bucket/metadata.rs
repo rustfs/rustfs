@@ -24,8 +24,8 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rmp_serde::Serializer as rmpSerializer;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::{
-    BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,
-    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
+    BucketLifecycleConfiguration, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
+    ReplicationConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
 };
 use serde::Serializer;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,7 @@ pub const OBJECT_LOCK_CONFIG: &str = "object-lock.xml";
 pub const BUCKET_VERSIONING_CONFIG: &str = "versioning.xml";
 pub const BUCKET_REPLICATION_CONFIG: &str = "replication.xml";
 pub const BUCKET_TARGETS_FILE: &str = "bucket-targets.json";
+pub const BUCKET_CORS_CONFIG: &str = "cors.xml";
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
@@ -69,6 +70,7 @@ pub struct BucketMetadata {
     pub replication_config_xml: Vec<u8>,
     pub bucket_targets_config_json: Vec<u8>,
     pub bucket_targets_config_meta_json: Vec<u8>,
+    pub cors_config_xml: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -81,6 +83,7 @@ pub struct BucketMetadata {
     pub notification_config_updated_at: OffsetDateTime,
     pub bucket_targets_config_updated_at: OffsetDateTime,
     pub bucket_targets_config_meta_updated_at: OffsetDateTime,
+    pub cors_config_updated_at: OffsetDateTime,
 
     #[serde(skip)]
     pub new_field_updated_at: OffsetDateTime,
@@ -107,6 +110,8 @@ pub struct BucketMetadata {
     pub bucket_target_config: Option<BucketTargets>,
     #[serde(skip)]
     pub bucket_target_config_meta: Option<HashMap<String, String>>,
+    #[serde(skip)]
+    pub cors_config: Option<CORSConfiguration>,
 }
 
 impl Default for BucketMetadata {
@@ -126,6 +131,7 @@ impl Default for BucketMetadata {
             replication_config_xml: Default::default(),
             bucket_targets_config_json: Default::default(),
             bucket_targets_config_meta_json: Default::default(),
+            cors_config_xml: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -137,6 +143,7 @@ impl Default for BucketMetadata {
             notification_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             bucket_targets_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             bucket_targets_config_meta_updated_at: OffsetDateTime::UNIX_EPOCH,
+            cors_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -149,6 +156,7 @@ impl Default for BucketMetadata {
             replication_config: Default::default(),
             bucket_target_config: Default::default(),
             bucket_target_config_meta: Default::default(),
+            cors_config: Default::default(),
         }
     }
 }
@@ -297,6 +305,10 @@ impl BucketMetadata {
                 self.bucket_targets_config_json = data.clone();
                 self.bucket_targets_config_updated_at = updated;
             }
+            BUCKET_CORS_CONFIG => {
+                self.cors_config_xml = data;
+                self.cors_config_updated_at = updated;
+            }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }
 
@@ -366,6 +378,9 @@ impl BucketMetadata {
             self.bucket_target_config = Some(bucket_targets);
         } else {
             self.bucket_target_config = Some(BucketTargets::default())
+        }
+        if !self.cors_config_xml.is_empty() {
+            self.cors_config = Some(deserialize::<CORSConfiguration>(&self.cors_config_xml)?);
         }
 
         Ok(())

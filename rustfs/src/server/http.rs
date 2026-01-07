@@ -57,6 +57,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
 
 /// Parse CORS allowed origins from configuration
+/// Note: This function is currently unused as global CORS layer has been removed.
+/// S3 API CORS is handled by bucket-level configuration, console has its own CORS layer.
+#[allow(dead_code)]
 fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     use http::Method;
 
@@ -108,6 +111,9 @@ fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     }
 }
 
+/// Get CORS allowed origins from environment variables
+/// Note: This function is currently unused as global CORS layer has been removed.
+#[allow(dead_code)]
 fn get_cors_allowed_origins() -> String {
     std::env::var(rustfs_config::ENV_CORS_ALLOWED_ORIGINS)
         .unwrap_or_else(|_| rustfs_config::DEFAULT_CORS_ALLOWED_ORIGINS.to_string())
@@ -276,14 +282,6 @@ pub async fn start_http_server(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
 
-    // Capture CORS configuration for the server loop
-    let cors_allowed_origins = get_cors_allowed_origins();
-    let cors_allowed_origins = if cors_allowed_origins.is_empty() {
-        None
-    } else {
-        Some(cors_allowed_origins)
-    };
-
     // Create compression configuration from environment variables
     let compression_config = CompressionConfig::from_env();
     if compression_config.enabled {
@@ -297,8 +295,10 @@ pub async fn start_http_server(
 
     let is_console = opt.console_enable;
     tokio::spawn(async move {
-        // Create CORS layer inside the server loop closure
-        let cors_layer = parse_cors_origins(cors_allowed_origins.as_ref());
+        // Note: CORS layer is removed from global middleware stack
+        // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
+        // - Console CORS is handled by its own cors_layer in setup_console_middleware_stack()
+        // This ensures S3 API CORS behavior matches AWS S3 specification
 
         #[cfg(unix)]
         let (mut sigterm_inner, mut sigint_inner) = {
@@ -404,7 +404,6 @@ pub async fn start_http_server(
             let connection_ctx = ConnectionContext {
                 http_server: http_server.clone(),
                 s3_service: s3_service.clone(),
-                cors_layer: cors_layer.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
                 readiness: readiness.clone(),
@@ -520,7 +519,6 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 struct ConnectionContext {
     http_server: Arc<ConnBuilder<TokioExecutor>>,
     s3_service: S3Service,
-    cors_layer: CorsLayer,
     compression_config: CompressionConfig,
     is_console: bool,
     readiness: Arc<GlobalReadiness>,
@@ -545,7 +543,6 @@ fn process_connection(
         let ConnectionContext {
             http_server,
             s3_service,
-            cors_layer,
             compression_config,
             is_console,
             readiness,
@@ -628,7 +625,7 @@ fn process_connection(
                     }),
             )
             .layer(PropagateRequestIdLayer::x_request_id())
-            .layer(cors_layer)
+            // CORS layer removed: S3 API uses bucket-level CORS, console has its own CORS layer
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
             .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
