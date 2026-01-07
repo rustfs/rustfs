@@ -2275,7 +2275,6 @@ impl DiskAPI for LocalDisk {
             .read_raw(volume, volume_dir.clone(), file_path, read_data)
             .await
             .map_err(|e| {
-                warn!("read_version read_raw {:?} failed: {e}", file_path);
                 if e == DiskError::FileNotFound && !version_id.is_empty() {
                     DiskError::FileVersionNotFound
                 } else {
