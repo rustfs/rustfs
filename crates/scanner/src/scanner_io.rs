@@ -167,13 +167,12 @@ impl ScannerIO for ECStore {
                             all_merged.merge(result);
                         }
 
-                        if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update {
-                           if let Err(e) = updates
+                        if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update
+                           && let Err(e) = updates
                                 .send(all_merged.dui(&all_merged.info.name, &all_buckets_clone))
                                 .await {
                                 error!("Failed to send data usage info: {}", e);
                             }
-                        }
                         break;
                     }
                     _ = ticker.tick() => {
@@ -245,10 +244,10 @@ impl ScannerIOCache for SetDisks {
         permutes.shuffle(&mut rand::rng());
 
         for bucket in permutes.iter() {
-            if old_cache.find(&bucket.name).is_none() {
-                if let Err(e) = bucket_tx.send(bucket.clone()).await {
-                    error!("Failed to send bucket info: {}", e);
-                }
+            if old_cache.find(&bucket.name).is_none()
+                && let Err(e) = bucket_tx.send(bucket.clone()).await
+            {
+                error!("Failed to send bucket info: {}", e);
             }
         }
 
@@ -272,7 +271,7 @@ impl ScannerIOCache for SetDisks {
         let store_clone = self.clone();
         let ctx_clone = ctx.clone();
         let send_update_fut = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(30 + rand::random::<u64>() % 10));
+            let mut ticker = tokio::time::interval(Duration::from_secs(3 + rand::random::<u64>() % 10));
 
             let mut last_update = None;
 
@@ -403,12 +402,11 @@ impl ScannerIOCache for SetDisks {
                         Err(e) => {
                             error!("Failed to scan disk: {}", e);
 
-                            if let (Some(last_update), Some(before_update)) = (cache.info.last_update, before) {
-                                if last_update > before_update {
-                                    if let Err(e) = cache.save(store_clone_clone.clone(), cache_name.as_str()).await {
-                                        error!("Failed to save data usage cache: {}", e);
-                                    }
-                                }
+                            if let (Some(last_update), Some(before_update)) = (cache.info.last_update, before)
+                                && last_update > before_update
+                                && let Err(e) = cache.save(store_clone_clone.clone(), cache_name.as_str()).await
+                            {
+                                error!("Failed to save data usage cache: {}", e);
                             }
 
                             if let Err(e) = update_fut.await {
@@ -576,13 +574,13 @@ impl ScannerIODisk for Disk {
             OffsetDateTime::now_utc(),
         ));
 
-        if replication_config.has_active_rules("", true) {
-            if let Ok(targets) = BucketTargetSys::get().list_bucket_targets(&cache.info.name).await {
-                cache.info.replication = Some(Arc::new(ReplicationConfig {
-                    config: Some(replication_config),
-                    remotes: Some(targets),
-                }));
-            }
+        if replication_config.has_active_rules("", true)
+            && let Ok(targets) = BucketTargetSys::get().list_bucket_targets(&cache.info.name).await
+        {
+            cache.info.replication = Some(Arc::new(ReplicationConfig {
+                config: Some(replication_config),
+                remotes: Some(targets),
+            }));
         }
 
         // TODO: object lock

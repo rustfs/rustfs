@@ -479,21 +479,21 @@ impl Metrics {
         // Lifetime operations
         for i in 0..Metric::Last as usize {
             let count = self.operations[i].load(Ordering::Relaxed);
-            if count > 0 {
-                if let Some(metric) = Metric::from_index(i) {
-                    metrics.life_time_ops.insert(metric.as_str().to_string(), count);
-                }
+            if count > 0
+                && let Some(metric) = Metric::from_index(i)
+            {
+                metrics.life_time_ops.insert(metric.as_str().to_string(), count);
             }
         }
 
         // Last minute statistics for realtime metrics
         for i in 0..Metric::LastRealtime as usize {
             let last_min = self.latency[i].total().await;
-            if last_min.n > 0 {
-                if let Some(_metric) = Metric::from_index(i) {
-                    // Convert to madmin TimedAction format if needed
-                    // This would require implementing the conversion
-                }
+            if last_min.n > 0
+                && let Some(_metric) = Metric::from_index(i)
+            {
+                // Convert to madmin TimedAction format if needed
+                // This would require implementing the conversion
             }
         }
 

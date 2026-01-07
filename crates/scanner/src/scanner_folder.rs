@@ -459,15 +459,15 @@ impl FolderScanner {
             return;
         }
 
-        if let Some(flat) = self.update_cache.size_recursive(&self.new_cache.info.name) {
-            if let Some(ref updates) = self.updates {
-                // Try to send without blocking
-                if let Err(e) = updates.send(flat.clone()).await {
-                    error!("send_update: failed to send update: {}", e);
-                }
-                self.last_update = SystemTime::now();
-                debug!("send_update: sent update for folder: {}", self.new_cache.info.name);
+        if let Some(flat) = self.update_cache.size_recursive(&self.new_cache.info.name)
+            && let Some(ref updates) = self.updates
+        {
+            // Try to send without blocking
+            if let Err(e) = updates.send(flat.clone()).await {
+                error!("send_update: failed to send update: {}", e);
             }
+            self.last_update = SystemTime::now();
+            debug!("send_update: sent update for folder: {}", self.new_cache.info.name);
         }
     }
 
@@ -659,10 +659,10 @@ impl FolderScanner {
                     Err(e) => {
                         warn!("scan_folder: failed to get size for item {}: {}", item.path, e);
                         // TODO: check error type
-                        if let Some(t) = wait {
-                            if let Ok(elapsed) = t.elapsed() {
-                                tokio::time::sleep(elapsed).await;
-                            }
+                        if let Some(t) = wait
+                            && let Ok(elapsed) = t.elapsed()
+                        {
+                            tokio::time::sleep(elapsed).await;
                         }
 
                         if e != StorageError::other("skip file".to_string()) {
@@ -684,10 +684,10 @@ impl FolderScanner {
                 into.add_sizes(&sz);
                 into.objects += 1;
 
-                if let Some(t) = wait {
-                    if let Ok(elapsed) = t.elapsed() {
-                        tokio::time::sleep(elapsed).await;
-                    }
+                if let Some(t) = wait
+                    && let Ok(elapsed) = t.elapsed()
+                {
+                    tokio::time::sleep(elapsed).await;
                 }
             }
 
@@ -1055,30 +1055,31 @@ impl FolderScanner {
             self.new_cache.replace_hashed(&this_hash, &folder.parent, into);
         }
 
-        if !into.compacted && self.new_cache.info.name != folder.name {
-            if let Some(mut flat) = self.new_cache.size_recursive(&this_hash.key()) {
-                flat.compacted = true;
-                let mut should_compact = false;
+        if !into.compacted
+            && self.new_cache.info.name != folder.name
+            && let Some(mut flat) = self.new_cache.size_recursive(&this_hash.key())
+        {
+            flat.compacted = true;
+            let mut should_compact = false;
 
-                if flat.objects < DATA_SCANNER_COMPACT_LEAST_OBJECT {
-                    should_compact = true;
-                } else {
-                    // Compact if we only have objects as children...
-                    should_compact = true;
-                    for k in &into.children {
-                        if let Some(v) = self.new_cache.cache.get(k) {
-                            if !v.children.is_empty() || v.objects > 1 {
-                                should_compact = false;
-                                break;
-                            }
-                        }
+            if flat.objects < DATA_SCANNER_COMPACT_LEAST_OBJECT {
+                should_compact = true;
+            } else {
+                // Compact if we only have objects as children...
+                should_compact = true;
+                for k in &into.children {
+                    if let Some(v) = self.new_cache.cache.get(k)
+                        && (!v.children.is_empty() || v.objects > 1)
+                    {
+                        should_compact = false;
+                        break;
                     }
                 }
+            }
 
-                if should_compact {
-                    self.new_cache.delete_recursive(&this_hash);
-                    self.new_cache.replace_hashed(&this_hash, &folder.parent, &flat);
-                }
+            if should_compact {
+                self.new_cache.delete_recursive(&this_hash);
+                self.new_cache.replace_hashed(&this_hash, &folder.parent, &flat);
             }
         }
 
