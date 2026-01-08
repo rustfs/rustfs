@@ -3732,11 +3732,7 @@ impl SetDisks {
 
     /// Refresh MetaCacheEntry metadata from disk with quorum-based reading
     /// This ensures we get the latest metadata from disk, bypassing stale cache
-    async fn refresh_entry_metadata(
-        &self,
-        entry: &mut MetaCacheEntry,
-        bucket: &str,
-    ) -> Result<()> {
+    async fn refresh_entry_metadata(&self, entry: &mut MetaCacheEntry, bucket: &str) -> Result<()> {
         if entry.is_dir() || entry.name.is_empty() {
             return Ok(());
         }
@@ -3768,13 +3764,11 @@ impl SetDisks {
             match FileMeta::load(&raw_info_opt.buf) {
                 Ok(meta) => {
                     let is_better = match &best_meta {
-                        Some((best, _)) => {
-                            match (meta.latest_mod_time(), best.latest_mod_time()) {
-                                (Some(new_time), Some(old_time)) => new_time > old_time,
-                                (Some(_), None) => true,
-                                (None, _) => false,
-                            }
-                        }
+                        Some((best, _)) => match (meta.latest_mod_time(), best.latest_mod_time()) {
+                            (Some(new_time), Some(old_time)) => new_time > old_time,
+                            (Some(_), None) => true,
+                            (None, _) => false,
+                        },
                         None => true,
                     };
                     if is_better {
@@ -3925,7 +3919,9 @@ impl SetDisks {
                 debug!(
                     "check_and_create_dir_delete_marker: object {} does not meet read quorum. \
                      valid_metas={}, read_quorum={}, skipping",
-                    object_name, valid_metas.len(), read_quorum
+                    object_name,
+                    valid_metas.len(),
+                    read_quorum
                 );
             }
         }
@@ -3933,8 +3929,12 @@ impl SetDisks {
         debug!(
             "check_and_create_dir_delete_marker: parent_dir={}, total_objects={}, \
              deleted_objects={}, objects_with_quorum={}, scanned_disks={}/{}",
-            parent_dir, total_objects, deleted_objects, objects_with_quorum,
-            successful_scans, online_disks.len()
+            parent_dir,
+            total_objects,
+            deleted_objects,
+            objects_with_quorum,
+            successful_scans,
+            online_disks.len()
         );
 
         // Only create delete marker if all objects that meet quorum are deleted
@@ -4855,7 +4855,8 @@ impl StorageAPI for SetDisks {
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
             // Check if parent directory needs a delete marker
-            if (opts.versioned || opts.version_suspended) && delete_marker
+            if (opts.versioned || opts.version_suspended)
+                && delete_marker
                 && let Some(parent_dir) = self.get_parent_directory(object)
             {
                 // Check and create delete marker synchronously to ensure consistency
