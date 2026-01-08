@@ -27,11 +27,11 @@ pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 /// Example: --secret-key rustfsadmin
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 
-/// Environment variable for gRPC authentication token
-/// Used to set the authentication token for gRPC communication
-/// Example: RUSTFS_GRPC_AUTH_TOKEN=your_token_here
+/// Environment variable for RPC authentication token
+/// Used to set the authentication token for RPC communication
+/// Example: RUSTFS_RPC_SECRET=your_token_here
 /// Default value: No default value. RUSTFS_SECRET_KEY value is recommended.
-pub const ENV_GRPC_AUTH_TOKEN: &str = "RUSTFS_GRPC_AUTH_TOKEN";
+pub const ENV_RPC_SECRET: &str = "RUSTFS_RPC_SECRET";
 
 /// IAM Policy Types
 /// Used to differentiate between embedded and inherited policies

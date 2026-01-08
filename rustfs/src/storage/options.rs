@@ -330,29 +330,56 @@ pub fn extract_metadata_from_mime_with_object_name(
 }
 
 pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    // Standard HTTP headers that should NOT be returned in the Metadata field
+    // These are returned as separate response headers, not user metadata
+    const EXCLUDED_HEADERS: &[&str] = &[
+        "content-type",
+        "content-encoding",
+        "content-disposition",
+        "content-language",
+        "cache-control",
+        "expires",
+        "etag",
+        "x-amz-storage-class",
+        "x-amz-tagging",
+        "x-amz-replication-status",
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key-md5",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+    ];
+
     let mut filtered_metadata = HashMap::new();
     for (k, v) in metadata {
+        // Skip internal/reserved metadata
         if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
             continue;
         }
+
+        // Skip empty object lock values
         if v.is_empty() && (k == &X_AMZ_OBJECT_LOCK_MODE.to_string() || k == &X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string()) {
             continue;
         }
 
+        // Skip encryption metadata placeholders
         if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
             continue;
         }
 
         let lower_key = k.to_ascii_lowercase();
-        if let Some(key) = lower_key.strip_prefix("x-amz-meta-") {
-            filtered_metadata.insert(key.to_string(), v.to_string());
-            continue;
-        }
-        if let Some(key) = lower_key.strip_prefix("x-rustfs-meta-") {
-            filtered_metadata.insert(key.to_string(), v.to_string());
+
+        // Skip standard HTTP headers (they are returned as separate headers, not metadata)
+        if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {
             continue;
         }
 
+        // Skip any x-amz-* headers that are not user metadata
+        // User metadata was stored WITHOUT the x-amz-meta- prefix by extract_metadata_from_mime
+        if lower_key.starts_with("x-amz-") {
+            continue;
+        }
+
+        // Include user-defined metadata (keys like "meta1", "custom-key", etc.)
         filtered_metadata.insert(k.clone(), v.clone());
     }
     if filtered_metadata.is_empty() {

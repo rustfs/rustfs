@@ -1,0 +1,19 @@
+{{- if .Values.gatewayApi.enabled -}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "rustfs.fullname" . }}-route
+spec:
+  parentRefs:
+    - name: {{ include "rustfs.fullname" . }}-gateway
+  hostnames:
+    - {{ .Values.gatewayApi.hostname }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: rustfs-svc
+          port: 9001
+{{- end }}

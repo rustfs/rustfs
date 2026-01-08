@@ -2037,9 +2037,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.0-rc.13"
+version = "0.7.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2bb4138de6db76c8155b4423e967049fbef2cf84ad6af7f552f73a161941b72"
+checksum = "c9c6daa2049db6a5fad90a981b8c63f023dbaf75a0fae73db4dcf234556fc957"
 dependencies = [
  "ctutils",
  "num-traits",
@@ -2075,7 +2075,7 @@ version = "0.7.0-pre.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da0b07a7a616370e8b6efca0c6a25e5f4c6d02fde11f3d570e4af64d8ed7e2e9"
 dependencies = [
- "crypto-bigint 0.7.0-rc.13",
+ "crypto-bigint 0.7.0-rc.14",
  "libm",
  "rand_core 0.10.0-rc-3",
 ]
@@ -3274,7 +3274,6 @@ dependencies = [
  "rustfs-common",
  "rustfs-ecstore",
  "rustfs-filemeta",
- "rustfs-iam",
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-protos",
@@ -3418,18 +3417,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "enum-as-inner"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.113",
 ]
 
 [[package]]
@@ -7520,7 +7507,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d27d813937fdf8e9ad15e3e422a55da4021d29639000139ca19d99f3949060da"
 dependencies = [
  "const-oid 0.10.1",
- "crypto-bigint 0.7.0-rc.13",
+ "crypto-bigint 0.7.0-rc.14",
  "crypto-primes",
  "digest 0.11.0-rc.5",
  "pkcs1 0.8.0-rc.4",
@@ -7768,6 +7755,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jemalloc_pprof",
+ "libc",
  "libsystemd",
  "libunftp",
  "matchit 0.9.1",
@@ -7778,7 +7766,6 @@ dependencies = [
  "moka",
  "pin-project-lite",
  "pprof",
- "rand 0.10.0-rc.6",
  "reqwest",
  "rmp-serde",
  "russh",
@@ -7817,7 +7804,6 @@ dependencies = [
  "socket2",
  "ssh-key",
  "subtle",
- "sysctl",
  "sysinfo",
  "thiserror 2.0.17",
  "tikv-jemalloc-ctl",
@@ -8132,11 +8118,9 @@ name = "rustfs-lock"
 version = "0.0.5"
 dependencies = [
  "async-trait",
- "bytes",
  "crossbeam-queue",
  "futures",
  "parking_lot",
- "rustfs-protos",
  "serde",
  "serde_json",
  "smallvec",
@@ -8145,7 +8129,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
- "url",
  "uuid",
 ]
 
@@ -8271,7 +8254,6 @@ dependencies = [
  "flatbuffers",
  "prost 0.14.1",
  "rustfs-common",
- "rustfs-credentials",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -8521,9 +8503,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.35"
+version = "0.23.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "533f54bc6a7d4f647e46ad909549eda97bf5afc1585190ef692b4286b198bd8f"
+checksum = "c665f33d38cea657d9614f766881e4d510e0eda4239891eea56b4cadcf01801b"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -8882,9 +8864,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.148"
+version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3084b546a1dd6289475996f182a22aba973866ea8e8b02c51d9f46b1336a22da"
+checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
  "itoa",
  "memchr",
@@ -8968,11 +8950,12 @@ dependencies = [
 
 [[package]]
 name = "serial_test"
-version = "3.2.0"
+version = "3.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b258109f244e1d6891bf1053a55d63a5cd4f8f4c30cf9a1280989f80e7a1fa9"
+checksum = "0d0b343e184fc3b7bb44dff0705fffcf4b3756ba6aff420dddd8b24ca145e555"
 dependencies = [
- "futures",
+ "futures-executor",
+ "futures-util",
  "log",
  "once_cell",
  "parking_lot",
@@ -8982,9 +8965,9 @@ dependencies = [
 
 [[package]]
 name = "serial_test_derive"
-version = "3.2.0"
+version = "3.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d69265a08751de7844521fd15003ae0a888e035773ba05695c5c759a6f89eef"
+checksum = "6f50427f258fb77356e4cd4aa0e87e2bd2c66dbcee41dc405282cae2bfc26c83"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9384,7 +9367,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ad6a09263583e83e934fcd436b7e3bb9d69602e2feef3787adb615c1fe3a343"
 dependencies = [
  "base64ct",
- "crypto-bigint 0.7.0-rc.13",
+ "crypto-bigint 0.7.0-rc.14",
  "digest 0.11.0-rc.5",
  "pem-rfc7468 1.0.0",
  "subtle",
@@ -9683,20 +9666,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.113",
-]
-
-[[package]]
-name = "sysctl"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cca424247104946a59dacd27eaad296223b7feec3d168a6dd04585183091eb0b"
-dependencies = [
- "bitflags 2.10.0",
- "byteorder",
- "enum-as-inner",
- "libc",
- "thiserror 2.0.17",
- "walkdir",
 ]
 
 [[package]]
@@ -10497,9 +10466,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.7"
+version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08bc136a29a3d1758e07a9cca267be308aeebf5cfd5a10f3f67ab2097683ef5b"
+checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
 dependencies = [
  "form_urlencoded",
  "idna",

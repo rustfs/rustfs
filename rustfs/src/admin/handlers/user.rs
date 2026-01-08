@@ -118,12 +118,14 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is not utf8"));
         }
 
-        let deny_only = ak == cred.access_key;
+        // Security fix: Always require explicit Allow permission for CreateUser
+        // Do not use deny_only to bypass permission checks, even when creating for self
+        // This ensures consistent security semantics and prevents privilege escalation
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
-            deny_only,
+            false, // Always require explicit Allow permission
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
@@ -375,12 +377,14 @@ impl Operation for GetUserInfo {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let deny_only = ak == cred.access_key;
+        // Security fix: Always require explicit Allow permission for GetUser
+        // Users should have explicit GetUser permission to view account information
+        // This ensures consistent security semantics across all admin operations
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
-            deny_only,
+            false, // Always require explicit Allow permission
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
@@ -651,7 +655,7 @@ impl Operation for ImportIam {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
+            vec![Action::AdminAction(AdminAction::ImportIAMAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;

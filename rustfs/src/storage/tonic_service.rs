@@ -1784,7 +1784,7 @@ impl Node for NodeService {
                 return Ok(Response::new(GetMetricsResponse {
                     success: false,
                     realtime_metrics: Bytes::new(),
-                    error_info: Some(format!("Invalid metric_type: {}", err)),
+                    error_info: Some(format!("Invalid metric_type: {err}")),
                 }));
             }
         };
@@ -1798,7 +1798,7 @@ impl Node for NodeService {
                 return Ok(Response::new(GetMetricsResponse {
                     success: false,
                     realtime_metrics: Bytes::new(),
-                    error_info: Some(format!("Invalid opts: {}", err)),
+                    error_info: Some(format!("Invalid opts: {err}")),
                 }));
             }
         };

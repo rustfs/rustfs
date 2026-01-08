@@ -21,7 +21,7 @@ use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateMa
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
-use http::{HeaderMap, Request as HttpRequest, Response};
+use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
@@ -30,7 +30,11 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use rustfs_common::GlobalReadiness;
+#[cfg(not(target_os = "openbsd"))]
 use rustfs_config::{MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+#[cfg(target_os = "openbsd")]
+use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
@@ -42,7 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
-use tonic::{Request, Status, metadata::MetadataValue};
+use tonic::{Request, Status};
 use tower::ServiceBuilder;
 use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -374,12 +378,11 @@ pub async fn start_http_server(
 
             // Enable TCP Keepalive to detect dead clients (e.g. power loss)
             // Idle: 10s, Interval: 5s, Retries: 3
-            let ka = TcpKeepalive::new()
-                .with_time(Duration::from_secs(10))
-                .with_interval(Duration::from_secs(5));
-
-            #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
-            let ka = ka.with_retries(3);
+            let mut ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
+            #[cfg(not(target_os = "openbsd"))]
+            {
+                ka = ka.with_interval(Duration::from_secs(5)).with_retries(3);
+            }
 
             if let Err(err) = socket_ref.set_tcp_keepalive(&ka) {
                 warn!(?err, "Failed to set TCP_KEEPALIVE");
@@ -388,9 +391,11 @@ pub async fn start_http_server(
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
+            #[cfg(not(any(target_os = "openbsd")))]
             if let Err(err) = socket_ref.set_recv_buffer_size(4 * MI_B) {
                 warn!(?err, "Failed to set set_recv_buffer_size");
             }
+            #[cfg(not(any(target_os = "openbsd")))]
             if let Err(err) = socket_ref.set_send_buffer_size(4 * MI_B) {
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
@@ -722,17 +727,11 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
-    let token_str = rustfs_credentials::get_grpc_token();
-
-    let token: MetadataValue<_> = token_str.parse().map_err(|e| {
-        error!("Failed to parse RUSTFS_GRPC_AUTH_TOKEN into gRPC metadata value: {}", e);
-        Status::internal("Invalid auth token configuration")
+    verify_rpc_signature(TONIC_RPC_PREFIX, &Method::GET, req.metadata().as_ref()).map_err(|e| {
+        error!("RPC signature verification failed: {}", e);
+        Status::unauthenticated("No valid auth token")
     })?;
-
-    match req.metadata().get("authorization") {
-        Some(t) if token == t => Ok(req),
-        _ => Err(Status::unauthenticated("No valid auth token")),
-    }
+    Ok(req)
 }
 
 /// Determines the listen backlog size.
@@ -740,38 +739,56 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
 /// It tries to read the system's maximum connection queue length (`somaxconn`).
 /// If reading fails, it falls back to a default value (e.g., 1024).
 /// This makes the backlog size adaptive to the system configuration.
+#[cfg(target_os = "linux")]
 fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
 
-    #[cfg(target_os = "linux")]
-    {
-        // For Linux, read from /proc/sys/net/core/somaxconn
-        match std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
-            Ok(s) => s.trim().parse().unwrap_or(DEFAULT_BACKLOG),
-            Err(_) => DEFAULT_BACKLOG,
-        }
+    // For Linux, read from /proc/sys/net/core/somaxconn
+    match std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
+        Ok(s) => s.trim().parse().unwrap_or(DEFAULT_BACKLOG),
+        Err(_) => DEFAULT_BACKLOG,
     }
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+}
+
+// For macOS and BSD variants use the syscall way of getting the connection queue length.
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+#[allow(unsafe_code)]
+fn get_listen_backlog() -> i32 {
+    const DEFAULT_BACKLOG: i32 = 1024;
+
+    #[cfg(target_os = "openbsd")]
+    let mut name = [libc::CTL_KERN, libc::KERN_SOMAXCONN];
+    #[cfg(any(target_os = "netbsd", target_os = "macos", target_os = "freebsd"))]
+    let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
+    let mut buf = [0; 1];
+    let mut buf_len = std::mem::size_of_val(&buf);
+
+    if unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            name.len() as u32,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut buf_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
     {
-        // For macOS and BSD variants, use sysctl
-        use sysctl::Sysctl;
-        match sysctl::Ctl::new("kern.ipc.somaxconn") {
-            Ok(ctl) => match ctl.value() {
-                Ok(sysctl::CtlValue::Int(val)) => val,
-                _ => DEFAULT_BACKLOG,
-            },
-            Err(_) => DEFAULT_BACKLOG,
-        }
+        return DEFAULT_BACKLOG;
     }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    )))]
-    {
-        // Fallback for Windows and other operating systems
-        DEFAULT_BACKLOG
-    }
+
+    buf[0]
+}
+
+// Fallback for Windows and other operating systems
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn get_listen_backlog() -> i32 {
+    const DEFAULT_BACKLOG: i32 = 1024;
+    DEFAULT_BACKLOG
 }

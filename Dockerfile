@@ -1,4 +1,4 @@
-FROM alpine:3.22 AS build
+FROM alpine:3.23 AS build
 
 ARG TARGETARCH
 ARG RELEASE=latest
@@ -40,7 +40,7 @@ RUN set -eux; \
     rm -rf rustfs.zip /build/.tmp || true
 
 
-FROM alpine:3.22
+FROM alpine:3.23
 
 ARG RELEASE=latest
 ARG BUILD_DATE
