@@ -62,7 +62,6 @@ impl Evaluator {
         if self.repl_cfg.is_none() {
             return false;
         }
-        // 核心：把内层条件合并到外层，用 && 串联
         if let Some(rcfg) = &self.repl_cfg
             && rcfg
                 .config
