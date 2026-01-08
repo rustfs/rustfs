@@ -4717,20 +4717,20 @@ impl StorageAPI for SetDisks {
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
             // Check if parent directory needs a delete marker
-            if (opts.versioned || opts.version_suspended) && delete_marker {
-                if let Some(parent_dir) = self.get_parent_directory(object) {
-                    // Check and create delete marker synchronously to ensure consistency
-                    if let Err(e) = self
-                        .check_and_create_dir_delete_marker(
-                            bucket,
-                            &parent_dir,
-                            opts.versioned || opts.version_suspended,
-                            &opts.delete_replication,
-                        )
-                        .await
-                    {
-                        warn!("Failed to create directory delete marker for {}: {:?}", parent_dir, e);
-                    }
+            if (opts.versioned || opts.version_suspended) && delete_marker
+                && let Some(parent_dir) = self.get_parent_directory(object)
+            {
+                // Check and create delete marker synchronously to ensure consistency
+                if let Err(e) = self
+                    .check_and_create_dir_delete_marker(
+                        bucket,
+                        &parent_dir,
+                        opts.versioned || opts.version_suspended,
+                        &opts.delete_replication,
+                    )
+                    .await
+                {
+                    warn!("Failed to create directory delete marker for {}: {:?}", parent_dir, e);
                 }
             }
             return Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended));
