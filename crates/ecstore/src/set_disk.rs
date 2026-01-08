@@ -83,7 +83,7 @@ use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX, 
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
-    path::{SLASH_SEPARATOR, base_dir_from_prefix, encode_dir_object, has_suffix, path_join_buf},
+    path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
 use rustfs_workers::workers::Workers;
 use s3s::header::X_AMZ_RESTORE;
@@ -3730,9 +3730,78 @@ impl SetDisks {
         None
     }
 
+    /// Refresh MetaCacheEntry metadata from disk with quorum-based reading
+    /// This ensures we get the latest metadata from disk, bypassing stale cache
+    async fn refresh_entry_metadata(
+        &self,
+        entry: &mut MetaCacheEntry,
+        bucket: &str,
+    ) -> Result<()> {
+        if entry.is_dir() || entry.name.is_empty() {
+            return Ok(());
+        }
+
+        // Read raw metadata from all disks with quorum
+        let disks_guard = self.disks.read().await;
+        let disks = disks_guard.clone();
+        drop(disks_guard);
+
+        let (raw_file_infos, errs) = Self::read_all_raw_file_info(&disks, bucket, &entry.name, false).await;
+
+        // Check read quorum requirement
+        let read_quorum = self.default_read_quorum();
+        let valid_count = raw_file_infos.iter().filter(|opt| opt.is_some()).count();
+
+        if valid_count < read_quorum {
+            debug!(
+                "refresh_entry_metadata: object {} does not meet read quorum. \
+                 valid_count={}, read_quorum={}, keeping existing metadata",
+                entry.name, valid_count, read_quorum
+            );
+            // If quorum not met, keep existing metadata
+            return Ok(());
+        }
+
+        // Find the latest metadata by comparing mod_time across all valid entries
+        let mut best_meta: Option<(FileMeta, Vec<u8>)> = None;
+        for raw_info_opt in raw_file_infos.iter().flatten() {
+            match FileMeta::load(&raw_info_opt.buf) {
+                Ok(meta) => {
+                    let is_better = match &best_meta {
+                        Some((best, _)) => {
+                            match (meta.latest_mod_time(), best.latest_mod_time()) {
+                                (Some(new_time), Some(old_time)) => new_time > old_time,
+                                (Some(_), None) => true,
+                                (None, _) => false,
+                            }
+                        }
+                        None => true,
+                    };
+                    if is_better {
+                        best_meta = Some((meta, raw_info_opt.buf.clone()));
+                    }
+                }
+                Err(e) => {
+                    debug!("refresh_entry_metadata: failed to load metadata for {}: {:?}", entry.name, e);
+                }
+            }
+        }
+
+        if let Some((meta, metadata_bytes)) = best_meta {
+            // Update entry with fresh metadata from disk
+            entry.metadata = metadata_bytes;
+            entry.cached = Some(meta);
+            debug!("refresh_entry_metadata: successfully refreshed metadata for {}", entry.name);
+        } else {
+            debug!("refresh_entry_metadata: no valid metadata found for {}, keeping existing", entry.name);
+        }
+
+        Ok(())
+    }
+
     /// Check if all objects in parent directory have delete markers,
     /// and create a delete marker for the directory if needed
-    async fn check_and_create_dir_delete_marker(
+    pub async fn check_and_create_dir_delete_marker(
         &self,
         bucket: &str,
         parent_dir: &str,
@@ -3745,37 +3814,86 @@ impl SetDisks {
             .await
             .map_err(|e| Error::other(self.format_lock_error(bucket, parent_dir, "write", &e)))?;
 
-        // Directly scan directory and read metadata files to bypass cache
+        // Get online disks for multi-disk scanning with quorum support
+        let (online_disks, _) = self.get_online_disks_with_healing(false).await;
+        if online_disks.is_empty() {
+            return Err(Error::other("No online disks available"));
+        }
+
+        // Calculate listing quorum (similar to list_path)
+        let listing_quorum = online_disks.len().div_ceil(2);
+
+        // Scan directory from multiple disks concurrently
+        let dir_path = parent_dir.trim_end_matches(SLASH_SEPARATOR);
+        let mut scan_futures = Vec::new();
+
+        for disk in &online_disks {
+            let disk = disk.clone();
+            let bucket = bucket.to_string();
+            let dir_path = dir_path.to_string();
+
+            scan_futures.push(async move {
+                match disk.list_dir("", &bucket, &dir_path, -1).await {
+                    Ok(entries) => Ok(entries),
+                    Err(e) => {
+                        // If directory doesn't exist on this disk, return empty list
+                        if matches!(e, DiskError::FileNotFound | DiskError::VolumeNotFound) {
+                            Ok(Vec::new())
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            });
+        }
+
+        // Collect results from all disks
+        let scan_results: Vec<_> = join_all(scan_futures).await;
+
+        // Merge directory entries from all disks using HashSet to deduplicate
+        let mut all_entries: HashSet<String> = HashSet::new();
+        let mut successful_scans = 0;
+
+        for result in scan_results {
+            match result {
+                Ok(entries) => {
+                    successful_scans += 1;
+                    for entry in entries {
+                        if !entry.is_empty() && entry != STORAGE_FORMAT_FILE {
+                            all_entries.insert(entry);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("check_and_create_dir_delete_marker: disk scan failed: {:?}", e);
+                }
+            }
+        }
+
+        // Check if we have quorum for directory listing
+        if successful_scans < listing_quorum {
+            warn!(
+                "check_and_create_dir_delete_marker: insufficient quorum for directory listing. \
+                 successful_scans={}, listing_quorum={}, parent_dir={}",
+                successful_scans, listing_quorum, parent_dir
+            );
+            return Err(Error::other(format!(
+                "Insufficient quorum for directory listing: {}/{}",
+                successful_scans, listing_quorum
+            )));
+        }
+
+        // Get disks for reading metadata
         let disks_guard = self.disks.read().await;
         let disks = disks_guard.clone();
-        drop(disks_guard); // Release the read lock early
+        drop(disks_guard);
 
-        // Get the first online disk to scan the directory
-        let Some(Some(disk)) = disks.first() else {
-            return Err(Error::other("No disks available"));
-        };
-
-        // List directory entries directly from disk (bypassing cache)
-        let dir_path = parent_dir.trim_end_matches(SLASH_SEPARATOR);
-        let dir_entries = match disk.list_dir("", bucket, dir_path, -1).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                // If directory doesn't exist or is empty, no objects to check
-                if matches!(e, DiskError::FileNotFound | DiskError::VolumeNotFound) {
-                    return Ok(());
-                }
-                return Err(Error::other(format!("Failed to list parent directory: {}", e)));
-            }
-        };
-
+        // Check each object's status across multiple disks using read_quorum
         let mut total_objects = 0;
         let mut deleted_objects = 0;
+        let mut objects_with_quorum = 0;
 
-        for entry in &dir_entries {
-            if entry.is_empty() || entry == STORAGE_FORMAT_FILE {
-                continue;
-            }
-
+        for entry in &all_entries {
             let obj_name = entry.trim_end_matches(SLASH_SEPARATOR);
             let object_name = if dir_path.is_empty() {
                 obj_name.to_string()
@@ -3783,31 +3901,49 @@ impl SetDisks {
                 format!("{}{}", parent_dir, obj_name)
             };
 
-            // Try to read metadata directly from disk
+            // Read metadata from all disks with quorum (read_all_xl already handles this)
             let (parts_metadata, _) = Self::read_all_xl(&disks, bucket, &object_name, false, false).await;
 
-            // Check if we found valid metadata (object exists)
-            if let Some(fi) = parts_metadata.iter().filter(|fi| fi.is_valid()).max_by_key(|fi| fi.mod_time) {
-                total_objects += 1;
+            // Calculate read quorum for this object
+            let read_quorum = self.default_read_quorum();
+            let valid_metas: Vec<_> = parts_metadata.iter().filter(|fi| fi.is_valid()).collect();
 
-                if fi.deleted {
-                    deleted_objects += 1;
+            // Only count objects that meet read quorum requirement
+            if valid_metas.len() >= read_quorum {
+                objects_with_quorum += 1;
+
+                // Find the latest valid metadata
+                if let Some(fi) = valid_metas.iter().max_by_key(|fi| fi.mod_time) {
+                    total_objects += 1;
+
+                    if fi.deleted {
+                        deleted_objects += 1;
+                    }
                 }
+            } else {
+                // Object doesn't meet quorum - skip it to avoid false positives
+                debug!(
+                    "check_and_create_dir_delete_marker: object {} does not meet read quorum. \
+                     valid_metas={}, read_quorum={}, skipping",
+                    object_name, valid_metas.len(), read_quorum
+                );
             }
         }
 
         debug!(
-            "check_and_create_dir_delete_marker: parent_dir={}, total_objects={}, deleted_objects={}",
-            parent_dir, total_objects, deleted_objects
+            "check_and_create_dir_delete_marker: parent_dir={}, total_objects={}, \
+             deleted_objects={}, objects_with_quorum={}, scanned_disks={}/{}",
+            parent_dir, total_objects, deleted_objects, objects_with_quorum,
+            successful_scans, online_disks.len()
         );
 
-        // If directory has objects and all objects have delete markers, create directory delete marker
-        if total_objects > 0 && total_objects == deleted_objects {
+        // Only create delete marker if all objects that meet quorum are deleted
+        if total_objects > 0 && total_objects == deleted_objects && objects_with_quorum == total_objects {
             let mod_time = OffsetDateTime::now_utc();
 
             let fi = FileInfo {
                 name: parent_dir.to_string(),
-                deleted: true, // delete marker
+                deleted: true,
                 mark_deleted: true,
                 mod_time: Some(mod_time),
                 version_id: if versioned { Some(Uuid::new_v4()) } else { None },
@@ -3815,15 +3951,17 @@ impl SetDisks {
                 ..Default::default()
             };
 
-            if let Err(e) = self.delete_object_version(bucket, parent_dir, &fi, true).await {
+            self.delete_object_version(bucket, parent_dir, &fi, true).await.map_err(|e| {
                 warn!("Failed to create delete marker for directory {}: {:?}", parent_dir, e);
-                return Err(e);
-            }
-            debug!("Successfully created delete marker for directory: {}", parent_dir);
+                e
+            })?;
+
+            debug!("Successfully created directory delete marker: {}", parent_dir);
         } else {
             debug!(
-                "Skipping directory delete marker creation: total_objects={}, deleted_objects={}",
-                total_objects, deleted_objects
+                "Skipping directory delete marker creation: total_objects={}, deleted_objects={}, \
+                 objects_with_quorum={} (not all objects meet quorum or not all deleted)",
+                total_objects, deleted_objects, objects_with_quorum
             );
         }
 
