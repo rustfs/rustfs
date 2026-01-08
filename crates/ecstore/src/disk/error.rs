@@ -145,6 +145,9 @@ pub enum DiskError {
 
     #[error("timeout")]
     Timeout,
+
+    #[error("invalid path")]
+    InvalidPath,
 }
 
 impl DiskError {
@@ -373,6 +376,7 @@ impl Clone for DiskError {
             DiskError::ShortWrite => DiskError::ShortWrite,
             DiskError::SourceStalled => DiskError::SourceStalled,
             DiskError::Timeout => DiskError::Timeout,
+            DiskError::InvalidPath => DiskError::InvalidPath,
         }
     }
 }
@@ -421,6 +425,7 @@ impl DiskError {
             DiskError::ShortWrite => 0x27,
             DiskError::SourceStalled => 0x28,
             DiskError::Timeout => 0x29,
+            DiskError::InvalidPath => 0x2A,
         }
     }
 
@@ -467,6 +472,7 @@ impl DiskError {
             0x27 => Some(DiskError::ShortWrite),
             0x28 => Some(DiskError::SourceStalled),
             0x29 => Some(DiskError::Timeout),
+            0x2A => Some(DiskError::InvalidPath),
             _ => None,
         }
     }

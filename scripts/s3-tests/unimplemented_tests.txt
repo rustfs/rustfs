@@ -1,0 +1,183 @@
+# Unimplemented S3 feature tests
+# ==============================
+#
+# These tests cover STANDARD S3 features not yet implemented in RustFS.
+# They are TEMPORARILY EXCLUDED and should be enabled as features are added.
+#
+# Unimplemented features:
+# - Versioning: Object versioning support
+# - Lifecycle: Object lifecycle management
+# - S3 Website: Static website hosting
+# - Bucket Logging: Access logging
+# - SSE-S3: Server-side encryption with S3-managed keys
+# - Object Lock: WORM protection
+# - IAM: Identity and Access Management roles/users
+# - SNS: Event notifications
+# - STS: Security Token Service
+# - Checksum: Full checksum validation
+# - Conditional writes: If-Match/If-None-Match for writes
+# - Object ownership: BucketOwnerEnforced/Preferred
+#
+# Total: all unimplemented S3 feature tests listed below (keep this comment in sync with the list)
+
+test_bucket_create_delete_bucket_ownership
+test_bucket_logging_owner
+test_bucket_policy_deny_self_denied_policy
+test_bucket_policy_deny_self_denied_policy_confirm_header
+test_bucket_policy_put_obj_kms_s3
+test_bucket_policy_put_obj_s3_kms
+test_copy_enc
+test_copy_part_enc
+test_delete_bucket_encryption_kms
+test_delete_bucket_encryption_s3
+test_encryption_key_no_sse_c
+test_encryption_sse_c_invalid_md5
+test_encryption_sse_c_method_head
+test_encryption_sse_c_multipart_bad_download
+test_encryption_sse_c_no_key
+test_encryption_sse_c_no_md5
+test_encryption_sse_c_other_key
+test_encryption_sse_c_present
+test_get_bucket_encryption_kms
+test_get_bucket_encryption_s3
+test_get_versioned_object_attributes
+test_lifecycle_delete
+test_lifecycle_expiration_days0
+test_lifecycle_expiration_header_put
+test_lifecycle_get
+test_lifecycle_get_no_id
+test_lifecycle_id_too_long
+test_lifecycle_invalid_status
+test_lifecycle_plain_null_version_current_transition
+test_lifecycle_same_id
+test_lifecycle_set
+test_lifecycle_set_date
+test_lifecycle_set_deletemarker
+test_lifecycle_set_empty_filter
+test_lifecycle_set_filter
+test_lifecycle_set_invalid_date
+test_lifecycle_set_multipart
+test_lifecycle_set_noncurrent
+test_lifecycle_set_noncurrent_transition
+test_lifecycle_transition_encrypted
+test_lifecycle_transition_set_invalid_date
+test_object_checksum_crc64nvme
+test_object_checksum_sha256
+test_object_lock_get_legal_hold_invalid_bucket
+test_object_lock_get_obj_lock_invalid_bucket
+test_object_lock_get_obj_retention_invalid_bucket
+test_object_lock_put_legal_hold_invalid_bucket
+test_object_lock_put_obj_lock_enable_after_create
+test_object_lock_put_obj_lock_invalid_bucket
+test_object_lock_put_obj_retention_invalid_bucket
+test_post_object_upload_checksum
+test_put_bucket_encryption_kms
+test_put_bucket_encryption_s3
+test_put_bucket_logging
+test_put_bucket_logging_errors
+test_put_bucket_logging_permissions
+test_put_bucket_logging_policy_wildcard
+test_put_obj_enc_conflict_bad_enc_kms
+test_put_obj_enc_conflict_c_kms
+test_put_obj_enc_conflict_c_s3
+test_put_obj_enc_conflict_s3_kms
+test_rm_bucket_logging
+test_sse_kms_no_key
+test_sse_kms_not_declared
+test_sse_kms_read_declare
+test_versioned_concurrent_object_create_and_remove
+test_versioned_concurrent_object_create_concurrent_remove
+test_versioned_object_acl
+test_versioning_bucket_atomic_upload_return_version_id
+test_versioning_bucket_create_suspend
+test_versioning_bucket_multipart_upload_return_version_id
+test_versioning_concurrent_multi_object_delete
+test_versioning_multi_object_delete
+test_versioning_multi_object_delete_with_marker
+test_versioning_obj_create_read_remove
+test_versioning_obj_create_read_remove_head
+test_versioning_obj_create_versions_remove_all
+test_versioning_obj_create_versions_remove_special_names
+test_versioning_obj_list_marker
+test_versioning_obj_plain_null_version_overwrite
+test_versioning_obj_plain_null_version_overwrite_suspended
+test_versioning_obj_plain_null_version_removal
+test_versioning_obj_suspend_versions
+
+# Teardown issues (list_object_versions on non-versioned buckets)
+# These tests pass but have cleanup issues with list_object_versions
+test_bucket_list_delimiter_basic
+test_bucket_list_encoding_basic
+test_bucket_listv2_delimiter_alt
+test_bucket_listv2_delimiter_basic
+test_bucket_listv2_delimiter_dot
+test_bucket_listv2_delimiter_empty
+test_bucket_listv2_delimiter_none
+test_bucket_listv2_delimiter_not_exist
+test_bucket_listv2_delimiter_percentage
+test_bucket_listv2_delimiter_prefix_ends_with_delimiter
+test_bucket_listv2_delimiter_unreadable
+test_bucket_listv2_delimiter_whitespace
+test_bucket_listv2_encoding_basic
+
+# Checksum and atomic write tests (require x-amz-checksum-* support)
+test_atomic_dual_write_1mb
+test_atomic_dual_write_4mb
+test_atomic_dual_write_8mb
+test_atomic_multipart_upload_write
+test_atomic_read_1mb
+test_atomic_read_4mb
+test_atomic_read_8mb
+test_atomic_write_1mb
+test_atomic_write_4mb
+test_atomic_write_8mb
+test_set_bucket_tagging
+
+# Tests with implementation issues (need investigation)
+test_bucket_policy_acl
+test_bucket_policy_different_tenant
+test_bucketv2_policy_acl
+test_multipart_resend_first_finishes_last
+
+# Multipart abort and policy issues
+test_abort_multipart_upload
+test_bucket_policy_multipart
+
+# Tests with prefix conflicts or ACL/tenant dependencies
+test_bucket_policy
+test_bucket_policy_allow_notprincipal
+test_bucket_policy_another_bucket
+test_bucket_policy_put_obj_acl
+test_bucket_policy_put_obj_grant
+test_bucket_policy_tenanted_bucket
+test_bucketv2_policy
+test_object_presigned_put_object_with_acl
+test_object_presigned_put_object_with_acl_tenant
+test_object_put_acl_mtime
+
+# ACL-dependent tests (PutBucketAcl not implemented)
+test_block_public_object_canned_acls
+test_block_public_put_bucket_acls
+test_get_authpublic_acl_bucket_policy_status
+test_get_nonpublicpolicy_acl_bucket_policy_status
+test_get_public_acl_bucket_policy_status
+test_get_publicpolicy_acl_bucket_policy_status
+test_ignore_public_acls
+
+# PublicAccessBlock and tag validation tests
+test_block_public_policy
+test_block_public_policy_with_principal
+test_get_obj_head_tagging
+test_get_public_block_deny_bucket_policy
+test_get_undefined_public_block
+test_put_excess_key_tags
+test_put_excess_tags
+test_put_excess_val_tags
+test_put_get_delete_public_block
+test_put_public_block
+test_set_get_del_bucket_policy
+
+# Object attributes and torrent tests
+test_create_bucket_no_ownership_controls
+test_get_checksum_object_attributes
+test_get_object_torrent

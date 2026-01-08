@@ -162,9 +162,17 @@ impl OperationHelper {
                 .build();
 
             let mut final_builder = builder.api(api_details.clone());
+            if let Ok(res) = result {
+                final_builder = final_builder.resp_header(extract_resp_elements(res));
+            }
             if let Some(err) = error_msg {
                 final_builder = final_builder.error(err);
             }
+
+            if let Some(sk) = rustfs_credentials::get_global_access_key_opt() {
+                final_builder = final_builder.access_key(&sk);
+            }
+
             self.audit_builder = Some(final_builder);
             self.api_builder = ApiDetailsBuilder(api_details); // Store final details for Drop use
         }

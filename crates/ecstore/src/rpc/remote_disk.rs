@@ -21,39 +21,44 @@ use std::{
 use bytes::Bytes;
 use futures::lock::Mutex;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
-use rustfs_protos::{
-    node_service_time_out_client,
-    proto_gen::node_service::{
-        CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
-        DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
-        ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
-        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-    },
+use rustfs_protos::proto_gen::node_service::{
+    CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
+    DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
+    ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
+    StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+    node_service_client::NodeServiceClient,
 };
 use rustfs_utils::string::parse_bool_with_default;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::disk::{
-    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    disk_store::{
-        CHECK_EVERY, CHECK_TIMEOUT_DURATION, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE, get_max_timeout_duration,
-    },
-    endpoint::Endpoint,
-};
-use crate::disk::{FileReader, FileWriter};
 use crate::disk::{disk_store::DiskHealthTracker, error::DiskError};
 use crate::{
     disk::error::{Error, Result},
     rpc::build_auth_headers,
 };
+use crate::{
+    disk::{
+        CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+        disk_store::{
+            CHECK_EVERY, CHECK_TIMEOUT_DURATION, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
+            get_max_timeout_duration,
+        },
+        endpoint::Endpoint,
+    },
+    rpc::client::gen_tonic_signature_interceptor,
+};
+use crate::{
+    disk::{FileReader, FileWriter},
+    rpc::client::{TonicInterceptor, node_service_time_out_client},
+};
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_rio::{HttpReader, HttpWriter};
 use tokio::{io::AsyncWrite, net::TcpStream, time::timeout};
-use tonic::Request;
+use tonic::{Request, service::interceptor::InterceptedService, transport::Channel};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -201,7 +206,7 @@ impl RemoteDisk {
 
     /// Perform basic connectivity check for remote disk
     async fn perform_connectivity_check(addr: &str) -> Result<()> {
-        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {}", e)))?;
+        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {e}")))?;
 
         let Some(host) = url.host_str() else {
             return Err(Error::other("No host in URL".to_string()));
@@ -215,7 +220,7 @@ impl RemoteDisk {
                 drop(stream);
                 Ok(())
             }
-            _ => Err(Error::other(format!("Cannot connect to {}:{}", host, port))),
+            _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
         }
     }
 
@@ -255,9 +260,15 @@ impl RemoteDisk {
                 // Timeout occurred, mark disk as potentially faulty
                 self.health.decrement_waiting();
                 warn!("Remote disk operation timeout after {:?}", timeout_duration);
-                Err(Error::other(format!("Remote disk operation timeout after {:?}", timeout_duration)))
+                Err(Error::other(format!("Remote disk operation timeout after {timeout_duration:?}")))
             }
         }
+    }
+
+    async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+            .await
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))
     }
 }
 
@@ -343,7 +354,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(MakeVolumeRequest {
@@ -370,7 +382,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(MakeVolumesRequest {
@@ -397,7 +410,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ListVolumesRequest {
@@ -429,7 +443,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(StatVolumeRequest {
@@ -458,7 +473,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(DeleteVolumeRequest {
@@ -545,7 +561,8 @@ impl DiskAPI for RemoteDisk {
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
 
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(DeleteVersionRequest {
@@ -603,7 +620,7 @@ impl DiskAPI for RemoteDisk {
                 }
             });
         }
-        let mut client = match node_service_time_out_client(&self.addr).await {
+        let mut client = match self.get_client().await {
             Ok(client) => client,
             Err(err) => {
                 let mut errors = Vec::with_capacity(versions.len());
@@ -674,7 +691,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(DeletePathsRequest {
@@ -703,7 +721,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(WriteMetadataRequest {
@@ -734,7 +753,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(UpdateMetadataRequest {
@@ -772,7 +792,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadVersionRequest {
@@ -804,7 +825,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadXlRequest {
@@ -843,7 +865,8 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let file_info = serde_json::to_string(&fi)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(RenameDataRequest {
@@ -878,7 +901,8 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
 
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = self
+            .get_client()
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
         let request = Request::new(ListDirRequest {
@@ -1039,7 +1063,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(RenameFileRequest {
@@ -1069,7 +1094,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(RenamePartRequest {
@@ -1101,7 +1127,8 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let options = serde_json::to_string(&opt)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(DeleteRequest {
@@ -1131,7 +1158,8 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let file_info = serde_json::to_string(&fi)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(VerifyFileRequest {
@@ -1160,7 +1188,8 @@ impl DiskAPI for RemoteDisk {
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadPartsRequest {
@@ -1190,7 +1219,8 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let file_info = serde_json::to_string(&fi)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(CheckPartsRequest {
@@ -1222,7 +1252,8 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let read_multiple_req = serde_json::to_string(&req)?;
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadMultipleRequest {
@@ -1255,7 +1286,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(WriteAllRequest {
@@ -1284,7 +1316,8 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = node_service_time_out_client(&self.addr)
+                let mut client = self
+                    .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadAllRequest {
@@ -1313,7 +1346,8 @@ impl DiskAPI for RemoteDisk {
         }
 
         let opts = serde_json::to_string(&opts)?;
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = self
+            .get_client()
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
         let request = Request::new(DiskInfoRequest {

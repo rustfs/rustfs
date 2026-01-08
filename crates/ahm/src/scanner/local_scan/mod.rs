@@ -306,7 +306,7 @@ fn compute_object_usage(bucket: &str, object: &str, file_meta: &FileMeta) -> Res
                     versions_count = versions_count.saturating_add(1);
 
                     if latest_file_info.is_none()
-                        && let Ok(info) = file_meta.into_fileinfo(bucket, object, "", false, false)
+                        && let Ok(info) = file_meta.into_fileinfo(bucket, object, "", false, false, false)
                     {
                         latest_file_info = Some(info);
                     }
