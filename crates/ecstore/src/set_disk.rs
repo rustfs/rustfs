@@ -71,7 +71,7 @@ use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType,
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
+    RawFileInfo, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
 };
 use rustfs_lock::FastLockGuard;
 use rustfs_lock::fast_lock::types::LockResult;
@@ -83,7 +83,7 @@ use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX, 
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
-    path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
+    path::{SLASH_SEPARATOR, base_dir_from_prefix, encode_dir_object, has_suffix, path_join_buf},
 };
 use rustfs_workers::workers::Workers;
 use s3s::header::X_AMZ_RESTORE;
@@ -3717,6 +3717,118 @@ impl SetDisks {
 
         None
     }
+
+    /// Get parent directory path from object key
+    /// Returns None if object is at root level or has no parent
+    fn get_parent_directory(&self, object: &str) -> Option<String> {
+        if let Some(idx) = object.rfind(SLASH_SEPARATOR) {
+            let parent = &object[..idx + 1]; // Include trailing slash
+            if !parent.is_empty() && parent != SLASH_SEPARATOR {
+                return Some(parent.to_string());
+            }
+        }
+        None
+    }
+
+    /// Check if all objects in parent directory have delete markers,
+    /// and create a delete marker for the directory if needed
+    async fn check_and_create_dir_delete_marker(
+        &self,
+        bucket: &str,
+        parent_dir: &str,
+        versioned: bool,
+        delete_replication: &Option<ReplicationState>,
+    ) -> Result<()> {
+        let _lock_guard = self
+            .fast_lock_manager
+            .acquire_write_lock(bucket, parent_dir, self.locker_owner.as_str())
+            .await
+            .map_err(|e| Error::other(self.format_lock_error(bucket, parent_dir, "write", &e)))?;
+
+        // Directly scan directory and read metadata files to bypass cache
+        let disks_guard = self.disks.read().await;
+        let disks = disks_guard.clone();
+        drop(disks_guard); // Release the read lock early
+
+        // Get the first online disk to scan the directory
+        let Some(Some(disk)) = disks.first() else {
+            return Err(Error::other("No disks available"));
+        };
+
+        // List directory entries directly from disk (bypassing cache)
+        let dir_path = parent_dir.trim_end_matches(SLASH_SEPARATOR);
+        let dir_entries = match disk.list_dir("", bucket, dir_path, -1).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                // If directory doesn't exist or is empty, no objects to check
+                if matches!(e, DiskError::FileNotFound | DiskError::VolumeNotFound) {
+                    return Ok(());
+                }
+                return Err(Error::other(format!("Failed to list parent directory: {}", e)));
+            }
+        };
+
+        let mut total_objects = 0;
+        let mut deleted_objects = 0;
+
+        for entry in &dir_entries {
+            if entry.is_empty() || entry == STORAGE_FORMAT_FILE {
+                continue;
+            }
+
+            let obj_name = entry.trim_end_matches(SLASH_SEPARATOR);
+            let object_name = if dir_path.is_empty() {
+                obj_name.to_string()
+            } else {
+                format!("{}{}", parent_dir, obj_name)
+            };
+
+            // Try to read metadata directly from disk
+            let (parts_metadata, _) = Self::read_all_xl(&disks, bucket, &object_name, false, false).await;
+
+            // Check if we found valid metadata (object exists)
+            if let Some(fi) = parts_metadata.iter().filter(|fi| fi.is_valid()).max_by_key(|fi| fi.mod_time) {
+                total_objects += 1;
+
+                if fi.deleted {
+                    deleted_objects += 1;
+                }
+            }
+        }
+
+        debug!(
+            "check_and_create_dir_delete_marker: parent_dir={}, total_objects={}, deleted_objects={}",
+            parent_dir, total_objects, deleted_objects
+        );
+
+        // If directory has objects and all objects have delete markers, create directory delete marker
+        if total_objects > 0 && total_objects == deleted_objects {
+            let mod_time = OffsetDateTime::now_utc();
+
+            let fi = FileInfo {
+                name: parent_dir.to_string(),
+                deleted: true, // delete marker
+                mark_deleted: true,
+                mod_time: Some(mod_time),
+                version_id: if versioned { Some(Uuid::new_v4()) } else { None },
+                replication_state_internal: delete_replication.clone(),
+                ..Default::default()
+            };
+
+            if let Err(e) = self.delete_object_version(bucket, parent_dir, &fi, true).await {
+                warn!("Failed to create delete marker for directory {}: {:?}", parent_dir, e);
+                return Err(e);
+            }
+            debug!("Successfully created delete marker for directory: {}", parent_dir);
+        } else {
+            debug!(
+                "Skipping directory delete marker creation: total_objects={}, deleted_objects={}",
+                total_objects, deleted_objects
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -4604,6 +4716,23 @@ impl StorageAPI for SetDisks {
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
+            // Check if parent directory needs a delete marker
+            if (opts.versioned || opts.version_suspended) && delete_marker {
+                if let Some(parent_dir) = self.get_parent_directory(object) {
+                    // Check and create delete marker synchronously to ensure consistency
+                    if let Err(e) = self
+                        .check_and_create_dir_delete_marker(
+                            bucket,
+                            &parent_dir,
+                            opts.versioned || opts.version_suspended,
+                            &opts.delete_replication,
+                        )
+                        .await
+                    {
+                        warn!("Failed to create directory delete marker for {}: {:?}", parent_dir, e);
+                    }
+                }
+            }
             return Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended));
         }
 
