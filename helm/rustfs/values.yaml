@@ -30,6 +30,11 @@ fullnameOverride: ""
 mode:
   standalone:
     enabled: false
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 0
+        maxUnavailable: 1
   distributed:
     enabled: true
 
