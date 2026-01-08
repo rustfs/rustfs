@@ -1,0 +1,23 @@
+{{- if .Values.gatewayApi.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ include "rustfs.fullname" . }}-gateway
+spec:
+  gatewayClassName: {{ .Values.gatewayApi.gatewayClass }}
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: {{ .Values.gatewayApi.secretName }}
+            kind: Secret
+{{- end }}
