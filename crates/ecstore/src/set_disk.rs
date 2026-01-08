@@ -4868,7 +4868,13 @@ impl StorageAPI for SetDisks {
                     )
                     .await
                 {
-                    warn!("Failed to create directory delete marker for {}: {:?}", parent_dir, e);
+                    error!(
+                        bucket = %bucket,
+                        parent_dir = %parent_dir,
+                        object = %object,
+                        error = %e,
+                        "Failed to create directory delete marker after object deletion."
+                    );
                 }
             }
             return Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended));
