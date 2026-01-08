@@ -16,7 +16,7 @@ ARG BUILDPLATFORM
 # -----------------------------
 # Build stage
 # -----------------------------
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.91-trixie AS builder
 
 # Re-declare args after FROM
 ARG TARGETPLATFORM

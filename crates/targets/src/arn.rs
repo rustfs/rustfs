@@ -37,11 +37,6 @@ impl TargetID {
         Self { id, name }
     }
 
-    /// Convert to string representation
-    pub fn to_id_string(&self) -> String {
-        format!("{}:{}", self.id, self.name)
-    }
-
     /// Create an ARN
     pub fn to_arn(&self, region: &str) -> ARN {
         ARN {
@@ -80,7 +75,7 @@ impl Serialize for TargetID {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.to_id_string())
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -130,7 +125,7 @@ impl ARN {
         if self.target_id.id.is_empty() && self.target_id.name.is_empty() && self.region.is_empty() {
             return String::new();
         }
-        format!("{}:{}:{}", ARN_PREFIX, self.region, self.target_id.to_id_string())
+        format!("{}:{}:{}", ARN_PREFIX, self.region, self.target_id)
     }
 
     /// Parsing ARN from string
