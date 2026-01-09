@@ -1,6 +1,6 @@
 [![RustFS](https://rustfs.com/images/rustfs-github.png)](https://rustfs.com)
 
-<p align="center">RustFS is a high-performance, distributed object storage system built in Rust.</p>
+<p align="center">CPP is a high-performance, distributed object storage system built in Rust.</p>
 
 <p align="center">
   <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
