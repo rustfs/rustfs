@@ -17,7 +17,7 @@
 use crate::os::{DiskInfo, IOStats};
 use std::io::Error;
 use std::path::Path;
-use windows::Win32::Foundation::{ERROR_SUCCESS, MAX_PATH};
+use windows::Win32::Foundation::MAX_PATH;
 use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetVolumeInformationW, GetVolumePathNameW};
 
 /// Returns total and free bytes available in a directory, e.g. `C:\`.
@@ -198,6 +198,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn test_get_info_invalid_path() {
+        use std::path::PathBuf;
         let invalid_path = PathBuf::from("Z:\\invalid\\path");
         let result = get_info(&invalid_path);
 
