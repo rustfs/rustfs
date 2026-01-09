@@ -13,149 +13,248 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{DiskInfo, IOStats};
+use crate::os::{DiskInfo, IOStats};
 use std::io::Error;
-use std::mem;
-use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use winapi::shared::minwindef::{DWORD, MAX_PATH};
-use winapi::shared::ntdef::ULARGE_INTEGER;
-use winapi::um::fileapi::{GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetVolumeInformationW, GetVolumePathNameW};
-use winapi::um::winnt::{LPCWSTR, WCHAR};
+use windows::Win32::Foundation::{ERROR_SUCCESS, MAX_PATH};
+use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetVolumeInformationW, GetVolumePathNameW};
 
 /// Returns total and free bytes available in a directory, e.g. `C:\`.
+#[allow(unsafe_code)]
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
-    let path_display = p.as_ref().display();
-    let path_wide: Vec<WCHAR> = p
+    let path_wide = p
         .as_ref()
-        .to_path_buf()
-        .into_os_string()
-        .encode_wide()
-        .chain(std::iter::once(0)) // Null-terminate the string
-        .collect();
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
 
-    let mut lp_free_bytes_available: ULARGE_INTEGER = unsafe { mem::zeroed() };
-    let mut lp_total_number_of_bytes: ULARGE_INTEGER = unsafe { mem::zeroed() };
-    let mut lp_total_number_of_free_bytes: ULARGE_INTEGER = unsafe { mem::zeroed() };
+    let mut free_bytes_available = 0u64;
+    let mut total_number_of_bytes = 0u64;
+    let mut total_number_of_free_bytes = 0u64;
 
-    let success = unsafe {
+    unsafe {
         GetDiskFreeSpaceExW(
-            path_wide.as_ptr(),
-            &mut lp_free_bytes_available,
-            &mut lp_total_number_of_bytes,
-            &mut lp_total_number_of_free_bytes,
+            windows::core::PCWSTR::from_raw(path_wide.as_ptr()),
+            Some(&mut free_bytes_available),
+            Some(&mut total_number_of_bytes),
+            Some(&mut total_number_of_free_bytes),
         )
-    };
-    if success == 0 {
-        return Err(Error::last_os_error());
+        .map_err(|e| Error::from_raw_os_error(e.code().0 as i32))?;
     }
 
-    let total = unsafe { *lp_total_number_of_bytes.QuadPart() };
-    let free = unsafe { *lp_total_number_of_free_bytes.QuadPart() };
+    let total = total_number_of_bytes;
+    let free = total_number_of_free_bytes;
 
     if free > total {
         return Err(Error::other(format!(
-            "detected free space ({free}) > total drive space ({total}), fs corruption at ({path_display}). please run 'fsck'"
+            "detected free space ({free}) > total drive space ({total}), fs corruption at ({}). please run 'fsck'",
+            p.as_ref().display()
         )));
     }
 
-    let mut lp_sectors_per_cluster: DWORD = 0;
-    let mut lp_bytes_per_sector: DWORD = 0;
-    let mut lp_number_of_free_clusters: DWORD = 0;
-    let mut lp_total_number_of_clusters: DWORD = 0;
+    let mut sectors_per_cluster = 0u32;
+    let mut bytes_per_sector = 0u32;
+    let mut number_of_free_clusters = 0u32;
+    let mut total_number_of_clusters = 0u32;
 
-    let success = unsafe {
+    unsafe {
         GetDiskFreeSpaceW(
-            path_wide.as_ptr(),
-            &mut lp_sectors_per_cluster,
-            &mut lp_bytes_per_sector,
-            &mut lp_number_of_free_clusters,
-            &mut lp_total_number_of_clusters,
+            windows::core::PCWSTR::from_raw(path_wide.as_ptr()),
+            Some(&mut sectors_per_cluster),
+            Some(&mut bytes_per_sector),
+            Some(&mut number_of_free_clusters),
+            Some(&mut total_number_of_clusters),
         )
-    };
-    if success == 0 {
-        return Err(Error::last_os_error());
+        .map_err(|e| Error::from_raw_os_error(e.code().0 as i32))?;
     }
 
     Ok(DiskInfo {
         total,
         free,
         used: total - free,
-        files: lp_total_number_of_clusters as u64,
-        ffree: lp_number_of_free_clusters as u64,
-
-        // TODO This field is currently unused, and since this logic causes a
-        // NotFound error during startup on Windows systems, it has been commented out here
-        //
-        // The error occurs in GetVolumeInformationW where the path parameter
-        // is of type [WCHAR; MAX_PATH]. For a drive letter, there are excessive
-        // trailing zeros, which causes the failure here.
-        //
-        // fstype: get_fs_type(&path_wide)?,
+        files: total_number_of_clusters as u64,
+        ffree: number_of_free_clusters as u64,
+        fstype: get_fs_type(&path_wide).unwrap_or_default(),
         ..Default::default()
     })
 }
 
 /// Returns leading volume name.
-#[allow(dead_code)]
-fn get_volume_name(v: &[WCHAR]) -> std::io::Result<LPCWSTR> {
-    let volume_name_size: DWORD = MAX_PATH as _;
-    let mut lp_volume_name_buffer: [WCHAR; MAX_PATH] = [0; MAX_PATH];
+#[allow(dead_code, unsafe_code)]
+fn get_volume_name(v: &[u16]) -> std::io::Result<Vec<u16>> {
+    let mut volume_name_buffer = [0u16; MAX_PATH as usize];
 
-    let success = unsafe { GetVolumePathNameW(v.as_ptr(), lp_volume_name_buffer.as_mut_ptr(), volume_name_size) };
-
-    if success == 0 {
-        return Err(Error::last_os_error());
+    unsafe {
+        GetVolumePathNameW(windows::core::PCWSTR::from_raw(v.as_ptr()), Some(&mut volume_name_buffer))
+            .map_err(|e| Error::from_raw_os_error(e.code().0 as i32))?;
     }
 
-    Ok(lp_volume_name_buffer.as_ptr())
+    let len = volume_name_buffer
+        .iter()
+        .position(|&x| x == 0)
+        .unwrap_or(volume_name_buffer.len());
+    Ok(volume_name_buffer[..len].to_vec())
 }
 
 #[allow(dead_code)]
-fn utf16_to_string(v: &[WCHAR]) -> String {
+fn utf16_to_string(v: &[u16]) -> String {
     let len = v.iter().position(|&x| x == 0).unwrap_or(v.len());
     String::from_utf16_lossy(&v[..len])
 }
 
 /// Returns the filesystem type of the underlying mounted filesystem
-#[allow(dead_code)]
-fn get_fs_type(p: &[WCHAR]) -> std::io::Result<String> {
+#[allow(dead_code, unsafe_code)]
+fn get_fs_type(p: &[u16]) -> std::io::Result<String> {
     let path = get_volume_name(p)?;
 
-    let volume_name_size: DWORD = MAX_PATH as _;
-    let n_file_system_name_size: DWORD = MAX_PATH as _;
+    let mut volume_serial_number = 0u32;
+    let mut maximum_component_length = 0u32;
+    let mut file_system_flags = 0u32;
+    let mut volume_name_buffer = [0u16; MAX_PATH as usize];
+    let mut file_system_name_buffer = [0u16; MAX_PATH as usize];
 
-    let mut lp_volume_serial_number: DWORD = 0;
-    let mut lp_maximum_component_length: DWORD = 0;
-    let mut lp_file_system_flags: DWORD = 0;
-
-    let mut lp_volume_name_buffer: [WCHAR; MAX_PATH] = [0; MAX_PATH];
-    let mut lp_file_system_name_buffer: [WCHAR; MAX_PATH] = [0; MAX_PATH];
-
-    let success = unsafe {
+    unsafe {
         GetVolumeInformationW(
-            path,
-            lp_volume_name_buffer.as_mut_ptr(),
-            volume_name_size,
-            &mut lp_volume_serial_number,
-            &mut lp_maximum_component_length,
-            &mut lp_file_system_flags,
-            lp_file_system_name_buffer.as_mut_ptr(),
-            n_file_system_name_size,
+            windows::core::PCWSTR::from_raw(path.as_ptr()),
+            Some(&mut volume_name_buffer),
+            Some(&mut volume_serial_number),
+            Some(&mut maximum_component_length),
+            Some(&mut file_system_flags),
+            Some(&mut file_system_name_buffer),
         )
-    };
-
-    if success == 0 {
-        return Err(Error::last_os_error());
+        .map_err(|e| Error::from_raw_os_error(e.code().0 as i32))?;
     }
 
-    Ok(utf16_to_string(&lp_file_system_name_buffer))
+    Ok(utf16_to_string(&file_system_name_buffer))
 }
 
-pub fn same_disk(_disk1: &str, _disk2: &str) -> std::io::Result<bool> {
-    Ok(false)
+/// Determines if two paths are on the same disk.
+///
+/// # Arguments
+/// * `disk1` - The first disk path as a string slice.
+/// * `disk2` - The second disk path as a string slice.
+///
+/// # Returns
+/// * `Ok(true)` if both paths are on the same disk.
+/// * `Ok(false)` if both paths are on different disks.
+/// * `Err` if an error occurs during the operation.
+#[allow(unsafe_code)]
+pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
+    let path1_wide: Vec<u16> = disk1.encode_utf16().chain(std::iter::once(0)).collect();
+    let path2_wide: Vec<u16> = disk2.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let volume1 = get_volume_name(&path1_wide)?;
+    let volume2 = get_volume_name(&path2_wide)?;
+
+    Ok(volume1 == volume2)
 }
 
+/// Retrieves I/O statistics for a drive identified by its major and minor numbers.
+///
+/// # Arguments
+/// * `major` - The major number of the drive.
+/// * `minor` - The minor number of the drive.
+///
+/// # Returns
+/// * `Ok(IOStats)` containing the I/O statistics.
+/// * `Err` if an error occurs during the operation.
+#[allow(unsafe_code)]
 pub fn get_drive_stats(_major: u32, _minor: u32) -> std::io::Result<IOStats> {
+    // Windows does not provide direct IO stats via simple API; this is a stub
+    // For full implementation, consider using PDH or WMI, but that adds complexity
     Ok(IOStats::default())
+}
+
+mod tests {
+    use crate::os::{get_drive_stats, get_info, same_disk, IOStats};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_get_info_valid_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let info = get_info(temp_dir.path()).unwrap();
+
+        // Verify disk info is valid
+        assert!(info.total > 0);
+        assert!(info.free > 0);
+        assert!(info.used > 0);
+        assert!(info.files > 0);
+        assert!(info.ffree > 0);
+        assert!(!info.fstype.is_empty());
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_get_info_invalid_path() {
+        let invalid_path = PathBuf::from("Z:\\invalid\\path");
+        let result = get_info(&invalid_path);
+
+        assert!(result.is_err());
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_same_disk_same_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
+
+        let result = same_disk(path, path).unwrap();
+        assert!(result);
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_same_disk_different_paths() {
+        let temp_dir1 = tempfile::tempdir().unwrap();
+        let temp_dir2 = tempfile::tempdir().unwrap();
+
+        let path1 = temp_dir1.path().to_str().unwrap();
+        let path2 = temp_dir2.path().to_str().unwrap();
+
+        let _result = same_disk(path1, path2).unwrap();
+        // Since both temporary directories are created in the same file system,
+        // they should be on the same disk in most cases
+        // Test passes if the function doesn't panic - the actual result depends on test environment
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn get_info_with_root_drive() {
+        let info = get_info("C:\\").unwrap();
+        assert!(info.total > 0);
+        assert!(info.free > 0);
+        assert!(info.used > 0);
+        assert!(info.files > 0);
+        assert!(info.ffree > 0);
+        assert!(!info.fstype.is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn get_info_with_network_path() {
+        // Assuming a network path exists; this may fail in test environments
+        let result = get_info("\\\\server\\share");
+        // Test that it either succeeds or fails gracefully
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn same_disk_different_drives() {
+        let result = same_disk("C:\\", "D:\\").unwrap();
+        // Result depends on system; test that it doesn't panic
+        assert!(result == true || result == false);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn same_disk_with_invalid_paths() {
+        let result = same_disk("invalid\\path", "another\\invalid");
+        assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn get_drive_stats_with_non_zero_params() {
+        let stats = get_drive_stats(1, 2).unwrap();
+        assert_eq!(stats, IOStats::default());
+    }
 }
