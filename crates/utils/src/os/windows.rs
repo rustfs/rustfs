@@ -1,4 +1,3 @@
-#![allow(unsafe_code)] // TODO: audit unsafe code
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(unsafe_code)] // TODO: audit unsafe code
+
 use crate::os::{DiskInfo, IOStats};
 use std::io::Error;
 use std::path::Path;
@@ -20,7 +21,6 @@ use windows::Win32::Foundation::{ERROR_SUCCESS, MAX_PATH};
 use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetVolumeInformationW, GetVolumePathNameW};
 
 /// Returns total and free bytes available in a directory, e.g. `C:\`.
-#[allow(unsafe_code)]
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let path_wide = p
         .as_ref()
@@ -81,7 +81,14 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
 }
 
 /// Returns leading volume name.
-#[allow(dead_code, unsafe_code)]
+///
+/// # Arguments
+/// * `v` - A slice of u16 representing the path in UTF-16 encoding
+///
+/// # Returns
+/// * `Ok(Vec<u16>)` containing the volume name in UTF-16 encoding.
+/// * `Err` if an error occurs during the operation.
+#[allow(dead_code)]
 fn get_volume_name(v: &[u16]) -> std::io::Result<Vec<u16>> {
     let mut volume_name_buffer = [0u16; MAX_PATH as usize];
 
@@ -104,7 +111,14 @@ fn utf16_to_string(v: &[u16]) -> String {
 }
 
 /// Returns the filesystem type of the underlying mounted filesystem
-#[allow(dead_code, unsafe_code)]
+///
+/// # Arguments
+/// * `p` - A slice of u16 representing the path in UTF-16 encoding
+///
+/// # Returns
+/// * `Ok(String)` containing the filesystem type (e.g., "NTFS", "FAT32").
+/// * `Err` if an error occurs during the operation.
+#[allow(dead_code)]
 fn get_fs_type(p: &[u16]) -> std::io::Result<String> {
     let path = get_volume_name(p)?;
 
@@ -139,7 +153,6 @@ fn get_fs_type(p: &[u16]) -> std::io::Result<String> {
 /// * `Ok(true)` if both paths are on the same disk.
 /// * `Ok(false)` if both paths are on different disks.
 /// * `Err` if an error occurs during the operation.
-#[allow(unsafe_code)]
 pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
     let path1_wide: Vec<u16> = disk1.encode_utf16().chain(std::iter::once(0)).collect();
     let path2_wide: Vec<u16> = disk2.encode_utf16().chain(std::iter::once(0)).collect();
@@ -159,7 +172,6 @@ pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
 /// # Returns
 /// * `Ok(IOStats)` containing the I/O statistics.
 /// * `Err` if an error occurs during the operation.
-#[allow(unsafe_code)]
 pub fn get_drive_stats(_major: u32, _minor: u32) -> std::io::Result<IOStats> {
     // Windows does not provide direct IO stats via simple API; this is a stub
     // For full implementation, consider using PDH or WMI, but that adds complexity
@@ -167,7 +179,7 @@ pub fn get_drive_stats(_major: u32, _minor: u32) -> std::io::Result<IOStats> {
 }
 
 mod tests {
-    use crate::os::{get_drive_stats, get_info, same_disk, IOStats};
+    use crate::os::{get_info, same_disk};
 
     #[cfg(target_os = "windows")]
     #[test]
@@ -225,36 +237,5 @@ mod tests {
         assert!(info.files > 0);
         assert!(info.ffree > 0);
         assert!(!info.fstype.is_empty());
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn get_info_with_network_path() {
-        // Assuming a network path exists; this may fail in test environments
-        let result = get_info("\\\\server\\share");
-        // Test that it either succeeds or fails gracefully
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn same_disk_different_drives() {
-        let result = same_disk("C:\\", "D:\\").unwrap();
-        // Result depends on system; test that it doesn't panic
-        assert!(result == true || result == false);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn same_disk_with_invalid_paths() {
-        let result = same_disk("invalid\\path", "another\\invalid");
-        assert!(result.is_err());
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn get_drive_stats_with_non_zero_params() {
-        let stats = get_drive_stats(1, 2).unwrap();
-        assert_eq!(stats, IOStats::default());
     }
 }

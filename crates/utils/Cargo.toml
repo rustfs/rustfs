@@ -72,8 +72,7 @@ rand = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_IO"] }
-
+windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [lints]
 workspace = true
