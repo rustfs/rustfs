@@ -178,9 +178,8 @@ pub fn get_drive_stats(_major: u32, _minor: u32) -> std::io::Result<IOStats> {
     Ok(IOStats::default())
 }
 
+#[cfg(test)]
 mod tests {
-    use crate::os::{get_info, same_disk};
-
     #[cfg(target_os = "windows")]
     #[test]
     fn test_get_info_valid_path() {
