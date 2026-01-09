@@ -72,7 +72,7 @@ rand = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true, optional = true, features = ["std", "fileapi", "minwindef", "ntdef", "winnt"] }
+windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [lints]
 workspace = true
@@ -89,7 +89,7 @@ compress = ["dep:flate2", "dep:brotli", "dep:snap", "dep:lz4", "dep:zstd"]
 string = ["dep:regex"]
 crypto = ["dep:base64-simd", "dep:hex-simd", "dep:hmac", "dep:hyper", "dep:sha1"]
 hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:siphasher", "dep:hex-simd", "dep:crc-fast"]
-os = ["dep:nix", "dep:tempfile", "winapi"]  # operating system utilities
+os = ["dep:nix", "dep:tempfile", "dep:windows"]  # operating system utilities
 integration = []  # integration test features
 sys = ["dep:sysinfo"]  # system information features
 http = ["dep:convert_case", "dep:http", "dep:regex"]
