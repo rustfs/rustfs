@@ -93,7 +93,7 @@ fn get_volume_name(v: &[u16]) -> std::io::Result<Vec<u16>> {
     let mut volume_name_buffer = [0u16; MAX_PATH as usize];
 
     unsafe {
-        GetVolumePathNameW(windows::core::PCWSTR::from_raw(v.as_ptr()), Some(&mut volume_name_buffer))
+        GetVolumePathNameW(windows::core::PCWSTR::from_raw(v.as_ptr()), &mut volume_name_buffer)
             .map_err(|e| Error::from_raw_os_error(e.code().0 as i32))?;
     }
 
@@ -180,6 +180,8 @@ pub fn get_drive_stats(_major: u32, _minor: u32) -> std::io::Result<IOStats> {
 
 #[cfg(test)]
 mod tests {
+    use crate::os::{get_info, same_disk};
+
     #[cfg(target_os = "windows")]
     #[test]
     fn test_get_info_valid_path() {
