@@ -51,7 +51,7 @@ use crate::{
     store_api::{ObjectOptions, PutObjReader},
 };
 use rustfs_rio::HashReader;
-use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
+use rustfs_utils::path::{SLASH_SEPARATOR_STR, path_join};
 use s3s::S3ErrorCode;
 
 use super::{
@@ -403,7 +403,7 @@ impl TierConfigMgr {
     pub async fn save_tiering_config<S: StorageAPI>(&self, api: Arc<S>) -> std::result::Result<(), std::io::Error> {
         let data = self.marshal()?;
 
-        let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, TIER_CONFIG_FILE);
+        let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR_STR, TIER_CONFIG_FILE);
 
         self.save_config(api, &config_file, data).await
     }
@@ -483,7 +483,7 @@ async fn new_and_save_tiering_config<S: StorageAPI>(api: Arc<S>) -> Result<TierC
 
 #[tracing::instrument(level = "debug", name = "load_tier_config", skip(api))]
 async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMgr, std::io::Error> {
-    let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, TIER_CONFIG_FILE);
+    let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR_STR, TIER_CONFIG_FILE);
     let data = read_config(api.clone(), config_file.as_str()).await;
     if let Err(err) = data {
         if is_err_config_not_found(&err) {

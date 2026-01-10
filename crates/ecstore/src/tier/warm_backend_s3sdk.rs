@@ -27,19 +27,11 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 
-use crate::client::{
-    api_get_options::GetObjectOptions,
-    api_put_object::PutObjectOptions,
-    api_remove::RemoveObjectOptions,
-    transition_api::{ReadCloser, ReaderImpl},
-};
-use crate::error::ErrorResponse;
-use crate::error::error_resp_to_object_err;
+use crate::client::transition_api::{ReadCloser, ReaderImpl};
 use crate::tier::{
     tier_config::TierS3,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
 };
-use rustfs_utils::path::SLASH_SEPARATOR;
 
 pub struct WarmBackendS3 {
     pub client: Arc<Client>,

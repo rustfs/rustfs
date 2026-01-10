@@ -30,13 +30,11 @@ use crate::client::{
     transition_api::{Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
-use crate::error::ErrorResponse;
-use crate::error::error_resp_to_object_err;
 use crate::tier::{
     tier_config::TierS3,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
 };
-use rustfs_utils::path::SLASH_SEPARATOR;
+use rustfs_utils::path::SLASH_SEPARATOR_STR;
 
 pub struct WarmBackendS3 {
     pub client: Arc<TransitionClient>,
@@ -178,7 +176,7 @@ impl WarmBackend for WarmBackendS3 {
     async fn in_use(&self) -> Result<bool, std::io::Error> {
         let result = self
             .core
-            .list_objects_v2(&self.bucket, &self.prefix, "", "", SLASH_SEPARATOR, 1)
+            .list_objects_v2(&self.bucket, &self.prefix, "", "", SLASH_SEPARATOR_STR, 1)
             .await?;
 
         Ok(result.common_prefixes.len() > 0 || result.contents.len() > 0)

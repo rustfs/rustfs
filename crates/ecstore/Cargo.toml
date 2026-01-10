@@ -48,6 +48,7 @@ async-trait.workspace = true
 bytes.workspace = true
 byteorder = { workspace = true }
 chrono.workspace = true
+dunce.workspace = true
 glob = { workspace = true }
 thiserror.workspace = true
 flatbuffers.workspace = true
@@ -108,7 +109,6 @@ google-cloud-storage = { workspace = true }
 google-cloud-auth = { workspace = true }
 aws-config = { workspace = true }
 faster-hex = { workspace = true }
-
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

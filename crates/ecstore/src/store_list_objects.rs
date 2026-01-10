@@ -34,7 +34,7 @@ use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
 };
-use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
+use rustfs_utils::path::{self, SLASH_SEPARATOR_STR, base_dir_from_prefix};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self};
@@ -132,7 +132,7 @@ impl ListPathOptions {
             return;
         }
 
-        let s = SLASH_SEPARATOR.chars().next().unwrap_or_default();
+        let s = SLASH_SEPARATOR_STR.chars().next().unwrap_or_default();
         self.filter_prefix = {
             let fp = self.prefix.trim_start_matches(&self.base_dir).trim_matches(s);
 
@@ -346,7 +346,7 @@ impl ECStore {
             if let Some(delimiter) = &delimiter {
                 if obj.is_dir && obj.mod_time.is_none() {
                     let mut found = false;
-                    if delimiter != SLASH_SEPARATOR {
+                    if delimiter != SLASH_SEPARATOR_STR {
                         for p in prefixes.iter() {
                             if found {
                                 break;
@@ -470,7 +470,7 @@ impl ECStore {
             if let Some(delimiter) = &delimiter {
                 if obj.is_dir && obj.mod_time.is_none() {
                     let mut found = false;
-                    if delimiter != SLASH_SEPARATOR {
+                    if delimiter != SLASH_SEPARATOR_STR {
                         for p in prefixes.iter() {
                             if found {
                                 break;
@@ -502,7 +502,7 @@ impl ECStore {
         // warn!("list_path opt {:?}", &o);
 
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
-        // if opts.prefix.ends_with(SLASH_SEPARATOR) {
+        // if opts.prefix.ends_with(SLASH_SEPARATOR_STR) {
         //     return Err(Error::msg("eof"));
         // }
 
@@ -520,11 +520,11 @@ impl ECStore {
             return Err(Error::Unexpected);
         }
 
-        if o.prefix.starts_with(SLASH_SEPARATOR) {
+        if o.prefix.starts_with(SLASH_SEPARATOR_STR) {
             return Err(Error::Unexpected);
         }
 
-        let slash_separator = Some(SLASH_SEPARATOR.to_owned());
+        let slash_separator = Some(SLASH_SEPARATOR_STR.to_owned());
 
         o.include_directories = o.separator == slash_separator;
 
@@ -774,8 +774,8 @@ impl ECStore {
                     let mut filter_prefix = {
                         prefix
                             .trim_start_matches(&path)
-                            .trim_start_matches(SLASH_SEPARATOR)
-                            .trim_end_matches(SLASH_SEPARATOR)
+                            .trim_start_matches(SLASH_SEPARATOR_STR)
+                            .trim_end_matches(SLASH_SEPARATOR_STR)
                             .to_owned()
                     };
 
@@ -1130,7 +1130,7 @@ async fn merge_entry_channels(
                     if path::clean(&best_entry.name) == path::clean(&other_entry.name) {
                         let dir_matches = best_entry.is_dir() && other_entry.is_dir();
                         let suffix_matches =
-                            best_entry.name.ends_with(SLASH_SEPARATOR) == other_entry.name.ends_with(SLASH_SEPARATOR);
+                            best_entry.name.ends_with(SLASH_SEPARATOR_STR) == other_entry.name.ends_with(SLASH_SEPARATOR_STR);
 
                         if dir_matches && suffix_matches {
                             to_merge.push(other_idx);

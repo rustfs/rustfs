@@ -19,7 +19,7 @@ use std::{
 
 use super::error::Result;
 use crate::disk::error_conv::to_file_error;
-use rustfs_utils::path::SLASH_SEPARATOR;
+use rustfs_utils::path::SLASH_SEPARATOR_STR;
 use tokio::fs;
 use tracing::warn;
 
@@ -118,7 +118,7 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> std::io::Result<Vec
         if file_type.is_file() {
             volumes.push(name);
         } else if file_type.is_dir() {
-            volumes.push(format!("{name}{SLASH_SEPARATOR}"));
+            volumes.push(format!("{name}{SLASH_SEPARATOR_STR}"));
         }
         count -= 1;
         if count == 0 {
