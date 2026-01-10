@@ -817,11 +817,14 @@ impl S3Access for FS {
         authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await
     }
 
-    /// Checks whether the ListObjectVersions request has accesses to the resources.
+    /// Checks whether the `ListObjectVersions` request is authorized for the requested bucket.
     ///
-    /// This method returns `Ok(())` by default.
-    async fn list_object_versions(&self, _req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
-        Ok(())
+    /// Returns `Ok(())` if the request is allowed, or an error if access is denied or another
+    /// authorization-related issue occurs.
+    async fn list_object_versions(&self, req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
     }
 
     /// Checks whether the ListObjects request has accesses to the resources.
