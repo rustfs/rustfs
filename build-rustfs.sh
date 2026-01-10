@@ -31,7 +31,7 @@ detect_platform() {
                     echo "armv7-unknown-linux-gnueabihf"
                     ;;
                 "loongarch64")
-                    echo "loongarch64-unknown-linux-musl"
+                    echo "loongarch64-unknown-linux-gnu"
                     ;;
                 *)
                     echo "unknown-platform"
@@ -126,6 +126,7 @@ usage() {
     echo "                              Supported platforms:"
     echo "                                x86_64-unknown-linux-gnu"
     echo "                                aarch64-unknown-linux-gnu"
+    echo "                                loongarch64-unknown-linux-gnu"
     echo "                                armv7-unknown-linux-gnueabihf"
     echo "                                x86_64-unknown-linux-musl"
     echo "                                aarch64-unknown-linux-musl"
