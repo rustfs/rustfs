@@ -83,6 +83,13 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 | **Edge & IoT** | **Strong Edge Support**<br>Ideal for secure, innovative edge devices. | **Weak Edge Support**<br>Often too heavy for edge gateways. |
 | **Risk Profile** | **Enterprise Risk Mitigation**<br>Clear IP rights and safe for commercial use. | **Legal Risks**<br>Intellectual property ambiguity and usage restrictions. |
 
+
+## Staying ahead
+
+Star RustFS on GitHub and be instantly notified of new releases.
+
+https://github.com/user-attachments/assets/7ee40bb4-3e46-4eac-b0d0-5fbeb85ff8f3
+
 ## Quickstart
 
 To get started with RustFS, follow these steps:
