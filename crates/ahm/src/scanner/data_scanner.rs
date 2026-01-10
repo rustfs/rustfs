@@ -989,6 +989,15 @@ impl Scanner {
             }
         });
 
+        // Sync memory cache with the latest data usage statistics
+        tokio::spawn(async move {
+            if let Err(e) = rustfs_ecstore::data_usage::sync_memory_cache_with_backend().await {
+                warn!("Failed to sync memory cache with backend: {}", e);
+            } else {
+                debug!("Successfully synced memory cache with backend");
+            }
+        });
+
         info!(
             "Data usage collection completed: {} buckets, {} objects ({} disks reporting)",
             data_usage.buckets_count,

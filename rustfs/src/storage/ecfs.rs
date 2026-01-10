@@ -40,6 +40,7 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use metrics::counter;
+use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
@@ -54,6 +55,7 @@ use rustfs_ecstore::{
         metadata_sys::get_replication_config,
         object_lock::objectlock_sys::BucketObjectLockSys,
         policy_sys::PolicySys,
+        quota::QuotaOperation,
         replication::{
             DeletedObjectReplicationInfo, ReplicationConfigurationExt, check_replicate_delete, get_must_replicate_options,
             must_replicate, schedule_replication, schedule_replication_delete,
@@ -1067,6 +1069,32 @@ impl S3 for FS {
             }
         }
 
+        // check quota for copy operation
+        if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
+            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+
+            match quota_checker
+                .check_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
+                .await
+            {
+                Ok(check_result) => {
+                    if !check_result.allowed {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            format!(
+                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                                check_result.current_usage,
+                                check_result.quota_limit.unwrap_or(0)
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                }
+            }
+        }
+
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
             .await
@@ -1440,6 +1468,9 @@ impl S3 for FS {
             }
         };
 
+        // Fast in-memory update for immediate quota consistency
+        rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+
         // Invalidate cache for the deleted object
         let manager = get_concurrency_manager();
         let del_bucket = bucket.clone();
@@ -1534,8 +1565,6 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let has_lock_enable = BucketObjectLockSys::get(&bucket).await.is_some();
-
         let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
 
         #[derive(Default, Clone)]
@@ -1548,6 +1577,7 @@ impl S3 for FS {
 
         let mut object_to_delete = Vec::new();
         let mut object_to_delete_index = HashMap::new();
+        let mut object_sizes = HashMap::new();
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             // Per S3 API spec, "null" string means non-versioned object
             // Filter out "null" version_id to treat as unversioned
@@ -1606,15 +1636,14 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-            let mut goi = ObjectInfo::default();
-            let mut gerr = None;
+            // Get object info to collect size for quota tracking
+            let (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
+                Ok(res) => (res, None),
+                Err(e) => (ObjectInfo::default(), Some(e.to_string())),
+            };
 
-            if replicate_deletes || object.version_id.is_some() && has_lock_enable {
-                (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
-                    Ok(res) => (res, None),
-                    Err(e) => (ObjectInfo::default(), Some(e.to_string())),
-                };
-            }
+            // Store object size for quota tracking
+            object_sizes.insert(object.object_name.clone(), goi.size);
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
                 object.version_id = Some(Uuid::nil());
@@ -3151,6 +3180,34 @@ impl S3 for FS {
         // Validate object key
         validate_object_key(&key, "PUT")?;
 
+        // check quota for put operation
+        if let Some(size) = content_length
+            && let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get()
+        {
+            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+
+            match quota_checker
+                .check_quota(&bucket, QuotaOperation::PutObject, size as u64)
+                .await
+            {
+                Ok(check_result) => {
+                    if !check_result.allowed {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            format!(
+                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                                check_result.current_usage,
+                                check_result.quota_limit.unwrap_or(0)
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                }
+            }
+        }
+
         if if_match.is_some() || if_none_match.is_some() {
             let Some(store) = new_object_layer_fn() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -3428,6 +3485,9 @@ impl S3 for FS {
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
+
+        // Fast in-memory update for immediate quota consistency
+        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
 
         // Invalidate cache for the written object to prevent stale data
         let manager = get_concurrency_manager();
@@ -4355,6 +4415,34 @@ impl S3 for FS {
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
             .await
             .map_err(ApiError::from)?;
+
+        // check quota after completing multipart upload
+        if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
+            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+
+            match quota_checker
+                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
+                .await
+            {
+                Ok(check_result) => {
+                    if !check_result.allowed {
+                        // Quota exceeded, delete the completed object
+                        let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            format!(
+                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                                check_result.current_usage,
+                                check_result.quota_limit.unwrap_or(0)
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                }
+            }
+        }
 
         // Invalidate cache for the completed multipart object
         let manager = get_concurrency_manager();

@@ -17,6 +17,8 @@ use std::{
     sync::Arc,
     time::SystemTime,
 };
+use tokio::sync::RwLock;
+use tracing::debug;
 
 pub mod local_snapshot;
 pub use local_snapshot::{
@@ -42,6 +44,12 @@ pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
+
+// Global in-memory cache for real-time usage statistics
+lazy_static::lazy_static! {
+    static ref USAGE_MEMORY_CACHE: Arc<RwLock<HashMap<String, u64>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+}
 
 // Data usage storage paths
 lazy_static::lazy_static! {
@@ -364,8 +372,128 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
     Ok(usage)
 }
 
+/// Fast in-memory increment for immediate quota consistency
+pub async fn increment_bucket_usage_memory(bucket: &str, size_increment: u64) {
+    let mut cache = USAGE_MEMORY_CACHE.write().await;
+    let current = cache.entry(bucket.to_string()).or_insert(0);
+    *current += size_increment;
+}
+
+/// Fast in-memory decrement for immediate quota consistency
+pub async fn decrement_bucket_usage_memory(bucket: &str, size_decrement: u64) {
+    let mut cache = USAGE_MEMORY_CACHE.write().await;
+    if let Some(current) = cache.get_mut(bucket) {
+        *current = current.saturating_sub(size_decrement);
+    }
+}
+
+/// Get bucket usage from in-memory cache
+pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
+    let cache = USAGE_MEMORY_CACHE.read().await;
+    cache.get(bucket).copied()
+}
+
+/// Sync memory cache with backend data (called by scanner)
+pub async fn sync_memory_cache_with_backend() -> Result<(), Error> {
+    if let Some(store) = crate::global::GLOBAL_OBJECT_API.get() {
+        match load_data_usage_from_backend(store.clone()).await {
+            Ok(data_usage_info) => {
+                let mut cache = USAGE_MEMORY_CACHE.write().await;
+                for (bucket, bucket_usage) in data_usage_info.buckets_usage.iter() {
+                    cache.insert(bucket.clone(), bucket_usage.size);
+                }
+            }
+            Err(e) => {
+                debug!("Failed to sync memory cache with backend: {}", e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Increment bucket usage by specified amount (fast incremental update)
+pub async fn increment_bucket_usage(
+    store: Arc<ECStore>,
+    bucket: &str,
+    size_increment: u64,
+    objects_increment: u64,
+) -> Result<(), Error> {
+    // Load existing data and get current timestamp
+    let (mut data_usage_info, current_ts) = match load_data_usage_from_backend(store.clone()).await {
+        Ok(info) => {
+            let ts = info.last_update.unwrap_or(SystemTime::UNIX_EPOCH);
+            (info, ts)
+        }
+        Err(_) => {
+            // If no existing data, create new with current timestamp
+            let info = DataUsageInfo::default();
+            let ts = SystemTime::now();
+            (info, ts)
+        }
+    };
+
+    // Ensure new timestamp is always greater than existing
+    let new_ts = current_ts
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        + 1;
+    let new_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(new_ts as u64);
+
+    // Increment bucket usage
+    let bucket_usage = data_usage_info
+        .buckets_usage
+        .entry(bucket.to_string())
+        .or_insert_with(Default::default);
+
+    bucket_usage.size += size_increment;
+    bucket_usage.objects_count += objects_increment;
+    bucket_usage.versions_count += objects_increment;
+
+    // Update totals
+    data_usage_info.objects_total_count += objects_increment;
+    data_usage_info.versions_total_count += objects_increment;
+    data_usage_info.objects_total_size += size_increment;
+    data_usage_info.last_update = Some(new_time);
+
+    // Store updated data
+    store_data_usage_in_backend(data_usage_info, store).await
+}
+
+/// Decrement bucket usage by specified amount
+pub async fn decrement_bucket_usage(
+    store: Arc<ECStore>,
+    bucket: &str,
+    size_decrement: u64,
+    objects_decrement: u64,
+) -> Result<(), Error> {
+    let mut data_usage_info = match load_data_usage_from_backend(store.clone()).await {
+        Ok(info) => info,
+        Err(_) => {
+            // If no existing data, build basic info first
+            build_basic_data_usage_info(store.clone()).await?
+        }
+    };
+
+    // Update bucket usage
+    if let Some(bucket_usage) = data_usage_info.buckets_usage.get_mut(bucket) {
+        bucket_usage.size = bucket_usage.size.saturating_sub(size_decrement);
+        bucket_usage.objects_count = bucket_usage.objects_count.saturating_sub(objects_decrement);
+        bucket_usage.versions_count = bucket_usage.versions_count.saturating_sub(objects_decrement);
+    }
+
+    // Update totals
+    data_usage_info.objects_total_count = data_usage_info.objects_total_count.saturating_sub(objects_decrement);
+    data_usage_info.versions_total_count = data_usage_info.versions_total_count.saturating_sub(objects_decrement);
+    data_usage_info.objects_total_size = data_usage_info.objects_total_size.saturating_sub(size_decrement);
+    data_usage_info.last_update = Some(SystemTime::now());
+
+    // Store updated data
+    store_data_usage_in_backend(data_usage_info, store).await
+}
+
 /// Build basic data usage info with real object counts
-async fn build_basic_data_usage_info(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+pub async fn build_basic_data_usage_info(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
     let mut data_usage_info = DataUsageInfo::default();
 
     // Get bucket list

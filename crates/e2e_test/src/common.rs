@@ -189,8 +189,6 @@ impl RustFSTestEnvironment {
 
     /// Start RustFS server with basic configuration
     pub async fn start_rustfs_server(&mut self, extra_args: Vec<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.cleanup_existing_processes().await?;
-
         let mut args = vec![
             "--address",
             &self.address,
@@ -362,4 +360,13 @@ pub async fn awscurl_put(
     secret_key: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     execute_awscurl(url, "PUT", Some(body), access_key, secret_key).await
+}
+
+/// Helper function for DELETE requests
+pub async fn awscurl_delete(
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    execute_awscurl(url, "DELETE", None, access_key, secret_key).await
 }

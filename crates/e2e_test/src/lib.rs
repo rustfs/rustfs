@@ -29,6 +29,10 @@ mod data_usage_test;
 #[cfg(test)]
 mod kms;
 
+// Quota tests
+#[cfg(test)]
+mod quota_test;
+
 // Special characters in path test modules
 #[cfg(test)]
 mod special_chars_test;
