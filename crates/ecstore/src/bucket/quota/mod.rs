@@ -69,7 +69,7 @@ impl BucketQuota {
 
     pub fn check_operation_allowed(&self, current_usage: u64, operation_size: u64) -> bool {
         if let Some(quota_limit) = self.quota {
-            current_usage + operation_size <= quota_limit
+            current_usage.saturating_add(operation_size) <= quota_limit
         } else {
             true // No quota limit
         }

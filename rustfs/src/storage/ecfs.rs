@@ -1100,6 +1100,11 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
+        // Update quota tracking after successful copy
+        if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
+            rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
+        }
+
         // Invalidate cache for the destination object to prevent stale data
         let manager = get_concurrency_manager();
         let dest_bucket = bucket.clone();
@@ -1745,6 +1750,10 @@ impl S3 for FS {
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
                 }
                 delete_results[*didx].delete_object = Some(dobjs[i].clone());
+                // Update quota tracking for successfully deleted objects
+                if let Some(&size) = object_sizes.get(&obj.object_name) {
+                    rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, size as u64).await;
+                }
                 continue;
             }
 
@@ -4436,6 +4445,10 @@ impl S3 for FS {
                                 check_result.quota_limit.unwrap_or(0)
                             ),
                         ));
+                    }
+                    // Update quota tracking after successful multipart upload
+                    if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
+                        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
                     }
                 }
                 Err(e) => {

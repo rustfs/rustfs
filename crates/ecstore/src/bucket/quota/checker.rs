@@ -153,10 +153,7 @@ impl QuotaChecker {
     }
 
     pub async fn get_real_time_usage(&self, bucket: &str) -> Result<u64, QuotaError> {
-        get_bucket_usage_memory(bucket)
-            .await
-            .or(Some(0))
-            .ok_or_else(|| QuotaError::StorageError(crate::error::Error::other("Failed to get bucket usage")))
+        Ok(get_bucket_usage_memory(bucket).await.unwrap_or(0))
     }
 }
 

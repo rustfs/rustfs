@@ -15,7 +15,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -44,11 +44,14 @@ pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
+const DATA_USAGE_CACHE_TTL_SECS: u64 = 10;
 
-// Global in-memory cache for real-time usage statistics
+// Global in-memory cache for real-time usage statistics (with TTL)
 lazy_static::lazy_static! {
-    static ref USAGE_MEMORY_CACHE: Arc<RwLock<HashMap<String, u64>>> =
+    static ref USAGE_MEMORY_CACHE: Arc<RwLock<HashMap<String, (u64, SystemTime)>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    static ref USAGE_CACHE_UPDATING: Arc<RwLock<bool>> =
+        Arc::new(RwLock::new(false));
 }
 
 // Data usage storage paths
@@ -375,22 +378,95 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
 /// Fast in-memory increment for immediate quota consistency
 pub async fn increment_bucket_usage_memory(bucket: &str, size_increment: u64) {
     let mut cache = USAGE_MEMORY_CACHE.write().await;
-    let current = cache.entry(bucket.to_string()).or_insert(0);
-    *current += size_increment;
+    let current = cache.entry(bucket.to_string()).or_insert_with(|| (0, SystemTime::now()));
+    current.0 += size_increment;
+    current.1 = SystemTime::now();
 }
 
 /// Fast in-memory decrement for immediate quota consistency
 pub async fn decrement_bucket_usage_memory(bucket: &str, size_decrement: u64) {
     let mut cache = USAGE_MEMORY_CACHE.write().await;
     if let Some(current) = cache.get_mut(bucket) {
-        *current = current.saturating_sub(size_decrement);
+        current.0 = current.0.saturating_sub(size_decrement);
+        current.1 = SystemTime::now();
     }
 }
 
 /// Get bucket usage from in-memory cache
 pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
+    update_usage_cache_if_needed().await;
+
     let cache = USAGE_MEMORY_CACHE.read().await;
-    cache.get(bucket).copied()
+    cache.get(bucket).map(|(usage, _)| *usage)
+}
+
+async fn update_usage_cache_if_needed() {
+    let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
+    let double_ttl = ttl * 2;
+    let now = SystemTime::now();
+
+    let cache = USAGE_MEMORY_CACHE.read().await;
+    let earliest_timestamp = cache.values().map(|(_, ts)| *ts).min();
+    drop(cache);
+
+    let age = match earliest_timestamp {
+        Some(ts) => now.duration_since(ts).unwrap_or_default(),
+        None => double_ttl,
+    };
+
+    if age < ttl {
+        return;
+    }
+
+    let mut updating = USAGE_CACHE_UPDATING.write().await;
+    if age < double_ttl {
+        if *updating {
+            return;
+        }
+        *updating = true;
+        drop(updating);
+
+        let cache_clone = USAGE_MEMORY_CACHE.clone();
+        let updating_clone = USAGE_CACHE_UPDATING.clone();
+        tokio::spawn(async move {
+            if let Some(store) = crate::global::GLOBAL_OBJECT_API.get()
+                && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
+            {
+                let mut cache = cache_clone.write().await;
+                for (bucket_name, bucket_usage) in data_usage_info.buckets_usage.iter() {
+                    cache.insert(bucket_name.clone(), (bucket_usage.size, SystemTime::now()));
+                }
+            }
+            let mut updating = updating_clone.write().await;
+            *updating = false;
+        });
+        return;
+    }
+
+    for retry in 0..10 {
+        if !*updating {
+            break;
+        }
+        drop(updating);
+        let delay = Duration::from_millis(1 << retry);
+        tokio::time::sleep(delay).await;
+        updating = USAGE_CACHE_UPDATING.write().await;
+    }
+
+    *updating = true;
+    drop(updating);
+
+    if let Some(store) = crate::global::GLOBAL_OBJECT_API.get()
+        && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
+    {
+        let mut cache = USAGE_MEMORY_CACHE.write().await;
+        for (bucket_name, bucket_usage) in data_usage_info.buckets_usage.iter() {
+            cache.insert(bucket_name.clone(), (bucket_usage.size, SystemTime::now()));
+        }
+    }
+
+    let mut updating = USAGE_CACHE_UPDATING.write().await;
+    *updating = false;
 }
 
 /// Sync memory cache with backend data (called by scanner)
@@ -400,7 +476,7 @@ pub async fn sync_memory_cache_with_backend() -> Result<(), Error> {
             Ok(data_usage_info) => {
                 let mut cache = USAGE_MEMORY_CACHE.write().await;
                 for (bucket, bucket_usage) in data_usage_info.buckets_usage.iter() {
-                    cache.insert(bucket.clone(), bucket_usage.size);
+                    cache.insert(bucket.clone(), (bucket_usage.size, SystemTime::now()));
                 }
             }
             Err(e) => {

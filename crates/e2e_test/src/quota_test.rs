@@ -149,7 +149,8 @@ impl QuotaTestEnv {
                 } else {
                     // Also check the error code directly
                     if let Some(service_err) = e.as_service_error()
-                        && service_err.is_not_found() {
+                        && service_err.is_not_found()
+                    {
                         return Ok(false);
                     }
                     Err(e.into())
@@ -563,6 +564,105 @@ mod integration_tests {
         assert!(response.is_err());
         let error_msg = response.unwrap_err().to_string();
         assert!(error_msg.contains("InvalidArgument"));
+
+        env.cleanup_bucket().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_quota_copy_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        init_logging();
+        let env = QuotaTestEnv::new().await?;
+
+        env.create_bucket().await?;
+
+        // Set quota of 2MB
+        env.set_bucket_quota(2 * 1024 * 1024).await?;
+
+        // Upload initial file
+        env.upload_object("original.txt", 1024 * 1024).await?;
+
+        // Copy file - should succeed (1MB each, total 2MB)
+        env.client
+            .copy_object()
+            .bucket(&env.bucket_name)
+            .key("copy1.txt")
+            .copy_source(format!("{}/{}", env.bucket_name, "original.txt"))
+            .send()
+            .await?;
+
+        assert!(env.object_exists("copy1.txt").await?);
+
+        // Try to copy again - should fail (1.5MB each, total 3MB > 2MB quota)
+        let copy_result = env
+            .client
+            .copy_object()
+            .bucket(&env.bucket_name)
+            .key("copy2.txt")
+            .copy_source(format!("{}/{}", env.bucket_name, "original.txt"))
+            .send()
+            .await;
+
+        assert!(copy_result.is_err());
+        assert!(!env.object_exists("copy2.txt").await?);
+
+        env.cleanup_bucket().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_quota_batch_delete() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        init_logging();
+        let env = QuotaTestEnv::new().await?;
+
+        env.create_bucket().await?;
+
+        // Set quota of 2MB
+        env.set_bucket_quota(2 * 1024 * 1024).await?;
+
+        // Upload files to fill quota
+        env.upload_object("file1.txt", 1024 * 1024).await?;
+        env.upload_object("file2.txt", 1024 * 1024).await?;
+
+        // Verify quota is full
+        let upload_result = env.upload_object("file3.txt", 1024).await;
+        assert!(upload_result.is_err());
+
+        // Delete multiple objects using batch delete
+        let objects = vec![
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key("file1.txt")
+                .build()
+                .unwrap(),
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key("file2.txt")
+                .build()
+                .unwrap(),
+        ];
+
+        let delete_result = env
+            .client
+            .delete_objects()
+            .bucket(&env.bucket_name)
+            .delete(
+                aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(objects))
+                    .quiet(true)
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await?;
+
+        assert_eq!(delete_result.deleted().len(), 2);
+
+        // Now should be able to upload again (quota freed up)
+        env.upload_object("file3.txt", 256 * 1024).await?;
+        assert!(env.object_exists("file3.txt").await?);
 
         env.cleanup_bucket().await?;
 

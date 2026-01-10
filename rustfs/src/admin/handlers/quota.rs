@@ -336,7 +336,13 @@ impl Operation for GetBucketQuotaStatsHandler {
         })?;
 
         let current_usage = current_usage_opt.unwrap_or(0);
-        let usage_percentage = quota.quota.map(|limit| (current_usage as f64 / limit as f64) * 100.0);
+        let usage_percentage = quota.quota.and_then(|limit| {
+            if limit == 0 {
+                None
+            } else {
+                Some((current_usage as f64 / limit as f64) * 100.0)
+            }
+        });
 
         let remaining_quota = quota.get_remaining_quota(current_usage);
 

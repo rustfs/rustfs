@@ -176,12 +176,14 @@ impl RustFSTestEnvironment {
     /// Kill any existing RustFS processes
     pub async fn cleanup_existing_processes(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Cleaning up any existing RustFS processes");
-        let output = Command::new("pkill").args(["-f", "rustfs"]).output();
+        let binary_path = rustfs_binary_path();
+        let binary_name = binary_path.to_string_lossy();
+        let output = Command::new("pkill").args(["-f", &binary_name]).output();
 
         if let Ok(output) = output
             && output.status.success()
         {
-            info!("Killed existing RustFS processes");
+            info!("Killed existing RustFS processes: {}", binary_name);
             sleep(Duration::from_millis(1000)).await;
         }
         Ok(())
@@ -189,6 +191,8 @@ impl RustFSTestEnvironment {
 
     /// Start RustFS server with basic configuration
     pub async fn start_rustfs_server(&mut self, extra_args: Vec<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.cleanup_existing_processes().await?;
+
         let mut args = vec![
             "--address",
             &self.address,

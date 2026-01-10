@@ -74,18 +74,21 @@ pub struct ScannerConfig {
     pub scan_mode: ScanMode,
     /// Whether to enable data usage statistics collection
     pub enable_data_usage_stats: bool,
+    /// Data usage statistics update interval (independent of disk scan)
+    pub data_usage_interval: Duration,
 }
 
 impl Default for ScannerConfig {
     fn default() -> Self {
         Self {
-            scan_interval: Duration::from_secs(300),       // 5 minutes
-            deep_scan_interval: Duration::from_secs(3600), // 1 hour
+            scan_interval: Duration::from_secs(300),       // 5 minutes for disk scan
+            deep_scan_interval: Duration::from_secs(3600), // 1 hour for deep scan
             max_concurrent_scans: 20,
             enable_healing: true,
             enable_metrics: true,
             scan_mode: ScanMode::Normal,
             enable_data_usage_stats: true,
+            data_usage_interval: Duration::from_secs(10), // 10 seconds for data usage
         }
     }
 }
@@ -791,16 +794,6 @@ impl Scanner {
             warn!("Failed to save checkpoint: {}", e);
         }
 
-        // Always trigger data usage collection during scan cycle
-        let config = self.config.read().await;
-        if config.enable_data_usage_stats {
-            info!("Data usage stats enabled, collecting data");
-            if let Err(e) = self.collect_and_persist_data_usage().await {
-                error!("Failed to collect data usage during scan cycle: {}", e);
-            }
-        }
-        drop(config);
-
         // Get aggregated statistics from all nodes
         debug!("About to get aggregated stats");
         match self.stats_aggregator.get_aggregated_stats().await {
@@ -986,15 +979,6 @@ impl Scanner {
                 error!("Failed to persist data usage to backend: {}", e);
             } else {
                 info!("Successfully persisted data usage to backend");
-            }
-        });
-
-        // Sync memory cache with the latest data usage statistics
-        tokio::spawn(async move {
-            if let Err(e) = rustfs_ecstore::data_usage::sync_memory_cache_with_backend().await {
-                warn!("Failed to sync memory cache with backend: {}", e);
-            } else {
-                debug!("Successfully synced memory cache with backend");
             }
         });
 
@@ -2503,38 +2487,39 @@ impl Scanner {
     async fn legacy_scan_loop(&self) -> Result<()> {
         info!("Starting legacy scan loop for backward compatibility");
 
+        let (scan_interval, data_usage_interval, enable_data_usage_stats) = {
+            let config = self.config.read().await;
+            (config.scan_interval, config.data_usage_interval, config.enable_data_usage_stats)
+        };
+
+        let mut disk_timer = tokio::time::interval(scan_interval);
+        let mut usage_timer = tokio::time::interval(data_usage_interval);
+
         loop {
-            if let Some(token) = get_ahm_services_cancel_token()
-                && token.is_cancelled()
-            {
-                info!("Cancellation requested, exiting legacy scan loop");
-                break;
-            }
+            tokio::select! {
+                _ = disk_timer.tick() => {
+                    if let Some(token) = get_ahm_services_cancel_token() && token.is_cancelled() {
+                        info!("Cancellation requested, exiting legacy scan loop");
+                        break;
+                    }
 
-            let (enable_data_usage_stats, scan_interval) = {
-                let config = self.config.read().await;
-                (config.enable_data_usage_stats, config.scan_interval)
-            };
+                    if let Err(e) = self.scan_cycle().await {
+                        error!("Scan cycle failed: {}", e);
+                    }
 
-            if enable_data_usage_stats && let Err(e) = self.collect_and_persist_data_usage().await {
-                warn!("Background data usage collection failed: {}", e);
-            }
+                    let local_stats = self.node_scanner.get_stats_summary().await;
+                    self.stats_aggregator.set_local_stats(local_stats).await;
+                }
+                _ = usage_timer.tick() => {
+                    if let Some(token) = get_ahm_services_cancel_token() && token.is_cancelled() {
+                        info!("Cancellation requested, exiting legacy scan loop");
+                        break;
+                    }
 
-            // Update local stats in aggregator after latest scan
-            let local_stats = self.node_scanner.get_stats_summary().await;
-            self.stats_aggregator.set_local_stats(local_stats).await;
-
-            match get_ahm_services_cancel_token() {
-                Some(token) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(scan_interval) => {}
-                        _ = token.cancelled() => {
-                            info!("Cancellation requested, exiting legacy scan loop");
-                            break;
-                        }
+                    if enable_data_usage_stats && let Err(e) = self.collect_and_persist_data_usage().await {
+                        warn!("Background data usage collection failed: {}", e);
                     }
                 }
-                None => tokio::time::sleep(scan_interval).await,
             }
         }
 
