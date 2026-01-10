@@ -12,38 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::error::{Error, Result};
-use super::os::{is_root_disk, rename_all};
-use super::{
-    BUCKET_META_PREFIX, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, os,
-};
-use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
-
 use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
-use crate::disk::error::FileAccessDeniedWithContext;
-use crate::disk::error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error};
-use crate::disk::fs::{
-    O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename,
-};
-use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{
-    CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN, CHECK_PART_VOLUME_NOT_FOUND,
-    FileReader, RUSTFS_META_TMP_DELETED_BUCKET, conv_part_err_to_int,
+    BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
+    CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
+    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts,
+    VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    endpoint::Endpoint,
+    error::{DiskError, Error, FileAccessDeniedWithContext, Result},
+    error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
+    format::FormatV3,
+    fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
+    os,
+    os::{check_path_length, is_empty_dir, is_root_disk, rename_all},
 };
-use crate::disk::{FileWriter, STORAGE_FORMAT_FILE};
-use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
-use rustfs_utils::path::{
-    GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR_STR, clean, decode_dir_object, encode_dir_object,
-    has_suffix, path_join, path_join_buf,
-};
-use tokio::time::interval;
-
 use crate::erasure_coding::bitrot_verify;
-// use path_absolutize::Absolutize;  // Replaced with direct path operations for better performance
 use crate::file_cache::{get_global_file_cache, prefetch_metadata_patterns, read_metadata_cached};
+use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use bytes::Bytes;
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
@@ -52,6 +39,10 @@ use rustfs_filemeta::{
 };
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
+use rustfs_utils::path::{
+    GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR_STR, clean, decode_dir_object, encode_dir_object,
+    has_suffix, path_join, path_join_buf,
+};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -67,6 +58,7 @@ use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::sync::RwLock;
+use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -129,6 +121,7 @@ impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
         debug!("Creating local disk");
         // Use optimized path resolution instead of absolutize() for better performance
+        // Use dunce::canonicalize instead of std::fs::canonicalize to avoid UNC paths on Windows
         let root = match dunce::canonicalize(ep.get_file_path()) {
             Ok(path) => path,
             Err(e) => {

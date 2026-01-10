@@ -110,7 +110,6 @@ google-cloud-auth = { workspace = true }
 aws-config = { workspace = true }
 faster-hex = { workspace = true }
 
-
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true, features = ["html_reports"] }
