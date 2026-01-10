@@ -4614,7 +4614,9 @@ impl StorageAPI for SetDisks {
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        Ok(ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended))
+        let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
+        obj_info.size = goi.size;
+        Ok(obj_info)
     }
 
     #[tracing::instrument(skip(self))]

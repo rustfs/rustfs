@@ -83,6 +83,7 @@ pub mod kms_keys;
 pub mod policies;
 pub mod pools;
 pub mod profile;
+pub mod quota;
 pub mod rebalance;
 pub mod service_account;
 pub mod sts;

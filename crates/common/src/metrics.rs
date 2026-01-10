@@ -96,6 +96,11 @@ pub enum Metric {
     ApplyNonCurrent,
     HealAbandonedVersion,
 
+    // Quota metrics:
+    QuotaCheck,
+    QuotaViolation,
+    QuotaSync,
+
     // START Trace metrics:
     StartTrace,
     ScanObject, // Scan object. All operations included.
@@ -131,6 +136,9 @@ impl Metric {
             Self::CleanAbandoned => "clean_abandoned",
             Self::ApplyNonCurrent => "apply_non_current",
             Self::HealAbandonedVersion => "heal_abandoned_version",
+            Self::QuotaCheck => "quota_check",
+            Self::QuotaViolation => "quota_violation",
+            Self::QuotaSync => "quota_sync",
             Self::StartTrace => "start_trace",
             Self::ScanObject => "scan_object",
             Self::HealAbandonedObject => "heal_abandoned_object",
@@ -163,15 +171,18 @@ impl Metric {
             10 => Some(Self::CleanAbandoned),
             11 => Some(Self::ApplyNonCurrent),
             12 => Some(Self::HealAbandonedVersion),
-            13 => Some(Self::StartTrace),
-            14 => Some(Self::ScanObject),
-            15 => Some(Self::HealAbandonedObject),
-            16 => Some(Self::LastRealtime),
-            17 => Some(Self::ScanFolder),
-            18 => Some(Self::ScanCycle),
-            19 => Some(Self::ScanBucketDrive),
-            20 => Some(Self::CompactFolder),
-            21 => Some(Self::Last),
+            13 => Some(Self::QuotaCheck),
+            14 => Some(Self::QuotaViolation),
+            15 => Some(Self::QuotaSync),
+            16 => Some(Self::StartTrace),
+            17 => Some(Self::ScanObject),
+            18 => Some(Self::HealAbandonedObject),
+            19 => Some(Self::LastRealtime),
+            20 => Some(Self::ScanFolder),
+            21 => Some(Self::ScanCycle),
+            22 => Some(Self::ScanBucketDrive),
+            23 => Some(Self::CompactFolder),
+            24 => Some(Self::Last),
             _ => None,
         }
     }
