@@ -102,9 +102,15 @@ async fn test_bucket_policy_authenticated_user() -> Result<(), Box<dyn std::erro
                 ]
             }
         ]
-    }).to_string();
+    })
+    .to_string();
 
-    admin_client.put_bucket_policy().bucket(bucket_name).policy(&policy_json).send().await?;
+    admin_client
+        .put_bucket_policy()
+        .bucket(bucket_name)
+        .policy(&policy_json)
+        .send()
+        .await?;
 
     // 6. Verify Access Allowed (With Bucket Policy)
     info!("Verifying PutObject...");
@@ -143,7 +149,7 @@ async fn test_bucket_policy_authenticated_user() -> Result<(), Box<dyn std::erro
         .send()
         .await
         .map_err(|e| format!("DeleteObject failed: {}", e))?;
-    
+
     info!("Test Passed!");
     Ok(())
 }
