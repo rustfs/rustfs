@@ -148,10 +148,9 @@ impl QuotaTestEnv {
                     Ok(false)
                 } else {
                     // Also check the error code directly
-                    if let Some(service_err) = e.as_service_error() {
-                        if service_err.is_not_found() {
-                            return Ok(false);
-                        }
+                    if let Some(service_err) = e.as_service_error()
+                        && service_err.is_not_found() {
+                        return Ok(false);
                     }
                     Err(e.into())
                 }
