@@ -7619,6 +7619,7 @@ dependencies = [
  "path-clean",
  "rand 0.10.0-rc.5",
  "rmp-serde",
+ "rustfs-ahm",
  "rustfs-common",
  "rustfs-config",
  "rustfs-ecstore",

@@ -22,6 +22,7 @@ use rustfs_ecstore::{
     store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
     tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
+use rustfs_ahm::{heal::storage::ECStoreHealStorage, init_heal_manager};
 use rustfs_scanner::scanner::init_data_scanner;
 use serial_test::serial;
 use std::{
@@ -52,7 +53,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     }
 
     // create temp dir as 4 disks with unique base dir
-    let test_base_dir = format!("/tmp/rustfs_ahm_lifecycle_test_{}", uuid::Uuid::new_v4());
+    let test_base_dir = format!("/tmp/rustfs_scanner_lifecycle_test_{}", uuid::Uuid::new_v4());
     let temp_dir = std::path::PathBuf::from(&test_base_dir);
     if temp_dir.exists() {
         fs::remove_dir_all(&temp_dir).await.ok();
@@ -397,6 +398,8 @@ mod serial_tests {
         let ctx = CancellationToken::new();
 
         // Start scanner
+        let heal_storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));
+        init_heal_manager(heal_storage, None).await;
         init_data_scanner(ctx.clone(), ecstore.clone()).await;
         println!("✅ Scanner started");
 

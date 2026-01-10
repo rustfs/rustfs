@@ -122,6 +122,25 @@
             ],
         },
         {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug test_lifecycle_transition_basic",
+            "cargo": {
+                "args": [
+                    "test",
+                    "-p",
+                    "rustfs-scanner",
+                    "--test",
+                    "lifecycle_integration_test",
+                    "serial_tests::test_lifecycle_transition_basic",
+                    "-j",
+                    "1"
+                ]
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
             "name": "Debug executable target/debug/test",
             "type":  "lldb",
             "request": "launch",
