@@ -88,7 +88,7 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 
 Star RustFS on GitHub and be instantly notified of new releases.
 
-https://github.com/user-attachments/assets/7ee40bb4-3e46-4eac-b0d0-5fbeb85ff8f3
+<img src="https://github.com/user-attachments/assets/7ee40bb4-3e46-4eac-b0d0-5fbeb85ff8f3" />
 
 ## Quickstart
 

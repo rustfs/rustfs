@@ -91,7 +91,7 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 
 在 GitHub 上为 RustFS 点赞，即可第一时间收到新版本发布通知。
 
-https://github.com/user-attachments/assets/7ee40bb4-3e46-4eac-b0d0-5fbeb85ff8f3
+<img src="https://github.com/user-attachments/assets/7ee40bb4-3e46-4eac-b0d0-5fbeb85ff8f3" />
 
 
 
