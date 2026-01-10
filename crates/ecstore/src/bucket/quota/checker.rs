@@ -55,7 +55,6 @@ impl QuotaChecker {
             Some(q) => q,
         };
 
-        // Get real-time usage from data usage system like MinIO
         let current_usage = self.get_real_time_usage(bucket).await?;
 
         let expected_usage = match operation {
