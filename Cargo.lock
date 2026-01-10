@@ -7974,6 +7974,7 @@ dependencies = [
  "bytesize",
  "chrono",
  "criterion",
+ "dunce",
  "enumset",
  "faster-hex",
  "flatbuffers",

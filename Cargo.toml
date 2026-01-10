@@ -184,6 +184,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "51.0.0"
 derive_builder = "0.20.2"
+dunce = "1.0.5"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
 flate2 = "1.1.5"
