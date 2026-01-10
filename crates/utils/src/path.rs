@@ -473,6 +473,7 @@ pub fn clean(path: &str) -> String {
 
     #[cfg(target_os = "windows")]
     {
+        use std::borrow::Cow;
         let bytes = path.as_bytes();
         let n = bytes.len();
         // Windows-aware handling
