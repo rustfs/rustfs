@@ -7418,6 +7418,52 @@ mod tests {
     }
 
     #[test]
+    fn test_etag_matches_quoted_formats() {
+        // Test various quoted ETag formats that S3 clients may send
+        // These tests ensure proper handling of If-Match headers
+
+        // Quoted ETag matching quoted ETag
+        assert!(e_tag_matches("\"143f7531a3558678c43d9e411c5c5d12\"", "\"143f7531a3558678c43d9e411c5c5d12\""));
+
+        // Quoted ETag matching unquoted ETag
+        assert!(e_tag_matches("143f7531a3558678c43d9e411c5c5d12", "\"143f7531a3558678c43d9e411c5c5d12\""));
+
+        // Unquoted ETag matching quoted ETag
+        assert!(e_tag_matches("\"143f7531a3558678c43d9e411c5c5d12\"", "143f7531a3558678c43d9e411c5c5d12"));
+
+        // Unquoted ETag matching unquoted ETag
+        assert!(e_tag_matches("143f7531a3558678c43d9e411c5c5d12", "143f7531a3558678c43d9e411c5c5d12"));
+
+        // Wildcard matching any ETag
+        assert!(e_tag_matches("143f7531a3558678c43d9e411c5c5d12", "*"));
+        assert!(e_tag_matches("\"143f7531a3558678c43d9e411c5c5d12\"", "*"));
+
+        // Non-matching ETags
+        assert!(!e_tag_matches("abc", "def"));
+        assert!(!e_tag_matches("\"abc\"", "\"def\""));
+        assert!(!e_tag_matches("abc", "\"def\""));
+    }
+
+    #[test]
+    fn test_canonicalize_etag() {
+        // Test the canonicalize_etag function directly
+        assert_eq!(canonicalize_etag("abc"), "abc");
+        assert_eq!(canonicalize_etag("\"abc\""), "abc");
+        assert_eq!(canonicalize_etag("\"\""), "");
+        assert_eq!(canonicalize_etag(""), "");
+
+        // Real-world MD5 ETag
+        assert_eq!(
+            canonicalize_etag("\"143f7531a3558678c43d9e411c5c5d12\""),
+            "143f7531a3558678c43d9e411c5c5d12"
+        );
+        assert_eq!(
+            canonicalize_etag("143f7531a3558678c43d9e411c5c5d12"),
+            "143f7531a3558678c43d9e411c5c5d12"
+        );
+    }
+
+    #[test]
     fn test_should_prevent_write() {
         let oi = ObjectInfo {
             etag: Some("abc".to_string()),
