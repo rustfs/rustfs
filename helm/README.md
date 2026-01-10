@@ -110,6 +110,10 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | storageclass.logStorageSize | string | `"256Mi"` | The storage size for logs PVC. |
 | storageclass.name | string | `"local-path"` | The name for StorageClass. |
 | tolerations | list | `[]` |  |
+| gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
+| gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
+| gatewayApi.hostname | string | Hostname to access RustFS via gateway api. |
+| gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
 
 ---
 
@@ -206,6 +210,22 @@ You should use `--set-file` parameter when running `helm install` command, for e
 ```
 helm install rustfs rustfs/rustfs -n rustfs --set tls.enabled=true,--set-file tls.crt=./tls.crt,--set-file tls.key=./tls.key
 ```
+
+# Gateway API support (alpha)
+
+Due to [ingress nginx retirement](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) in March 2026, so RustFS adds support for [gateway api](https://gateway-api.sigs.k8s.io/). Currently, RustFS only supports traefik as gateway class, more and more gateway class support will be added in the future after those classes are tested. If you want to enable gateway api, specify `gatewayApi.enabled` to `true` while specify `ingress.enabled` to `false`. After installation, you can find the `Gateway` and `HttpRoute` resources,
+
+```
+$ kubectl -n rustfs get gateway
+NAME             CLASS     ADDRESS   PROGRAMMED   AGE
+rustfs-gateway   traefik             True         169m
+
+$ kubectl -n rustfs get httproute
+NAME           HOSTNAMES            AGE
+rustfs-route   ["example.rustfs.com"]   172m
+```
+
+Then, via RustFS instance via `https://example.rustfs.com` or `http://example.rustfs.com`.
 
 # Uninstall
 
