@@ -165,7 +165,7 @@ pub fn has_prefix(s: &str, prefix: &str) -> bool {
 ///
 pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
     if elem.is_empty() {
-        return PathBuf::new();
+        return PathBuf::from(".");
     }
     // Collect components as owned Strings (lossy for non-UTF8)
     let strs: Vec<String> = elem.iter().map(|p| p.as_ref().to_string_lossy().into_owned()).collect();
