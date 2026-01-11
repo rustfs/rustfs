@@ -12,11 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::HashMap,
-    io::{Cursor, Read as _, Write as _},
-};
-
 use crate::{
     admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
@@ -49,7 +44,7 @@ use rustfs_policy::policy::{
     BucketPolicy,
     action::{Action, AdminAction},
 };
-use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
+use rustfs_utils::path::{SLASH_SEPARATOR_STR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
     dto::{
@@ -61,6 +56,10 @@ use s3s::{
 };
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
+use std::{
+    collections::HashMap,
+    io::{Cursor, Read as _, Write as _},
+};
 use time::OffsetDateTime;
 use tracing::warn;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -424,7 +423,7 @@ impl Operation for ImportBucketMetadata {
         // Extract bucket names
         let mut bucket_names = Vec::new();
         for (file_path, _) in &file_contents {
-            let file_path_split = file_path.split(SLASH_SEPARATOR).collect::<Vec<&str>>();
+            let file_path_split = file_path.split(SLASH_SEPARATOR_STR).collect::<Vec<&str>>();
 
             if file_path_split.len() < 2 {
                 warn!("file path is invalid: {}", file_path);
@@ -463,7 +462,7 @@ impl Operation for ImportBucketMetadata {
 
         // Second pass: process file contents
         for (file_path, content) in file_contents {
-            let file_path_split = file_path.split(SLASH_SEPARATOR).collect::<Vec<&str>>();
+            let file_path_split = file_path.split(SLASH_SEPARATOR_STR).collect::<Vec<&str>>();
 
             if file_path_split.len() < 2 {
                 warn!("file path is invalid: {}", file_path);
