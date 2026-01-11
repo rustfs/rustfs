@@ -37,8 +37,8 @@ pub enum QuotaType {
 pub struct BucketQuota {
     pub quota: Option<u64>,
     pub quota_type: QuotaType,
+    /// Timestamp when this quota configuration was set (for audit purposes)
     pub created_at: Option<OffsetDateTime>,
-    pub updated_at: Option<OffsetDateTime>,
 }
 
 impl BucketQuota {
@@ -59,7 +59,6 @@ impl BucketQuota {
             quota,
             quota_type: QuotaType::Hard,
             created_at: Some(now),
-            updated_at: Some(now),
         }
     }
 

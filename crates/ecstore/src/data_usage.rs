@@ -44,7 +44,7 @@ pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
-const DATA_USAGE_CACHE_TTL_SECS: u64 = 10;
+const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
 
 // Global in-memory cache for real-time usage statistics (with TTL)
 lazy_static::lazy_static! {
@@ -485,87 +485,6 @@ pub async fn sync_memory_cache_with_backend() -> Result<(), Error> {
         }
     }
     Ok(())
-}
-
-/// Increment bucket usage by specified amount (fast incremental update)
-pub async fn increment_bucket_usage(
-    store: Arc<ECStore>,
-    bucket: &str,
-    size_increment: u64,
-    objects_increment: u64,
-) -> Result<(), Error> {
-    // Load existing data and get current timestamp
-    let (mut data_usage_info, current_ts) = match load_data_usage_from_backend(store.clone()).await {
-        Ok(info) => {
-            let ts = info.last_update.unwrap_or(SystemTime::UNIX_EPOCH);
-            (info, ts)
-        }
-        Err(_) => {
-            // If no existing data, create new with current timestamp
-            let info = DataUsageInfo::default();
-            let ts = SystemTime::now();
-            (info, ts)
-        }
-    };
-
-    // Ensure new timestamp is always greater than existing
-    let new_ts = current_ts
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        + 1;
-    let new_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(new_ts as u64);
-
-    // Increment bucket usage
-    let bucket_usage = data_usage_info
-        .buckets_usage
-        .entry(bucket.to_string())
-        .or_insert_with(Default::default);
-
-    bucket_usage.size += size_increment;
-    bucket_usage.objects_count += objects_increment;
-    bucket_usage.versions_count += objects_increment;
-
-    // Update totals
-    data_usage_info.objects_total_count += objects_increment;
-    data_usage_info.versions_total_count += objects_increment;
-    data_usage_info.objects_total_size += size_increment;
-    data_usage_info.last_update = Some(new_time);
-
-    // Store updated data
-    store_data_usage_in_backend(data_usage_info, store).await
-}
-
-/// Decrement bucket usage by specified amount
-pub async fn decrement_bucket_usage(
-    store: Arc<ECStore>,
-    bucket: &str,
-    size_decrement: u64,
-    objects_decrement: u64,
-) -> Result<(), Error> {
-    let mut data_usage_info = match load_data_usage_from_backend(store.clone()).await {
-        Ok(info) => info,
-        Err(_) => {
-            // If no existing data, build basic info first
-            build_basic_data_usage_info(store.clone()).await?
-        }
-    };
-
-    // Update bucket usage
-    if let Some(bucket_usage) = data_usage_info.buckets_usage.get_mut(bucket) {
-        bucket_usage.size = bucket_usage.size.saturating_sub(size_decrement);
-        bucket_usage.objects_count = bucket_usage.objects_count.saturating_sub(objects_decrement);
-        bucket_usage.versions_count = bucket_usage.versions_count.saturating_sub(objects_decrement);
-    }
-
-    // Update totals
-    data_usage_info.objects_total_count = data_usage_info.objects_total_count.saturating_sub(objects_decrement);
-    data_usage_info.versions_total_count = data_usage_info.versions_total_count.saturating_sub(objects_decrement);
-    data_usage_info.objects_total_size = data_usage_info.objects_total_size.saturating_sub(size_decrement);
-    data_usage_info.last_update = Some(SystemTime::now());
-
-    // Store updated data
-    store_data_usage_in_backend(data_usage_info, store).await
 }
 
 /// Build basic data usage info with real object counts

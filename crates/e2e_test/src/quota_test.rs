@@ -668,4 +668,130 @@ mod integration_tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_quota_multipart_upload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        init_logging();
+        let env = QuotaTestEnv::new().await?;
+
+        env.create_bucket().await?;
+
+        // Set quota of 10MB
+        env.set_bucket_quota(10 * 1024 * 1024).await?;
+
+        let key = "multipart_test.txt";
+        let part_size = 5 * 1024 * 1024; // 5MB minimum per part (S3 requirement)
+
+        // Test 1: Multipart upload within quota (single 5MB part)
+        let create_result = env
+            .client
+            .create_multipart_upload()
+            .bucket(&env.bucket_name)
+            .key(key)
+            .send()
+            .await?;
+
+        let upload_id = create_result.upload_id().unwrap();
+
+        // Upload single 5MB part (S3 allows single part with any size ≥ 5MB for the only part)
+        let part_data = vec![1u8; part_size];
+        let part_result = env
+            .client
+            .upload_part()
+            .bucket(&env.bucket_name)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(aws_sdk_s3::primitives::ByteStream::from(part_data))
+            .send()
+            .await?;
+
+        let uploaded_parts = vec![aws_sdk_s3::types::CompletedPart::builder()
+            .part_number(1)
+            .e_tag(part_result.e_tag().unwrap())
+            .build(),
+        ];
+
+        env.client
+            .complete_multipart_upload()
+            .bucket(&env.bucket_name)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                    .set_parts(Some(uploaded_parts))
+                    .build(),
+            )
+            .send()
+            .await?;
+
+        assert!(env.object_exists(key).await?);
+
+        // Test 2: Multipart upload exceeds quota (should fail)
+        // Upload 6MB filler (total now: 5MB + 6MB = 11MB > 10MB quota)
+        let upload_filler = env.upload_object("filler.txt", 6 * 1024 * 1024).await;
+        // This should fail due to quota
+        assert!(upload_filler.is_err());
+
+        // Verify filler doesn't exist
+        assert!(!env.object_exists("filler.txt").await?);
+
+        // Now try a multipart upload that exceeds quota
+        // Current usage: 5MB (from Test 1), quota: 10MB
+        // Trying to upload 6MB via multipart → should fail
+
+        let create_result2 = env
+            .client
+            .create_multipart_upload()
+            .bucket(&env.bucket_name)
+            .key("over_quota.txt")
+            .send()
+            .await?;
+
+        let upload_id2 = create_result2.upload_id().unwrap();
+
+        let mut uploaded_parts2 = vec![];
+        for part_num in 1..=2 {
+            let part_data = vec![part_num as u8; part_size];
+            let part_result = env
+                .client
+                .upload_part()
+                .bucket(&env.bucket_name)
+                .key("over_quota.txt")
+                .upload_id(upload_id2)
+                .part_number(part_num)
+                .body(aws_sdk_s3::primitives::ByteStream::from(part_data))
+                .send()
+                .await?;
+
+            uploaded_parts2.push(
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .part_number(part_num)
+                    .e_tag(part_result.e_tag().unwrap())
+                    .build(),
+            );
+        }
+
+        let complete_result = env
+            .client
+            .complete_multipart_upload()
+            .bucket(&env.bucket_name)
+            .key("over_quota.txt")
+            .upload_id(upload_id2)
+            .multipart_upload(
+                aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                    .set_parts(Some(uploaded_parts2))
+                    .build(),
+            )
+            .send()
+            .await;
+
+        assert!(complete_result.is_err());
+        assert!(!env.object_exists("over_quota.txt").await?);
+
+        env.cleanup_bucket().await?;
+
+        Ok(())
+    }
 }
