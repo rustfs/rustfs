@@ -14,8 +14,6 @@
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut};
-#[cfg(test)]
-use std::sync::MutexGuard;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
@@ -83,7 +81,7 @@ fn reset_dns_resolver_inner() {
 
 #[cfg(test)]
 pub struct MockResolverGuard {
-    _lock: MutexGuard<'static, ()>,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]

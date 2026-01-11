@@ -47,7 +47,7 @@ const LONG_VERSION: &str = concat!(
     concat!("git status   :\n", build::GIT_STATUS_FILE),
 );
 
-#[derive(Debug, Parser, Clone)]
+#[derive(Parser, Clone)]
 #[command(version = SHORT_VERSION, long_version = LONG_VERSION)]
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
@@ -60,7 +60,11 @@ pub struct Opt {
     pub volumes: Vec<String>,
 
     /// bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_ADDRESS.to_string(), env = "RUSTFS_ADDRESS")]
+    #[arg(
+        long,
+        default_value_t = rustfs_config::DEFAULT_ADDRESS.to_string(),
+        env = "RUSTFS_ADDRESS"
+    )]
     pub address: String,
 
     /// Domain name used for virtual-hosted-style requests.
@@ -73,23 +77,43 @@ pub struct Opt {
     pub server_domains: Vec<String>,
 
     /// Access key used for authentication.
-    #[arg(long, default_value_t = rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
+    #[arg(
+        long,
+        default_value_t = rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(),
+        env = "RUSTFS_ACCESS_KEY"
+    )]
     pub access_key: String,
 
     /// Secret key used for authentication.
-    #[arg(long, default_value_t = rustfs_credentials::DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
+    #[arg(
+        long,
+        default_value_t = rustfs_credentials::DEFAULT_SECRET_KEY.to_string(),
+        env = "RUSTFS_SECRET_KEY"
+    )]
     pub secret_key: String,
 
     /// Enable console server
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_ENABLE, env = "RUSTFS_CONSOLE_ENABLE")]
+    #[arg(
+        long,
+        default_value_t = rustfs_config::DEFAULT_CONSOLE_ENABLE,
+        env = "RUSTFS_CONSOLE_ENABLE"
+    )]
     pub console_enable: bool,
 
     /// Console server bind address
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_ADDRESS.to_string(), env = "RUSTFS_CONSOLE_ADDRESS")]
+    #[arg(
+        long,
+        default_value_t = rustfs_config::DEFAULT_CONSOLE_ADDRESS.to_string(),
+        env = "RUSTFS_CONSOLE_ADDRESS"
+    )]
     pub console_address: String,
 
     /// Observability endpoint for trace, metrics and logs,only support grpc mode.
-    #[arg(long, default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(), env = "RUSTFS_OBS_ENDPOINT")]
+    #[arg(
+        long,
+        default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(),
+        env = "RUSTFS_OBS_ENDPOINT"
+    )]
     pub obs_endpoint: String,
 
     /// tls path for rustfs API and console.
@@ -135,6 +159,42 @@ pub struct Opt {
     /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
     #[arg(long, default_value_t = String::from("GeneralPurpose"), env = "RUSTFS_BUFFER_PROFILE")]
     pub buffer_profile: String,
+}
+
+impl std::fmt::Debug for Opt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opt")
+            .field("volumes", &self.volumes)
+            .field("address", &self.address)
+            .field("server_domains", &self.server_domains)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &Opt::mask_sensitive(Some(&self.secret_key))) // Hide sensitive values
+            .field("console_enable", &self.console_enable)
+            .field("console_address", &self.console_address)
+            .field("obs_endpoint", &self.obs_endpoint)
+            .field("tls_path", &self.tls_path)
+            .field("license", &Opt::mask_sensitive(self.license.as_ref()))
+            .field("region", &self.region)
+            .field("kms_enable", &self.kms_enable)
+            .field("kms_backend", &self.kms_backend)
+            .field("kms_key_dir", &self.kms_key_dir)
+            .field("kms_vault_address", &self.kms_vault_address)
+            .field("kms_vault_token", &Opt::mask_sensitive(self.kms_vault_token.as_ref()))
+            .field("kms_default_key_id", &self.kms_default_key_id)
+            .field("buffer_profile_disable", &self.buffer_profile_disable)
+            .field("buffer_profile", &self.buffer_profile)
+            .finish()
+    }
+}
+
+impl Opt {
+    /// Mask sensitive information in Option<String>
+    fn mask_sensitive(s: Option<&String>) -> String {
+        match s {
+            None => "".to_string(),
+            Some(s) => format!("{}***{}|{}", s.chars().next().unwrap_or('*'), s.chars().last().unwrap_or('*'), s.len()),
+        }
+    }
 }
 
 // lazy_static::lazy_static! {

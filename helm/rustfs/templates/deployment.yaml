@@ -10,6 +10,10 @@ metadata:
     {{- end }}
 spec:
   replicas: 1
+  {{- with .Values.mode.standalone.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "rustfs.selectorLabels" . | nindent 6 }}
