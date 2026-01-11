@@ -114,6 +114,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
 | gatewayApi.hostname | string | Hostname to access RustFS via gateway api. |
 | gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
+| gatewayApi.existingGateway | string | The existing gateway to use, instead of creating a new one. |
 
 ---
 
