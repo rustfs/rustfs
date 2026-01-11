@@ -62,7 +62,6 @@ mod cache;
 pub mod config;
 mod encryption;
 mod error;
-pub mod service;
 pub mod manager;
 pub mod service;
 pub mod service_manager;
@@ -75,7 +74,6 @@ pub use api_types::{
     UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
-pub use service::{DataKey, ObjectEncryptionService};
 pub use error::{KmsError, Result};
 pub use manager::KmsManager;
 pub use service::{DataKey, ObjectEncryptionService};
@@ -154,7 +152,10 @@ mod tests {
         // Start first service
         let temp_dir1 = TempDir::new().expect("Failed to create temp dir");
         let config1 = KmsConfig::local(temp_dir1.path().to_path_buf());
-        manager.configure(config1.clone()).await.expect("Configuration should succeed");
+        manager
+            .configure(config1.clone())
+            .await
+            .expect("Configuration should succeed");
         manager.start().await.expect("Start should succeed");
 
         // Verify version 1
@@ -176,7 +177,7 @@ mod tests {
         // Old service reference should still be valid (Arc keeps it alive)
         // New requests should get version 2
         let service2 = manager.get_encryption_service().await.expect("Service should be available");
-        
+
         // Verify they are different instances
         assert!(!Arc::ptr_eq(&service1, &service2));
 
@@ -193,7 +194,7 @@ mod tests {
 
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let base_path = temp_dir.path().to_path_buf();
-        
+
         // Initial configuration
         let config1 = KmsConfig::local(base_path.clone());
         manager.configure(config1).await.expect("Configuration should succeed");
@@ -216,7 +217,7 @@ mod tests {
         for handle in handles {
             results.push(handle.await);
         }
-        
+
         // All should succeed (serialized by mutex)
         for result in results {
             assert!(result.expect("Task should complete").is_ok());

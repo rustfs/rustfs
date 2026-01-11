@@ -66,7 +66,6 @@ struct StoredMasterKey {
     nonce: Vec<u8>,
 }
 
-
 impl LocalKmsClient {
     /// Create a new local KMS client
     pub async fn new(config: LocalConfig) -> Result<Self> {
@@ -214,7 +213,6 @@ impl LocalKmsClient {
         info!("Saved master key {} to {:?}", master_key.key_id, key_path);
         Ok(())
     }
-
 
     /// Get the actual key material for a master key
     async fn get_key_material(&self, key_id: &str) -> Result<Vec<u8>> {
