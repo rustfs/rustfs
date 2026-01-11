@@ -95,6 +95,7 @@ serde_urlencoded = { workspace = true }
 rustls = { workspace = true }
 subtle = { workspace = true }
 rustls-pemfile = { workspace = true }
+aes-gcm = { workspace = true }
 
 # Time and Date
 chrono = { workspace = true }
@@ -128,6 +129,7 @@ urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
 libc = { workspace = true }
+rand = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
