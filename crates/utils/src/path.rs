@@ -788,7 +788,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn test_path_join_buf() {
         #[cfg(not(target_os = "windows"))]
         {
