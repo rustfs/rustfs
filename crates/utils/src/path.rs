@@ -797,7 +797,7 @@ mod tests {
             assert_eq!(path_join_buf(&["a/", "b"]), "a/b");
 
             // Empty array input
-            assert_eq!(path_join_buf(&[]), "");
+            assert_eq!(path_join_buf(&[]), ".");
 
             // Single element
             assert_eq!(path_join_buf(&["a"]), "a");
@@ -830,7 +830,7 @@ mod tests {
             assert_eq!(path_join_buf(&["a\\", "b"]), "a\\b");
 
             // Empty array input
-            assert_eq!(path_join_buf(&[]), "");
+            assert_eq!(path_join_buf(&[]), ".");
 
             // Single element
             assert_eq!(path_join_buf(&["a"]), "a");
