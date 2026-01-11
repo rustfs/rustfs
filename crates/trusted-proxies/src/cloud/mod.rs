@@ -12,8 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Cloud service integration module
+//!
+//! This module provides integration with various cloud providers
+//! for automatic IP range detection and metadata fetching.
+
 mod detector;
-mod metadata;
+pub mod metadata;
 mod ranges;
 
+pub use detector::*;
 pub use ranges::*;
+
+// Re-export metadata module types
+pub use metadata::*;

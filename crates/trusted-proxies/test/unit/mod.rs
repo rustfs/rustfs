@@ -11,3 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+//! Unit tests for the trusted proxy system
+
+mod config_tests;
+mod ip_tests;
+mod validation_tests;
+mod validator_tests;
+
+// 重新导出测试模块
+pub use config_tests::*;
+pub use ip_tests::*;
+pub use validation_tests::*;
+pub use validator_tests::*;

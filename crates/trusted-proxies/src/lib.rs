@@ -15,10 +15,11 @@
 mod api;
 mod cloud;
 mod config;
-mod errors;
+mod error;
 mod logging;
 mod middleware;
 mod proxy;
+mod state;
 mod utils;
 
 pub use cloud::*;

@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cloud provider metadata fetching
-//!
-//! This module contains implementations for fetching metadata
-//! from various cloud providers.
+use crate::{AppConfig, ProxyMetrics};
+use std::sync::Arc;
 
-mod aws;
-mod azure;
-mod gcp;
-
-pub use aws::*;
-pub use azure::*;
-pub use gcp::*;
+/// 应用状态
+#[derive(Clone)]
+pub struct AppState {
+    /// 应用配置
+    pub config: Arc<AppConfig>,
+    /// 代理指标收集器
+    pub metrics: Option<ProxyMetrics>,
+}

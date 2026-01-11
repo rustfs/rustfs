@@ -3255,6 +3255,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "780955b8b195a21ab8e4ac6b60dd1dbdcec1dc6c51c0617964b08c81785e12c9"
 
 [[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+
+[[package]]
 name = "doxygen-rs"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8387,10 +8393,15 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "chrono",
+ "dotenvy",
  "http 1.4.0",
  "ipnetwork",
+ "lazy_static",
  "metrics",
  "moka",
+ "parking_lot",
+ "regex",
  "reqwest",
  "rustfs-utils",
  "serde",
@@ -8398,7 +8409,10 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tower",
+ "tower-http",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

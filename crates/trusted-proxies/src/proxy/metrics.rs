@@ -11,3 +11,201 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+//! Metrics and monitoring for proxy validation
+
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
+use std::time::Duration;
+use tracing::{info, warn};
+
+use crate::config::ValidationMode;
+use crate::error::ProxyError;
+
+/// 代理验证指标
+#[derive(Debug, Clone)]
+pub struct ProxyMetrics {
+    /// 是否启用指标
+    enabled: bool,
+    /// 应用名称（用于指标标签）
+    app_name: String,
+}
+
+impl ProxyMetrics {
+    /// 创建新的指标收集器
+    pub fn new(app_name: &str, enabled: bool) -> Self {
+        let metrics = Self {
+            enabled,
+            app_name: app_name.to_string(),
+        };
+
+        // 注册指标描述
+        metrics.register_descriptions();
+
+        metrics
+    }
+
+    /// 注册指标描述
+    fn register_descriptions(&self) {
+        if !self.enabled {
+            return;
+        }
+
+        describe_counter!("proxy_validation_attempts_total", "Total number of proxy validation attempts");
+
+        describe_counter!("proxy_validation_success_total", "Total number of successful proxy validations");
+
+        describe_counter!("proxy_validation_failure_total", "Total number of failed proxy validations");
+
+        describe_counter!(
+            "proxy_validation_failure_by_type_total",
+            "Total number of failed proxy validations by error type"
+        );
+
+        describe_gauge!("proxy_chain_length", "Length of proxy chains being validated");
+
+        describe_histogram!("proxy_validation_duration_seconds", "Duration of proxy validation in seconds");
+
+        describe_gauge!("proxy_cache_size", "Size of the proxy validation cache");
+
+        describe_counter!("proxy_cache_hits_total", "Total number of cache hits");
+
+        describe_counter!("proxy_cache_misses_total", "Total number of cache misses");
+    }
+
+    /// 记录验证尝试
+    pub fn increment_validation_attempts(&self) {
+        if !self.enabled {
+            return;
+        }
+
+        counter!(
+            "proxy_validation_attempts_total",
+            1,
+            "app" => self.app_name.clone()
+        );
+    }
+
+    /// 记录验证成功
+    pub fn record_validation_success(&self, from_trusted_proxy: bool, proxy_hops: usize, duration: Duration) {
+        if !self.enabled {
+            return;
+        }
+
+        counter!(
+            "proxy_validation_success_total",
+            1,
+            "app" => self.app_name.clone(),
+            "trusted" => from_trusted_proxy.to_string()
+        );
+
+        gauge!(
+            "proxy_chain_length",
+            proxy_hops as f64,
+            "app" => self.app_name.clone()
+        );
+
+        histogram!(
+            "proxy_validation_duration_seconds",
+            duration.as_secs_f64(),
+            "app" => self.app_name.clone()
+        );
+    }
+
+    /// 记录验证失败
+    pub fn record_validation_failure(&self, error: &ProxyError, duration: Duration) {
+        if !self.enabled {
+            return;
+        }
+
+        let error_type = match error {
+            ProxyError::InvalidXForwardedFor(_) => "invalid_x_forwarded_for",
+            ProxyError::InvalidForwardedHeader(_) => "invalid_forwarded_header",
+            ProxyError::ChainValidationFailed(_) => "chain_validation_failed",
+            ProxyError::ChainTooLong(_, _) => "chain_too_long",
+            ProxyError::UntrustedProxy(_) => "untrusted_proxy",
+            ProxyError::ChainNotContinuous => "chain_not_continuous",
+            ProxyError::IpParseError(_) => "ip_parse_error",
+            ProxyError::HeaderParseError(_) => "header_parse_error",
+            ProxyError::Timeout => "timeout",
+            ProxyError::Internal(_) => "internal",
+        };
+
+        counter!(
+            "proxy_validation_failure_total",
+            1,
+            "app" => self.app_name.clone(),
+            "error_type" => error_type
+        );
+
+        counter!(
+            "proxy_validation_failure_by_type_total",
+            1,
+            "app" => self.app_name.clone(),
+            "error_type" => error_type
+        );
+
+        histogram!(
+            "proxy_validation_duration_seconds",
+            duration.as_secs_f64(),
+            "app" => self.app_name.clone(),
+            "error_type" => error_type
+        );
+    }
+
+    /// 记录验证模式使用情况
+    pub fn record_validation_mode(&self, mode: ValidationMode) {
+        if !self.enabled {
+            return;
+        }
+
+        gauge!(
+            "proxy_validation_mode",
+            match mode {
+                ValidationMode::Lenient => 0.0,
+                ValidationMode::Strict => 1.0,
+                ValidationMode::HopByHop => 2.0,
+            },
+            "app" => self.app_name.clone(),
+            "mode" => mode.as_str()
+        );
+    }
+
+    /// 记录缓存指标
+    pub fn record_cache_metrics(&self, hits: u64, misses: u64, size: usize) {
+        if !self.enabled {
+            return;
+        }
+
+        counter!("proxy_cache_hits_total", hits, "app" => self.app_name.clone());
+        counter!("proxy_cache_misses_total", misses, "app" => self.app_name.clone());
+        gauge!("proxy_cache_size", size as f64, "app" => self.app_name.clone());
+    }
+
+    /// 打印指标摘要
+    pub fn print_summary(&self) {
+        if !self.enabled {
+            info!("Metrics collection is disabled");
+            return;
+        }
+
+        info!("Proxy metrics enabled for application: {}", self.app_name);
+        info!("Available metrics:");
+        info!("  - proxy_validation_attempts_total");
+        info!("  - proxy_validation_success_total");
+        info!("  - proxy_validation_failure_total");
+        info!("  - proxy_validation_failure_by_type_total");
+        info!("  - proxy_chain_length");
+        info!("  - proxy_validation_duration_seconds");
+        info!("  - proxy_cache_size");
+        info!("  - proxy_cache_hits_total");
+        info!("  - proxy_cache_misses_total");
+    }
+}
+
+/// 默认应用名称
+const DEFAULT_APP_NAME: &str = "trusted-proxy";
+
+/// 创建默认的代理指标收集器
+pub fn default_proxy_metrics(enabled: bool) -> ProxyMetrics {
+    ProxyMetrics::new(DEFAULT_APP_NAME, enabled)
+}

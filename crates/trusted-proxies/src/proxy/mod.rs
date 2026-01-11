@@ -12,6 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Core proxy handling module
+//!
+//! This module contains the main logic for validating and processing
+//! requests through trusted proxies.
+
 mod cache;
 mod chain;
 mod metrics;
+mod validator;
+
+pub use cache::*;
+pub use chain::*;
+pub use metrics::*;
+pub use validator::*;
+
+// Re-export commonly used types
+pub use crate::config::{TrustedProxyConfig, ValidationMode};
+pub use crate::error::ProxyError;

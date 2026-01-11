@@ -12,5 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Middleware module for Axum web framework
+
 mod layer;
 mod service;
+
+pub use layer::*;
+pub use service::*;
+
+// Re-export commonly used types
+pub use crate::proxy::ClientInfo;

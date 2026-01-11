@@ -11,3 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+//! Integration tests for the trusted proxy system
+
+mod api_tests;
+mod cloud_tests;
+mod proxy_tests;
+
+// 重新导出测试模块
+pub use api_tests::*;
+pub use cloud_tests::*;
+pub use proxy_tests::*;
