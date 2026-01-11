@@ -31,14 +31,14 @@ use crate::{
 use rustfs_common::data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
-use rustfs_utils::path::SLASH_SEPARATOR;
+use rustfs_utils::path::SLASH_SEPARATOR_STR;
 use tokio::fs;
 use tracing::{error, info, warn};
 
 use crate::error::Error;
 
 // Data usage storage constants
-pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
+pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR_STR;
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
@@ -47,17 +47,17 @@ pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 lazy_static::lazy_static! {
     pub static ref DATA_USAGE_BUCKET: String = format!("{}{}{}",
         crate::disk::RUSTFS_META_BUCKET,
-        SLASH_SEPARATOR,
+        SLASH_SEPARATOR_STR,
         crate::disk::BUCKET_META_PREFIX
     );
     pub static ref DATA_USAGE_OBJ_NAME_PATH: String = format!("{}{}{}",
         crate::disk::BUCKET_META_PREFIX,
-        SLASH_SEPARATOR,
+        SLASH_SEPARATOR_STR,
         DATA_USAGE_OBJ_NAME
     );
     pub static ref DATA_USAGE_BLOOM_NAME_PATH: String = format!("{}{}{}",
         crate::disk::BUCKET_META_PREFIX,
-        SLASH_SEPARATOR,
+        SLASH_SEPARATOR_STR,
         DATA_USAGE_BLOOM_NAME
     );
 }
