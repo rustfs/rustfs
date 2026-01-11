@@ -250,7 +250,8 @@ pub async fn start_http_server(
         b.set_access(store.clone());
         b.set_route(admin::make_admin_route(opt.console_enable)?);
 
-        if !opt.server_domains.is_empty() {
+        // console server does not need to setup virtual-hosted-style requests
+        if !opt.server_domains.is_empty() && !opt.console_enable {
             MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
 
             // add the default port number to the given server domains
