@@ -34,6 +34,7 @@ use rustfs_common::data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_utils::path::SLASH_SEPARATOR_STR;
+use std::sync::OnceLock;
 use tokio::fs;
 use tracing::{error, info, warn};
 
@@ -46,12 +47,18 @@ const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
 
-// Global in-memory cache for real-time usage statistics (with TTL)
-lazy_static::lazy_static! {
-    static ref USAGE_MEMORY_CACHE: Arc<RwLock<HashMap<String, (u64, SystemTime)>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    static ref USAGE_CACHE_UPDATING: Arc<RwLock<bool>> =
-        Arc::new(RwLock::new(false));
+type UsageMemoryCache = Arc<RwLock<HashMap<String, (u64, SystemTime)>>>;
+type CacheUpdating = Arc<RwLock<bool>>;
+
+static USAGE_MEMORY_CACHE: OnceLock<UsageMemoryCache> = OnceLock::new();
+static USAGE_CACHE_UPDATING: OnceLock<CacheUpdating> = OnceLock::new();
+
+fn memory_cache() -> &'static UsageMemoryCache {
+    USAGE_MEMORY_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+fn cache_updating() -> &'static CacheUpdating {
+    USAGE_CACHE_UPDATING.get_or_init(|| Arc::new(RwLock::new(false)))
 }
 
 // Data usage storage paths
@@ -377,7 +384,7 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
 
 /// Fast in-memory increment for immediate quota consistency
 pub async fn increment_bucket_usage_memory(bucket: &str, size_increment: u64) {
-    let mut cache = USAGE_MEMORY_CACHE.write().await;
+    let mut cache = memory_cache().write().await;
     let current = cache.entry(bucket.to_string()).or_insert_with(|| (0, SystemTime::now()));
     current.0 += size_increment;
     current.1 = SystemTime::now();
@@ -385,7 +392,7 @@ pub async fn increment_bucket_usage_memory(bucket: &str, size_increment: u64) {
 
 /// Fast in-memory decrement for immediate quota consistency
 pub async fn decrement_bucket_usage_memory(bucket: &str, size_decrement: u64) {
-    let mut cache = USAGE_MEMORY_CACHE.write().await;
+    let mut cache = memory_cache().write().await;
     if let Some(current) = cache.get_mut(bucket) {
         current.0 = current.0.saturating_sub(size_decrement);
         current.1 = SystemTime::now();
@@ -396,7 +403,7 @@ pub async fn decrement_bucket_usage_memory(bucket: &str, size_decrement: u64) {
 pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
     update_usage_cache_if_needed().await;
 
-    let cache = USAGE_MEMORY_CACHE.read().await;
+    let cache = memory_cache().read().await;
     cache.get(bucket).map(|(usage, _)| *usage)
 }
 
@@ -405,7 +412,7 @@ async fn update_usage_cache_if_needed() {
     let double_ttl = ttl * 2;
     let now = SystemTime::now();
 
-    let cache = USAGE_MEMORY_CACHE.read().await;
+    let cache = memory_cache().read().await;
     let earliest_timestamp = cache.values().map(|(_, ts)| *ts).min();
     drop(cache);
 
@@ -418,7 +425,7 @@ async fn update_usage_cache_if_needed() {
         return;
     }
 
-    let mut updating = USAGE_CACHE_UPDATING.write().await;
+    let mut updating = cache_updating().write().await;
     if age < double_ttl {
         if *updating {
             return;
@@ -426,8 +433,8 @@ async fn update_usage_cache_if_needed() {
         *updating = true;
         drop(updating);
 
-        let cache_clone = USAGE_MEMORY_CACHE.clone();
-        let updating_clone = USAGE_CACHE_UPDATING.clone();
+        let cache_clone = (*memory_cache()).clone();
+        let updating_clone = (*cache_updating()).clone();
         tokio::spawn(async move {
             if let Some(store) = crate::global::GLOBAL_OBJECT_API.get()
                 && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
@@ -450,7 +457,7 @@ async fn update_usage_cache_if_needed() {
         drop(updating);
         let delay = Duration::from_millis(1 << retry);
         tokio::time::sleep(delay).await;
-        updating = USAGE_CACHE_UPDATING.write().await;
+        updating = cache_updating().write().await;
     }
 
     *updating = true;
@@ -459,13 +466,13 @@ async fn update_usage_cache_if_needed() {
     if let Some(store) = crate::global::GLOBAL_OBJECT_API.get()
         && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
     {
-        let mut cache = USAGE_MEMORY_CACHE.write().await;
+        let mut cache = memory_cache().write().await;
         for (bucket_name, bucket_usage) in data_usage_info.buckets_usage.iter() {
             cache.insert(bucket_name.clone(), (bucket_usage.size, SystemTime::now()));
         }
     }
 
-    let mut updating = USAGE_CACHE_UPDATING.write().await;
+    let mut updating = cache_updating().write().await;
     *updating = false;
 }
 
@@ -474,7 +481,7 @@ pub async fn sync_memory_cache_with_backend() -> Result<(), Error> {
     if let Some(store) = crate::global::GLOBAL_OBJECT_API.get() {
         match load_data_usage_from_backend(store.clone()).await {
             Ok(data_usage_info) => {
-                let mut cache = USAGE_MEMORY_CACHE.write().await;
+                let mut cache = memory_cache().write().await;
                 for (bucket, bucket_usage) in data_usage_info.buckets_usage.iter() {
                     cache.insert(bucket.clone(), (bucket_usage.size, SystemTime::now()));
                 }

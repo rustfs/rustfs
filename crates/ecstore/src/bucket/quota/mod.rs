@@ -14,8 +14,6 @@
 
 pub mod checker;
 
-pub use checker::*;
-
 use crate::error::Result;
 use rmp_serde::Serializer as rmpSerializer;
 use rustfs_config::{
