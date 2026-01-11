@@ -64,7 +64,7 @@ pub fn has_suffix(s: &str, suffix: &str) -> bool {
 ///
 pub fn encode_dir_object(object: &str) -> String {
     if has_suffix(object, SLASH_SEPARATOR_STR) {
-        format!("{}{}", object.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX)
+        format!("{}{}", object.trim_end_matches(SLASH_SEPARATOR_STR), GLOBAL_DIR_SUFFIX)
     } else {
         object.to_string()
     }
@@ -184,7 +184,7 @@ pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
 /// A String representing the joined path.
 ///
 pub fn path_join_buf(elements: &[&str]) -> String {
-    let trailing_slash = !elements.is_empty() && elements.last().is_some_and(|last| last.ends_with(SLASH_SEPARATOR));
+    let trailing_slash = !elements.is_empty() && elements.last().is_some_and(|last| last.ends_with(SLASH_SEPARATOR_STR));
 
     let mut dst = String::new();
     let mut added = 0;
@@ -377,10 +377,10 @@ fn path_needs_clean(path: &[u8]) -> bool {
 /// # Returns
 /// A tuple containing the bucket and object as `String`s.
 ///
-pub fn path_to_bucket_object_with_base_path(bash_path: &str, path: &str) -> (String, String) {
-    let path = path.trim_start_matches(bash_path).trim_start_matches(SLASH_SEPARATOR);
+pub fn path_to_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
+    let path = path.trim_start_matches(base_path).trim_start_matches(SLASH_SEPARATOR);
     if let Some(m) = path.find(SLASH_SEPARATOR) {
-        return (path[..m].to_string(), path[m + SLASH_SEPARATOR.len_utf8()..].to_string());
+        return (path[..m].to_string(), path[m + SLASH_SEPARATOR_STR.len()..].to_string());
     }
 
     (path.to_string(), "".to_string())
@@ -425,22 +425,16 @@ fn contains_any_sep_str(s: &str) -> bool {
 /// A `String` representing the base directory extracted from the prefix.
 ///
 pub fn base_dir_from_prefix(prefix: &str) -> String {
-    let mut base_dir = dir(prefix);
-    // If the directory is the current or root directory, it is returned empty
-    if base_dir == "." || base_dir == SLASH_SEPARATOR_STR {
-        base_dir = String::new();
-    }
-
-    // If the prefix itself does not contain any delimiter ('\' is also detected on Windows), there is no base dir
     if !contains_any_sep_str(prefix) {
-        base_dir = String::new();
+        return String::new();
     }
-
-    // Make sure the return value ends with a platform separator (if not empty)
+    let mut base_dir = dir(prefix);
+    if base_dir == "." || base_dir == SLASH_SEPARATOR_STR {
+        base_dir.clear();
+    }
     if !base_dir.is_empty() && !base_dir.ends_with(SLASH_SEPARATOR_STR) {
         base_dir.push_str(SLASH_SEPARATOR_STR);
     }
-
     base_dir
 }
 
@@ -458,7 +452,8 @@ pub fn base_dir_from_prefix(prefix: &str) -> String {
 /// If the result of this process is an empty string, clean returns the string ".".
 ///
 /// This function is adapted to work cross-platform by using the appropriate path separator.
-/// It does not handle Windows drive letters or UNC paths.
+/// On Windows, this function is aware of drive letters (e.g., `C:`) and UNC paths
+/// (e.g., `\\server\share`) and cleans them using the appropriate separator.
 ///
 /// # Arguments
 /// * `path` - A string slice that holds the path to be cleaned.
@@ -562,11 +557,8 @@ pub fn clean(path: &str) -> String {
 
         // Join components
         for (idx, c) in comps.iter().enumerate() {
-            if idx > 0 || (!out.is_empty() && !out.ends_with(SLASH_SEPARATOR_STR)) {
-                // ensure separator between components
-                if !out.is_empty() && !out.ends_with(SLASH_SEPARATOR_STR) {
-                    out.push(SLASH_SEPARATOR);
-                }
+            if !out.is_empty() && !out.ends_with(SLASH_SEPARATOR_STR) {
+                out.push(SLASH_SEPARATOR);
             }
             out.push_str(c);
         }
@@ -578,7 +570,7 @@ pub fn clean(path: &str) -> String {
         }
 
         // If output is just "C:" (drive without components and not rooted), keep as "C:"
-        if let Some(_) = drive {
+        if drive.is_some() {
             if out.len() == 2 && out.as_bytes()[1] == b':' {
                 return out;
             }
@@ -796,16 +788,77 @@ mod tests {
     use super::*;
 
     #[test]
+    #[test]
     fn test_path_join_buf() {
         #[cfg(not(target_os = "windows"))]
         {
+            // Basic joining
             assert_eq!(path_join_buf(&["a", "b"]), "a/b");
             assert_eq!(path_join_buf(&["a/", "b"]), "a/b");
+
+            // Empty array input
+            assert_eq!(path_join_buf(&[]), "");
+
+            // Single element
+            assert_eq!(path_join_buf(&["a"]), "a");
+
+            // Multiple elements
+            assert_eq!(path_join_buf(&["a", "b", "c"]), "a/b/c");
+
+            // Elements with trailing separators
+            assert_eq!(path_join_buf(&["a/", "b/"]), "a/b/");
+
+            // Elements requiring cleaning (with "." and "..")
+            assert_eq!(path_join_buf(&["a", ".", "b"]), "a/b");
+            assert_eq!(path_join_buf(&["a", "..", "b"]), "b");
+            assert_eq!(path_join_buf(&["a", "b", ".."]), "a");
+
+            // Preservation of trailing slashes
+            assert_eq!(path_join_buf(&["a", "b/"]), "a/b/");
+            assert_eq!(path_join_buf(&["a/", "b/"]), "a/b/");
+
+            // Empty elements
+            assert_eq!(path_join_buf(&["a", "", "b"]), "a/b");
+
+            // Double slashes (cleaning)
+            assert_eq!(path_join_buf(&["a//", "b"]), "a/b");
         }
         #[cfg(target_os = "windows")]
         {
+            // Basic joining
             assert_eq!(path_join_buf(&["a", "b"]), "a\\b");
             assert_eq!(path_join_buf(&["a\\", "b"]), "a\\b");
+
+            // Empty array input
+            assert_eq!(path_join_buf(&[]), "");
+
+            // Single element
+            assert_eq!(path_join_buf(&["a"]), "a");
+
+            // Multiple elements
+            assert_eq!(path_join_buf(&["a", "b", "c"]), "a\\b\\c");
+
+            // Elements with trailing separators
+            assert_eq!(path_join_buf(&["a\\", "b\\"]), "a\\b\\");
+
+            // Elements requiring cleaning (with "." and "..")
+            assert_eq!(path_join_buf(&["a", ".", "b"]), "a\\b");
+            assert_eq!(path_join_buf(&["a", "..", "b"]), "b");
+            assert_eq!(path_join_buf(&["a", "b", ".."]), "a");
+
+            // Mixed separator handling
+            assert_eq!(path_join_buf(&["a/b", "c"]), "a\\b\\c");
+            assert_eq!(path_join_buf(&["a\\", "b/c"]), "a\\b\\c");
+
+            // Preservation of trailing slashes
+            assert_eq!(path_join_buf(&["a", "b\\"]), "a\\b\\");
+            assert_eq!(path_join_buf(&["a\\", "b\\"]), "a\\b\\");
+
+            // Empty elements
+            assert_eq!(path_join_buf(&["a", "", "b"]), "a\\b");
+
+            // Double slashes (cleaning)
+            assert_eq!(path_join_buf(&["a\\\\", "b"]), "a\\b");
         }
     }
 
@@ -885,6 +938,10 @@ mod tests {
         {
             assert_eq!(clean("a\\b\\..\\c"), "a\\c");
             assert_eq!(clean("a\\\\b"), "a\\b");
+            assert_eq!(clean("C:\\"), "C:\\");
+            assert_eq!(clean("C:\\a\\..\\b"), "C:\\b");
+            assert_eq!(clean("C:a\\b\\..\\c"), "C:a\\c");
+            assert_eq!(clean("\\\\server\\share\\a\\\\b"), "\\\\server\\share\\a\\b");
         }
     }
 
