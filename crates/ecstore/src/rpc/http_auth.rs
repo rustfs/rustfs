@@ -113,7 +113,7 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
     // Compare signatures
     if signature != expected_signature {
         error!(
-            "verify_rpc_signature: Invalid signature: url {}, method {}, timestamp {}, signature {}, expected_signature: {}***{}|{}, ",
+            "verify_rpc_signature: Invalid signature: url {}, method {}, timestamp {}, signature {}, expected_signature: {}***{}|{}",
             url,
             method,
             timestamp,
