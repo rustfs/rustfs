@@ -41,7 +41,6 @@ pub struct VaultKmsClient {
     dek_crypto: AesDekCrypto,
 }
 
-
 /// Key data stored in Vault
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VaultKeyData {
@@ -113,7 +112,6 @@ impl VaultKmsClient {
         format!("{}/{}", self.key_path_prefix, key_id)
     }
 
-
     /// Encrypt key material using Vault's transit engine
     async fn encrypt_key_material(&self, key_material: &[u8]) -> Result<String> {
         // For simplicity, we'll base64 encode the key material
@@ -133,7 +131,7 @@ impl VaultKmsClient {
     /// Get the actual key material for a master key
     async fn get_key_material(&self, key_id: &str) -> Result<Vec<u8>> {
         let mut key_data = self.get_key_data(key_id).await?;
-        
+
         // If encrypted_key_material is empty, generate and store it (fix for old keys)
         if key_data.encrypted_key_material.is_empty() {
             warn!("Key {} has empty encrypted_key_material, generating and storing new key material", key_id);
@@ -143,7 +141,7 @@ impl VaultKmsClient {
             self.store_key_data(key_id, &key_data).await?;
             return Ok(key_material);
         }
-        
+
         let key_material = match self.decrypt_key_material(&key_data.encrypted_key_material).await {
             Ok(km) => km,
             Err(e) => {
@@ -155,19 +153,22 @@ impl VaultKmsClient {
                 return Ok(new_key_material);
             }
         };
-        
+
         // Validate key material length (should be 32 bytes for AES-256)
         if key_material.len() != 32 {
             // Try to fix: generate new key material if length is wrong
-            warn!("Key {} has invalid key material length ({} bytes), generating new key material", 
-                  key_id, key_material.len());
+            warn!(
+                "Key {} has invalid key material length ({} bytes), generating new key material",
+                key_id,
+                key_material.len()
+            );
             let new_key_material = generate_key_material(&key_data.algorithm)?;
             key_data.encrypted_key_material = self.encrypt_key_material(&new_key_material).await?;
             // Store the updated key data back to Vault
             self.store_key_data(key_id, &key_data).await?;
             return Ok(new_key_material);
         }
-        
+
         Ok(key_material)
     }
 
@@ -225,9 +226,11 @@ impl VaultKmsClient {
             encrypted_key_material: existing_key_data.encrypted_key_material.clone(), // Preserve the key material
         };
 
-        debug!("VaultKeyData tags before storage: {:?}, encrypted_key_material length: {}", 
-               key_data.tags, 
-               key_data.encrypted_key_material.len());
+        debug!(
+            "VaultKeyData tags before storage: {:?}, encrypted_key_material length: {}",
+            key_data.tags,
+            key_data.encrypted_key_material.len()
+        );
         self.store_key_data(key_id, &key_data).await
     }
 

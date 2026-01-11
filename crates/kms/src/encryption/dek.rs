@@ -108,8 +108,8 @@ impl DekCrypto for AesDekCrypto {
         }
 
         // Create cipher from key material
-        let key = Key::<Aes256Gcm>::try_from(key_material)
-            .map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
+        let key =
+            Key::<Aes256Gcm>::try_from(key_material).map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
         let cipher = Aes256Gcm::new(&key);
 
         // Generate random nonce (12 bytes for GCM)
@@ -145,8 +145,8 @@ impl DekCrypto for AesDekCrypto {
         }
 
         // Create cipher from key material
-        let key = Key::<Aes256Gcm>::try_from(key_material)
-            .map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
+        let key =
+            Key::<Aes256Gcm>::try_from(key_material).map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
         let cipher = Aes256Gcm::new(&key);
 
         // Convert nonce
@@ -287,8 +287,7 @@ mod tests {
         assert!(!serialized.is_empty());
 
         // Test deserialization
-        let deserialized: DataKeyEnvelope =
-            serde_json::from_slice(&serialized).expect("Deserialization should succeed");
+        let deserialized: DataKeyEnvelope = serde_json::from_slice(&serialized).expect("Deserialization should succeed");
         assert_eq!(deserialized.key_id, envelope.key_id);
         assert_eq!(deserialized.master_key_id, envelope.master_key_id);
         assert_eq!(deserialized.encrypted_key, envelope.encrypted_key);
@@ -307,10 +306,8 @@ mod tests {
             "created_at": "2024-01-01T00:00:00Z"
         }"#;
 
-        let deserialized: DataKeyEnvelope =
-            serde_json::from_str(old_envelope_json).expect("Should deserialize old format");
+        let deserialized: DataKeyEnvelope = serde_json::from_str(old_envelope_json).expect("Should deserialize old format");
         assert_eq!(deserialized.key_id, "test-key-id");
         assert_eq!(deserialized.master_key_id, "master-key-id");
     }
 }
-

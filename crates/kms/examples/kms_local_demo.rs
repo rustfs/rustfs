@@ -24,12 +24,12 @@
 //!
 //! Run with: `cargo run --example demo1`
 
-use std::fs;
 use rustfs_kms::{
-    init_global_kms_service_manager, CreateKeyRequest, DescribeKeyRequest, EncryptionAlgorithm,
-    GenerateDataKeyRequest, KmsConfig, KeySpec, KeyUsage, ListKeysRequest,
+    CreateKeyRequest, DescribeKeyRequest, EncryptionAlgorithm, GenerateDataKeyRequest, KeySpec, KeyUsage, KmsConfig,
+    ListKeysRequest, init_global_kms_service_manager,
 };
 use std::collections::HashMap;
+use std::fs;
 use std::io::Cursor;
 use tokio::io::AsyncReadExt;
 
@@ -121,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   - Master Key (CMK): Used to encrypt/decrypt data keys");
     println!("   - Data Key (DEK): Used to encrypt/decrypt actual data");
     println!("   In production, you can skip this and use encrypt_object() directly!\n");
-    
+
     let data_key_request = GenerateDataKeyRequest {
         key_id: master_key_id.clone(),
         key_spec: KeySpec::Aes256,
@@ -137,7 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   ✓ Data key generated (for demonstration):");
     println!("     - Master Key ID: {}", data_key_response.key_id);
     println!("     - Data Key (plaintext) length: {} bytes", data_key_response.plaintext_key.len());
-    println!("     - Encrypted Data Key (ciphertext blob) length: {} bytes", data_key_response.ciphertext_blob.len());
+    println!(
+        "     - Encrypted Data Key (ciphertext blob) length: {} bytes",
+        data_key_response.ciphertext_blob.len()
+    );
     println!("     - Note: This data key is NOT used in Step 9 - encrypt_object() generates its own!\n");
 
     // Step 9: Encrypt some data using high-level API
@@ -149,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   3. Uses the data key to encrypt the actual data");
     println!("   4. Stores the encrypted data key (ciphertext blob) in metadata");
     println!("   You only need to provide the master_key_id - everything else is handled!\n");
-    
+
     let plaintext = b"Hello, RustFS KMS! This is a test message for encryption.";
     println!("   Plaintext: {}", String::from_utf8_lossy(plaintext));
 
@@ -169,8 +172,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   ✓ Data encrypted:");
     println!("     - Encrypted data length: {} bytes", encryption_result.ciphertext.len());
     println!("     - Algorithm: {}", encryption_result.metadata.algorithm);
-    println!("     - Master Key ID: {} (used to encrypt the data key)", encryption_result.metadata.key_id);
-    println!("     - Encrypted Data Key length: {} bytes (stored in metadata)", encryption_result.metadata.encrypted_data_key.len());
+    println!(
+        "     - Master Key ID: {} (used to encrypt the data key)",
+        encryption_result.metadata.key_id
+    );
+    println!(
+        "     - Encrypted Data Key length: {} bytes (stored in metadata)",
+        encryption_result.metadata.encrypted_data_key.len()
+    );
     println!("     - Original size: {} bytes\n", encryption_result.metadata.original_size);
 
     // Step 10: Decrypt the data using high-level API
@@ -180,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   2. Uses master key to decrypt the data key");
     println!("   3. Uses the decrypted data key to decrypt the actual data");
     println!("   You only need to provide the encrypted data and metadata!\n");
-    
+
     let mut decrypted_reader = encryption_service
         .decrypt_object(
             "demo-bucket",
@@ -240,4 +249,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-

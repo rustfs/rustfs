@@ -16,12 +16,15 @@
 
 use crate::backends::{KmsBackend, local::LocalKmsBackend};
 use crate::config::{BackendConfig, KmsConfig};
-use crate::service::ObjectEncryptionService;
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
+use crate::service::ObjectEncryptionService;
 use arc_swap::ArcSwap;
-use std::sync::{Arc, OnceLock, atomic::{AtomicU64, Ordering}};
-use tokio::sync::{RwLock, Mutex};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
 /// KMS service status
@@ -155,7 +158,7 @@ impl KmsServiceManager {
     }
 
     /// Stop KMS service
-    /// 
+    ///
     /// Note: This stops accepting new operations, but existing operations using
     /// the service will continue until they complete (due to Arc reference counting).
     pub async fn stop(&self) -> Result<()> {
@@ -184,18 +187,18 @@ impl KmsServiceManager {
     }
 
     /// Reconfigure and restart KMS service with zero-downtime
-    /// 
+    ///
     /// This method implements versioned service switching:
     /// 1. Creates a new service version without stopping the old one
     /// 2. Atomically switches to the new version
     /// 3. Old operations continue using the old service (via Arc reference counting)
     /// 4. New operations automatically use the new service
-    /// 
+    ///
     /// This ensures zero downtime during reconfiguration, even for long-running
     /// operations like encrypting large files.
     pub async fn reconfigure(&self, new_config: KmsConfig) -> Result<()> {
         let _guard = self.lifecycle_mutex.lock().await;
-        
+
         info!("Reconfiguring KMS service (zero-downtime)");
 
         // Configure with new config
@@ -209,8 +212,7 @@ impl KmsServiceManager {
         match self.create_service_version(&new_config).await {
             Ok(new_service_version) => {
                 // Get old version for logging (lock-free read)
-                let old_version = self.current_service.load().as_ref().as_ref()
-                    .and_then(|sv| Some(sv.version));
+                let old_version = self.current_service.load().as_ref().as_ref().and_then(|sv| Some(sv.version));
 
                 // Atomically switch to new service version (lock-free, instant CAS operation)
                 // This is a true atomic operation - no waiting for locks, instant switch
@@ -226,8 +228,7 @@ impl KmsServiceManager {
                 if let Some(old_ver) = old_version {
                     info!(
                         "KMS service reconfigured successfully: version {} -> {} (old service will be cleaned up when operations complete)",
-                        old_ver,
-                        new_service_version.version
+                        old_ver, new_service_version.version
                     );
                 } else {
                     info!(
@@ -248,32 +249,29 @@ impl KmsServiceManager {
     }
 
     /// Get KMS manager (if running)
-    /// 
+    ///
     /// Returns the manager from the current service version.
     /// Uses lock-free atomic load for optimal performance.
     pub async fn get_manager(&self) -> Option<Arc<KmsManager>> {
-        self.current_service.load().as_ref().as_ref()
-            .map(|sv| sv.manager.clone())
+        self.current_service.load().as_ref().as_ref().map(|sv| sv.manager.clone())
     }
 
     /// Get encryption service (if running)
-    /// 
+    ///
     /// Returns the service from the current service version.
     /// Uses lock-free atomic load - no blocking, instant access.
     /// This ensures new operations always use the latest service version,
     /// while existing operations continue using their Arc references.
     pub async fn get_encryption_service(&self) -> Option<Arc<ObjectEncryptionService>> {
-        self.current_service.load().as_ref().as_ref()
-            .map(|sv| sv.service.clone())
+        self.current_service.load().as_ref().as_ref().map(|sv| sv.service.clone())
     }
 
     /// Get current service version number
-    /// 
+    ///
     /// Useful for monitoring and debugging.
     /// Uses lock-free atomic load.
     pub async fn get_service_version(&self) -> Option<u64> {
-        self.current_service.load().as_ref().as_ref()
-            .map(|sv| sv.version)
+        self.current_service.load().as_ref().as_ref().map(|sv| sv.version)
     }
 
     /// Health check for the KMS service
@@ -306,12 +304,12 @@ impl KmsServiceManager {
     }
 
     /// Create a new service version from configuration
-    /// 
+    ///
     /// This creates a new backend, manager, and service, and assigns it a new version number.
     async fn create_service_version(&self, config: &KmsConfig) -> Result<ServiceVersion> {
         // Increment version counter
         let version = self.version_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        
+
         info!("Creating KMS service version {} with backend: {:?}", version, config.backend);
 
         // Create backend

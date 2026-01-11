@@ -31,8 +31,8 @@
 //!   RUSTFS_KMS_VAULT_ADDRESS=http://127.0.0.1:8200 RUSTFS_KMS_VAULT_TOKEN=your-token cargo run --example demo2
 
 use rustfs_kms::{
-    init_global_kms_service_manager, CreateKeyRequest, DescribeKeyRequest, EncryptionAlgorithm,
-    GenerateDataKeyRequest, KmsConfig, KmsError, KeySpec, KeyUsage, ListKeysRequest,
+    CreateKeyRequest, DescribeKeyRequest, EncryptionAlgorithm, GenerateDataKeyRequest, KeySpec, KeyUsage, KmsConfig, KmsError,
+    ListKeysRequest, init_global_kms_service_manager,
 };
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -53,18 +53,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 2: Get Vault configuration from environment or use defaults
     println!("2. Configuring Vault backend...");
-    let vault_address = std::env::var("RUSTFS_KMS_VAULT_ADDRESS")
-        .unwrap_or_else(|_| "http://127.0.0.1:8200".to_string());
-    let vault_token = std::env::var("RUSTFS_KMS_VAULT_TOKEN")
-        .unwrap_or_else(|_| {
-            println!("   ⚠️  No RUSTFS_KMS_VAULT_TOKEN found, using default 'dev-token'");
-            println!("      For production, set RUSTFS_KMS_VAULT_TOKEN environment variable");
-            "dev-token".to_string()
-        });
+    let vault_address = std::env::var("RUSTFS_KMS_VAULT_ADDRESS").unwrap_or_else(|_| "http://127.0.0.1:8200".to_string());
+    let vault_token = std::env::var("RUSTFS_KMS_VAULT_TOKEN").unwrap_or_else(|_| {
+        println!("   ⚠️  No RUSTFS_KMS_VAULT_TOKEN found, using default 'dev-token'");
+        println!("      For production, set RUSTFS_KMS_VAULT_TOKEN environment variable");
+        "dev-token".to_string()
+    });
 
-    let vault_url = Url::parse(&vault_address)
-        .map_err(|e| format!("Invalid Vault address '{}': {}", vault_address, e))?;
-    
+    let vault_url = Url::parse(&vault_address).map_err(|e| format!("Invalid Vault address '{}': {}", vault_address, e))?;
+
     println!("   ✓ Vault address: {}", vault_address);
     println!("   ✓ Using token authentication\n");
 
@@ -160,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   - Master Key (CMK): Stored in Vault, used to encrypt/decrypt data keys");
     println!("   - Data Key (DEK): Generated per object, encrypted by master key");
     println!("   In production, you can skip this and use encrypt_object() directly!\n");
-    
+
     let data_key_request = GenerateDataKeyRequest {
         key_id: master_key_id.clone(),
         key_spec: KeySpec::Aes256,
@@ -176,7 +173,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   ✓ Data key generated (for demonstration):");
     println!("     - Master Key ID: {}", data_key_response.key_id);
     println!("     - Data Key (plaintext) length: {} bytes", data_key_response.plaintext_key.len());
-    println!("     - Encrypted Data Key (ciphertext blob) length: {} bytes", data_key_response.ciphertext_blob.len());
+    println!(
+        "     - Encrypted Data Key (ciphertext blob) length: {} bytes",
+        data_key_response.ciphertext_blob.len()
+    );
     println!("     - Note: This data key is NOT used in Step 9 - encrypt_object() generates its own!\n");
 
     // Step 9: Encrypt some data using high-level API
@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   3. Uses the data key to encrypt the actual data");
     println!("   4. Stores the encrypted data key (ciphertext blob) in metadata");
     println!("   You only need to provide the master_key_id - everything else is handled!\n");
-    
+
     let plaintext = b"Hello, RustFS KMS with Vault! This is a test message for encryption.";
     println!("   Plaintext: {}", String::from_utf8_lossy(plaintext));
 
@@ -208,8 +208,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   ✓ Data encrypted:");
     println!("     - Encrypted data length: {} bytes", encryption_result.ciphertext.len());
     println!("     - Algorithm: {}", encryption_result.metadata.algorithm);
-    println!("     - Master Key ID: {} (stored in Vault, used to encrypt the data key)", encryption_result.metadata.key_id);
-    println!("     - Encrypted Data Key length: {} bytes (stored in metadata)", encryption_result.metadata.encrypted_data_key.len());
+    println!(
+        "     - Master Key ID: {} (stored in Vault, used to encrypt the data key)",
+        encryption_result.metadata.key_id
+    );
+    println!(
+        "     - Encrypted Data Key length: {} bytes (stored in metadata)",
+        encryption_result.metadata.encrypted_data_key.len()
+    );
     println!("     - Original size: {} bytes\n", encryption_result.metadata.original_size);
 
     // Step 10: Decrypt the data using high-level API
@@ -219,7 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   2. Uses master key from Vault to decrypt the data key");
     println!("   3. Uses the decrypted data key to decrypt the actual data");
     println!("   You only need to provide the encrypted data and metadata!\n");
-    
+
     let mut decrypted_reader = encryption_service
         .decrypt_object(
             "demo-bucket",
@@ -284,4 +290,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-

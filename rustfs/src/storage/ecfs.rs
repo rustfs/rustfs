@@ -25,6 +25,12 @@ use crate::storage::concurrency::{
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
+use crate::storage::sse::{
+    InMemoryAsyncReader, ManagedEncryptionMaterial, SsecParams, apply_ssec_decryption, apply_ssec_encryption,
+    create_managed_encryption_material, decrypt_managed_encryption_key, decrypt_multipart_managed_stream, derive_part_nonce,
+    generate_ssec_nonce, is_managed_sse, store_ssec_metadata, strip_managed_encryption_metadata, validate_ssec_params,
+    verify_ssec_key_match,
+};
 use crate::storage::{
     access::{ReqInfo, authorize_request},
     options::{
@@ -32,7 +38,7 @@ use crate::storage::{
         get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
     },
 };
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+// base64 imports moved to sse module
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use datafusion::arrow::{
@@ -89,13 +95,9 @@ use rustfs_ecstore::{
     },
 };
 use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
-use rustfs_filemeta::{ObjectPartInfo, RestoreStatusOps};
+use rustfs_filemeta::RestoreStatusOps;
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
-use rustfs_kms::{
-    DataKey,
-    service_manager::get_global_encryption_service,
-    types::{EncryptionMetadata, ObjectEncryptionContext},
-};
+// KMS imports moved to sse module
 use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
@@ -136,10 +138,8 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{
-    io::{AsyncRead, AsyncSeek},
-    sync::mpsc,
-};
+use tokio::sync::mpsc;
+// AsyncRead and AsyncSeek moved to sse module
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -265,118 +265,7 @@ pub struct FS {
     // pub store: ECStore,
 }
 
-struct ManagedEncryptionMaterial {
-    data_key: DataKey,
-    headers: HashMap<String, String>,
-    kms_key_id: String,
-}
-
-async fn create_managed_encryption_material(
-    bucket: &str,
-    key: &str,
-    algorithm: &ServerSideEncryption,
-    kms_key_id: Option<String>,
-    original_size: i64,
-) -> Result<ManagedEncryptionMaterial, ApiError> {
-    let Some(service) = get_global_encryption_service().await else {
-        return Err(ApiError::from(StorageError::other("KMS encryption service is not initialized")));
-    };
-
-    if !is_managed_sse(algorithm) {
-        return Err(ApiError::from(StorageError::other(format!(
-            "Unsupported server-side encryption algorithm: {}",
-            algorithm.as_str()
-        ))));
-    }
-
-    let algorithm_str = algorithm.as_str();
-
-    let mut context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
-    if original_size >= 0 {
-        context = context.with_size(original_size as u64);
-    }
-
-    let mut kms_key_candidate = kms_key_id;
-    if kms_key_candidate.is_none() {
-        kms_key_candidate = service.get_default_key_id().cloned();
-    }
-
-    let kms_key_to_use = kms_key_candidate
-        .clone()
-        .ok_or_else(|| ApiError::from(StorageError::other("No KMS key available for managed server-side encryption")))?;
-
-    let (data_key, encrypted_data_key) = service
-        .create_data_key(&kms_key_candidate, &context)
-        .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {e}"))))?;
-
-    let metadata = EncryptionMetadata {
-        algorithm: algorithm_str.to_string(),
-        key_id: kms_key_to_use.clone(),
-        key_version: 1,
-        iv: data_key.nonce.to_vec(),
-        tag: None,
-        encryption_context: context.encryption_context.clone(),
-        encrypted_at: Utc::now(),
-        original_size: if original_size >= 0 { original_size as u64 } else { 0 },
-        encrypted_data_key,
-    };
-
-    let mut headers = service.metadata_to_headers(&metadata);
-    headers.insert("x-rustfs-encryption-original-size".to_string(), metadata.original_size.to_string());
-
-    Ok(ManagedEncryptionMaterial {
-        data_key,
-        headers,
-        kms_key_id: kms_key_to_use,
-    })
-}
-
-async fn decrypt_managed_encryption_key(
-    bucket: &str,
-    key: &str,
-    metadata: &HashMap<String, String>,
-) -> Result<Option<([u8; 32], [u8; 12], Option<i64>)>, ApiError> {
-    if !metadata.contains_key("x-rustfs-encryption-key") {
-        return Ok(None);
-    }
-
-    let Some(service) = get_global_encryption_service().await else {
-        return Err(ApiError::from(StorageError::other("KMS encryption service is not initialized")));
-    };
-
-    let parsed = service
-        .headers_to_metadata(metadata)
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to parse encryption metadata: {e}"))))?;
-
-    if parsed.iv.len() != 12 {
-        return Err(ApiError::from(StorageError::other("Invalid encryption nonce length; expected 12 bytes")));
-    }
-
-    let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
-    let data_key = service
-        .decrypt_data_key(&parsed.encrypted_data_key, &context)
-        .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {e}"))))?;
-
-    let key_bytes = data_key.plaintext_key;
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&parsed.iv[..12]);
-
-    let original_size = metadata
-        .get("x-rustfs-encryption-original-size")
-        .and_then(|s| s.parse::<i64>().ok());
-
-    Ok(Some((key_bytes, nonce, original_size)))
-}
-
-fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
-    let mut nonce = base;
-    let current = u32::from_be_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]);
-    let incremented = current.wrapping_add(part_number as u32);
-    nonce[8..12].copy_from_slice(&incremented.to_be_bytes());
-    nonce
-}
+// SSE-related types and functions moved to crate::storage::sse module
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct ListObjectUnorderedQuery {
@@ -384,98 +273,8 @@ struct ListObjectUnorderedQuery {
     allow_unordered: Option<String>,
 }
 
-struct InMemoryAsyncReader {
-    cursor: std::io::Cursor<Vec<u8>>,
-}
-
-impl InMemoryAsyncReader {
-    fn new(data: Vec<u8>) -> Self {
-        Self {
-            cursor: std::io::Cursor::new(data),
-        }
-    }
-}
-
-impl AsyncRead for InMemoryAsyncReader {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let unfilled = buf.initialize_unfilled();
-        let bytes_read = std::io::Read::read(&mut self.cursor, unfilled)?;
-        buf.advance(bytes_read);
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncSeek for InMemoryAsyncReader {
-    fn start_seek(mut self: std::pin::Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
-        // std::io::Cursor natively supports negative SeekCurrent offsets
-        // It will automatically handle validation and return an error if the final position would be negative
-        std::io::Seek::seek(&mut self.cursor, position)?;
-        Ok(())
-    }
-
-    fn poll_complete(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<u64>> {
-        std::task::Poll::Ready(Ok(self.cursor.position()))
-    }
-}
-
-async fn decrypt_multipart_managed_stream(
-    mut encrypted_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
-    parts: &[ObjectPartInfo],
-    key_bytes: [u8; 32],
-    base_nonce: [u8; 12],
-) -> Result<(Box<dyn Reader>, i64), StorageError> {
-    let total_plain_capacity: usize = parts.iter().map(|part| part.actual_size.max(0) as usize).sum();
-
-    let mut plaintext = Vec::with_capacity(total_plain_capacity);
-
-    for part in parts {
-        if part.size == 0 {
-            continue;
-        }
-
-        let mut encrypted_part = vec![0u8; part.size];
-        tokio::io::AsyncReadExt::read_exact(&mut encrypted_stream, &mut encrypted_part)
-            .await
-            .map_err(|e| StorageError::other(format!("failed to read encrypted multipart segment {}: {}", part.number, e)))?;
-
-        let part_nonce = derive_part_nonce(base_nonce, part.number);
-        let cursor = std::io::Cursor::new(encrypted_part);
-        let mut decrypt_reader = DecryptReader::new(WarpReader::new(cursor), key_bytes, part_nonce);
-
-        tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut plaintext)
-            .await
-            .map_err(|e| StorageError::other(format!("failed to decrypt multipart segment {}: {}", part.number, e)))?;
-    }
-
-    let total_plain_size = plaintext.len() as i64;
-    let reader = Box::new(WarpReader::new(InMemoryAsyncReader::new(plaintext))) as Box<dyn Reader>;
-
-    Ok((reader, total_plain_size))
-}
-
-fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>) {
-    const KEYS: [&str; 7] = [
-        "x-amz-server-side-encryption",
-        "x-amz-server-side-encryption-aws-kms-key-id",
-        "x-rustfs-encryption-iv",
-        "x-rustfs-encryption-tag",
-        "x-rustfs-encryption-key",
-        "x-rustfs-encryption-context",
-        "x-rustfs-encryption-original-size",
-    ];
-
-    for key in KEYS.iter() {
-        metadata.remove(*key);
-    }
-}
-
-fn is_managed_sse(algorithm: &ServerSideEncryption) -> bool {
-    matches!(algorithm.as_str(), "AES256" | "aws:kms")
-}
+// InMemoryAsyncReader, decrypt_multipart_managed_stream, strip_managed_encryption_metadata,
+// and is_managed_sse moved to crate::storage::sse module
 
 /// Validate object key for control characters and log special characters
 ///
@@ -1284,39 +1083,19 @@ impl S3 for FS {
 
         // Apply SSE-C encryption if customer-provided key is specified
         if let (Some(sse_alg), Some(sse_key), Some(sse_md5)) = (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
-            && sse_alg.as_str() == "AES256"
         {
-            let key_bytes = BASE64_STANDARD.decode(sse_key.as_str()).map_err(|e| {
-                error!("Failed to decode SSE-C key: {}", e);
-                ApiError::from(StorageError::other("Invalid SSE-C key"))
-            })?;
+            let params = SsecParams {
+                algorithm: sse_alg.as_str().to_string(),
+                key: sse_key.clone(),
+                key_md5: sse_md5.clone(),
+            };
 
-            if key_bytes.len() != 32 {
-                return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
-            }
+            let validated = validate_ssec_params(&params)?;
+            let encrypted_reader = apply_ssec_encryption(reader, &validated, &bucket, &key);
+            reader = HashReader::new(encrypted_reader, -1, actual_size, None, None, false).map_err(ApiError::from)?;
 
-            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
-            if computed_md5 != sse_md5.as_str() {
-                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
-            }
-
-            // Store original size before encryption
-            src_info
-                .user_defined
-                .insert("x-amz-server-side-encryption-customer-original-size".to_string(), actual_size.to_string());
-
-            // SAFETY: The length of `key_bytes` is checked to be 32 bytes above,
-            // so this conversion cannot fail.
-            let key_array: [u8; 32] = key_bytes.try_into().expect("key length already checked");
-            // Generate deterministic nonce from bucket-key
-            let nonce_source = format!("{bucket}-{key}");
-            let nonce_hash = md5::compute(nonce_source.as_bytes());
-            let nonce: [u8; 12] = nonce_hash.0[..12]
-                .try_into()
-                .expect("MD5 hash is always 16 bytes; taking first 12 bytes for nonce is safe");
-
-            let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
+            // Store SSE-C metadata for GET responses
+            store_ssec_metadata(&mut src_info.user_defined, &validated, actual_size);
         }
 
         src_info.put_object_reader = Some(PutObjReader::new(reader));
@@ -1325,19 +1104,6 @@ impl S3 for FS {
 
         for (k, v) in compress_metadata {
             src_info.user_defined.insert(k, v);
-        }
-
-        // Store SSE-C metadata for GET responses
-        if let Some(ref sse_alg) = sse_customer_algorithm {
-            src_info.user_defined.insert(
-                "x-amz-server-side-encryption-customer-algorithm".to_string(),
-                sse_alg.as_str().to_string(),
-            );
-        }
-        if let Some(ref sse_md5) = sse_customer_key_md5 {
-            src_info
-                .user_defined
-                .insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
         }
 
         // check quota for copy operation
@@ -2462,51 +2228,19 @@ impl S3 for FS {
                     // TODO: Implement proper multipart SSE-C encryption/decryption
                 } else {
                     // Verify that the provided key MD5 matches the stored MD5
-                    if let Some(stored_md5) = stored_sse_key_md5 {
-                        debug!("SSE-C MD5 comparison: provided='{}', stored='{}'", sse_key_md5_provided, stored_md5);
-                        if sse_key_md5_provided != stored_md5 {
-                            error!("SSE-C key MD5 mismatch: provided='{}', stored='{}'", sse_key_md5_provided, stored_md5);
-                            return Err(
-                                ApiError::from(StorageError::other("SSE-C key does not match object encryption key")).into()
-                            );
-                        }
-                    } else {
-                        return Err(ApiError::from(StorageError::other(
-                            "Object encrypted with SSE-C but stored key MD5 not found",
-                        ))
-                        .into());
-                    }
+                    verify_ssec_key_match(sse_key_md5_provided, stored_sse_key_md5)?;
 
-                    // Decode the base64 key
-                    let key_bytes = BASE64_STANDARD
-                        .decode(sse_key)
-                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
-
-                    // Verify key length (should be 32 bytes for AES-256)
-                    if key_bytes.len() != 32 {
-                        return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
-                    }
-
-                    // Convert Vec<u8> to [u8; 32]
-                    let mut key_array = [0u8; 32];
-                    key_array.copy_from_slice(&key_bytes[..32]);
-
-                    // Verify MD5 hash of the key matches what the client claims
-                    let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
-                    if computed_md5 != *sse_key_md5_provided {
-                        return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
-                    }
-
-                    // Generate the same deterministic nonce from object key
-                    let mut nonce = [0u8; 12];
-                    let nonce_source = format!("{bucket}-{key}");
-                    let nonce_hash = md5::compute(nonce_source.as_bytes());
-                    nonce.copy_from_slice(&nonce_hash.0[..12]);
+                    // Validate and prepare SSE-C decryption parameters
+                    let params = SsecParams {
+                        algorithm: "AES256".to_string(),
+                        key: sse_key.to_string(),
+                        key_md5: sse_key_md5_provided.to_string(),
+                    };
+                    let validated = validate_ssec_params(&params)?;
 
                     // Apply decryption
-                    // We need to wrap the stream in a Reader first since DecryptReader expects a Reader
                     let warp_reader = WarpReader::new(final_stream);
-                    let decrypt_reader = DecryptReader::new(warp_reader, key_array, nonce);
+                    let decrypt_reader = apply_ssec_decryption(warp_reader, &validated, &bucket, &key);
                     final_stream = Box::new(decrypt_reader);
                 }
             } else {
@@ -3715,45 +3449,24 @@ impl S3 for FS {
         }
 
         // Apply SSE-C encryption if customer provided key
-        if let (Some(_), Some(sse_key), Some(sse_key_md5_provided)) =
+        if let (Some(sse_alg), Some(sse_key), Some(sse_key_md5)) =
             (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
         {
-            // Decode the base64 key
-            let key_bytes = BASE64_STANDARD
-                .decode(sse_key)
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
+            let params = SsecParams {
+                algorithm: sse_alg.as_str().to_string(),
+                key: sse_key.clone(),
+                key_md5: sse_key_md5.clone(),
+            };
 
-            // Verify key length (should be 32 bytes for AES-256)
-            if key_bytes.len() != 32 {
-                return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
-            }
-
-            // Convert Vec<u8> to [u8; 32]
-            let mut key_array = [0u8; 32];
-            key_array.copy_from_slice(&key_bytes[..32]);
-
-            // Verify MD5 hash of the key matches what the client claims
-            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
-            if computed_md5 != *sse_key_md5_provided {
-                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
-            }
+            let validated = validate_ssec_params(&params)?;
 
             // Store original size for later retrieval during decryption
             let original_size = if size >= 0 { size } else { actual_size };
-            metadata.insert(
-                "x-amz-server-side-encryption-customer-original-size".to_string(),
-                original_size.to_string(),
-            );
-
-            // Generate a deterministic nonce from object key for consistency
-            let mut nonce = [0u8; 12];
-            let nonce_source = format!("{bucket}-{key}");
-            let nonce_hash = md5::compute(nonce_source.as_bytes());
-            nonce.copy_from_slice(&nonce_hash.0[..12]);
+            store_ssec_metadata(&mut metadata, &validated, original_size);
 
             // Apply encryption
-            let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
+            let encrypted_reader = apply_ssec_encryption(reader, &validated, &bucket, &key);
+            reader = HashReader::new(encrypted_reader, -1, actual_size, None, None, false).map_err(ApiError::from)?;
         }
 
         // Apply managed SSE (SSE-S3 or SSE-KMS) when requested
@@ -4052,9 +3765,9 @@ impl S3 for FS {
             upload_id,
             part_number,
             content_length,
-            sse_customer_algorithm: _sse_customer_algorithm,
-            sse_customer_key: _sse_customer_key,
-            sse_customer_key_md5: _sse_customer_key_md5,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
             // content_md5,
             ..
         } = input;
@@ -4151,45 +3864,32 @@ impl S3 for FS {
 
         let actual_size = size;
 
-        // TODO: Apply SSE-C encryption for upload_part if needed
-        // Temporarily commented out to debug multipart issues
-        /*
-        // Apply SSE-C encryption if customer provided key before any other processing
-        if let (Some(_), Some(sse_key), Some(sse_key_md5_provided)) =
-            (&_sse_customer_algorithm, &_sse_customer_key, &_sse_customer_key_md5) {
+        // Apply SSE-C encryption for upload_part if customer provided key
+        if let (Some(sse_alg), Some(sse_key), Some(sse_key_md5)) =
+            (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
+        {
+            let params = SsecParams {
+                algorithm: sse_alg.as_str().to_string(),
+                key: sse_key.clone(),
+                key_md5: sse_key_md5.clone(),
+            };
 
-            // Decode the base64 key
-            let key_bytes = BASE64_STANDARD.decode(sse_key)
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {}", e))))?;
+            let validated = validate_ssec_params(&params)?;
 
-            // Verify key length (should be 32 bytes for AES-256)
-            if key_bytes.len() != 32 {
-                return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
-            }
+            // For multipart upload, derive a unique nonce for each part
+            // This ensures each part has a different nonce while maintaining determinism
+            let base_nonce = generate_ssec_nonce(&bucket, &key);
+            let part_nonce = derive_part_nonce(base_nonce, part_id);
 
-            // Convert Vec<u8> to [u8; 32]
-            let mut key_array = [0u8; 32];
-            key_array.copy_from_slice(&key_bytes[..32]);
+            // Apply encryption with part-specific nonce
+            let encrypted_reader = EncryptReader::new(reader, validated.key_bytes, part_nonce);
+            reader = Box::new(encrypted_reader);
 
-            // Verify MD5 hash of the key matches what the client claims
-            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
-            if computed_md5 != *sse_key_md5_provided {
-                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
-            }
-
-            // Generate a deterministic nonce from object key for consistency
-            let mut nonce = [0u8; 12];
-            let nonce_source = format!("{}-{}", bucket, key);
-            let nonce_hash = md5::compute(nonce_source.as_bytes());
-            nonce.copy_from_slice(&nonce_hash.0[..12]);
-
-            // Apply encryption - this will change the size so we need to handle it
-            let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
-            reader = Box::new(encrypt_reader);
             // When encrypting, size becomes unknown since encryption adds authentication tags
             size = -1;
+
+            debug!("Applied SSE-C encryption to part {} with derived nonce for {}/{}", part_id, bucket, key);
         }
-        */
 
         let mut md5hex = if let Some(base64_md5) = input.content_md5 {
             let md5 = base64_simd::STANDARD
