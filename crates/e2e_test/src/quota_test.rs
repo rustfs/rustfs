@@ -707,10 +707,11 @@ mod integration_tests {
             .send()
             .await?;
 
-        let uploaded_parts = vec![aws_sdk_s3::types::CompletedPart::builder()
-            .part_number(1)
-            .e_tag(part_result.e_tag().unwrap())
-            .build(),
+        let uploaded_parts = vec![
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(1)
+                .e_tag(part_result.e_tag().unwrap())
+                .build(),
         ];
 
         env.client
