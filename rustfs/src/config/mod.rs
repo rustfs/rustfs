@@ -47,7 +47,7 @@ const LONG_VERSION: &str = concat!(
     concat!("git status   :\n", build::GIT_STATUS_FILE),
 );
 
-#[derive(Debug, Parser, Clone)]
+#[derive(Parser, Clone)]
 #[command(version = SHORT_VERSION, long_version = LONG_VERSION)]
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
@@ -135,6 +135,40 @@ pub struct Opt {
     /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
     #[arg(long, default_value_t = String::from("GeneralPurpose"), env = "RUSTFS_BUFFER_PROFILE")]
     pub buffer_profile: String,
+}
+
+impl std::fmt::Debug for Opt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opt")
+            .field("volumes", &self.volumes)
+            .field("address", &self.address)
+            .field("server_domains", &self.server_domains)
+            .field("access_key", &self.access_key)
+            .field(
+                "secret_key",
+                &format!(
+                    "{}***{}|{}",
+                    self.secret_key.chars().next().unwrap_or('*'),
+                    self.secret_key.chars().last().unwrap_or('*'),
+                    self.secret_key.len()
+                ),
+            ) // Hide sensitive values
+            .field("console_enable", &self.console_enable)
+            .field("console_address", &self.console_address)
+            .field("obs_endpoint", &self.obs_endpoint)
+            .field("tls_path", &self.tls_path)
+            .field("license", &self.license)
+            .field("region", &self.region)
+            .field("kms_enable", &self.kms_enable)
+            .field("kms_backend", &self.kms_backend)
+            .field("kms_key_dir", &self.kms_key_dir)
+            .field("kms_vault_address", &self.kms_vault_address)
+            .field("kms_vault_token", &self.kms_vault_token)
+            .field("kms_default_key_id", &self.kms_default_key_id)
+            .field("buffer_profile_disable", &self.buffer_profile_disable)
+            .field("buffer_profile", &self.buffer_profile)
+            .finish()
+    }
 }
 
 // lazy_static::lazy_static! {

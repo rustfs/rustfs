@@ -108,14 +108,13 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
     }
 
     // Generate expected signature
-
     let expected_signature = generate_signature(&secret, url, method, timestamp);
 
     // Compare signatures
     if signature != expected_signature {
         error!(
-            "verify_rpc_signature: Invalid signature: secret {}, url {}, method {}, timestamp {}, signature {}, expected_signature {}",
-            secret, url, method, timestamp, signature, expected_signature
+            "verify_rpc_signature: Invalid signature: url {}, method {}, timestamp {}, signature {}, expected_signature {}",
+            url, method, timestamp, signature, expected_signature
         );
 
         return Err(std::io::Error::other("Invalid signature"));
