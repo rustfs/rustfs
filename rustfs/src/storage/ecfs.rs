@@ -2610,7 +2610,18 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
+        // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
+        let info = match store.get_object_info(&bucket, &key, &opts).await {
+            Ok(info) => info,
+            Err(err) => {
+                // If the error indicates the object or its version was not found, return 404 (NoSuchKey)
+                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                }
+                // Other errors, such as insufficient permissions, still return the original error
+                return Err(ApiError::from(err).into());
+            }
+        };
 
         if info.delete_marker {
             if opts.version_id.is_none() {
@@ -2689,7 +2700,7 @@ impl S3 for FS {
             .get("x-amz-server-side-encryption-customer-algorithm")
             .map(|v| SSECustomerAlgorithm::from(v.clone()));
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
-        let ssekms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
+        let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
         // Prefer explicit storage_class from object info; fall back to persisted metadata header.
         let storage_class = info
             .storage_class
@@ -2754,7 +2765,7 @@ impl S3 for FS {
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
-            ssekms_key_id,
+            ssekms_key_id: sse_kms_key_id,
             checksum_crc32,
             checksum_crc32c,
             checksum_sha1,
