@@ -4750,8 +4750,10 @@ impl S3 for FS {
         // TODO: getOpts, Replicate
         // Support versioned objects
         let version_id = req.input.version_id.clone();
-        let mut opts = ObjectOptions::default();
-        opts.version_id = self.parse_version_id(version_id)?.map(Into::into);
+        let opts = ObjectOptions {
+            version_id: self.parse_version_id(version_id)?.map(Into::into),
+            ..Default::default()
+        };
 
         store.put_object_tags(&bucket, &object, &tags, &opts).await.map_err(|e| {
             error!("Failed to put object tags: {}", e);
@@ -4761,20 +4763,13 @@ impl S3 for FS {
 
         // Invalidate cache for the tagged object
         let manager = get_concurrency_manager();
-        let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.as_deref());
+        let version_id = req.input.version_id.clone();
+        let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
         tokio::spawn(async move {
-            if let Err(e) = manager
+            manager
                 .invalidate_cache_versioned(&bucket, &object, version_id.as_deref())
-                .await
-            {
-                error!(
-                    "Failed to invalidate cache for tagged object (bucket={}, object={}, version_id={:?}, cache_key={}): {}",
-                    bucket, object, version_id, cache_key, e
-                );
-                counter!("rustfs.put_object_tagging.failure").increment(1);
-            } else {
-                debug!("Cache invalidated for tagged object: {}", cache_key);
-            }
+                .await;
+            debug!("Cache invalidated for tagged object: {}", cache_key);
         });
 
         // Add metrics
@@ -4788,7 +4783,7 @@ impl S3 for FS {
         }));
         let _ = helper.complete(&result);
         let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", [("operation", "put")]).record(duration.as_secs_f64());
+        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
         result
     }
 
@@ -4806,8 +4801,10 @@ impl S3 for FS {
 
         // Support versioned objects
         let version_id = req.input.version_id.clone();
-        let mut opts = ObjectOptions::default();
-        opts.version_id = self.parse_version_id(version_id)?.map(Into::into);
+        let opts = ObjectOptions {
+            version_id: self.parse_version_id(version_id)?.map(Into::into),
+            ..Default::default()
+        };
 
         let tags = store.get_object_tags(&bucket, &object, &opts).await.map_err(|e| {
             if is_err_object_not_found(&e) {
@@ -4824,7 +4821,7 @@ impl S3 for FS {
         // Add metrics
         counter!("rustfs.get_object_tagging.success").increment(1);
         let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", [("operation", "put")]).record(duration.as_secs_f64());
+        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
         Ok(S3Response::new(GetObjectTaggingOutput {
             tag_set,
             version_id: req.input.version_id.clone(),
@@ -4851,8 +4848,11 @@ impl S3 for FS {
         };
 
         // Support versioned objects
-        let mut opts = ObjectOptions::default();
-        opts.version_id = self.parse_version_id(version_id)?.map(Into::into);
+        let version_id_for_parse = version_id.clone();
+        let opts = ObjectOptions {
+            version_id: self.parse_version_id(version_id_for_parse)?.map(Into::into),
+            ..Default::default()
+        };
 
         // TODO: Replicate (keep the original TODO, if further replication logic is needed)
         store.delete_object_tags(&bucket, &object, &opts).await.map_err(|e| {
@@ -4864,23 +4864,13 @@ impl S3 for FS {
         let manager = get_concurrency_manager();
         let version_id_clone = version_id.clone();
         tokio::spawn(async move {
-            match manager
+            manager
                 .invalidate_cache_versioned(&bucket, &object, version_id_clone.as_deref())
-                .await
-            {
-                Ok(()) => {
-                    debug!(
-                        "Cache invalidated for deleted tagged object: bucket={}, object={}, version_id={:?}",
-                        bucket, object, version_id_clone
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to invalidate cache for deleted tagged object: bucket={}, object={}, version_id={:?}, error={}",
-                        bucket, object, version_id_clone, e
-                    );
-                }
-            }
+                .await;
+            debug!(
+                "Cache invalidated for deleted tagged object: bucket={}, object={}, version_id={:?}",
+                bucket, object, version_id_clone
+            );
         });
 
         // Add metrics
@@ -4892,7 +4882,7 @@ impl S3 for FS {
         let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
         let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", [("operation", "delete")]).record(duration.as_secs_f64());
+        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "delete").record(duration.as_secs_f64());
         result
     }
 
