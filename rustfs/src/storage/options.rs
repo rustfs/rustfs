@@ -18,6 +18,7 @@ use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
+use rustfs_utils::http::RUSTFS_FORCE_DELETE;
 use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
 use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
@@ -76,6 +77,11 @@ pub async fn del_opts(
         error!("del_opts: invalid argument: {} error: {}", object, err);
         StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())
     })?;
+
+    opts.delete_prefix = headers
+        .get(RUSTFS_FORCE_DELETE)
+        .map(|v| v.to_str().unwrap_or_default() == "true")
+        .unwrap_or_default();
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
@@ -663,6 +669,39 @@ mod tests {
                 _ => panic!("Expected InvalidVersionID error"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_del_opts_with_delete_prefix() {
+        let mut headers = create_test_headers();
+        let metadata = create_test_metadata();
+
+        // Test without RUSTFS_FORCE_DELETE header - should default to false
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(!opts.delete_prefix);
+
+        // Test with RUSTFS_FORCE_DELETE header set to "true"
+        headers.insert(RUSTFS_FORCE_DELETE, HeaderValue::from_static("true"));
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(opts.delete_prefix);
+
+        // Test with RUSTFS_FORCE_DELETE header set to "false"
+        headers.insert(RUSTFS_FORCE_DELETE, HeaderValue::from_static("false"));
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(!opts.delete_prefix);
+
+        // Test with RUSTFS_FORCE_DELETE header set to other value
+        headers.insert(RUSTFS_FORCE_DELETE, HeaderValue::from_static("maybe"));
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(!opts.delete_prefix);
     }
 
     #[tokio::test]

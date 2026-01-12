@@ -11,7 +11,7 @@ image:
   # This sets the pull policy for images.
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "latest"
+  tag: ""
 
 # This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
 imagePullSecrets: []
@@ -30,6 +30,11 @@ fullnameOverride: ""
 mode:
   standalone:
     enabled: false
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 0
+        maxUnavailable: 1
   distributed:
     enabled: true
 
@@ -129,6 +134,12 @@ ingress:
     secretName: secret-tls
     crt: tls.crt
     key: tls.key
+
+gatewayApi:
+  enabled: false
+  gatewayClass: traefik
+  hostname: example.rustfs.com
+  secretName: secret-tls
 
 resources:
   # We usually recommend not to specify default resources and to leave this as a conscious

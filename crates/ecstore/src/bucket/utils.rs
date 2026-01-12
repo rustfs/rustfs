@@ -14,7 +14,7 @@
 
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, StorageError};
-use rustfs_utils::path::SLASH_SEPARATOR;
+use rustfs_utils::path::SLASH_SEPARATOR_STR;
 use s3s::xml;
 
 pub fn is_meta_bucketname(name: &str) -> bool {
@@ -194,7 +194,7 @@ pub fn is_valid_object_name(object: &str) -> bool {
         return false;
     }
 
-    if object.ends_with(SLASH_SEPARATOR) {
+    if object.ends_with(SLASH_SEPARATOR_STR) {
         return false;
     }
 
@@ -206,7 +206,7 @@ pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Res
         return Err(StorageError::ObjectNameTooLong(bucket.to_owned(), object.to_owned()));
     }
 
-    if object.starts_with(SLASH_SEPARATOR) {
+    if object.starts_with(SLASH_SEPARATOR_STR) {
         return Err(StorageError::ObjectNamePrefixAsSlash(bucket.to_owned(), object.to_owned()));
     }
 
