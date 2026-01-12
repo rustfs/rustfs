@@ -715,6 +715,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_del_opts_with_null_version_id() {
+        let headers = create_test_headers();
+        let metadata = create_test_metadata();
+        let result = del_opts("test-bucket", "test-object", Some("null".to_string()), &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let result = del_opts("test-bucket", "test-object", Some("NULL".to_string()), &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_get_opts_basic() {
         let headers = create_test_headers();
 
