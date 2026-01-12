@@ -37,3 +37,5 @@ updates:
       dependencies:
         patterns:
           - "*"
+        ignore:
+          - dependency-name: "object_store"
