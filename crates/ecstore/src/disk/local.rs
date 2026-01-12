@@ -1872,12 +1872,12 @@ impl DiskAPI for LocalDisk {
 
         let mut objs_returned = 0;
 
-        if opts.base_dir.ends_with(SLASH_SEPARATOR) {
+        if opts.base_dir.ends_with(SLASH_SEPARATOR_STR) {
             if let Ok(data) = self
                 .read_metadata(
                     &opts.bucket,
                     path_join_buf(&[
-                        format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX).as_str(),
+                        format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR_STR), GLOBAL_DIR_SUFFIX).as_str(),
                         STORAGE_FORMAT_FILE,
                     ])
                     .as_str(),
