@@ -20,7 +20,6 @@
     rust_2018_idioms
 )]
 
-pub mod data_usage;
 pub mod data_usage_define;
 pub mod error;
 pub mod last_minute;

@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use crate::data_usage::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
+use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
 use crate::metrics::CurrentCycle;
 use crate::metrics::global_metrics;
 use crate::scanner_folder::data_usage_update_dir_cycles;
