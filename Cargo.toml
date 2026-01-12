@@ -131,7 +131,7 @@ byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.3"
-quick-xml = "0.38.4"
+quick-xml = "0.39.0"
 rmcp = { version = "0.12.0" }
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
@@ -212,7 +212,7 @@ nix = { version = "0.30.1", features = ["fs"] }
 nu-ansi-term = "0.50.3"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.11.0"
-object_store = "0.12.4"
+object_store = "0.13.0"
 parking_lot = "0.12.5"
 path-absolutize = "3.1.1"
 path-clean = "1.0.1"
