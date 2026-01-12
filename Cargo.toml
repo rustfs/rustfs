@@ -147,7 +147,7 @@ blake3 = { version = "1.8.3", features = ["rayon", "mmap"] }
 chacha20poly1305 = { version = "0.11.0-rc.2" }
 crc-fast = "1.6.0"
 hmac = { version = "0.13.0-rc.3" }
-jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.2.0", features = ["aws_lc_rs"] }
 pbkdf2 = "0.13.0-rc.6"
 rsa = { version = "0.10.0-rc.11" }
 rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
