@@ -2614,7 +2614,7 @@ impl S3 for FS {
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
             Err(err) => {
-                // Check if there is no error for the object and return 404 Not Found
+                // If the error indicates the object or its version was not found, return 404 (NoSuchKey)
                 if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                     return Err(S3Error::new(S3ErrorCode::NoSuchKey));
                 }
