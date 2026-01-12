@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_ecstore::bucket::quota::QuotaError;
 use rustfs_ecstore::error::StorageError;
 use s3s::{S3Error, S3ErrorCode};
 
@@ -281,6 +282,29 @@ impl From<rustfs_iam::error::Error> for ApiError {
     fn from(err: rustfs_iam::error::Error) -> Self {
         let serr: StorageError = err.into();
         serr.into()
+    }
+}
+
+impl From<QuotaError> for ApiError {
+    fn from(err: QuotaError) -> Self {
+        let code = match &err {
+            QuotaError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
+            QuotaError::ConfigNotFound { .. } => S3ErrorCode::NoSuchBucket,
+            QuotaError::InvalidConfig { .. } => S3ErrorCode::InvalidArgument,
+            QuotaError::StorageError(_) => S3ErrorCode::InternalError,
+        };
+
+        let message = if code == S3ErrorCode::InternalError {
+            err.to_string()
+        } else {
+            ApiError::error_code_to_message(&code)
+        };
+
+        ApiError {
+            code,
+            message,
+            source: Some(Box::new(err)),
+        }
     }
 }
 
