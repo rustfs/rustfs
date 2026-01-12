@@ -274,9 +274,9 @@ impl AuditSystem {
         drop(state);
 
         let registry = self.registry.lock().await;
-        let target_ids = registry.list_targets();
+        let target_keys = registry.list_targets();
 
-        if target_ids.is_empty() {
+        if target_keys.is_empty() {
             warn!("No audit targets configured for dispatch");
             return Ok(());
         }
@@ -284,22 +284,22 @@ impl AuditSystem {
         // Dispatch to all targets concurrently
         let mut tasks = Vec::new();
 
-        for target_id in target_ids {
-            if let Some(target) = registry.get_target(&target_id) {
+        for target_key in target_keys {
+            if let Some(target) = registry.get_target(&target_key) {
                 let entry_clone = Arc::clone(&entry);
-                let target_id_clone = target_id.clone();
+                let target_key_clone = target_key.clone();
 
                 // Create EntityTarget for the audit log entry
                 let entity_target = EntityTarget {
                     object_name: entry.api.name.clone().unwrap_or_default(),
                     bucket_name: entry.api.bucket.clone().unwrap_or_default(),
-                    event_name: rustfs_targets::EventName::ObjectCreatedPut, // Default, should be derived from entry
+                    event_name: entry.event, // Default, should be derived from entry
                     data: (*entry_clone).clone(),
                 };
 
                 let task = async move {
                     let result = target.save(Arc::new(entity_target)).await;
-                    (target_id_clone, result)
+                    (target_key_clone, result)
                 };
 
                 tasks.push(task);
@@ -312,14 +312,14 @@ impl AuditSystem {
         let mut errors = Vec::new();
         let mut success_count = 0;
 
-        for (target_id, result) in results {
+        for (target_key, result) in results {
             match result {
                 Ok(_) => {
                     success_count += 1;
                     observability::record_target_success();
                 }
                 Err(e) => {
-                    error!(target_id = %target_id, error = %e, "Failed to dispatch audit log to target");
+                    error!(target_id = %target_key, error = %e, "Failed to dispatch audit log to target");
                     errors.push(e);
                     observability::record_target_failure();
                 }
@@ -360,18 +360,18 @@ impl AuditSystem {
         drop(state);
 
         let registry = self.registry.lock().await;
-        let target_ids = registry.list_targets();
+        let target_keys = registry.list_targets();
 
-        if target_ids.is_empty() {
+        if target_keys.is_empty() {
             warn!("No audit targets configured for batch dispatch");
             return Ok(());
         }
 
         let mut tasks = Vec::new();
-        for target_id in target_ids {
-            if let Some(target) = registry.get_target(&target_id) {
+        for target_key in target_keys {
+            if let Some(target) = registry.get_target(&target_key) {
                 let entries_clone: Vec<_> = entries.iter().map(Arc::clone).collect();
-                let target_id_clone = target_id.clone();
+                let target_key_clone = target_key.clone();
 
                 let task = async move {
                     let mut success_count = 0;
@@ -380,7 +380,7 @@ impl AuditSystem {
                         let entity_target = EntityTarget {
                             object_name: entry.api.name.clone().unwrap_or_default(),
                             bucket_name: entry.api.bucket.clone().unwrap_or_default(),
-                            event_name: rustfs_targets::EventName::ObjectCreatedPut,
+                            event_name: entry.event,
                             data: (*entry).clone(),
                         };
                         match target.save(Arc::new(entity_target)).await {
@@ -388,7 +388,7 @@ impl AuditSystem {
                             Err(e) => errors.push(e),
                         }
                     }
-                    (target_id_clone, success_count, errors)
+                    (target_key_clone, success_count, errors)
                 };
                 tasks.push(task);
             }
@@ -418,6 +418,7 @@ impl AuditSystem {
     }
 
     /// Starts the audit stream processing for a target with batching and retry logic
+    ///
     /// # Arguments
     /// * `store` - The store from which to read audit entries
     /// * `target` - The target to which audit entries will be sent
@@ -501,7 +502,7 @@ impl AuditSystem {
     /// Enables a specific target
     ///
     /// # Arguments
-    /// * `target_id` - The ID of the target to enable
+    /// * `target_id` - The ID of the target to enable, TargetID to string
     ///
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
@@ -520,7 +521,7 @@ impl AuditSystem {
     /// Disables a specific target
     ///
     /// # Arguments
-    /// * `target_id` - The ID of the target to disable
+    /// * `target_id` - The ID of the target to disable, TargetID to string
     ///
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
@@ -539,7 +540,7 @@ impl AuditSystem {
     /// Removes a target from the system
     ///
     /// # Arguments
-    /// * `target_id` - The ID of the target to remove
+    /// * `target_id` - The ID of the target to remove, TargetID to string
     ///
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
@@ -559,7 +560,7 @@ impl AuditSystem {
     /// Updates or inserts a target
     ///
     /// # Arguments
-    /// * `target_id` - The ID of the target to upsert
+    /// * `target_id` - The ID of the target to upsert, TargetID to string
     /// * `target` - The target instance to insert or update
     ///
     /// # Returns
@@ -596,7 +597,7 @@ impl AuditSystem {
     /// Gets information about a specific target
     ///
     /// # Arguments
-    /// * `target_id` - The ID of the target to retrieve
+    /// * `target_id` - The ID of the target to retrieve, TargetID to string
     ///
     /// # Returns
     /// * `Option<String>` - Target ID if found

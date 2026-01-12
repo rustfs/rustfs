@@ -44,7 +44,6 @@ jobs:
           set -x
           old_version=$(grep "^appVersion:" helm/rustfs/Chart.yaml | awk '{print $2}')
           sed -i "s/$old_version/$new_version/g" helm/rustfs/Chart.yaml
-          sed  -i "/^image:/,/^[^ ]/ s/tag:.*/tag: "$new_version"/" helm/rustfs/values.yaml
 
       - name: Set up Helm
         uses: azure/setup-helm@v4.3.0
