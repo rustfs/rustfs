@@ -187,7 +187,7 @@ derive_builder = "0.20.2"
 dunce = "1.0.5"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
-flate2 = "1.1.5"
+flate2 = "1.1.8"
 flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
 glob = "0.3.3"
 google-cloud-storage = "1.5.0"
@@ -243,7 +243,7 @@ thiserror = "2.0.17"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.4"
 tracing-error = "0.2.1"
-tracing-opentelemetry = "0.32.0"
+tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.8"
