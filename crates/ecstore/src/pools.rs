@@ -454,7 +454,7 @@ pub fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (Strin
         .strip_prefix(SLASH_SEPARATOR_STR)
         .unwrap_or(path);
     // Find the position of the first '/'
-    let Some(pos) = trimmed_path.find(SLASH_SEPARATOR) else {
+    let Some(pos) = trimmed_path.find(SLASH_SEPARATOR_STR) else {
         return (trimmed_path.to_string(), "".to_string());
     };
     // Split into bucket and prefix
