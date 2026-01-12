@@ -17,7 +17,11 @@ use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
+use crate::server::{
+    ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
+    hybrid::hybrid,
+    layer::{ConditionalCorsLayer, RedirectLayer},
+};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -625,10 +629,15 @@ fn process_connection(
                     }),
             )
             .layer(PropagateRequestIdLayer::x_request_id())
-            // CORS layer removed: S3 API uses bucket-level CORS, console has its own CORS layer
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
             .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
+            // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
+            // Admin has its own CORS handling in router.rs
+            // Console has its own CORS layer in setup_console_middleware_stack()
+            // S3 API uses this system default CORS (RUSTFS_CORS_ALLOWED_ORIGINS)
+            // Bucket-level CORS takes precedence when configured (handled in router.rs for OPTIONS, and in ecfs.rs for actual requests)
+            .layer(ConditionalCorsLayer::new())
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
 

@@ -15,6 +15,7 @@
 use crate::admin::console::is_console_path;
 use crate::admin::console::make_console_server;
 use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX};
+use http::HeaderValue;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -32,6 +33,7 @@ use s3s::route::S3Route;
 use s3s::s3_error;
 use tower::Service;
 use tracing::error;
+use tracing::info;
 
 pub struct S3Router<T> {
     router: Router<T>,
@@ -178,10 +180,19 @@ where
             return Err(s3_error!(InternalError, "console is not enabled"));
         }
 
-        // Handle OPTIONS preflight requests for S3 bucket CORS
-        // This only handles S3 bucket paths, not console paths
+        // Handle OPTIONS preflight requests
         if req.method == Method::OPTIONS && req.headers.contains_key("origin") {
-            let path = req.uri.path().trim_start_matches('/');
+            let path = req.uri.path();
+            info!("path: {}", path);
+            // Handle Admin API CORS preflight
+            if path.starts_with(ADMIN_PREFIX) || path.starts_with(RPC_PREFIX) || path == "/" {
+                let mut response = S3Response::new(Body::empty());
+                apply_admin_cors_preflight(&req.headers, &mut response);
+                return Ok(response);
+            }
+
+            // Handle S3 bucket CORS preflight
+            let path = path.trim_start_matches('/');
             let bucket = path.split('/').next().unwrap_or("").to_string();
 
             if !bucket.is_empty() {
@@ -201,11 +212,18 @@ where
         }
 
         let uri = format!("{}|{}", &req.method, req.uri.path());
+        // Clone headers before moving req
+        let request_headers = req.headers.clone();
+
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;
             let mut resp = op.call(req, mat.params).await?;
             resp.status = Some(resp.output.0);
-            return Ok(resp.map_output(|x| x.1));
+            let mut response = resp.map_output(|x| x.1);
+
+            apply_admin_cors_headers(&request_headers, &mut response.headers);
+
+            return Ok(response);
         }
 
         Err(s3_error!(NotImplemented))
@@ -257,4 +275,87 @@ fn convert_response(resp: http::Response<axum::body::Body>) -> S3Response<Body> 
     s3_resp.headers = parts.headers;
     s3_resp.extensions = parts.extensions;
     s3_resp
+}
+
+/// Get admin CORS allowed origins from environment variable
+fn get_admin_cors_origins() -> Option<String> {
+    std::env::var("RUSTFS_ADMIN_CORS_ALLOWED_ORIGINS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            // Fallback to RUSTFS_CORS_ALLOWED_ORIGINS if admin-specific is not set
+            std::env::var("RUSTFS_CORS_ALLOWED_ORIGINS").ok().filter(|s| !s.is_empty())
+        })
+}
+
+/// Apply CORS headers to Admin API preflight (OPTIONS) response
+pub fn apply_admin_cors_preflight(headers: &HeaderMap, response: &mut S3Response<Body>) {
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+
+    let cors_origins = get_admin_cors_origins();
+    let allowed_origin = match (origin, cors_origins) {
+        (Some(orig), Some(config)) if config == "*" => Some(orig),
+        (Some(orig), Some(config)) => {
+            let origins: Vec<&str> = config.split(',').map(|s| s.trim()).collect();
+            if origins.contains(&orig.as_str()) { Some(orig) } else { None }
+        }
+        (Some(orig), None) => Some(orig), // Default: allow all if not configured
+        _ => None,
+    };
+
+    if let Some(origin) = allowed_origin {
+        if let Ok(header_value) = HeaderValue::from_str(&origin) {
+            response.headers.insert("access-control-allow-origin", header_value);
+        }
+    }
+
+    // Get requested headers from preflight request
+    let requested_headers = headers
+        .get("access-control-request-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("*");
+
+    response.headers.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD"),
+    );
+    response.headers.insert(
+        "access-control-allow-headers",
+        HeaderValue::from_str(requested_headers).unwrap_or_else(|_| HeaderValue::from_static("*")),
+    );
+    response.headers.insert(
+        "access-control-max-age",
+        HeaderValue::from_static("86400"), // 24 hours
+    );
+}
+
+/// Apply CORS headers to Admin API response
+fn apply_admin_cors_headers(request_headers: &HeaderMap, response_headers: &mut HeaderMap) {
+    let origin = request_headers
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let cors_origins = get_admin_cors_origins();
+    let allowed_origin = match (origin, cors_origins) {
+        (Some(orig), Some(config)) if config == "*" => Some(orig),
+        (Some(orig), Some(config)) => {
+            let origins: Vec<&str> = config.split(',').map(|s| s.trim()).collect();
+            if origins.contains(&orig.as_str()) { Some(orig) } else { None }
+        }
+        (Some(orig), None) => Some(orig), // Default: allow all if not configured
+        _ => None,
+    };
+
+    if let Some(origin) = allowed_origin {
+        if let Ok(header_value) = HeaderValue::from_str(&origin) {
+            response_headers.insert("access-control-allow-origin", header_value);
+        }
+    }
+
+    // Expose common headers that might be needed by clients
+    response_headers.insert(
+        "access-control-expose-headers",
+        HeaderValue::from_static("x-request-id, content-type, content-length"),
+    );
 }

@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::console::is_console_path;
 use crate::server::hybrid::HybridBody;
-use http::{Request as HttpRequest, Response, StatusCode};
+use crate::server::{ADMIN_PREFIX, RPC_PREFIX};
+use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
 use hyper::body::Incoming;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Redirect layer that redirects browser requests to the console
 #[derive(Clone)]
@@ -87,5 +90,135 @@ where
         // Otherwise, forward to the next service
         let mut inner = self.inner.clone();
         Box::pin(async move { inner.call(req).await.map_err(Into::into) })
+    }
+}
+
+/// Conditional CORS layer that only applies to S3 API requests
+/// (not Admin, not Console, not RPC)
+#[derive(Clone)]
+pub struct ConditionalCorsLayer {
+    cors_origins: Option<String>,
+}
+
+impl ConditionalCorsLayer {
+    pub fn new() -> Self {
+        let cors_origins = std::env::var("RUSTFS_CORS_ALLOWED_ORIGINS").ok().filter(|s| !s.is_empty());
+        Self { cors_origins }
+    }
+
+    fn is_bucket_level_path(path: &str) -> bool {
+        // Exclude Admin, Console, RPC, and special paths
+        !path.starts_with(ADMIN_PREFIX)
+            && !path.starts_with(RPC_PREFIX)
+            && !is_console_path(path)
+            && path != "/health"
+            && path != "/profile/cpu"
+            && path != "/profile/memory"
+    }
+
+    fn apply_cors_headers(&self, request_headers: &HeaderMap, response_headers: &mut HeaderMap) {
+        let origin = request_headers
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let allowed_origin = match (origin, &self.cors_origins) {
+            (Some(orig), Some(config)) if config == "*" => Some(orig),
+            (Some(orig), Some(config)) => {
+                let origins: Vec<&str> = config.split(',').map(|s| s.trim()).collect();
+                if origins.contains(&orig.as_str()) { Some(orig) } else { None }
+            }
+            (Some(orig), None) => Some(orig), // Default: allow all if not configured
+            _ => None,
+        };
+
+        if let Some(origin) = allowed_origin {
+            if let Ok(header_value) = HeaderValue::from_str(&origin) {
+                response_headers.insert("access-control-allow-origin", header_value);
+            }
+        }
+
+        // Allow all methods by default
+        response_headers.insert(
+            "access-control-allow-methods",
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH"),
+        );
+
+        // Allow all headers by default
+        response_headers.insert("access-control-allow-headers", HeaderValue::from_static("*"));
+
+        // Expose common headers
+        response_headers.insert(
+            "access-control-expose-headers",
+            HeaderValue::from_static("x-request-id, content-type, content-length, etag"),
+        );
+
+        // Allow credentials if needed
+        response_headers.insert("access-control-allow-credentials", HeaderValue::from_static("true"));
+    }
+}
+
+impl Default for ConditionalCorsLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<S> Layer<S> for ConditionalCorsLayer {
+    type Service = ConditionalCorsService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ConditionalCorsService {
+            inner,
+            cors_origins: Arc::new(self.cors_origins.clone()),
+        }
+    }
+}
+
+/// Service implementation for conditional CORS
+#[derive(Clone)]
+pub struct ConditionalCorsService<S> {
+    inner: S,
+    cors_origins: Arc<Option<String>>,
+}
+
+impl<S, ResBody> Service<HttpRequest<Incoming>> for ConditionalCorsService<S>
+where
+    S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ResBody: Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+        let path = req.uri().path().to_string();
+        let is_bucket_level_api = ConditionalCorsLayer::is_bucket_level_path(&path);
+        let request_headers = req.headers().clone();
+        let cors_origins = self.cors_origins.clone();
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            let mut response = inner.call(req).await.map_err(Into::into)?;
+
+            // Apply CORS headers only to S3 API requests
+            if is_bucket_level_api
+                && request_headers.contains_key("origin")
+                && !response.headers().contains_key("access-control-allow-origin")
+            {
+                let cors_layer = ConditionalCorsLayer {
+                    cors_origins: (*cors_origins).clone(),
+                };
+                cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+            }
+
+            Ok(response)
+        })
     }
 }
