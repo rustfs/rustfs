@@ -2494,7 +2494,7 @@ impl S3 for FS {
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
 
         // Get version_id from object info
-        // If versioning is enabled, always return version_id
+        // If versioning is enabled and version_id exists in object info, return it
         // If version_id is Uuid::nil(), return "null" string (AWS S3 convention)
         let output_version_id = if versioned {
             info.version_id.map(|vid| {
