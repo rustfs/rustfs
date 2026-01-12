@@ -243,7 +243,7 @@ thiserror = "2.0.17"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.4"
 tracing-error = "0.2.1"
-tracing-opentelemetry = "0.32.0"
+tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.8"
