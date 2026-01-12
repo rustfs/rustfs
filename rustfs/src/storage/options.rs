@@ -18,6 +18,7 @@ use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
+use rustfs_utils::http::RUSTFS_FORCE_DELETE;
 use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
 use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
@@ -76,6 +77,11 @@ pub async fn del_opts(
         error!("del_opts: invalid argument: {} error: {}", object, err);
         StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())
     })?;
+
+    opts.delete_prefix = headers
+        .get(RUSTFS_FORCE_DELETE)
+        .map(|v| v.to_str().unwrap() == "true")
+        .unwrap_or_default();
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
