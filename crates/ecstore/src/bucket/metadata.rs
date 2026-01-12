@@ -355,7 +355,7 @@ impl BucketMetadata {
             self.tagging_config = Some(deserialize::<Tagging>(&self.tagging_config_xml)?);
         }
         if !self.quota_config_json.is_empty() {
-            self.quota_config = Some(BucketQuota::unmarshal(&self.quota_config_json)?);
+            self.quota_config = Some(serde_json::from_slice(&self.quota_config_json)?);
         }
         if !self.replication_config_xml.is_empty() {
             self.replication_config = Some(deserialize::<ReplicationConfiguration>(&self.replication_config_xml)?);
@@ -487,7 +487,8 @@ mod test {
         bm.tagging_config_updated_at = OffsetDateTime::now_utc();
 
         // Add quota configuration
-        let quota_json = r#"{"quota":1073741824,"quotaType":"hard"}"#; // 1GB quota
+        let quota_json =
+            r#"{"quota":1073741824,"quota_type":"Hard","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}"#; // 1GB quota
         bm.quota_config_json = quota_json.as_bytes().to_vec();
         bm.quota_config_updated_at = OffsetDateTime::now_utc();
 
