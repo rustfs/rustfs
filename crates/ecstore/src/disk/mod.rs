@@ -711,6 +711,10 @@ pub fn has_part_err(part_errs: &[usize]) -> bool {
     part_errs.iter().any(|err| *err != CHECK_PART_SUCCESS)
 }
 
+pub fn count_part_not_success(part_errs: &[usize]) -> usize {
+    part_errs.iter().filter(|err| **err != CHECK_PART_SUCCESS).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -50,7 +50,7 @@ impl Display for HealItemType {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum DriveState {
     Ok,
     Offline,
@@ -59,7 +59,7 @@ pub enum DriveState {
     PermissionDenied,
     Faulty,
     RootMount,
-    Unknown,
+    Unknown(String),
     Unformatted, // only returned by disk
 }
 
@@ -73,8 +73,24 @@ impl DriveState {
             DriveState::PermissionDenied => "permission-denied",
             DriveState::Faulty => "faulty",
             DriveState::RootMount => "root-mount",
-            DriveState::Unknown => "unknown",
+            DriveState::Unknown(reason) => reason,
             DriveState::Unformatted => "unformatted",
+        }
+    }
+}
+
+impl Clone for DriveState {
+    fn clone(&self) -> Self {
+        match self {
+            DriveState::Unknown(reason) => DriveState::Unknown(reason.clone()),
+            DriveState::Ok => DriveState::Ok,
+            DriveState::Offline => DriveState::Offline,
+            DriveState::Corrupt => DriveState::Corrupt,
+            DriveState::Missing => DriveState::Missing,
+            DriveState::PermissionDenied => DriveState::PermissionDenied,
+            DriveState::Faulty => DriveState::Faulty,
+            DriveState::RootMount => DriveState::RootMount,
+            DriveState::Unformatted => DriveState::Unformatted,
         }
     }
 }

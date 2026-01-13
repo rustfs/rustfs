@@ -1570,6 +1570,8 @@ impl DiskAPI for LocalDisk {
                 .as_str(),
             )?;
 
+            info!("check_parts: part_path: {:?}", &part_path);
+
             match lstat(&part_path).await {
                 Ok(st) => {
                     if st.is_dir() {
@@ -1584,6 +1586,8 @@ impl DiskAPI for LocalDisk {
                     resp.results[i] = CHECK_PART_SUCCESS;
                 }
                 Err(err) => {
+                    info!("check_parts: failed to stat file: {:?}, error: {:?}", &part_path, &err);
+
                     let e: DiskError = to_file_error(err).into();
 
                     if e == DiskError::FileNotFound {
