@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod bitrot;
 pub mod decode;
 pub mod encode;
 pub mod erasure;
 pub mod heal;
-
-mod bitrot;
 pub use bitrot::*;
 
 pub use erasure::{Erasure, ReedSolomonEncoder, calc_shard_size};

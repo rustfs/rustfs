@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::replication::ObjectOpts;
 use s3s::dto::ReplicaModificationsStatus;
 use s3s::dto::ReplicationRule;
-
-use super::ObjectOpts;
 
 pub trait ReplicationRuleExt {
     fn prefix(&self) -> &str;

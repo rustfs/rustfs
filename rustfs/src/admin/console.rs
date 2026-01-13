@@ -269,6 +269,7 @@ async fn version_handler() -> impl IntoResponse {
 /// - 200 OK with JSON body containing the console configuration if initialized.
 /// - 500 Internal Server Error if configuration is not initialized.
 #[instrument(fields(uri))]
+#[allow(dead_code)]
 async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme
     let scheme = headers
@@ -482,7 +483,6 @@ fn setup_console_middleware_stack(
     let mut app = Router::new()
         .route(FAVICON_PATH, get(static_handler))
         .route(&format!("{CONSOLE_PREFIX}/license"), get(license_handler))
-        .route(&format!("{CONSOLE_PREFIX}/config.json"), get(config_handler))
         .route(&format!("{CONSOLE_PREFIX}/version"), get(version_handler))
         .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))

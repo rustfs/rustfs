@@ -130,8 +130,8 @@ bytesize = "2.3.1"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
-prost = "0.14.1"
-quick-xml = "0.38.4"
+prost = "0.14.3"
+quick-xml = "0.39.0"
 rmcp = { version = "0.12.0" }
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
@@ -143,12 +143,12 @@ schemars = "1.2.0"
 # Cryptography and Security
 aes-gcm = { version = "0.11.0-rc.2", features = ["rand_core"] }
 argon2 = { version = "0.6.0-rc.5" }
-blake3 = { version = "1.8.2", features = ["rayon", "mmap"] }
+blake3 = { version = "1.8.3", features = ["rayon", "mmap"] }
 chacha20poly1305 = { version = "0.11.0-rc.2" }
 crc-fast = "1.6.0"
 hmac = { version = "0.13.0-rc.3" }
-jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
-pbkdf2 = "0.13.0-rc.5"
+jsonwebtoken = { version = "10.2.0", features = ["aws_lc_rs"] }
+pbkdf2 = "0.13.0-rc.6"
 rsa = { version = "0.10.0-rc.11" }
 rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pemfile = "2.2.0"
@@ -184,9 +184,10 @@ criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "51.0.0"
 derive_builder = "0.20.2"
+dunce = "1.0.5"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
-flate2 = "1.1.5"
+flate2 = "1.1.8"
 flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
 glob = "0.3.3"
 google-cloud-storage = "1.5.0"
@@ -197,7 +198,7 @@ hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
 ipnetwork = { version = "0.21.1", features = ["serde"] }
 lazy_static = "1.5.0"
-libc = "0.2.179"
+libc = "0.2.180"
 libsystemd = "0.7.2"
 local-ip-address = "0.6.8"
 lz4 = "1.28.1"
@@ -242,7 +243,7 @@ thiserror = "2.0.17"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.4"
 tracing-error = "0.2.1"
-tracing-opentelemetry = "0.32.0"
+tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.8"
@@ -270,7 +271,7 @@ libunftp = "0.21.0"
 russh = { version = "0.56.0", features = ["aws-lc-rs", "rsa"], default-features = false }
 russh-sftp = "2.1.1"
 ssh-key = { version = "0.7.0-rc.4", features = ["std", "rsa", "ed25519"] }
-suppaftp = { version = "7.0.7", features = ["tokio", "tokio-rustls", "rustls"] }
+suppaftp = { version = "7.1.0", features = ["tokio", "tokio-rustls", "rustls"] }
 rcgen = "0.14.6"
 
 # Performance Analysis and Memory Profiling

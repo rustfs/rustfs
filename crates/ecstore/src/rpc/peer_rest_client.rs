@@ -27,7 +27,6 @@ use rustfs_madmin::{
     net::NetInfo,
 };
 use rustfs_protos::evict_failed_connection;
-use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_protos::proto_gen::node_service::{
     DeleteBucketMetadataRequest, DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest,
     GetMemInfoRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest,
@@ -35,6 +34,7 @@ use rustfs_protos::proto_gen::node_service::{
     LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
     LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest,
     ReloadSiteReplicationConfigRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StopRebalanceRequest,
+    node_service_client::NodeServiceClient,
 };
 use rustfs_utils::XHost;
 use serde::{Deserialize, Serialize as _};

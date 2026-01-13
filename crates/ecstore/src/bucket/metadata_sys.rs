@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::metadata::{BucketMetadata, load_bucket_metadata};
+use super::quota::BucketQuota;
+use super::target::BucketTargets;
 use crate::StorageAPI as _;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
@@ -20,6 +23,7 @@ use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
 use crate::store::ECStore;
 use futures::future::join_all;
+use lazy_static::lazy_static;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::ReplicationConfiguration;
@@ -35,12 +39,6 @@ use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::error;
-
-use super::metadata::{BucketMetadata, load_bucket_metadata};
-use super::quota::BucketQuota;
-use super::target::BucketTargets;
-
-use lazy_static::lazy_static;
 
 lazy_static! {
     pub static ref GLOBAL_BucketMetadataSys: OnceLock<Arc<RwLock<BucketMetadataSys>>> = OnceLock::new();
