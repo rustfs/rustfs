@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::error::{Error, Result};
-use super::{DiskInfo, error::DiskError};
+use crate::disk::error::{Error, Result};
+use crate::disk::{DiskInfo, error::DiskError};
 use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
 use uuid::Uuid;

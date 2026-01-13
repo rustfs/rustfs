@@ -12,15 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
+use crate::{
+    disk::{
+        CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
+        FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
+        WalkDirOptions,
+        disk_store::{
+            CHECK_EVERY, CHECK_TIMEOUT_DURATION, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
+            get_max_timeout_duration,
+        },
+        endpoint::Endpoint,
+        {
+            disk_store::DiskHealthTracker,
+            error::{DiskError, Error, Result},
+        },
+    },
+    rpc::build_auth_headers,
+    rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client},
 };
-
 use bytes::Bytes;
 use futures::lock::Mutex;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
+use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
     CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
     DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
@@ -28,37 +42,18 @@ use rustfs_protos::proto_gen::node_service::{
     StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
     node_service_client::NodeServiceClient,
 };
-use rustfs_utils::string::parse_bool_with_default;
-use tokio::time;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
-
-use crate::disk::{disk_store::DiskHealthTracker, error::DiskError};
-use crate::{
-    disk::error::{Error, Result},
-    rpc::build_auth_headers,
-};
-use crate::{
-    disk::{
-        CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-        disk_store::{
-            CHECK_EVERY, CHECK_TIMEOUT_DURATION, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
-            get_max_timeout_duration,
-        },
-        endpoint::Endpoint,
-    },
-    rpc::client::gen_tonic_signature_interceptor,
-};
-use crate::{
-    disk::{FileReader, FileWriter},
-    rpc::client::{TonicInterceptor, node_service_time_out_client},
-};
-use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
-use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_rio::{HttpReader, HttpWriter};
+use rustfs_utils::string::parse_bool_with_default;
+use std::{
+    path::PathBuf,
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
+use tokio::time;
 use tokio::{io::AsyncWrite, net::TcpStream, time::timeout};
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, service::interceptor::InterceptedService, transport::Channel};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug)]

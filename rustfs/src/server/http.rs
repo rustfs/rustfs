@@ -559,7 +559,7 @@ fn process_connection(
         let remote_addr = match socket.peer_addr() {
             Ok(addr) => Some(RemoteAddr(addr)),
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     error = %e,
                     "Failed to obtain peer address; policy evaluation may fall back to a default source IP"
                 );
@@ -762,7 +762,7 @@ fn get_listen_backlog() -> i32 {
     #[cfg(any(target_os = "netbsd", target_os = "macos", target_os = "freebsd"))]
     let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
     let mut buf = [0; 1];
-    let mut buf_len = std::mem::size_of_val(&buf);
+    let mut buf_len = size_of_val(&buf);
 
     if unsafe {
         libc::sysctl(

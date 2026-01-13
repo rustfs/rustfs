@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::error::DiskError;
+use crate::disk::error::DiskError;
 
 pub fn to_file_error(io_err: std::io::Error) -> std::io::Error {
     match io_err.kind() {

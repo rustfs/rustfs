@@ -14,9 +14,10 @@
 
 use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use async_trait::async_trait;
-use rustfs_lock::types::{LockId, LockMetadata, LockPriority};
-use rustfs_lock::{LockClient, LockError, LockInfo, LockResponse, LockStats, LockStatus, Result};
-use rustfs_lock::{LockRequest, LockType};
+use rustfs_lock::{
+    LockClient, LockError, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
+    types::{LockId, LockMetadata, LockPriority},
+};
 use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_protos::proto_gen::node_service::{GenerallyLockRequest, PingRequest};
 use std::collections::HashMap;

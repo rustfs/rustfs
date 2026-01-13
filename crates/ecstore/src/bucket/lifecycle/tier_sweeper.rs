@@ -18,14 +18,13 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
+use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
+use crate::global::GLOBAL_TierConfigMgr;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::io::Write;
 use xxhash_rust::xxh64;
-
-use super::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
-use super::lifecycle::{self, ObjectOpts};
-use crate::global::GLOBAL_TierConfigMgr;
 
 static XXHASH_SEED: u64 = 0;
 
