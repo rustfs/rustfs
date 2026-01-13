@@ -137,10 +137,10 @@ impl ConditionalCorsLayer {
             _ => None,
         };
 
-        if let Some(origin) = allowed_origin
-            && let Ok(header_value) = HeaderValue::from_str(&origin)
-        {
-            response_headers.insert("access-control-allow-origin", header_value);
+        if let Some(origin) = allowed_origin {
+            if let Ok(header_value) = HeaderValue::from_str(&origin) {
+                response_headers.insert("access-control-allow-origin", header_value);
+            }
         }
 
         // Allow all methods by default
