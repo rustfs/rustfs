@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::lifecycle;
+use crate::bucket::lifecycle::lifecycle;
 
 #[derive(Debug, Clone, Default)]
 pub enum LcEventSrc {

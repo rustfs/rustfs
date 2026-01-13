@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
-use tracing::{error, info, instrument, warn};
-
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
     disks_layout::DisksLayout,
     global::global_rustfs_port,
 };
-use std::io::{Error, Result};
+use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
+    io::{Error, Result},
     net::IpAddr,
 };
+use tracing::{error, info, instrument, warn};
 
 /// enum for setup type.
 #[derive(PartialEq, Eq, Debug, Clone)]

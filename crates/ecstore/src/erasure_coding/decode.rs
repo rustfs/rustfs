@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::BitrotReader;
-use super::Erasure;
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
+use crate::erasure_coding::{BitrotReader, Erasure};
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
 use std::io;
@@ -317,6 +316,7 @@ mod tests {
     use crate::{disk::error::DiskError, erasure_coding::BitrotWriter};
 
     use super::*;
+    use crate::erasure_coding::BitrotReader;
     use std::io::Cursor;
 
     #[tokio::test]
