@@ -55,75 +55,9 @@ use tower::ServiceBuilder;
 use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
-
-/// Parse CORS allowed origins from configuration
-/// Note: This function is currently unused as global CORS layer has been removed.
-/// S3 API CORS is handled by bucket-level configuration, console has its own CORS layer.
-#[allow(dead_code)]
-fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
-    use http::Method;
-
-    let cors_layer = CorsLayer::new()
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::HEAD,
-            Method::OPTIONS,
-        ])
-        .allow_headers(Any);
-
-    match origins {
-        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
-        Some(origins_str) => {
-            let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
-            if origins.is_empty() {
-                warn!("Empty CORS origins provided, using permissive CORS");
-                cors_layer.allow_origin(Any).expose_headers(Any)
-            } else {
-                // Parse origins with proper error handling
-                let mut valid_origins = Vec::new();
-                for origin in origins {
-                    match origin.parse::<http::HeaderValue>() {
-                        Ok(header_value) => {
-                            valid_origins.push(header_value);
-                        }
-                        Err(e) => {
-                            warn!("Invalid CORS origin '{}': {}", origin, e);
-                        }
-                    }
-                }
-
-                if valid_origins.is_empty() {
-                    warn!("No valid CORS origins found, using permissive CORS");
-                    cors_layer.allow_origin(Any).expose_headers(Any)
-                } else {
-                    info!("Endpoint CORS origins configured: {:?}", valid_origins);
-                    cors_layer.allow_origin(AllowOrigin::list(valid_origins)).expose_headers(Any)
-                }
-            }
-        }
-        None => {
-            debug!("No CORS origins configured for endpoint, using permissive CORS");
-            cors_layer.allow_origin(Any).expose_headers(Any)
-        }
-    }
-}
-
-/// Get CORS allowed origins from environment variables
-/// Note: This function is currently unused as global CORS layer has been removed.
-#[allow(dead_code)]
-fn get_cors_allowed_origins() -> String {
-    std::env::var(rustfs_config::ENV_CORS_ALLOWED_ORIGINS)
-        .unwrap_or_else(|_| rustfs_config::DEFAULT_CORS_ALLOWED_ORIGINS.to_string())
-        .parse::<String>()
-        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
-}
 
 pub async fn start_http_server(
     opt: &config::Opt,

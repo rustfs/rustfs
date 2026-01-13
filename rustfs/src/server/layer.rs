@@ -106,7 +106,7 @@ impl ConditionalCorsLayer {
         Self { cors_origins }
     }
 
-    fn is_bucket_level_path(path: &str) -> bool {
+    fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and special paths
         !path.starts_with(ADMIN_PREFIX)
             && !path.starts_with(RPC_PREFIX)
@@ -132,10 +132,10 @@ impl ConditionalCorsLayer {
             _ => None,
         };
 
-        if let Some(origin) = allowed_origin {
-            if let Ok(header_value) = HeaderValue::from_str(&origin) {
-                response_headers.insert("access-control-allow-origin", header_value);
-            }
+        if let Some(origin) = allowed_origin
+            && let Ok(header_value) = HeaderValue::from_str(&origin)
+        {
+            response_headers.insert("access-control-allow-origin", header_value);
         }
 
         // Allow all methods by default
@@ -187,7 +187,7 @@ where
     S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
-    ResBody: Send + 'static,
+    ResBody: Default + Send + 'static,
 {
     type Response = Response<ResBody>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -199,18 +199,49 @@ where
 
     fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
         let path = req.uri().path().to_string();
-        let is_bucket_level_api = ConditionalCorsLayer::is_bucket_level_path(&path);
+        let method = req.method().clone();
         let request_headers = req.headers().clone();
         let cors_origins = self.cors_origins.clone();
+        // Handle OPTIONS preflight requests - return response directly without calling handler
+        if method == Method::OPTIONS && request_headers.contains_key("origin") {
+            info!("OPTIONS preflight request for path: {}", path);
+
+            let path_trimmed = path.trim_start_matches('/');
+            let bucket = path_trimmed.split('/').next().unwrap_or("").to_string();
+            let method_clone = method.clone();
+            let request_headers_clone = request_headers.clone();
+
+            return Box::pin(async move {
+                let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+
+                if ConditionalCorsLayer::is_s3_path(&path)
+                    && !bucket.is_empty()
+                    && cors_origins.is_some()
+                    && let Some(cors_headers) =
+                        crate::storage::ecfs::apply_cors_headers(&bucket, &method_clone, &request_headers_clone).await
+                {
+                    for (key, value) in cors_headers.iter() {
+                        response.headers_mut().insert(key, value.clone());
+                    }
+                    return Ok(response);
+                }
+
+                let cors_layer = ConditionalCorsLayer {
+                    cors_origins: (*cors_origins).clone(),
+                };
+                cors_layer.apply_cors_headers(&request_headers_clone, response.headers_mut());
+
+                Ok(response)
+            });
+        }
 
         let mut inner = self.inner.clone();
         Box::pin(async move {
             let mut response = inner.call(req).await.map_err(Into::into)?;
 
-            // Apply CORS headers only to S3 API requests
-            if is_bucket_level_api
-                && request_headers.contains_key("origin")
-                && !response.headers().contains_key("access-control-allow-origin")
+            // Apply CORS headers only to S3 API requests (non-OPTIONS)
+            if cors_origins.is_none()
+                || (request_headers.contains_key("origin") && !response.headers().contains_key("access-control-allow-origin"))
             {
                 let cors_layer = ConditionalCorsLayer {
                     cors_origins: (*cors_origins).clone(),
