@@ -36,3 +36,4 @@ spec:
     requests:
       storage: {{ .logStorageSize }}
 {{- end }}
+{{- end }}
