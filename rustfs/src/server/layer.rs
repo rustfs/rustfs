@@ -106,14 +106,19 @@ impl ConditionalCorsLayer {
         Self { cors_origins }
     }
 
+    /// Exact paths that should be excluded from being treated as S3 paths.
+    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &[
+        "/health",
+        "/profile/cpu",
+        "/profile/memory",
+    ];
+
     fn is_s3_path(path: &str) -> bool {
-        // Exclude Admin, Console, RPC, and special paths
+        // Exclude Admin, Console, RPC, and configured special paths
         !path.starts_with(ADMIN_PREFIX)
             && !path.starts_with(RPC_PREFIX)
             && !is_console_path(path)
-            && path != "/health"
-            && path != "/profile/cpu"
-            && path != "/profile/memory"
+            && !Self::EXCLUDED_EXACT_PATHS.iter().any(|p| path == *p)
     }
 
     fn apply_cors_headers(&self, request_headers: &HeaderMap, response_headers: &mut HeaderMap) {
