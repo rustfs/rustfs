@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use crate::disk::error::{Error, Result};
-use crate::erasure_coding::decode::ParallelReader;
-use crate::erasure_coding::encode::MultiWriter;
 use crate::erasure_coding::BitrotReader;
 use crate::erasure_coding::BitrotWriterWrapper;
+use crate::erasure_coding::decode::ParallelReader;
+use crate::erasure_coding::encode::MultiWriter;
 use bytes::Bytes;
 use tokio::io::AsyncRead;
 use tracing::info;

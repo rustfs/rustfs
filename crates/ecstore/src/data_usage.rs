@@ -12,16 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    sync::{Arc, OnceLock},
-    time::{Duration, SystemTime},
-};
-use tokio::sync::RwLock;
 pub mod local_snapshot;
-use crate::error::Error;
+
 use crate::{
-    bucket::metadata_sys::get_replication_config, config::com::read_config, disk::DiskAPI, store::ECStore, store_api::StorageAPI,
+    bucket::metadata_sys::get_replication_config, config::com::read_config, disk::DiskAPI, error::Error, store::ECStore,
+    store_api::StorageAPI,
 };
 pub use local_snapshot::{
     DATA_USAGE_DIR, DATA_USAGE_STATE_DIR, LOCAL_USAGE_SNAPSHOT_VERSION, LocalUsageSnapshot, LocalUsageSnapshotMeta,
@@ -32,7 +27,13 @@ use rustfs_common::data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_utils::path::SLASH_SEPARATOR_STR;
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::{Arc, OnceLock},
+    time::{Duration, SystemTime},
+};
 use tokio::fs;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 // Data usage storage constants
@@ -108,7 +109,7 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
         Err(e) => {
             error!("Failed to read data usage info from backend: {}", e);
             if e == Error::ConfigNotFound {
-                debug!("Data usage config not found, building basic statistics");
+                info!("Data usage config not found, building basic statistics");
                 return build_basic_data_usage_info(store).await;
             }
             return Err(Error::other(e));

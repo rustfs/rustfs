@@ -311,12 +311,12 @@ impl Erasure {
 
 #[cfg(test)]
 mod tests {
-    use rustfs_utils::HashAlgorithm;
-
-    use crate::{disk::error::DiskError, erasure_coding::BitrotWriter};
-
     use super::*;
-    use crate::erasure_coding::BitrotReader;
+    use crate::{
+        disk::error::DiskError,
+        erasure_coding::{BitrotReader, BitrotWriter},
+    };
+    use rustfs_utils::HashAlgorithm;
     use std::io::Cursor;
 
     #[tokio::test]
