@@ -2634,54 +2634,54 @@ impl SetDisks {
 
             Some(fast_lock_guard)
 
-            // // Check if lock is already held
-            // let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
-            // let mut reuse_existing_lock = false;
-            // if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key) {
-            //     if lock_info.owner.as_ref() == self.locker_owner.as_str()
-            //         && matches!(lock_info.mode, rustfs_lock::fast_lock::types::LockMode::Exclusive)
-            //     {
-            //         reuse_existing_lock = true;
-            //         debug!("Reusing existing exclusive lock for object {} held by {}", object, self.locker_owner);
-            //     } else {
-            //         warn!("Lock already exists for object {}: {:?}", object, lock_info);
-            //     }
-            // } else {
-            //     info!("No existing lock found for object {}", object);
-            // }
+            // Check if lock is already held
+            let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
+            let mut reuse_existing_lock = false;
+            if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key) {
+                if lock_info.owner.as_ref() == self.locker_owner.as_str()
+                    && matches!(lock_info.mode, rustfs_lock::fast_lock::types::LockMode::Exclusive)
+                {
+                    reuse_existing_lock = true;
+                    debug!("Reusing existing exclusive lock for object {} held by {}", object, self.locker_owner);
+                } else {
+                    warn!("Lock already exists for object {}: {:?}", object, lock_info);
+                }
+            } else {
+                info!("No existing lock found for object {}", object);
+            }
 
-            // if reuse_existing_lock {
-            //     None
-            // } else {
-            //     let mut lock_result = None;
-            //     for i in 0..3 {
-            //         let start_time = Instant::now();
-            //         match self
-            //             .fast_lock_manager
-            //             .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-            //             .await
-            //         {
-            //             Ok(res) => {
-            //                 let elapsed = start_time.elapsed();
-            //                 info!(duration = ?elapsed, attempt = i + 1, "Write lock acquired");
-            //                 lock_result = Some(res);
-            //                 break;
-            //             }
-            //             Err(e) => {
-            //                 let elapsed = start_time.elapsed();
-            //                 info!(error = ?e, attempt = i + 1, duration = ?elapsed, "Lock acquisition failed, retrying");
-            //                 if i < 2 {
-            //                     tokio::time::sleep(Duration::from_millis(50 * (i as u64 + 1))).await;
-            //                 } else {
-            //                     let message = self.format_lock_error(bucket, object, "write", &e);
-            //                     error!("Failed to acquire write lock after retries: {}", message);
-            //                     return Err(DiskError::other(message));
-            //                 }
-            //             }
-            //         }
-            //     }
-            //     lock_result
-            // }
+            if reuse_existing_lock {
+                None
+            } else {
+                let mut lock_result = None;
+                for i in 0..3 {
+                    let start_time = Instant::now();
+                    match self
+                        .fast_lock_manager
+                        .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                        .await
+                    {
+                        Ok(res) => {
+                            let elapsed = start_time.elapsed();
+                            info!(duration = ?elapsed, attempt = i + 1, "Write lock acquired");
+                            lock_result = Some(res);
+                            break;
+                        }
+                        Err(e) => {
+                            let elapsed = start_time.elapsed();
+                            info!(error = ?e, attempt = i + 1, duration = ?elapsed, "Lock acquisition failed, retrying");
+                            if i < 2 {
+                                tokio::time::sleep(Duration::from_millis(50 * (i as u64 + 1))).await;
+                            } else {
+                                let message = self.format_lock_error(bucket, object, "write", &e);
+                                error!("Failed to acquire write lock after retries: {}", message);
+                                return Err(DiskError::other(message));
+                            }
+                        }
+                    }
+                }
+                lock_result
+            }
         } else {
             info!("Skipping lock acquisition (no_lock=true)");
             None
