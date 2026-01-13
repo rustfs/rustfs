@@ -15,6 +15,7 @@
 use crate::admin::console::is_console_path;
 use crate::server::hybrid::HybridBody;
 use crate::server::{ADMIN_PREFIX, RPC_PREFIX};
+use crate::storage::ecfs;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
 use hyper::body::Incoming;
 use std::future::Future;
@@ -107,11 +108,7 @@ impl ConditionalCorsLayer {
     }
 
     /// Exact paths that should be excluded from being treated as S3 paths.
-    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &[
-        "/health",
-        "/profile/cpu",
-        "/profile/memory",
-    ];
+    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &["/health", "/profile/cpu", "/profile/memory"];
 
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths
@@ -212,23 +209,20 @@ where
             info!("OPTIONS preflight request for path: {}", path);
 
             let path_trimmed = path.trim_start_matches('/');
-            let bucket = path_trimmed.split('/').next().unwrap_or("").to_string();
+            let bucket = path_trimmed.split('/').next().unwrap_or("").to_string(); // virtual host styple?
             let method_clone = method.clone();
             let request_headers_clone = request_headers.clone();
 
             return Box::pin(async move {
                 let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
 
-                if ConditionalCorsLayer::is_s3_path(&path)
-                    && !bucket.is_empty()
-                    && cors_origins.is_some()
-                    && let Some(cors_headers) =
-                        crate::storage::ecfs::apply_cors_headers(&bucket, &method_clone, &request_headers_clone).await
-                {
-                    for (key, value) in cors_headers.iter() {
-                        response.headers_mut().insert(key, value.clone());
+                if ConditionalCorsLayer::is_s3_path(&path) && !bucket.is_empty() && cors_origins.is_some() {
+                    if let Some(cors_headers) = ecfs::apply_cors_headers(&bucket, &method_clone, &request_headers_clone).await {
+                        for (key, value) in cors_headers.iter() {
+                            response.headers_mut().insert(key, value.clone());
+                        }
+                        return Ok(response);
                     }
-                    return Ok(response);
                 }
 
                 let cors_layer = ConditionalCorsLayer {
@@ -245,9 +239,7 @@ where
             let mut response = inner.call(req).await.map_err(Into::into)?;
 
             // Apply CORS headers only to S3 API requests (non-OPTIONS)
-            if cors_origins.is_none()
-                || (request_headers.contains_key("origin") && !response.headers().contains_key("access-control-allow-origin"))
-            {
+            if request_headers.contains_key("origin") && !response.headers().contains_key("access-control-allow-origin") {
                 let cors_layer = ConditionalCorsLayer {
                     cors_origins: (*cors_origins).clone(),
                 };

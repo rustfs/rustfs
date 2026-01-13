@@ -942,8 +942,10 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         let has_wildcard_origin = rule.allowed_origins.iter().any(|o| o == "*");
         if has_wildcard_origin {
             cors_headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
-        } else if let Ok(origin_value) = HeaderValue::from_str(origin) {
-            cors_headers.insert("access-control-allow-origin", origin_value);
+        } else {
+            if let Ok(origin_value) = HeaderValue::from_str(origin) {
+                cors_headers.insert("access-control-allow-origin", origin_value);
+            }
         }
 
         // Vary: Origin (required for caching, except when using wildcard)
@@ -960,36 +962,33 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         }
 
         // Access-Control-Allow-Headers (required for preflight if headers were requested)
-        if is_preflight && let Some(ref allowed_headers) = rule.allowed_headers {
-            let headers_str = allowed_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
-            if let Ok(headers_value) = HeaderValue::from_str(&headers_str) {
-                cors_headers.insert("access-control-allow-headers", headers_value);
+        if is_preflight {
+            if let Some(ref allowed_headers) = rule.allowed_headers {
+                let headers_str = allowed_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
+                if let Ok(headers_value) = HeaderValue::from_str(&headers_str) {
+                    cors_headers.insert("access-control-allow-headers", headers_value);
+                }
             }
         }
 
         // Access-Control-Expose-Headers (for actual requests)
-        if !is_preflight && let Some(ref expose_headers) = rule.expose_headers {
-            let expose_headers_str = expose_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
-            if let Ok(expose_value) = HeaderValue::from_str(&expose_headers_str) {
-                cors_headers.insert("access-control-expose-headers", expose_value);
+        if !is_preflight {
+            if let Some(ref expose_headers) = rule.expose_headers {
+                let expose_headers_str = expose_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
+                if let Ok(expose_value) = HeaderValue::from_str(&expose_headers_str) {
+                    cors_headers.insert("access-control-expose-headers", expose_value);
+                }
             }
         }
 
         // Access-Control-Max-Age (for preflight requests)
-        if is_preflight
-            && let Some(max_age) = rule.max_age_seconds
-            && let Ok(max_age_value) = HeaderValue::from_str(&max_age.to_string())
-        {
-            cors_headers.insert("access-control-max-age", max_age_value);
+        if is_preflight {
+            if let Some(max_age) = rule.max_age_seconds {
+                if let Ok(max_age_value) = HeaderValue::from_str(&max_age.to_string()) {
+                    cors_headers.insert("access-control-max-age", max_age_value);
+                }
+            }
         }
-
-        // Access-Control-Allow-Credentials (if needed, based on origin)
-        // Note: Cannot use wildcard origin with credentials
-        // S3 doesn't typically set this, but included for completeness
-        // Uncomment if credentials support is needed:
-        // if !has_wildcard_origin {
-        //     cors_headers.insert("access-control-allow-credentials", HeaderValue::from_static("true"));
-        // }
 
         return Some(cors_headers);
     }
