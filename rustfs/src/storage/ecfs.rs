@@ -853,16 +853,12 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         return None;
     }
 
-    // Convert HTTP method to string for matching
-    let method_str = match method.as_str() {
-        "GET" => "GET",
-        "PUT" => "PUT",
-        "POST" => "POST",
-        "DELETE" => "DELETE",
-        "HEAD" => "HEAD",
-        "OPTIONS" => "OPTIONS",
-        _ => return None,
-    };
+    // Check if method is supported and get its string representation
+    const SUPPORTED_METHODS: &[&str] = &["GET", "PUT", "POST", "DELETE", "HEAD", "OPTIONS"];
+    let method_str = method.as_str();
+    if !SUPPORTED_METHODS.contains(&method_str) {
+        return None;
+    }
 
     // For OPTIONS (preflight) requests, check Access-Control-Request-Method
     let is_preflight = method == http::Method::OPTIONS;
@@ -942,10 +938,8 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         let has_wildcard_origin = rule.allowed_origins.iter().any(|o| o == "*");
         if has_wildcard_origin {
             cors_headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
-        } else {
-            if let Ok(origin_value) = HeaderValue::from_str(origin) {
-                cors_headers.insert("access-control-allow-origin", origin_value);
-            }
+        } else if let Ok(origin_value) = HeaderValue::from_str(origin) {
+            cors_headers.insert("access-control-allow-origin", origin_value);
         }
 
         // Vary: Origin (required for caching, except when using wildcard)
@@ -962,31 +956,25 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         }
 
         // Access-Control-Allow-Headers (required for preflight if headers were requested)
-        if is_preflight {
-            if let Some(ref allowed_headers) = rule.allowed_headers {
-                let headers_str = allowed_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
-                if let Ok(headers_value) = HeaderValue::from_str(&headers_str) {
-                    cors_headers.insert("access-control-allow-headers", headers_value);
-                }
+        if is_preflight && let Some(ref allowed_headers) = rule.allowed_headers {
+            let headers_str = allowed_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
+            if let Ok(headers_value) = HeaderValue::from_str(&headers_str) {
+                cors_headers.insert("access-control-allow-headers", headers_value);
             }
         }
 
         // Access-Control-Expose-Headers (for actual requests)
-        if !is_preflight {
-            if let Some(ref expose_headers) = rule.expose_headers {
-                let expose_headers_str = expose_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
-                if let Ok(expose_value) = HeaderValue::from_str(&expose_headers_str) {
-                    cors_headers.insert("access-control-expose-headers", expose_value);
-                }
+        if !is_preflight && let Some(ref expose_headers) = rule.expose_headers {
+            let expose_headers_str = expose_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
+            if let Ok(expose_value) = HeaderValue::from_str(&expose_headers_str) {
+                cors_headers.insert("access-control-expose-headers", expose_value);
             }
         }
 
         // Access-Control-Max-Age (for preflight requests)
-        if is_preflight {
-            if let Some(max_age) = rule.max_age_seconds {
-                if let Ok(max_age_value) = HeaderValue::from_str(&max_age.to_string()) {
-                    cors_headers.insert("access-control-max-age", max_age_value);
-                }
+        if is_preflight && let Some(max_age) = rule.max_age_seconds {
+            if let Ok(max_age_value) = HeaderValue::from_str(&max_age.to_string()) {
+                cors_headers.insert("access-control-max-age", max_age_value);
             }
         }
 

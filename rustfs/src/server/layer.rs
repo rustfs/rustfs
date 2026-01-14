@@ -115,7 +115,7 @@ impl ConditionalCorsLayer {
         !path.starts_with(ADMIN_PREFIX)
             && !path.starts_with(RPC_PREFIX)
             && !is_console_path(path)
-            && !Self::EXCLUDED_EXACT_PATHS.iter().any(|p| path == *p)
+            && Self::EXCLUDED_EXACT_PATHS.contains(&path)
     }
 
     fn apply_cors_headers(&self, request_headers: &HeaderMap, response_headers: &mut HeaderMap) {
@@ -134,11 +134,17 @@ impl ConditionalCorsLayer {
             _ => None,
         };
 
-        if let Some(origin) = allowed_origin {
-            if let Ok(header_value) = HeaderValue::from_str(&origin) {
+        // Track whether we're using a specific origin (not wildcard)
+        let using_specific_origin = if let Some(origin) = &allowed_origin {
+            if let Ok(header_value) = HeaderValue::from_str(origin) {
                 response_headers.insert("access-control-allow-origin", header_value);
+                true // Using specific origin, credentials allowed
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
 
         // Allow all methods by default
         response_headers.insert(
@@ -155,8 +161,11 @@ impl ConditionalCorsLayer {
             HeaderValue::from_static("x-request-id, content-type, content-length, etag"),
         );
 
-        // Allow credentials if needed
-        response_headers.insert("access-control-allow-credentials", HeaderValue::from_static("true"));
+        // Only set credentials when using a specific origin (not wildcard)
+        // CORS spec: credentials cannot be used with wildcard origins
+        if using_specific_origin {
+            response_headers.insert("access-control-allow-credentials", HeaderValue::from_static("true"));
+        }
     }
 }
 
@@ -216,13 +225,15 @@ where
             return Box::pin(async move {
                 let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
 
-                if ConditionalCorsLayer::is_s3_path(&path) && !bucket.is_empty() && cors_origins.is_some() {
-                    if let Some(cors_headers) = ecfs::apply_cors_headers(&bucket, &method_clone, &request_headers_clone).await {
-                        for (key, value) in cors_headers.iter() {
-                            response.headers_mut().insert(key, value.clone());
-                        }
-                        return Ok(response);
+                if ConditionalCorsLayer::is_s3_path(&path)
+                    && !bucket.is_empty()
+                    && cors_origins.is_some()
+                    && let Some(cors_headers) = ecfs::apply_cors_headers(&bucket, &method_clone, &request_headers_clone).await
+                {
+                    for (key, value) in cors_headers.iter() {
+                        response.headers_mut().insert(key, value.clone());
                     }
+                    return Ok(response);
                 }
 
                 let cors_layer = ConditionalCorsLayer {
