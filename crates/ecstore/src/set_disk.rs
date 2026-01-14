@@ -6342,7 +6342,7 @@ fn is_object_dang_ling(
     }
 
     if !valid_meta.is_valid() {
-        let data_blocks = (meta_arr.len() + 1) / 2;
+        let data_blocks = meta_arr.len().div_ceil(2);
         if not_found_parts_errs > data_blocks {
             return (valid_meta, true);
         }
@@ -6355,7 +6355,7 @@ fn is_object_dang_ling(
     }
 
     if valid_meta.deleted {
-        let data_blocks = (errs.len() + 1) / 2;
+        let data_blocks = errs.len().div_ceil(2);
         return (valid_meta, not_found_meta_errs > data_blocks);
     }
 
@@ -6697,7 +6697,7 @@ async fn disks_with_all_parts(
     // Build dataErrsByDisk from dataErrsByPart
     for (part, disks) in data_errs_by_part.iter() {
         for disk_idx in disks.iter() {
-            if let Some(parts) = data_errs_by_disk.get_mut(&disk_idx)
+            if let Some(parts) = data_errs_by_disk.get_mut(disk_idx)
                 && *part < parts.len()
             {
                 parts[*part] = disks[*disk_idx];
