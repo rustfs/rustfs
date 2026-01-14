@@ -2630,9 +2630,9 @@ impl SetDisks {
         let _write_lock_guard = if !opts.no_lock {
             info!("Acquiring write lock for object: {}, owner: {}", object, self.locker_owner);
 
-            let fast_lock_guard = self.new_ns_lock(bucket, object).await?;
+            // let fast_lock_guard = self.new_ns_lock(bucket, object).await?;
 
-            Some(fast_lock_guard)
+            // Some(fast_lock_guard)
 
             // Check if lock is already held
             let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
