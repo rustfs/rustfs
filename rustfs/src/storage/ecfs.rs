@@ -18,6 +18,7 @@ use crate::config::workload_profiles::{
 };
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
+use crate::server::cors;
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
@@ -822,7 +823,7 @@ async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store
 /// This avoids unnecessary function calls for non-CORS requests
 #[inline]
 fn needs_cors_processing(headers: &HeaderMap) -> bool {
-    headers.contains_key("origin")
+    headers.contains_key(cors::standard::ORIGIN)
 }
 
 /// Apply CORS headers to response based on bucket CORS configuration and request origin
@@ -840,7 +841,7 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
     use http::HeaderValue;
 
     // Get Origin header from request
-    let origin = headers.get("origin")?.to_str().ok()?;
+    let origin = headers.get(cors::standard::ORIGIN)?.to_str().ok()?;
 
     // Get CORS configuration for the bucket
     let cors_config = match metadata_sys::get_cors_config(bucket).await {
@@ -864,7 +865,7 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
     let is_preflight = method == http::Method::OPTIONS;
     let requested_method = if is_preflight {
         headers
-            .get("access-control-request-method")
+            .get(cors::request::ACCESS_CONTROL_REQUEST_METHOD)
             .and_then(|v| v.to_str().ok())
             .unwrap_or(method_str)
     } else {
@@ -874,7 +875,7 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
     // Get requested headers from preflight request
     let requested_headers = if is_preflight {
         headers
-            .get("access-control-request-headers")
+            .get(cors::request::ACCESS_CONTROL_REQUEST_HEADERS)
             .and_then(|v| v.to_str().ok())
             .map(|h| h.split(',').map(|s| s.trim().to_lowercase()).collect::<Vec<_>>())
     } else {
@@ -931,27 +932,27 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         }
 
         // Found matching rule, build response headers
-        let mut cors_headers = HeaderMap::new();
+        let mut response_headers = HeaderMap::new();
 
         // Access-Control-Allow-Origin
         // If origin is "*", use "*", otherwise echo back the origin
         let has_wildcard_origin = rule.allowed_origins.iter().any(|o| o == "*");
         if has_wildcard_origin {
-            cors_headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
         } else if let Ok(origin_value) = HeaderValue::from_str(origin) {
-            cors_headers.insert("access-control-allow-origin", origin_value);
+            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
         }
 
         // Vary: Origin (required for caching, except when using wildcard)
         if !has_wildcard_origin {
-            cors_headers.insert("vary", HeaderValue::from_static("Origin"));
+            response_headers.insert(cors::standard::VARY, HeaderValue::from_static("Origin"));
         }
 
         // Access-Control-Allow-Methods (required for preflight)
         if is_preflight || !rule.allowed_methods.is_empty() {
             let methods_str = rule.allowed_methods.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ");
             if let Ok(methods_value) = HeaderValue::from_str(&methods_str) {
-                cors_headers.insert("access-control-allow-methods", methods_value);
+                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_METHODS, methods_value);
             }
         }
 
@@ -959,7 +960,7 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         if is_preflight && let Some(ref allowed_headers) = rule.allowed_headers {
             let headers_str = allowed_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
             if let Ok(headers_value) = HeaderValue::from_str(&headers_str) {
-                cors_headers.insert("access-control-allow-headers", headers_value);
+                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_HEADERS, headers_value);
             }
         }
 
@@ -967,23 +968,23 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         if !is_preflight && let Some(ref expose_headers) = rule.expose_headers {
             let expose_headers_str = expose_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
             if let Ok(expose_value) = HeaderValue::from_str(&expose_headers_str) {
-                cors_headers.insert("access-control-expose-headers", expose_value);
+                response_headers.insert(cors::response::ACCESS_CONTROL_EXPOSE_HEADERS, expose_value);
             }
         }
 
         // Access-Control-Max-Age (for preflight requests)
-        if is_preflight && let Some(max_age) = rule.max_age_seconds {
-            if let Ok(max_age_value) = HeaderValue::from_str(&max_age.to_string()) {
-                cors_headers.insert("access-control-max-age", max_age_value);
-            }
+        if is_preflight
+            && let Some(max_age) = rule.max_age_seconds
+            && let Ok(max_age_value) = HeaderValue::from_str(&max_age.to_string())
+        {
+            response_headers.insert(cors::response::ACCESS_CONTROL_MAX_AGE, max_age_value);
         }
 
-        return Some(cors_headers);
+        return Some(response_headers);
     }
 
-    None // No matching rule found
+    None // No matching rule found}
 }
-
 /// Check if an origin matches a pattern (supports wildcards like https://*.example.com)
 fn matches_origin_pattern(pattern: &str, origin: &str) -> bool {
     // Simple wildcard matching: * matches any sequence

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::console::is_console_path;
+use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{ADMIN_PREFIX, RPC_PREFIX};
 use crate::storage::ecfs;
@@ -120,7 +121,7 @@ impl ConditionalCorsLayer {
 
     fn apply_cors_headers(&self, request_headers: &HeaderMap, response_headers: &mut HeaderMap) {
         let origin = request_headers
-            .get("origin")
+            .get(cors::standard::ORIGIN)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
@@ -137,7 +138,7 @@ impl ConditionalCorsLayer {
         // Track whether we're using a specific origin (not wildcard)
         let using_specific_origin = if let Some(origin) = &allowed_origin {
             if let Ok(header_value) = HeaderValue::from_str(origin) {
-                response_headers.insert("access-control-allow-origin", header_value);
+                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, header_value);
                 true // Using specific origin, credentials allowed
             } else {
                 false
@@ -148,23 +149,23 @@ impl ConditionalCorsLayer {
 
         // Allow all methods by default
         response_headers.insert(
-            "access-control-allow-methods",
+            cors::response::ACCESS_CONTROL_ALLOW_METHODS,
             HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH"),
         );
 
         // Allow all headers by default
-        response_headers.insert("access-control-allow-headers", HeaderValue::from_static("*"));
+        response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"));
 
         // Expose common headers
         response_headers.insert(
-            "access-control-expose-headers",
+            cors::response::ACCESS_CONTROL_EXPOSE_HEADERS,
             HeaderValue::from_static("x-request-id, content-type, content-length, etag"),
         );
 
         // Only set credentials when using a specific origin (not wildcard)
         // CORS spec: credentials cannot be used with wildcard origins
         if using_specific_origin {
-            response_headers.insert("access-control-allow-credentials", HeaderValue::from_static("true"));
+            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
         }
     }
 }
@@ -214,7 +215,7 @@ where
         let request_headers = req.headers().clone();
         let cors_origins = self.cors_origins.clone();
         // Handle OPTIONS preflight requests - return response directly without calling handler
-        if method == Method::OPTIONS && request_headers.contains_key("origin") {
+        if method == Method::OPTIONS && request_headers.contains_key(cors::standard::ORIGIN) {
             info!("OPTIONS preflight request for path: {}", path);
 
             let path_trimmed = path.trim_start_matches('/');
@@ -250,7 +251,9 @@ where
             let mut response = inner.call(req).await.map_err(Into::into)?;
 
             // Apply CORS headers only to S3 API requests (non-OPTIONS)
-            if request_headers.contains_key("origin") && !response.headers().contains_key("access-control-allow-origin") {
+            if request_headers.contains_key(cors::standard::ORIGIN)
+                && !response.headers().contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN)
+            {
                 let cors_layer = ConditionalCorsLayer {
                     cors_origins: (*cors_origins).clone(),
                 };
