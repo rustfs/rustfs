@@ -873,6 +873,8 @@ impl S3 for FS {
             sse_customer_key_md5,
             metadata_directive,
             metadata,
+            copy_source_if_match,
+            copy_source_if_none_match,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -947,6 +949,30 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let mut src_info = gr.object_info.clone();
+
+        // Validate copy source conditions
+        if let Some(if_match) = copy_source_if_match {
+            if let Some(ref etag) = src_info.etag {
+                if let Some(strong_etag) = if_match.into_etag() {
+                    if ETag::Strong(etag.clone()) != strong_etag {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
+                } else {
+                    // Weak ETag or Any (*) in If-Match should fail per RFC 9110
+                    return Err(s3_error!(PreconditionFailed));
+                }
+            } else {
+                return Err(s3_error!(PreconditionFailed));
+            }
+        }
+
+        if let Some(if_none_match) = copy_source_if_none_match
+            && let Some(ref etag) = src_info.etag
+            && let Some(strong_etag) = if_none_match.into_etag()
+            && ETag::Strong(etag.clone()) == strong_etag
+        {
+            return Err(s3_error!(PreconditionFailed));
+        }
 
         if cp_src_dst_same {
             src_info.metadata_only = true;
