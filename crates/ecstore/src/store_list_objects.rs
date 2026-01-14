@@ -410,13 +410,13 @@ impl ECStore {
             ..Default::default()
         };
 
-        let mut list_result = match self.list_path(&opts).await {
-            Ok(res) => res,
-            Err(err) => MetaCacheEntriesSortedResult {
+        let mut list_result = self
+            .list_path(&opts)
+            .await
+            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
                 err: Some(err.into()),
                 ..Default::default()
-            },
-        };
+            });
 
         if let Some(err) = list_result.err.clone()
             && err != rustfs_filemeta::Error::Unexpected
@@ -988,7 +988,7 @@ async fn gather_results(
         }
 
         if let Some(marker) = &opts.marker
-            && &entry.name < marker
+            && &entry.name <= marker
         {
             continue;
         }
@@ -1476,7 +1476,6 @@ mod test {
     // use crate::error::Error;
     // use crate::metacache::writer::MetacacheReader;
     // use crate::set_disk::SetDisks;
-    // use crate::store::ECStore;
     // use crate::store_list_objects::ListPathOptions;
     // use crate::store_list_objects::WalkOptions;
     // use crate::store_list_objects::WalkVersionsSortOrder;
