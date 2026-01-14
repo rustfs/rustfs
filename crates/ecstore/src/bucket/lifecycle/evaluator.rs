@@ -62,15 +62,14 @@ impl Evaluator {
         if self.repl_cfg.is_none() {
             return false;
         }
-        if let Some(rcfg) = &self.repl_cfg {
-            if rcfg
+        if let Some(rcfg) = &self.repl_cfg
+            && rcfg
                 .config
                 .as_ref()
                 .is_some_and(|config| config.has_active_rules(obj.name.as_str(), true))
-                && !obj.version_purge_status.is_empty()
-            {
-                return true;
-            }
+            && !obj.version_purge_status.is_empty()
+        {
+            return true;
         }
         false
     }
@@ -105,10 +104,10 @@ impl Evaluator {
             .is_some_and(|v| matches!(v.as_str(), ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE))
         {
             let t = utc_now_ntp();
-            if let Some(retain_until) = ret.retain_until_date {
-                if OffsetDateTime::from(retain_until).gt(&t) {
-                    return true;
-                }
+            if let Some(retain_until) = ret.retain_until_date
+                && OffsetDateTime::from(retain_until).gt(&t)
+            {
+                return true;
             }
         }
         false
