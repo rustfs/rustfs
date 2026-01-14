@@ -1155,9 +1155,16 @@ impl TargetClient {
         body: ByteStream,
         opts: &PutObjectOptions,
     ) -> Result<(), S3ClientError> {
-        let headers = opts.header();
+        let mut headers = opts.header();
 
         let builder = self.client.put_object();
+
+        let version_id = opts.internal.source_version_id.clone();
+        if !version_id.is_empty()
+            && let Ok(header_value) = HeaderValue::from_str(&version_id)
+        {
+            headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
+        }
 
         match builder
             .bucket(bucket)
@@ -1186,9 +1193,33 @@ impl TargetClient {
         &self,
         bucket: &str,
         object: &str,
-        _opts: &PutObjectOptions,
+        opts: &PutObjectOptions,
     ) -> Result<String, S3ClientError> {
-        match self.client.create_multipart_upload().bucket(bucket).key(object).send().await {
+        let mut headers = HeaderMap::new();
+        let version_id = opts.internal.source_version_id.clone();
+        if !version_id.is_empty()
+            && let Ok(header_value) = HeaderValue::from_str(&version_id)
+        {
+            headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
+        }
+
+        match self
+            .client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(object)
+            .customize()
+            .map_request(move |mut req| {
+                for (k, v) in headers.clone().into_iter() {
+                    let key_str = k.unwrap().as_str().to_string();
+                    let value_str = v.to_str().unwrap_or("").to_string();
+                    req.headers_mut().insert(key_str, value_str);
+                }
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+        {
             Ok(res) => Ok(res.upload_id.unwrap_or_default()),
             Err(e) => Err(e.into()),
         }
