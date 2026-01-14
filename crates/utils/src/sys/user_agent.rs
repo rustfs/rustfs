@@ -65,7 +65,10 @@ impl UserAgent {
         }
     }
 
-    /// Obtain operating system platform information (cached)
+    /// Obtain operating system platform information using a thread-safe cache.
+    ///
+    /// The value is computed once on first use via `OnceLock` and then reused
+    /// for all subsequent calls for the lifetime of the program.
     fn get_os_platform() -> &'static str {
         OS_PLATFORM.get_or_init(|| {
             if cfg!(target_os = "windows") {
