@@ -12,18 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Azure Cloud metadata fetching implementation
+//! Azure Cloud metadata fetching implementation for identifying trusted proxy ranges.
 
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
+use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::cloud::detector::CloudMetadataFetcher;
 use crate::error::AppError;
 
-/// Azure 元数据获取器
+/// Fetcher for Azure-specific metadata.
 #[derive(Debug, Clone)]
 pub struct AzureMetadataFetcher {
     client: Client,
@@ -31,7 +32,7 @@ pub struct AzureMetadataFetcher {
 }
 
 impl AzureMetadataFetcher {
-    /// 创建新的 Azure 元数据获取器
+    /// Creates a new `AzureMetadataFetcher`.
     pub fn new() -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(2))
@@ -44,7 +45,7 @@ impl AzureMetadataFetcher {
         }
     }
 
-    /// 获取 Azure 元数据
+    /// Retrieves metadata from the Azure Instance Metadata Service (IMDS).
     async fn get_metadata(&self, path: &str) -> Result<String, AppError> {
         let url = format!("{}/metadata/{}?api-version=2021-05-01", self.metadata_endpoint, path);
 
@@ -56,7 +57,7 @@ impl AzureMetadataFetcher {
                     let text = response
                         .text()
                         .await
-                        .map_err(|e| AppError::cloud(format!("Failed to read response: {}", e)))?;
+                        .map_err(|e| AppError::cloud(format!("Failed to read Azure metadata response: {}", e)))?;
                     Ok(text)
                 } else {
                     debug!("Azure metadata request failed with status: {}", response.status());
@@ -70,9 +71,9 @@ impl AzureMetadataFetcher {
         }
     }
 
-    /// 从 Microsoft 下载 IP 范围
+    /// Fetches Azure public IP ranges from the official Microsoft download source.
     async fn fetch_azure_ip_ranges(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
-        // Azure 官方 IP 范围下载 URL
+        // Official Azure IP ranges download URL (periodically updated).
         let url =
             "https://download.microsoft.com/download/7/1/D/71D86715-5596-4529-9B13-DA13A5DE5B63/ServiceTags_Public_20231211.json";
 
@@ -83,7 +84,6 @@ impl AzureMetadataFetcher {
 
         #[derive(Debug, Deserialize)]
         struct AzureServiceTag {
-            id: String,
             name: String,
             properties: AzureServiceTagProperties,
         }
@@ -91,8 +91,6 @@ impl AzureMetadataFetcher {
         #[derive(Debug, Deserialize)]
         struct AzureServiceTagProperties {
             address_prefixes: Vec<String>,
-            region: Option<String>,
-            system_service: Option<String>,
         }
 
         debug!("Fetching Azure IP ranges from: {}", url);
@@ -103,12 +101,12 @@ impl AzureMetadataFetcher {
                     let service_tags: AzureServiceTags = response
                         .json()
                         .await
-                        .map_err(|e| AppError::cloud(format!("Failed to parse Azure IP ranges: {}", e)))?;
+                        .map_err(|e| AppError::cloud(format!("Failed to parse Azure IP ranges JSON: {}", e)))?;
 
                     let mut networks = Vec::new();
 
                     for tag in service_tags.values {
-                        // 只包含 Azure 数据中心和前端服务的 IP 范围
+                        // Include general Azure datacenter ranges, excluding specific internal services.
                         if tag.name.contains("Azure") && !tag.name.contains("ActiveDirectory") {
                             for prefix in tag.properties.address_prefixes {
                                 if let Ok(network) = ipnetwork::IpNetwork::from_str(&prefix) {
@@ -118,25 +116,24 @@ impl AzureMetadataFetcher {
                         }
                     }
 
-                    info!("Fetched {} Azure public IP ranges", networks.len());
+                    info!("Successfully fetched {} Azure public IP ranges", networks.len());
                     Ok(networks)
                 } else {
-                    debug!("Failed to fetch Azure IP ranges: {}", response.status());
+                    debug!("Failed to fetch Azure IP ranges: HTTP {}", response.status());
                     Ok(Vec::new())
                 }
             }
             Err(e) => {
                 debug!("Failed to fetch Azure IP ranges: {}", e);
-                // 如果 API 失败，返回默认的 Azure IP 范围
+                // Fallback to hardcoded ranges if the download fails.
                 Self::default_azure_ranges()
             }
         }
     }
 
-    /// 默认 Azure IP 范围（作为备选）
+    /// Returns a set of default Azure IP ranges as a fallback.
     fn default_azure_ranges() -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
         let ranges = vec![
-            // Azure 全球 IP 范围
             "13.64.0.0/11",
             "13.96.0.0/13",
             "13.104.0.0/14",
@@ -199,7 +196,6 @@ impl AzureMetadataFetcher {
             "168.62.0.0/15",
             "191.233.0.0/18",
             "193.149.0.0/19",
-            // IPv6 范围
             "2603:1000::/40",
             "2603:1010::/40",
             "2603:1020::/40",
@@ -223,7 +219,7 @@ impl AzureMetadataFetcher {
 
         match networks {
             Ok(networks) => {
-                debug!("Using default Azure IP ranges");
+                debug!("Using default Azure public IP ranges");
                 Ok(networks)
             }
             Err(e) => Err(AppError::cloud(format!("Failed to parse default Azure ranges: {}", e))),
@@ -238,7 +234,7 @@ impl CloudMetadataFetcher for AzureMetadataFetcher {
     }
 
     async fn fetch_network_cidrs(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
-        // 尝试从 Azure 元数据获取网络信息
+        // Attempt to fetch network interface information from Azure IMDS.
         match self.get_metadata("instance/network/interface").await {
             Ok(metadata) => {
                 #[derive(Debug, Deserialize)]
@@ -258,7 +254,7 @@ impl CloudMetadataFetcher for AzureMetadataFetcher {
                 }
 
                 let interfaces: Vec<AzureNetworkInterface> = serde_json::from_str(&metadata)
-                    .map_err(|e| AppError::cloud(format!("Failed to parse Azure network metadata: {}", e)))?;
+                    .map_err(|e| AppError::cloud(format!("Failed to parse Azure network metadata JSON: {}", e)))?;
 
                 let mut cidrs = Vec::new();
                 for interface in interfaces {
@@ -271,17 +267,15 @@ impl CloudMetadataFetcher for AzureMetadataFetcher {
                 }
 
                 if !cidrs.is_empty() {
-                    info!("Fetched {} network CIDRs from Azure metadata", cidrs.len());
+                    info!("Successfully fetched {} network CIDRs from Azure metadata", cidrs.len());
                     Ok(cidrs)
                 } else {
-                    // 如果元数据中没有网络信息，使用默认的 Azure VNet 范围
-                    debug!("No network CIDRs found in Azure metadata, using defaults");
+                    debug!("No network CIDRs found in Azure metadata, falling back to defaults");
                     Self::default_azure_network_ranges()
                 }
             }
             Err(e) => {
                 warn!("Failed to fetch Azure network metadata: {}", e);
-                // 元数据获取失败，使用默认范围
                 Self::default_azure_network_ranges()
             }
         }
@@ -293,25 +287,24 @@ impl CloudMetadataFetcher for AzureMetadataFetcher {
 }
 
 impl AzureMetadataFetcher {
-    /// 默认 Azure 网络范围
+    /// Returns a set of default Azure VNet ranges as a fallback.
     fn default_azure_network_ranges() -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
-        // Azure 虚拟网络的常见 IP 范围
         let ranges = vec![
-            "10.0.0.0/8",     // 大型虚拟网络
-            "172.16.0.0/12",  // 中型虚拟网络
-            "192.168.0.0/16", // 小型虚拟网络
-            "100.64.0.0/10",  // Azure 保留范围
-            "192.0.0.0/24",   // Azure 保留
+            "10.0.0.0/8",     // Large VNets
+            "172.16.0.0/12",  // Medium VNets
+            "192.168.0.0/16", // Small VNets
+            "100.64.0.0/10",  // Azure reserved range
+            "192.0.0.0/24",   // Azure reserved
         ];
 
         let networks: Result<Vec<_>, _> = ranges.into_iter().map(|s| ipnetwork::IpNetwork::from_str(s)).collect();
 
         match networks {
             Ok(networks) => {
-                debug!("Using default Azure network ranges");
+                debug!("Using default Azure VNet network ranges");
                 Ok(networks)
             }
-            Err(e) => Err(AppError::cloud(format!("Failed to parse default network ranges: {}", e))),
+            Err(e) => Err(AppError::cloud(format!("Failed to parse default Azure network ranges: {}", e))),
         }
     }
 }

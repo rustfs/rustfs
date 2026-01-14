@@ -12,22 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! IP address utility functions
+//! IP address utility functions for validation and classification.
 
 use ipnetwork::IpNetwork;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
-/// IP 工具函数集合
+/// Collection of IP-related utility functions.
 pub struct IpUtils;
 
 impl IpUtils {
-    /// 检查 IP 地址是否有效
+    /// Checks if an IP address is valid for general use (not unspecified, multicast, or reserved).
     pub fn is_valid_ip_address(ip: &IpAddr) -> bool {
         !ip.is_unspecified() && !ip.is_multicast() && !Self::is_reserved_ip(ip)
     }
 
-    /// 检查 IP 是否为保留地址
+    /// Checks if an IP address belongs to a reserved range.
     pub fn is_reserved_ip(ip: &IpAddr) -> bool {
         match ip {
             IpAddr::V4(ipv4) => Self::is_reserved_ipv4(ipv4),
@@ -35,11 +35,11 @@ impl IpUtils {
         }
     }
 
-    /// 检查 IPv4 是否为保留地址
+    /// Checks if an IPv4 address belongs to a reserved range.
     pub fn is_reserved_ipv4(ip: &Ipv4Addr) -> bool {
         let octets = ip.octets();
 
-        // 检查常见的保留地址范围
+        // Check common reserved IPv4 ranges
         matches!(
             octets,
             [0, _, _, _] |           // 0.0.0.0/8
@@ -60,11 +60,11 @@ impl IpUtils {
         )
     }
 
-    /// 检查 IPv6 是否为保留地址
+    /// Checks if an IPv6 address belongs to a reserved range.
     pub fn is_reserved_ipv6(ip: &Ipv6Addr) -> bool {
         let segments = ip.segments();
 
-        // 检查常见的保留地址范围
+        // Check common reserved IPv6 ranges
         matches!(
             segments,
             [0, 0, 0, 0, 0, 0, 0, 0] |                          // ::/128
@@ -76,7 +76,7 @@ impl IpUtils {
         )
     }
 
-    /// 检查 IP 是否为私有地址
+    /// Checks if an IP address is a private address.
     pub fn is_private_ip(ip: &IpAddr) -> bool {
         match ip {
             IpAddr::V4(ipv4) => Self::is_private_ipv4(ipv4),
@@ -84,7 +84,7 @@ impl IpUtils {
         }
     }
 
-    /// 检查 IPv4 是否为私有地址
+    /// Checks if an IPv4 address is a private address.
     pub fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
         let octets = ip.octets();
 
@@ -96,7 +96,7 @@ impl IpUtils {
         )
     }
 
-    /// 检查 IPv6 是否为私有地址
+    /// Checks if an IPv6 address is a private address.
     pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
         let segments = ip.segments();
 
@@ -106,7 +106,7 @@ impl IpUtils {
         )
     }
 
-    /// 检查 IP 是否为回环地址
+    /// Checks if an IP address is a loopback address.
     pub fn is_loopback_ip(ip: &IpAddr) -> bool {
         match ip {
             IpAddr::V4(ipv4) => ipv4.is_loopback(),
@@ -114,7 +114,7 @@ impl IpUtils {
         }
     }
 
-    /// 检查 IP 是否为链路本地地址
+    /// Checks if an IP address is a link-local address.
     pub fn is_link_local_ip(ip: &IpAddr) -> bool {
         match ip {
             IpAddr::V4(ipv4) => ipv4.is_link_local(),
@@ -122,7 +122,7 @@ impl IpUtils {
         }
     }
 
-    /// 检查 IP 是否为文档地址（TEST-NET）
+    /// Checks if an IP address is a documentation address (TEST-NET).
     pub fn is_documentation_ip(ip: &IpAddr) -> bool {
         match ip {
             IpAddr::V4(ipv4) => {
@@ -141,12 +141,12 @@ impl IpUtils {
         }
     }
 
-    /// 从字符串解析 IP 地址，支持 CIDR 表示法
+    /// Parses an IP address or CIDR range from a string.
     pub fn parse_ip_or_cidr(s: &str) -> Result<IpNetwork, String> {
         IpNetwork::from_str(s).map_err(|e| format!("Failed to parse IP/CIDR '{}': {}", s, e))
     }
 
-    /// 从逗号分隔的字符串解析 IP 列表
+    /// Parses a comma-separated list of IP addresses.
     pub fn parse_ip_list(s: &str) -> Result<Vec<IpAddr>, String> {
         let mut ips = Vec::new();
 
@@ -165,7 +165,7 @@ impl IpUtils {
         Ok(ips)
     }
 
-    /// 从逗号分隔的字符串解析网络列表
+    /// Parses a comma-separated list of IP networks (CIDR).
     pub fn parse_network_list(s: &str) -> Result<Vec<IpNetwork>, String> {
         let mut networks = Vec::new();
 
@@ -184,12 +184,12 @@ impl IpUtils {
         Ok(networks)
     }
 
-    /// 检查 IP 是否在给定的网络列表中
+    /// Checks if an IP address is contained within any of the given networks.
     pub fn ip_in_networks(ip: &IpAddr, networks: &[IpNetwork]) -> bool {
         networks.iter().any(|network| network.contains(*ip))
     }
 
-    /// 获取 IP 地址的类型描述
+    /// Returns a string description of the IP address type.
     pub fn get_ip_type(ip: &IpAddr) -> &'static str {
         if Self::is_private_ip(ip) {
             "private"
@@ -206,16 +206,16 @@ impl IpUtils {
         }
     }
 
-    /// 将 IP 地址转换为规范形式
+    /// Returns the canonical string representation of an IP address.
     pub fn canonical_ip(ip: &IpAddr) -> String {
         match ip {
             IpAddr::V4(ipv4) => ipv4.to_string(),
             IpAddr::V6(ipv6) => {
-                // 压缩 IPv6 地址
+                // Compress IPv6 address
                 let mut result = String::new();
                 let segments = ipv6.segments();
 
-                // 查找最长的连续零段
+                // Find the longest sequence of zero segments
                 let mut longest_start = 0;
                 let mut longest_len = 0;
                 let mut current_start = 0;
@@ -241,20 +241,21 @@ impl IpUtils {
                     longest_len = current_len;
                 }
 
-                // 格式化为字符串
-                for mut i in 0..8 {
+                // Format as string
+                let mut i = 0;
+                while i < 8 {
                     if i == longest_start && longest_len > 1 {
                         result.push_str("::");
-                        i += longest_len - 1;
-                    } else if i == longest_start && longest_len == 1 {
-                        result.push('0');
+                        i += longest_len;
+                        if i == 8 {
+                            break;
+                        }
                     } else {
-                        if i > 0 && i != longest_start {
+                        if i > 0 && (i != longest_start + longest_len || longest_len <= 1) {
                             result.push(':');
                         }
-                        if segments[i] != 0 || (i == 7 && result.is_empty()) {
-                            result.push_str(&format!("{:x}", segments[i]));
-                        }
+                        result.push_str(&format!("{:x}", segments[i]));
+                        i += 1;
                     }
                 }
 
@@ -262,4 +263,9 @@ impl IpUtils {
             }
         }
     }
+}
+
+/// Helper function to check if an IP address is valid.
+pub fn is_valid_ip_address(ip: &IpAddr) -> bool {
+    IpUtils::is_valid_ip_address(ip)
 }

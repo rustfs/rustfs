@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Shared application state.
+
 use crate::{AppConfig, ProxyMetrics};
 use std::sync::Arc;
 
-/// 应用状态
+/// Global application state shared across handlers and middleware.
 #[derive(Clone)]
 pub struct AppState {
-    /// 应用配置
+    /// Immutable application configuration.
     pub config: Arc<AppConfig>,
-    /// 代理指标收集器
+    /// Optional metrics collector for observability.
     pub metrics: Option<ProxyMetrics>,
 }

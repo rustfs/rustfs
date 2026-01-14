@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! AWS metadata fetching implementation
+//! AWS metadata fetching implementation for identifying trusted proxy ranges.
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -23,7 +23,7 @@ use tracing::{debug, info};
 use crate::cloud::detector::CloudMetadataFetcher;
 use crate::error::AppError;
 
-/// AWS 元数据获取器
+/// Fetcher for AWS-specific metadata.
 #[derive(Debug, Clone)]
 pub struct AwsMetadataFetcher {
     client: Client,
@@ -31,7 +31,7 @@ pub struct AwsMetadataFetcher {
 }
 
 impl AwsMetadataFetcher {
-    /// 创建新的 AWS 元数据获取器
+    /// Creates a new `AwsMetadataFetcher`.
     pub fn new() -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(2))
@@ -44,7 +44,7 @@ impl AwsMetadataFetcher {
         }
     }
 
-    /// 获取 IMDSv2 令牌
+    /// Retrieves an IMDSv2 token for secure metadata access.
     async fn get_metadata_token(&self) -> Result<String, AppError> {
         let url = format!("{}/latest/api/token", self.metadata_endpoint);
 
@@ -60,11 +60,11 @@ impl AwsMetadataFetcher {
                     let token = response
                         .text()
                         .await
-                        .map_err(|e| AppError::cloud(format!("Failed to read token: {}", e)))?;
+                        .map_err(|e| AppError::cloud(format!("Failed to read IMDSv2 token: {}", e)))?;
                     Ok(token)
                 } else {
                     debug!("IMDSv2 token request failed with status: {}", response.status());
-                    Err(AppError::cloud("Failed to get IMDSv2 token".to_string()))
+                    Err(AppError::cloud("Failed to obtain IMDSv2 token"))
                 }
             }
             Err(e) => {
@@ -82,11 +82,11 @@ impl CloudMetadataFetcher for AwsMetadataFetcher {
     }
 
     async fn fetch_network_cidrs(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
-        // 简化实现：返回常见的 AWS VPC 范围
+        // Simplified implementation: returns standard AWS VPC private ranges.
         let default_ranges = vec![
-            "10.0.0.0/8",     // 大型 VPC
-            "172.16.0.0/12",  // 中型 VPC
-            "192.168.0.0/16", // 小型 VPC
+            "10.0.0.0/8",     // Large VPCs
+            "172.16.0.0/12",  // Medium VPCs
+            "192.168.0.0/16", // Small VPCs
         ];
 
         let networks: Result<Vec<_>, _> = default_ranges
@@ -96,10 +96,10 @@ impl CloudMetadataFetcher for AwsMetadataFetcher {
 
         match networks {
             Ok(networks) => {
-                debug!("Using default AWS network ranges");
+                debug!("Using default AWS VPC network ranges");
                 Ok(networks)
             }
-            Err(e) => Err(AppError::cloud(format!("Failed to parse default ranges: {}", e))),
+            Err(e) => Err(AppError::cloud(format!("Failed to parse default AWS ranges: {}", e))),
         }
     }
 
@@ -114,7 +114,6 @@ impl CloudMetadataFetcher for AwsMetadataFetcher {
         #[derive(Debug, serde::Deserialize)]
         struct AwsPrefix {
             ip_prefix: String,
-            region: String,
             service: String,
         }
 
@@ -124,12 +123,12 @@ impl CloudMetadataFetcher for AwsMetadataFetcher {
                     let ip_ranges: AwsIpRanges = response
                         .json()
                         .await
-                        .map_err(|e| AppError::cloud(format!("Failed to parse AWS IP ranges: {}", e)))?;
+                        .map_err(|e| AppError::cloud(format!("Failed to parse AWS IP ranges JSON: {}", e)))?;
 
                     let mut networks = Vec::new();
 
                     for prefix in ip_ranges.prefixes {
-                        // 只包含 EC2 和 CloudFront 的 IP 范围
+                        // Include EC2 and CloudFront ranges as potential trusted proxies.
                         if prefix.service == "EC2" || prefix.service == "CLOUDFRONT" {
                             if let Ok(network) = ipnetwork::IpNetwork::from_str(&prefix.ip_prefix) {
                                 networks.push(network);
@@ -137,10 +136,10 @@ impl CloudMetadataFetcher for AwsMetadataFetcher {
                         }
                     }
 
-                    info!("Fetched {} AWS public IP ranges", networks.len());
+                    info!("Successfully fetched {} AWS public IP ranges", networks.len());
                     Ok(networks)
                 } else {
-                    debug!("Failed to fetch AWS IP ranges: {}", response.status());
+                    debug!("Failed to fetch AWS IP ranges: HTTP {}", response.status());
                     Ok(Vec::new())
                 }
             }

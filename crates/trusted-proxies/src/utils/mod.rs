@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Utility functions and helpers
+//! Utility functions and helpers for the trusted proxy system.
 
 mod ip;
 mod validation;
@@ -20,32 +20,32 @@ mod validation;
 pub use ip::*;
 pub use validation::*;
 
-/// 工具函数集合
+/// Collection of general utility functions.
 #[derive(Debug, Clone)]
 pub struct Utils;
 
 impl Utils {
-    /// 生成追踪 ID
+    /// Generates a unique trace ID.
     pub fn generate_trace_id() -> String {
         format!("trace-{}", uuid::Uuid::new_v4())
     }
 
-    /// 生成 Span ID
+    /// Generates a unique span ID.
     pub fn generate_span_id() -> String {
         format!("span-{}", uuid::Uuid::new_v4())
     }
 
-    /// 安全的将字符串转换为 usize
+    /// Safely parses a string into a `usize`, returning a default value on failure.
     pub fn safe_parse_usize(s: &str, default: usize) -> usize {
         s.parse().unwrap_or(default)
     }
 
-    /// 安全的将字符串转换为 u64
+    /// Safely parses a string into a `u64`, returning a default value on failure.
     pub fn safe_parse_u64(s: &str, default: u64) -> u64 {
         s.parse().unwrap_or(default)
     }
 
-    /// 安全的将字符串转换为布尔值
+    /// Safely parses a string into a boolean, returning a default value on failure.
     pub fn safe_parse_bool(s: &str, default: bool) -> bool {
         match s.to_lowercase().as_str() {
             "true" | "1" | "yes" | "on" => true,
@@ -54,7 +54,7 @@ impl Utils {
         }
     }
 
-    /// 格式化持续时间
+    /// Formats a `Duration` into a human-readable string.
     pub fn format_duration(duration: std::time::Duration) -> String {
         if duration.as_secs() > 0 {
             format!("{:.2}s", duration.as_secs_f64())
@@ -67,22 +67,22 @@ impl Utils {
         }
     }
 
-    /// 获取当前时间戳
+    /// Returns the current UTC timestamp in RFC 3339 format.
     pub fn current_timestamp() -> String {
         chrono::Utc::now().to_rfc3339()
     }
 
-    /// 安全的获取环境变量
+    /// Safely retrieves an environment variable.
     pub fn get_env_var(key: &str) -> Option<String> {
         std::env::var(key).ok()
     }
 
-    /// 获取环境变量，如果不存在则使用默认值
+    /// Retrieves an environment variable or returns a default value if not set.
     pub fn get_env_var_or(key: &str, default: &str) -> String {
         std::env::var(key).unwrap_or_else(|_| default.to_string())
     }
 
-    /// 检查环境变量是否存在
+    /// Checks if an environment variable is set.
     pub fn has_env_var(key: &str) -> bool {
         std::env::var(key).is_ok()
     }

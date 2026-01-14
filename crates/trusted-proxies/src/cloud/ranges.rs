@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cloud provider IP range definitions
+//! Static and dynamic IP range definitions for various cloud providers.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -23,11 +23,11 @@ use tracing::{debug, info};
 
 use crate::error::AppError;
 
-/// Cloudflare IP 范围
+/// Utility for fetching Cloudflare IP ranges.
 pub struct CloudflareIpRanges;
 
 impl CloudflareIpRanges {
-    /// 获取 Cloudflare IP 范围
+    /// Returns a static list of Cloudflare IP ranges.
     pub async fn fetch() -> Result<Vec<IpNetwork>, AppError> {
         let ranges = vec![
             // IPv4 ranges
@@ -60,14 +60,14 @@ impl CloudflareIpRanges {
 
         match networks {
             Ok(networks) => {
-                info!("Loaded {} Cloudflare IP ranges", networks.len());
+                info!("Loaded {} static Cloudflare IP ranges", networks.len());
                 Ok(networks)
             }
-            Err(e) => Err(AppError::cloud(format!("Failed to parse Cloudflare IP ranges: {}", e))),
+            Err(e) => Err(AppError::cloud(format!("Failed to parse static Cloudflare IP ranges: {}", e))),
         }
     }
 
-    /// 从 Cloudflare API 获取 IP 范围
+    /// Fetches the latest Cloudflare IP ranges from their official API.
     pub async fn fetch_from_api() -> Result<Vec<IpNetwork>, AppError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
@@ -91,7 +91,7 @@ impl CloudflareIpRanges {
                             .lines()
                             .map(|line| line.trim())
                             .filter(|line| !line.is_empty())
-                            .map(|line| IpNetwork::from_str(line))
+                            .map(IpNetwork::from_str)
                             .collect();
 
                         match ranges {
@@ -104,7 +104,7 @@ impl CloudflareIpRanges {
                             }
                         }
                     } else {
-                        debug!("Failed to fetch IP ranges from {}: {}", url, response.status());
+                        debug!("Failed to fetch IP ranges from {}: HTTP {}", url, response.status());
                     }
                 }
                 Err(e) => {
@@ -114,24 +114,23 @@ impl CloudflareIpRanges {
         }
 
         if all_ranges.is_empty() {
-            // 如果 API 失败，回退到静态列表
+            // Fallback to static list if API requests fail.
             Self::fetch().await
         } else {
-            info!("Fetched {} Cloudflare IP ranges from API", all_ranges.len());
+            info!("Successfully fetched {} Cloudflare IP ranges from API", all_ranges.len());
             Ok(all_ranges)
         }
     }
 }
 
-/// DigitalOcean IP 范围
+/// Utility for fetching DigitalOcean IP ranges.
 pub struct DigitalOceanIpRanges;
 
 impl DigitalOceanIpRanges {
-    /// 获取 DigitalOcean IP 范围
+    /// Returns a static list of DigitalOcean IP ranges.
     pub async fn fetch() -> Result<Vec<IpNetwork>, AppError> {
-        // DigitalOcean 的 IP 范围相对稳定，使用静态列表
         let ranges = vec![
-            // 数据中心 IP 范围
+            // Datacenter IP ranges
             "64.227.0.0/16",
             "138.197.0.0/16",
             "139.59.0.0/16",
@@ -142,7 +141,7 @@ impl DigitalOceanIpRanges {
             "206.189.0.0/16",
             "207.154.0.0/16",
             "209.97.0.0/16",
-            // 负载均衡器 IP 范围
+            // Load Balancer IP ranges
             "144.126.0.0/16",
             "143.198.0.0/16",
             "161.35.0.0/16",
@@ -152,19 +151,19 @@ impl DigitalOceanIpRanges {
 
         match networks {
             Ok(networks) => {
-                info!("Loaded {} DigitalOcean IP ranges", networks.len());
+                info!("Loaded {} static DigitalOcean IP ranges", networks.len());
                 Ok(networks)
             }
-            Err(e) => Err(AppError::cloud(format!("Failed to parse DigitalOcean IP ranges: {}", e))),
+            Err(e) => Err(AppError::cloud(format!("Failed to parse static DigitalOcean IP ranges: {}", e))),
         }
     }
 }
 
-/// Google Cloud IP 范围
+/// Utility for fetching Google Cloud IP ranges.
 pub struct GoogleCloudIpRanges;
 
 impl GoogleCloudIpRanges {
-    /// 从 Google API 获取 IP 范围
+    /// Fetches the latest Google Cloud IP ranges from their official source.
     pub async fn fetch() -> Result<Vec<IpNetwork>, AppError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
@@ -181,7 +180,6 @@ impl GoogleCloudIpRanges {
         #[derive(Debug, serde::Deserialize)]
         struct GooglePrefix {
             ipv4_prefix: Option<String>,
-            ipv6_prefix: Option<String>,
         }
 
         match client.get(url).send().await {
@@ -190,7 +188,7 @@ impl GoogleCloudIpRanges {
                     let ip_ranges: GoogleIpRanges = response
                         .json()
                         .await
-                        .map_err(|e| AppError::cloud(format!("Failed to parse Google IP ranges: {}", e)))?;
+                        .map_err(|e| AppError::cloud(format!("Failed to parse Google IP ranges JSON: {}", e)))?;
 
                     let mut networks = Vec::new();
 
@@ -202,10 +200,10 @@ impl GoogleCloudIpRanges {
                         }
                     }
 
-                    info!("Fetched {} Google Cloud IP ranges from API", networks.len());
+                    info!("Successfully fetched {} Google Cloud IP ranges from API", networks.len());
                     Ok(networks)
                 } else {
-                    debug!("Failed to fetch Google IP ranges: {}", response.status());
+                    debug!("Failed to fetch Google IP ranges: HTTP {}", response.status());
                     Ok(Vec::new())
                 }
             }

@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Integration tests for the trusted proxy system
+use std::time::Duration;
+use rustfs_trusted_proxies::cloud::detector::CloudDetector;
+use rustfs_trusted_proxies::cloud::metadata::AwsMetadataFetcher;
 
-mod api_tests;
-mod cloud_tests;
-mod proxy_tests;
+#[tokio::test]
+async fn test_cloud_detector_disabled() {
+    let detector = CloudDetector::new(false, Duration::from_secs(1), None);
+    let provider = detector.detect_provider();
+    assert!(provider.is_none());
+}
 
-// 重新导出测试模块
-pub use api_tests::*;
-pub use cloud_tests::*;
-pub use proxy_tests::*;
+#[tokio::test]
+async fn test_aws_metadata_fetcher() {
+    let fetcher = AwsMetadataFetcher::new();
+    assert_eq!(fetcher.provider_name(), "aws");
+}

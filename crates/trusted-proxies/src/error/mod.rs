@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Error types for the trusted proxy system
+//! Error types for the trusted proxy system.
 
 mod config;
 mod proxy;
@@ -20,55 +20,55 @@ mod proxy;
 pub use config::*;
 pub use proxy::*;
 
-/// 统一错误类型
+/// Unified error type for the application.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    /// 配置错误
+    /// Errors related to configuration.
     #[error("Configuration error: {0}")]
     Config(#[from] ConfigError),
 
-    /// 代理验证错误
+    /// Errors related to proxy validation.
     #[error("Proxy validation error: {0}")]
     Proxy(#[from] ProxyError),
 
-    /// 云服务错误
+    /// Errors related to cloud service integration.
     #[error("Cloud service error: {0}")]
     Cloud(String),
 
-    /// 内部错误
+    /// General internal errors.
     #[error("Internal error: {0}")]
     Internal(String),
 
-    /// IO 错误
+    /// Standard I/O errors.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// HTTP 错误
+    /// Errors related to HTTP requests or responses.
     #[error("HTTP error: {0}")]
     Http(String),
 }
 
 impl AppError {
-    /// 创建云服务错误
+    /// Creates a new `Cloud` error.
     pub fn cloud(msg: impl Into<String>) -> Self {
         Self::Cloud(msg.into())
     }
 
-    /// 创建内部错误
+    /// Creates a new `Internal` error.
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
     }
 
-    /// 创建 HTTP 错误
+    /// Creates a new `Http` error.
     pub fn http(msg: impl Into<String>) -> Self {
         Self::Http(msg.into())
     }
 
-    /// 判断错误是否可恢复
+    /// Returns true if the error is considered recoverable.
     pub fn is_recoverable(&self) -> bool {
         match self {
             Self::Config(_) => true,
-            Self::Proxy(_) => true,
+            Self::Proxy(e) => e.is_recoverable(),
             Self::Cloud(_) => true,
             Self::Internal(_) => false,
             Self::Io(_) => true,
@@ -77,7 +77,7 @@ impl AppError {
     }
 }
 
-/// HTTP 响应错误类型
+/// Type alias for API error responses (Status Code, Error Message).
 pub type ApiError = (axum::http::StatusCode, String);
 
 impl From<AppError> for ApiError {

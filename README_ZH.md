@@ -175,7 +175,7 @@ make help-docker                      # 显示所有 Docker 相关命令
 ### 访问 RustFS
 
 5.  **访问控制台**: 打开浏览器并访问 `http://localhost:9000` 进入 RustFS 控制台。
-      * 默认账号/密码: `rustfsadmin` / `rustfsadmin`
+      * 默认账号/密码：`rustfsadmin` / `rustfsadmin`
 6.  **创建存储桶**: 使用控制台为您​​的对象创建一个新的存储桶 (Bucket)。
 7.  **上传对象**: 您可以直接通过控制台上传文件，或使用 S3 兼容的 API/客户端与您的 RustFS 实例进行交互。
 

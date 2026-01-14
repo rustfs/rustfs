@@ -12,42 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Configuration error types
+//! Configuration error types for the trusted proxy system.
 
 use std::net::AddrParseError;
 
-/// 配置错误类型
+/// Errors related to application configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// 环境变量缺失
+    /// Required environment variable is missing.
     #[error("Missing environment variable: {0}")]
     MissingEnvVar(String),
 
-    /// 环境变量解析失败
+    /// Environment variable exists but could not be parsed.
     #[error("Failed to parse environment variable {0}: {1}")]
     EnvParseError(String, String),
 
-    /// 无效的配置值
+    /// A configuration value is logically invalid.
     #[error("Invalid configuration value for {0}: {1}")]
     InvalidValue(String, String),
 
-    /// 无效的 IP 地址或网络
+    /// An IP address or CIDR range is malformed.
     #[error("Invalid IP address or network: {0}")]
     InvalidIp(String),
 
-    /// 配置验证失败
+    /// Configuration failed overall validation.
     #[error("Configuration validation failed: {0}")]
     ValidationFailed(String),
 
-    /// 配置冲突
+    /// Two or more configuration settings are in conflict.
     #[error("Configuration conflict: {0}")]
     Conflict(String),
 
-    /// 配置文件错误
+    /// Error reading or parsing a configuration file.
     #[error("Config file error: {0}")]
     FileError(String),
 
-    /// 无效的配置
+    /// General invalid configuration error.
     #[error("Invalid config: {0}")]
     InvalidConfig(String),
 }
@@ -65,17 +65,17 @@ impl From<ipnetwork::IpNetworkError> for ConfigError {
 }
 
 impl ConfigError {
-    /// 创建环境变量缺失错误
+    /// Creates a `MissingEnvVar` error.
     pub fn missing_env_var(key: &str) -> Self {
         Self::MissingEnvVar(key.to_string())
     }
 
-    /// 创建环境变量解析错误
+    /// Creates an `EnvParseError`.
     pub fn env_parse(key: &str, value: &str) -> Self {
         Self::EnvParseError(key.to_string(), value.to_string())
     }
 
-    /// 创建无效配置值错误
+    /// Creates an `InvalidValue` error.
     pub fn invalid_value(field: &str, value: &str) -> Self {
         Self::InvalidValue(field.to_string(), value.to_string())
     }

@@ -12,58 +12,57 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Configuration loader for environment variables and files
+//! Configuration loader for environment variables and files.
 
 use std::net::{IpAddr, SocketAddr};
-use std::str::FromStr;
 
 use crate::config::env::*;
 use crate::config::{AppConfig, CacheConfig, CloudConfig, MonitoringConfig, TrustedProxy, TrustedProxyConfig, ValidationMode};
 use crate::error::ConfigError;
+use rustfs_utils::*;
 
-/// 配置加载器
+/// Loader for application configuration.
 #[derive(Debug, Clone)]
 pub struct ConfigLoader;
 
 impl ConfigLoader {
-    /// 从环境变量加载完整应用配置
+    /// Loads the complete application configuration from environment variables.
     pub fn from_env() -> Result<AppConfig, ConfigError> {
-        // 加载可信代理配置
+        // Load proxy-specific configuration.
         let proxy_config = Self::load_proxy_config()?;
 
-        // 加载缓存配置
+        // Load cache configuration.
         let cache_config = Self::load_cache_config();
 
-        // 加载监控配置
+        // Load monitoring and observability configuration.
         let monitoring_config = Self::load_monitoring_config();
 
-        // 加载云服务配置
+        // Load cloud provider integration configuration.
         let cloud_config = Self::load_cloud_config();
 
-        // 服务器地址
+        // Load server binding address.
         let server_addr = Self::load_server_addr();
 
         Ok(AppConfig::new(proxy_config, cache_config, monitoring_config, cloud_config, server_addr))
     }
 
-    /// 加载可信代理配置
+    /// Loads trusted proxy configuration from environment variables.
     fn load_proxy_config() -> Result<TrustedProxyConfig, ConfigError> {
-        // 解析可信代理列表
         let mut proxies = Vec::new();
 
-        // 基础可信代理
+        // Parse base trusted proxies from environment.
         let base_networks = parse_ip_list_from_env(ENV_TRUSTED_PROXIES, DEFAULT_TRUSTED_PROXIES)?;
         for network in base_networks {
             proxies.push(TrustedProxy::Cidr(network));
         }
 
-        // 额外可信代理
+        // Parse extra trusted proxies from environment.
         let extra_networks = parse_ip_list_from_env(ENV_EXTRA_TRUSTED_PROXIES, DEFAULT_EXTRA_TRUSTED_PROXIES)?;
         for network in extra_networks {
             proxies.push(TrustedProxy::Cidr(network));
         }
 
-        // 单个 IP（从环境变量解析）
+        // Parse individual trusted proxy IPs.
         let ip_strings = parse_string_list_from_env("TRUSTED_PROXY_IPS", "");
         for ip_str in ip_strings {
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
@@ -71,16 +70,16 @@ impl ConfigLoader {
             }
         }
 
-        // 验证模式
-        let validation_mode_str = get_string_from_env(ENV_PROXY_VALIDATION_MODE, DEFAULT_PROXY_VALIDATION_MODE);
+        // Determine validation mode.
+        let validation_mode_str = get_env_str(ENV_PROXY_VALIDATION_MODE, DEFAULT_PROXY_VALIDATION_MODE);
         let validation_mode = ValidationMode::from_str(&validation_mode_str)?;
 
-        // 其他配置
-        let enable_rfc7239 = get_bool_from_env(ENV_PROXY_ENABLE_RFC7239, DEFAULT_PROXY_ENABLE_RFC7239);
-        let max_hops = get_usize_from_env(ENV_PROXY_MAX_HOPS, DEFAULT_PROXY_MAX_HOPS);
-        let enable_chain_check = get_bool_from_env(ENV_PROXY_CHAIN_CONTINUITY_CHECK, DEFAULT_PROXY_CHAIN_CONTINUITY_CHECK);
+        // Load other proxy settings.
+        let enable_rfc7239 = get_env_bool(ENV_PROXY_ENABLE_RFC7239, DEFAULT_PROXY_ENABLE_RFC7239);
+        let max_hops = get_env_usize(ENV_PROXY_MAX_HOPS, DEFAULT_PROXY_MAX_HOPS);
+        let enable_chain_check = get_env_bool(ENV_PROXY_CHAIN_CONTINUITY_CHECK, DEFAULT_PROXY_CHAIN_CONTINUITY_CHECK);
 
-        // 私有网络
+        // Load private network ranges.
         let private_networks = parse_ip_list_from_env(ENV_PRIVATE_NETWORKS, DEFAULT_PRIVATE_NETWORKS)?;
 
         Ok(TrustedProxyConfig::new(
@@ -93,29 +92,29 @@ impl ConfigLoader {
         ))
     }
 
-    /// 加载缓存配置
+    /// Loads cache configuration from environment variables.
     fn load_cache_config() -> CacheConfig {
         CacheConfig {
-            capacity: get_usize_from_env(ENV_CACHE_CAPACITY, DEFAULT_CACHE_CAPACITY),
-            ttl_seconds: get_u64_from_env(ENV_CACHE_TTL_SECONDS, DEFAULT_CACHE_TTL_SECONDS),
-            cleanup_interval_seconds: get_u64_from_env(ENV_CACHE_CLEANUP_INTERVAL, DEFAULT_CACHE_CLEANUP_INTERVAL),
+            capacity: get_env_usize(ENV_CACHE_CAPACITY, DEFAULT_CACHE_CAPACITY),
+            ttl_seconds: get_env_u64(ENV_CACHE_TTL_SECONDS, DEFAULT_CACHE_TTL_SECONDS),
+            cleanup_interval_seconds: get_env_u64(ENV_CACHE_CLEANUP_INTERVAL, DEFAULT_CACHE_CLEANUP_INTERVAL),
         }
     }
 
-    /// 加载监控配置
+    /// Loads monitoring configuration from environment variables.
     fn load_monitoring_config() -> MonitoringConfig {
         MonitoringConfig {
-            metrics_enabled: get_bool_from_env(ENV_METRICS_ENABLED, DEFAULT_METRICS_ENABLED),
-            log_level: get_string_from_env(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL),
-            structured_logging: get_bool_from_env(ENV_STRUCTURED_LOGGING, DEFAULT_STRUCTURED_LOGGING),
-            tracing_enabled: get_bool_from_env(ENV_TRACING_ENABLED, DEFAULT_TRACING_ENABLED),
-            log_failed_validations: get_bool_from_env(ENV_PROXY_LOG_FAILED_VALIDATIONS, DEFAULT_PROXY_LOG_FAILED_VALIDATIONS),
+            metrics_enabled: get_env_bool(ENV_METRICS_ENABLED, DEFAULT_METRICS_ENABLED),
+            log_level: get_env_str(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL),
+            structured_logging: get_env_bool(ENV_STRUCTURED_LOGGING, DEFAULT_STRUCTURED_LOGGING),
+            tracing_enabled: get_env_bool(ENV_TRACING_ENABLED, DEFAULT_TRACING_ENABLED),
+            log_failed_validations: get_env_bool(ENV_PROXY_LOG_FAILED_VALIDATIONS, DEFAULT_PROXY_LOG_FAILED_VALIDATIONS),
         }
     }
 
-    /// 加载云服务配置
+    /// Loads cloud configuration from environment variables.
     fn load_cloud_config() -> CloudConfig {
-        let forced_provider_str = get_string_from_env(ENV_CLOUD_PROVIDER_FORCE, DEFAULT_CLOUD_PROVIDER_FORCE);
+        let forced_provider_str = get_env_str(ENV_CLOUD_PROVIDER_FORCE, DEFAULT_CLOUD_PROVIDER_FORCE);
         let forced_provider = if forced_provider_str.is_empty() {
             None
         } else {
@@ -123,24 +122,24 @@ impl ConfigLoader {
         };
 
         CloudConfig {
-            metadata_enabled: get_bool_from_env(ENV_CLOUD_METADATA_ENABLED, DEFAULT_CLOUD_METADATA_ENABLED),
-            metadata_timeout_seconds: get_u64_from_env(ENV_CLOUD_METADATA_TIMEOUT, DEFAULT_CLOUD_METADATA_TIMEOUT),
-            cloudflare_ips_enabled: get_bool_from_env(ENV_CLOUDFLARE_IPS_ENABLED, DEFAULT_CLOUDFLARE_IPS_ENABLED),
+            metadata_enabled: get_env_bool(ENV_CLOUD_METADATA_ENABLED, DEFAULT_CLOUD_METADATA_ENABLED),
+            metadata_timeout_seconds: get_env_u64(ENV_CLOUD_METADATA_TIMEOUT, DEFAULT_CLOUD_METADATA_TIMEOUT),
+            cloudflare_ips_enabled: get_env_bool(ENV_CLOUDFLARE_IPS_ENABLED, DEFAULT_CLOUDFLARE_IPS_ENABLED),
             forced_provider,
         }
     }
 
-    /// 加载服务器地址
+    /// Loads the server binding address from environment variables.
     fn load_server_addr() -> SocketAddr {
-        let host = get_string_from_env("SERVER_HOST", "0.0.0.0");
-        let port = get_usize_from_env("SERVER_PORT", 3000) as u16;
+        let host = get_env_str("SERVER_HOST", "0.0.0.0");
+        let port = get_env_usize("SERVER_PORT", 3000) as u16;
 
         format!("{}:{}", host, port)
             .parse()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 3000)))
     }
 
-    /// 从环境变量加载配置，如果失败则使用默认值
+    /// Loads configuration from environment, falling back to defaults on failure.
     pub fn from_env_or_default() -> AppConfig {
         match Self::from_env() {
             Ok(config) => {
@@ -154,9 +153,8 @@ impl ConfigLoader {
         }
     }
 
-    /// 创建默认配置
+    /// Returns a default configuration.
     pub fn default_config() -> AppConfig {
-        // 默认可信代理配置
         let proxy_config = TrustedProxyConfig::new(
             vec![
                 TrustedProxy::Single("127.0.0.1".parse().unwrap()),
@@ -173,7 +171,6 @@ impl ConfigLoader {
             ],
         );
 
-        // 默认应用配置
         AppConfig::new(
             proxy_config,
             CacheConfig::default(),
@@ -183,7 +180,7 @@ impl ConfigLoader {
         )
     }
 
-    /// 打印配置摘要
+    /// Prints a summary of the configuration to the log.
     pub fn print_summary(config: &AppConfig) {
         tracing::info!("=== Application Configuration ===");
         tracing::info!("Server: {}", config.server_addr);

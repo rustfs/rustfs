@@ -12,26 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Logging module for structured logging and middleware
+//! Logging module for structured logging and observability.
 
 mod middleware;
 
 pub use middleware::*;
 
-/// 日志配置
+/// Configuration for the logging system.
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
-    /// 是否启用结构化日志
+    /// Whether to use structured JSON logging.
     pub structured: bool,
-    /// 日志级别
+    /// The logging level (e.g., "info", "debug").
     pub level: String,
-    /// 是否启用请求 ID
+    /// Whether to include a unique request ID in logs.
     pub enable_request_id: bool,
-    /// 是否记录请求体
+    /// Whether to log the contents of request bodies.
     pub log_request_body: bool,
-    /// 是否记录响应体
+    /// Whether to log the contents of response bodies.
     pub log_response_body: bool,
-    /// 敏感字段列表（将被脱敏）
+    /// List of header names that should be redacted in logs.
     pub sensitive_fields: Vec<String>,
 }
 
@@ -48,40 +48,31 @@ impl Default for LoggingConfig {
                 "token".to_string(),
                 "secret".to_string(),
                 "authorization".to_string(),
+                "cookie".to_string(),
+                "set-cookie".to_string(),
             ],
         }
     }
 }
 
-/// 初始化日志系统
+/// Initializes the global tracing subscriber.
 pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // 创建日志过滤器
     let filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(config.level.parse().unwrap_or(tracing::Level::INFO.into()))
         .from_env_lossy();
 
-    // 根据配置选择日志格式
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true);
+
     if config.structured {
-        // 结构化日志（JSON 格式）
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_thread_names(true)
-            .with_file(true)
-            .with_line_number(true)
-            .init();
+        subscriber.json().init();
     } else {
-        // 普通文本日志
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_thread_names(true)
-            .with_file(true)
-            .with_line_number(true)
-            .init();
+        subscriber.init();
     }
 
     tracing::info!("Logging initialized with level: {}", config.level);
@@ -89,19 +80,19 @@ pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// 日志记录器
+/// Helper for logging application events with consistent metadata.
 #[derive(Debug, Clone)]
 pub struct Logger {
     config: LoggingConfig,
 }
 
 impl Logger {
-    /// 创建新的日志记录器
+    /// Creates a new `Logger`.
     pub fn new(config: LoggingConfig) -> Self {
         Self { config }
     }
 
-    /// 记录 HTTP 请求
+    /// Logs an incoming HTTP request.
     pub fn log_request(&self, req: &axum::http::Request<axum::body::Body>, request_id: &str) {
         let method = req.method();
         let uri = req.uri();
@@ -115,13 +106,12 @@ impl Logger {
             "HTTP request received"
         );
 
-        // 如果启用了请求体日志记录，记录头部
         if self.config.log_request_body {
             self.log_headers(req.headers(), "request");
         }
     }
 
-    /// 记录 HTTP 响应
+    /// Logs an outgoing HTTP response.
     pub fn log_response(&self, res: &axum::http::Response<axum::body::Body>, request_id: &str, duration: std::time::Duration) {
         let status = res.status();
         let version = res.version();
@@ -134,13 +124,12 @@ impl Logger {
             "HTTP response sent"
         );
 
-        // 如果启用了响应体日志记录，记录头部
         if self.config.log_response_body {
             self.log_headers(res.headers(), "response");
         }
     }
 
-    /// 记录头部信息（脱敏敏感字段）
+    /// Logs HTTP headers, redacting sensitive information.
     fn log_headers(&self, headers: &axum::http::HeaderMap, header_type: &str) {
         let mut header_fields = std::collections::HashMap::new();
 
@@ -151,7 +140,6 @@ impl Logger {
                 Err(_) => "[BINARY]".to_string(),
             };
 
-            // 检查是否为敏感字段
             let is_sensitive = self
                 .config
                 .sensitive_fields
@@ -172,7 +160,7 @@ impl Logger {
         );
     }
 
-    /// 记录错误
+    /// Logs an error with optional request context.
     pub fn log_error(&self, error: &impl std::error::Error, request_id: Option<&str>) {
         if let Some(id) = request_id {
             tracing::error!(
@@ -190,7 +178,7 @@ impl Logger {
         }
     }
 
-    /// 记录警告
+    /// Logs a warning message.
     pub fn log_warning(&self, message: &str, context: Option<&str>) {
         if let Some(ctx) = context {
             tracing::warn!(message = %message, context = %ctx, "Warning");
@@ -199,7 +187,7 @@ impl Logger {
         }
     }
 
-    /// 记录信息
+    /// Logs an informational message.
     pub fn log_info(&self, message: &str, context: Option<&str>) {
         if let Some(ctx) = context {
             tracing::info!(message = %message, context = %ctx, "Info");
@@ -208,7 +196,7 @@ impl Logger {
         }
     }
 
-    /// 记录调试信息
+    /// Logs a debug message.
     pub fn log_debug(&self, message: &str, context: Option<&str>) {
         if let Some(ctx) = context {
             tracing::debug!(message = %message, context = %ctx, "Debug");

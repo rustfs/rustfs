@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Configuration type definitions
+//! Configuration type definitions for the trusted proxy system.
 
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
@@ -21,25 +21,26 @@ use std::time::Duration;
 
 use crate::error::ConfigError;
 
-/// 代理验证模式
+/// Proxy validation mode defining how the proxy chain is verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationMode {
-    /// 宽松模式：只要最后一个代理可信，就接受整个链
+    /// Lenient mode: Accepts the entire chain as long as the last proxy is trusted.
     Lenient,
-    /// 严格模式：要求链中所有代理都可信
+    /// Strict mode: Requires all proxies in the chain to be trusted.
     Strict,
-    /// 跳数验证模式：从右向左找到第一个不可信代理
+    /// Hop-by-hop mode: Finds the first untrusted proxy from right to left.
+    /// This is the recommended mode for most production environments.
     HopByHop,
 }
 
 impl ValidationMode {
-    /// 从字符串解析验证模式
+    /// Parses the validation mode from a string.
     pub fn from_str(s: &str) -> Result<Self, ConfigError> {
         match s.to_lowercase().as_str() {
             "lenient" => Ok(Self::Lenient),
             "strict" => Ok(Self::Strict),
-            "hop_by_hop" => Ok(Self::HopByHop),
+            "hop_by_hop" | "hopbyhop" => Ok(Self::HopByHop),
             _ => Err(ConfigError::InvalidConfig(format!(
                 "Invalid validation mode: '{}'. Must be one of: lenient, strict, hop_by_hop",
                 s
@@ -47,7 +48,7 @@ impl ValidationMode {
         }
     }
 
-    /// 转换为字符串
+    /// Returns the string representation of the validation mode.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Lenient => "lenient",
@@ -63,17 +64,17 @@ impl Default for ValidationMode {
     }
 }
 
-/// 可信代理类型
-#[derive(Debug, Clone)]
+/// Represents a trusted proxy entry, which can be a single IP or a CIDR range.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustedProxy {
-    /// 单个 IP 地址
+    /// A single IP address.
     Single(IpAddr),
-    /// IP 地址段 (CIDR 表示法)
+    /// An IP network range (CIDR notation).
     Cidr(IpNetwork),
 }
 
 impl TrustedProxy {
-    /// 检查 IP 是否匹配此代理配置
+    /// Checks if the given IP address matches this proxy configuration.
     pub fn contains(&self, ip: &IpAddr) -> bool {
         match self {
             Self::Single(proxy_ip) => ip == proxy_ip,
@@ -81,7 +82,7 @@ impl TrustedProxy {
         }
     }
 
-    /// 转换为字符串表示
+    /// Returns the string representation of the proxy entry.
     pub fn to_string(&self) -> String {
         match self {
             Self::Single(ip) => ip.to_string(),
@@ -90,25 +91,25 @@ impl TrustedProxy {
     }
 }
 
-/// 可信代理配置
+/// Configuration for trusted proxies and validation logic.
 #[derive(Debug, Clone)]
 pub struct TrustedProxyConfig {
-    /// 代理列表
+    /// List of trusted proxy entries.
     pub proxies: Vec<TrustedProxy>,
-    /// 验证模式
+    /// The validation mode to use for verifying proxy chains.
     pub validation_mode: ValidationMode,
-    /// 是否启用 RFC 7239 Forwarded 头部
+    /// Whether to enable RFC 7239 "Forwarded" header support.
     pub enable_rfc7239: bool,
-    /// 最大代理跳数
+    /// Maximum allowed proxy hops in the chain.
     pub max_hops: usize,
-    /// 是否启用链连续性检查
+    /// Whether to enable continuity checks for the proxy chain.
     pub enable_chain_continuity_check: bool,
-    /// 私有网络范围
+    /// Private network ranges that should be treated with caution.
     pub private_networks: Vec<IpNetwork>,
 }
 
 impl TrustedProxyConfig {
-    /// 创建新配置
+    /// Creates a new trusted proxy configuration.
     pub fn new(
         proxies: Vec<TrustedProxy>,
         validation_mode: ValidationMode,
@@ -127,23 +128,23 @@ impl TrustedProxyConfig {
         }
     }
 
-    /// 检查 SocketAddr 是否来自可信代理
+    /// Checks if a SocketAddr originates from a trusted proxy.
     pub fn is_trusted(&self, addr: &SocketAddr) -> bool {
         let ip = addr.ip();
         self.proxies.iter().any(|proxy| proxy.contains(&ip))
     }
 
-    /// 检查 IP 是否在私有网络范围内
+    /// Checks if an IP address belongs to a private network range.
     pub fn is_private_network(&self, ip: &IpAddr) -> bool {
         self.private_networks.iter().any(|network| network.contains(*ip))
     }
 
-    /// 获取所有网络范围的字符串表示（用于调试）
+    /// Returns a list of all network strings for debugging purposes.
     pub fn get_network_strings(&self) -> Vec<String> {
         self.proxies.iter().map(|p| p.to_string()).collect()
     }
 
-    /// 获取配置摘要
+    /// Returns a summary of the configuration.
     pub fn summary(&self) -> String {
         format!(
             "TrustedProxyConfig {{ proxies: {}, mode: {}, max_hops: {} }}",
@@ -154,14 +155,14 @@ impl TrustedProxyConfig {
     }
 }
 
-/// 缓存配置
+/// Configuration for the internal caching mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
-    /// 缓存容量
+    /// Maximum number of entries in the cache.
     pub capacity: usize,
-    /// 缓存 TTL（秒）
+    /// Time-to-live for cache entries in seconds.
     pub ttl_seconds: u64,
-    /// 缓存清理间隔（秒）
+    /// Interval for cache cleanup in seconds.
     pub cleanup_interval_seconds: u64,
 }
 
@@ -176,29 +177,29 @@ impl Default for CacheConfig {
 }
 
 impl CacheConfig {
-    /// 获取缓存 TTL 时长
+    /// Returns the TTL as a Duration.
     pub fn ttl_duration(&self) -> Duration {
         Duration::from_secs(self.ttl_seconds)
     }
 
-    /// 获取缓存清理间隔时长
+    /// Returns the cleanup interval as a Duration.
     pub fn cleanup_interval(&self) -> Duration {
         Duration::from_secs(self.cleanup_interval_seconds)
     }
 }
 
-/// 监控配置
+/// Configuration for monitoring and observability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitoringConfig {
-    /// 是否启用监控指标
+    /// Whether to enable Prometheus metrics.
     pub metrics_enabled: bool,
-    /// 日志级别
+    /// The logging level (e.g., "info", "debug").
     pub log_level: String,
-    /// 是否启用结构化日志
+    /// Whether to use structured JSON logging.
     pub structured_logging: bool,
-    /// 是否启用请求追踪
+    /// Whether to enable distributed tracing.
     pub tracing_enabled: bool,
-    /// 是否记录验证失败的请求
+    /// Whether to log detailed information about failed validations.
     pub log_failed_validations: bool,
 }
 
@@ -214,16 +215,16 @@ impl Default for MonitoringConfig {
     }
 }
 
-/// 云服务集成配置
+/// Configuration for cloud provider integration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudConfig {
-    /// 是否启用云元数据获取
+    /// Whether to enable automatic cloud metadata discovery.
     pub metadata_enabled: bool,
-    /// 云元数据获取超时（秒）
+    /// Timeout for cloud metadata requests in seconds.
     pub metadata_timeout_seconds: u64,
-    /// 是否启用 Cloudflare IP 范围
+    /// Whether to automatically include Cloudflare IP ranges.
     pub cloudflare_ips_enabled: bool,
-    /// 强制指定的云服务商
+    /// Optionally force a specific cloud provider.
     pub forced_provider: Option<String>,
 }
 
@@ -239,29 +240,29 @@ impl Default for CloudConfig {
 }
 
 impl CloudConfig {
-    /// 获取元数据获取超时时长
+    /// Returns the metadata timeout as a Duration.
     pub fn metadata_timeout(&self) -> Duration {
         Duration::from_secs(self.metadata_timeout_seconds)
     }
 }
 
-/// 完整的应用配置
+/// Complete application configuration.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    /// 代理配置
+    /// Trusted proxy settings.
     pub proxy: TrustedProxyConfig,
-    /// 缓存配置
+    /// Cache settings.
     pub cache: CacheConfig,
-    /// 监控配置
+    /// Monitoring and observability settings.
     pub monitoring: MonitoringConfig,
-    /// 云服务配置
+    /// Cloud integration settings.
     pub cloud: CloudConfig,
-    /// 服务器绑定地址
+    /// The address the server should bind to.
     pub server_addr: SocketAddr,
 }
 
 impl AppConfig {
-    /// 创建应用配置
+    /// Creates a new application configuration.
     pub fn new(
         proxy: TrustedProxyConfig,
         cache: CacheConfig,
@@ -278,7 +279,7 @@ impl AppConfig {
         }
     }
 
-    /// 获取配置摘要
+    /// Returns a summary of the application configuration.
     pub fn summary(&self) -> String {
         format!(
             "AppConfig {{\n\

@@ -12,42 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Proxy validator for validating proxy chains and client information
-
-use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+//! Proxy validator for verifying proxy chains and extracting client information.
 
 use axum::http::HeaderMap;
-use tracing::{debug, trace, warn};
+use std::net::{IpAddr, SocketAddr};
+use std::time::Instant;
+use tracing::{debug, warn};
 
 use crate::config::{TrustedProxyConfig, ValidationMode};
 use crate::error::ProxyError;
 use crate::proxy::chain::ProxyChainAnalyzer;
 use crate::proxy::metrics::ProxyMetrics;
 
-/// 客户端信息验证结果
+/// Information about the client extracted from the request and proxy headers.
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
-    /// 真实客户端 IP 地址（已验证）
+    /// The verified real IP address of the client.
     pub real_ip: IpAddr,
-    /// 原始请求主机名（如果来自可信代理）
+    /// The original host requested by the client (if provided by a trusted proxy).
     pub forwarded_host: Option<String>,
-    /// 原始请求协议（如果来自可信代理）
+    /// The original protocol (http/https) used by the client (if provided by a trusted proxy).
     pub forwarded_proto: Option<String>,
-    /// 请求是否来自可信代理
+    /// Whether the request was received from a trusted proxy.
     pub is_from_trusted_proxy: bool,
-    /// 直接连接的代理 IP（如果经过代理）
+    /// The IP address of the proxy that directly connected to this server.
     pub proxy_ip: Option<IpAddr>,
-    /// 代理链长度
+    /// The number of proxy hops identified in the chain.
     pub proxy_hops: usize,
-    /// 验证模式
+    /// The validation mode used for this request.
     pub validation_mode: ValidationMode,
-    /// 验证警告信息
+    /// Any warnings generated during the validation process.
     pub warnings: Vec<String>,
 }
 
 impl ClientInfo {
-    /// 创建直接连接的客户端信息（无代理）
+    /// Creates a `ClientInfo` for a direct connection without any proxies.
     pub fn direct(addr: SocketAddr) -> Self {
         Self {
             real_ip: addr.ip(),
@@ -61,7 +60,7 @@ impl ClientInfo {
         }
     }
 
-    /// 从可信代理创建客户端信息
+    /// Creates a `ClientInfo` for a request received through a trusted proxy.
     pub fn from_trusted_proxy(
         real_ip: IpAddr,
         forwarded_host: Option<String>,
@@ -83,7 +82,7 @@ impl ClientInfo {
         }
     }
 
-    /// 获取客户端信息的字符串表示（用于日志）
+    /// Returns a string representation of the client info for logging.
     pub fn to_log_string(&self) -> String {
         format!(
             "client_ip={}, proxy={:?}, hops={}, trusted={}, mode={:?}",
@@ -92,19 +91,19 @@ impl ClientInfo {
     }
 }
 
-/// 代理验证器
+/// Core validator that processes incoming requests to verify proxy chains.
 #[derive(Debug, Clone)]
 pub struct ProxyValidator {
-    /// 代理配置
+    /// Configuration for trusted proxies.
     config: TrustedProxyConfig,
-    /// 代理链分析器
+    /// Analyzer for verifying the integrity of the proxy chain.
     chain_analyzer: ProxyChainAnalyzer,
-    /// 监控指标
+    /// Metrics collector for observability.
     metrics: Option<ProxyMetrics>,
 }
 
 impl ProxyValidator {
-    /// 创建新的代理验证器
+    /// Creates a new `ProxyValidator` with the given configuration and metrics.
     pub fn new(config: TrustedProxyConfig, metrics: Option<ProxyMetrics>) -> Self {
         let chain_analyzer = ProxyChainAnalyzer::new(config.clone());
 
@@ -115,53 +114,53 @@ impl ProxyValidator {
         }
     }
 
-    /// 验证请求并提取客户端信息
+    /// Validates an incoming request and extracts client information.
     pub fn validate_request(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
         let start_time = Instant::now();
 
-        // 记录验证开始
+        // Record the start of the validation attempt.
         self.record_metric_start();
 
-        // 验证请求
+        // Perform the internal validation logic.
         let result = self.validate_request_internal(peer_addr, headers);
 
-        // 记录验证结果
+        // Record the result and duration.
         let duration = start_time.elapsed();
         self.record_metric_result(&result, duration);
 
         result
     }
 
-    /// 内部验证逻辑
+    /// Internal logic for request validation.
     fn validate_request_internal(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
-        // 如果没有对端地址，使用默认值
+        // Fallback to unspecified address if peer address is missing.
         let peer_addr = peer_addr.unwrap_or_else(|| SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0));
 
-        // 检查是否来自可信代理
+        // Check if the direct peer is a trusted proxy.
         if self.config.is_trusted(&peer_addr) {
-            debug!("Request from trusted proxy: {}", peer_addr.ip());
+            debug!("Request received from trusted proxy: {}", peer_addr.ip());
 
-            // 来自可信代理，解析转发头部
+            // Parse and validate headers from the trusted proxy.
             self.validate_trusted_proxy_request(&peer_addr, headers)
         } else {
-            // 检查是否为私有网络地址
+            // Log a warning if the request is from a private network but not trusted.
             if self.config.is_private_network(&peer_addr.ip()) {
                 warn!(
-                    "Request from private network but not trusted: {}. This might be a configuration issue.",
+                    "Request from private network but not trusted: {}. This might indicate a configuration issue.",
                     peer_addr.ip()
                 );
             }
 
-            // 来自不可信代理或直接连接
+            // Treat as a direct connection if the peer is not trusted.
             Ok(ClientInfo::direct(peer_addr))
         }
     }
 
-    /// 验证来自可信代理的请求
+    /// Validates a request that originated from a trusted proxy.
     fn validate_trusted_proxy_request(&self, proxy_addr: &SocketAddr, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
         let proxy_ip = proxy_addr.ip();
 
-        // 优先使用 RFC 7239 Forwarded 头部（如果启用）
+        // Prefer RFC 7239 "Forwarded" header if enabled, otherwise fallback to legacy headers.
         let client_info = if self.config.enable_rfc7239 {
             self.try_parse_rfc7239_headers(headers, proxy_ip)
                 .unwrap_or_else(|| self.parse_legacy_headers(headers, proxy_ip))
@@ -169,27 +168,20 @@ impl ProxyValidator {
             self.parse_legacy_headers(headers, proxy_ip)
         };
 
-        // 验证代理链
+        // Analyze the integrity and continuity of the proxy chain.
         let chain_analysis = self
             .chain_analyzer
             .analyze_chain(&client_info.proxy_chain, proxy_ip, headers)?;
 
-        // 检查代理链长度
+        // Enforce maximum hop limit.
         if chain_analysis.hops > self.config.max_hops {
             return Err(ProxyError::ChainTooLong(chain_analysis.hops, self.config.max_hops));
         }
 
-        // 检查链连续性（如果启用）
+        // Enforce chain continuity if enabled.
         if self.config.enable_chain_continuity_check && !chain_analysis.is_continuous {
             return Err(ProxyError::ChainNotContinuous);
         }
-
-        // 创建客户端信息
-        let warnings = if !chain_analysis.warnings.is_empty() {
-            chain_analysis.warnings
-        } else {
-            Vec::new()
-        };
 
         Ok(ClientInfo::from_trusted_proxy(
             chain_analysis.client_ip,
@@ -198,11 +190,11 @@ impl ProxyValidator {
             proxy_ip,
             chain_analysis.hops,
             self.config.validation_mode,
-            warnings,
+            chain_analysis.warnings,
         ))
     }
 
-    /// 尝试解析 RFC 7239 Forwarded 头部
+    /// Attempts to parse the RFC 7239 "Forwarded" header.
     fn try_parse_rfc7239_headers(&self, headers: &HeaderMap, proxy_ip: IpAddr) -> Option<ParsedHeaders> {
         headers
             .get("forwarded")
@@ -210,7 +202,7 @@ impl ProxyValidator {
             .and_then(|s| Self::parse_forwarded_header(s, proxy_ip))
     }
 
-    /// 解析传统的代理头部
+    /// Parses legacy proxy headers (X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto).
     fn parse_legacy_headers(&self, headers: &HeaderMap, proxy_ip: IpAddr) -> ParsedHeaders {
         let forwarded_host = headers
             .get("x-forwarded-host")
@@ -225,8 +217,8 @@ impl ProxyValidator {
         let proxy_chain = headers
             .get("x-forwarded-for")
             .and_then(|h| h.to_str().ok())
-            .map(|s| Self::parse_x_forwarded_for(s))
-            .unwrap_or_else(Vec::new);
+            .map(Self::parse_x_forwarded_for)
+            .unwrap_or_default();
 
         ParsedHeaders {
             proxy_chain,
@@ -235,16 +227,15 @@ impl ProxyValidator {
         }
     }
 
-    /// 解析 RFC 7239 Forwarded 头部
+    /// Parses the RFC 7239 "Forwarded" header value.
     fn parse_forwarded_header(header_value: &str, proxy_ip: IpAddr) -> Option<ParsedHeaders> {
-        // 简化实现：只处理第一个值
+        // Simplified implementation: processes only the first entry in the header.
         let first_part = header_value.split(',').next()?.trim();
 
         let mut proxy_chain = Vec::new();
         let mut forwarded_host = None;
         let mut forwarded_proto = None;
 
-        // 解析键值对
         for part in first_part.split(';') {
             let part = part.trim();
             if let Some((key, value)) = part.split_once('=') {
@@ -253,7 +244,7 @@ impl ProxyValidator {
 
                 match key.as_str() {
                     "for" => {
-                        // 解析客户端 IP（可能包含端口）
+                        // Extract IP address, ignoring port if present.
                         if let Some(ip_part) = value.split(':').next() {
                             if let Ok(ip) = ip_part.parse::<IpAddr>() {
                                 proxy_chain.push(ip);
@@ -271,7 +262,7 @@ impl ProxyValidator {
             }
         }
 
-        // 如果没有找到客户端 IP，添加代理 IP 作为备选
+        // Fallback to the proxy IP if no client IP was found in the header.
         if proxy_chain.is_empty() {
             proxy_chain.push(proxy_ip);
         }
@@ -283,28 +274,28 @@ impl ProxyValidator {
         })
     }
 
-    /// 解析 X-Forwarded-For 头部
+    /// Parses the X-Forwarded-For header into a list of IP addresses.
     fn parse_x_forwarded_for(header_value: &str) -> Vec<IpAddr> {
         header_value
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .filter_map(|s| {
-                // 移除端口部分（如果存在）
+                // Strip port if present.
                 let ip_part = s.split(':').next().unwrap_or(s);
                 ip_part.parse::<IpAddr>().ok()
             })
             .collect()
     }
 
-    /// 记录验证开始指标
+    /// Records the start of a validation attempt in metrics.
     fn record_metric_start(&self) {
         if let Some(metrics) = &self.metrics {
             metrics.increment_validation_attempts();
         }
     }
 
-    /// 记录验证结果指标
+    /// Records the result of a validation attempt in metrics.
     fn record_metric_result(&self, result: &Result<ClientInfo, ProxyError>, duration: std::time::Duration) {
         if let Some(metrics) = &self.metrics {
             match result {
@@ -314,7 +305,6 @@ impl ProxyValidator {
                 Err(err) => {
                     metrics.record_validation_failure(err, duration);
 
-                    // 记录失败的验证（如果启用）
                     if self.config.log_failed_validations {
                         warn!("Proxy validation failed: {}", err);
                     }
@@ -324,13 +314,13 @@ impl ProxyValidator {
     }
 }
 
-/// 解析后的头部信息
+/// Internal structure for holding parsed header information.
 #[derive(Debug, Clone)]
 struct ParsedHeaders {
-    /// 代理链（客户端 IP 在第一个位置）
+    /// The chain of proxy IPs (client IP is typically the first).
     proxy_chain: Vec<IpAddr>,
-    /// 转发的主机名
+    /// The original host requested.
     forwarded_host: Option<String>,
-    /// 转发的协议
+    /// The original protocol used.
     forwarded_proto: Option<String>,
 }

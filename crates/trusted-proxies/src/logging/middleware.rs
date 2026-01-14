@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Logging middleware for Axum
+//! Logging middleware for the Axum web framework.
 
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -21,14 +21,14 @@ use uuid::Uuid;
 
 use crate::logging::Logger;
 
-/// 请求日志中间件层
+/// Tower Layer for request logging middleware.
 #[derive(Clone)]
 pub struct RequestLoggingLayer {
     logger: Logger,
 }
 
 impl RequestLoggingLayer {
-    /// 创建新的日志中间件层
+    /// Creates a new `RequestLoggingLayer`.
     pub fn new(logger: Logger) -> Self {
         Self { logger }
     }
@@ -45,7 +45,7 @@ impl<S> tower::Layer<S> for RequestLoggingLayer {
     }
 }
 
-/// 请求日志中间件服务
+/// Tower Service for request logging middleware.
 #[derive(Clone)]
 pub struct RequestLoggingMiddleware<S> {
     inner: S,
@@ -70,24 +70,22 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // 生成请求 ID
+            // Generate a unique request ID for correlation.
             let request_id = Uuid::new_v4().to_string();
 
-            // 记录请求开始时间和日志
             let start_time = Instant::now();
             logger.log_request(&req, &request_id);
 
-            // 将请求 ID 添加到请求扩展中
+            // Inject the request ID into the request extensions.
             let mut req = req;
             req.extensions_mut().insert(RequestId(request_id.clone()));
 
-            // 处理请求
+            // Process the request.
             let result = inner.call(req).await;
 
-            // 计算处理时间
             let duration = start_time.elapsed();
 
-            // 记录响应
+            // Log the response or error.
             match &result {
                 Ok(response) => {
                     logger.log_response(response, &request_id, duration);
@@ -102,12 +100,12 @@ where
     }
 }
 
-/// 请求 ID 包装器
+/// Wrapper for a unique request ID.
 #[derive(Debug, Clone)]
 pub struct RequestId(String);
 
 impl RequestId {
-    /// 获取请求 ID
+    /// Returns the request ID as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -119,7 +117,7 @@ impl std::fmt::Display for RequestId {
     }
 }
 
-/// 代理特定的日志中间件
+/// Middleware specifically for logging proxy-related information.
 #[derive(Clone)]
 pub struct ProxyLoggingMiddleware<S> {
     inner: S,
@@ -127,7 +125,7 @@ pub struct ProxyLoggingMiddleware<S> {
 }
 
 impl<S> ProxyLoggingMiddleware<S> {
-    /// 创建新的代理日志中间件
+    /// Creates a new `ProxyLoggingMiddleware`.
     pub fn new(inner: S, logger: Logger) -> Self {
         Self { inner, logger }
     }
@@ -147,7 +145,7 @@ where
     }
 
     fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
-        // 记录代理相关信息
+        // Log proxy-specific details if available.
         let peer_addr = req.extensions().get::<std::net::SocketAddr>().copied();
         let client_info = req.extensions().get::<crate::middleware::ClientInfo>();
 
@@ -155,7 +153,7 @@ where
             self.logger
                 .log_info(&format!("Proxy request from {}: {}", addr, info.to_log_string()), None);
 
-            // 如果有警告，记录它们
+            // Log any warnings generated during proxy validation.
             if !info.warnings.is_empty() {
                 for warning in &info.warnings {
                     self.logger.log_warning(warning, Some("proxy_validation"));
@@ -167,14 +165,14 @@ where
     }
 }
 
-/// 代理日志中间件层
+/// Tower Layer for proxy logging middleware.
 #[derive(Clone)]
 pub struct ProxyLoggingLayer {
     logger: Logger,
 }
 
 impl ProxyLoggingLayer {
-    /// 创建新的代理日志中间件层
+    /// Creates a new `ProxyLoggingLayer`.
     pub fn new(logger: Logger) -> Self {
         Self { logger }
     }

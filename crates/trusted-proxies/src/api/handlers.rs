@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! API request handlers
+//! API request handlers for the trusted proxy service.
 
 use axum::{
     extract::{Request, State},
@@ -25,7 +25,7 @@ use crate::error::AppError;
 use crate::middleware::ClientInfo;
 use crate::AppState;
 
-/// 健康检查端点
+/// Health check endpoint to verify service availability.
 pub async fn health_check() -> impl IntoResponse {
     Json(json!({
         "status": "healthy",
@@ -35,7 +35,7 @@ pub async fn health_check() -> impl IntoResponse {
     }))
 }
 
-/// 显示配置信息
+/// Returns the current application configuration.
 pub async fn show_config(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let config = &state.config;
 
@@ -45,7 +45,7 @@ pub async fn show_config(State(state): State<AppState>) -> Result<Json<Value>, A
         },
         "proxy": {
             "trusted_networks_count": config.proxy.proxies.len(),
-            "validation_mode": format!("{:?}", config.proxy.validation_mode),
+            "validation_mode": config.proxy.validation_mode.as_str(),
             "max_hops": config.proxy.max_hops,
             "enable_rfc7239": config.proxy.enable_rfc7239,
         },
@@ -66,9 +66,9 @@ pub async fn show_config(State(state): State<AppState>) -> Result<Json<Value>, A
     Ok(Json(response))
 }
 
-/// 显示客户端信息
-pub async fn client_info(State(state): State<AppState>, req: Request) -> impl IntoResponse {
-    // 从请求扩展中获取客户端信息
+/// Returns information about the client as identified by the trusted proxy middleware.
+pub async fn client_info(State(_state): State<AppState>, req: Request) -> impl IntoResponse {
+    // Retrieve the verified client information from the request extensions.
     let client_info = req.extensions().get::<ClientInfo>();
 
     match client_info {
@@ -78,7 +78,7 @@ pub async fn client_info(State(state): State<AppState>, req: Request) -> impl In
                     "real_ip": info.real_ip.to_string(),
                     "is_from_trusted_proxy": info.is_from_trusted_proxy,
                     "proxy_hops": info.proxy_hops,
-                    "validation_mode": format!("{:?}", info.validation_mode),
+                    "validation_mode": info.validation_mode.as_str(),
                 },
                 "headers": {
                     "forwarded_host": info.forwarded_host,
@@ -93,7 +93,7 @@ pub async fn client_info(State(state): State<AppState>, req: Request) -> impl In
         None => {
             let response = json!({
                 "error": "Client information not available",
-                "message": "The trusted proxy middleware may not be enabled or configured correctly",
+                "message": "The trusted proxy middleware may not be enabled or configured correctly.",
             });
 
             (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
@@ -101,9 +101,9 @@ pub async fn client_info(State(state): State<AppState>, req: Request) -> impl In
     }
 }
 
-/// 代理测试端点（用于测试代理头部）
+/// Debugging endpoint that returns all proxy-related headers received in the request.
 pub async fn proxy_test(req: Request) -> Json<Value> {
-    // 收集所有代理相关的头部
+    // Collect all headers related to proxying.
     let headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -114,7 +114,7 @@ pub async fn proxy_test(req: Request) -> Json<Value> {
         .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("[INVALID]").to_string()))
         .collect();
 
-    // 获取对端地址
+    // Get the direct peer address.
     let peer_addr = req
         .extensions()
         .get::<std::net::SocketAddr>()
@@ -130,19 +130,17 @@ pub async fn proxy_test(req: Request) -> Json<Value> {
     }))
 }
 
-/// 指标端点（Prometheus 格式）
+/// Endpoint for retrieving Prometheus metrics.
 pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     if !state.config.monitoring.metrics_enabled {
-        return (StatusCode::NOT_FOUND, "Metrics are not enabled".to_string()).into_response();
+        return (StatusCode::NOT_FOUND, "Metrics are not enabled").into_response();
     }
 
-    // 在实际应用中，这里应该返回 Prometheus 格式的指标
-    // 这里返回简单的 JSON 作为示例
-    let metrics = json!({
-        "message": "Metrics endpoint",
-        "note": "In a real implementation, this would return Prometheus format metrics",
+    // In a production environment, this would return the actual Prometheus-formatted metrics.
+    let metrics_summary = json!({
         "status": "metrics_enabled",
+        "note": "Prometheus metrics are being collected. Use a compatible exporter to view them.",
     });
 
-    Json(metrics).into_response()
+    Json(metrics_summary).into_response()
 }

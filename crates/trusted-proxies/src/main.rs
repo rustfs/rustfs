@@ -12,19 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Main application entry point for the trusted proxy system
+//! Main application entry point for the RustFS Trusted Proxies service.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    response::{IntoResponse, Json},
-    routing::get,
-    Router,
-};
+use axum::{routing::get, Router};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{info, Level};
+use tracing_subscriber::EnvFilter;
 
 mod api;
 mod cloud;
@@ -36,98 +31,86 @@ mod state;
 mod utils;
 
 use api::handlers;
-use config::{AppConfig, ConfigLoader};
+use config::{AppConfig, ConfigLoader, MonitoringConfig};
 use error::AppError;
 use middleware::TrustedProxyLayer;
-use proxy::metrics::{default_proxy_metrics, ProxyMetrics};
+use proxy::metrics::default_proxy_metrics;
 use state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
-    // 加载环境变量
+    // Load environment variables from .env file if present.
     dotenvy::dotenv().ok();
 
-    // 从环境变量加载配置
+    // Load application configuration from environment variables.
     let config = ConfigLoader::from_env_or_default();
 
-    // 初始化日志
+    // Initialize the logging system.
     init_logging(&config.monitoring)?;
 
-    // 打印配置摘要
+    // Print a summary of the loaded configuration.
     ConfigLoader::print_summary(&config);
 
-    // 初始化指标收集器
+    // Initialize metrics collector if enabled.
     let metrics = if config.monitoring.metrics_enabled {
-        let metrics = default_proxy_metrics(true);
-        metrics.print_summary();
-        Some(metrics)
+        let m = default_proxy_metrics(true);
+        m.print_summary();
+        Some(m)
     } else {
         None
     };
 
-    // 创建应用状态
+    // Create shared application state.
     let state = AppState {
-        config: Arc::new(config),
+        config: Arc::new(config.clone()),
         metrics: metrics.clone(),
     };
 
-    // 创建可信代理中间件层
-    let proxy_layer = TrustedProxyLayer::enabled(state.clone().config.proxy.clone(), metrics);
+    // Initialize the trusted proxy middleware layer.
+    let proxy_layer = TrustedProxyLayer::enabled(config.proxy.clone(), metrics);
 
-    // 创建路由
+    // Build the Axum application router.
     let app = Router::new()
-        // 健康检查端点
         .route("/health", get(handlers::health_check))
-        // 配置查看端点
         .route("/config", get(handlers::show_config))
-        // 客户端信息端点
         .route("/client-info", get(handlers::client_info))
-        // 代理测试端点
         .route("/proxy-test", get(handlers::proxy_test))
-        // 指标端点（如果启用）
         .route("/metrics", get(handlers::metrics))
-        // 添加应用状态
-        .with_state(state.clone())
-        // 添加可信代理中间件
+        .with_state(state)
         .layer(proxy_layer)
-        // 添加追踪中间件（如果启用）
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        // 添加 CORS 中间件
         .layer(tower_http::cors::CorsLayer::permissive())
-        // 添加压缩中间件
         .layer(tower_http::compression::CompressionLayer::new());
 
-    // 启动服务器
-    let addr = state.config.server_addr;
-    let listener = TcpListener::bind(addr).await.map_err(|e| AppError::Io(e))?;
+    // Bind the TCP listener and start the server.
+    let addr = config.server_addr;
+    let listener = TcpListener::bind(addr).await?;
 
     info!("Server listening on http://{}", addr);
     info!("Available endpoints:");
-    info!("  GET /health      - Health check");
-    info!("  GET /config      - Show configuration");
-    info!("  GET /client-info - Show client information");
-    info!("  GET /proxy-test  - Test proxy headers");
+    info!("  GET /health      - Service health check");
+    info!("  GET /config      - Current configuration summary");
+    info!("  GET /client-info - Extracted client information");
+    info!("  GET /proxy-test  - Debugging endpoint for proxy headers");
     info!("  GET /metrics     - Prometheus metrics (if enabled)");
 
-    axum::serve(listener, app).await.map_err(|e| AppError::Io(e))?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-/// 初始化日志系统
-fn init_logging(monitoring_config: &config::MonitoringConfig) -> Result<(), AppError> {
-    // 创建日志过滤器
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(monitoring_config.log_level.parse().unwrap_or(tracing::Level::INFO.into()))
+/// Initializes the tracing subscriber for logging.
+fn init_logging(monitoring_config: &MonitoringConfig) -> Result<(), AppError> {
+    let filter = EnvFilter::builder()
+        .with_default_directive(monitoring_config.log_level.parse().unwrap_or(Level::INFO.into()))
         .from_env_lossy();
 
-    // 根据配置选择日志格式
+    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
+
     if monitoring_config.structured_logging {
-        // 结构化日志（JSON 格式）
-        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+        subscriber.json().init();
     } else {
-        // 普通文本日志
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        subscriber.init();
     }
 
     info!("Logging initialized with level: {}", monitoring_config.log_level);

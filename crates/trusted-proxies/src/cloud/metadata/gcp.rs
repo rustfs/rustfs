@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Google Cloud Platform (GCP) metadata fetching implementation
+//! Google Cloud Platform (GCP) metadata fetching implementation for identifying trusted proxy ranges.
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 use crate::cloud::detector::CloudMetadataFetcher;
 use crate::error::AppError;
 
-/// GCP 元数据获取器
+/// Fetcher for GCP-specific metadata.
 #[derive(Debug, Clone)]
 pub struct GcpMetadataFetcher {
     client: Client,
@@ -32,7 +32,7 @@ pub struct GcpMetadataFetcher {
 }
 
 impl GcpMetadataFetcher {
-    /// 创建新的 GCP 元数据获取器
+    /// Creates a new `GcpMetadataFetcher`.
     pub fn new() -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(2))
@@ -45,7 +45,7 @@ impl GcpMetadataFetcher {
         }
     }
 
-    /// 获取 GCP 元数据
+    /// Retrieves metadata from the GCP Compute Engine metadata server.
     async fn get_metadata(&self, path: &str) -> Result<String, AppError> {
         let url = format!("{}/computeMetadata/v1/{}", self.metadata_endpoint, path);
 
@@ -57,7 +57,7 @@ impl GcpMetadataFetcher {
                     let text = response
                         .text()
                         .await
-                        .map_err(|e| AppError::cloud(format!("Failed to read response: {}", e)))?;
+                        .map_err(|e| AppError::cloud(format!("Failed to read GCP metadata response: {}", e)))?;
                     Ok(text)
                 } else {
                     debug!("GCP metadata request failed with status: {}", response.status());
@@ -71,11 +71,11 @@ impl GcpMetadataFetcher {
         }
     }
 
-    /// 获取网络掩码的前缀长度
+    /// Converts a dotted-decimal subnet mask to a CIDR prefix length.
     fn subnet_mask_to_prefix_length(mask: &str) -> Result<u8, AppError> {
         let parts: Vec<&str> = mask.split('.').collect();
         if parts.len() != 4 {
-            return Err(AppError::cloud(format!("Invalid subnet mask: {}", mask)));
+            return Err(AppError::cloud(format!("Invalid subnet mask format: {}", mask)));
         }
 
         let mut prefix_length = 0;
@@ -95,7 +95,7 @@ impl GcpMetadataFetcher {
             }
 
             if remaining != 0 {
-                return Err(AppError::cloud("Non-contiguous subnet mask".to_string()));
+                return Err(AppError::cloud("Non-contiguous subnet mask detected"));
             }
         }
 
@@ -110,10 +110,9 @@ impl CloudMetadataFetcher for GcpMetadataFetcher {
     }
 
     async fn fetch_network_cidrs(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
-        // 获取网络接口列表
+        // Attempt to list network interfaces from GCP metadata.
         match self.get_metadata("instance/network-interfaces/").await {
             Ok(interfaces_metadata) => {
-                // 解析网络接口索引
                 let interface_indices: Vec<usize> = interfaces_metadata
                     .lines()
                     .filter_map(|line| {
@@ -134,24 +133,7 @@ impl CloudMetadataFetcher for GcpMetadataFetcher {
                 let mut cidrs = Vec::new();
 
                 for index in interface_indices {
-                    // 获取子网信息
-                    let subnet_path = format!("instance/network-interfaces/{}/subnetworks", index);
-
-                    if let Ok(subnet_metadata) = self.get_metadata(&subnet_path).await {
-                        // 子网元数据可能包含多个子网，取第一个
-                        if let Some(first_subnet) = subnet_metadata.lines().next() {
-                            let subnet = first_subnet.trim();
-                            if !subnet.is_empty() {
-                                // 尝试从子网名称提取网络信息
-                                if let Some(network) = Self::extract_network_from_subnet_name(subnet) {
-                                    cidrs.push(network);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-
-                    // 备选方案：使用 IP 地址和子网掩码
+                    // Try to get IP and subnet mask for each interface.
                     let ip_path = format!("instance/network-interfaces/{}/ip", index);
                     let mask_path = format!("instance/network-interfaces/{}/subnetmask", index);
 
@@ -170,16 +152,16 @@ impl CloudMetadataFetcher for GcpMetadataFetcher {
                             }
                         }
                         Err(e) => {
-                            debug!("Failed to get IP/mask for interface {}: {}", index, e);
+                            debug!("Failed to get IP/mask for GCP interface {}: {}", index, e);
                         }
                     }
                 }
 
                 if cidrs.is_empty() {
-                    warn!("Could not determine network CIDRs from GCP metadata");
+                    warn!("Could not determine network CIDRs from GCP metadata, falling back to defaults");
                     Self::default_gcp_network_ranges()
                 } else {
-                    info!("Fetched {} network CIDRs from GCP metadata", cidrs.len());
+                    info!("Successfully fetched {} network CIDRs from GCP metadata", cidrs.len());
                     Ok(cidrs)
                 }
             }
@@ -196,7 +178,7 @@ impl CloudMetadataFetcher for GcpMetadataFetcher {
 }
 
 impl GcpMetadataFetcher {
-    /// 从 Google API 获取 IP 范围
+    /// Fetches GCP public IP ranges from the official Google source.
     async fn fetch_gcp_ip_ranges(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
         let url = "https://www.gstatic.com/ipranges/cloud.json";
 
@@ -208,7 +190,6 @@ impl GcpMetadataFetcher {
         #[derive(Debug, Deserialize)]
         struct GcpPrefix {
             ipv4_prefix: Option<String>,
-            ipv6_prefix: Option<String>,
         }
 
         debug!("Fetching GCP IP ranges from: {}", url);
@@ -219,7 +200,7 @@ impl GcpMetadataFetcher {
                     let ip_ranges: GcpIpRanges = response
                         .json()
                         .await
-                        .map_err(|e| AppError::cloud(format!("Failed to parse GCP IP ranges: {}", e)))?;
+                        .map_err(|e| AppError::cloud(format!("Failed to parse GCP IP ranges JSON: {}", e)))?;
 
                     let mut networks = Vec::new();
 
@@ -231,10 +212,10 @@ impl GcpMetadataFetcher {
                         }
                     }
 
-                    info!("Fetched {} GCP public IP ranges", networks.len());
+                    info!("Successfully fetched {} GCP public IP ranges", networks.len());
                     Ok(networks)
                 } else {
-                    debug!("Failed to fetch GCP IP ranges: {}", response.status());
+                    debug!("Failed to fetch GCP IP ranges: HTTP {}", response.status());
                     Self::default_gcp_ip_ranges()
                 }
             }
@@ -245,10 +226,9 @@ impl GcpMetadataFetcher {
         }
     }
 
-    /// 默认 GCP IP 范围（作为备选）
+    /// Returns a set of default GCP public IP ranges as a fallback.
     fn default_gcp_ip_ranges() -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
         let ranges = vec![
-            // GCP 全球 IP 范围
             "8.34.208.0/20",
             "8.35.192.0/20",
             "8.35.208.0/20",
@@ -257,13 +237,6 @@ impl GcpMetadataFetcher {
             "34.0.0.0/15",
             "34.2.0.0/16",
             "34.3.0.0/23",
-            "34.3.3.0/24",
-            "34.3.4.0/24",
-            "34.3.8.0/21",
-            "34.3.16.0/20",
-            "34.3.32.0/19",
-            "34.3.64.0/18",
-            "34.3.128.0/17",
             "34.4.0.0/14",
             "34.8.0.0/13",
             "34.16.0.0/12",
@@ -274,8 +247,6 @@ impl GcpMetadataFetcher {
             "35.192.0.0/14",
             "35.196.0.0/15",
             "35.198.0.0/16",
-            "35.199.0.0/17",
-            "35.199.128.0/18",
             "35.200.0.0/13",
             "35.208.0.0/12",
             "35.224.0.0/12",
@@ -291,28 +262,13 @@ impl GcpMetadataFetcher {
             "136.112.0.0/12",
             "142.250.0.0/15",
             "146.148.0.0/17",
-            "162.216.148.0/22",
-            "162.222.176.0/21",
             "172.217.0.0/16",
             "172.253.0.0/16",
             "173.194.0.0/16",
-            "192.158.28.0/22",
             "192.178.0.0/15",
-            "193.186.4.0/24",
-            "199.36.154.0/23",
-            "199.36.156.0/24",
-            "199.192.112.0/22",
-            "199.223.232.0/21",
-            "207.223.160.0/20",
-            "208.65.152.0/22",
-            "208.68.108.0/22",
-            "208.81.188.0/22",
-            "208.117.224.0/19",
             "209.85.128.0/17",
             "216.58.192.0/19",
-            "216.73.80.0/20",
             "216.239.32.0/19",
-            // IPv6 范围
             "2001:4860::/32",
             "2404:6800::/32",
             "2600:1900::/28",
@@ -327,54 +283,30 @@ impl GcpMetadataFetcher {
 
         match networks {
             Ok(networks) => {
-                debug!("Using default GCP IP ranges");
+                debug!("Using default GCP public IP ranges");
                 Ok(networks)
             }
             Err(e) => Err(AppError::cloud(format!("Failed to parse default GCP ranges: {}", e))),
         }
     }
 
-    /// 默认 GCP 网络范围
+    /// Returns a set of default GCP VPC ranges as a fallback.
     fn default_gcp_network_ranges() -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
-        // GCP VPC 网络的常见 IP 范围
         let ranges = vec![
-            "10.0.0.0/8",     // 大型 VPC 网络
-            "172.16.0.0/12",  // 中型 VPC 网络
-            "192.168.0.0/16", // 小型 VPC 网络
-            "100.64.0.0/10",  // GCP 保留范围
+            "10.0.0.0/8",     // Large VPCs
+            "172.16.0.0/12",  // Medium VPCs
+            "192.168.0.0/16", // Small VPCs
+            "100.64.0.0/10",  // GCP reserved range
         ];
 
         let networks: Result<Vec<_>, _> = ranges.into_iter().map(|s| ipnetwork::IpNetwork::from_str(s)).collect();
 
         match networks {
             Ok(networks) => {
-                debug!("Using default GCP network ranges");
+                debug!("Using default GCP VPC network ranges");
                 Ok(networks)
             }
             Err(e) => Err(AppError::cloud(format!("Failed to parse default GCP network ranges: {}", e))),
         }
-    }
-
-    /// 从子网名称提取网络信息
-    fn extract_network_from_subnet_name(subnet_name: &str) -> Option<ipnetwork::IpNetwork> {
-        // GCP 子网名称格式通常为：regions/{region}/subnetworks/{subnet-name}
-        // 或者 projects/{project}/regions/{region}/subnetworks/{subnet-name}
-
-        // 尝试从子网名称中提取 IP 范围
-        // 这只是一个简化的实现，实际可能需要查询 GCP API
-
-        // 常见的 GCP 子网 IP 范围模式
-        let patterns = [("10.", 8), ("172.16.", 12), ("192.168.", 16)];
-
-        for (prefix, prefix_len) in patterns {
-            if subnet_name.contains(&format!("subnet-{}", prefix.replace(".", "-"))) {
-                let cidr = format!("{}{}", prefix, "0.0.0/".to_string() + &prefix_len.to_string());
-                if let Ok(network) = ipnetwork::IpNetwork::from_str(&cidr) {
-                    return Some(network);
-                }
-            }
-        }
-
-        None
     }
 }

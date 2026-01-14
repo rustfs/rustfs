@@ -33,7 +33,7 @@ http = { workspace = true }
 tower-http = { workspace = true }
 ipnetwork = { workspace = true }
 metrics = { workspace = true }
-moka = { workspace = true }
+moka = { workspace = true, features = ["future"] }
 reqwest = { workspace = true }
 rustfs-utils = { workspace = true }
 serde.workspace = true
@@ -49,5 +49,19 @@ regex = { workspace = true }
 lazy_static = { workspace = true }
 dotenvy = "0.15.7"
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+wiremock = "0.6"
+
 [lints]
 workspace = true
+
+[[test]]
+name = "unit_tests"
+path = "tests/unit/mod.rs"
+
+[[test]]
+name = "integration_tests"
+path = "tests/integration/mod.rs"

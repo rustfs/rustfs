@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tower layer implementation for trusted proxy middleware
+//! Tower layer implementation for the trusted proxy middleware.
 
 use std::sync::Arc;
 use tower::Layer;
@@ -22,17 +22,17 @@ use crate::middleware::TrustedProxyMiddleware;
 use crate::proxy::ProxyMetrics;
 use crate::proxy::ProxyValidator;
 
-/// 可信代理中间件层
+/// Tower Layer for the trusted proxy middleware.
 #[derive(Clone)]
 pub struct TrustedProxyLayer {
-    /// 代理验证器
+    /// The validator used to verify proxy chains.
     pub(crate) validator: Arc<ProxyValidator>,
-    /// 是否启用中间件
+    /// Whether the middleware is enabled.
     pub(crate) enabled: bool,
 }
 
 impl TrustedProxyLayer {
-    /// 创建新的中间件层
+    /// Creates a new `TrustedProxyLayer`.
     pub fn new(config: TrustedProxyConfig, metrics: Option<ProxyMetrics>, enabled: bool) -> Self {
         let validator = ProxyValidator::new(config, metrics);
 
@@ -42,12 +42,12 @@ impl TrustedProxyLayer {
         }
     }
 
-    /// 创建启用的中间件层
+    /// Creates a new `TrustedProxyLayer` that is enabled by default.
     pub fn enabled(config: TrustedProxyConfig, metrics: Option<ProxyMetrics>) -> Self {
         Self::new(config, metrics, true)
     }
 
-    /// 创建禁用的中间件层
+    /// Creates a new `TrustedProxyLayer` that is disabled.
     pub fn disabled() -> Self {
         Self::new(
             TrustedProxyConfig::new(Vec::new(), crate::config::ValidationMode::Lenient, true, 10, true, Vec::new()),
@@ -56,7 +56,7 @@ impl TrustedProxyLayer {
         )
     }
 
-    /// 检查中间件是否启用
+    /// Returns true if the middleware is enabled.
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }

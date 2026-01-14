@@ -12,50 +12,50 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Proxy validation error types
+//! Proxy validation error types for the trusted proxy system.
 
 use std::net::AddrParseError;
 
-/// 代理验证错误类型
+/// Errors that can occur during proxy chain validation.
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
-    /// 无效的 X-Forwarded-For 头部
+    /// The X-Forwarded-For header is malformed or contains invalid data.
     #[error("Invalid X-Forwarded-For header: {0}")]
     InvalidXForwardedFor(String),
 
-    /// 无效的 Forwarded 头部（RFC 7239）
+    /// The RFC 7239 Forwarded header is malformed.
     #[error("Invalid Forwarded header (RFC 7239): {0}")]
     InvalidForwardedHeader(String),
 
-    /// 代理链验证失败
+    /// General failure during proxy chain validation.
     #[error("Proxy chain validation failed: {0}")]
     ChainValidationFailed(String),
 
-    /// 代理链过长
+    /// The number of proxy hops exceeds the configured limit.
     #[error("Proxy chain too long: {0} hops (max: {1})")]
     ChainTooLong(usize, usize),
 
-    /// 来自不可信代理
+    /// The request originated from a proxy that is not in the trusted list.
     #[error("Request from untrusted proxy: {0}")]
     UntrustedProxy(String),
 
-    /// 代理链不连续
+    /// The proxy chain is not continuous (e.g., an untrusted IP is between trusted ones).
     #[error("Proxy chain is not continuous")]
     ChainNotContinuous,
 
-    /// IP 地址解析失败
+    /// An IP address in the chain could not be parsed.
     #[error("Failed to parse IP address: {0}")]
     IpParseError(String),
 
-    /// 头部解析失败
+    /// A header value could not be parsed as a string.
     #[error("Failed to parse header: {0}")]
     HeaderParseError(String),
 
-    /// 验证超时
+    /// Validation took too long and timed out.
     #[error("Validation timeout")]
     Timeout,
 
-    /// 内部验证错误
+    /// An unexpected internal error occurred during validation.
     #[error("Internal validation error: {0}")]
     Internal(String),
 }
@@ -67,40 +67,41 @@ impl From<AddrParseError> for ProxyError {
 }
 
 impl ProxyError {
-    /// 创建无效 X-Forwarded-For 头部错误
+    /// Creates an `InvalidXForwardedFor` error.
     pub fn invalid_xff(msg: impl Into<String>) -> Self {
         Self::InvalidXForwardedFor(msg.into())
     }
 
-    /// 创建无效 Forwarded 头部错误
+    /// Creates an `InvalidForwardedHeader` error.
     pub fn invalid_forwarded(msg: impl Into<String>) -> Self {
         Self::InvalidForwardedHeader(msg.into())
     }
 
-    /// 创建代理链验证失败错误
+    /// Creates a `ChainValidationFailed` error.
     pub fn chain_failed(msg: impl Into<String>) -> Self {
         Self::ChainValidationFailed(msg.into())
     }
 
-    /// 创建来自不可信代理错误
+    /// Creates an `UntrustedProxy` error.
     pub fn untrusted(proxy: impl Into<String>) -> Self {
         Self::UntrustedProxy(proxy.into())
     }
 
-    /// 创建内部验证错误
+    /// Creates an `Internal` validation error.
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
     }
 
-    /// 判断错误是否可恢复（是否应该继续处理请求）
+    /// Determines if the error is recoverable, meaning the request can still be processed
+    /// (perhaps by falling back to the direct peer IP).
     pub fn is_recoverable(&self) -> bool {
         match self {
-            // 这些错误通常意味着我们应该拒绝请求或使用备用 IP
+            // These errors typically mean we should use the direct peer IP as a fallback.
             Self::UntrustedProxy(_) => true,
             Self::ChainTooLong(_, _) => true,
             Self::ChainNotContinuous => true,
 
-            // 这些错误可能意味着配置问题或恶意请求
+            // These errors suggest malformed requests or severe configuration issues.
             Self::InvalidXForwardedFor(_) => false,
             Self::InvalidForwardedHeader(_) => false,
             Self::ChainValidationFailed(_) => false,

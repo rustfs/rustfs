@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cloud provider detection and metadata fetching
+//! Cloud provider detection and metadata fetching.
 
 use async_trait::async_trait;
 use std::time::Duration;
@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::AppError;
 
-/// 云服务商类型
+/// Supported cloud providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CloudProvider {
     /// Amazon Web Services
@@ -33,14 +33,14 @@ pub enum CloudProvider {
     DigitalOcean,
     /// Cloudflare
     Cloudflare,
-    /// 未知或自定义
+    /// Unknown or custom provider.
     Unknown(String),
 }
 
 impl CloudProvider {
-    /// 从环境变量检测云服务商
+    /// Detects the cloud provider based on environment variables.
     pub fn detect_from_env() -> Option<Self> {
-        // 检查 AWS 环境变量
+        // Check for AWS environment variables.
         if std::env::var("AWS_EXECUTION_ENV").is_ok()
             || std::env::var("AWS_REGION").is_ok()
             || std::env::var("EC2_INSTANCE_ID").is_ok()
@@ -48,7 +48,7 @@ impl CloudProvider {
             return Some(Self::Aws);
         }
 
-        // 检查 Azure 环境变量
+        // Check for Azure environment variables.
         if std::env::var("WEBSITE_SITE_NAME").is_ok()
             || std::env::var("WEBSITE_INSTANCE_ID").is_ok()
             || std::env::var("APPSETTING_WEBSITE_SITE_NAME").is_ok()
@@ -56,7 +56,7 @@ impl CloudProvider {
             return Some(Self::Azure);
         }
 
-        // 检查 GCP 环境变量
+        // Check for GCP environment variables.
         if std::env::var("GCP_PROJECT").is_ok()
             || std::env::var("GOOGLE_CLOUD_PROJECT").is_ok()
             || std::env::var("GAE_INSTANCE").is_ok()
@@ -64,12 +64,12 @@ impl CloudProvider {
             return Some(Self::Gcp);
         }
 
-        // 检查 DigitalOcean 环境变量
+        // Check for DigitalOcean environment variables.
         if std::env::var("DIGITALOCEAN_REGION").is_ok() {
             return Some(Self::DigitalOcean);
         }
 
-        // 检查 Cloudflare 环境变量
+        // Check for Cloudflare environment variables.
         if std::env::var("CF_PAGES").is_ok() || std::env::var("CF_WORKERS").is_ok() {
             return Some(Self::Cloudflare);
         }
@@ -77,7 +77,7 @@ impl CloudProvider {
         None
     }
 
-    /// 获取云服务商名称
+    /// Returns the canonical name of the cloud provider.
     pub fn name(&self) -> &str {
         match self {
             Self::Aws => "aws",
@@ -89,7 +89,7 @@ impl CloudProvider {
         }
     }
 
-    /// 从字符串解析云服务商
+    /// Parses a cloud provider from a string.
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "aws" | "amazon" => Self::Aws,
@@ -102,29 +102,27 @@ impl CloudProvider {
     }
 }
 
-/// 云元数据获取器特征
+/// Trait for fetching metadata from a specific cloud provider.
 #[async_trait]
 pub trait CloudMetadataFetcher: Send + Sync {
-    /// 获取云服务商名称
+    /// Returns the name of the provider.
     fn provider_name(&self) -> &str;
 
-    /// 获取实例所在的网络 CIDR 范围
+    /// Fetches the network CIDR ranges for the current instance.
     async fn fetch_network_cidrs(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError>;
 
-    /// 获取云服务商的公共 IP 范围
+    /// Fetches the public IP ranges for the cloud provider.
     async fn fetch_public_ip_ranges(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError>;
 
-    /// 获取可信代理的 IP 范围
+    /// Fetches all IP ranges that should be considered trusted proxies.
     async fn fetch_trusted_proxy_ranges(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
         let mut ranges = Vec::new();
 
-        // 尝试获取网络 CIDR
         match self.fetch_network_cidrs().await {
             Ok(cidrs) => ranges.extend(cidrs),
             Err(e) => warn!("Failed to fetch network CIDRs from {}: {}", self.provider_name(), e),
         }
 
-        // 尝试获取公共 IP 范围
         match self.fetch_public_ip_ranges().await {
             Ok(public_ranges) => ranges.extend(public_ranges),
             Err(e) => warn!("Failed to fetch public IP ranges from {}: {}", self.provider_name(), e),
@@ -134,19 +132,19 @@ pub trait CloudMetadataFetcher: Send + Sync {
     }
 }
 
-/// 云服务检测器
+/// Detector for identifying the current cloud environment and fetching relevant metadata.
 #[derive(Debug, Clone)]
 pub struct CloudDetector {
-    /// 是否启用云检测
+    /// Whether cloud detection is enabled.
     enabled: bool,
-    /// 超时时间
+    /// Timeout for metadata requests.
     timeout: Duration,
-    /// 强制指定的云服务商
+    /// Optionally force a specific provider.
     forced_provider: Option<CloudProvider>,
 }
 
 impl CloudDetector {
-    /// 创建新的云检测器
+    /// Creates a new `CloudDetector`.
     pub fn new(enabled: bool, timeout: Duration, forced_provider: Option<String>) -> Self {
         let forced_provider = forced_provider.map(|s| CloudProvider::from_str(&s));
 
@@ -157,22 +155,20 @@ impl CloudDetector {
         }
     }
 
-    /// 检测云服务商
+    /// Identifies the current cloud provider.
     pub fn detect_provider(&self) -> Option<CloudProvider> {
         if !self.enabled {
             return None;
         }
 
-        // 如果强制指定了云服务商，直接返回
         if let Some(provider) = self.forced_provider {
             return Some(provider);
         }
 
-        // 自动检测
         CloudProvider::detect_from_env()
     }
 
-    /// 获取可信代理 IP 范围
+    /// Fetches trusted IP ranges for the detected cloud provider.
     pub async fn fetch_trusted_ranges(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
         if !self.enabled {
             debug!("Cloud metadata fetching is disabled");
@@ -218,7 +214,7 @@ impl CloudDetector {
         }
     }
 
-    /// 尝试所有云服务商获取元数据
+    /// Attempts to fetch metadata from all supported providers sequentially.
     pub async fn try_all_providers(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
         if !self.enabled {
             return Ok(Vec::new());
@@ -251,11 +247,7 @@ impl CloudDetector {
     }
 }
 
-/// 默认云检测器
+/// Returns a default `CloudDetector` with detection disabled.
 pub fn default_cloud_detector() -> CloudDetector {
-    CloudDetector::new(
-        false, // 默认禁用
-        Duration::from_secs(5),
-        None,
-    )
+    CloudDetector::new(false, Duration::from_secs(5), None)
 }

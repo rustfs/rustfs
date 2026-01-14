@@ -12,19 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod api;
-pub mod cloud;
-pub mod config;
-pub mod error;
-pub mod logging;
-pub mod middleware;
-pub mod proxy;
-pub mod state;
-pub mod utils;
+//! Unit tests for the trusted proxy system components.
 
-// Re-export core types for convenience
-pub use cloud::*;
-pub use config::*;
-pub use middleware::{ClientInfo, TrustedProxyLayer, TrustedProxyMiddleware};
-pub use proxy::*;
-pub use state::AppState;
+#[cfg(test)]
+mod config_tests;
+#[cfg(test)]
+mod ip_tests;
+#[cfg(test)]
+mod validation_tests;
+#[cfg(test)]
+mod validator_tests;
