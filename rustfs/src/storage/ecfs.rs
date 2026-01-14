@@ -146,6 +146,8 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
 use urlencoding::encode;
 use uuid::Uuid;
+use crate::storage::sse::{EncryptionRequest, apply_encryption};
+
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -3334,40 +3336,6 @@ impl S3 for FS {
 
         let store = get_validated_store(&bucket).await?;
 
-        // TDD: Get bucket default encryption configuration
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-        debug!("TDD: bucket_sse_config={:?}", bucket_sse_config);
-
-        // TDD: Determine effective encryption configuration (request overrides bucket default)
-        let original_sse = server_side_encryption.clone();
-        let effective_sse = server_side_encryption.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                debug!("TDD: Processing bucket SSE config: {:?}", config);
-                config.rules.first().and_then(|rule| {
-                    debug!("TDD: Processing SSE rule: {:?}", rule);
-                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                        debug!("TDD: Found SSE default: {:?}", sse);
-                        match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
-                        }
-                    })
-                })
-            })
-        });
-        debug!("TDD: effective_sse={:?} (original={:?})", effective_sse, original_sse);
-
-        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
-
         let mut metadata = metadata.unwrap_or_default();
 
         if let Some(content_type) = content_type {
@@ -3378,24 +3346,6 @@ impl S3 for FS {
 
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_string());
-        }
-
-        // TDD: Store effective SSE information in metadata for GET responses
-        if let Some(sse_alg) = &sse_customer_algorithm {
-            metadata.insert(
-                "x-amz-server-side-encryption-customer-algorithm".to_string(),
-                sse_alg.as_str().to_string(),
-            );
-        }
-        if let Some(sse_md5) = &sse_customer_key_md5 {
-            metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
-        }
-        if let Some(sse) = &effective_sse {
-            metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
-        }
-
-        if let Some(kms_key_id) = &effective_kms_key_id {
-            metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
         }
 
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
@@ -3448,49 +3398,35 @@ impl S3 for FS {
             opts.want_checksum = reader.checksum();
         }
 
-        // Apply SSE-C encryption if customer provided key
-        if let (Some(sse_alg), Some(sse_key), Some(sse_key_md5)) =
-            (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
-        {
-            let params = SsecParams {
-                algorithm: sse_alg.as_str().to_string(),
-                key: sse_key.clone(),
-                key_md5: sse_key_md5.clone(),
-            };
+        // Apply encryption using unified SSE API
+        let encryption_request = EncryptionRequest {
+            bucket: &bucket,
+            key: &key,
+            server_side_encryption: server_side_encryption,
+            ssekms_key_id: ssekms_key_id,
+            sse_customer_algorithm: sse_customer_algorithm.clone(),
+            sse_customer_key: sse_customer_key,
+            sse_customer_key_md5: sse_customer_key_md5.clone(),
+            content_size: actual_size,
+            part_number: None,
+        };
 
-            let validated = validate_ssec_params(&params)?;
-
-            // Store original size for later retrieval during decryption
-            let original_size = if size >= 0 { size } else { actual_size };
-            store_ssec_metadata(&mut metadata, &validated, original_size);
-
-            // Apply encryption
-            let encrypted_reader = apply_ssec_encryption(reader, &validated, &bucket, &key);
+        let mut effective_sse = None;
+        let mut effective_kms_key_id = None;
+        if let Some(material) = apply_encryption(encryption_request).await? {
+            // Apply encryption wrapper
+            let encrypted_reader = material.wrap_reader(reader);
             reader = HashReader::new(encrypted_reader, -1, actual_size, None, None, false).map_err(ApiError::from)?;
-        }
 
-        // Apply managed SSE (SSE-S3 or SSE-KMS) when requested
-        if sse_customer_algorithm.is_none()
-            && let Some(sse_alg) = &effective_sse
-            && is_managed_sse(sse_alg)
-        {
-            let material =
-                create_managed_encryption_material(&bucket, &key, sse_alg, effective_kms_key_id.clone(), actual_size).await?;
+            // Merge encryption metadata
+            metadata.extend(material.metadata);
 
-            let ManagedEncryptionMaterial {
-                data_key,
-                headers,
-                kms_key_id: kms_key_used,
-            } = material;
+            // Update effective_kms_key_id if managed SSE was used
+            if let Some(kms_key_id) = material.kms_key_id {
+                effective_kms_key_id = Some(kms_key_id);
+            }
 
-            let key_bytes = data_key.plaintext_key;
-            let nonce = data_key.nonce;
-
-            metadata.extend(headers);
-            effective_kms_key_id = Some(kms_key_used.clone());
-
-            let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
+            effective_sse = Some(material.algorithm);
         }
 
         let mut reader = PutObjReader::new(reader);

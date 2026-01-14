@@ -93,6 +93,82 @@ use tokio::io::{AsyncRead, AsyncSeek};
 use tracing::error;
 
 use crate::error::ApiError;
+use rustfs_ecstore::bucket::metadata_sys;
+use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
+
+// ============================================================================
+// High-Level SSE Configuration
+// ============================================================================
+
+/// SSE configuration resolved from request and bucket defaults
+#[derive(Debug)]
+pub struct SseConfiguration {
+    /// Effective server-side encryption algorithm (after considering bucket defaults)
+    pub effective_sse: Option<ServerSideEncryption>,
+    /// Effective KMS key ID (after considering bucket defaults)
+    pub effective_kms_key_id: Option<SSEKMSKeyId>,
+}
+
+/// Prepare SSE configuration by resolving request parameters with bucket defaults
+///
+/// This function:
+/// 1. Queries bucket default encryption configuration
+/// 2. Resolves effective encryption (request overrides bucket default)
+/// 3. Prepares metadata headers for managed SSE
+///
+/// # Arguments
+/// * `bucket` - Bucket name
+/// * `server_side_encryption` - SSE algorithm from request (SSE-S3 or SSE-KMS)
+/// * `ssekms_key_id` - KMS key ID from request
+/// * `sse_customer_algorithm` - SSE-C algorithm from request
+///
+/// # Returns
+/// `SseConfiguration` with resolved encryption parameters and metadata headers
+pub async fn prepare_sse_configuration(
+    bucket: &str,
+    server_side_encryption: Option<ServerSideEncryption>,
+    ssekms_key_id: Option<SSEKMSKeyId>,
+) -> Result<SseConfiguration, ApiError> {
+    use tracing::debug;
+
+    // Get bucket default encryption configuration
+    let bucket_sse_config = metadata_sys::get_sse_config(bucket).await.ok();
+    debug!("bucket_sse_config={:?}", bucket_sse_config);
+
+    // Determine effective encryption configuration (request overrides bucket default)
+    let effective_sse = server_side_encryption.clone().or_else(|| {
+        bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+            debug!("Processing bucket SSE config: {:?}", config);
+            config.rules.first().and_then(|rule| {
+                debug!("Processing SSE rule: {:?}", rule);
+                rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
+                    debug!("Found SSE default: {:?}", sse);
+                    match sse.sse_algorithm.as_str() {
+                        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
+                    }
+                })
+            })
+        })
+    });
+    debug!("effective_sse={:?} (original={:?})", effective_sse, server_side_encryption);
+
+    let effective_kms_key_id = ssekms_key_id.or_else(|| {
+        bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+            config.rules.first().and_then(|rule| {
+                rule.apply_server_side_encryption_by_default
+                    .as_ref()
+                    .and_then(|sse| sse.kms_master_key_id.clone())
+            })
+        })
+    });
+
+    Ok(SseConfiguration {
+        effective_sse,
+        effective_kms_key_id,
+    })
+}
 
 // ============================================================================
 // Core Types - Unified Encryption/Decryption API
@@ -106,15 +182,15 @@ pub struct EncryptionRequest<'a> {
     /// Object key
     pub key: &'a str,
     /// Server-side encryption algorithm (SSE-S3 or SSE-KMS)
-    pub server_side_encryption: Option<&'a ServerSideEncryption>,
+    pub server_side_encryption: Option<ServerSideEncryption>,
     /// KMS key ID (for SSE-KMS)
-    pub ssekms_key_id: Option<&'a str>,
+    pub ssekms_key_id: Option<SSEKMSKeyId>,
     /// SSE-C algorithm (customer-provided key)
-    pub sse_customer_algorithm: Option<&'a ServerSideEncryption>,
+    pub sse_customer_algorithm: Option<SSECustomerAlgorithm>,
     /// SSE-C key (Base64-encoded)
-    pub sse_customer_key: Option<&'a str>,
+    pub sse_customer_key: Option<SSECustomerKey>,
     /// SSE-C key MD5 (Base64-encoded)
-    pub sse_customer_key_md5: Option<&'a str>,
+    pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
     /// Content size (for metadata)
     pub content_size: i64,
     /// Part number (for multipart upload, None for single-part)
@@ -131,9 +207,9 @@ pub struct DecryptionRequest<'a> {
     /// Object metadata containing encryption headers
     pub metadata: &'a HashMap<String, String>,
     /// SSE-C key (Base64-encoded) - required if object was encrypted with SSE-C
-    pub sse_customer_key: Option<&'a str>,
+    pub sse_customer_key: Option<&'a SSECustomerKey>,
     /// SSE-C key MD5 (Base64-encoded) - required if object was encrypted with SSE-C
-    pub sse_customer_key_md5: Option<&'a str>,
+    pub sse_customer_key_md5: Option<&'a SSECustomerKeyMD5>,
     /// Part number (for multipart upload, None for single-part)
     pub part_number: Option<usize>,
 }
@@ -147,10 +223,12 @@ pub struct EncryptionMaterial {
     pub nonce: [u8; 12],
     /// Metadata to store with the object
     pub metadata: HashMap<String, String>,
+    /// Server-side encryption algorithm
+    pub algorithm: ServerSideEncryption,
     /// Encryption type for logging/debugging
     pub encryption_type: EncryptionType,
     /// KMS key ID (for managed SSE only)
-    pub kms_key_id: Option<String>,
+    pub kms_key_id: Option<SSEKMSKeyId>,
 }
 
 /// Unified decryption material returned by `apply_decryption()`
@@ -237,15 +315,21 @@ impl DecryptionMaterial {
 /// ```
 pub async fn apply_encryption(request: EncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
     // Priority 1: SSE-C (customer-provided key)
-    if let (Some(algorithm), Some(key), Some(key_md5)) =
-        (request.sse_customer_algorithm, request.sse_customer_key, request.sse_customer_key_md5)
-    {
+    if let (
+        Some(algorithm),
+        Some(key),
+        Some(key_md5),
+    ) = (
+        request.sse_customer_algorithm,
+        request.sse_customer_key,
+        request.sse_customer_key_md5,
+    ) {
         return apply_ssec_encryption_material(
-            request.bucket,
-            request.key,
+            &request.bucket,
+            &request.key,
             algorithm,
-            key,
-            key_md5,
+            &key,
+            &key_md5,
             request.content_size,
             request.part_number,
         )
@@ -254,18 +338,34 @@ pub async fn apply_encryption(request: EncryptionRequest<'_>) -> Result<Option<E
     }
 
     // Priority 2: Managed SSE (SSE-S3 or SSE-KMS)
-    if let Some(sse_algorithm) = request.server_side_encryption {
-        if is_managed_sse(sse_algorithm) {
-            return apply_managed_encryption_material(
+    let sse_config = prepare_sse_configuration(
+        request.bucket,
+        request.server_side_encryption,
+        request.ssekms_key_id,
+    )
+    .await?;
+
+    if let Some(sse_algorithm) = sse_config.effective_sse {
+        if is_managed_sse(&sse_algorithm) {
+            let mut metadata = HashMap::new();
+
+            metadata.insert("x-amz-server-side-encryption".to_string(), sse_algorithm.as_str().to_string());
+
+            let material = apply_managed_encryption_material(
                 request.bucket,
                 request.key,
                 sse_algorithm,
-                request.ssekms_key_id,
+                sse_config.effective_kms_key_id,
                 request.content_size,
                 request.part_number,
             )
             .await
-            .map(Some);
+            .map(Some)?;
+
+            if let Some(mut material) = material {
+                material.metadata.extend(metadata);
+                return Ok(Some(material));
+            }
         }
     }
 
@@ -341,14 +441,14 @@ pub async fn apply_decryption(request: DecryptionRequest<'_>) -> Result<Option<D
 async fn apply_ssec_encryption_material(
     bucket: &str,
     key: &str,
-    algorithm: &ServerSideEncryption,
-    sse_key: &str,
-    sse_key_md5: &str,
+    algorithm: SSECustomerAlgorithm,
+    sse_key: &SSECustomerKey,
+    sse_key_md5: &SSECustomerKeyMD5,
     content_size: i64,
     part_number: Option<usize>,
 ) -> Result<EncryptionMaterial, ApiError> {
     let params = SsecParams {
-        algorithm: algorithm.as_str().to_string(),
+        algorithm: algorithm.clone(),
         key: sse_key.to_string(),
         key_md5: sse_key_md5.to_string(),
     };
@@ -372,11 +472,14 @@ async fn apply_ssec_encryption_material(
         content_size.to_string(),
     );
 
+    let algorithm = ServerSideEncryption::from(validated.algorithm);
+
     Ok(EncryptionMaterial {
         key_bytes: validated.key_bytes,
         nonce,
         metadata,
         encryption_type: EncryptionType::SseC,
+        algorithm,
         kms_key_id: None,
     })
 }
@@ -434,8 +537,8 @@ async fn apply_ssec_decryption_material(
 async fn apply_managed_encryption_material(
     bucket: &str,
     key: &str,
-    algorithm: &ServerSideEncryption,
-    kms_key_id: Option<&str>,
+    algorithm: ServerSideEncryption,
+    kms_key_id: Option<SSEKMSKeyId>,
     content_size: i64,
     part_number: Option<usize>,
 ) -> Result<EncryptionMaterial, ApiError> {
@@ -447,7 +550,7 @@ async fn apply_managed_encryption_material(
         return Err(ApiError::from(StorageError::other("KMS encryption service is not initialized")));
     };
 
-    if !is_managed_sse(algorithm) {
+    if !is_managed_sse(&algorithm) {
         return Err(ApiError::from(StorageError::other(format!(
             "Unsupported server-side encryption algorithm: {}",
             algorithm.as_str()
@@ -466,7 +569,7 @@ async fn apply_managed_encryption_material(
         context = context.with_size(content_size as u64);
     }
 
-    let mut kms_key_candidate = kms_key_id.map(|s| s.to_string());
+    let mut kms_key_candidate = kms_key_id.clone().map(|s| s.to_string());
     if kms_key_candidate.is_none() {
         kms_key_candidate = service.get_default_key_id().cloned();
     }
@@ -493,10 +596,12 @@ async fn apply_managed_encryption_material(
     };
 
     let mut metadata = service.metadata_to_headers(&encryption_metadata);
-    metadata.insert(
-        "x-rustfs-encryption-original-size".to_string(),
-        encryption_metadata.original_size.to_string(),
-    );
+    metadata.insert("x-rustfs-encryption-original-size".to_string(), encryption_metadata.original_size.to_string());
+
+    // if kms_key is changed, we need to update the metadata
+    if kms_key_id.is_none() {
+        metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_to_use.clone());
+    }
 
     // Handle part-specific nonce if needed
     let nonce = if let Some(part_num) = part_number {
@@ -509,6 +614,7 @@ async fn apply_managed_encryption_material(
         key_bytes: data_key.plaintext_key,
         nonce,
         metadata,
+        algorithm,
         encryption_type,
         kms_key_id: Some(kms_key_to_use),
     })
@@ -582,29 +688,29 @@ pub struct ManagedEncryptionMaterial {
     /// Metadata headers to store with the object
     pub headers: HashMap<String, String>,
     /// KMS key ID used for encryption
-    pub kms_key_id: String,
+    pub kms_key_id: SSEKMSKeyId,
 }
 
 /// Validated SSE-C parameters
 #[derive(Debug, Clone)]
 pub struct ValidatedSsecParams {
     /// Encryption algorithm (always "AES256" for SSE-C)
-    pub algorithm: String,
+    pub algorithm: SSECustomerAlgorithm,
     /// Decoded encryption key bytes (32 bytes for AES-256)
     pub key_bytes: [u8; 32],
     /// Base64-encoded MD5 of the key
-    pub key_md5: String,
+    pub key_md5: SSECustomerKeyMD5,
 }
 
 /// SSE-C parameters from client request
 #[derive(Debug, Clone)]
 pub struct SsecParams {
     /// Encryption algorithm
-    pub algorithm: String,
+    pub algorithm: SSECustomerAlgorithm,
     /// Base64-encoded encryption key
-    pub key: String,
+    pub key: SSECustomerKey,
     /// Base64-encoded MD5 of the key
-    pub key_md5: String,
+    pub key_md5: SSECustomerKeyMD5,
 }
 
 // ============================================================================
@@ -771,10 +877,10 @@ impl SseDekProvider for SimpleSseDekProvider {
 // Legacy Functions (SSE-S3 / SSE-KMS)
 // ============================================================================
 
-/// Check if the algorithm is a managed SSE type (SSE-S3 or SSE-KMS)
+/// Check if the server_side_encryption is a managed SSE type (SSE-S3 or SSE-KMS)
 #[inline]
-pub fn is_managed_sse(algorithm: &ServerSideEncryption) -> bool {
-    matches!(algorithm.as_str(), "AES256" | "aws:kms")
+pub fn is_managed_sse(server_side_encryption: &ServerSideEncryption) -> bool {
+    matches!(server_side_encryption.as_str(), "AES256" | "aws:kms")
 }
 
 /// Create managed encryption material for SSE-S3 or SSE-KMS
@@ -1498,4 +1604,3 @@ mod tests {
         assert!(debug_str.contains("SseKms"));
     }
 }
-
