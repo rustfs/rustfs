@@ -5,7 +5,14 @@ metadata:
   name: {{ include "rustfs.fullname" . }}-route
 spec:
   parentRefs:
+  {{- if .Values.gatewayApi.existingGateway.name }}
+    - name: {{ .Values.gatewayApi.existingGateway.name }}
+      {{- if .Values.gatewayApi.existingGateway.namespace }}
+      namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
+      {{- end }}
+  {{- else }}
     - name: {{ include "rustfs.fullname" . }}-gateway
+  {{- end }}
   hostnames:
     - {{ .Values.gatewayApi.hostname }}
   rules:
