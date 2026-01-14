@@ -86,11 +86,11 @@ use rustfs_kms::{
     service_manager::get_global_encryption_service,
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
-use rustfs_rio::{DecryptReader, EncryptReader, Reader, WarpReader};
+use rustfs_rio::{DecryptReader, EncryptReader, HardLimitReader, Reader, WarpReader};
 use s3s::dto::ServerSideEncryption;
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncSeek};
-use tracing::error;
+use tracing::{debug, error, warn};
 
 use crate::error::ApiError;
 use rustfs_ecstore::bucket::metadata_sys;
@@ -212,6 +212,8 @@ pub struct DecryptionRequest<'a> {
     pub sse_customer_key_md5: Option<&'a SSECustomerKeyMD5>,
     /// Part number (for multipart upload, None for single-part)
     pub part_number: Option<usize>,
+    /// Parts information for multipart objects
+    pub parts: &'a [ObjectPartInfo],
 }
 
 /// Unified encryption material returned by `apply_encryption()`
@@ -242,6 +244,10 @@ pub struct DecryptionMaterial {
     pub original_size: Option<i64>,
     /// Encryption type for logging/debugging
     pub encryption_type: EncryptionType,
+    /// Whether this is a multipart object
+    pub is_multipart: bool,
+    /// Part information for multipart objects
+    pub parts: Vec<ObjectPartInfo>,
 }
 
 /// Type of encryption used
@@ -267,11 +273,53 @@ impl EncryptionMaterial {
 
 impl DecryptionMaterial {
     /// Wrap a reader with decryption
-    pub fn wrap_reader<R>(&self, reader: R) -> Box<DecryptReader<R>>
+    /// For multipart objects, use `wrap_multipart_stream` instead
+    pub fn wrap_single_reader<R>(&self, reader: R) -> Box<DecryptReader<R>>
     where
         R: Reader + 'static,
     {
         Box::new(DecryptReader::new(reader, self.key_bytes, self.nonce))
+    }
+
+    /// Wrap a stream with multipart decryption
+    /// Returns the decrypted reader and the total plaintext size
+    pub async fn wrap_multipart_stream(
+        &self,
+        encrypted_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    ) -> Result<(Box<dyn Reader>, i64), StorageError> {
+        decrypt_multipart_managed_stream(encrypted_stream, &self.parts, self.key_bytes, self.nonce).await
+    }
+
+    /// Unified method to wrap stream with decryption and hard limit
+    /// Handles both single-part and multipart objects, applies decryption and size limiting
+    /// Accepts AsyncRead stream (from object storage) and returns (decrypted_reader, plaintext_size)
+    pub async fn wrap_reader(
+        self,
+        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        encrypted_size: i64,
+    ) -> Result<(Box<dyn Reader>, i64), StorageError> {
+        let (mut final_stream, response_content_length): (Box<dyn Reader>, i64) = if self.is_multipart {
+            // Multipart decryption
+            let (decrypted_reader, plain_size) = self.wrap_multipart_stream(stream).await?;
+            (decrypted_reader, plain_size)
+        } else {
+            // Single-part decryption - wrap AsyncRead into Reader first
+            let warp_reader = WarpReader::new(stream);
+            let decrypt_reader = self.wrap_single_reader(warp_reader);
+            let plain_size = self.original_size.unwrap_or(encrypted_size);
+            (decrypt_reader, plain_size)
+        };
+
+        // Add hard limit reader to prevent over-reading
+        let limit_reader = HardLimitReader::new(Box::new(WarpReader::new(final_stream)), response_content_length);
+        final_stream = Box::new(limit_reader);
+
+        debug!(
+            "{:?} decryption applied: plaintext_size={}, encrypted_size={}",
+            self.encryption_type, response_content_length, encrypted_size
+        );
+
+        Ok((final_stream, response_content_length))
     }
 }
 
@@ -315,15 +363,9 @@ impl DecryptionMaterial {
 /// ```
 pub async fn apply_encryption(request: EncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
     // Priority 1: SSE-C (customer-provided key)
-    if let (
-        Some(algorithm),
-        Some(key),
-        Some(key_md5),
-    ) = (
-        request.sse_customer_algorithm,
-        request.sse_customer_key,
-        request.sse_customer_key_md5,
-    ) {
+    if let (Some(algorithm), Some(key), Some(key_md5)) =
+        (request.sse_customer_algorithm, request.sse_customer_key, request.sse_customer_key_md5)
+    {
         return apply_ssec_encryption_material(
             &request.bucket,
             &request.key,
@@ -338,20 +380,11 @@ pub async fn apply_encryption(request: EncryptionRequest<'_>) -> Result<Option<E
     }
 
     // Priority 2: Managed SSE (SSE-S3 or SSE-KMS)
-    let sse_config = prepare_sse_configuration(
-        request.bucket,
-        request.server_side_encryption,
-        request.ssekms_key_id,
-    )
-    .await?;
+    let sse_config = prepare_sse_configuration(request.bucket, request.server_side_encryption, request.ssekms_key_id).await?;
 
     if let Some(sse_algorithm) = sse_config.effective_sse {
         if is_managed_sse(&sse_algorithm) {
-            let mut metadata = HashMap::new();
-
-            metadata.insert("x-amz-server-side-encryption".to_string(), sse_algorithm.as_str().to_string());
-
-            let material = apply_managed_encryption_material(
+            return apply_managed_encryption_material(
                 request.bucket,
                 request.key,
                 sse_algorithm,
@@ -360,12 +393,7 @@ pub async fn apply_encryption(request: EncryptionRequest<'_>) -> Result<Option<E
                 request.part_number,
             )
             .await
-            .map(Some)?;
-
-            if let Some(mut material) = material {
-                material.metadata.extend(metadata);
-                return Ok(Some(material));
-            }
+            .map(Some);
         }
     }
 
@@ -404,6 +432,8 @@ pub async fn apply_encryption(request: EncryptionRequest<'_>) -> Result<Option<E
 /// }
 /// ```
 pub async fn apply_decryption(request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, ApiError> {
+    let is_multipart = request.parts.len() > 1;
+
     // Check for SSE-C encryption
     if request
         .metadata
@@ -418,16 +448,38 @@ pub async fn apply_decryption(request: DecryptionRequest<'_>) -> Result<Option<D
             }
         };
 
-        return apply_ssec_decryption_material(request.bucket, request.key, request.metadata, key, key_md5, request.part_number)
-            .await
-            .map(Some);
+        // For multipart SSE-C objects, just validate the key but don't decrypt yet
+        if is_multipart {
+            warn!(
+                "SSE-C multipart object detected with {} parts. Currently, multipart SSE-C upload parts are not encrypted during upload_part, so no decryption is needed during GET.",
+                request.parts.len()
+            );
+
+            // Verify that the provided key MD5 matches the stored MD5 for security
+            let stored_md5 = request.metadata.get("x-amz-server-side-encryption-customer-key-md5");
+            verify_ssec_key_match(key_md5, stored_md5)?;
+
+            // Return None to indicate no decryption is needed (parts are not encrypted)
+            return Ok(None);
+        }
+
+        let mut material =
+            apply_ssec_decryption_material(request.bucket, request.key, request.metadata, key, key_md5, request.part_number)
+                .await?;
+        material.is_multipart = is_multipart;
+        material.parts = request.parts.to_vec();
+        return Ok(Some(material));
     }
 
     // Check for managed SSE encryption
     if request.metadata.contains_key("x-rustfs-encryption-key") {
-        return apply_managed_decryption_material(request.bucket, request.key, request.metadata, request.part_number)
-            .await
-            .map(|opt| opt);
+        let mut material_opt =
+            apply_managed_decryption_material(request.bucket, request.key, request.metadata, request.part_number).await?;
+        if let Some(ref mut material) = material_opt {
+            material.is_multipart = is_multipart;
+            material.parts = request.parts.to_vec();
+        }
+        return Ok(material_opt);
     }
 
     // No encryption detected
@@ -527,6 +579,8 @@ async fn apply_ssec_decryption_material(
         nonce,
         original_size,
         encryption_type: EncryptionType::SseC,
+        is_multipart: false,
+        parts: Vec::new(),
     })
 }
 
@@ -596,7 +650,11 @@ async fn apply_managed_encryption_material(
     };
 
     let mut metadata = service.metadata_to_headers(&encryption_metadata);
-    metadata.insert("x-rustfs-encryption-original-size".to_string(), encryption_metadata.original_size.to_string());
+    metadata.insert(
+        "x-rustfs-encryption-original-size".to_string(),
+        encryption_metadata.original_size.to_string(),
+    );
+    metadata.insert("x-amz-server-side-encryption".to_string(), algorithm_str.to_string());
 
     // if kms_key is changed, we need to update the metadata
     if kms_key_id.is_none() {
@@ -673,6 +731,8 @@ async fn apply_managed_decryption_material(
         nonce,
         original_size,
         encryption_type,
+        is_multipart: false,
+        parts: Vec::new(),
     }))
 }
 
