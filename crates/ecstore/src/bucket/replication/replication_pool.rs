@@ -1,22 +1,30 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::StorageAPI;
 use crate::bucket::replication::ResyncOpts;
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::replicate_delete;
 use crate::bucket::replication::replicate_object;
-use crate::disk::BUCKET_META_PREFIX;
-use std::any::Any;
-use std::sync::Arc;
-use std::sync::atomic::AtomicI32;
-use std::sync::atomic::Ordering;
-
 use crate::bucket::replication::replication_resyncer::{
     BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationResyncer,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::read_config;
+use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
 use crate::store_api::ObjectInfo;
-
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfReplicateEntry;
 use rustfs_filemeta::ReplicateDecision;
@@ -29,6 +37,10 @@ use rustfs_filemeta::ResyncDecision;
 use rustfs_filemeta::replication_statuses_map;
 use rustfs_filemeta::version_purge_statuses_map;
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
+use std::any::Any;
+use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;

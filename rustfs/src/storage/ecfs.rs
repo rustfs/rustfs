@@ -39,7 +39,8 @@ use datafusion::arrow::{
 };
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
-use metrics::counter;
+use metrics::{counter, histogram};
+use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
@@ -54,6 +55,7 @@ use rustfs_ecstore::{
         metadata_sys::get_replication_config,
         object_lock::objectlock_sys::BucketObjectLockSys,
         policy_sys::PolicySys,
+        quota::QuotaOperation,
         replication::{
             DeletedObjectReplicationInfo, ReplicationConfigurationExt, check_replicate_delete, get_must_replicate_options,
             must_replicate, schedule_replication, schedule_replication_delete,
@@ -780,6 +782,25 @@ impl FS {
         let _ = helper.complete(&result);
         result
     }
+
+    /// Auxiliary functions: parse version ID
+    ///
+    /// # Arguments
+    /// * `version_id` - An optional string representing the version ID to be parsed.
+    ///
+    /// # Returns
+    /// * `S3Result<Option<Uuid>>` - A result containing an optional UUID if parsing is successful, or an S3 error if parsing fails.
+    fn parse_version_id(&self, version_id: Option<String>) -> S3Result<Option<Uuid>> {
+        if let Some(vid) = version_id {
+            let uuid = Uuid::parse_str(&vid).map_err(|e| {
+                error!("Invalid version ID: {}", e);
+                s3_error!(InvalidArgument, "Invalid version ID")
+            })?;
+            Ok(Some(uuid))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// Helper function to get store and validate bucket exists
@@ -1067,10 +1088,41 @@ impl S3 for FS {
             }
         }
 
+        // check quota for copy operation
+        if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
+            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+
+            match quota_checker
+                .check_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
+                .await
+            {
+                Ok(check_result) => {
+                    if !check_result.allowed {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            format!(
+                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                                check_result.current_usage,
+                                check_result.quota_limit.unwrap_or(0)
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                }
+            }
+        }
+
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
             .await
             .map_err(ApiError::from)?;
+
+        // Update quota tracking after successful copy
+        if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
+            rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
+        }
 
         // Invalidate cache for the destination object to prevent stale data
         let manager = get_concurrency_manager();
@@ -1440,6 +1492,9 @@ impl S3 for FS {
             }
         };
 
+        // Fast in-memory update for immediate quota consistency
+        rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+
         // Invalidate cache for the deleted object
         let manager = get_concurrency_manager();
         let del_bucket = bucket.clone();
@@ -1534,8 +1589,6 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let has_lock_enable = BucketObjectLockSys::get(&bucket).await.is_some();
-
         let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
 
         #[derive(Default, Clone)]
@@ -1548,6 +1601,7 @@ impl S3 for FS {
 
         let mut object_to_delete = Vec::new();
         let mut object_to_delete_index = HashMap::new();
+        let mut object_sizes = HashMap::new();
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             // Per S3 API spec, "null" string means non-versioned object
             // Filter out "null" version_id to treat as unversioned
@@ -1606,15 +1660,14 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-            let mut goi = ObjectInfo::default();
-            let mut gerr = None;
+            // Get object info to collect size for quota tracking
+            let (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
+                Ok(res) => (res, None),
+                Err(e) => (ObjectInfo::default(), Some(e.to_string())),
+            };
 
-            if replicate_deletes || object.version_id.is_some() && has_lock_enable {
-                (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
-                    Ok(res) => (res, None),
-                    Err(e) => (ObjectInfo::default(), Some(e.to_string())),
-                };
-            }
+            // Store object size for quota tracking
+            object_sizes.insert(object.object_name.clone(), goi.size);
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
                 object.version_id = Some(Uuid::nil());
@@ -1716,6 +1769,10 @@ impl S3 for FS {
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
                 }
                 delete_results[*didx].delete_object = Some(dobjs[i].clone());
+                // Update quota tracking for successfully deleted objects
+                if let Some(&size) = object_sizes.get(&obj.object_name) {
+                    rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, size as u64).await;
+                }
                 continue;
             }
 
@@ -2453,6 +2510,23 @@ impl S3 for FS {
             }
         }
 
+        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+
+        // Get version_id from object info
+        // If versioning is enabled and version_id exists in object info, return it
+        // If version_id is Uuid::nil(), return "null" string (AWS S3 convention)
+        let output_version_id = if versioned {
+            info.version_id.map(|vid| {
+                if vid == Uuid::nil() {
+                    "null".to_string()
+                } else {
+                    vid.to_string()
+                }
+            })
+        } else {
+            None
+        };
+
         let output = GetObjectOutput {
             body,
             content_length: Some(response_content_length),
@@ -2473,6 +2547,7 @@ impl S3 for FS {
             checksum_sha256,
             checksum_crc64nvme,
             checksum_type,
+            version_id: output_version_id,
             ..Default::default()
         };
 
@@ -2572,7 +2647,18 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
+        // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
+        let info = match store.get_object_info(&bucket, &key, &opts).await {
+            Ok(info) => info,
+            Err(err) => {
+                // If the error indicates the object or its version was not found, return 404 (NoSuchKey)
+                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                }
+                // Other errors, such as insufficient permissions, still return the original error
+                return Err(ApiError::from(err).into());
+            }
+        };
 
         if info.delete_marker {
             if opts.version_id.is_none() {
@@ -2651,7 +2737,7 @@ impl S3 for FS {
             .get("x-amz-server-side-encryption-customer-algorithm")
             .map(|v| SSECustomerAlgorithm::from(v.clone()));
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
-        let ssekms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
+        let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
         // Prefer explicit storage_class from object info; fall back to persisted metadata header.
         let storage_class = info
             .storage_class
@@ -2716,7 +2802,7 @@ impl S3 for FS {
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
-            ssekms_key_id,
+            ssekms_key_id: sse_kms_key_id,
             checksum_crc32,
             checksum_crc32c,
             checksum_sha1,
@@ -3151,6 +3237,34 @@ impl S3 for FS {
         // Validate object key
         validate_object_key(&key, "PUT")?;
 
+        // check quota for put operation
+        if let Some(size) = content_length
+            && let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get()
+        {
+            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+
+            match quota_checker
+                .check_quota(&bucket, QuotaOperation::PutObject, size as u64)
+                .await
+            {
+                Ok(check_result) => {
+                    if !check_result.allowed {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            format!(
+                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                                check_result.current_usage,
+                                check_result.quota_limit.unwrap_or(0)
+                            ),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                }
+            }
+        }
+
         if if_match.is_some() || if_none_match.is_some() {
             let Some(store) = new_object_layer_fn() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -3428,6 +3542,9 @@ impl S3 for FS {
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
+
+        // Fast in-memory update for immediate quota consistency
+        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
 
         // Invalidate cache for the written object to prevent stale data
         let manager = get_concurrency_manager();
@@ -4356,6 +4473,38 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
+        // check quota after completing multipart upload
+        if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
+            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+
+            match quota_checker
+                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
+                .await
+            {
+                Ok(check_result) => {
+                    if !check_result.allowed {
+                        // Quota exceeded, delete the completed object
+                        let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            format!(
+                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                                check_result.current_usage,
+                                check_result.quota_limit.unwrap_or(0)
+                            ),
+                        ));
+                    }
+                    // Update quota tracking after successful multipart upload
+                    if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
+                        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+                    }
+                }
+                Err(e) => {
+                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                }
+            }
+        }
+
         // Invalidate cache for the completed multipart object
         let manager = get_concurrency_manager();
         let mpu_bucket = bucket.clone();
@@ -4540,6 +4689,7 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, "s3:PutObjectTagging");
         let PutObjectTaggingInput {
             bucket,
@@ -4553,6 +4703,8 @@ impl S3 for FS {
             // Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html
             // Reference: https://docs.aws.amazon.com/zh_cn/AmazonS3/latest/API/API_PutObjectTagging.html
             // https://github.com/minio/mint/blob/master/run/core/aws-sdk-go-v2/main.go#L1647
+            error!("Tag set exceeds maximum of 10 tags: {}", tagging.tag_set.len());
+            return Err(s3_error!(InvalidTag, "Cannot have more than 10 tags per object"));
         }
 
         let Some(store) = new_object_layer_fn() else {
@@ -4561,71 +4713,118 @@ impl S3 for FS {
 
         let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
         for tag in &tagging.tag_set {
-            let key = tag
-                .key
-                .as_ref()
-                .filter(|k| !k.is_empty())
-                .ok_or_else(|| s3_error!(InvalidTag, "Tag key cannot be empty"))?;
+            let key = tag.key.as_ref().filter(|k| !k.is_empty()).ok_or_else(|| {
+                error!("Empty tag key");
+                s3_error!(InvalidTag, "Tag key cannot be empty")
+            })?;
 
             if key.len() > 128 {
+                error!("Tag key too long: {} bytes", key.len());
                 return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
             }
 
-            let value = tag
-                .value
-                .as_ref()
-                .ok_or_else(|| s3_error!(InvalidTag, "Tag value cannot be null"))?;
+            let value = tag.value.as_ref().ok_or_else(|| {
+                error!("Null tag value");
+                s3_error!(InvalidTag, "Tag value cannot be null")
+            })?;
 
             if value.is_empty() {
+                error!("Empty tag value");
                 return Err(s3_error!(InvalidTag, "Tag value cannot be empty"));
             }
 
             if value.len() > 256 {
+                error!("Tag value too long: {} bytes", value.len());
                 return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
             }
 
             if !tag_keys.insert(key) {
+                error!("Duplicate tag key: {}", key);
                 return Err(s3_error!(InvalidTag, "Cannot provide multiple Tags with the same key"));
             }
         }
 
         let tags = encode_tags(tagging.tag_set);
+        debug!("Encoded tags: {}", tags);
 
-        // TODO: getOpts
-        // TODO: Replicate
+        // TODO: getOpts, Replicate
+        // Support versioned objects
+        let version_id = req.input.version_id.clone();
+        let opts = ObjectOptions {
+            version_id: self.parse_version_id(version_id)?.map(Into::into),
+            ..Default::default()
+        };
 
-        store
-            .put_object_tags(&bucket, &object, &tags, &ObjectOptions::default())
-            .await
-            .map_err(ApiError::from)?;
+        store.put_object_tags(&bucket, &object, &tags, &opts).await.map_err(|e| {
+            error!("Failed to put object tags: {}", e);
+            counter!("rustfs.put_object_tagging.failure").increment(1);
+            ApiError::from(e)
+        })?;
 
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id);
+        // Invalidate cache for the tagged object
+        let manager = get_concurrency_manager();
+        let version_id = req.input.version_id.clone();
+        let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
+        tokio::spawn(async move {
+            manager
+                .invalidate_cache_versioned(&bucket, &object, version_id.as_deref())
+                .await;
+            debug!("Cache invalidated for tagged object: {}", cache_key);
+        });
 
-        let result = Ok(S3Response::new(PutObjectTaggingOutput { version_id: None }));
+        // Add metrics
+        counter!("rustfs.put_object_tagging.success").increment(1);
+
+        let version_id_resp = req.input.version_id.clone().unwrap_or_default();
+        helper = helper.version_id(version_id_resp);
+
+        let result = Ok(S3Response::new(PutObjectTaggingOutput {
+            version_id: req.input.version_id.clone(),
+        }));
         let _ = helper.complete(&result);
+        let duration = start_time.elapsed();
+        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
         result
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        let start_time = std::time::Instant::now();
         let GetObjectTaggingInput { bucket, key: object, .. } = req.input;
 
+        info!("Starting get_object_tagging for bucket: {}, object: {}", bucket, object);
+
         let Some(store) = new_object_layer_fn() else {
+            error!("Store not initialized");
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        // TODO: version
-        let tags = store
-            .get_object_tags(&bucket, &object, &ObjectOptions::default())
-            .await
-            .map_err(ApiError::from)?;
+        // Support versioned objects
+        let version_id = req.input.version_id.clone();
+        let opts = ObjectOptions {
+            version_id: self.parse_version_id(version_id)?.map(Into::into),
+            ..Default::default()
+        };
+
+        let tags = store.get_object_tags(&bucket, &object, &opts).await.map_err(|e| {
+            if is_err_object_not_found(&e) {
+                error!("Object not found: {}", e);
+                return s3_error!(NoSuchKey);
+            }
+            error!("Failed to get object tags: {}", e);
+            ApiError::from(e).into()
+        })?;
 
         let tag_set = decode_tags(tags.as_str());
+        debug!("Decoded tag set: {:?}", tag_set);
 
+        // Add metrics
+        counter!("rustfs.get_object_tagging.success").increment(1);
+        let duration = start_time.elapsed();
+        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
         Ok(S3Response::new(GetObjectTaggingOutput {
             tag_set,
-            version_id: None,
+            version_id: req.input.version_id.clone(),
         }))
     }
 
@@ -4634,25 +4833,56 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedDeleteTagging, "s3:DeleteObjectTagging");
-        let DeleteObjectTaggingInput { bucket, key: object, .. } = req.input.clone();
+        let DeleteObjectTaggingInput {
+            bucket,
+            key: object,
+            version_id,
+            ..
+        } = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {
+            error!("Store not initialized");
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        // TODO: Replicate
-        // TODO: version
-        store
-            .delete_object_tags(&bucket, &object, &ObjectOptions::default())
-            .await
-            .map_err(ApiError::from)?;
+        // Support versioned objects
+        let version_id_for_parse = version_id.clone();
+        let opts = ObjectOptions {
+            version_id: self.parse_version_id(version_id_for_parse)?.map(Into::into),
+            ..Default::default()
+        };
 
-        let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
-        helper = helper.version_id(version_id);
+        // TODO: Replicate (keep the original TODO, if further replication logic is needed)
+        store.delete_object_tags(&bucket, &object, &opts).await.map_err(|e| {
+            error!("Failed to delete object tags: {}", e);
+            ApiError::from(e)
+        })?;
 
-        let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }));
+        // Invalidate cache for the deleted tagged object
+        let manager = get_concurrency_manager();
+        let version_id_clone = version_id.clone();
+        tokio::spawn(async move {
+            manager
+                .invalidate_cache_versioned(&bucket, &object, version_id_clone.as_deref())
+                .await;
+            debug!(
+                "Cache invalidated for deleted tagged object: bucket={}, object={}, version_id={:?}",
+                bucket, object, version_id_clone
+            );
+        });
+
+        // Add metrics
+        counter!("rustfs.delete_object_tagging.success").increment(1);
+
+        let version_id_resp = version_id.clone().unwrap_or_default();
+        helper = helper.version_id(version_id_resp);
+
+        let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
+        let duration = start_time.elapsed();
+        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "delete").record(duration.as_secs_f64());
         result
     }
 

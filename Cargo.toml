@@ -131,7 +131,7 @@ byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.3"
-quick-xml = "0.38.4"
+quick-xml = "0.39.0"
 rmcp = { version = "0.12.0" }
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
@@ -147,8 +147,8 @@ blake3 = { version = "1.8.3", features = ["rayon", "mmap"] }
 chacha20poly1305 = { version = "0.11.0-rc.2" }
 crc-fast = "1.6.0"
 hmac = { version = "0.13.0-rc.3" }
-jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
-pbkdf2 = "0.13.0-rc.5"
+jsonwebtoken = { version = "10.2.0", features = ["aws_lc_rs"] }
+pbkdf2 = "0.13.0-rc.6"
 rsa = { version = "0.10.0-rc.11" }
 rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pemfile = "2.2.0"
@@ -187,7 +187,7 @@ derive_builder = "0.20.2"
 dunce = "1.0.5"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
-flate2 = "1.1.5"
+flate2 = "1.1.8"
 flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
 glob = "0.3.3"
 google-cloud-storage = "1.5.0"
@@ -243,7 +243,7 @@ thiserror = "2.0.17"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.4"
 tracing-error = "0.2.1"
-tracing-opentelemetry = "0.32.0"
+tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.8"

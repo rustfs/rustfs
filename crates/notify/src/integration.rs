@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
+use crate::notifier::TargetList;
 use crate::{
     Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
 };
@@ -189,6 +190,22 @@ impl NotificationSystem {
     /// A Vec containing all active Targets `TargetID`.
     pub async fn get_active_targets(&self) -> Vec<TargetID> {
         self.notifier.target_list().read().await.keys()
+    }
+
+    /// Gets the complete Target list, including both active and inactive Targets.
+    ///
+    /// # Return
+    /// An `Arc<RwLock<TargetList>>` containing all Targets.
+    pub async fn get_all_targets(&self) -> Arc<RwLock<TargetList>> {
+        self.notifier.target_list()
+    }
+
+    /// Gets all Target values, including both active and inactive Targets.
+    ///
+    /// # Return
+    /// A Vec containing all Targets.
+    pub async fn get_target_values(&self) -> Vec<Arc<dyn Target<Event> + Send + Sync>> {
+        self.notifier.target_list().read().await.values()
     }
 
     /// Checks if there are active subscribers for the given bucket and event name.

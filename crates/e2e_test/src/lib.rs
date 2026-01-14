@@ -29,6 +29,10 @@ mod data_usage_test;
 #[cfg(test)]
 mod kms;
 
+// Quota tests
+#[cfg(test)]
+mod quota_test;
+
 #[cfg(test)]
 mod bucket_policy_check_test;
 

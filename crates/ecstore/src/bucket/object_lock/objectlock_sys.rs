@@ -12,15 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::metadata_sys::get_object_lock_config;
+use crate::bucket::object_lock::objectlock;
+use crate::store_api::ObjectInfo;
+use s3s::dto::{DefaultRetention, ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 use std::sync::Arc;
 use time::OffsetDateTime;
-
-use s3s::dto::{DefaultRetention, ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
-
-use crate::bucket::metadata_sys::get_object_lock_config;
-use crate::store_api::ObjectInfo;
-
-use super::objectlock;
 
 pub struct BucketObjectLockSys {}
 

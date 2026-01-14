@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
-
 use rustfs_utils::string::match_simple;
+use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 
 pub trait VersioningApi {
     fn enabled(&self) -> bool;

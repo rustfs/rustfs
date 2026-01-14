@@ -12,36 +12,50 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    sync::Arc,
-    time::SystemTime,
-};
-
 pub mod local_snapshot;
+
+use crate::{
+    bucket::metadata_sys::get_replication_config, config::com::read_config, disk::DiskAPI, error::Error, store::ECStore,
+    store_api::StorageAPI,
+};
 pub use local_snapshot::{
     DATA_USAGE_DIR, DATA_USAGE_STATE_DIR, LOCAL_USAGE_SNAPSHOT_VERSION, LocalUsageSnapshot, LocalUsageSnapshotMeta,
     data_usage_dir, data_usage_state_dir, ensure_data_usage_layout, read_snapshot as read_local_snapshot, snapshot_file_name,
     snapshot_object_path, snapshot_path, write_snapshot as write_local_snapshot,
 };
-
-use crate::{
-    bucket::metadata_sys::get_replication_config, config::com::read_config, disk::DiskAPI, store::ECStore, store_api::StorageAPI,
-};
 use rustfs_common::data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_utils::path::SLASH_SEPARATOR_STR;
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::{Arc, OnceLock},
+    time::{Duration, SystemTime},
+};
 use tokio::fs;
-use tracing::{error, info, warn};
-
-use crate::error::Error;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 
 // Data usage storage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR_STR;
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
+const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
+
+type UsageMemoryCache = Arc<RwLock<HashMap<String, (u64, SystemTime)>>>;
+type CacheUpdating = Arc<RwLock<bool>>;
+
+static USAGE_MEMORY_CACHE: OnceLock<UsageMemoryCache> = OnceLock::new();
+static USAGE_CACHE_UPDATING: OnceLock<CacheUpdating> = OnceLock::new();
+
+fn memory_cache() -> &'static UsageMemoryCache {
+    USAGE_MEMORY_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+fn cache_updating() -> &'static CacheUpdating {
+    USAGE_CACHE_UPDATING.get_or_init(|| Arc::new(RwLock::new(false)))
+}
 
 // Data usage storage paths
 lazy_static::lazy_static! {
@@ -94,8 +108,8 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
         Ok(data) => data,
         Err(e) => {
             error!("Failed to read data usage info from backend: {}", e);
-            if e == crate::error::Error::ConfigNotFound {
-                warn!("Data usage config not found, building basic statistics");
+            if e == Error::ConfigNotFound {
+                info!("Data usage config not found, building basic statistics");
                 return build_basic_data_usage_info(store).await;
             }
             return Err(Error::other(e));
@@ -128,7 +142,7 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
             .map(|(bucket, &size)| {
                 (
                     bucket.clone(),
-                    rustfs_common::data_usage::BucketUsageInfo {
+                    BucketUsageInfo {
                         size,
                         ..Default::default()
                     },
@@ -245,7 +259,7 @@ pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskU
 
                 // If a snapshot is corrupted or unreadable, skip it but keep processing others
                 if let Err(err) = &snapshot_result {
-                    warn!(
+                    info!(
                         "Failed to read data usage snapshot for disk {} (pool {}, set {}, disk {}): {}",
                         disk_id, pool_idx, set_disks.set_index, disk_index, err
                     );
@@ -254,7 +268,7 @@ pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskU
                     if let Err(remove_err) = fs::remove_file(&snapshot_file).await
                         && remove_err.kind() != std::io::ErrorKind::NotFound
                     {
-                        warn!("Failed to remove corrupted snapshot {:?}: {}", snapshot_file, remove_err);
+                        info!("Failed to remove corrupted snapshot {:?}: {}", snapshot_file, remove_err);
                     }
                 }
 
@@ -341,7 +355,7 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
 
         continuation = result.next_continuation_token.clone();
         if continuation.is_none() {
-            warn!(
+            info!(
                 "Bucket {} listing marked truncated but no continuation token returned; stopping early",
                 bucket_name
             );
@@ -364,8 +378,120 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
     Ok(usage)
 }
 
+/// Fast in-memory increment for immediate quota consistency
+pub async fn increment_bucket_usage_memory(bucket: &str, size_increment: u64) {
+    let mut cache = memory_cache().write().await;
+    let current = cache.entry(bucket.to_string()).or_insert_with(|| (0, SystemTime::now()));
+    current.0 += size_increment;
+    current.1 = SystemTime::now();
+}
+
+/// Fast in-memory decrement for immediate quota consistency
+pub async fn decrement_bucket_usage_memory(bucket: &str, size_decrement: u64) {
+    let mut cache = memory_cache().write().await;
+    if let Some(current) = cache.get_mut(bucket) {
+        current.0 = current.0.saturating_sub(size_decrement);
+        current.1 = SystemTime::now();
+    }
+}
+
+/// Get bucket usage from in-memory cache
+pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
+    update_usage_cache_if_needed().await;
+
+    let cache = memory_cache().read().await;
+    cache.get(bucket).map(|(usage, _)| *usage)
+}
+
+async fn update_usage_cache_if_needed() {
+    let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
+    let double_ttl = ttl * 2;
+    let now = SystemTime::now();
+
+    let cache = memory_cache().read().await;
+    let earliest_timestamp = cache.values().map(|(_, ts)| *ts).min();
+    drop(cache);
+
+    let age = match earliest_timestamp {
+        Some(ts) => now.duration_since(ts).unwrap_or_default(),
+        None => double_ttl,
+    };
+
+    if age < ttl {
+        return;
+    }
+
+    let mut updating = cache_updating().write().await;
+    if age < double_ttl {
+        if *updating {
+            return;
+        }
+        *updating = true;
+        drop(updating);
+
+        let cache_clone = (*memory_cache()).clone();
+        let updating_clone = (*cache_updating()).clone();
+        tokio::spawn(async move {
+            if let Some(store) = crate::global::GLOBAL_OBJECT_API.get()
+                && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
+            {
+                let mut cache = cache_clone.write().await;
+                for (bucket_name, bucket_usage) in data_usage_info.buckets_usage.iter() {
+                    cache.insert(bucket_name.clone(), (bucket_usage.size, SystemTime::now()));
+                }
+            }
+            let mut updating = updating_clone.write().await;
+            *updating = false;
+        });
+        return;
+    }
+
+    for retry in 0..10 {
+        if !*updating {
+            break;
+        }
+        drop(updating);
+        let delay = Duration::from_millis(1 << retry);
+        tokio::time::sleep(delay).await;
+        updating = cache_updating().write().await;
+    }
+
+    *updating = true;
+    drop(updating);
+
+    if let Some(store) = crate::global::GLOBAL_OBJECT_API.get()
+        && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
+    {
+        let mut cache = memory_cache().write().await;
+        for (bucket_name, bucket_usage) in data_usage_info.buckets_usage.iter() {
+            cache.insert(bucket_name.clone(), (bucket_usage.size, SystemTime::now()));
+        }
+    }
+
+    let mut updating = cache_updating().write().await;
+    *updating = false;
+}
+
+/// Sync memory cache with backend data (called by scanner)
+pub async fn sync_memory_cache_with_backend() -> Result<(), Error> {
+    if let Some(store) = crate::global::GLOBAL_OBJECT_API.get() {
+        match load_data_usage_from_backend(store.clone()).await {
+            Ok(data_usage_info) => {
+                let mut cache = memory_cache().write().await;
+                for (bucket, bucket_usage) in data_usage_info.buckets_usage.iter() {
+                    cache.insert(bucket.clone(), (bucket_usage.size, SystemTime::now()));
+                }
+            }
+            Err(e) => {
+                debug!("Failed to sync memory cache with backend: {}", e);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build basic data usage info with real object counts
-async fn build_basic_data_usage_info(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+pub async fn build_basic_data_usage_info(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
     let mut data_usage_info = DataUsageInfo::default();
 
     // Get bucket list
@@ -437,7 +563,7 @@ pub fn cache_to_data_usage_info(cache: &DataUsageCache, path: &str, buckets: &[c
             None => continue,
         };
         let flat = cache.flatten(&e);
-        let mut bui = rustfs_common::data_usage::BucketUsageInfo {
+        let mut bui = BucketUsageInfo {
             size: flat.size as u64,
             versions_count: flat.versions as u64,
             objects_count: flat.objects as u64,
@@ -515,7 +641,7 @@ pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str
                 break;
             }
             Err(err) => match err {
-                crate::error::Error::FileNotFound | crate::error::Error::VolumeNotFound => {
+                Error::FileNotFound | Error::VolumeNotFound => {
                     match store
                         .get_object_reader(
                             RUSTFS_META_BUCKET,
@@ -536,7 +662,7 @@ pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str
                             break;
                         }
                         Err(_) => match err {
-                            crate::error::Error::FileNotFound | crate::error::Error::VolumeNotFound => {
+                            Error::FileNotFound | Error::VolumeNotFound => {
                                 break;
                             }
                             _ => {}
@@ -565,9 +691,9 @@ pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate:
     use std::path::Path;
 
     let Some(store) = new_object_layer_fn() else {
-        return Err(crate::error::Error::other("errServerNotInitialized"));
+        return Err(Error::other("errServerNotInitialized"));
     };
-    let buf = cache.marshal_msg().map_err(crate::error::Error::other)?;
+    let buf = cache.marshal_msg().map_err(Error::other)?;
     let buf_clone = buf.clone();
 
     let store_clone = store.clone();

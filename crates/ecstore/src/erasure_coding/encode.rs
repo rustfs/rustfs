@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::BitrotWriterWrapper;
-use super::Erasure;
 use crate::disk::error::Error;
 use crate::disk::error_reduce::count_errs;
 use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_write_quorum_errs};
+use crate::erasure_coding::BitrotWriterWrapper;
+use crate::erasure_coding::Erasure;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;

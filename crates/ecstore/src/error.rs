@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::{S3Error, S3ErrorCode};
-
-use rustfs_utils::path::decode_dir_object;
-
 use crate::bucket::error::BucketMetadataError;
 use crate::disk::error::DiskError;
+use rustfs_utils::path::decode_dir_object;
+use s3s::{S3Error, S3ErrorCode};
 
 pub type Error = StorageError;
 pub type Result<T> = core::result::Result<T, Error>;
