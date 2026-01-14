@@ -18,6 +18,7 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use crate::bucket::lifecycle::rule::TransitionOps;
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
     ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
@@ -29,8 +30,6 @@ use std::sync::Arc;
 use time::macros::{datetime, offset};
 use time::{self, Duration, OffsetDateTime};
 use tracing::info;
-
-use crate::bucket::lifecycle::rule::TransitionOps;
 
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";

@@ -1825,16 +1825,16 @@ impl StorageAPI for ECStore {
             if self.is_suspended(pool.pool_idx).await {
                 continue;
             }
-            match pool
+            return match pool
                 .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
                 .await
             {
-                Ok(res) => return Ok(res),
+                Ok(res) => Ok(res),
                 Err(err) => {
                     if is_err_invalid_upload_id(&err) {
                         continue;
                     }
-                    return Err(err);
+                    Err(err)
                 }
             };
         }
@@ -2204,7 +2204,7 @@ impl StorageAPI for ECStore {
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
         check_del_obj_args(bucket, object)?;
 
-        let object = rustfs_utils::path::encode_dir_object(object);
+        let object = encode_dir_object(object);
 
         if self.single_pool() {
             return self.pools[0]
@@ -2324,17 +2324,15 @@ impl StorageAPI for ECStore {
 
         // No pool returned a nil error, return the first non 'not found' error
         for (index, err) in errs.iter().enumerate() {
-            match err {
+            return match err {
                 Some(err) => {
                     if is_err_object_not_found(err) || is_err_version_not_found(err) {
                         continue;
                     }
-                    return Ok((ress.remove(index), Some(err.clone())));
+                    Ok((ress.remove(index), Some(err.clone())))
                 }
-                None => {
-                    return Ok((ress.remove(index), None));
-                }
-            }
+                None => Ok((ress.remove(index), None)),
+            };
         }
 
         // At this stage, all errors are 'not found'

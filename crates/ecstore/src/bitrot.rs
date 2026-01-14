@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::disk::error::DiskError;
-use crate::disk::{self, DiskAPI as _, DiskStore};
+use crate::disk::{self, DiskAPI as _, DiskStore, error::DiskError};
 use crate::erasure_coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use rustfs_utils::HashAlgorithm;
 use std::io::Cursor;

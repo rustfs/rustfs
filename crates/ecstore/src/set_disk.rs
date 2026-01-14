@@ -82,7 +82,7 @@ use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX, 
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
-    path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
+    path::{SLASH_SEPARATOR_STR, encode_dir_object, has_suffix, path_join_buf},
 };
 use rustfs_workers::workers::Workers;
 use s3s::header::X_AMZ_RESTORE;
@@ -1485,20 +1485,8 @@ impl SetDisks {
             let object = object.clone();
             let version_id = version_id.clone();
             tokio::spawn(async move {
-                if let Some(disk) = disk
-                    && disk.is_online().await
-                {
-                    if version_id.is_empty() {
-                        match disk.read_xl(&bucket, &object, read_data).await {
-                            Ok(info) => {
-                                let fi = file_info_from_raw(info, &bucket, &object, read_data).await?;
-                                Ok(fi)
-                            }
-                            Err(err) => Err(err),
-                        }
-                    } else {
-                        disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
-                    }
+                if let Some(disk) = disk {
+                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
                 }
@@ -1626,7 +1614,7 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         read_data: bool,
-        _incl_free_vers: bool,
+        incl_free_vers: bool,
     ) -> (Vec<FileInfo>, Vec<Option<DiskError>>) {
         let mut metadata_array = vec![None; fileinfos.len()];
         let mut meta_file_infos = vec![FileInfo::default(); fileinfos.len()];
@@ -1676,7 +1664,7 @@ impl SetDisks {
             ..Default::default()
         };
 
-        let finfo = match meta.into_fileinfo(bucket, object, "", true, true) {
+        let finfo = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
             Ok(res) => res,
             Err(err) => {
                 for item in errs.iter_mut() {
@@ -1703,7 +1691,7 @@ impl SetDisks {
 
         for (idx, meta_op) in metadata_array.iter().enumerate() {
             if let Some(meta) = meta_op {
-                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, true) {
+                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, incl_free_vers, true) {
                     Ok(res) => meta_file_infos[idx] = res,
                     Err(err) => errs[idx] = Some(err.into()),
                 }
@@ -4626,7 +4614,9 @@ impl StorageAPI for SetDisks {
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        Ok(ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended))
+        let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
+        obj_info.size = goi.size;
+        Ok(obj_info)
     }
 
     #[tracing::instrument(skip(self))]
@@ -5336,7 +5326,7 @@ impl StorageAPI for SetDisks {
                 &upload_id_path,
                 fi.data_dir.map(|v| v.to_string()).unwrap_or_default().as_str(),
             ]),
-            SLASH_SEPARATOR
+            SLASH_SEPARATOR_STR
         );
 
         let mut part_numbers = match Self::list_parts(&online_disks, &part_path, read_quorum).await {
@@ -5474,7 +5464,7 @@ impl StorageAPI for SetDisks {
         let mut populated_upload_ids = HashSet::new();
 
         for upload_id in upload_ids.iter() {
-            let upload_id = upload_id.trim_end_matches(SLASH_SEPARATOR).to_string();
+            let upload_id = upload_id.trim_end_matches(SLASH_SEPARATOR_STR).to_string();
             if populated_upload_ids.contains(&upload_id) {
                 continue;
             }
@@ -6234,7 +6224,7 @@ impl StorageAPI for SetDisks {
             None
         };
 
-        if has_suffix(object, SLASH_SEPARATOR) {
+        if has_suffix(object, SLASH_SEPARATOR_STR) {
             let (result, err) = self.heal_object_dir_locked(bucket, object, opts.dry_run, opts.remove).await?;
             return Ok((result, err.map(|e| e.into())));
         }
