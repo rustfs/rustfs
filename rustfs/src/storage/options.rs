@@ -58,8 +58,7 @@ pub async fn del_opts(
     let vid = if vid.is_none() {
         headers
             .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
-            .map(|v| v.to_str().ok().map(|s| s.to_owned()))
-            .flatten()
+            .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
     } else {
         vid
     };
@@ -185,8 +184,7 @@ pub async fn put_opts(
     let vid = if vid.is_none() {
         headers
             .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
-            .map(|v| v.to_str().ok().map(|s| s.to_owned()))
-            .flatten()
+            .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
     } else {
         vid
     };
