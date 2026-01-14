@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_utils::string::has_pattern;
-use rustfs_utils::string::has_string_suffix_in_slice;
+use rustfs_utils::string::{has_pattern, has_string_suffix_in_slice};
 use std::env;
 use tracing::error;
 

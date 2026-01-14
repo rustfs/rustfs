@@ -12,18 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::error::DiskError;
+use crate::disk::error::Result;
+use crate::disk::error_conv::to_file_error;
+use rustfs_utils::path::SLASH_SEPARATOR_STR;
 use std::{
     io,
     path::{Component, Path},
 };
-
-use super::error::Result;
-use crate::disk::error_conv::to_file_error;
-use rustfs_utils::path::SLASH_SEPARATOR_STR;
 use tokio::fs;
 use tracing::warn;
-
-use super::error::DiskError;
 
 /// Check path length according to OS limits.
 pub fn check_path_length(path_name: &str) -> Result<()> {

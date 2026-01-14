@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{quota::BucketQuota, target::BucketTargets};
-
 use super::object_lock::ObjectLockApi;
 use super::versioning::VersioningApi;
+use super::{quota::BucketQuota, target::BucketTargets};
 use crate::bucket::utils::deserialize;
 use crate::config::com::{read_config, save_config};
+use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
 use crate::new_object_layer_fn;
+use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rmp_serde::Serializer as rmpSerializer;
 use rustfs_policy::policy::BucketPolicy;
@@ -33,9 +34,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::error;
-
-use crate::disk::BUCKET_META_PREFIX;
-use crate::store::ECStore;
 
 pub const BUCKET_METADATA_FILE: &str = ".metadata.bin";
 pub const BUCKET_METADATA_FORMAT: u16 = 1;
@@ -355,7 +353,7 @@ impl BucketMetadata {
             self.tagging_config = Some(deserialize::<Tagging>(&self.tagging_config_xml)?);
         }
         if !self.quota_config_json.is_empty() {
-            self.quota_config = Some(BucketQuota::unmarshal(&self.quota_config_json)?);
+            self.quota_config = Some(serde_json::from_slice(&self.quota_config_json)?);
         }
         if !self.replication_config_xml.is_empty() {
             self.replication_config = Some(deserialize::<ReplicationConfiguration>(&self.replication_config_xml)?);
@@ -487,7 +485,8 @@ mod test {
         bm.tagging_config_updated_at = OffsetDateTime::now_utc();
 
         // Add quota configuration
-        let quota_json = r#"{"quota":1073741824,"quotaType":"hard"}"#; // 1GB quota
+        let quota_json =
+            r#"{"quota":1073741824,"quota_type":"Hard","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}"#; // 1GB quota
         bm.quota_config_json = quota_json.as_bytes().to_vec();
         bm.quota_config_updated_at = OffsetDateTime::now_utc();
 

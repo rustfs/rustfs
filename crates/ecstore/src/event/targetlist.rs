@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::event::targetid::TargetID;
 use std::sync::atomic::AtomicI64;
-
-use super::targetid::TargetID;
 
 #[derive(Default)]
 pub struct TargetList {

@@ -12,12 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    admin_server_info::get_local_server_property,
-    new_object_layer_fn,
-    store_api::StorageAPI,
-    // utils::os::get_drive_stats,
-};
+use crate::{admin_server_info::get_local_server_property, new_object_layer_fn, store_api::StorageAPI};
 use chrono::Utc;
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, metrics::global_metrics};
 use rustfs_madmin::metrics::{DiskIOStats, DiskMetric, RealtimeMetrics};

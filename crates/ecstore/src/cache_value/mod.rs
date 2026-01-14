@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use lazy_static::lazy_static;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub mod metacache_set;

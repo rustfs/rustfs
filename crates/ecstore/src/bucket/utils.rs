@@ -14,15 +14,14 @@
 
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, StorageError};
+use regex::Regex;
 use rustfs_utils::path::SLASH_SEPARATOR_STR;
 use s3s::xml;
+use tracing::instrument;
 
 pub fn is_meta_bucketname(name: &str) -> bool {
     name.starts_with(RUSTFS_META_BUCKET)
 }
-
-use regex::Regex;
-use tracing::instrument;
 
 lazy_static::lazy_static! {
     static ref VALID_BUCKET_NAME: Regex = Regex::new(r"^[A-Za-z0-9][A-Za-z0-9\.\-\_\:]{1,61}[A-Za-z0-9]$").unwrap();

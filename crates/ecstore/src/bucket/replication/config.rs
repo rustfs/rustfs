@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::ReplicationRuleExt as _;
+use crate::bucket::replication::ReplicationRuleExt as _;
 use crate::bucket::tagging::decode_tags_to_map;
 use rustfs_filemeta::ReplicationType;
 use s3s::dto::DeleteMarkerReplicationStatus;

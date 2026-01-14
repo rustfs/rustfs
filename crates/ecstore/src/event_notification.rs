@@ -14,15 +14,14 @@
 // limitations under the License.
 #![allow(unused_variables)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-
 use crate::bucket::metadata::BucketMetadata;
 use crate::event::name::EventName;
 use crate::event::targetlist::TargetList;
 use crate::store::ECStore;
 use crate::store_api::ObjectInfo;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub struct EventNotifier {
     target_list: TargetList,

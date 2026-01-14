@@ -13,56 +13,19 @@
 // limitations under the License.
 
 use super::{DiskInfo, IOStats};
-use nix::sys::statfs::Statfs;
-use nix::sys::{stat::stat, statfs::statfs};
+use nix::sys::{stat::stat, statvfs::statvfs};
 use std::io::Error;
 use std::path::Path;
-
-// FreeBSD and OpenBSD return a signed integer for blocks_available.
-// Cast to an unsigned integer to use with DiskInfo.
-#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
-fn blocks_available(stat: &Statfs) -> u64 {
-    match stat.blocks_available().try_into() {
-        Ok(bavail) => bavail,
-        Err(e) => {
-            tracing::warn!("blocks_available returned a negative value: Using 0 as fallback. {}", e);
-            0
-        }
-    }
-}
-
-// FreeBSD returns a signed integer for files_free. Cast to an unsigned integer
-// to use with DiskInfo
-#[cfg(target_os = "freebsd")]
-fn files_free(stat: &Statfs) -> u64 {
-    match stat.files_free().try_into() {
-        Ok(files_free) => files_free,
-        Err(e) => {
-            tracing::warn!("files_free returned a negative value: Using 0 as fallback. {}", e);
-            0
-        }
-    }
-}
-
-#[cfg(not(target_os = "freebsd"))]
-fn files_free(stat: &Statfs) -> u64 {
-    stat.files_free()
-}
-
-#[cfg(not(any(target_os = "freebsd", target_os = "openbsd")))]
-fn blocks_available(stat: &Statfs) -> u64 {
-    stat.blocks_available()
-}
 
 /// Returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let path_display = p.as_ref().display();
-    let stat = statfs(p.as_ref())?;
+    let stat = statvfs(p.as_ref())?;
 
-    let bsize = stat.block_size() as u64;
-    let bfree = stat.blocks_free();
-    let bavail = blocks_available(&stat);
-    let blocks = stat.blocks();
+    let bsize = stat.block_size();
+    let bfree = stat.blocks_free() as u64;
+    let bavail = stat.blocks_available() as u64;
+    let blocks = stat.blocks() as u64;
 
     let reserved = match bfree.checked_sub(bavail) {
         Some(reserved) => reserved,
@@ -96,9 +59,9 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         total,
         free,
         used,
-        files: stat.files(),
-        ffree: files_free(&stat),
-        fstype: stat.filesystem_type_name().to_string(),
+        files: stat.files() as u64,
+        ffree: stat.files_free() as u64,
+        // Statvfs does not provide a way to return the filesystem as name.
         ..Default::default()
     })
 }
