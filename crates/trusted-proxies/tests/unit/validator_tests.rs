@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::net::{IpAddr, SocketAddr};
-use std::str::FromStr;
 use axum::http::HeaderMap;
 use rustfs_trusted_proxies::config::{TrustedProxy, TrustedProxyConfig, ValidationMode};
 use rustfs_trusted_proxies::proxy::chain::ProxyChainAnalyzer;
 use rustfs_trusted_proxies::proxy::validator::{ClientInfo, ProxyValidator};
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 
 fn create_test_config() -> TrustedProxyConfig {
     let proxies = vec![

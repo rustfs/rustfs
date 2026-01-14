@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::net::IpAddr;
 use rustfs_trusted_proxies::config::env::{DEFAULT_TRUSTED_PROXIES, ENV_TRUSTED_PROXIES};
 use rustfs_trusted_proxies::config::{ConfigLoader, TrustedProxy, TrustedProxyConfig, ValidationMode};
+use std::net::IpAddr;
 
 #[test]
 fn test_config_loader_default() {

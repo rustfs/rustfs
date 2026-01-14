@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
 use rustfs_trusted_proxies::cloud::detector::CloudDetector;
 use rustfs_trusted_proxies::cloud::metadata::AwsMetadataFetcher;
+use std::time::Duration;
 
 #[tokio::test]
 async fn test_cloud_detector_disabled() {

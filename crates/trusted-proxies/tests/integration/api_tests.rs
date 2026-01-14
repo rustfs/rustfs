@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
 use axum::body::Body;
-use axum::{routing::get, Router};
-use serde_json::{json};
-use tower::ServiceExt;
+use axum::{Router, routing::get};
 use rustfs_trusted_proxies::config::{AppConfig, TrustedProxy, TrustedProxyConfig, ValidationMode};
 use rustfs_trusted_proxies::state::AppState;
+use serde_json::json;
+use std::sync::Arc;
+use tower::ServiceExt;
 
 fn create_test_app_state() -> AppState {
     let proxies = vec![TrustedProxy::Single("127.0.0.1".parse().unwrap())];

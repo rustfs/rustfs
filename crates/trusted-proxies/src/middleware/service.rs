@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 use axum::extract::Request;
 use axum::response::Response;
 use tower::Service;
-use tracing::{debug, instrument, Span};
+use tracing::{Span, debug, instrument};
 
 use crate::middleware::layer::TrustedProxyLayer;
 use crate::proxy::{ClientInfo, ProxyValidator};

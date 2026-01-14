@@ -16,9 +16,9 @@
 
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use tokio::net::TcpListener;
-use tracing::{info, Level};
+use tracing::{Level, info};
 use tracing_subscriber::EnvFilter;
 
 mod api;

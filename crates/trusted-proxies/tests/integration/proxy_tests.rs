@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use axum::body::Body;
-use axum::{routing::get, Router};
-use tower::ServiceExt;
+use axum::{Router, routing::get};
 use rustfs_trusted_proxies::config::{TrustedProxy, TrustedProxyConfig, ValidationMode};
 use rustfs_trusted_proxies::middleware::TrustedProxyLayer;
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn test_proxy_validation_flow() {
@@ -24,9 +24,7 @@ async fn test_proxy_validation_flow() {
     let config = TrustedProxyConfig::new(proxies, ValidationMode::HopByHop, true, 10, true, vec![]);
     let proxy_layer = TrustedProxyLayer::enabled(config, None);
 
-    let app = Router::new()
-        .route("/test", get(|| async { "OK" }))
-        .layer(proxy_layer);
+    let app = Router::new().route("/test", get(|| async { "OK" })).layer(proxy_layer);
 
     let request = axum::http::Request::builder()
         .uri("/test")

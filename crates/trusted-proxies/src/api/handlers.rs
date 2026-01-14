@@ -14,16 +14,15 @@
 
 //! API request handlers for the trusted proxy service.
 
+use crate::AppState;
+use crate::error::AppError;
+use crate::middleware::ClientInfo;
 use axum::{
     extract::{Request, State},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
-use serde_json::{json, Value};
-
-use crate::error::AppError;
-use crate::middleware::ClientInfo;
-use crate::AppState;
+use serde_json::{Value, json};
 
 /// Health check endpoint to verify service availability.
 pub async fn health_check() -> impl IntoResponse {

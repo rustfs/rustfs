@@ -30,10 +30,7 @@ pub struct IpValidationCache {
 impl IpValidationCache {
     /// Creates a new `IpValidationCache` using Moka.
     pub fn new(capacity: usize, ttl: Duration, enabled: bool) -> Self {
-        let cache = Cache::builder()
-            .max_capacity(capacity as u64)
-            .time_to_live(ttl)
-            .build();
+        let cache = Cache::builder().max_capacity(capacity as u64).time_to_live(ttl).build();
 
         Self { cache, enabled }
     }

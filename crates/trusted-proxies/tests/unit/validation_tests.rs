@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use http::HeaderMap;
-use std::net::IpAddr;
 use rustfs_trusted_proxies::utils::{IpUtils, ValidationUtils};
+use std::net::IpAddr;
 
 #[test]
 fn test_email_validation() {
@@ -42,10 +42,7 @@ fn test_forwarded_header_validation() {
 
 #[test]
 fn test_ip_in_range_validation() {
-    let cidr_ranges = vec![
-        "10.0.0.0/8".to_string(),
-        "192.168.0.0/16".to_string(),
-    ];
+    let cidr_ranges = vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()];
     let ip: IpAddr = "10.0.1.1".parse().unwrap();
     assert!(ValidationUtils::validate_ip_in_range(&ip, &cidr_ranges));
 }
