@@ -20,7 +20,6 @@ use matchit::Params;
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
 use rustfs_config::{ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_targets::check_mqtt_broker_available;
-use s3s::header::CONTENT_LENGTH;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -32,7 +31,7 @@ use std::sync::Arc;
 use tokio::net::lookup_host;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep, timeout};
-use tracing::{Span, debug, error, info, warn};
+use tracing::{Span, info, warn};
 use url::Url;
 
 #[derive(Debug, Deserialize)]
@@ -75,7 +74,6 @@ fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>>
 fn build_response(status: StatusCode, body: Body, request_id: Option<&http::HeaderValue>) -> S3Response<(StatusCode, Body)> {
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-    // Note: Body in s3s might not have is_empty(), we check content length if possible or just set it for empty bodies
     if let Some(v) = request_id {
         header.insert("x-request-id", v.clone());
     }
@@ -247,8 +245,7 @@ impl Operation for ListNotificationTargets {
         check_permissions(&req).await?;
         let ns = get_notification_system()?;
 
-        let all_targets_guard = ns.get_all_targets().await.read().await;
-        let targets = all_targets_guard.values();
+        let targets = ns.get_target_values().await;
         let target_count = targets.len();
 
         let semaphore = Arc::new(Semaphore::new(10));
@@ -269,7 +266,6 @@ impl Operation for ListNotificationTargets {
                 }
             });
         }
-        drop(all_targets_guard);
 
         let mut notification_endpoints = Vec::with_capacity(target_count);
         while let Some(endpoint) = futures.next().await {
