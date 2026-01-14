@@ -116,10 +116,9 @@ use rustfs_utils::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
             AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
-            RESERVED_METADATA_PREFIX_LOWER,
+            RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
         },
     },
-    obj::extract_user_defined_metadata,
     path::{is_dir_object, path_join_buf},
 };
 use rustfs_zip::CompressionFormat;
@@ -875,6 +874,7 @@ impl S3 for FS {
             metadata,
             copy_source_if_match,
             copy_source_if_none_match,
+            content_type,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -889,6 +889,14 @@ impl S3 for FS {
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
         validate_object_key(&key, "COPY (dest)")?;
+
+        if src_bucket == bucket && src_key == key {
+            error!("Rejected self-copy operation: bucket={}, key={}", bucket, key);
+            return Err(s3_error!(
+                InvalidRequest,
+                "Cannot copy an object to itself. Source and destination must be different."
+            ));
+        }
 
         // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
 
@@ -1019,6 +1027,9 @@ impl S3 for FS {
                 .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"));
             src_info
                 .user_defined
+                .remove(&format!("{RESERVED_METADATA_PREFIX}actual-size"));
+            src_info
+                .user_defined
                 .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"));
         }
 
@@ -1105,12 +1116,13 @@ impl S3 for FS {
         }
 
         if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
-            let src_user_defined = extract_user_defined_metadata(&src_info.user_defined);
-            src_user_defined.keys().for_each(|k| {
-                src_info.user_defined.remove(k);
-            });
+            src_info.user_defined.clear();
             if let Some(metadata) = metadata {
                 src_info.user_defined.extend(metadata);
+            }
+            if let Some(ct) = content_type {
+                src_info.content_type = Some(ct.clone());
+                src_info.user_defined.insert("content-type".to_string(), ct);
             }
         }
 
