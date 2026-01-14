@@ -15,7 +15,7 @@
 use rustfs_config::VERSION;
 use std::env;
 use std::fmt;
-#[cfg(not(any(target_os = "openbsd", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "openbsd", target_os = "freebsd", target_os = "netbsd")))]
 use sysinfo::System;
 
 /// Business Type Enumeration

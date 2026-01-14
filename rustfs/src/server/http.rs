@@ -30,9 +30,6 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use rustfs_common::GlobalReadiness;
-#[cfg(not(target_os = "openbsd"))]
-use rustfs_config::{MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-#[cfg(target_os = "openbsd")]
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
@@ -379,11 +376,14 @@ pub async fn start_http_server(
 
             // Enable TCP Keepalive to detect dead clients (e.g. power loss)
             // Idle: 10s, Interval: 5s, Retries: 3
-            let mut ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
+            #[cfg(target_os = "openbsd")]
+            let ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
+
             #[cfg(not(target_os = "openbsd"))]
-            {
-                ka = ka.with_interval(Duration::from_secs(5)).with_retries(3);
-            }
+            let ka = TcpKeepalive::new()
+                .with_time(Duration::from_secs(10))
+                .with_interval(Duration::from_secs(5))
+                .with_retries(3);
 
             if let Err(err) = socket_ref.set_tcp_keepalive(&ka) {
                 warn!(?err, "Failed to set TCP_KEEPALIVE");
@@ -392,12 +392,13 @@ pub async fn start_http_server(
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
-            #[cfg(not(any(target_os = "openbsd")))]
-            if let Err(err) = socket_ref.set_recv_buffer_size(4 * MI_B) {
+
+            #[cfg(not(target_os = "openbsd"))]
+            if let Err(err) = socket_ref.set_recv_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_recv_buffer_size");
             }
-            #[cfg(not(any(target_os = "openbsd")))]
-            if let Err(err) = socket_ref.set_send_buffer_size(4 * MI_B) {
+            #[cfg(not(target_os = "openbsd"))]
+            if let Err(err) = socket_ref.set_send_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
 
@@ -752,14 +753,15 @@ fn get_listen_backlog() -> i32 {
 }
 
 // For macOS and BSD variants use the syscall way of getting the connection queue length.
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+// NetBSD has no somaxconn-like kernel state.
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
 #[allow(unsafe_code)]
 fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
 
     #[cfg(target_os = "openbsd")]
     let mut name = [libc::CTL_KERN, libc::KERN_SOMAXCONN];
-    #[cfg(any(target_os = "netbsd", target_os = "macos", target_os = "freebsd"))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
     let mut buf = [0; 1];
     let mut buf_len = size_of_val(&buf);
@@ -781,14 +783,8 @@ fn get_listen_backlog() -> i32 {
     buf[0]
 }
 
-// Fallback for Windows and other operating systems
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-)))]
+// Fallback for Windows, NetBSD and other operating systems.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
 fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
     DEFAULT_BACKLOG
