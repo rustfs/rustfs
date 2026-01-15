@@ -40,7 +40,7 @@ services:
         [
           "CMD",
           "sh", "-c",
-          "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health"
+          "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health"
         ]
       interval: 30s
       timeout: 10s
