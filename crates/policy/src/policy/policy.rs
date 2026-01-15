@@ -1119,7 +1119,7 @@ mod test {
     }
 
     #[test]
-    fn test_bucket_policy_serialize_single_action_as_string() {
+    fn test_bucket_policy_serialize_single_action_as_array() {
         use crate::policy::action::{Action, ActionSet, S3Action};
         use crate::policy::resource::{Resource, ResourceSet};
         use crate::policy::{Effect, Principal};
@@ -1153,8 +1153,10 @@ mod test {
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
         let action = &parsed["Statement"][0]["Action"];
 
-        // Single action should be serialized as string
-        assert!(action.is_string(), "Single action should serialize as string");
-        assert_eq!(action.as_str().unwrap(), "s3:ListBucket");
+        // Single action should be serialized as array for S3 specification compliance
+        assert!(action.is_array(), "Single action should serialize as array");
+        let arr = action.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str().unwrap(), "s3:ListBucket");
     }
 }

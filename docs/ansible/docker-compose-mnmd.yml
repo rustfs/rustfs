@@ -63,7 +63,7 @@
                 test:
                   [
                     "CMD-SHELL",
-                    "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health || exit 1"
+                    "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/health || exit 1"
                   ]
                 interval: 10s
                 timeout: 5s

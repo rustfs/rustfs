@@ -370,6 +370,11 @@ impl TargetList {
         self.targets.keys().cloned().collect()
     }
 
+    /// Returns all targets in the list
+    pub fn values(&self) -> Vec<Arc<dyn Target<Event> + Send + Sync>> {
+        self.targets.values().cloned().collect()
+    }
+
     /// Returns the number of targets
     pub fn len(&self) -> usize {
         self.targets.len()
