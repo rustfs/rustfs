@@ -25,6 +25,7 @@ use axum::{
 use serde_json::{Value, json};
 
 /// Health check endpoint to verify service availability.
+#[allow(dead_code)]
 pub async fn health_check() -> impl IntoResponse {
     Json(json!({
         "status": "healthy",
@@ -35,6 +36,7 @@ pub async fn health_check() -> impl IntoResponse {
 }
 
 /// Returns the current application configuration.
+#[allow(dead_code)]
 pub async fn show_config(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let config = &state.config;
 
@@ -66,6 +68,7 @@ pub async fn show_config(State(state): State<AppState>) -> Result<Json<Value>, A
 }
 
 /// Returns information about the client as identified by the trusted proxy middleware.
+#[allow(dead_code)]
 pub async fn client_info(State(_state): State<AppState>, req: Request) -> impl IntoResponse {
     // Retrieve the verified client information from the request extensions.
     let client_info = req.extensions().get::<ClientInfo>();
@@ -101,6 +104,7 @@ pub async fn client_info(State(_state): State<AppState>, req: Request) -> impl I
 }
 
 /// Debugging endpoint that returns all proxy-related headers received in the request.
+#[allow(dead_code)]
 pub async fn proxy_test(req: Request) -> Json<Value> {
     // Collect all headers related to proxying.
     let headers: Vec<(String, String)> = req
@@ -130,6 +134,7 @@ pub async fn proxy_test(req: Request) -> Json<Value> {
 }
 
 /// Endpoint for retrieving Prometheus metrics.
+#[allow(dead_code)]
 pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     if !state.config.monitoring.metrics_enabled {
         return (StatusCode::NOT_FOUND, "Metrics are not enabled").into_response();

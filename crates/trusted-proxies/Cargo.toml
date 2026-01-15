@@ -25,7 +25,6 @@ keywords = ["trusted-proxies", "network-security", "rustfs", "proxy-management"]
 categories = ["network-programming", "security", "web-programming"]
 
 [dependencies]
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
@@ -43,7 +42,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "ti
 tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-parking_lot = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 regex = { workspace = true }
 lazy_static = { workspace = true }
@@ -52,8 +50,6 @@ dotenvy = "0.15.7"
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tower = { workspace = true, features = ["util"] }
-http-body-util = "0.1"
-wiremock = "0.6"
 
 [lints]
 workspace = true

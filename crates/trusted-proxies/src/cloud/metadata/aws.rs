@@ -32,11 +32,14 @@ pub struct AwsMetadataFetcher {
 
 impl AwsMetadataFetcher {
     /// Creates a new `AwsMetadataFetcher`.
-    pub fn new() -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap_or_else(|_| Client::new());
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Duration to use for HTTP request timeouts.
+    ///
+    /// Returns a new instance of `AwsMetadataFetcher`.
+    pub fn new(timeout: Duration) -> Self {
+        let client = Client::builder().timeout(timeout).build().unwrap_or_else(|_| Client::new());
 
         Self {
             client,
@@ -45,6 +48,7 @@ impl AwsMetadataFetcher {
     }
 
     /// Retrieves an IMDSv2 token for secure metadata access.
+    #[allow(dead_code)]
     async fn get_metadata_token(&self) -> Result<String, AppError> {
         let url = format!("{}/latest/api/token", self.metadata_endpoint);
 

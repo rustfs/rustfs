@@ -16,7 +16,7 @@
 
 use crate::config::{TrustedProxyConfig, ValidationMode};
 use crate::error::ProxyError;
-use crate::utils::ip::is_valid_ip_address;
+use crate::utils::is_valid_ip_address;
 use axum::http::HeaderMap;
 use std::collections::HashSet;
 use std::net::IpAddr;

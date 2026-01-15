@@ -29,11 +29,11 @@ use crate::proxy::{ClientInfo, ProxyValidator};
 #[derive(Clone)]
 pub struct TrustedProxyMiddleware<S> {
     /// The inner service being wrapped.
-    inner: S,
+    pub(crate) inner: S,
     /// The validator used to verify proxy chains.
-    validator: Arc<ProxyValidator>,
+    pub(crate) validator: Arc<ProxyValidator>,
     /// Whether the middleware is enabled.
-    enabled: bool,
+    pub(crate) enabled: bool,
 }
 
 impl<S> TrustedProxyMiddleware<S> {

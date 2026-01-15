@@ -71,9 +71,9 @@ impl ProxyMetrics {
 
         counter!(
             "proxy_validation_attempts_total",
-            1,
             "app" => self.app_name.clone()
-        );
+        )
+        .increment(1);
     }
 
     /// Records a successful validation.
@@ -84,22 +84,22 @@ impl ProxyMetrics {
 
         counter!(
             "proxy_validation_success_total",
-            1,
             "app" => self.app_name.clone(),
             "trusted" => from_trusted_proxy.to_string()
-        );
+        )
+        .increment(1);
 
         gauge!(
             "proxy_chain_length",
-            proxy_hops as f64,
             "app" => self.app_name.clone()
-        );
+        )
+        .set(proxy_hops as f64);
 
         histogram!(
             "proxy_validation_duration_seconds",
-            duration.as_secs_f64(),
             "app" => self.app_name.clone()
-        );
+        )
+        .record(duration.as_secs_f64());
     }
 
     /// Records a failed validation with the specific error type.
@@ -123,24 +123,24 @@ impl ProxyMetrics {
 
         counter!(
             "proxy_validation_failure_total",
-            1,
             "app" => self.app_name.clone(),
             "error_type" => error_type
-        );
+        )
+        .increment(1);
 
         counter!(
             "proxy_validation_failure_by_type_total",
-            1,
             "app" => self.app_name.clone(),
             "error_type" => error_type
-        );
+        )
+        .increment(1);
 
         histogram!(
             "proxy_validation_duration_seconds",
-            duration.as_secs_f64(),
             "app" => self.app_name.clone(),
             "error_type" => error_type
-        );
+        )
+        .record(duration.as_secs_f64());
     }
 
     /// Records the validation mode currently in use.
@@ -151,14 +151,14 @@ impl ProxyMetrics {
 
         gauge!(
             "proxy_validation_mode",
-            match mode {
-                ValidationMode::Lenient => 0.0,
-                ValidationMode::Strict => 1.0,
-                ValidationMode::HopByHop => 2.0,
-            },
             "app" => self.app_name.clone(),
             "mode" => mode.as_str()
-        );
+        )
+        .set(match mode {
+            ValidationMode::Lenient => 0.0,
+            ValidationMode::Strict => 1.0,
+            ValidationMode::HopByHop => 2.0,
+        });
     }
 
     /// Records cache performance metrics.
@@ -167,9 +167,9 @@ impl ProxyMetrics {
             return;
         }
 
-        counter!("proxy_cache_hits_total", hits, "app" => self.app_name.clone());
-        counter!("proxy_cache_misses_total", misses, "app" => self.app_name.clone());
-        gauge!("proxy_cache_size", size as f64, "app" => self.app_name.clone());
+        counter!("proxy_cache_hits_total", "app" => self.app_name.clone()).increment(hits);
+        counter!("proxy_cache_misses_total", "app" => self.app_name.clone()).increment(misses);
+        gauge!("proxy_cache_size", "app" => self.app_name.clone()).set(size as f64);
     }
 
     /// Prints a summary of enabled metrics to the log.

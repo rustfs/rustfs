@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use http::HeaderMap;
-use rustfs_trusted_proxies::utils::{IpUtils, ValidationUtils};
+use rustfs_trusted_proxies::utils::ValidationUtils;
 use std::net::IpAddr;
 
 #[test]

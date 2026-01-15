@@ -57,7 +57,7 @@ impl IpValidationCache {
 
     /// Clears all entries from the cache.
     pub async fn clear(&self) {
-        self.cache.invalidate_all().await;
+        self.cache.invalidate_all();
         metrics::gauge!("proxy.cache.size").set(0.0);
     }
 

@@ -33,11 +33,8 @@ pub struct AzureMetadataFetcher {
 
 impl AzureMetadataFetcher {
     /// Creates a new `AzureMetadataFetcher`.
-    pub fn new() -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap_or_else(|_| Client::new());
+    pub fn new(timeout: Duration) -> Self {
+        let client = Client::builder().timeout(timeout).build().unwrap_or_else(|_| Client::new());
 
         Self {
             client,

@@ -163,9 +163,9 @@ impl ProxyValidator {
         // Prefer RFC 7239 "Forwarded" header if enabled, otherwise fallback to legacy headers.
         let client_info = if self.config.enable_rfc7239 {
             self.try_parse_rfc7239_headers(headers, proxy_ip)
-                .unwrap_or_else(|| self.parse_legacy_headers(headers, proxy_ip))
+                .unwrap_or_else(|| self.parse_legacy_headers(headers))
         } else {
-            self.parse_legacy_headers(headers, proxy_ip)
+            self.parse_legacy_headers(headers)
         };
 
         // Analyze the integrity and continuity of the proxy chain.
@@ -203,7 +203,7 @@ impl ProxyValidator {
     }
 
     /// Parses legacy proxy headers (X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto).
-    fn parse_legacy_headers(&self, headers: &HeaderMap, proxy_ip: IpAddr) -> ParsedHeaders {
+    fn parse_legacy_headers(&self, headers: &HeaderMap) -> ParsedHeaders {
         let forwarded_host = headers
             .get("x-forwarded-host")
             .and_then(|h| h.to_str().ok())
@@ -304,10 +304,6 @@ impl ProxyValidator {
                 }
                 Err(err) => {
                     metrics.record_validation_failure(err, duration);
-
-                    if self.config.log_failed_validations {
-                        warn!("Proxy validation failed: {}", err);
-                    }
                 }
             }
         }

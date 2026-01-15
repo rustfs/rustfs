@@ -14,12 +14,11 @@
 
 //! Logging middleware for the Axum web framework.
 
+use crate::logging::Logger;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tower::Service;
 use uuid::Uuid;
-
-use crate::logging::Logger;
 
 /// Tower Layer for request logging middleware.
 #[derive(Clone)]
@@ -56,6 +55,7 @@ impl<S> Service<axum::extract::Request> for RequestLoggingMiddleware<S>
 where
     S: Service<axum::extract::Request, Response = axum::response::Response> + Clone + Send + 'static,
     S::Future: Send,
+    S::Error: std::error::Error + Send + Sync + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -144,7 +144,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
+    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
         // Log proxy-specific details if available.
         let peer_addr = req.extensions().get::<std::net::SocketAddr>().copied();
         let client_info = req.extensions().get::<crate::middleware::ClientInfo>();

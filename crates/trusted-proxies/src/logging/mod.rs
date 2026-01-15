@@ -93,7 +93,7 @@ impl Logger {
     }
 
     /// Logs an incoming HTTP request.
-    pub fn log_request(&self, req: &axum::http::Request<axum::body::Body>, request_id: &str) {
+    pub fn log_request(&self, req: &http::Request<axum::body::Body>, request_id: &str) {
         let method = req.method();
         let uri = req.uri();
         let version = req.version();
@@ -112,7 +112,7 @@ impl Logger {
     }
 
     /// Logs an outgoing HTTP response.
-    pub fn log_response(&self, res: &axum::http::Response<axum::body::Body>, request_id: &str, duration: std::time::Duration) {
+    pub fn log_response(&self, res: &http::Response<axum::body::Body>, request_id: &str, duration: std::time::Duration) {
         let status = res.status();
         let version = res.version();
 
@@ -130,7 +130,7 @@ impl Logger {
     }
 
     /// Logs HTTP headers, redacting sensitive information.
-    fn log_headers(&self, headers: &axum::http::HeaderMap, header_type: &str) {
+    fn log_headers(&self, headers: &http::HeaderMap, header_type: &str) {
         let mut header_fields = std::collections::HashMap::new();
 
         for (name, value) in headers {

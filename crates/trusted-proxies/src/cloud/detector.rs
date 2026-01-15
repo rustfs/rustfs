@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use crate::error::AppError;
 
 /// Supported cloud providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CloudProvider {
     /// Amazon Web Services
     Aws,
@@ -161,8 +161,8 @@ impl CloudDetector {
             return None;
         }
 
-        if let Some(provider) = self.forced_provider {
-            return Some(provider);
+        if let Some(provider) = self.forced_provider.as_ref() {
+            return Some(provider.clone());
         }
 
         CloudProvider::detect_from_env()
@@ -180,17 +180,17 @@ impl CloudDetector {
         match provider {
             Some(CloudProvider::Aws) => {
                 info!("Detected AWS environment, fetching metadata");
-                let fetcher = crate::cloud::metadata::AwsMetadataFetcher::new();
+                let fetcher = crate::cloud::metadata::AwsMetadataFetcher::new(self.timeout);
                 fetcher.fetch_trusted_proxy_ranges().await
             }
             Some(CloudProvider::Azure) => {
                 info!("Detected Azure environment, fetching metadata");
-                let fetcher = crate::cloud::metadata::AzureMetadataFetcher::new();
+                let fetcher = crate::cloud::metadata::AzureMetadataFetcher::new(self.timeout);
                 fetcher.fetch_trusted_proxy_ranges().await
             }
             Some(CloudProvider::Gcp) => {
                 info!("Detected GCP environment, fetching metadata");
-                let fetcher = crate::cloud::metadata::GcpMetadataFetcher::new();
+                let fetcher = crate::cloud::metadata::GcpMetadataFetcher::new(self.timeout);
                 fetcher.fetch_trusted_proxy_ranges().await
             }
             Some(CloudProvider::Cloudflare) => {
@@ -221,9 +221,9 @@ impl CloudDetector {
         }
 
         let providers: Vec<Box<dyn CloudMetadataFetcher>> = vec![
-            Box::new(crate::cloud::metadata::AwsMetadataFetcher::new()),
-            Box::new(crate::cloud::metadata::AzureMetadataFetcher::new()),
-            Box::new(crate::cloud::metadata::GcpMetadataFetcher::new()),
+            Box::new(crate::cloud::metadata::AwsMetadataFetcher::new(self.timeout)),
+            Box::new(crate::cloud::metadata::AzureMetadataFetcher::new(self.timeout)),
+            Box::new(crate::cloud::metadata::GcpMetadataFetcher::new(self.timeout)),
         ];
 
         for provider in providers {
