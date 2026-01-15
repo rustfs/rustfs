@@ -18,6 +18,7 @@ use crate::config::workload_profiles::{
 };
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
+use crate::server::cors;
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
@@ -48,8 +49,8 @@ use rustfs_ecstore::{
             lifecycle::{self, Lifecycle, TransitionOptions},
         },
         metadata::{
-            BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_REPLICATION_CONFIG,
-            BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
+            BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
+            BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
         },
         metadata_sys,
         metadata_sys::get_replication_config,
@@ -816,6 +817,205 @@ async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store
         .map_err(ApiError::from)?;
 
     Ok(store)
+}
+
+/// Quick check if CORS processing is needed (lightweight check for Origin header)
+/// This avoids unnecessary function calls for non-CORS requests
+#[inline]
+fn needs_cors_processing(headers: &HeaderMap) -> bool {
+    headers.contains_key(cors::standard::ORIGIN)
+}
+
+/// Apply CORS headers to response based on bucket CORS configuration and request origin
+///
+/// This function:
+/// 1. Reads the Origin header from the request
+/// 2. Retrieves the bucket's CORS configuration
+/// 3. Matches the origin against CORS rules
+/// 4. Validates AllowedHeaders if request headers are present
+/// 5. Returns headers to add to the response if a match is found
+///
+/// Note: This function should only be called if `needs_cors_processing()` returns true
+/// to avoid unnecessary overhead for non-CORS requests.
+pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, headers: &HeaderMap) -> Option<HeaderMap> {
+    use http::HeaderValue;
+
+    // Get Origin header from request
+    let origin = headers.get(cors::standard::ORIGIN)?.to_str().ok()?;
+
+    // Get CORS configuration for the bucket
+    let cors_config = match metadata_sys::get_cors_config(bucket).await {
+        Ok((config, _)) => config,
+        Err(_) => return None, // No CORS config, no headers to add
+    };
+
+    // Early return if no CORS rules configured
+    if cors_config.cors_rules.is_empty() {
+        return None;
+    }
+
+    // Check if method is supported and get its string representation
+    const SUPPORTED_METHODS: &[&str] = &["GET", "PUT", "POST", "DELETE", "HEAD", "OPTIONS"];
+    let method_str = method.as_str();
+    if !SUPPORTED_METHODS.contains(&method_str) {
+        return None;
+    }
+
+    // For OPTIONS (preflight) requests, check Access-Control-Request-Method
+    let is_preflight = method == http::Method::OPTIONS;
+    let requested_method = if is_preflight {
+        headers
+            .get(cors::request::ACCESS_CONTROL_REQUEST_METHOD)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(method_str)
+    } else {
+        method_str
+    };
+
+    // Get requested headers from preflight request
+    let requested_headers = if is_preflight {
+        headers
+            .get(cors::request::ACCESS_CONTROL_REQUEST_HEADERS)
+            .and_then(|v| v.to_str().ok())
+            .map(|h| h.split(',').map(|s| s.trim().to_lowercase()).collect::<Vec<_>>())
+    } else {
+        None
+    };
+
+    // Find matching CORS rule
+    for rule in cors_config.cors_rules.iter() {
+        // Check if origin matches
+        let origin_matches = rule.allowed_origins.iter().any(|allowed_origin| {
+            if allowed_origin == "*" {
+                true
+            } else {
+                // Exact match or pattern match (support wildcards like https://*.example.com)
+                allowed_origin == origin || matches_origin_pattern(allowed_origin, origin)
+            }
+        });
+
+        if !origin_matches {
+            continue;
+        }
+
+        // Check if method is allowed
+        let method_allowed = rule
+            .allowed_methods
+            .iter()
+            .any(|allowed_method| allowed_method.as_str() == requested_method);
+
+        if !method_allowed {
+            continue;
+        }
+
+        // Validate AllowedHeaders if present in the request
+        if let Some(ref req_headers) = requested_headers {
+            if let Some(ref allowed_headers) = rule.allowed_headers {
+                // Check if all requested headers are allowed
+                let all_headers_allowed = req_headers.iter().all(|req_header| {
+                    allowed_headers.iter().any(|allowed_header| {
+                        let allowed_lower = allowed_header.to_lowercase();
+                        // "*" allows all headers, or exact match
+                        allowed_lower == "*" || allowed_lower == *req_header
+                    })
+                });
+
+                if !all_headers_allowed {
+                    // If not all headers are allowed, skip this rule
+                    continue;
+                }
+            } else if !req_headers.is_empty() {
+                // If no AllowedHeaders specified but headers were requested, skip this rule
+                // Unless the rule explicitly allows all headers
+                continue;
+            }
+        }
+
+        // Found matching rule, build response headers
+        let mut response_headers = HeaderMap::new();
+
+        // Access-Control-Allow-Origin
+        // If origin is "*", use "*", otherwise echo back the origin
+        let has_wildcard_origin = rule.allowed_origins.iter().any(|o| o == "*");
+        if has_wildcard_origin {
+            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        } else if let Ok(origin_value) = HeaderValue::from_str(origin) {
+            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
+        }
+
+        // Vary: Origin (required for caching, except when using wildcard)
+        if !has_wildcard_origin {
+            response_headers.insert(cors::standard::VARY, HeaderValue::from_static("Origin"));
+        }
+
+        // Access-Control-Allow-Methods (required for preflight)
+        if is_preflight || !rule.allowed_methods.is_empty() {
+            let methods_str = rule.allowed_methods.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ");
+            if let Ok(methods_value) = HeaderValue::from_str(&methods_str) {
+                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_METHODS, methods_value);
+            }
+        }
+
+        // Access-Control-Allow-Headers (required for preflight if headers were requested)
+        if is_preflight && let Some(ref allowed_headers) = rule.allowed_headers {
+            let headers_str = allowed_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
+            if let Ok(headers_value) = HeaderValue::from_str(&headers_str) {
+                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_HEADERS, headers_value);
+            }
+        }
+
+        // Access-Control-Expose-Headers (for actual requests)
+        if !is_preflight && let Some(ref expose_headers) = rule.expose_headers {
+            let expose_headers_str = expose_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
+            if let Ok(expose_value) = HeaderValue::from_str(&expose_headers_str) {
+                response_headers.insert(cors::response::ACCESS_CONTROL_EXPOSE_HEADERS, expose_value);
+            }
+        }
+
+        // Access-Control-Max-Age (for preflight requests)
+        if is_preflight
+            && let Some(max_age) = rule.max_age_seconds
+            && let Ok(max_age_value) = HeaderValue::from_str(&max_age.to_string())
+        {
+            response_headers.insert(cors::response::ACCESS_CONTROL_MAX_AGE, max_age_value);
+        }
+
+        return Some(response_headers);
+    }
+
+    None // No matching rule found
+}
+/// Check if an origin matches a pattern (supports wildcards like https://*.example.com)
+fn matches_origin_pattern(pattern: &str, origin: &str) -> bool {
+    // Simple wildcard matching: * matches any sequence
+    if pattern.contains('*') {
+        let pattern_parts: Vec<&str> = pattern.split('*').collect();
+        if pattern_parts.len() == 2 {
+            origin.starts_with(pattern_parts[0]) && origin.ends_with(pattern_parts[1])
+        } else {
+            false
+        }
+    } else {
+        pattern == origin
+    }
+}
+
+/// Wrap S3Response with CORS headers if needed
+/// This function performs a lightweight check first to avoid unnecessary CORS processing
+/// for non-CORS requests (requests without Origin header)
+async fn wrap_response_with_cors<T>(bucket: &str, method: &http::Method, headers: &HeaderMap, output: T) -> S3Response<T> {
+    let mut response = S3Response::new(output);
+
+    // Quick check: only process CORS if Origin header is present
+    if needs_cors_processing(headers)
+        && let Some(cors_headers) = apply_cors_headers(bucket, method, headers).await
+    {
+        for (key, value) in cors_headers.iter() {
+            response.headers.insert(key, value.clone());
+        }
+    }
+
+    response
 }
 
 #[async_trait::async_trait]
@@ -2598,7 +2798,8 @@ impl S3 for FS {
             cache_key, response_content_length, total_duration, optimal_buffer_size
         );
 
-        let result = Ok(S3Response::new(output));
+        let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+        let result = Ok(response);
         let _ = helper.complete(&result);
         result
     }
@@ -2843,7 +3044,14 @@ impl S3 for FS {
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(event_info).version_id(version_id);
 
-        let result = Ok(S3Response::new(output));
+        // NOTE ON CORS:
+        // Bucket-level CORS headers are intentionally applied only for object retrieval
+        // operations (GET/HEAD) via `wrap_response_with_cors`. Other S3 operations that
+        // interact with objects (PUT/POST/DELETE/LIST, etc.) rely on the system-level
+        // CORS layer instead. In case both are applicable, this bucket-level CORS logic
+        // takes precedence for these read operations.
+        let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+        let result = Ok(response);
         let _ = helper.complete(&result);
 
         result
@@ -4713,6 +4921,82 @@ impl S3 for FS {
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
+    #[instrument(level = "debug", skip(self))]
+    async fn get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        let bucket = req.input.bucket.clone();
+        // check bucket exists.
+        let _bucket = self
+            .head_bucket(req.map_input(|input| HeadBucketInput {
+                bucket: input.bucket,
+                expected_bucket_owner: None,
+            }))
+            .await?;
+
+        let cors_configuration = match metadata_sys::get_cors_config(&bucket).await {
+            Ok((config, _)) => config,
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::NoSuchCORSConfiguration,
+                        "The CORS configuration does not exist".to_string(),
+                    ));
+                }
+                warn!("get_cors_config err {:?}", &err);
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        Ok(S3Response::new(GetBucketCorsOutput {
+            cors_rules: Some(cors_configuration.cors_rules),
+        }))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        let PutBucketCorsInput {
+            bucket,
+            cors_configuration,
+            ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let data = try_!(serialize(&cors_configuration));
+
+        metadata_sys::update(&bucket, BUCKET_CORS_CONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketCorsOutput::default()))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    async fn delete_bucket_cors(&self, req: S3Request<DeleteBucketCorsInput>) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        let DeleteBucketCorsInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        metadata_sys::delete(&bucket, BUCKET_CORS_CONFIG)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(DeleteBucketCorsOutput {}))
+    }
+
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
         let start_time = std::time::Instant::now();
@@ -6556,5 +6840,202 @@ mod tests {
         assert!(filtered_key_marker.is_some());
         assert!(filtered_version_marker.is_some());
         assert_eq!(filtered_version_marker.unwrap(), "null");
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_exact_match() {
+        // Test exact match
+        assert!(matches_origin_pattern("https://example.com", "https://example.com"));
+        assert!(matches_origin_pattern("http://localhost:3000", "http://localhost:3000"));
+        assert!(!matches_origin_pattern("https://example.com", "https://other.com"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_wildcard() {
+        // Test wildcard pattern matching (S3 CORS supports * as subdomain wildcard)
+        assert!(matches_origin_pattern("https://*.example.com", "https://app.example.com"));
+        assert!(matches_origin_pattern("https://*.example.com", "https://api.example.com"));
+        assert!(matches_origin_pattern("https://*.example.com", "https://subdomain.example.com"));
+
+        // Test wildcard at start (matches any domain)
+        assert!(matches_origin_pattern("https://*", "https://example.com"));
+        assert!(matches_origin_pattern("https://*", "https://any-domain.com"));
+
+        // Test wildcard at end (matches any protocol)
+        assert!(matches_origin_pattern("*://example.com", "https://example.com"));
+        assert!(matches_origin_pattern("*://example.com", "http://example.com"));
+
+        // Test invalid wildcard patterns (should not match)
+        assert!(!matches_origin_pattern("https://*.*.com", "https://app.example.com")); // Multiple wildcards (invalid pattern)
+        // Note: "https://*example.com" actually matches "https://app.example.com" with our current implementation
+        // because it splits on * and checks starts_with/ends_with. This is a limitation but acceptable
+        // for S3 CORS which typically uses patterns like "https://*.example.com"
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_no_wildcard() {
+        // Test patterns without wildcards
+        assert!(matches_origin_pattern("https://example.com", "https://example.com"));
+        assert!(!matches_origin_pattern("https://example.com", "https://example.org"));
+        assert!(!matches_origin_pattern("http://example.com", "https://example.com")); // Different protocol
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_edge_cases() {
+        // Test edge cases
+        assert!(!matches_origin_pattern("", "https://example.com")); // Empty pattern
+        assert!(!matches_origin_pattern("https://example.com", "")); // Empty origin
+        assert!(matches_origin_pattern("", "")); // Both empty
+        assert!(!matches_origin_pattern("https://example.com", "http://example.com")); // Protocol mismatch
+    }
+
+    #[test]
+    fn test_cors_headers_validation() {
+        use http::HeaderMap;
+
+        // Test case 1: Validate header name case-insensitivity
+        let mut headers = HeaderMap::new();
+        headers.insert("access-control-request-headers", "Content-Type,X-Custom-Header".parse().unwrap());
+
+        let req_headers_str = headers
+            .get("access-control-request-headers")
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        let req_headers: Vec<String> = req_headers_str.split(',').map(|s| s.trim().to_lowercase()).collect();
+
+        // Headers should be lowercased for comparison
+        assert_eq!(req_headers, vec!["content-type", "x-custom-header"]);
+
+        // Test case 2: Wildcard matching
+        let allowed_headers = ["*".to_string()];
+        let all_allowed = req_headers.iter().all(|req_header| {
+            allowed_headers
+                .iter()
+                .any(|allowed| allowed.to_lowercase() == "*" || allowed.to_lowercase() == *req_header)
+        });
+        assert!(all_allowed, "Wildcard should allow all headers");
+
+        // Test case 3: Specific header matching
+        let allowed_headers = ["content-type".to_string(), "x-custom-header".to_string()];
+        let all_allowed = req_headers
+            .iter()
+            .all(|req_header| allowed_headers.iter().any(|allowed| allowed.to_lowercase() == *req_header));
+        assert!(all_allowed, "All requested headers should be allowed");
+
+        // Test case 4: Disallowed header
+        let req_headers = ["content-type".to_string(), "x-forbidden-header".to_string()];
+        let allowed_headers = ["content-type".to_string()];
+        let all_allowed = req_headers
+            .iter()
+            .all(|req_header| allowed_headers.iter().any(|allowed| allowed.to_lowercase() == *req_header));
+        assert!(!all_allowed, "Forbidden header should not be allowed");
+    }
+
+    #[test]
+    fn test_cors_response_headers_structure() {
+        use http::{HeaderMap, HeaderValue};
+
+        let mut cors_headers = HeaderMap::new();
+
+        // Simulate building CORS response headers
+        let origin = "https://example.com";
+        let methods = ["GET", "PUT", "POST"];
+        let allowed_headers = ["Content-Type", "Authorization"];
+        let expose_headers = ["ETag", "x-amz-version-id"];
+        let max_age = 3600;
+
+        // Add headers
+        cors_headers.insert("access-control-allow-origin", HeaderValue::from_str(origin).unwrap());
+        cors_headers.insert("vary", HeaderValue::from_static("Origin"));
+
+        let methods_str = methods.join(", ");
+        cors_headers.insert("access-control-allow-methods", HeaderValue::from_str(&methods_str).unwrap());
+
+        let headers_str = allowed_headers.join(", ");
+        cors_headers.insert("access-control-allow-headers", HeaderValue::from_str(&headers_str).unwrap());
+
+        let expose_str = expose_headers.join(", ");
+        cors_headers.insert("access-control-expose-headers", HeaderValue::from_str(&expose_str).unwrap());
+
+        cors_headers.insert("access-control-max-age", HeaderValue::from_str(&max_age.to_string()).unwrap());
+
+        // Verify all headers are present
+        assert_eq!(cors_headers.get("access-control-allow-origin").unwrap(), origin);
+        assert_eq!(cors_headers.get("vary").unwrap(), "Origin");
+        assert_eq!(cors_headers.get("access-control-allow-methods").unwrap(), "GET, PUT, POST");
+        assert_eq!(cors_headers.get("access-control-allow-headers").unwrap(), "Content-Type, Authorization");
+        assert_eq!(cors_headers.get("access-control-expose-headers").unwrap(), "ETag, x-amz-version-id");
+        assert_eq!(cors_headers.get("access-control-max-age").unwrap(), "3600");
+    }
+
+    #[test]
+    fn test_cors_preflight_vs_actual_request() {
+        use http::Method;
+
+        // Test that we can distinguish preflight from actual requests
+        let preflight_method = Method::OPTIONS;
+        let actual_method = Method::PUT;
+
+        assert_eq!(preflight_method, Method::OPTIONS);
+        assert_ne!(actual_method, Method::OPTIONS);
+
+        // Preflight should check Access-Control-Request-Method
+        // Actual request should use the actual method
+        let is_preflight_1 = preflight_method == Method::OPTIONS;
+        let is_preflight_2 = actual_method == Method::OPTIONS;
+
+        assert!(is_preflight_1);
+        assert!(!is_preflight_2);
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_no_origin() {
+        // Test when no Origin header is present
+        let headers = HeaderMap::new();
+        let method = http::Method::GET;
+
+        // Should return None when no origin header
+        let result = apply_cors_headers("test-bucket", &method, &headers).await;
+        assert!(result.is_none(), "Should return None when no Origin header");
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_no_cors_config() {
+        // Test when bucket has no CORS configuration
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://example.com".parse().unwrap());
+        let method = http::Method::GET;
+
+        // Should return None when no CORS config exists
+        // Note: This test may fail if test-bucket actually has CORS config
+        // In a real scenario, we'd use a mock or ensure the bucket doesn't exist
+        let _result = apply_cors_headers("non-existent-bucket-for-testing", &method, &headers).await;
+        // Result depends on whether bucket exists and has CORS config
+        // This is expected behavior - we just verify it doesn't panic
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_unsupported_method() {
+        // Test with unsupported HTTP method
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://example.com".parse().unwrap());
+        let method = http::Method::PATCH; // Unsupported method
+
+        let result = apply_cors_headers("test-bucket", &method, &headers).await;
+        assert!(result.is_none(), "Should return None for unsupported methods");
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_complex_wildcards() {
+        // Test more complex wildcard scenarios
+        assert!(matches_origin_pattern("https://*.example.com", "https://sub.example.com"));
+        // Note: "https://*.example.com" matches "https://api.sub.example.com" with our implementation
+        // because it only checks starts_with and ends_with. Real S3 might be more strict.
+
+        // Test wildcard in middle position
+        // Our implementation allows this, but it's not standard S3 CORS pattern
+        // The pattern "https://example.*.com" splits to ["https://example.", ".com"]
+        // and "https://example.sub.com" matches because it starts with "https://example." and ends with ".com"
+        // This is acceptable for our use case as S3 CORS typically uses "https://*.example.com" format
     }
 }

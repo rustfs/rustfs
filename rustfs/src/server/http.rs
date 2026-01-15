@@ -17,7 +17,11 @@ use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
+use crate::server::{
+    ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
+    hybrid::hybrid,
+    layer::{ConditionalCorsLayer, RedirectLayer},
+};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -48,69 +52,9 @@ use tower::ServiceBuilder;
 use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
-
-/// Parse CORS allowed origins from configuration
-fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
-    use http::Method;
-
-    let cors_layer = CorsLayer::new()
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::HEAD,
-            Method::OPTIONS,
-        ])
-        .allow_headers(Any);
-
-    match origins {
-        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
-        Some(origins_str) => {
-            let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
-            if origins.is_empty() {
-                warn!("Empty CORS origins provided, using permissive CORS");
-                cors_layer.allow_origin(Any).expose_headers(Any)
-            } else {
-                // Parse origins with proper error handling
-                let mut valid_origins = Vec::new();
-                for origin in origins {
-                    match origin.parse::<http::HeaderValue>() {
-                        Ok(header_value) => {
-                            valid_origins.push(header_value);
-                        }
-                        Err(e) => {
-                            warn!("Invalid CORS origin '{}': {}", origin, e);
-                        }
-                    }
-                }
-
-                if valid_origins.is_empty() {
-                    warn!("No valid CORS origins found, using permissive CORS");
-                    cors_layer.allow_origin(Any).expose_headers(Any)
-                } else {
-                    info!("Endpoint CORS origins configured: {:?}", valid_origins);
-                    cors_layer.allow_origin(AllowOrigin::list(valid_origins)).expose_headers(Any)
-                }
-            }
-        }
-        None => {
-            debug!("No CORS origins configured for endpoint, using permissive CORS");
-            cors_layer.allow_origin(Any).expose_headers(Any)
-        }
-    }
-}
-
-fn get_cors_allowed_origins() -> String {
-    std::env::var(rustfs_config::ENV_CORS_ALLOWED_ORIGINS)
-        .unwrap_or_else(|_| rustfs_config::DEFAULT_CORS_ALLOWED_ORIGINS.to_string())
-        .parse::<String>()
-        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
-}
 
 pub async fn start_http_server(
     opt: &config::Opt,
@@ -273,14 +217,6 @@ pub async fn start_http_server(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
 
-    // Capture CORS configuration for the server loop
-    let cors_allowed_origins = get_cors_allowed_origins();
-    let cors_allowed_origins = if cors_allowed_origins.is_empty() {
-        None
-    } else {
-        Some(cors_allowed_origins)
-    };
-
     // Create compression configuration from environment variables
     let compression_config = CompressionConfig::from_env();
     if compression_config.enabled {
@@ -294,8 +230,10 @@ pub async fn start_http_server(
 
     let is_console = opt.console_enable;
     tokio::spawn(async move {
-        // Create CORS layer inside the server loop closure
-        let cors_layer = parse_cors_origins(cors_allowed_origins.as_ref());
+        // Note: CORS layer is removed from global middleware stack
+        // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
+        // - Console CORS is handled by its own cors_layer in setup_console_middleware_stack()
+        // This ensures S3 API CORS behavior matches AWS S3 specification
 
         #[cfg(unix)]
         let (mut sigterm_inner, mut sigint_inner) = {
@@ -405,7 +343,6 @@ pub async fn start_http_server(
             let connection_ctx = ConnectionContext {
                 http_server: http_server.clone(),
                 s3_service: s3_service.clone(),
-                cors_layer: cors_layer.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
                 readiness: readiness.clone(),
@@ -521,7 +458,6 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 struct ConnectionContext {
     http_server: Arc<ConnBuilder<TokioExecutor>>,
     s3_service: S3Service,
-    cors_layer: CorsLayer,
     compression_config: CompressionConfig,
     is_console: bool,
     readiness: Arc<GlobalReadiness>,
@@ -546,7 +482,6 @@ fn process_connection(
         let ConnectionContext {
             http_server,
             s3_service,
-            cors_layer,
             compression_config,
             is_console,
             readiness,
@@ -629,10 +564,15 @@ fn process_connection(
                     }),
             )
             .layer(PropagateRequestIdLayer::x_request_id())
-            .layer(cors_layer)
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
             .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
+            // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
+            // Admin has its own CORS handling in router.rs
+            // Console has its own CORS layer in setup_console_middleware_stack()
+            // S3 API uses this system default CORS (RUSTFS_CORS_ALLOWED_ORIGINS)
+            // Bucket-level CORS takes precedence when configured (handled in router.rs for OPTIONS, and in ecfs.rs for actual requests)
+            .layer(ConditionalCorsLayer::new())
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
 
