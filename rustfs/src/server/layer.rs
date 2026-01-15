@@ -116,7 +116,7 @@ impl ConditionalCorsLayer {
         !path.starts_with(ADMIN_PREFIX)
             && !path.starts_with(RPC_PREFIX)
             && !is_console_path(path)
-            && Self::EXCLUDED_EXACT_PATHS.contains(&path)
+            && !Self::EXCLUDED_EXACT_PATHS.contains(&path)
     }
 
     fn apply_cors_headers(&self, request_headers: &HeaderMap, response_headers: &mut HeaderMap) {
