@@ -983,7 +983,7 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         return Some(response_headers);
     }
 
-    None // No matching rule found}
+    None // No matching rule found
 }
 /// Check if an origin matches a pattern (supports wildcards like https://*.example.com)
 fn matches_origin_pattern(pattern: &str, origin: &str) -> bool {
