@@ -147,10 +147,10 @@ impl ConditionalCorsLayer {
             false
         };
 
-        // Allow all methods by default
+        // Allow all methods by default (S3-compatible set)
         response_headers.insert(
             cors::response::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH"),
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD"),
         );
 
         // Allow all headers by default
