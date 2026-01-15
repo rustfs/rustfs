@@ -890,7 +890,12 @@ impl S3 for FS {
         validate_object_key(&src_key, "COPY (source)")?;
         validate_object_key(&key, "COPY (dest)")?;
 
-        if src_bucket == bucket && src_key == key {
+        // AWS S3 allows self-copy when metadata directive is REPLACE (used to update metadata in-place).
+        // Reject only when the directive is not REPLACE.
+        if metadata_directive.as_ref().map(|d| d.as_str()) != Some(MetadataDirective::REPLACE)
+            && src_bucket == bucket
+            && src_key == key
+        {
             error!("Rejected self-copy operation: bucket={}, key={}", bucket, key);
             return Err(s3_error!(
                 InvalidRequest,
@@ -1033,6 +1038,17 @@ impl S3 for FS {
                 .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"));
         }
 
+        if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
+            src_info.user_defined.clear();
+            if let Some(metadata) = metadata {
+                src_info.user_defined.extend(metadata);
+            }
+            if let Some(ct) = content_type {
+                src_info.content_type = Some(ct.clone());
+                src_info.user_defined.insert("content-type".to_string(), ct);
+            }
+        }
+
         let mut reader = HashReader::new(reader, length, actual_size, None, None, false).map_err(ApiError::from)?;
 
         if let Some(ref sse_alg) = effective_sse
@@ -1113,17 +1129,6 @@ impl S3 for FS {
             src_info
                 .user_defined
                 .insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
-        }
-
-        if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
-            src_info.user_defined.clear();
-            if let Some(metadata) = metadata {
-                src_info.user_defined.extend(metadata);
-            }
-            if let Some(ct) = content_type {
-                src_info.content_type = Some(ct.clone());
-                src_info.user_defined.insert("content-type".to_string(), ct);
-            }
         }
 
         // check quota for copy operation
