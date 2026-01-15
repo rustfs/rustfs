@@ -15,7 +15,7 @@ services:
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_EXTERNAL_ADDRESS=:9000
-      - RUSTFS_CORS_ALLOWED_ORIGINS=http://localhost:9001
+      - RUSTFS_CORS_ALLOWED_ORIGINS=http://127.0.0.1:9001
       - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_ACCESS_KEY=admin
       - RUSTFS_SECRET_KEY=password
@@ -25,7 +25,7 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health" ]
+      test: [ "CMD", "sh", "-c", "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -56,7 +56,7 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health" ]
+      test: [ "CMD", "sh", "-c", "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -92,7 +92,7 @@ services:
       - rustfs_secret_key
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/rustfs/console/health" ]
+      test: [ "CMD", "sh", "-c", "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -127,7 +127,7 @@ services:
       - rustfs_enterprise_secret_key
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -k -f https://localhost:9001/rustfs/console/health" ]
+      test: [ "CMD", "sh", "-c", "curl -f http://127.0.0.1:9000/health && curl -k -f https://127.0.0.1:9001/rustfs/console/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -152,7 +152,7 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:9000/health" ]
+      test: [ "CMD", "curl", "-f", "http://127.0.0.1:9000/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
