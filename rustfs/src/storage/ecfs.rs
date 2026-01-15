@@ -3044,6 +3044,12 @@ impl S3 for FS {
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(event_info).version_id(version_id);
 
+        // NOTE ON CORS:
+        // Bucket-level CORS headers are intentionally applied only for object retrieval
+        // operations (GET/HEAD) via `wrap_response_with_cors`. Other S3 operations that
+        // interact with objects (PUT/POST/DELETE/LIST, etc.) rely on the system-level
+        // CORS layer instead. In case both are applicable, this bucket-level CORS logic
+        // takes precedence for these read operations.
         let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
         let result = Ok(response);
         let _ = helper.complete(&result);
