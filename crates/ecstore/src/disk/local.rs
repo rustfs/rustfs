@@ -849,7 +849,6 @@ impl LocalDisk {
         // Invalidate cache after successful write
         get_global_file_cache().invalidate(&file_path).await;
         Ok(())
-
     }
 
     // write_all_public for trail
