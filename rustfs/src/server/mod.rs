@@ -15,6 +15,7 @@
 mod audit;
 mod cert;
 mod compress;
+pub mod cors;
 mod event;
 mod http;
 mod hybrid;
