@@ -219,7 +219,7 @@ where
             info!("OPTIONS preflight request for path: {}", path);
 
             let path_trimmed = path.trim_start_matches('/');
-            let bucket = path_trimmed.split('/').next().unwrap_or("").to_string(); // virtual host styple?
+            let bucket = path_trimmed.split('/').next().unwrap_or("").to_string(); // virtual host style?
             let method_clone = method.clone();
             let request_headers_clone = request_headers.clone();
 
