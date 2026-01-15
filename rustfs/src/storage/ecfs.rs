@@ -1029,6 +1029,9 @@ impl S3 for FS {
                 .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"));
             src_info
                 .user_defined
+                .remove(&format!("{RESERVED_METADATA_PREFIX}compression"));
+            src_info
+                .user_defined
                 .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"));
             src_info
                 .user_defined
@@ -1036,8 +1039,14 @@ impl S3 for FS {
             src_info
                 .user_defined
                 .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"));
+            src_info
+                .user_defined
+                .remove(&format!("{RESERVED_METADATA_PREFIX}compression-size"));
         }
 
+        // Handle MetadataDirective REPLACE: replace user metadata while preserving system metadata.
+        // System metadata (compression, encryption) is added after this block to ensure
+        // it's not cleared by the REPLACE operation.
         if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
             src_info.user_defined.clear();
             if let Some(metadata) = metadata {
