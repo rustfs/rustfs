@@ -176,7 +176,7 @@ pub async fn start_http_server(
 
         println!("Console WebUI Start Time: {now_time}");
         println!("Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html");
-        println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
+        println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html");
     } else {
         info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
@@ -285,8 +285,7 @@ pub async fn start_http_server(
             .max_frame_size(H2_MAX_FRAME_SIZE)
             .max_concurrent_streams(Some(2048))
             .keep_alive_interval(Some(Duration::from_secs(20)))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_interval(Some(Duration::from_secs(20)));
+            .keep_alive_timeout(Duration::from_secs(10));
 
         let http_server = Arc::new(conn_builder);
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
@@ -701,6 +700,8 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
             error!("HTTP user-custom error:{}", hyper_err);
         } else if hyper_err.is_canceled() {
             warn!("The HTTP connection is canceled:{}", hyper_err);
+        } else if format!("{:?}", hyper_err).contains("HeaderTimeout") {
+            warn!("The HTTP connection timed out (HeaderTimeout): {}", hyper_err);
         } else {
             error!("Unknown hyper error:{:?}", hyper_err);
         }
@@ -748,7 +749,7 @@ fn get_listen_backlog() -> i32 {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
     let mut buf = [0; 1];
-    let mut buf_len = size_of_val(&buf);
+    let mut buf_len = std::mem::size_of_val(&buf);
 
     if unsafe {
         libc::sysctl(
