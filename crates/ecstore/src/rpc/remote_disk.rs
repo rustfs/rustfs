@@ -308,7 +308,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(skip(self))]
     fn path(&self) -> PathBuf {
-        self.root.clone()
+        PathBuf::from(self.endpoint.get_file_path())
     }
 
     #[tracing::instrument(skip(self))]
