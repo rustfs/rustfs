@@ -76,6 +76,7 @@ use url::Host;
 
 pub mod bucket_meta;
 pub mod event;
+pub mod file_history;
 pub mod group;
 pub mod kms;
 pub mod kms_dynamic;
