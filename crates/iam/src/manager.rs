@@ -134,6 +134,7 @@ where
         for attempt in 0..MAX_RETRIES {
             if let Err(e) = self.clone().load().await {
                 if attempt == MAX_RETRIES - 1 {
+                    self.state.store(IamState::Error as u8, Ordering::SeqCst);
                     warn!("IAM failed to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
                     break;
                 } else {
