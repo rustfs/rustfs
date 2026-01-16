@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::metadata::{BucketMetadata, load_bucket_metadata};
+use super::quota::BucketQuota;
+use super::target::BucketTargets;
 use crate::StorageAPI as _;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
@@ -20,12 +23,13 @@ use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
 use crate::store::ECStore;
 use futures::future::join_all;
+use lazy_static::lazy_static;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::ReplicationConfiguration;
 use s3s::dto::{
-    BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ServerSideEncryptionConfiguration, Tagging,
-    VersioningConfiguration,
+    BucketLifecycleConfiguration, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
+    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
 };
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -35,12 +39,6 @@ use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::error;
-
-use super::metadata::{BucketMetadata, load_bucket_metadata};
-use super::quota::BucketQuota;
-use super::target::BucketTargets;
-
-use lazy_static::lazy_static;
 
 lazy_static! {
     pub static ref GLOBAL_BucketMetadataSys: OnceLock<Arc<RwLock<BucketMetadataSys>>> = OnceLock::new();
@@ -110,6 +108,13 @@ pub async fn get_bucket_targets_config(bucket: &str) -> Result<BucketTargets> {
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_bucket_targets_config(bucket).await
+}
+
+pub async fn get_cors_config(bucket: &str) -> Result<(CORSConfiguration, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_cors_config(bucket).await
 }
 
 pub async fn get_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
@@ -504,6 +509,16 @@ impl BucketMetadataSys {
 
         if let Some(config) = &bm.sse_config {
             Ok((config.clone(), bm.encryption_config_updated_at))
+        } else {
+            Err(Error::ConfigNotFound)
+        }
+    }
+
+    pub async fn get_cors_config(&self, bucket: &str) -> Result<(CORSConfiguration, OffsetDateTime)> {
+        let (bm, _) = self.get_config(bucket).await?;
+
+        if let Some(config) = &bm.cors_config {
+            Ok((config.clone(), bm.cors_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
         }

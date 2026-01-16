@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-
 use s3s::dto::Tag;
+use std::collections::HashMap;
 use url::form_urlencoded;
 
 pub fn decode_tags(tags: &str) -> Vec<Tag> {

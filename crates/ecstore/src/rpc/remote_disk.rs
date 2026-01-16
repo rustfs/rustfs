@@ -12,6 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::{
+    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader,
+    FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    disk_store::{
+        CHECK_EVERY, CHECK_TIMEOUT_DURATION, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE, get_max_timeout_duration,
+    },
+    endpoint::Endpoint,
+};
+use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGuard};
+use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::{
+    disk::error::{Error, Result},
+    rpc::build_auth_headers,
+};
+use bytes::Bytes;
+use futures::lock::Mutex;
+use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
+use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_protos::proto_gen::node_service::RenamePartRequest;
+use rustfs_protos::proto_gen::node_service::{
+    CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
+    DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
+    ReadMetadataRequest, ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
+    RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+    node_service_client::NodeServiceClient,
+};
+use rustfs_rio::{HttpReader, HttpWriter};
+use rustfs_utils::string::parse_bool_with_default;
 use std::{
     path::PathBuf,
     sync::{
@@ -20,56 +48,17 @@ use std::{
     },
     time::Duration,
 };
-
-use bytes::Bytes;
-use futures::lock::Mutex;
-use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
-use rustfs_protos::proto_gen::node_service::{
-    CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
-    DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
-    ReadMetadataRequest, ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
-    RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-    node_service_client::NodeServiceClient,
-};
-use rustfs_utils::string::parse_bool_with_default;
 use tokio::time;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
-
-use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGuard};
-use crate::{
-    disk::error::{Error, Result},
-    rpc::build_auth_headers,
-};
-use crate::{
-    disk::{
-        CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-        disk_store::{
-            CHECK_EVERY, CHECK_TIMEOUT_DURATION, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
-            get_max_timeout_duration,
-        },
-        endpoint::Endpoint,
-    },
-    rpc::client::gen_tonic_signature_interceptor,
-};
-use crate::{
-    disk::{FileReader, FileWriter},
-    rpc::client::{TonicInterceptor, node_service_time_out_client},
-};
-use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
-use rustfs_protos::proto_gen::node_service::RenamePartRequest;
-use rustfs_rio::{HttpReader, HttpWriter};
 use tokio::{io::AsyncWrite, net::TcpStream, time::timeout};
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, service::interceptor::InterceptedService, transport::Channel};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug)]
 pub struct RemoteDisk {
     pub id: Mutex<Option<Uuid>>,
     pub addr: String,
-    pub url: url::Url,
-    pub root: PathBuf,
     endpoint: Endpoint,
     pub scanning: Arc<AtomicU32>,
     /// Whether health checking is enabled
@@ -82,8 +71,6 @@ pub struct RemoteDisk {
 
 impl RemoteDisk {
     pub async fn new(ep: &Endpoint, opt: &DiskOption) -> Result<Self> {
-        // let root = fs::canonicalize(ep.url.path()).await?;
-        let root = PathBuf::from(ep.get_file_path());
         let addr = if let Some(port) = ep.url.port() {
             format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), port)
         } else {
@@ -97,8 +84,6 @@ impl RemoteDisk {
         let disk = Self {
             id: Mutex::new(None),
             addr: addr.clone(),
-            url: ep.url.clone(),
-            root,
             endpoint: ep.clone(),
             scanning: Arc::new(AtomicU32::new(0)),
             health_check: opt.health_check && env_health_check,

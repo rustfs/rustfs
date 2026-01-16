@@ -65,13 +65,23 @@ pub async fn del_opts(
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid
-        && *id != Uuid::nil().to_string()
-        && let Err(err) = Uuid::parse_str(id.as_str())
-    {
-        error!("del_opts: invalid version id: {} error: {}", id, err);
-        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-    }
+    // Handle AWS S3 special case: "null" string represents null version ID
+    // When VersionId='null' is specified, it means delete the object with null version ID
+    let vid = if let Some(ref id) = vid {
+        if id.eq_ignore_ascii_case("null") {
+            // Convert "null" to Uuid::nil() string representation
+            Some(Uuid::nil().to_string())
+        } else {
+            // Validate UUID format for other version IDs
+            if *id != Uuid::nil().to_string() && Uuid::parse_str(id.as_str()).is_err() {
+                error!("del_opts: invalid version id: {} error: invalid UUID format", id);
+                return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+            }
+            Some(id.clone())
+        }
+    } else {
+        None
+    };
 
     let mut opts = put_opts_from_headers(headers, metadata.clone()).map_err(|err| {
         error!("del_opts: invalid argument: {} error: {}", object, err);
@@ -702,6 +712,16 @@ mod tests {
         assert!(result.is_ok());
         let opts = result.unwrap();
         assert!(!opts.delete_prefix);
+    }
+
+    #[tokio::test]
+    async fn test_del_opts_with_null_version_id() {
+        let headers = create_test_headers();
+        let metadata = create_test_metadata();
+        let result = del_opts("test-bucket", "test-object", Some("null".to_string()), &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let result = del_opts("test-bucket", "test-object", Some("NULL".to_string()), &headers, metadata.clone()).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

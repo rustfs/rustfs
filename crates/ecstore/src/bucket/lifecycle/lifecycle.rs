@@ -18,6 +18,8 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use crate::bucket::lifecycle::rule::TransitionOps;
+use crate::store_api::ObjectInfo;
 use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
@@ -33,19 +35,15 @@ use time::{self, Duration, OffsetDateTime};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::bucket::lifecycle::rule::TransitionOps;
-use crate::store_api::ObjectInfo;
-
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
-
-const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration allows a maximum of 1000 rules";
 const ERR_LIFECYCLE_NO_RULE: &str = "Lifecycle configuration should have at least one rule";
 const ERR_LIFECYCLE_DUPLICATE_ID: &str = "Rule ID must be unique. Found same ID for more than one rule";
 const _ERR_XML_NOT_WELL_FORMED: &str =
     "The XML you provided was not well-formed or did not validate against our published schema";
 const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
     "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an retention bucket";
+const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration should have at most 1000 rules";
 
 pub use rustfs_common::metrics::IlmAction;
 

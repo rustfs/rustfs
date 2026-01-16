@@ -13,6 +13,14 @@
 // limitations under the License.
 
 use crate::bucket::metadata::BucketMetadata;
+use crate::bucket::metadata_sys::get_bucket_targets_config;
+use crate::bucket::metadata_sys::get_replication_config;
+use crate::bucket::replication::ObjectOpts;
+use crate::bucket::replication::ReplicationConfigurationExt;
+use crate::bucket::target::ARN;
+use crate::bucket::target::BucketTargetType;
+use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
+use crate::bucket::versioning_sys::BucketVersioningSys;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
 use aws_sdk_s3::error::SdkError;
@@ -51,15 +59,6 @@ use tracing::error;
 use tracing::warn;
 use url::Url;
 use uuid::Uuid;
-
-use crate::bucket::metadata_sys::get_bucket_targets_config;
-use crate::bucket::metadata_sys::get_replication_config;
-use crate::bucket::replication::ObjectOpts;
-use crate::bucket::replication::ReplicationConfigurationExt;
-use crate::bucket::target::ARN;
-use crate::bucket::target::BucketTargetType;
-use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
-use crate::bucket::versioning_sys::BucketVersioningSys;
 
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);

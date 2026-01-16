@@ -26,6 +26,9 @@ updates:
       day: "monday"
       timezone: "Asia/Shanghai"
       time: "08:00"
+    ignore:
+      - dependency-name: "object_store"
+        versions: [ "0.13.x" ]
     groups:
       s3s:
         update-types:

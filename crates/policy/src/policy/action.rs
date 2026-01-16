@@ -22,8 +22,8 @@ use strum::{EnumString, IntoStaticStr};
 
 use super::{Error as IamError, Validator, utils::wildcard};
 
-/// A set of policy actions that serializes as a single string when containing one item,
-/// or as an array when containing multiple items (matching AWS S3 API format).
+/// A set of policy actions that always serializes as an array of strings,
+/// conforming to the S3 policy specification for consistency and compatibility.
 #[derive(Clone, Default, Debug)]
 pub struct ActionSet(pub HashSet<Action>);
 
@@ -34,15 +34,8 @@ impl Serialize for ActionSet {
     {
         use serde::ser::SerializeSeq;
 
-        if self.0.len() == 1 {
-            // Serialize single action as string (not array)
-            if let Some(action) = self.0.iter().next() {
-                let action_str: &str = action.into();
-                return serializer.serialize_str(action_str);
-            }
-        }
-
-        // Serialize multiple actions as array
+        // Always serialize as array, even for single action, to match S3 specification
+        // and ensure compatibility with AWS SDK clients that expect array format
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
         for action in &self.0 {
             let action_str: &str = action.into();
@@ -610,13 +603,17 @@ mod tests {
 
     #[test]
     fn test_actionset_serialize_single_element() {
-        // Single element should serialize as string
+        // Single element should serialize as array for S3 specification compliance
         let mut set = HashSet::new();
         set.insert(Action::S3Action(S3Action::GetObjectAction));
         let actionset = ActionSet(set);
 
         let json = serde_json::to_string(&actionset).expect("Should serialize");
-        assert_eq!(json, "\"s3:GetObject\"");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        assert!(parsed.is_array(), "Should serialize as array");
+        let arr = parsed.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str().unwrap(), "s3:GetObject");
     }
 
     #[test]
@@ -636,12 +633,16 @@ mod tests {
 
     #[test]
     fn test_actionset_wildcard_serialization() {
-        // Wildcard action should serialize correctly
+        // Wildcard action should serialize as array for S3 specification compliance
         let mut set = HashSet::new();
         set.insert(Action::try_from("*").expect("Should parse wildcard"));
         let actionset = ActionSet(set);
 
         let json = serde_json::to_string(&actionset).expect("Should serialize");
-        assert_eq!(json, "\"s3:*\"");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        assert!(parsed.is_array(), "Should serialize as array");
+        let arr = parsed.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str().unwrap(), "s3:*");
     }
 }

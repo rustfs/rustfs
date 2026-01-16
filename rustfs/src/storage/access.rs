@@ -342,7 +342,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketCorsAction)).await
+        authorize_request(req, Action::S3Action(S3Action::DeleteBucketCorsAction)).await
     }
 
     /// Checks whether the DeleteBucketEncryption request has accesses to the resources.

@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::BitrotReader;
-use super::BitrotWriterWrapper;
-use super::decode::ParallelReader;
 use crate::disk::error::{Error, Result};
+use crate::erasure_coding::BitrotReader;
+use crate::erasure_coding::BitrotWriterWrapper;
+use crate::erasure_coding::decode::ParallelReader;
 use crate::erasure_coding::encode::MultiWriter;
 use bytes::Bytes;
 use tokio::io::AsyncRead;
