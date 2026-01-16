@@ -116,21 +116,29 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
                     "Bucket '{}' has existing notification configuration: {:?}", bucket, cfg);
 
                 let mut event_rules = Vec::new();
-                process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), |arn_str| {
+                if let Err(e) = process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), |arn_str| {
                     ARN::parse(arn_str)
                         .map(|arn| arn.target_id)
                         .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                });
-                process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), |arn_str| {
+                }) {
+                    error!("Failed to parse queue notification config for bucket '{}': {:?}", bucket, e);
+                }
+                if let Err(e) = process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), |arn_str| {
                     ARN::parse(arn_str)
                         .map(|arn| arn.target_id)
                         .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                });
-                process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), |arn_str| {
-                    ARN::parse(arn_str)
-                        .map(|arn| arn.target_id)
-                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                });
+                }) {
+                    error!("Failed to parse topic notification config for bucket '{}': {:?}", bucket, e);
+                }
+                if let Err(e) =
+                    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), |arn_str| {
+                        ARN::parse(arn_str)
+                            .map(|arn| arn.target_id)
+                            .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+                    })
+                {
+                    error!("Failed to parse lambda notification config for bucket '{}': {:?}", bucket, e);
+                }
 
                 if let Err(e) = notifier_global::add_event_specific_rules(bucket, region, &event_rules)
                     .await
