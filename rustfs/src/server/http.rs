@@ -84,6 +84,7 @@ pub async fn start_http_server(
         };
 
         // If address is IPv6 try to enable dual-stack; on failure, switch to IPv4 socket.
+        #[cfg(not(target_os = "openbsd"))]
         if server_addr.is_ipv6()
             && let Err(e) = socket.set_only_v6(false)
         {
@@ -109,7 +110,6 @@ pub async fn start_http_server(
         socket.set_tcp_keepalive(&keepalive)?;
 
         // 4. Increase receive buffer to support BDP at GB-level throughput
-        #[cfg(not(target_os = "openbsd"))]
         socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
 
         // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
@@ -124,7 +124,6 @@ pub async fn start_http_server(
                 socket.set_nonblocking(true)?;
                 socket.set_tcp_nodelay(true)?;
                 socket.set_tcp_keepalive(&keepalive)?;
-                #[cfg(not(target_os = "openbsd"))]
                 socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
                 socket.bind(&server_addr.into())?;
                 // [FIX] Ensure fallback socket is moved to listening state as well.
@@ -285,7 +284,7 @@ pub async fn start_http_server(
             .max_concurrent_streams(Some(2048))
             .keep_alive_interval(Some(Duration::from_secs(20)))
             .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
+            .keep_alive_interval(Some(Duration::from_secs(20)));
 
         let http_server = Arc::new(conn_builder);
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
@@ -369,11 +368,9 @@ pub async fn start_http_server(
             }
 
             // 4. Increase receive buffer to support BDP at GB-level throughput
-            #[cfg(not(target_os = "openbsd"))]
             if let Err(err) = socket_ref.set_recv_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_recv_buffer_size");
             }
-            #[cfg(not(target_os = "openbsd"))]
             if let Err(err) = socket_ref.set_send_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
