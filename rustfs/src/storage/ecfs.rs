@@ -5820,12 +5820,12 @@ impl S3 for FS {
                 ARN::parse(arn_str)
                     .map(|arn| arn.target_id)
                     .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-            });
+            })?;
             process_topic_configurations(&mut event_rules, notification_configuration.topic_configurations.clone(), |arn_str| {
                 ARN::parse(arn_str)
                     .map(|arn| arn.target_id)
                     .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-            });
+            })?;
             process_lambda_configurations(
                 &mut event_rules,
                 notification_configuration.lambda_function_configurations.clone(),
@@ -5834,14 +5834,16 @@ impl S3 for FS {
                         .map(|arn| arn.target_id)
                         .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
                 },
-            );
+            )?;
 
-            event_rules
+            Ok::<_, TargetIDError>(event_rules)
         };
 
-        let (clear_result, event_rules) = tokio::join!(clear_rules, parse_rules);
+        let (clear_result, event_rules_result) = tokio::join!(clear_rules, parse_rules);
 
         clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
+        let event_rules =
+            event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
         warn!("notify event rules: {:?}", &event_rules);
 
         // Add a new notification rule
@@ -6357,54 +6359,57 @@ pub(crate) fn process_queue_configurations<F>(
     event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
     configurations: Option<Vec<QueueConfiguration>>,
     target_id_parser: F,
-) where
+) -> Result<(), TargetIDError>
+where
     F: Fn(&str) -> Result<TargetID, TargetIDError>,
 {
     if let Some(configs) = configurations {
         for cfg in configs {
             let events = cfg.events.iter().filter_map(|e| EventName::parse(e.as_ref()).ok()).collect();
             let (prefix, suffix) = extract_prefix_suffix(cfg.filter.as_ref());
-            let target_ids = vec![target_id_parser(&cfg.queue_arn).ok()].into_iter().flatten().collect();
-            event_rules.push((events, prefix, suffix, target_ids));
+            let target_id = target_id_parser(&cfg.queue_arn)?;
+            event_rules.push((events, prefix, suffix, vec![target_id]));
         }
     }
+    Ok(())
 }
 
 pub(crate) fn process_topic_configurations<F>(
     event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
     configurations: Option<Vec<TopicConfiguration>>,
     target_id_parser: F,
-) where
+) -> Result<(), TargetIDError>
+where
     F: Fn(&str) -> Result<TargetID, TargetIDError>,
 {
     if let Some(configs) = configurations {
         for cfg in configs {
             let events = cfg.events.iter().filter_map(|e| EventName::parse(e.as_ref()).ok()).collect();
             let (prefix, suffix) = extract_prefix_suffix(cfg.filter.as_ref());
-            let target_ids = vec![target_id_parser(&cfg.topic_arn).ok()].into_iter().flatten().collect();
-            event_rules.push((events, prefix, suffix, target_ids));
+            let target_id = target_id_parser(&cfg.topic_arn)?;
+            event_rules.push((events, prefix, suffix, vec![target_id]));
         }
     }
+    Ok(())
 }
 
 pub(crate) fn process_lambda_configurations<F>(
     event_rules: &mut Vec<(Vec<EventName>, String, String, Vec<TargetID>)>,
     configurations: Option<Vec<LambdaFunctionConfiguration>>,
     target_id_parser: F,
-) where
+) -> Result<(), TargetIDError>
+where
     F: Fn(&str) -> Result<TargetID, TargetIDError>,
 {
     if let Some(configs) = configurations {
         for cfg in configs {
             let events = cfg.events.iter().filter_map(|e| EventName::parse(e.as_ref()).ok()).collect();
             let (prefix, suffix) = extract_prefix_suffix(cfg.filter.as_ref());
-            let target_ids = vec![target_id_parser(&cfg.lambda_function_arn).ok()]
-                .into_iter()
-                .flatten()
-                .collect();
-            event_rules.push((events, prefix, suffix, target_ids));
+            let target_id = target_id_parser(&cfg.lambda_function_arn)?;
+            event_rules.push((events, prefix, suffix, vec![target_id]));
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelete]) -> bool {
@@ -7063,5 +7068,111 @@ mod tests {
         // The pattern "https://example.*.com" splits to ["https://example.", ".com"]
         // and "https://example.sub.com" matches because it starts with "https://example." and ends with ".com"
         // This is acceptable for our use case as S3 CORS typically uses "https://*.example.com" format
+    }
+
+    // === Notification Configuration Error Propagation Tests ===
+
+    #[test]
+    fn test_process_queue_configurations_propagates_error_on_invalid_arn() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let invalid_arn = "arn:minio:sqs::1:webhook"; // Wrong prefix, should fail
+
+        let result = process_queue_configurations(
+            &mut event_rules,
+            Some(vec![s3s::dto::QueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                queue_arn: invalid_arn.to_string(),
+                filter: None,
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_err(), "Should return error for invalid ARN prefix");
+        assert!(event_rules.is_empty(), "Should not add rules when ARN is invalid");
+    }
+
+    #[test]
+    fn test_process_topic_configurations_propagates_error_on_invalid_arn() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let invalid_arn = "arn:aws:sns:us-east-1:123:topic"; // Wrong prefix, should fail
+
+        let result = process_topic_configurations(
+            &mut event_rules,
+            Some(vec![s3s::dto::TopicConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                topic_arn: invalid_arn.to_string(),
+                filter: None,
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_err(), "Should return error for invalid ARN prefix");
+        assert!(event_rules.is_empty(), "Should not add rules when ARN is invalid");
+    }
+
+    #[test]
+    fn test_process_lambda_configurations_propagates_error_on_invalid_arn() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let invalid_arn = "arn:aws:lambda:us-east-1:123:function"; // Wrong prefix, should fail
+
+        let result = process_lambda_configurations(
+            &mut event_rules,
+            Some(vec![s3s::dto::LambdaFunctionConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                lambda_function_arn: invalid_arn.to_string(),
+                filter: None,
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_err(), "Should return error for invalid ARN prefix");
+        assert!(event_rules.is_empty(), "Should not add rules when ARN is invalid");
+    }
+
+    #[test]
+    fn test_process_queue_configurations_succeeds_with_valid_arn() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let valid_arn = "arn:rustfs:sqs:us-east-1:1:webhook"; // Correct prefix
+
+        let result = process_queue_configurations(
+            &mut event_rules,
+            Some(vec![s3s::dto::QueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                queue_arn: valid_arn.to_string(),
+                filter: None,
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_ok(), "Should succeed with valid ARN");
+        assert_eq!(event_rules.len(), 1, "Should add one rule");
     }
 }
