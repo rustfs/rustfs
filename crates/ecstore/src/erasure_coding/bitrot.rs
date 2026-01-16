@@ -108,7 +108,6 @@ pin_project! {
         inner: W,
         hash_algo: HashAlgorithm,
         shard_size: usize,
-        buf: Vec<u8>,
         finished: bool,
     }
 }
@@ -124,7 +123,6 @@ where
             inner,
             hash_algo,
             shard_size,
-            buf: Vec::new(),
             finished: false,
         }
     }
@@ -159,18 +157,18 @@ where
 
         if hash_algo.size() > 0 {
             let hash = hash_algo.hash_encode(buf);
-            self.buf.extend_from_slice(hash.as_ref());
+            if hash.as_ref().is_empty() {
+                error!("bitrot writer write hash error: hash is empty");
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "hash is empty"));
+            }
+            self.inner.write_all(hash.as_ref()).await?;
         }
 
-        self.buf.extend_from_slice(buf);
+        self.inner.write_all(buf).await?;
 
-        self.inner.write_all(&self.buf).await?;
-
-        // self.inner.flush().await?;
+        self.inner.flush().await?;
 
         let n = buf.len();
-
-        self.buf.clear();
 
         Ok(n)
     }
