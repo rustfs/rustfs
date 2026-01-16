@@ -655,13 +655,16 @@ async fn apply_managed_encryption_material(
 
     // Build metadata headers
     let mut metadata = HashMap::new();
-    
+
     // Try to use service for metadata formatting if available, otherwise build manually
     if let Some(service) = get_global_encryption_service().await {
         metadata = service.metadata_to_headers(&encryption_metadata);
     } else {
         // Manual metadata building for test mode
-        metadata.insert("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(&encryption_metadata.encrypted_data_key));
+        metadata.insert(
+            "x-rustfs-encryption-key".to_string(),
+            BASE64_STANDARD.encode(&encryption_metadata.encrypted_data_key),
+        );
         metadata.insert("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(&encryption_metadata.iv));
         metadata.insert("x-rustfs-encryption-algorithm".to_string(), encryption_metadata.algorithm.clone());
         metadata.insert("x-amz-server-side-encryption".to_string(), algorithm_str.to_string());
@@ -671,7 +674,7 @@ async fn apply_managed_encryption_material(
             metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_to_use.clone());
         }
     }
-    
+
     metadata.insert(
         "x-rustfs-encryption-original-size".to_string(),
         encryption_metadata.original_size.to_string(),
@@ -695,8 +698,8 @@ async fn apply_managed_encryption_material(
 }
 
 async fn apply_managed_decryption_material(
-    bucket: &str,
-    key: &str,
+    _bucket: &str,
+    _key: &str,
     metadata: &HashMap<String, String>,
     part_number: Option<usize>,
 ) -> Result<Option<DecryptionMaterial>, ApiError> {
@@ -853,51 +856,35 @@ impl KmsSseDekProvider {
     pub async fn new() -> Result<Self, ApiError> {
         let service = get_global_encryption_service()
             .await
-            .ok_or_else(|| ApiError::from(StorageError::other(
-                "KMS encryption service is not initialized"
-            )))?;
+            .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
         Ok(Self { service })
     }
 }
 
 #[async_trait]
 impl SseDekProvider for KmsSseDekProvider {
-    async fn generate_sse_dek(
-        &self,
-        bucket: &str,
-        key: &str,
-        kms_key_id: &str,
-    ) -> Result<(DataKey, Vec<u8>), ApiError> {
-        let context = ObjectEncryptionContext::new(
-            bucket.to_string(), 
-            key.to_string()
-        );
-        
+    async fn generate_sse_dek(&self, bucket: &str, key: &str, kms_key_id: &str) -> Result<(DataKey, Vec<u8>), ApiError> {
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
+
         let kms_key_option = Some(kms_key_id.to_string());
-        let (data_key, encrypted_data_key) = self.service
+        let (data_key, encrypted_data_key) = self
+            .service
             .create_data_key(&kms_key_option, &context)
             .await
-            .map_err(|e| ApiError::from(StorageError::other(
-                format!("Failed to create data key: {}", e)
-            )))?;
-        
+            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {}", e))))?;
+
         Ok((data_key, encrypted_data_key))
     }
-    
-    async fn decrypt_sse_dek(
-        &self,
-        encrypted_dek: &[u8],
-        _kms_key_id: &str,
-    ) -> Result<[u8; 32], ApiError> {
+
+    async fn decrypt_sse_dek(&self, encrypted_dek: &[u8], _kms_key_id: &str) -> Result<[u8; 32], ApiError> {
         // Create a minimal context for decryption
         let context = ObjectEncryptionContext::new("".to_string(), "".to_string());
-        let data_key = self.service
+        let data_key = self
+            .service
             .decrypt_data_key(encrypted_dek, &context)
             .await
-            .map_err(|e| ApiError::from(StorageError::other(
-                format!("Failed to decrypt data key: {}", e)
-            )))?;
-        
+            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {}", e))))?;
+
         Ok(data_key.plaintext_key)
     }
 }
@@ -907,28 +894,28 @@ impl SseDekProvider for KmsSseDekProvider {
 // ============================================================================
 
 /// Simple SSE DEK provider for testing purposes
-/// 
+///
 /// This provider reads a single 32-byte customer master key (CMK) from the
 /// `__RUSTFS_SSE_SIMPLE_CMK` environment variable. The key must be base64-encoded.
-/// 
+///
 /// # Environment Variable Format
-/// 
+///
 /// ```text
 /// __RUSTFS_SSE_SIMPLE_CMK=<base64_encoded_32_byte_key>
 /// ```
-/// 
+///
 /// Example:
 /// ```bash
 /// export __RUSTFS_SSE_SIMPLE_CMK="AKHul86TBMMJ3+VrGlh9X3dHJsOtSXOXHOODPwmAnOo="
 /// ```
-/// 
+///
 /// # Key Generation
-/// 
+///
 /// Use the provided script to generate a valid key:
 /// ```bash
 /// # Windows
 /// .\scripts\generate-sse-keys.ps1
-/// 
+///
 /// # Linux/Unix/macOS
 /// ./scripts/generate-sse-keys.sh
 /// ```
@@ -956,10 +943,7 @@ impl SimpleSseDekProvider {
                             arr
                         }
                         Err(_) => {
-                            eprintln!(
-                                "✗ Failed to load master key: decoded key is not 32 bytes (got {} bytes)",
-                                decoded_len
-                            );
+                            eprintln!("✗ Failed to load master key: decoded key is not 32 bytes (got {} bytes)", decoded_len);
                             [0u8; 32]
                         }
                     }
@@ -1092,7 +1076,7 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
     if let Some(provider) = GLOBAL_SSE_DEK_PROVIDER.get() {
         return Ok(provider.clone());
     }
-    
+
     // Determine provider based on environment variable
     let provider: Arc<dyn SseDekProvider> = if std::env::var("__RUSTFS_SSE_SIMPLE_CMK").is_ok() {
         debug!("Using SimpleSseDekProvider (test mode) based on __RUSTFS_SSE_SIMPLE_CMK");
@@ -1101,14 +1085,12 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
         debug!("Using KmsSseDekProvider (production mode)");
         Arc::new(KmsSseDekProvider::new().await?)
     };
-    
+
     // Store in global cache
     GLOBAL_SSE_DEK_PROVIDER
         .set(provider.clone())
-        .map_err(|_| ApiError::from(StorageError::other(
-            "Failed to initialize global SSE DEK provider (already set)"
-        )))?;
-    
+        .map_err(|_| ApiError::from(StorageError::other("Failed to initialize global SSE DEK provider (already set)")))?;
+
     Ok(provider)
 }
 
