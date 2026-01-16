@@ -27,7 +27,7 @@ use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder as ConnBuilder,
     server::graceful::GracefulShutdown,
     service::TowerToHyperService,
@@ -270,6 +270,7 @@ pub async fn start_http_server(
         // Optimize for HTTP/1.1 (S3 small files/management plane)
         conn_builder
             .http1()
+            .timer(TokioTimer::new())
             .keep_alive(true)
             .header_read_timeout(Duration::from_secs(5))
             .max_buf_size(64 * 1024)
@@ -278,6 +279,7 @@ pub async fn start_http_server(
         // Optimize for HTTP/2 (AI/Data Lake high concurrency synchronization)
         conn_builder
             .http2()
+            .timer(TokioTimer::new())
             .initial_stream_window_size(H2_INITIAL_STREAM_WINDOW_SIZE)
             .initial_connection_window_size(H2_INITIAL_CONN_WINDOW_SIZE)
             .max_frame_size(H2_MAX_FRAME_SIZE)
