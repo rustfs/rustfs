@@ -116,9 +116,7 @@ md5.workspace = true
 mime_guess = { workspace = true }
 moka = { workspace = true }
 pin-project-lite.workspace = true
-# rand = "0.8" is pinned due to dependency conflicts with workspace version
-rand = "0.8"
-rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
+ rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
 sysinfo = { workspace = true, features = ["multithread"] }
