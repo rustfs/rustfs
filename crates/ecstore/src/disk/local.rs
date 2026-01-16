@@ -844,7 +844,11 @@ impl LocalDisk {
         self.write_all_internal(&tmp_file_path, InternalBuf::Ref(buf), sync, &tmp_volume_dir)
             .await?;
 
-        rename_all(tmp_file_path, file_path, volume_dir).await
+        rename_all(tmp_file_path, &file_path, volume_dir).await?;
+
+        // Invalidate cache after successful write
+        get_global_file_cache().invalidate(&file_path).await;
+        Ok(())
     }
 
     // write_all_public for trail
