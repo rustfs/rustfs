@@ -20,7 +20,6 @@ use crate::{
     manager::{extract_jwt_claims, get_default_policyes},
 };
 use futures::future::join_all;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::store_api::{ObjectInfoOrErr, WalkOptions};
 use rustfs_ecstore::{
@@ -31,6 +30,7 @@ use rustfs_ecstore::{
     store::ECStore,
     store_api::{ObjectInfo, ObjectOptions},
 };
+use rustfs_kms::{KmsServiceStatus, get_global_kms_service_manager};
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
 use rustfs_utils::path::{SLASH_SEPARATOR_STR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
@@ -129,20 +129,34 @@ impl ObjectStore {
         Self { object_api }
     }
 
-    fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
-        let de = rustfs_crypto::decrypt_data(get_global_action_cred().unwrap_or_default().secret_key.as_bytes(), data)?;
-        Ok(de)
-    }
+    async fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
+        if String::from_utf8(data.to_vec()).is_ok() {
+            return Ok(data.to_vec());
+        }
 
-    fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
-        let en = rustfs_crypto::encrypt_data(get_global_action_cred().unwrap_or_default().secret_key.as_bytes(), data)?;
-        Ok(en)
+        if let Some(kms_manager) = get_global_kms_service_manager() {
+            let status = kms_manager.get_status().await;
+            if status == KmsServiceStatus::Running
+                && let Some(manager) = kms_manager.get_manager().await
+            {
+                let decrypt_request = rustfs_kms::DecryptRequest {
+                    ciphertext: data.to_vec(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                };
+                if let Ok(decrypted) = manager.decrypt(decrypt_request).await {
+                    return Ok(decrypted.plaintext);
+                }
+            }
+        }
+
+        Ok(data.to_vec())
     }
 
     async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, ObjectInfo)> {
         let (data, obj) = read_config_with_metadata(self.object_api.clone(), path.as_ref(), &ObjectOptions::default()).await?;
-
-        Ok((Self::decrypt_data(&data)?, obj))
+        let decrypted = Self::decrypt_data(&data).await?;
+        Ok((decrypted, obj))
     }
 
     async fn list_iam_config_items(&self, prefix: &str, ctx: CancellationToken, sender: Sender<StringOrErr>) {
@@ -405,18 +419,9 @@ impl Store for ObjectStore {
         false
     }
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
-        let mut data = read_config(self.object_api.clone(), path.as_ref()).await?;
-
-        data = match Self::decrypt_data(&data) {
-            Ok(v) => v,
-            Err(err) => {
-                warn!("config decrypt failed, keeping file: {}, path: {}", err, path.as_ref());
-                // keep the config file when decrypt failed - do not delete
-                return Err(Error::ConfigNotFound);
-            }
-        };
-
-        Ok(serde_json::from_slice(&data)?)
+        let data = read_config(self.object_api.clone(), path.as_ref()).await?;
+        let decrypted = Self::decrypt_data(&data).await?;
+        Ok(serde_json::from_slice(&decrypted)?)
     }
     /// Saves IAM configuration with a retry mechanism on failure.
     ///
@@ -434,7 +439,31 @@ impl Store for ObjectStore {
     #[tracing::instrument(level = "debug", skip(self, item, path))]
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()> {
         let mut data = serde_json::to_vec(&item)?;
-        data = Self::encrypt_data(&data)?;
+        let path_ref = path.as_ref();
+
+        if let Some(kms_manager) = get_global_kms_service_manager() {
+            let status = kms_manager.get_status().await;
+            if status == KmsServiceStatus::Running
+                && let Some(manager) = kms_manager.get_manager().await
+            {
+                let default_key_id = manager.get_default_key_id().map(|s| s.to_string());
+                if let Some(key_id) = default_key_id {
+                    let encrypt_request = rustfs_kms::EncryptRequest {
+                        key_id: key_id.clone(),
+                        plaintext: data.clone(),
+                        encryption_context: {
+                            let mut ctx = HashMap::new();
+                            ctx.insert("object_path".to_string(), path_ref.to_string());
+                            ctx
+                        },
+                        grant_tokens: Vec::new(),
+                    };
+                    if let Ok(encrypted) = manager.encrypt(encrypt_request).await {
+                        data = encrypted.ciphertext;
+                    }
+                }
+            }
+        }
 
         let mut attempts = 0;
         let max_attempts = 5;

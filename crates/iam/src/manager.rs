@@ -117,7 +117,9 @@ where
             last_timestamp: AtomicI64::new(0),
         });
 
-        sys.clone().init(receiver).await.unwrap();
+        if let Err(e) = sys.clone().init(receiver).await {
+            warn!("IAM sub-system partially initialized, some features may not be available: {:?}", e);
+        }
         sys
     }
 
@@ -132,9 +134,8 @@ where
         for attempt in 0..MAX_RETRIES {
             if let Err(e) = self.clone().load().await {
                 if attempt == MAX_RETRIES - 1 {
-                    self.state.store(IamState::Error as u8, Ordering::SeqCst);
-                    error!("IAM fail to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
-                    return Err(e);
+                    warn!("IAM failed to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
+                    break;
                 } else {
                     warn!("IAM load failed, retrying... attempt {}", attempt + 1);
                     tokio::time::sleep(Duration::from_secs(1)).await;
