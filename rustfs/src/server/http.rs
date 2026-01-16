@@ -99,6 +99,19 @@ pub async fn start_http_server(
         // Set the socket to non-blocking before passing it to Tokio.
         socket.set_nonblocking(true)?;
 
+        // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
+        socket.set_tcp_nodelay(true)?;
+
+        // 3. Set system-level TCP KeepAlive to protect long connections
+        // Note: This sets keepalive on the LISTENING socket, which is inherited by accepted sockets on some platforms (e.g. Linux).
+        // However, we also explicitly set it on accepted sockets in the loop below to be safe and cross-platform.
+        let keepalive = get_default_tcp_keepalive();
+        socket.set_tcp_keepalive(&keepalive)?;
+
+        // 4. Increase receive buffer to support BDP at GB-level throughput
+        #[cfg(not(target_os = "openbsd"))]
+        socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
+
         // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
         if let Err(bind_err) = socket.bind(&server_addr.into()) {
             warn!("Failed to bind to {}: {}.", server_addr, bind_err);
@@ -109,6 +122,10 @@ pub async fn start_http_server(
                 socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
                 socket.set_reuse_address(true)?;
                 socket.set_nonblocking(true)?;
+                socket.set_tcp_nodelay(true)?;
+                socket.set_tcp_keepalive(&keepalive)?;
+                #[cfg(not(target_os = "openbsd"))]
+                socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
                 socket.bind(&server_addr.into())?;
                 // [FIX] Ensure fallback socket is moved to listening state as well.
                 socket.listen(backlog)?;
@@ -244,7 +261,33 @@ pub async fn start_http_server(
             (sigterm_inner, sigint_inner)
         };
 
-        let http_server = Arc::new(ConnBuilder::new(TokioExecutor::new()));
+        // RustFS Transport Layer Configuration Constants - Optimized for S3 Workloads
+        const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024 * 2; // 2MB: Optimize large file throughput
+        const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 1024 * 1024 * 4; // 4MB: Link-level flow control
+        const H2_MAX_FRAME_SIZE: u32 = 16384; // 16KB: Reduce framing overhead
+
+        let mut conn_builder = ConnBuilder::new(TokioExecutor::new());
+
+        // Optimize for HTTP/1.1 (S3 small files/management plane)
+        conn_builder
+            .http1()
+            .keep_alive(true)
+            .header_read_timeout(Duration::from_secs(5))
+            .max_buf_size(64 * 1024)
+            .writev(true);
+
+        // Optimize for HTTP/2 (AI/Data Lake high concurrency synchronization)
+        conn_builder
+            .http2()
+            .initial_stream_window_size(H2_INITIAL_STREAM_WINDOW_SIZE)
+            .initial_connection_window_size(H2_INITIAL_CONN_WINDOW_SIZE)
+            .max_frame_size(H2_MAX_FRAME_SIZE)
+            .max_concurrent_streams(Some(2048))
+            .keep_alive_interval(Some(Duration::from_secs(20)))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+
+        let http_server = Arc::new(conn_builder);
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
         let graceful = Arc::new(GracefulShutdown::new());
         debug!("graceful initiated");
@@ -252,6 +295,9 @@ pub async fn start_http_server(
         // service ready
         worker_state_manager.update(ServiceState::Ready);
         let tls_acceptor = tls_acceptor.map(Arc::new);
+
+        // Initialize keepalive configuration once to avoid recreation in the loop
+        let keepalive_conf = get_default_tcp_keepalive();
 
         loop {
             debug!("Waiting for new connection...");
@@ -313,24 +359,16 @@ pub async fn start_http_server(
             let socket_ref = SockRef::from(&socket);
 
             // Enable TCP Keepalive to detect dead clients (e.g. power loss)
-            // Idle: 10s, Interval: 5s, Retries: 3
-            #[cfg(target_os = "openbsd")]
-            let ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
-
-            #[cfg(not(target_os = "openbsd"))]
-            let ka = TcpKeepalive::new()
-                .with_time(Duration::from_secs(10))
-                .with_interval(Duration::from_secs(5))
-                .with_retries(3);
-
-            if let Err(err) = socket_ref.set_tcp_keepalive(&ka) {
+            if let Err(err) = socket_ref.set_tcp_keepalive(&keepalive_conf) {
                 warn!(?err, "Failed to set TCP_KEEPALIVE");
             }
 
+            // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
 
+            // 4. Increase receive buffer to support BDP at GB-level throughput
             #[cfg(not(target_os = "openbsd"))]
             if let Err(err) = socket_ref.set_recv_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_recv_buffer_size");
@@ -646,6 +684,13 @@ fn process_connection(
 
 /// Handles connection errors by logging them with appropriate severity
 fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
+    let s = err.to_string();
+    if s.contains("connection reset") || s.contains("broken pipe") {
+        warn!("The connection was reset by the peer or broken pipe: {}", s);
+        // Ignore common non-fatal errors
+        return;
+    }
+
     if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
         if hyper_err.is_incomplete_message() {
             warn!("The HTTP connection is closed prematurely and the message is not completed:{}", hyper_err);
@@ -728,4 +773,19 @@ fn get_listen_backlog() -> i32 {
 fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
     DEFAULT_BACKLOG
+}
+
+fn get_default_tcp_keepalive() -> TcpKeepalive {
+    #[cfg(target_os = "openbsd")]
+    {
+        TcpKeepalive::new().with_time(Duration::from_secs(60))
+    }
+
+    #[cfg(not(target_os = "openbsd"))]
+    {
+        TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(5))
+            .with_retries(3)
+    }
 }
