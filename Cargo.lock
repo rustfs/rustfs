@@ -7925,7 +7925,6 @@ dependencies = [
  "rustfs-credentials",
  "rustfs-crypto",
  "rustfs-ecstore",
- "rustfs-kms",
  "rustfs-madmin",
  "rustfs-policy",
  "rustfs-utils",

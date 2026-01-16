@@ -49,7 +49,6 @@ rustfs-madmin.workspace = true
 rustfs-utils = { workspace = true, features = ["path"] }
 tokio-util.workspace = true
 pollster.workspace = true
-rustfs-kms = { workspace = true }
 
 [dev-dependencies]
 pollster.workspace = true
