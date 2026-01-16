@@ -114,6 +114,7 @@
                 // "RUSTFS_OBS_METRIC_ENDPOINT": "http://127.0.0.1:4318/v1/metrics", // default otlp http endpoint
                 // "RUSTFS_OBS_LOG_ENDPOINT": "http://127.0.0.1:4318/v1/logs", // default otlp http endpoint
                 // "RUSTFS_COMPRESS_ENABLE": "true",
+                "__RUSTFS_SSE_SIMPLE_CMK": "2dfNXGHlsEflGVCxb+5DIdGEl1sIvtwX+QfmYasi5QM=",
                 "RUSTFS_CONSOLE_ADDRESS": "127.0.0.1:9001",
                 "RUSTFS_OBS_LOG_DIRECTORY": "./target/logs",
             },

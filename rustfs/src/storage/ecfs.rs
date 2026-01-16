@@ -3350,6 +3350,7 @@ impl S3 for FS {
         let mut reader = PutObjReader::new(reader);
 
         let mt2 = metadata.clone();
+        opts.user_defined.extend(metadata);
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());

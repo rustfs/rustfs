@@ -664,18 +664,18 @@ async fn apply_managed_encryption_material(
         metadata.insert("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(&encryption_metadata.encrypted_data_key));
         metadata.insert("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(&encryption_metadata.iv));
         metadata.insert("x-rustfs-encryption-algorithm".to_string(), encryption_metadata.algorithm.clone());
+        metadata.insert("x-amz-server-side-encryption".to_string(), algorithm_str.to_string());
+
+        // if kms_key is changed, we need to update the metadata
+        if kms_key_id.is_none() {
+            metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_to_use.clone());
+        }
     }
     
     metadata.insert(
         "x-rustfs-encryption-original-size".to_string(),
         encryption_metadata.original_size.to_string(),
     );
-    metadata.insert("x-amz-server-side-encryption".to_string(), algorithm_str.to_string());
-
-    // if kms_key is changed, we need to update the metadata
-    if kms_key_id.is_none() {
-        metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_to_use.clone());
-    }
 
     // Handle part-specific nonce if needed
     let nonce = if let Some(part_num) = part_number {
@@ -906,63 +906,80 @@ impl SseDekProvider for KmsSseDekProvider {
 // Test/Simple DEK Provider
 // ============================================================================
 
-// Implement a simple SSE DEK provider for testing purposes
+/// Simple SSE DEK provider for testing purposes
+/// 
+/// This provider reads a single 32-byte customer master key (CMK) from the
+/// `__RUSTFS_SSE_SIMPLE_CMK` environment variable. The key must be base64-encoded.
+/// 
+/// # Environment Variable Format
+/// 
+/// ```text
+/// __RUSTFS_SSE_SIMPLE_CMK=<base64_encoded_32_byte_key>
+/// ```
+/// 
+/// Example:
+/// ```bash
+/// export __RUSTFS_SSE_SIMPLE_CMK="AKHul86TBMMJ3+VrGlh9X3dHJsOtSXOXHOODPwmAnOo="
+/// ```
+/// 
+/// # Key Generation
+/// 
+/// Use the provided script to generate a valid key:
+/// ```bash
+/// # Windows
+/// .\scripts\generate-sse-keys.ps1
+/// 
+/// # Linux/Unix/macOS
+/// ./scripts/generate-sse-keys.sh
+/// ```
 struct SimpleSseDekProvider {
-    cmk_ids: HashMap<String, [u8; 32]>,
+    master_key: [u8; 32],
 }
 
-// __RUSTFS_SSE_SIMPLE_CMK_ID format: key-id1:base64_key1,key-id2:base64_key2,...
-
 impl SimpleSseDekProvider {
-    /// Create a SimpleSseDekProvider with predefined keys (for testing)
+    /// Create a SimpleSseDekProvider with a predefined key (for testing)
     #[cfg(test)]
-    pub fn new_with_keys(cmk_ids: HashMap<String, [u8; 32]>) -> Self {
-        Self { cmk_ids }
+    pub fn new_with_key(master_key: [u8; 32]) -> Self {
+        Self { master_key }
     }
 
     pub fn new() -> Self {
-        let cmk_id = std::env::var("__RUSTFS_SSE_SIMPLE_CMK_ID").unwrap_or_else(|_| "".to_string());
+        let cmk_value = std::env::var("__RUSTFS_SSE_SIMPLE_CMK").unwrap_or_else(|_| "".to_string());
 
-        let cmk_ids: HashMap<String, [u8; 32]> = cmk_id
-            .split(',')
-            .filter_map(|pair| {
-                let parts: Vec<&str> = pair.split(':').collect();
-                if parts.len() == 2 {
-                    let key_name = parts[0];
-                    match BASE64_STANDARD.decode(parts[1]) {
-                        Ok(v) => {
-                            let decoded_len = v.len();
-                            match v.try_into() {
-                                Ok(arr) => {
-                                    println!("✓ Successfully loaded CMK: {}", key_name);
-                                    Some((key_name.to_string(), arr))
-                                }
-                                Err(_) => {
-                                    eprintln!(
-                                        "✗ Failed to load CMK '{}': decoded key is not 32 bytes (got {} bytes)",
-                                        key_name, decoded_len
-                                    );
-                                    None
-                                }
-                            }
+        let master_key = if !cmk_value.is_empty() {
+            match BASE64_STANDARD.decode(cmk_value.trim()) {
+                Ok(v) => {
+                    let decoded_len = v.len();
+                    match v.try_into() {
+                        Ok(arr) => {
+                            println!("✓ Successfully loaded master key (32 bytes)");
+                            arr
                         }
-                        Err(e) => {
-                            eprintln!("✗ Failed to load CMK '{}': invalid base64 encoding: {}", key_name, e);
-                            None
+                        Err(_) => {
+                            eprintln!(
+                                "✗ Failed to load master key: decoded key is not 32 bytes (got {} bytes)",
+                                decoded_len
+                            );
+                            [0u8; 32]
                         }
                     }
-                } else {
-                    eprintln!("✗ Invalid CMK format in '{}': expected 'name:base64_key'", pair);
-                    None
                 }
-            })
-            .collect();
+                Err(e) => {
+                    eprintln!("✗ Failed to load master key: invalid base64 encoding: {}", e);
+                    [0u8; 32]
+                }
+            }
+        } else {
+            [0u8; 32]
+        };
 
-        if cmk_ids.is_empty() {
-            eprintln!("⚠️  WARNING: No valid CMK keys loaded! All encryption operations will fail.");
+        if master_key == [0u8; 32] {
+            eprintln!("✗ Failed to load master key: no valid master key loaded! All encryption operations will fail.");
+            eprintln!("    Set __RUSTFS_SSE_SIMPLE_CMK environment variable to a base64-encoded 32-byte key.");
+            std::process::exit(1);
         }
 
-        Self { cmk_ids }
+        Self { master_key: master_key }
     }
 
     // Simple encryption of DEK
@@ -1016,13 +1033,7 @@ impl SimpleSseDekProvider {
 
 #[async_trait]
 impl SseDekProvider for SimpleSseDekProvider {
-    async fn generate_sse_dek(&self, _bucket: &str, _key: &str, kms_key_id: &str) -> Result<(DataKey, Vec<u8>), ApiError> {
-        let cmk_value = self
-            .cmk_ids
-            .get(kms_key_id)
-            .ok_or_else(|| ApiError::from(StorageError::other(format!("CMK ID not found: {}", kms_key_id))))?
-            .clone();
-
+    async fn generate_sse_dek(&self, _bucket: &str, _key: &str, _kms_key_id: &str) -> Result<(DataKey, Vec<u8>), ApiError> {
         // Generate a 32-byte array as data key
         let mut dek = [0u8; 32];
         rand::rng().fill_bytes(&mut dek);
@@ -1031,8 +1042,8 @@ impl SseDekProvider for SimpleSseDekProvider {
         let mut nonce = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce);
 
-        // Encrypt data key
-        let encrypted_dek = Self::encrypt_dek(dek, cmk_value)?;
+        // Encrypt data key with master key
+        let encrypted_dek = Self::encrypt_dek(dek, self.master_key)?;
 
         // Return data key and IV
         Ok((
@@ -1044,18 +1055,11 @@ impl SseDekProvider for SimpleSseDekProvider {
         ))
     }
 
-    async fn decrypt_sse_dek(&self, encrypted_dek: &[u8], kms_key_id: &str) -> Result<[u8; 32], ApiError> {
-        // Verify CMK ID exists (for testing purposes)
-        let cmk_value = self
-            .cmk_ids
-            .get(kms_key_id)
-            .ok_or_else(|| ApiError::from(StorageError::other(format!("CMK ID not found: {}", kms_key_id))))?
-            .clone();
-
-        // Decrypt data key
+    async fn decrypt_sse_dek(&self, encrypted_dek: &[u8], _kms_key_id: &str) -> Result<[u8; 32], ApiError> {
+        // Decrypt data key with master key
         let encrypted_dek_str = std::str::from_utf8(encrypted_dek)
             .map_err(|_| ApiError::from(StorageError::other("Invalid UTF-8 in encrypted DEK")))?;
-        let dek = Self::decrypt_dek(encrypted_dek_str, cmk_value)?;
+        let dek = Self::decrypt_dek(encrypted_dek_str, self.master_key)?;
         Ok(dek)
     }
 }
@@ -1070,7 +1074,7 @@ static GLOBAL_SSE_DEK_PROVIDER: OnceLock<Arc<dyn SseDekProvider>> = OnceLock::ne
 /// Get or initialize the global SSE DEK provider
 ///
 /// Factory function that automatically selects the appropriate provider:
-/// - If `__RUSTFS_SSE_SIMPLE_CMK_ID` environment variable exists: use SimpleSseDekProvider (test mode)
+/// - If `__RUSTFS_SSE_SIMPLE_CMK` environment variable exists: use SimpleSseDekProvider (test mode)
 /// - Otherwise: use KmsSseDekProvider (production mode with real KMS)
 ///
 /// # Returns
@@ -1090,8 +1094,8 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
     }
     
     // Determine provider based on environment variable
-    let provider: Arc<dyn SseDekProvider> = if std::env::var("__RUSTFS_SSE_SIMPLE_CMK_ID").is_ok() {
-        debug!("Using SimpleSseDekProvider (test mode) based on __RUSTFS_SSE_SIMPLE_CMK_ID");
+    let provider: Arc<dyn SseDekProvider> = if std::env::var("__RUSTFS_SSE_SIMPLE_CMK").is_ok() {
+        debug!("Using SimpleSseDekProvider (test mode) based on __RUSTFS_SSE_SIMPLE_CMK");
         Arc::new(SimpleSseDekProvider::new())
     } else {
         debug!("Using KmsSseDekProvider (production mode)");
@@ -1613,15 +1617,13 @@ mod tests {
         use std::io::Cursor;
         use tokio::io::AsyncReadExt;
 
-        // 1. Setup: Create SimpleSseDekProvider with test CMK
-        let mut test_keys = HashMap::new();
-        test_keys.insert("test-key".to_string(), [42u8; 32]);
-        let provider = SimpleSseDekProvider::new_with_keys(test_keys);
+        // 1. Setup: Create SimpleSseDekProvider with test master key
+        let provider = SimpleSseDekProvider::new_with_key([42u8; 32]);
 
         // 2. Generate a data encryption key
         let bucket = "test-bucket";
         let key = "test-key";
-        let kms_key_id = "test-key"; // Must match the key in SimpleSseDekProvider::new()
+        let kms_key_id = "default"; // Key ID is ignored in simple provider
 
         let (data_key, _encrypted_dek) = provider
             .generate_sse_dek(bucket, key, kms_key_id)
@@ -1682,14 +1684,12 @@ mod tests {
         use std::io::Cursor;
         use tokio::io::AsyncReadExt;
 
-        // 1. Setup: Create SimpleSseDekProvider with test CMK
-        let mut test_keys = HashMap::new();
-        test_keys.insert("test-key".to_string(), [42u8; 32]);
-        let provider = SimpleSseDekProvider::new_with_keys(test_keys);
+        // 1. Setup: Create SimpleSseDekProvider with test master key
+        let provider = SimpleSseDekProvider::new_with_key([42u8; 32]);
 
         let bucket = "test-bucket";
         let key = "test-key-large";
-        let kms_key_id = "test-key";
+        let kms_key_id = "default";
 
         let (data_key, _encrypted_dek) = provider
             .generate_sse_dek(bucket, key, kms_key_id)
@@ -1735,14 +1735,12 @@ mod tests {
         use std::io::Cursor;
         use tokio::io::AsyncReadExt;
 
-        // 1. Setup: Create SimpleSseDekProvider with test CMK
-        let mut test_keys = HashMap::new();
-        test_keys.insert("test-key".to_string(), [42u8; 32]);
-        let provider = SimpleSseDekProvider::new_with_keys(test_keys);
+        // 1. Setup: Create SimpleSseDekProvider with test master key
+        let provider = SimpleSseDekProvider::new_with_key([42u8; 32]);
 
         let bucket = "test-bucket";
         let key = "test-key";
-        let kms_key_id = "test-key";
+        let kms_key_id = "default";
 
         // Generate two different keys (with different nonces)
         let (data_key1, _) = provider
@@ -1787,14 +1785,12 @@ mod tests {
         use std::io::Cursor;
         use tokio::io::AsyncReadExt;
 
-        // 1. Setup: Create SimpleSseDekProvider with test CMK
-        let mut test_keys = HashMap::new();
-        test_keys.insert("test-key".to_string(), [42u8; 32]);
-        let provider = SimpleSseDekProvider::new_with_keys(test_keys);
+        // 1. Setup: Create SimpleSseDekProvider with test master key
+        let provider = SimpleSseDekProvider::new_with_key([42u8; 32]);
 
         let bucket = "test-bucket";
         let key = "test-key";
-        let kms_key_id = "test-key";
+        let kms_key_id = "default";
 
         // 1. Generate DEK and get encrypted DEK
         let (data_key, encrypted_dek) = provider
