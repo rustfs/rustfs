@@ -3,7 +3,7 @@
 {{- $ingressAnnotations := dict }}
 {{- if eq .Values.ingress.className "nginx" }}
 {{- $ingressAnnotations = .Values.ingress.nginxAnnotations }}
-{{- else if eq .Values.ingress.className "" }}
+{{- else }}
 {{- $ingressAnnotations = .Values.ingress.customAnnotations }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
