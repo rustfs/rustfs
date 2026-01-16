@@ -17,7 +17,11 @@ use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
+use crate::server::{
+    ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
+    hybrid::hybrid,
+    layer::{ConditionalCorsLayer, RedirectLayer},
+};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
@@ -30,9 +34,6 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use rustfs_common::GlobalReadiness;
-#[cfg(not(target_os = "openbsd"))]
-use rustfs_config::{MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-#[cfg(target_os = "openbsd")]
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
@@ -51,69 +52,9 @@ use tower::ServiceBuilder;
 use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
-
-/// Parse CORS allowed origins from configuration
-fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
-    use http::Method;
-
-    let cors_layer = CorsLayer::new()
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::HEAD,
-            Method::OPTIONS,
-        ])
-        .allow_headers(Any);
-
-    match origins {
-        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
-        Some(origins_str) => {
-            let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
-            if origins.is_empty() {
-                warn!("Empty CORS origins provided, using permissive CORS");
-                cors_layer.allow_origin(Any).expose_headers(Any)
-            } else {
-                // Parse origins with proper error handling
-                let mut valid_origins = Vec::new();
-                for origin in origins {
-                    match origin.parse::<http::HeaderValue>() {
-                        Ok(header_value) => {
-                            valid_origins.push(header_value);
-                        }
-                        Err(e) => {
-                            warn!("Invalid CORS origin '{}': {}", origin, e);
-                        }
-                    }
-                }
-
-                if valid_origins.is_empty() {
-                    warn!("No valid CORS origins found, using permissive CORS");
-                    cors_layer.allow_origin(Any).expose_headers(Any)
-                } else {
-                    info!("Endpoint CORS origins configured: {:?}", valid_origins);
-                    cors_layer.allow_origin(AllowOrigin::list(valid_origins)).expose_headers(Any)
-                }
-            }
-        }
-        None => {
-            debug!("No CORS origins configured for endpoint, using permissive CORS");
-            cors_layer.allow_origin(Any).expose_headers(Any)
-        }
-    }
-}
-
-fn get_cors_allowed_origins() -> String {
-    std::env::var(rustfs_config::ENV_CORS_ALLOWED_ORIGINS)
-        .unwrap_or_else(|_| rustfs_config::DEFAULT_CORS_ALLOWED_ORIGINS.to_string())
-        .parse::<String>()
-        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
-}
 
 pub async fn start_http_server(
     opt: &config::Opt,
@@ -276,14 +217,6 @@ pub async fn start_http_server(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
 
-    // Capture CORS configuration for the server loop
-    let cors_allowed_origins = get_cors_allowed_origins();
-    let cors_allowed_origins = if cors_allowed_origins.is_empty() {
-        None
-    } else {
-        Some(cors_allowed_origins)
-    };
-
     // Create compression configuration from environment variables
     let compression_config = CompressionConfig::from_env();
     if compression_config.enabled {
@@ -297,8 +230,10 @@ pub async fn start_http_server(
 
     let is_console = opt.console_enable;
     tokio::spawn(async move {
-        // Create CORS layer inside the server loop closure
-        let cors_layer = parse_cors_origins(cors_allowed_origins.as_ref());
+        // Note: CORS layer is removed from global middleware stack
+        // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
+        // - Console CORS is handled by its own cors_layer in setup_console_middleware_stack()
+        // This ensures S3 API CORS behavior matches AWS S3 specification
 
         #[cfg(unix)]
         let (mut sigterm_inner, mut sigint_inner) = {
@@ -379,11 +314,14 @@ pub async fn start_http_server(
 
             // Enable TCP Keepalive to detect dead clients (e.g. power loss)
             // Idle: 10s, Interval: 5s, Retries: 3
-            let mut ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
+            #[cfg(target_os = "openbsd")]
+            let ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
+
             #[cfg(not(target_os = "openbsd"))]
-            {
-                ka = ka.with_interval(Duration::from_secs(5)).with_retries(3);
-            }
+            let ka = TcpKeepalive::new()
+                .with_time(Duration::from_secs(10))
+                .with_interval(Duration::from_secs(5))
+                .with_retries(3);
 
             if let Err(err) = socket_ref.set_tcp_keepalive(&ka) {
                 warn!(?err, "Failed to set TCP_KEEPALIVE");
@@ -392,19 +330,19 @@ pub async fn start_http_server(
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
-            #[cfg(not(any(target_os = "openbsd")))]
-            if let Err(err) = socket_ref.set_recv_buffer_size(4 * MI_B) {
+
+            #[cfg(not(target_os = "openbsd"))]
+            if let Err(err) = socket_ref.set_recv_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_recv_buffer_size");
             }
-            #[cfg(not(any(target_os = "openbsd")))]
-            if let Err(err) = socket_ref.set_send_buffer_size(4 * MI_B) {
+            #[cfg(not(target_os = "openbsd"))]
+            if let Err(err) = socket_ref.set_send_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
 
             let connection_ctx = ConnectionContext {
                 http_server: http_server.clone(),
                 s3_service: s3_service.clone(),
-                cors_layer: cors_layer.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
                 readiness: readiness.clone(),
@@ -520,7 +458,6 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 struct ConnectionContext {
     http_server: Arc<ConnBuilder<TokioExecutor>>,
     s3_service: S3Service,
-    cors_layer: CorsLayer,
     compression_config: CompressionConfig,
     is_console: bool,
     readiness: Arc<GlobalReadiness>,
@@ -545,7 +482,6 @@ fn process_connection(
         let ConnectionContext {
             http_server,
             s3_service,
-            cors_layer,
             compression_config,
             is_console,
             readiness,
@@ -628,10 +564,15 @@ fn process_connection(
                     }),
             )
             .layer(PropagateRequestIdLayer::x_request_id())
-            .layer(cors_layer)
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
             .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
+            // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
+            // Admin has its own CORS handling in router.rs
+            // Console has its own CORS layer in setup_console_middleware_stack()
+            // S3 API uses this system default CORS (RUSTFS_CORS_ALLOWED_ORIGINS)
+            // Bucket-level CORS takes precedence when configured (handled in router.rs for OPTIONS, and in ecfs.rs for actual requests)
+            .layer(ConditionalCorsLayer::new())
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
             .service(service);
 
@@ -752,14 +693,15 @@ fn get_listen_backlog() -> i32 {
 }
 
 // For macOS and BSD variants use the syscall way of getting the connection queue length.
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+// NetBSD has no somaxconn-like kernel state.
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
 #[allow(unsafe_code)]
 fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
 
     #[cfg(target_os = "openbsd")]
     let mut name = [libc::CTL_KERN, libc::KERN_SOMAXCONN];
-    #[cfg(any(target_os = "netbsd", target_os = "macos", target_os = "freebsd"))]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
     let mut buf = [0; 1];
     let mut buf_len = size_of_val(&buf);
@@ -781,14 +723,8 @@ fn get_listen_backlog() -> i32 {
     buf[0]
 }
 
-// Fallback for Windows and other operating systems
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-)))]
+// Fallback for Windows, NetBSD and other operating systems.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
 fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
     DEFAULT_BACKLOG
