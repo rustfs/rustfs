@@ -109,7 +109,7 @@ futures-util = "0.3.31"
 pollster = "0.4.0"
 hyper = { version = "1.8.1", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
-hyper-util = { version = "0.1.19", features = ["tokio", "server-auto", "server-graceful"] }
+hyper-util = { version = "0.1.19", features = ["tokio", "server-auto", "server-graceful", "tracing"] }
 http = "1.4.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
