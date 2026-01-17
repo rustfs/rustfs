@@ -20,11 +20,11 @@
 #![allow(clippy::all)]
 
 //use bytes::Bytes;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use futures_util::ready;
 use http::HeaderMap;
 use std::io::{Cursor, Error as IoError, ErrorKind as IoErrorKind, Read};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::io::BufReader;
 use tokio_util::io::StreamReader;
 
@@ -33,11 +33,11 @@ use crate::client::{
     api_get_options::GetObjectOptions,
     transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
-use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
-use hyper::body::Bytes;
-use hyper::body::Body;
-use http_body_util::BodyExt;
 use futures_util::StreamExt;
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
+use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use tokio_util::io::ReaderStream;
 
 impl TransitionClient {

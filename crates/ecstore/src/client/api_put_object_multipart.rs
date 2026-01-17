@@ -19,12 +19,12 @@
 
 //use bytes::Bytes;
 use http::{HeaderMap, HeaderName, StatusCode};
+use hyper::body::Bytes;
 use s3s::S3ErrorCode;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
-use hyper::body::Bytes;
 
 use crate::client::checksum::ChecksumMode;
 use crate::client::utils::base64_encode;
@@ -226,7 +226,7 @@ impl TransitionClient {
         };
 
         let resp = self.execute_method(http::Method::POST, &mut req_metadata).await?;
-        
+
         let resp_status = resp.status();
         let h = resp.headers().clone();
 

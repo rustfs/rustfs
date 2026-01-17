@@ -30,11 +30,11 @@ use crate::client::{
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 //use s3s::Body;
-use s3s::header::{X_AMZ_MAX_PARTS, X_AMZ_OBJECT_ATTRIBUTES, X_AMZ_PART_NUMBER_MARKER, X_AMZ_VERSION_ID};
+use http_body_util::BodyExt;
+use hyper::body::Body;
 use hyper::body::Bytes;
 use hyper::body::Incoming;
-use hyper::body::Body;
-use http_body_util::BodyExt;
+use s3s::header::{X_AMZ_MAX_PARTS, X_AMZ_OBJECT_ATTRIBUTES, X_AMZ_PART_NUMBER_MARKER, X_AMZ_VERSION_ID};
 
 pub struct ObjectAttributesOptions {
     pub max_parts: i64,

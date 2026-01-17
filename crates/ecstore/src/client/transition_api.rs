@@ -20,6 +20,7 @@
 
 use crate::client::bucket_cache::BucketLocationCache;
 use crate::client::{
+    api_error_response::ErrorResponse,
     api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
     api_get_options::GetObjectOptions,
     api_put_object::PutObjectOptions,
@@ -30,7 +31,6 @@ use crate::client::{
     },
     constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
     credentials::{CredContext, Credentials, SignatureType, Static},
-    api_error_response::ErrorResponse,
 };
 use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
 //use bytes::Bytes;
@@ -40,6 +40,10 @@ use http::{
     HeaderValue, Response, StatusCode,
     request::{Builder, Request},
 };
+use http_body::Body;
+use http_body_util::BodyExt;
+use hyper::body::Bytes;
+use hyper::body::Incoming;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use md5::Digest;
@@ -55,8 +59,8 @@ use rustfs_utils::{
     },
 };
 use s3s::S3ErrorCode;
-use s3s::dto::ReplicationStatus;
 use s3s::dto::Owner;
+use s3s::dto::ReplicationStatus;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::Cursor;
@@ -73,10 +77,6 @@ use tokio::io::BufReader;
 use tracing::{debug, error, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
-use http_body::Body;
-use hyper::body::Incoming;
-use hyper::body::Bytes;
-use http_body_util::BodyExt;
 
 const C_USER_AGENT: &str = "RustFS (linux; x86)";
 
@@ -277,8 +277,7 @@ impl TransitionClient {
             debug!("endpoint_url: {}", self.endpoint_url.as_str().to_string());
             resp = http_client.request(req);
         }
-        let resp = resp
-            .await;
+        let resp = resp.await;
         debug!("http_client url: {} {}", req_method, req_uri);
         debug!("http_client headers: {:?}", req_headers);
         if let Err(err) = resp {
@@ -357,7 +356,8 @@ impl TransitionClient {
                     body_vec.extend_from_slice(data);
                 }
             }
-            let mut err_response = http_resp_to_error_response(resp_status, &h, body_vec.clone(), &metadata.bucket_name, &metadata.object_name);
+            let mut err_response =
+                http_resp_to_error_response(resp_status, &h, body_vec.clone(), &metadata.bucket_name, &metadata.object_name);
             err_response.message = format!("remote tier error: {}", err_response.message);
 
             if self.region == "" {
@@ -993,12 +993,7 @@ impl Default for UploadInfo {
 /// containing metadata about an S3 object.
 pub fn to_object_info(bucket_name: &str, object_name: &str, h: &HeaderMap) -> Result<ObjectInfo, std::io::Error> {
     // Helper function to get header value as string
-    let get_header = |name: &str| -> String {
-        h.get(name)
-            .and_then(|val| val.to_str().ok())
-            .unwrap_or("")
-            .to_string()
-    };
+    let get_header = |name: &str| -> String { h.get(name).and_then(|val| val.to_str().ok()).unwrap_or("").to_string() };
 
     // Get and process the ETag
     let etag = {

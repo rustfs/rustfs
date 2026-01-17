@@ -19,14 +19,14 @@
 #![allow(clippy::all)]
 
 use http::{HeaderMap, HeaderValue};
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 use std::{collections::HashMap, str::FromStr};
 use tokio::io::BufReader;
 use tracing::warn;
 use uuid::Uuid;
-use hyper::body::Bytes;
-use hyper::body::Body;
-use http_body_util::BodyExt;
 
 use crate::client::{
     api_error_response::{ErrorResponse, err_invalid_argument, http_resp_to_error_response},

@@ -19,10 +19,10 @@
 #![allow(clippy::all)]
 
 use http::{HeaderMap, StatusCode};
-use std::collections::HashMap;
-use hyper::body::Bytes;
-use hyper::body::Body;
 use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
+use std::collections::HashMap;
 
 use crate::client::{
     api_error_response::http_resp_to_error_response,
@@ -69,7 +69,13 @@ impl TransitionClient {
 
         //if resp != nil {
         if resp_status != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp_status, &h, vec![], bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                resp_status,
+                &h,
+                vec![],
+                bucket_name,
+                "",
+            )));
         }
         //}
         Ok(())
@@ -107,7 +113,13 @@ impl TransitionClient {
         let h = resp.headers().clone();
 
         if resp_status != StatusCode::NO_CONTENT {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp_status, &h, vec![], bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                resp_status,
+                &h,
+                vec![],
+                bucket_name,
+                "",
+            )));
         }
 
         Ok(())

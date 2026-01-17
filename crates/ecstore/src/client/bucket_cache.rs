@@ -25,15 +25,15 @@ use crate::client::{
     transition_api::{CreateBucketConfiguration, LocationConstraint, TransitionClient},
 };
 use http::Request;
+use http_body_util::BodyExt;
 use hyper::StatusCode;
+use hyper::body::Body;
+use hyper::body::Bytes;
+use hyper::body::Incoming;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use s3s::S3ErrorCode;
 use std::collections::HashMap;
-use hyper::body::Bytes;
-use hyper::body::Body;
-use http_body_util::BodyExt;
-use hyper::body::Incoming;
 
 #[derive(Debug, Clone)]
 pub struct BucketLocationCache {
@@ -123,7 +123,11 @@ impl TransitionClient {
             url_str = target_url.to_string();
         }
 
-        let Ok(mut req) = Request::builder().method(http::Method::GET).uri(url_str).body(s3s::Body::empty()) else {
+        let Ok(mut req) = Request::builder()
+            .method(http::Method::GET)
+            .uri(url_str)
+            .body(s3s::Body::empty())
+        else {
             return Err(std::io::Error::other("create request error"));
         };
 
@@ -183,7 +187,7 @@ async fn process_bucket_location_response(
     if resp.status() != StatusCode::OK {
         let resp_status = resp.status();
         let h = resp.headers().clone();
-        
+
         let err_resp = http_resp_to_error_response(resp_status, &h, vec![], bucket_name, "");
         match err_resp.code {
                 S3ErrorCode::NotImplemented => {
@@ -227,7 +231,9 @@ async fn process_bucket_location_response(
         let d = quick_xml::de::from_str::<CreateBucketConfiguration>(&String::from_utf8(body_vec).unwrap()).unwrap();
         location = d.location_constraint;
     } else {
-        if let Ok(LocationConstraint { field }) = quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(body_vec).unwrap()) {
+        if let Ok(LocationConstraint { field }) =
+            quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(body_vec).unwrap())
+        {
             location = field;
         }
     }

@@ -29,12 +29,12 @@ use crate::client::{
 use crate::store_api::BucketInfo;
 //use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use std::collections::HashMap;
-use hyper::body::Bytes;
-use hyper::body::Body;
-use http_body_util::BodyExt;
 
 impl TransitionClient {
     pub fn list_buckets(&self) -> Result<Vec<BucketInfo>, std::io::Error> {
@@ -105,7 +105,13 @@ impl TransitionClient {
         let h = resp.headers().clone();
 
         if resp.status() != StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp_status, &h, vec![], bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                resp_status,
+                &h,
+                vec![],
+                bucket_name,
+                "",
+            )));
         }
 
         //let mut list_bucket_result = ListBucketV2Result::default();

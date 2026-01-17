@@ -19,6 +19,9 @@
 #![allow(clippy::all)]
 
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
 use rustfs_utils::HashAlgorithm;
 use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
@@ -27,9 +30,6 @@ use std::fmt::Display;
 use std::{collections::HashMap, sync::Arc};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use hyper::body::Bytes;
-use hyper::body::Body;
-use http_body_util::BodyExt;
 
 use crate::client::utils::base64_encode;
 use crate::client::{

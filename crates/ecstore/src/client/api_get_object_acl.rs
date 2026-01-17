@@ -25,11 +25,11 @@ use crate::client::{
 };
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
+use http_body_util::BodyExt;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 use s3s::dto::Owner;
 use std::collections::HashMap;
-use http_body_util::BodyExt;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Grantee {
@@ -97,7 +97,13 @@ impl TransitionClient {
         }
 
         if resp_status != http::StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp_status, &h, body_vec, bucket_name, object_name)));
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                resp_status,
+                &h,
+                body_vec,
+                bucket_name,
+                object_name,
+            )));
         }
 
         let mut res = match quick_xml::de::from_str::<AccessControlPolicy>(&String::from_utf8(body_vec).unwrap()) {

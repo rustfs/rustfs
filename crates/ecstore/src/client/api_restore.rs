@@ -25,13 +25,13 @@ use crate::client::{
     transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
 use http::HeaderMap;
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
 use s3s::dto::RestoreRequest;
 use std::collections::HashMap;
 use std::io::Cursor;
 use tokio::io::BufReader;
-use hyper::body::Bytes;
-use hyper::body::Body;
-use http_body_util::BodyExt;
 
 const TIER_STANDARD: &str = "Standard";
 const TIER_BULK: &str = "Bulk";
@@ -121,7 +121,13 @@ impl TransitionClient {
             }
         }
         if resp_status != http::StatusCode::ACCEPTED && resp_status != http::StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(resp_status, &h, body_vec, bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                resp_status,
+                &h,
+                body_vec,
+                bucket_name,
+                "",
+            )));
         }
         Ok(())
     }
