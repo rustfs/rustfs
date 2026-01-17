@@ -5071,11 +5071,11 @@ impl S3 for FS {
             Some(SseTypeV2::SseC(_, _, _)) => (None, None), // SSE-C handled separately
             None => (None, None),
         };
-        
+
         if let Some(material) = sse_encryption(encryption_request).await? {
             // Store encryption metadata for later use by upload_part and complete_multipart_upload
             metadata.extend(material.metadata);
-            
+
             // Update effective_kms_key_id if managed SSE was used
             if let Some(kms_key_id) = material.kms_key_id {
                 effective_kms_key_id = Some(kms_key_id);
