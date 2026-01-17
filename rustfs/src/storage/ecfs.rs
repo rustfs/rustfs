@@ -1071,12 +1071,9 @@ impl S3 for FS {
             version_id,
             ..
         } = req.input.clone();
-        
+
         let rreq = rreq.ok_or_else(|| {
-            S3Error::with_message(
-                S3ErrorCode::Custom("ErrValidRestoreObject".into()),
-                "restore request is required",
-            )
+            S3Error::with_message(S3ErrorCode::Custom("ErrValidRestoreObject".into()), "restore request is required")
         })?;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1086,20 +1083,12 @@ impl S3 for FS {
         let version_id_str = version_id.unwrap_or_default();
         let opts = post_restore_opts(&version_id_str, &bucket, &object)
             .await
-            .map_err(|_| {
-                S3Error::with_message(
-                    S3ErrorCode::Custom("ErrPostRestoreOpts".into()),
-                    "restore object failed.",
-                )
-            })?;
+            .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?;
 
-        let mut obj_info = store.get_object_info(&bucket, &object, &opts).await
-            .map_err(|_| {
-                S3Error::with_message(
-                    S3ErrorCode::Custom("ErrInvalidObjectState".into()),
-                    "restore object failed.",
-                )
-            })?;
+        let mut obj_info = store
+            .get_object_info(&bucket, &object, &opts)
+            .await
+            .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "restore object failed."))?;
 
         // Check if object is in a transitioned state
         if obj_info.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
@@ -1111,10 +1100,7 @@ impl S3 for FS {
 
         // Validate restore request
         rreq.validate(store.clone()).map_err(|_| {
-            S3Error::with_message(
-                S3ErrorCode::Custom("ErrValidRestoreObject".into()),
-                "restore object validation failed",
-            )
+            S3Error::with_message(S3ErrorCode::Custom("ErrValidRestoreObject".into()), "restore object validation failed")
         })?;
 
         // Check if restore is already in progress
@@ -1162,7 +1148,7 @@ impl S3 for FS {
                 );
             }
             obj_info.user_defined = metadata;
-            
+
             store
                 .clone()
                 .copy_object(
@@ -1182,13 +1168,8 @@ impl S3 for FS {
                     },
                 )
                 .await
-                .map_err(|_| {
-                    S3Error::with_message(
-                        S3ErrorCode::Custom("ErrCopyObject".into()),
-                        "restore object failed",
-                    )
-                })?;
-                
+                .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed"))?;
+
             if already_restored {
                 let output = RestoreObjectOutput {
                     request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
@@ -1210,14 +1191,14 @@ impl S3 for FS {
                 }
             }
         }
-        
+
         // Spawn restoration task in the background
         let store_clone = store.clone();
         let bucket_clone = bucket.clone();
         let object_clone = object.clone();
         let rreq_clone = rreq.clone();
         let obj_info_clone = obj_info_.clone();
-        
+
         tokio::spawn(async move {
             let opts = ObjectOptions {
                 transition: TransitionOptions {
@@ -1228,9 +1209,17 @@ impl S3 for FS {
                 version_id: obj_info_clone.version_id.map(|e| e.to_string()),
                 ..Default::default()
             };
-            
-            if let Err(err) = store_clone.restore_transitioned_object(&bucket_clone, &object_clone, &opts).await {
-                warn!("unable to restore transitioned bucket/object {}/{}: {}", bucket_clone, object_clone, err.to_string());
+
+            if let Err(err) = store_clone
+                .restore_transitioned_object(&bucket_clone, &object_clone, &opts)
+                .await
+            {
+                warn!(
+                    "unable to restore transitioned bucket/object {}/{}: {}",
+                    bucket_clone,
+                    object_clone,
+                    err.to_string()
+                );
                 // Note: Errors from background tasks cannot be returned to client
                 // Consider adding to monitoring/metrics system
             } else {
