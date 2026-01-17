@@ -17,13 +17,14 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use bytes::Bytes;
+//use bytes::Bytes;
 use http::{HeaderMap, HeaderName, StatusCode};
 use s3s::S3ErrorCode;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
+use hyper::body::Bytes;
 
 use crate::client::checksum::ChecksumMode;
 use crate::client::utils::base64_encode;
@@ -225,10 +226,15 @@ impl TransitionClient {
         };
 
         let resp = self.execute_method(http::Method::POST, &mut req_metadata).await?;
+        
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
         //if resp.is_none() {
         if resp.status() != StatusCode::OK {
             return Err(std::io::Error::other(http_resp_to_error_response(
-                &resp,
+                resp_status,
+                &h,
                 vec![],
                 bucket_name,
                 object_name,
@@ -287,9 +293,14 @@ impl TransitionClient {
         };
 
         let resp = self.execute_method(http::Method::PUT, &mut req_metadata).await?;
+
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
         if resp.status() != StatusCode::OK {
             return Err(std::io::Error::other(http_resp_to_error_response(
-                &resp,
+                resp_status,
+                &h,
                 vec![],
                 &p.bucket_name.clone(),
                 &p.object_name,
@@ -370,7 +381,8 @@ impl TransitionClient {
 
         let resp = self.execute_method(http::Method::POST, &mut req_metadata).await?;
 
-        let b = resp.body().bytes().expect("err").to_vec();
+        let h = resp.headers().clone();
+
         let complete_multipart_upload_result: CompleteMultipartUploadResult = CompleteMultipartUploadResult::default();
 
         let (exp_time, rule_id) = if let Some(h_x_amz_expiration) = resp.headers().get(X_AMZ_EXPIRATION) {
@@ -382,7 +394,6 @@ impl TransitionClient {
             (OffsetDateTime::now_utc(), "".to_string())
         };
 
-        let h = resp.headers();
         Ok(UploadInfo {
             bucket: complete_multipart_upload_result.bucket,
             key: complete_multipart_upload_result.key,
