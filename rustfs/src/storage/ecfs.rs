@@ -670,7 +670,7 @@ impl FS {
                     let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
 
                     reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-                    size = -1;
+                    size = HashReader::SIZE_PRESERVE_LAYER;
                 }
 
                 let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
@@ -1222,7 +1222,7 @@ impl S3 for FS {
             // let hrd = HashReader::new(reader, length, actual_size, None, false).map_err(ApiError::from)?;
 
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-            length = -1;
+            length = HashReader::SIZE_PRESERVE_LAYER;
         } else {
             src_info
                 .user_defined
@@ -3699,7 +3699,7 @@ impl S3 for FS {
             opts.want_checksum = hrd.checksum();
 
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-            size = -1;
+            size = HashReader::SIZE_PRESERVE_LAYER;
             md5hex = None;
             sha256hex = None;
         }
@@ -4211,7 +4211,7 @@ impl S3 for FS {
 
             let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
             reader = Box::new(compress_reader);
-            size = -1;
+            size = HashReader::SIZE_PRESERVE_LAYER;
             md5hex = None;
             sha256hex = None;
         }
@@ -4439,7 +4439,7 @@ impl S3 for FS {
         if is_compressible {
             let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-            size = -1;
+            size = HashReader::SIZE_PRESERVE_LAYER;
         }
 
         let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
