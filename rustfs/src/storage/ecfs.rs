@@ -26,8 +26,8 @@ use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::sse::{
-    DecryptionRequest, EncryptionRequest, InMemoryAsyncReader, sse_decryption, sse_encryption,
-    decrypt_managed_encryption_key, derive_part_nonce, prepare_sse_configuration, strip_managed_encryption_metadata,
+    DecryptionRequest, EncryptionRequest, InMemoryAsyncReader, decrypt_managed_encryption_key, derive_part_nonce,
+    prepare_sse_configuration, sse_decryption, sse_encryption, strip_managed_encryption_metadata,
 };
 use crate::storage::{
     access::{ReqInfo, authorize_request},
@@ -1081,7 +1081,7 @@ impl S3 for FS {
             content_size: actual_size,
             part_number: None,
         };
-        
+
         if let Some(material) = sse_encryption(encryption_request).await? {
             // Apply encryption wrapper
             let encrypted_reader = material.wrap_reader(reader);
@@ -3497,7 +3497,7 @@ impl S3 for FS {
 
         // Prepare SSE configuration using unified API
         let sse_config = prepare_sse_configuration(&bucket, server_side_encryption, ssekms_key_id).await?;
-        
+
         let effective_sse = sse_config.effective_sse.clone();
         let mut effective_kms_key_id = sse_config.effective_kms_key_id.clone();
 
@@ -3527,11 +3527,11 @@ impl S3 for FS {
             content_size: 0, // Size unknown at multipart creation
             part_number: None,
         };
-        
+
         if let Some(material) = sse_encryption(encryption_request).await? {
             // Store encryption metadata for later use by upload_part and complete_multipart_upload
             metadata.extend(material.metadata);
-            
+
             // Update effective_kms_key_id if managed SSE was used
             if let Some(kms_key_id) = material.kms_key_id {
                 effective_kms_key_id = Some(kms_key_id);
@@ -3708,7 +3708,7 @@ impl S3 for FS {
             content_size: actual_size,
             part_number: Some(part_id),
         };
-        
+
         if let Some(material) = sse_encryption(encryption_request).await? {
             // Apply encryption wrapper
             let encrypted_reader = material.wrap_reader(reader);
@@ -3717,7 +3717,10 @@ impl S3 for FS {
             // When encrypting, size becomes unknown since encryption adds authentication tags
             size = -1;
 
-            debug!("Applied {:?} encryption to part {} for {}/{}", material.encryption_type, part_id, bucket, key);
+            debug!(
+                "Applied {:?} encryption to part {} for {}/{}",
+                material.encryption_type, part_id, bucket, key
+            );
         }
 
         let mut md5hex = if let Some(base64_md5) = input.content_md5 {
@@ -3762,7 +3765,7 @@ impl S3 for FS {
             part_number: Some(part_id),
             parts: &[],
         };
-        
+
         if let Some(material) = sse_decryption(decryption_request).await? {
             // For upload_part, we use the decryption material to get the key/nonce,
             // then apply encryption (since we're encrypting the part data)
@@ -3971,7 +3974,7 @@ impl S3 for FS {
         // Note: SSE-C for copy source is handled via copy_source_sse_customer_* headers
         let copy_source_sse_customer_key = req.input.copy_source_sse_customer_key.as_ref();
         let copy_source_sse_customer_key_md5 = req.input.copy_source_sse_customer_key_md5.as_ref();
-        
+
         let src_decryption_request = DecryptionRequest {
             bucket: &src_bucket,
             key: &src_key,
@@ -3981,7 +3984,7 @@ impl S3 for FS {
             part_number: None,
             parts: &src_info.parts,
         };
-        
+
         if let Some(material) = sse_decryption(src_decryption_request).await? {
             reader = material.wrap_single_reader(reader);
             if let Some(original) = material.original_size {
@@ -4011,7 +4014,7 @@ impl S3 for FS {
             part_number: Some(part_id),
             parts: &[],
         };
-        
+
         if let Some(material) = sse_decryption(dst_decryption_request).await? {
             // For upload_part_copy, we use the decryption material to get the key/nonce,
             // then apply encryption (since we're encrypting the part data)

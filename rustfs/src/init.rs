@@ -185,10 +185,7 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
                     .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
 
                 // root key for local backend(optional)
-                let master_key = opt
-                    .kms_local_master_key
-                    .as_ref()
-                    .map_or(None, |k| Some(k.to_string()));
+                let master_key = opt.kms_local_master_key.as_ref().map_or(None, |k| Some(k.to_string()));
 
                 rustfs_kms::config::KmsConfig {
                     backend: rustfs_kms::config::KmsBackend::Local,

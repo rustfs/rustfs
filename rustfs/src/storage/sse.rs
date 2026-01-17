@@ -247,7 +247,6 @@ pub struct DecryptionMaterial {
     pub algorithm: SSECustomerAlgorithm,
     pub customer_key_md5: Option<SSECustomerKeyMD5>, // if use SSE-C, check key md5
 
-
     /// Decryption key bytes
     pub key_bytes: [u8; 32],
     /// Nonce/IV for decryption
@@ -725,8 +724,7 @@ async fn apply_managed_decryption_material(
     let server_side_encryption = metadata.get("x-amz-server-side-encryption").unwrap().clone();
 
     // Parse metadata - try using service if available, otherwise parse manually
-    let (encrypted_data_key, iv, algorithm) =
-        if let Some(service) = get_global_encryption_service().await {
+    let (encrypted_data_key, iv, algorithm) = if let Some(service) = get_global_encryption_service().await {
         // Production mode: use service for metadata parsing
         let parsed = service
             .headers_to_metadata(metadata)
