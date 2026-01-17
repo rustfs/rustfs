@@ -26,7 +26,7 @@ use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
-    access::{ReqInfo, authorize_request},
+    access::{ReqInfo, authorize_request, has_bypass_governance_header},
     options::{
         copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
         get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
@@ -53,7 +53,10 @@ use rustfs_ecstore::{
         },
         metadata_sys,
         metadata_sys::get_replication_config,
-        object_lock::objectlock_sys::BucketObjectLockSys,
+        object_lock::{
+            objectlock,
+            objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion},
+        },
         policy_sys::PolicySys,
         quota::QuotaOperation,
         replication::{
@@ -1955,11 +1958,12 @@ impl S3 for FS {
 
         let metadata = extract_metadata(&req.headers);
 
+        // Clone version_id before it's moved
+        let version_id_clone = version_id.clone();
+
         let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
-
-        // TODO: check object lock
 
         let lock_cfg = BucketObjectLockSys::get(&bucket).await;
         if lock_cfg.is_some() && opts.delete_prefix {
@@ -1982,6 +1986,32 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        // Check Object Lock retention before deletion
+        // Get object info first to check retention
+        let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+
+        match store.get_object_info(&bucket, &key, &get_opts).await {
+            Ok(obj_info) => {
+                // Check for bypass governance retention header (permission already verified in access.rs)
+                let bypass_governance = has_bypass_governance_header(&req.headers);
+
+                if check_object_lock_for_deletion(&bucket, &obj_info, bypass_governance).await {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::AccessDenied,
+                        "Object is retained and cannot be deleted until the retention period expires",
+                    ));
+                }
+            }
+            Err(err) => {
+                // If object not found, allow deletion to proceed (will return 204 No Content)
+                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                    return Err(ApiError::from(err).into());
+                }
+            }
+        }
 
         let obj_info = {
             match store.delete_object(&bucket, &key, opts).await {
@@ -2101,6 +2131,9 @@ impl S3 for FS {
 
         let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
 
+        // Check for bypass governance retention header (permission already verified in access.rs)
+        let bypass_governance = has_bypass_governance_header(&req.headers);
+
         #[derive(Default, Clone)]
         struct DeleteResult {
             delete_object: Option<rustfs_ecstore::store_api::DeletedObject>,
@@ -2175,6 +2208,17 @@ impl S3 for FS {
                 Ok(res) => (res, None),
                 Err(e) => (ObjectInfo::default(), Some(e.to_string())),
             };
+
+            // Check Object Lock retention before deletion
+            if gerr.is_none() && check_object_lock_for_deletion(&bucket, &goi, bypass_governance).await {
+                delete_results[idx].error = Some(Error {
+                    code: Some("AccessDenied".to_string()),
+                    key: Some(obj_id.key.clone()),
+                    message: Some("Object is retained and cannot be deleted until the retention period expires".to_string()),
+                    version_id: version_id.clone(),
+                });
+                continue;
+            }
 
             // Store object size for quota tracking
             object_sizes.insert(object.object_name.clone(), goi.size);
@@ -5992,6 +6036,20 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
+        // When Object Lock is enabled, automatically enable versioning if not already enabled
+        // This matches AWS S3 and MinIO behavior
+        let versioning_config = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
+        if !versioning_config.enabled() {
+            let enable_versioning_config = VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            };
+            let versioning_data = try_!(serialize(&enable_versioning_config));
+            metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
+                .await
+                .map_err(ApiError::from)?;
+        }
+
         Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
 
@@ -6639,7 +6697,48 @@ impl S3 for FS {
         // check object lock
         validate_bucket_object_lock_enabled(&bucket).await?;
 
-        // TODO: check allow
+        // Check if object already has retention and if modification is allowed
+        // This follows AWS S3 and MinIO behavior:
+        // - COMPLIANCE mode: cannot modify retention (even with bypass header)
+        // - GOVERNANCE mode: requires bypass header to modify retention
+        let check_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+
+        if let Ok(existing_obj_info) = store.get_object_info(&bucket, &key, &check_opts).await {
+            let existing_retention = objectlock::get_object_retention_meta(&existing_obj_info.user_defined);
+
+            if let Some(mode) = existing_retention.mode {
+                let mode_str = mode.as_str();
+
+                // Check if retention period is still active
+                let now = objectlock::utc_now_ntp();
+                let retention_active = if let Some(retain_until_date) = existing_retention.retain_until_date {
+                    OffsetDateTime::from(retain_until_date).unix_timestamp() > now.unix_timestamp()
+                } else {
+                    false
+                };
+
+                if retention_active {
+                    if mode_str == ObjectLockRetentionMode::COMPLIANCE {
+                        // COMPLIANCE mode: cannot modify retention, even with bypass header
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::AccessDenied,
+                            "Cannot modify retention in COMPLIANCE mode",
+                        ));
+                    } else if mode_str == ObjectLockRetentionMode::GOVERNANCE {
+                        // GOVERNANCE mode: need bypass header to modify retention
+                        // (permission for bypass already verified in access.rs)
+                        if !has_bypass_governance_header(&req.headers) {
+                            return Err(S3Error::with_message(
+                                S3ErrorCode::AccessDenied,
+                                "Cannot modify retention in GOVERNANCE mode without x-amz-bypass-governance-retention header",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
 
         let eval_metadata = parse_object_lock_retention(retention)?;
 

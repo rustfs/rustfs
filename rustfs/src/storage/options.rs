@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use http::{HeaderMap, HeaderValue};
+use rustfs_ecstore::bucket::object_lock::objectlock_sys::BucketObjectLockSys;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
@@ -188,8 +189,14 @@ pub async fn put_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
-    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
+    let mut versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+
+    // If Object Lock is enabled, automatically enable versioning for PUT operations
+    // This matches AWS S3 and MinIO behavior: Object Lock requires versioning
+    if !versioned && !version_suspended && BucketObjectLockSys::get(bucket).await.is_some() {
+        versioned = true;
+    }
 
     let vid = if vid.is_none() {
         headers

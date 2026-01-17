@@ -90,7 +90,7 @@ impl Evaluator {
             return false;
         }
 
-        let lhold = get_object_legalhold_meta(obj.user_defined.clone());
+        let lhold = get_object_legalhold_meta(&obj.user_defined);
         if lhold
             .status
             .is_some_and(|v| v.valid() && v.as_str() == ObjectLockLegalHoldStatus::ON)
@@ -98,7 +98,7 @@ impl Evaluator {
             return true;
         }
 
-        let ret = get_object_retention_meta(obj.user_defined.clone());
+        let ret = get_object_retention_meta(&obj.user_defined);
         if ret
             .mode
             .is_some_and(|v| matches!(v.as_str(), ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE))
