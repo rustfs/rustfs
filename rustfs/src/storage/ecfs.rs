@@ -5072,7 +5072,7 @@ impl S3 for FS {
             None => (None, None),
         };
         
-        if let Some(material) = apply_encryption(encryption_request).await? {
+        if let Some(material) = sse_encryption(encryption_request).await? {
             // Store encryption metadata for later use by upload_part and complete_multipart_upload
             metadata.extend(material.metadata);
             

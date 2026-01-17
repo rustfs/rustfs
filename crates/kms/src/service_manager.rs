@@ -221,7 +221,7 @@ impl KmsServiceManager {
         match self.create_service_version(&new_config).await {
             Ok(new_service_version) => {
                 // Get old version for logging (lock-free read)
-                let old_version = self.current_service.load().as_ref().as_ref().and_then(|sv| Some(sv.version));
+                let old_version = self.current_service.load().as_ref().as_ref().map(|sv| sv.version);
 
                 // Atomically switch to new service version (lock-free, instant CAS operation)
                 // This is a true atomic operation - no waiting for locks, instant switch
