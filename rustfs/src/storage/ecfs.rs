@@ -993,7 +993,7 @@ impl S3 for FS {
         // Note: SSE-C for copy source is handled via copy_source_sse_customer_* headers
         let copy_source_sse_customer_key = req.input.copy_source_sse_customer_key.as_ref();
         let copy_source_sse_customer_key_md5 = req.input.copy_source_sse_customer_key_md5.as_ref();
-        
+
         let decryption_request = DecryptionRequest {
             bucket: &src_bucket,
             key: &src_key,
@@ -1003,7 +1003,7 @@ impl S3 for FS {
             part_number: None,
             parts: &src_info.parts,
         };
-        
+
         if let Some(material) = apply_decryption(decryption_request).await? {
             reader = material.wrap_single_reader(reader);
             if let Some(original) = material.original_size {
@@ -2179,21 +2179,26 @@ impl S3 for FS {
             None
         };
 
-        // Apply unified SSE decryption using apply_decryption API
-        let mut final_stream = reader.stream;
-        let mut encryption_applied = false;
-        let mut response_content_length = content_length;
-
         // ============================================
         // Apply Unified SSE Decryption
         // ============================================
         // Apply decryption if object is encrypted
+
+        // Apply unified SSE decryption using apply_decryption API
+        let mut final_stream = reader.stream;
+        let mut response_content_length = content_length;
+
         debug!(
             "GET object metadata check: parts={}, provided_sse_key={:?}",
             info.parts.len(),
             req.input.sse_customer_key.is_some()
         );
 
+        let mut encryption_applied = false;
+        let server_side_encryption: Option<ServerSideEncryption>;
+        let sse_customer_algorithm: Option<SSECustomerAlgorithm>;
+        let sse_customer_key_md5: Option<SSECustomerKeyMD5>;
+        let ssekms_key_id: Option<SSEKMSKeyId>;
         let decryption_request = DecryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -2204,6 +2209,11 @@ impl S3 for FS {
             parts: &info.parts,
         };
         if let Some(material) = apply_decryption(decryption_request).await? {
+            ssekms_key_id = material.kms_key_id.clone();
+            server_side_encryption = Some(material.server_side_encryption.clone());
+            sse_customer_algorithm = Some(material.algorithm.clone());
+            sse_customer_key_md5 = material.customer_key_md5.clone();
+
             // Apply unified SSE decryption (handles single-part, multipart, and hard limit)
             let (decrypted_stream, plaintext_size) = material
                 .wrap_reader(final_stream, content_length)
@@ -2213,6 +2223,12 @@ impl S3 for FS {
             final_stream = decrypted_stream;
             response_content_length = plaintext_size;
             encryption_applied = true;
+        } else {
+            // No encryption applied
+            ssekms_key_id = None;
+            server_side_encryption = None;
+            sse_customer_algorithm = None;
+            sse_customer_key_md5 = None;
         }
 
         // Calculate concurrency-aware buffer size for optimal performance
@@ -2363,21 +2379,6 @@ impl S3 for FS {
                 )))
             }
         };
-
-        // Extract SSE information from metadata for response
-        let server_side_encryption = info
-            .user_defined
-            .get("x-amz-server-side-encryption")
-            .map(|v| ServerSideEncryption::from(v.clone()));
-        let sse_customer_algorithm = info
-            .user_defined
-            .get("x-amz-server-side-encryption-customer-algorithm")
-            .map(|v| SSECustomerAlgorithm::from(v.clone()));
-        let sse_customer_key_md5 = info
-            .user_defined
-            .get("x-amz-server-side-encryption-customer-key-md5")
-            .cloned();
-        let ssekms_key_id = info.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
 
         let mut checksum_crc32 = None;
         let mut checksum_crc32c = None;
@@ -3342,7 +3343,7 @@ impl S3 for FS {
                 effective_kms_key_id = Some(kms_key_id);
             }
 
-            effective_sse = Some(material.algorithm);
+            effective_sse = Some(material.server_side_encryption);
         }
 
         let mut reader = PutObjReader::new(reader);
@@ -3437,8 +3438,8 @@ impl S3 for FS {
         let output = PutObjectOutput {
             e_tag,
             server_side_encryption: effective_sse, // TDD: Return effective encryption config
-            sse_customer_algorithm: sse_customer_algorithm,
-            sse_customer_key_md5: sse_customer_key_md5,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
             ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
             checksum_crc32,
             checksum_crc32c,

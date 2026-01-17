@@ -97,10 +97,14 @@ use tracing::{debug, error, warn};
 use crate::error::ApiError;
 use rustfs_ecstore::bucket::metadata_sys;
 use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
-
+use crate::storage::sse::EncryptionType::SseC;
 // ============================================================================
 // High-Level SSE Configuration
 // ============================================================================
+
+const DEFAULT_SSE_ALGORITHM: &str = "AES256";
+
+const SUPPORT_SSE_ALGORITHMS: &[&str] = &[DEFAULT_SSE_ALGORITHM];
 
 /// SSE configuration resolved from request and bucket defaults
 #[derive(Debug)]
@@ -221,31 +225,36 @@ pub struct DecryptionRequest<'a> {
 /// Unified encryption material returned by `apply_encryption()`
 #[derive(Debug)]
 pub struct EncryptionMaterial {
+    pub encryption_type: EncryptionType,
+    pub server_side_encryption: ServerSideEncryption,
+    pub kms_key_id: Option<SSEKMSKeyId>,
+    pub algorithm: SSECustomerAlgorithm,
+
     /// Encryption key bytes
     pub key_bytes: [u8; 32],
     /// Nonce/IV for encryption
     pub nonce: [u8; 12],
     /// Metadata to store with the object
     pub metadata: HashMap<String, String>,
-    /// Server-side encryption algorithm
-    pub algorithm: ServerSideEncryption,
-    /// Encryption type for logging/debugging
-    pub encryption_type: EncryptionType,
-    /// KMS key ID (for managed SSE only)
-    pub kms_key_id: Option<SSEKMSKeyId>,
 }
 
 /// Unified decryption material returned by `apply_decryption()`
 #[derive(Debug)]
 pub struct DecryptionMaterial {
+    pub encryption_type: EncryptionType,
+    pub server_side_encryption: ServerSideEncryption,
+    pub kms_key_id: Option<SSEKMSKeyId>,
+    pub algorithm: SSECustomerAlgorithm,
+    pub customer_key_md5: Option<SSECustomerKeyMD5>, // if use SSE-C, check key md5
+
+
     /// Decryption key bytes
     pub key_bytes: [u8; 32],
     /// Nonce/IV for decryption
     pub nonce: [u8; 12],
     /// Original unencrypted size (if available)
     pub original_size: Option<i64>,
-    /// Encryption type for logging/debugging
-    pub encryption_type: EncryptionType,
+
     /// Whether this is a multipart object
     pub is_multipart: bool,
     /// Part information for multipart objects
@@ -372,8 +381,8 @@ pub async fn apply_encryption(request: EncryptionRequest<'_>) -> Result<Option<E
             &request.bucket,
             &request.key,
             algorithm,
-            &key,
-            &key_md5,
+            key,
+            key_md5,
             request.content_size,
             request.part_number,
         )
@@ -384,12 +393,12 @@ pub async fn apply_encryption(request: EncryptionRequest<'_>) -> Result<Option<E
     // Priority 2: Managed SSE (SSE-S3 or SSE-KMS)
     let sse_config = prepare_sse_configuration(request.bucket, request.server_side_encryption, request.ssekms_key_id).await?;
 
-    if let Some(sse_algorithm) = sse_config.effective_sse {
-        if is_managed_sse(&sse_algorithm) {
+    if let Some(server_side_encryption) = sse_config.effective_sse {
+        if is_managed_sse(&server_side_encryption) {
             return apply_managed_encryption_material(
                 request.bucket,
                 request.key,
-                sse_algorithm,
+                server_side_encryption,
                 sse_config.effective_kms_key_id,
                 request.content_size,
                 request.part_number,
@@ -450,16 +459,16 @@ pub async fn apply_decryption(request: DecryptionRequest<'_>) -> Result<Option<D
             }
         };
 
+        // Verify that the provided key MD5 matches the stored MD5 for security
+        let stored_md5 = request.metadata.get("x-amz-server-side-encryption-customer-key-md5");
+        verify_ssec_key_match(key_md5, stored_md5.clone())?;
+
         // For multipart SSE-C objects, just validate the key but don't decrypt yet
         if is_multipart {
             warn!(
                 "SSE-C multipart object detected with {} parts. Currently, multipart SSE-C upload parts are not encrypted during upload_part, so no decryption is needed during GET.",
                 request.parts.len()
             );
-
-            // Verify that the provided key MD5 matches the stored MD5 for security
-            let stored_md5 = request.metadata.get("x-amz-server-side-encryption-customer-key-md5");
-            verify_ssec_key_match(key_md5, stored_md5)?;
 
             // Return None to indicate no decryption is needed (parts are not encrypted)
             return Ok(None);
@@ -470,6 +479,8 @@ pub async fn apply_decryption(request: DecryptionRequest<'_>) -> Result<Option<D
                 .await?;
         material.is_multipart = is_multipart;
         material.parts = request.parts.to_vec();
+        material.customer_key_md5 = Some(key_md5.clone());
+
         return Ok(Some(material));
     }
 
@@ -496,18 +507,18 @@ async fn apply_ssec_encryption_material(
     bucket: &str,
     key: &str,
     algorithm: SSECustomerAlgorithm,
-    sse_key: &SSECustomerKey,
-    sse_key_md5: &SSECustomerKeyMD5,
+    sse_key: SSECustomerKey,
+    sse_key_md5: SSECustomerKeyMD5,
     content_size: i64,
     part_number: Option<usize>,
 ) -> Result<EncryptionMaterial, ApiError> {
     let params = SsecParams {
-        algorithm: algorithm.clone(),
+        algorithm,
         key: sse_key.to_string(),
-        key_md5: sse_key_md5.to_string(),
+        key_md5: sse_key_md5,
     };
 
-    let validated = validate_ssec_params(&params)?;
+    let validated = validate_ssec_params(params)?;
 
     // Generate nonce (deterministic for SSE-C)
     let base_nonce = generate_ssec_nonce(bucket, key);
@@ -526,15 +537,14 @@ async fn apply_ssec_encryption_material(
         content_size.to_string(),
     );
 
-    let algorithm = ServerSideEncryption::from(validated.algorithm);
-
     Ok(EncryptionMaterial {
+        encryption_type: EncryptionType::SseC,
+        server_side_encryption: ServerSideEncryption::AES256.parse().unwrap(),
+        kms_key_id: None,
+        algorithm: validated.algorithm,
         key_bytes: validated.key_bytes,
         nonce,
         metadata,
-        encryption_type: EncryptionType::SseC,
-        algorithm,
-        kms_key_id: None,
     })
 }
 
@@ -546,10 +556,6 @@ async fn apply_ssec_decryption_material(
     sse_key_md5: &str,
     part_number: Option<usize>,
 ) -> Result<DecryptionMaterial, ApiError> {
-    // Verify key matches
-    let stored_md5 = metadata.get("x-amz-server-side-encryption-customer-key-md5");
-    verify_ssec_key_match(sse_key_md5, stored_md5)?;
-
     // Validate provided key
     let algorithm = metadata
         .get("x-amz-server-side-encryption-customer-algorithm")
@@ -562,7 +568,7 @@ async fn apply_ssec_decryption_material(
         key_md5: sse_key_md5.to_string(),
     };
 
-    let validated = validate_ssec_params(&params)?;
+    let validated = validate_ssec_params(params)?;
 
     // Generate nonce (same as encryption)
     let base_nonce = generate_ssec_nonce(bucket, key);
@@ -577,10 +583,16 @@ async fn apply_ssec_decryption_material(
         .and_then(|s| s.parse::<i64>().ok());
 
     Ok(DecryptionMaterial {
+        encryption_type: EncryptionType::SseC,
+        server_side_encryption: ServerSideEncryption::AES256.parse().unwrap(), // const
+        kms_key_id: None,
+        algorithm: SSECustomerAlgorithm::from(algorithm),
+
+        customer_key_md5: None,
         key_bytes: validated.key_bytes,
         nonce,
         original_size,
-        encryption_type: EncryptionType::SseC,
+
         is_multipart: false,
         parts: Vec::new(),
     })
@@ -593,7 +605,7 @@ async fn apply_ssec_decryption_material(
 async fn apply_managed_encryption_material(
     bucket: &str,
     key: &str,
-    algorithm: ServerSideEncryption,
+    server_side_encryption: ServerSideEncryption,
     kms_key_id: Option<SSEKMSKeyId>,
     content_size: i64,
     part_number: Option<usize>,
@@ -602,15 +614,14 @@ async fn apply_managed_encryption_material(
     // During UploadPart, we use the same base nonce with incremented counter
     // This is handled externally, so here we just generate the base material
 
-    if !is_managed_sse(&algorithm) {
+    if !is_managed_sse(&server_side_encryption) {
         return Err(ApiError::from(StorageError::other(format!(
-            "Unsupported server-side encryption algorithm: {}",
-            algorithm.as_str()
+            "Unsupported server-side encryption: {}",
+            server_side_encryption.as_str()
         ))));
     }
 
-    let algorithm_str = algorithm.as_str();
-    let encryption_type = match algorithm_str {
+    let encryption_type = match server_side_encryption.as_str() {
         "AES256" => EncryptionType::SseS3,
         "aws:kms" => EncryptionType::SseKms,
         _ => EncryptionType::SseS3,
@@ -641,8 +652,10 @@ async fn apply_managed_encryption_material(
         .await
         .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {e}"))))?;
 
+    let algorithm = DEFAULT_SSE_ALGORITHM.to_string();
+
     let encryption_metadata = EncryptionMetadata {
-        algorithm: algorithm_str.to_string(),
+        algorithm: algorithm.clone(),
         key_id: kms_key_to_use.clone(),
         key_version: 1,
         iv: data_key.nonce.to_vec(),
@@ -667,7 +680,7 @@ async fn apply_managed_encryption_material(
         );
         metadata.insert("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(&encryption_metadata.iv));
         metadata.insert("x-rustfs-encryption-algorithm".to_string(), encryption_metadata.algorithm.clone());
-        metadata.insert("x-amz-server-side-encryption".to_string(), algorithm_str.to_string());
+        metadata.insert("x-amz-server-side-encryption".to_string(), server_side_encryption.as_str().to_string());
 
         // if kms_key is changed, we need to update the metadata
         if kms_key_id.is_none() {
@@ -688,12 +701,14 @@ async fn apply_managed_encryption_material(
     };
 
     Ok(EncryptionMaterial {
+        encryption_type,
+        server_side_encryption,
+        kms_key_id: Some(kms_key_to_use),
+        algorithm,
+
         key_bytes: data_key.plaintext_key,
         nonce,
         metadata,
-        algorithm,
-        encryption_type,
-        kms_key_id: Some(kms_key_to_use),
     })
 }
 
@@ -703,12 +718,15 @@ async fn apply_managed_decryption_material(
     metadata: &HashMap<String, String>,
     part_number: Option<usize>,
 ) -> Result<Option<DecryptionMaterial>, ApiError> {
-    if !metadata.contains_key("x-rustfs-encryption-key") {
+    if !metadata.contains_key("x-rustfs-encryption-key") || !metadata.contains_key("x-amz-server-side-encryption") {
         return Ok(None);
     }
 
+    let server_side_encryption = metadata.get("x-amz-server-side-encryption").unwrap().clone();
+
     // Parse metadata - try using service if available, otherwise parse manually
-    let (encrypted_data_key, iv, algorithm) = if let Some(service) = get_global_encryption_service().await {
+    let (encrypted_data_key, iv, algorithm) =
+        if let Some(service) = get_global_encryption_service().await {
         // Production mode: use service for metadata parsing
         let parsed = service
             .headers_to_metadata(metadata)
@@ -773,17 +791,23 @@ async fn apply_managed_decryption_material(
         .get("x-rustfs-encryption-original-size")
         .and_then(|s| s.parse::<i64>().ok());
 
-    let encryption_type = match algorithm.as_str() {
-        "AES256" => EncryptionType::SseS3,
-        "aws:kms" => EncryptionType::SseKms,
+    let encryption_type = match server_side_encryption.as_str() {
+        ServerSideEncryption::AES256 => EncryptionType::SseS3,
+        ServerSideEncryption::AWS_KMS => EncryptionType::SseKms,
         _ => EncryptionType::SseS3,
     };
 
     Ok(Some(DecryptionMaterial {
+        encryption_type,
+        server_side_encryption: ServerSideEncryption::from(server_side_encryption),
+        kms_key_id: Some(SSEKMSKeyId::from(kms_key_id)),
+        algorithm,
+        customer_key_md5: None,
+
         key_bytes,
         nonce,
         original_size,
-        encryption_type,
+
         is_multipart: false,
         parts: Vec::new(),
     }))
@@ -1351,12 +1375,12 @@ pub async fn decrypt_multipart_managed_stream(
 ///
 /// # Returns
 /// `ValidatedSsecParams` with decoded key bytes
-pub fn validate_ssec_params(params: &SsecParams) -> Result<ValidatedSsecParams, ApiError> {
+pub fn validate_ssec_params(params: SsecParams) -> Result<ValidatedSsecParams, ApiError> {
     // Validate algorithm
-    if params.algorithm != "AES256" {
+    if !SUPPORT_SSE_ALGORITHMS.contains(&params.algorithm.as_str()) {
         return Err(ApiError::from(StorageError::other(format!(
-            "Unsupported SSE-C algorithm: {}. Only AES256 is supported",
-            params.algorithm
+            "Unsupported SSE-C algorithm: {}. Only {} is supported",
+            params.algorithm, DEFAULT_SSE_ALGORITHM
         ))));
     }
 
@@ -1385,9 +1409,9 @@ pub fn validate_ssec_params(params: &SsecParams) -> Result<ValidatedSsecParams, 
     let key_array: [u8; 32] = key_bytes.try_into().expect("key length already validated to be 32 bytes");
 
     Ok(ValidatedSsecParams {
-        algorithm: params.algorithm.clone(),
+        algorithm: params.algorithm,
         key_bytes: key_array,
-        key_md5: params.key_md5.clone(),
+        key_md5: params.key_md5,
     })
 }
 
@@ -1505,7 +1529,7 @@ mod tests {
             key_md5,
         };
 
-        let result = validate_ssec_params(&params);
+        let result = validate_ssec_params(params);
         assert!(result.is_ok());
         let validated = result.unwrap();
         assert_eq!(validated.key_bytes, [42u8; 32]);
@@ -1522,7 +1546,7 @@ mod tests {
             key_md5,
         };
 
-        let result = validate_ssec_params(&params);
+        let result = validate_ssec_params(params);
         assert!(result.is_err());
     }
 
@@ -1537,7 +1561,7 @@ mod tests {
             key_md5,
         };
 
-        let result = validate_ssec_params(&params);
+        let result = validate_ssec_params(params);
         assert!(result.is_err());
     }
 
@@ -1552,7 +1576,7 @@ mod tests {
             key_md5,
         };
 
-        let result = validate_ssec_params(&params);
+        let result = validate_ssec_params(params);
         assert!(result.is_err());
     }
 
