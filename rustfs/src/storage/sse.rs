@@ -228,6 +228,8 @@ pub struct EncryptionMaterial {
     pub encryption_type: EncryptionType,
     pub server_side_encryption: ServerSideEncryption,
     pub kms_key_id: Option<SSEKMSKeyId>,
+
+    #[allow(unused)]
     pub algorithm: SSECustomerAlgorithm,
 
     /// Encryption key bytes
@@ -815,17 +817,6 @@ async fn apply_managed_decryption_material(
 // Legacy Types (for backward compatibility)
 // ============================================================================
 
-/// Material for managed server-side encryption (SSE-S3/SSE-KMS)
-#[derive(Debug, Clone)]
-pub struct ManagedEncryptionMaterial {
-    /// Data encryption key
-    pub data_key: DataKey,
-    /// Metadata headers to store with the object
-    pub headers: HashMap<String, String>,
-    /// KMS key ID used for encryption
-    pub kms_key_id: SSEKMSKeyId,
-}
-
 /// Validated SSE-C parameters
 #[derive(Debug, Clone)]
 pub struct ValidatedSsecParams {
@@ -1135,70 +1126,6 @@ pub fn reset_sse_dek_provider() {
 #[inline]
 pub fn is_managed_sse(server_side_encryption: &ServerSideEncryption) -> bool {
     matches!(server_side_encryption.as_str(), "AES256" | "aws:kms")
-}
-
-/// Create managed encryption material for SSE-S3 or SSE-KMS
-///
-/// **DEPRECATED**: Use `apply_encryption()` instead for unified API
-pub async fn create_managed_encryption_material(
-    bucket: &str,
-    key: &str,
-    algorithm: &ServerSideEncryption,
-    kms_key_id: Option<String>,
-    original_size: i64,
-) -> Result<ManagedEncryptionMaterial, ApiError> {
-    let Some(service) = get_global_encryption_service().await else {
-        return Err(ApiError::from(StorageError::other("KMS encryption service is not initialized")));
-    };
-
-    if !is_managed_sse(algorithm) {
-        return Err(ApiError::from(StorageError::other(format!(
-            "Unsupported server-side encryption algorithm: {}",
-            algorithm.as_str()
-        ))));
-    }
-
-    let algorithm_str = algorithm.as_str();
-
-    let mut context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
-    if original_size >= 0 {
-        context = context.with_size(original_size as u64);
-    }
-
-    let mut kms_key_candidate = kms_key_id;
-    if kms_key_candidate.is_none() {
-        kms_key_candidate = service.get_default_key_id().cloned();
-    }
-
-    let kms_key_to_use = kms_key_candidate
-        .clone()
-        .ok_or_else(|| ApiError::from(StorageError::other("No KMS key available for managed server-side encryption")))?;
-
-    let (data_key, encrypted_data_key) = service
-        .create_data_key(&kms_key_candidate, &context)
-        .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {e}"))))?;
-
-    let metadata = EncryptionMetadata {
-        algorithm: algorithm_str.to_string(),
-        key_id: kms_key_to_use.clone(),
-        key_version: 1,
-        iv: data_key.nonce.to_vec(),
-        tag: None,
-        encryption_context: context.encryption_context.clone(),
-        encrypted_at: Utc::now(),
-        original_size: if original_size >= 0 { original_size as u64 } else { 0 },
-        encrypted_data_key,
-    };
-
-    let mut headers = service.metadata_to_headers(&metadata);
-    headers.insert("x-rustfs-encryption-original-size".to_string(), metadata.original_size.to_string());
-
-    Ok(ManagedEncryptionMaterial {
-        data_key,
-        headers,
-        kms_key_id: kms_key_to_use,
-    })
 }
 
 /// Decrypt managed encryption key from object metadata
