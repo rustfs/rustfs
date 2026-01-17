@@ -97,7 +97,7 @@ use tracing::{debug, error, warn};
 use crate::error::ApiError;
 use rustfs_ecstore::bucket::metadata_sys;
 use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
-use crate::storage::sse::EncryptionType::SseC;
+
 // ============================================================================
 // High-Level SSE Configuration
 // ============================================================================
@@ -372,7 +372,7 @@ impl DecryptionMaterial {
 ///     metadata.extend(material.metadata);
 /// }
 /// ```
-pub async fn apply_encryption(request: EncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
+pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
     // Priority 1: SSE-C (customer-provided key)
     if let (Some(algorithm), Some(key), Some(key_md5)) =
         (request.sse_customer_algorithm, request.sse_customer_key, request.sse_customer_key_md5)
@@ -442,7 +442,7 @@ pub async fn apply_encryption(request: EncryptionRequest<'_>) -> Result<Option<E
 ///     reader = material.wrap_reader(reader)?;
 /// }
 /// ```
-pub async fn apply_decryption(request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, ApiError> {
+pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, ApiError> {
     let is_multipart = request.parts.len() > 1;
 
     // Check for SSE-C encryption
@@ -943,11 +943,11 @@ impl SseDekProvider for KmsSseDekProvider {
 /// # Linux/Unix/macOS
 /// ./scripts/generate-sse-keys.sh
 /// ```
-struct SimpleSseDekProvider {
+struct TestSseDekProvider {
     master_key: [u8; 32],
 }
 
-impl SimpleSseDekProvider {
+impl TestSseDekProvider {
     /// Create a SimpleSseDekProvider with a predefined key (for testing)
     #[cfg(test)]
     pub fn new_with_key(master_key: [u8; 32]) -> Self {
@@ -1040,7 +1040,7 @@ impl SimpleSseDekProvider {
 }
 
 #[async_trait]
-impl SseDekProvider for SimpleSseDekProvider {
+impl SseDekProvider for TestSseDekProvider {
     async fn generate_sse_dek(&self, _bucket: &str, _key: &str, _kms_key_id: &str) -> Result<(DataKey, Vec<u8>), ApiError> {
         // Generate a 32-byte array as data key
         let mut dek = [0u8; 32];
@@ -1104,7 +1104,7 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
     // Determine provider based on environment variable
     let provider: Arc<dyn SseDekProvider> = if std::env::var("__RUSTFS_SSE_SIMPLE_CMK").is_ok() {
         debug!("Using SimpleSseDekProvider (test mode) based on __RUSTFS_SSE_SIMPLE_CMK");
-        Arc::new(SimpleSseDekProvider::new())
+        Arc::new(TestSseDekProvider::new())
     } else {
         debug!("Using KmsSseDekProvider (production mode)");
         Arc::new(KmsSseDekProvider::new().await?)
@@ -1624,7 +1624,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         // 1. Setup: Create SimpleSseDekProvider with test master key
-        let provider = SimpleSseDekProvider::new_with_key([42u8; 32]);
+        let provider = TestSseDekProvider::new_with_key([42u8; 32]);
 
         // 2. Generate a data encryption key
         let bucket = "test-bucket";
@@ -1691,7 +1691,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         // 1. Setup: Create SimpleSseDekProvider with test master key
-        let provider = SimpleSseDekProvider::new_with_key([42u8; 32]);
+        let provider = TestSseDekProvider::new_with_key([42u8; 32]);
 
         let bucket = "test-bucket";
         let key = "test-key-large";
@@ -1742,7 +1742,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         // 1. Setup: Create SimpleSseDekProvider with test master key
-        let provider = SimpleSseDekProvider::new_with_key([42u8; 32]);
+        let provider = TestSseDekProvider::new_with_key([42u8; 32]);
 
         let bucket = "test-bucket";
         let key = "test-key";
@@ -1792,7 +1792,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         // 1. Setup: Create SimpleSseDekProvider with test master key
-        let provider = SimpleSseDekProvider::new_with_key([42u8; 32]);
+        let provider = TestSseDekProvider::new_with_key([42u8; 32]);
 
         let bucket = "test-bucket";
         let key = "test-key";

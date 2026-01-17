@@ -138,6 +138,10 @@ pub struct Opt {
     #[arg(long, env = "RUSTFS_KMS_KEY_DIR")]
     pub kms_key_dir: Option<String>,
 
+    /// KMS local master key for local backend (optional)
+    #[arg(long, env = "RUSTFS_KMS_LOCAL_MASTER_KEY")]
+    pub kms_local_master_key: Option<String>,
+
     /// Vault address for vault backend
     #[arg(long, env = "RUSTFS_KMS_VAULT_ADDRESS")]
     pub kms_vault_address: Option<String>,

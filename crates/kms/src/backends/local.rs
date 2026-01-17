@@ -25,6 +25,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
 };
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -57,8 +58,8 @@ struct StoredMasterKey {
     created_at: chrono::DateTime<chrono::Utc>,
     rotated_at: Option<chrono::DateTime<chrono::Utc>>,
     created_by: Option<String>,
-    /// Encrypted key material (32 bytes for AES-256)
-    encrypted_key_material: Vec<u8>,
+    /// Encrypted key material (32 bytes encoded in base64 for AES-256)
+    encrypted_key_material: String,
     /// Nonce used for encryption
     nonce: Vec<u8>,
 }
@@ -107,8 +108,8 @@ impl LocalKmsClient {
         self.config.key_dir.join(format!("{key_id}.key"))
     }
 
-    /// Load a master key from disk
-    async fn load_master_key(&self, key_id: &str) -> Result<MasterKeyInfo> {
+    /// Decode and decrypt a stored key file, returning both the metadata and decrypted key material
+    async fn decode_stored_key(&self, key_id: &str) -> Result<(StoredMasterKey, Vec<u8>)> {
         let key_path = self.master_key_path(key_id);
         if !key_path.exists() {
             return Err(KmsError::key_not_found(key_id));
@@ -118,7 +119,7 @@ impl LocalKmsClient {
         let stored_key: StoredMasterKey = serde_json::from_slice(&content)?;
 
         // Decrypt key material if master cipher is available
-        let _key_material = if let Some(ref cipher) = self.master_cipher {
+        let key_material = if let Some(ref cipher) = self.master_cipher {
             if stored_key.nonce.len() != 12 {
                 return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
             }
@@ -127,12 +128,27 @@ impl LocalKmsClient {
             nonce_array.copy_from_slice(&stored_key.nonce);
             let nonce = Nonce::from(nonce_array);
 
+            // Decode base64 string to bytes
+            let encrypted_bytes = BASE64
+                .decode(&stored_key.encrypted_key_material)
+                .map_err(|e| KmsError::cryptographic_error("base64_decode", e.to_string()))?;
+
             cipher
-                .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
+                .decrypt(&nonce, encrypted_bytes.as_ref())
                 .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
         } else {
-            stored_key.encrypted_key_material
+            // Decode base64 string to bytes when no encryption
+            BASE64
+                .decode(&stored_key.encrypted_key_material)
+                .map_err(|e| KmsError::cryptographic_error("base64_decode", e.to_string()))?
         };
+
+        Ok((stored_key, key_material))
+    }
+
+    /// Load a master key from disk
+    async fn load_master_key(&self, key_id: &str) -> Result<MasterKeyInfo> {
+        let (stored_key, _key_material) = self.decode_stored_key(key_id).await?;
 
         Ok(MasterKeyInfo {
             key_id: stored_key.key_id,
@@ -161,9 +177,11 @@ impl LocalKmsClient {
             let encrypted = cipher
                 .encrypt(&nonce, key_material)
                 .map_err(|e| KmsError::cryptographic_error("encrypt", e.to_string()))?;
-            (encrypted, nonce.to_vec())
+            // Encode encrypted bytes to base64 string
+            (BASE64.encode(&encrypted), nonce.to_vec())
         } else {
-            (key_material.to_vec(), Vec::new())
+            // Encode key material to base64 string when no encryption
+            (BASE64.encode(key_material), Vec::new())
         };
 
         let stored_key = StoredMasterKey {
@@ -203,30 +221,7 @@ impl LocalKmsClient {
 
     /// Get the actual key material for a master key
     async fn get_key_material(&self, key_id: &str) -> Result<Vec<u8>> {
-        let key_path = self.master_key_path(key_id);
-
-        if !key_path.exists() {
-            return Err(KmsError::key_not_found(key_id));
-        }
-
-        let content = fs::read(&key_path).await?;
-        let stored_key: StoredMasterKey = serde_json::from_slice(&content)?;
-
-        // Decrypt key material if master cipher is available
-        let key_material = if let Some(ref cipher) = self.master_cipher {
-            if stored_key.nonce.len() != 12 {
-                return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
-            }
-            let mut nonce_array = [0u8; 12];
-            nonce_array.copy_from_slice(&stored_key.nonce);
-            let nonce = Nonce::from(nonce_array);
-            cipher
-                .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
-                .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
-        } else {
-            stored_key.encrypted_key_material
-        };
-
+        let (_stored_key, key_material) = self.decode_stored_key(key_id).await?;
         Ok(key_material)
     }
 
@@ -752,28 +747,12 @@ impl KmsBackend for LocalKmsBackend {
         };
 
         // Save the updated key to disk - preserve existing key material!
-        // Load the stored key from disk to get the existing key material
-        let key_path = self.client.master_key_path(key_id);
-        let content = tokio::fs::read(&key_path)
+        // Load and decode the stored key to get the existing key material
+        let (_stored_key, existing_key_material) = self
+            .client
+            .decode_stored_key(key_id)
             .await
-            .map_err(|e| KmsError::internal_error(format!("Failed to read key file: {e}")))?;
-        let stored_key: StoredMasterKey =
-            serde_json::from_slice(&content).map_err(|e| KmsError::internal_error(format!("Failed to parse stored key: {e}")))?;
-
-        // Decrypt the existing key material to preserve it
-        let existing_key_material = if let Some(ref cipher) = self.client.master_cipher {
-            if stored_key.nonce.len() != 12 {
-                return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
-            }
-            let mut nonce_array = [0u8; 12];
-            nonce_array.copy_from_slice(&stored_key.nonce);
-            let nonce = Nonce::from(nonce_array);
-            cipher
-                .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
-                .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
-        } else {
-            stored_key.encrypted_key_material
-        };
+            .map_err(|e| KmsError::internal_error(format!("Failed to decode key: {e}")))?;
 
         self.client.save_master_key(&master_key, &existing_key_material).await?;
 
@@ -820,27 +799,11 @@ impl KmsBackend for LocalKmsBackend {
 
         // Save the updated key to disk - this is the missing critical step!
         // Preserve existing key material instead of generating new one
-        let key_path = self.client.master_key_path(key_id);
-        let content = tokio::fs::read(&key_path)
+        let (_stored_key, existing_key_material) = self
+            .client
+            .decode_stored_key(key_id)
             .await
-            .map_err(|e| KmsError::internal_error(format!("Failed to read key file: {e}")))?;
-        let stored_key: StoredMasterKey =
-            serde_json::from_slice(&content).map_err(|e| KmsError::internal_error(format!("Failed to parse stored key: {e}")))?;
-
-        // Decrypt the existing key material to preserve it
-        let existing_key_material = if let Some(ref cipher) = self.client.master_cipher {
-            if stored_key.nonce.len() != 12 {
-                return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
-            }
-            let mut nonce_array = [0u8; 12];
-            nonce_array.copy_from_slice(&stored_key.nonce);
-            let nonce = Nonce::from(nonce_array);
-            cipher
-                .decrypt(&nonce, stored_key.encrypted_key_material.as_ref())
-                .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
-        } else {
-            stored_key.encrypted_key_material
-        };
+            .map_err(|e| KmsError::internal_error(format!("Failed to decode key: {e}")))?;
 
         self.client.save_master_key(&master_key, &existing_key_material).await?;
 

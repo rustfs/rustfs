@@ -26,7 +26,7 @@ use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::sse::{
-    DecryptionRequest, EncryptionRequest, InMemoryAsyncReader, apply_decryption, apply_encryption,
+    DecryptionRequest, EncryptionRequest, InMemoryAsyncReader, sse_decryption, sse_encryption,
     decrypt_managed_encryption_key, derive_part_nonce, prepare_sse_configuration, strip_managed_encryption_metadata,
 };
 use crate::storage::{
@@ -1004,7 +1004,7 @@ impl S3 for FS {
             parts: &src_info.parts,
         };
 
-        if let Some(material) = apply_decryption(decryption_request).await? {
+        if let Some(material) = sse_decryption(decryption_request).await? {
             reader = material.wrap_single_reader(reader);
             if let Some(original) = material.original_size {
                 src_info.actual_size = original;
@@ -1082,7 +1082,7 @@ impl S3 for FS {
             part_number: None,
         };
         
-        if let Some(material) = apply_encryption(encryption_request).await? {
+        if let Some(material) = sse_encryption(encryption_request).await? {
             // Apply encryption wrapper
             let encrypted_reader = material.wrap_reader(reader);
             reader = HashReader::new(encrypted_reader, -1, actual_size, None, None, false).map_err(ApiError::from)?;
@@ -2208,7 +2208,7 @@ impl S3 for FS {
             part_number: None,
             parts: &info.parts,
         };
-        if let Some(material) = apply_decryption(decryption_request).await? {
+        if let Some(material) = sse_decryption(decryption_request).await? {
             ssekms_key_id = material.kms_key_id.clone();
             server_side_encryption = Some(material.server_side_encryption.clone());
             sse_customer_algorithm = Some(material.algorithm.clone());
@@ -3330,7 +3330,7 @@ impl S3 for FS {
             content_size: actual_size,
             part_number: None,
         };
-        if let Some(material) = apply_encryption(encryption_request).await? {
+        if let Some(material) = sse_encryption(encryption_request).await? {
             // Apply encryption wrapper
             let encrypted_reader = material.wrap_reader(reader);
             reader = HashReader::new(encrypted_reader, -1, actual_size, None, None, false).map_err(ApiError::from)?;
@@ -3528,7 +3528,7 @@ impl S3 for FS {
             part_number: None,
         };
         
-        if let Some(material) = apply_encryption(encryption_request).await? {
+        if let Some(material) = sse_encryption(encryption_request).await? {
             // Store encryption metadata for later use by upload_part and complete_multipart_upload
             metadata.extend(material.metadata);
             
@@ -3709,7 +3709,7 @@ impl S3 for FS {
             part_number: Some(part_id),
         };
         
-        if let Some(material) = apply_encryption(encryption_request).await? {
+        if let Some(material) = sse_encryption(encryption_request).await? {
             // Apply encryption wrapper
             let encrypted_reader = material.wrap_reader(reader);
             reader = encrypted_reader;
@@ -3763,7 +3763,7 @@ impl S3 for FS {
             parts: &[],
         };
         
-        if let Some(material) = apply_decryption(decryption_request).await? {
+        if let Some(material) = sse_decryption(decryption_request).await? {
             // For upload_part, we use the decryption material to get the key/nonce,
             // then apply encryption (since we're encrypting the part data)
             let part_nonce = derive_part_nonce(material.nonce, part_id);
@@ -3982,7 +3982,7 @@ impl S3 for FS {
             parts: &src_info.parts,
         };
         
-        if let Some(material) = apply_decryption(src_decryption_request).await? {
+        if let Some(material) = sse_decryption(src_decryption_request).await? {
             reader = material.wrap_single_reader(reader);
             if let Some(original) = material.original_size {
                 src_info.actual_size = original;
@@ -4012,7 +4012,7 @@ impl S3 for FS {
             parts: &[],
         };
         
-        if let Some(material) = apply_decryption(dst_decryption_request).await? {
+        if let Some(material) = sse_decryption(dst_decryption_request).await? {
             // For upload_part_copy, we use the decryption material to get the key/nonce,
             // then apply encryption (since we're encrypting the part data)
             let part_nonce = derive_part_nonce(material.nonce, part_id);
