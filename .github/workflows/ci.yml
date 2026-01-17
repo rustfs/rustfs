@@ -159,8 +159,8 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: s3s-e2e
-          git: https://github.com/Nugine/s3s.git
-          rev: 9e41304ed549b89cfb03ede98e9c0d2ac7522051
+          git: https://github.com/s3s-project/s3s.git
+          rev: 4a04a670cf41274d9be9ab65dc36f4aa3f92fbad
 
       - name: Build debug binary
         run: |
