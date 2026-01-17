@@ -1453,9 +1453,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.52"
+version = "1.2.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd4932aefd12402b36c60956a4fe0035421f544799057659ff86f923657aada3"
+checksum = "755d2fce177175ffca841e9a06afdb2c4ab0f593d53b4dee48147dfaade85932"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1635,9 +1635,9 @@ dependencies = [
 
 [[package]]
 name = "cmov"
-version = "0.4.5"
+version = "0.5.0-pre.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1339d398d44e506d9b72c1af2f6f51a41c9c64f9a0738eb9aedede47ed1f683"
+checksum = "5417da527aa9bf6a1e10a781231effd1edd3ee82f27d5f8529ac9b279babce96"
 
 [[package]]
 name = "colorchoice"
@@ -2084,9 +2084,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c67c81499f542d1dd38c6a2a2fe825f4dd4bca5162965dd2eea0c8119873d3c"
+checksum = "758e5ed90be3c8abff7f9a6f37ab7f6d8c59c2210d448b81f3f508134aec84e4"
 dependencies = [
  "cmov",
 ]
@@ -3567,9 +3567,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f449e6c6c08c865631d4890cfacf252b3d396c9bcc83adb6623cdb02a8336c41"
+checksum = "8591b0bcc8a98a64310a2fae1bb3e9b8564dd10e381e6e28010fde8e8e8568db"
 
 [[package]]
 name = "findshlibs"
@@ -8376,7 +8376,7 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.8",
+ "rustls-webpki 0.103.9",
  "subtle",
  "zeroize",
 ]
@@ -8404,9 +8404,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.13.3"
+version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4910321ebe4151be888e35fe062169554e74aad01beafed60410131420ceffbc"
+checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
 dependencies = [
  "web-time",
  "zeroize",
@@ -8425,9 +8425,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.8"
+version = "0.103.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ffdfa2f5286e2247234e03f680868ac2815974dc39e00ea15adc445d0aafe52"
+checksum = "d7df23109aa6c1567d1c575b9952556388da57401e4ace1d15f79eedad0d8f53"
 dependencies = [
  "aws-lc-rs",
  "ring",

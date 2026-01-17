@@ -152,7 +152,7 @@ pbkdf2 = "0.13.0-rc.7"
 rsa = { version = "0.10.0-rc.12" }
 rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pemfile = "2.2.0"
-rustls-pki-types = "1.13.2"
+rustls-pki-types = "1.14.0"
 sha1 = "0.11.0-rc.3"
 sha2 = "0.11.0-rc.3"
 subtle = "2.6"
