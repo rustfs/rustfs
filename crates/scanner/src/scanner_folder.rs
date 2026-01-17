@@ -44,7 +44,7 @@ use rustfs_ecstore::pools::{path2_bucket_object, path2_bucket_object_with_base_p
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicationStatusType};
-use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf, path_to_bucket_object_with_base_path};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use tokio::select;
 use tokio::sync::mpsc;

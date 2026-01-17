@@ -1104,7 +1104,7 @@ impl S3 for FS {
         })?;
 
         // Check if restore is already in progress
-        if obj_info.restore_ongoing && (rreq.type_.as_ref().map_or(true, |t| t.as_str() != "SELECT")) {
+        if obj_info.restore_ongoing && (rreq.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT")) {
             return Err(S3Error::with_message(
                 S3ErrorCode::Custom("ErrObjectRestoreAlreadyInProgress".into()),
                 "restore object failed.",
@@ -1124,7 +1124,7 @@ impl S3 for FS {
         let mut header = HeaderMap::new();
 
         let obj_info_ = obj_info.clone();
-        if rreq.type_.as_ref().map_or(true, |t| t.as_str() != "SELECT") {
+        if rreq.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT") {
             obj_info.metadata_only = true;
             metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), rreq.days.unwrap_or(1).to_string());
             metadata.insert(AMZ_RESTORE_REQUEST_DATE.to_string(), OffsetDateTime::now_utc().format(&Rfc3339).unwrap());
