@@ -14,7 +14,7 @@
 
 //! Object encryption service implementation
 
-mod ciphers;
-pub mod service;
+pub mod ciphers;
+pub mod dek;
 
-pub use service::ObjectEncryptionService;
+pub use dek::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
