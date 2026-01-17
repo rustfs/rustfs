@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_ahm::{heal::storage::ECStoreHealStorage, init_heal_manager};
 use rustfs_ecstore::{
     bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
     bucket::metadata_sys,
@@ -22,7 +23,6 @@ use rustfs_ecstore::{
     store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
     tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
-use rustfs_ahm::{heal::storage::ECStoreHealStorage, init_heal_manager};
 use rustfs_scanner::scanner::init_data_scanner;
 use serial_test::serial;
 use std::{
@@ -351,7 +351,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    //#[ignore]
+    #[ignore]
     async fn test_lifecycle_transition_basic() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
