@@ -27,7 +27,7 @@ use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder as ConnBuilder,
     server::graceful::GracefulShutdown,
     service::TowerToHyperService,
@@ -84,6 +84,7 @@ pub async fn start_http_server(
         };
 
         // If address is IPv6 try to enable dual-stack; on failure, switch to IPv4 socket.
+        #[cfg(not(target_os = "openbsd"))]
         if server_addr.is_ipv6()
             && let Err(e) = socket.set_only_v6(false)
         {
@@ -99,6 +100,18 @@ pub async fn start_http_server(
         // Set the socket to non-blocking before passing it to Tokio.
         socket.set_nonblocking(true)?;
 
+        // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
+        socket.set_tcp_nodelay(true)?;
+
+        // 3. Set system-level TCP KeepAlive to protect long connections
+        // Note: This sets keepalive on the LISTENING socket, which is inherited by accepted sockets on some platforms (e.g. Linux).
+        // However, we also explicitly set it on accepted sockets in the loop below to be safe and cross-platform.
+        let keepalive = get_default_tcp_keepalive();
+        socket.set_tcp_keepalive(&keepalive)?;
+
+        // 4. Increase receive buffer to support BDP at GB-level throughput
+        socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
+
         // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
         if let Err(bind_err) = socket.bind(&server_addr.into()) {
             warn!("Failed to bind to {}: {}.", server_addr, bind_err);
@@ -109,6 +122,9 @@ pub async fn start_http_server(
                 socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
                 socket.set_reuse_address(true)?;
                 socket.set_nonblocking(true)?;
+                socket.set_tcp_nodelay(true)?;
+                socket.set_tcp_keepalive(&keepalive)?;
+                socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
                 socket.bind(&server_addr.into())?;
                 // [FIX] Ensure fallback socket is moved to listening state as well.
                 socket.listen(backlog)?;
@@ -160,7 +176,7 @@ pub async fn start_http_server(
 
         println!("Console WebUI Start Time: {now_time}");
         println!("Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html");
-        println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
+        println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html");
     } else {
         info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
@@ -244,7 +260,34 @@ pub async fn start_http_server(
             (sigterm_inner, sigint_inner)
         };
 
-        let http_server = Arc::new(ConnBuilder::new(TokioExecutor::new()));
+        // RustFS Transport Layer Configuration Constants - Optimized for S3 Workloads
+        const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024 * 2; // 2MB: Optimize large file throughput
+        const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 1024 * 1024 * 4; // 4MB: Link-level flow control
+        const H2_MAX_FRAME_SIZE: u32 = 16384; // 16KB: Reduce framing overhead
+
+        let mut conn_builder = ConnBuilder::new(TokioExecutor::new());
+
+        // Optimize for HTTP/1.1 (S3 small files/management plane)
+        conn_builder
+            .http1()
+            .timer(TokioTimer::new())
+            .keep_alive(true)
+            .header_read_timeout(Duration::from_secs(5))
+            .max_buf_size(64 * 1024)
+            .writev(true);
+
+        // Optimize for HTTP/2 (AI/Data Lake high concurrency synchronization)
+        conn_builder
+            .http2()
+            .timer(TokioTimer::new())
+            .initial_stream_window_size(H2_INITIAL_STREAM_WINDOW_SIZE)
+            .initial_connection_window_size(H2_INITIAL_CONN_WINDOW_SIZE)
+            .max_frame_size(H2_MAX_FRAME_SIZE)
+            .max_concurrent_streams(Some(2048))
+            .keep_alive_interval(Some(Duration::from_secs(20)))
+            .keep_alive_timeout(Duration::from_secs(10));
+
+        let http_server = Arc::new(conn_builder);
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
         let graceful = Arc::new(GracefulShutdown::new());
         debug!("graceful initiated");
@@ -252,6 +295,9 @@ pub async fn start_http_server(
         // service ready
         worker_state_manager.update(ServiceState::Ready);
         let tls_acceptor = tls_acceptor.map(Arc::new);
+
+        // Initialize keepalive configuration once to avoid recreation in the loop
+        let keepalive_conf = get_default_tcp_keepalive();
 
         loop {
             debug!("Waiting for new connection...");
@@ -313,29 +359,19 @@ pub async fn start_http_server(
             let socket_ref = SockRef::from(&socket);
 
             // Enable TCP Keepalive to detect dead clients (e.g. power loss)
-            // Idle: 10s, Interval: 5s, Retries: 3
-            #[cfg(target_os = "openbsd")]
-            let ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
-
-            #[cfg(not(target_os = "openbsd"))]
-            let ka = TcpKeepalive::new()
-                .with_time(Duration::from_secs(10))
-                .with_interval(Duration::from_secs(5))
-                .with_retries(3);
-
-            if let Err(err) = socket_ref.set_tcp_keepalive(&ka) {
+            if let Err(err) = socket_ref.set_tcp_keepalive(&keepalive_conf) {
                 warn!(?err, "Failed to set TCP_KEEPALIVE");
             }
 
+            // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
 
-            #[cfg(not(target_os = "openbsd"))]
+            // 4. Increase receive buffer to support BDP at GB-level throughput
             if let Err(err) = socket_ref.set_recv_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_recv_buffer_size");
             }
-            #[cfg(not(target_os = "openbsd"))]
             if let Err(err) = socket_ref.set_send_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
@@ -646,6 +682,13 @@ fn process_connection(
 
 /// Handles connection errors by logging them with appropriate severity
 fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
+    let s = err.to_string();
+    if s.contains("connection reset") || s.contains("broken pipe") {
+        warn!("The connection was reset by the peer or broken pipe: {}", s);
+        // Ignore common non-fatal errors
+        return;
+    }
+
     if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
         if hyper_err.is_incomplete_message() {
             warn!("The HTTP connection is closed prematurely and the message is not completed:{}", hyper_err);
@@ -657,6 +700,8 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
             error!("HTTP user-custom error:{}", hyper_err);
         } else if hyper_err.is_canceled() {
             warn!("The HTTP connection is canceled:{}", hyper_err);
+        } else if format!("{:?}", hyper_err).contains("HeaderTimeout") {
+            warn!("The HTTP connection timed out (HeaderTimeout): {}", hyper_err);
         } else {
             error!("Unknown hyper error:{:?}", hyper_err);
         }
@@ -704,7 +749,7 @@ fn get_listen_backlog() -> i32 {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
     let mut buf = [0; 1];
-    let mut buf_len = size_of_val(&buf);
+    let mut buf_len = std::mem::size_of_val(&buf);
 
     if unsafe {
         libc::sysctl(
@@ -728,4 +773,19 @@ fn get_listen_backlog() -> i32 {
 fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
     DEFAULT_BACKLOG
+}
+
+fn get_default_tcp_keepalive() -> TcpKeepalive {
+    #[cfg(target_os = "openbsd")]
+    {
+        TcpKeepalive::new().with_time(Duration::from_secs(60))
+    }
+
+    #[cfg(not(target_os = "openbsd"))]
+    {
+        TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(5))
+            .with_retries(3)
+    }
 }

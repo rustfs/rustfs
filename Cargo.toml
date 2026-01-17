@@ -132,7 +132,7 @@ flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.3"
 quick-xml = "0.39.0"
-rmcp = { version = "0.12.0" }
+rmcp = { version = "0.13.0" }
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -171,7 +171,7 @@ atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.12" }
 aws-credential-types = { version = "1.2.11" }
-aws-sdk-s3 = { version = "1.119.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.120.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-types = { version = "1.3.6" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
@@ -188,7 +188,7 @@ dunce = "1.0.5"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
 flate2 = "1.1.8"
-flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
+flexi_logger = { version = "0.31.8", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
 glob = "0.3.3"
 google-cloud-storage = "1.6.0"
 google-cloud-auth = "1.4.0"
