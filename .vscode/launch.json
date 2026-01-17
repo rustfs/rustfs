@@ -121,7 +121,7 @@
                 "rust"
             ],
         },
-                {
+        {
             "name": "Debug executable target/debug/rustfs with sse",
             "type":  "lldb",
             "request": "launch",

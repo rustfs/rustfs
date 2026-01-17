@@ -987,7 +987,7 @@ impl TestSseDekProvider {
             std::process::exit(1);
         }
 
-        Self { master_key: master_key }
+        Self { master_key }
     }
 
     // Simple encryption of DEK
@@ -1426,41 +1426,6 @@ pub fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&nonce_hash.0[..12]);
     nonce
-}
-
-/// Apply SSE-C encryption to a reader
-///
-/// **DEPRECATED**: Use `apply_encryption()` instead for unified API
-pub fn apply_ssec_encryption<R>(reader: R, validated: &ValidatedSsecParams, bucket: &str, key: &str) -> Box<EncryptReader<R>>
-where
-    R: Reader + 'static,
-{
-    let nonce = generate_ssec_nonce(bucket, key);
-    Box::new(EncryptReader::new(reader, validated.key_bytes, nonce))
-}
-
-/// Apply SSE-C decryption to a reader
-///
-/// **DEPRECATED**: Use `apply_decryption()` instead for unified API
-pub fn apply_ssec_decryption<R>(reader: R, validated: &ValidatedSsecParams, bucket: &str, key: &str) -> Box<DecryptReader<R>>
-where
-    R: Reader + 'static,
-{
-    let nonce = generate_ssec_nonce(bucket, key);
-    Box::new(DecryptReader::new(reader, validated.key_bytes, nonce))
-}
-
-/// Store SSE-C metadata in object metadata
-///
-/// Stores the algorithm and key MD5 for later validation during GetObject.
-/// Note: The encryption key itself is NEVER stored.
-pub fn store_ssec_metadata(metadata: &mut HashMap<String, String>, validated: &ValidatedSsecParams, original_size: i64) {
-    metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), validated.algorithm.clone());
-    metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), validated.key_md5.clone());
-    metadata.insert(
-        "x-amz-server-side-encryption-customer-original-size".to_string(),
-        original_size.to_string(),
-    );
 }
 
 /// Verify SSE-C key matches the stored metadata
