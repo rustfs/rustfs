@@ -3778,7 +3778,11 @@ impl ObjectIO for SetDisks {
         }
 
         if object_info.is_remote() {
-            let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, opts).await?;
+            let mut opts = opts.clone();
+            if object_info.parts.len() == 1 {
+                opts.part_number = Some(1);
+            }
+            let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, &opts).await?;
             return Ok(gr);
         }
 
