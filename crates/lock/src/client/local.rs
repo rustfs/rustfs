@@ -17,11 +17,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::{
-    GlobalLockManager,
-    client::LockClient,
-    error::Result,
-    fast_lock::{FastLockGuard, LockManager},
-    types::{LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockType},
+    FastLockGuard, GlobalLockManager, LockClient, LockId, LockInfo, LockManager, LockMetadata, LockPriority, LockRequest,
+    LockResponse, LockStats, LockStatus, LockType, Result,
 };
 
 /// Local lock client using FastLock
@@ -54,12 +51,12 @@ impl Default for LocalClient {
 impl LockClient for LocalClient {
     async fn acquire_exclusive(&self, request: &LockRequest) -> Result<LockResponse> {
         let lock_manager = self.get_lock_manager();
-        let lock_request = crate::fast_lock::ObjectLockRequest::new_write("", request.resource.clone(), request.owner.clone())
+        let lock_request = crate::ObjectLockRequest::new_write("", request.resource.clone(), request.owner.clone())
             .with_acquire_timeout(request.acquire_timeout);
 
         match lock_manager.acquire_lock(lock_request).await {
             Ok(guard) => {
-                let lock_id = crate::types::LockId::new_deterministic(&request.resource);
+                let lock_id = LockId::new_deterministic(&request.resource);
 
                 // Store guard for later release
                 let mut guards = self.guard_storage.write().await;
@@ -98,12 +95,12 @@ impl LockClient for LocalClient {
 
     async fn acquire_shared(&self, request: &LockRequest) -> Result<LockResponse> {
         let lock_manager = self.get_lock_manager();
-        let lock_request = crate::fast_lock::ObjectLockRequest::new_read("", request.resource.clone(), request.owner.clone())
+        let lock_request = crate::ObjectLockRequest::new_read("", request.resource.clone(), request.owner.clone())
             .with_acquire_timeout(request.acquire_timeout);
 
         match lock_manager.acquire_lock(lock_request).await {
             Ok(guard) => {
-                let lock_id = crate::types::LockId::new_deterministic(&request.resource);
+                let lock_id = LockId::new_deterministic(&request.resource);
 
                 // Store guard for later release
                 let mut guards = self.guard_storage.write().await;
@@ -166,14 +163,14 @@ impl LockClient for LocalClient {
         if let Some(guard) = guards.get(lock_id) {
             // We have an active guard for this lock
             let lock_type = match guard.mode() {
-                crate::fast_lock::types::LockMode::Shared => crate::types::LockType::Shared,
-                crate::fast_lock::types::LockMode::Exclusive => crate::types::LockType::Exclusive,
+                crate::LockMode::Shared => LockType::Shared,
+                crate::LockMode::Exclusive => LockType::Exclusive,
             };
             Ok(Some(LockInfo {
                 id: lock_id.clone(),
                 resource: lock_id.resource.clone(),
                 lock_type,
-                status: crate::types::LockStatus::Acquired,
+                status: LockStatus::Acquired,
                 owner: guard.owner().to_string(),
                 acquired_at: std::time::SystemTime::now(),
                 expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(30),
@@ -207,7 +204,7 @@ impl LockClient for LocalClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LockType;
+    use crate::LockType;
 
     #[tokio::test]
     async fn test_local_client_acquire_exclusive() {
