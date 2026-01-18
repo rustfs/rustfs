@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod local;
+pub mod local;
 // pub mod remote;
 
 use crate::{LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, Result};
