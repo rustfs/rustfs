@@ -42,19 +42,26 @@ pub use disabled_manager::DisabledLockManager;
 pub use guard::FastLockGuard;
 pub use manager::FastObjectLockManager;
 pub use manager_trait::LockManager;
+use std::time::Duration;
 pub use types::*;
 
 /// Default shard count (must be power of 2)
 pub const DEFAULT_SHARD_COUNT: usize = 1024;
 
 /// Default lock timeout
-pub const DEFAULT_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default acquire timeout - increased for database workloads  
-pub const DEFAULT_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Maximum acquire timeout for high-load scenarios
-pub const MAX_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub const MAX_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Lock cleanup interval
-pub const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default RustFS specific timeouts in seconds
+pub(crate) const DEFAULT_RUSTFS_MAX_ACQUIRE_TIMEOUT: u64 = 120;
+
+/// Default RustFS acquire timeout in seconds
+pub(crate) const DEFAULT_RUSTFS_ACQUIRE_TIMEOUT: u64 = 60;

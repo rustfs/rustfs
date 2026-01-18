@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::fast_lock::guard::FastLockGuard;
 use serde::{Deserialize, Serialize};
 use smartstring::SmartString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
-
-use crate::fast_lock::guard::FastLockGuard;
 
 /// Object key for version-aware locking
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

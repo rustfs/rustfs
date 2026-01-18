@@ -7985,6 +7985,7 @@ dependencies = [
  "crossbeam-queue",
  "futures",
  "parking_lot",
+ "rustfs-utils",
  "serde",
  "serde_json",
  "smallvec",
