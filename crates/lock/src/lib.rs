@@ -68,11 +68,15 @@ pub const BUILD_TIMESTAMP: &str = "unknown";
 /// Maximum number of items in delete list
 pub const MAX_DELETE_LIST: usize = 1000;
 
+/// Default setting for RUSTFS_ENABLE_LOCKS environment variable
+const DEFAULT_RUSTFS_LOCKS_ENABLED: bool = true;
+
 // ============================================================================
 // Global FastLock Manager
 // ============================================================================
 
 // Global singleton FastLock manager shared across all lock implementations
+use crate::fast_lock::{DEFAULT_RUSTFS_ACQUIRE_TIMEOUT, DEFAULT_RUSTFS_MAX_ACQUIRE_TIMEOUT};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -92,20 +96,40 @@ impl GlobalLockManager {
     /// Create a lock manager based on environment variable configuration
     pub fn new() -> Self {
         // Check RUSTFS_ENABLE_LOCKS environment variable
-        let locks_enabled = std::env::var("RUSTFS_ENABLE_LOCKS")
-            .unwrap_or_else(|_| "true".to_string())
-            .to_lowercase();
-
-        match locks_enabled.as_str() {
-            "false" | "0" | "no" | "off" | "disabled" => {
-                tracing::info!("Lock system disabled via RUSTFS_ENABLE_LOCKS environment variable");
-                Self::Disabled(DisabledLockManager::new())
-            }
-            _ => {
-                tracing::info!("Lock system enabled");
-                Self::Enabled(Arc::new(FastObjectLockManager::new()))
-            }
+        let locks_enabled = rustfs_utils::get_env_bool("RUSTFS_ENABLE_LOCKS", DEFAULT_RUSTFS_LOCKS_ENABLED);
+        if !locks_enabled {
+            tracing::info!("Lock system disabled via RUSTFS_ENABLE_LOCKS environment variable");
+            return Self::Disabled(DisabledLockManager::new());
         }
+        tracing::info!("Lock system enabled");
+
+        // Read lock acquire timeout from environment variable
+        let mut acquire_secs = rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", DEFAULT_RUSTFS_ACQUIRE_TIMEOUT);
+
+        // Enforce minimum of 1 second
+        if acquire_secs == 0 {
+            tracing::warn!("Requested lock acquire timeout {}s is below minimum 1s, using minimum", acquire_secs);
+            acquire_secs = 1;
+        }
+
+        if acquire_secs > DEFAULT_RUSTFS_MAX_ACQUIRE_TIMEOUT {
+            tracing::warn!(
+                "Requested lock acquire timeout {}s exceeds maximum {}, using maximum",
+                acquire_secs,
+                DEFAULT_RUSTFS_MAX_ACQUIRE_TIMEOUT
+            );
+            acquire_secs = DEFAULT_RUSTFS_MAX_ACQUIRE_TIMEOUT;
+        }
+        let acquire_timeout = std::time::Duration::from_secs(acquire_secs);
+        tracing::info!("Lock system enabled with acquire timeout: {}s", acquire_timeout.as_secs());
+
+        // Create lock manager with custom configuration
+        let config = fast_lock::LockConfig {
+            default_acquire_timeout: acquire_timeout,
+            ..Default::default()
+        };
+
+        Self::Enabled(Arc::new(FastObjectLockManager::with_config(config)))
     }
 
     /// Check if the lock manager is disabled
