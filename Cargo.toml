@@ -239,7 +239,7 @@ sysinfo = "0.37.2"
 temp-env = "0.3.6"
 tempfile = "3.24.0"
 test-case = "3.3.1"
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.4"
 tracing-error = "0.2.1"
