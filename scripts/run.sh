@@ -186,6 +186,9 @@ export RUSTFS_HEAL_QUEUE_SIZE=10000
 # rustfs trust system CA certificates
 export RUSTFS_TRUST_SYSTEM_CA=true
 
+# Enable FTP server
+export RUSTFS_FTPS_ENABLE=false
+
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
