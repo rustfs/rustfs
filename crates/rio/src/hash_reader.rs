@@ -161,6 +161,8 @@ pin_project! {
 }
 
 impl HashReader {
+    /// Used for transformation layers (compression/encryption)
+    pub const SIZE_PRESERVE_LAYER: i64 = -1;
     pub fn new(
         mut inner: Box<dyn Reader>,
         size: i64,
@@ -169,7 +171,8 @@ impl HashReader {
         sha256hex: Option<String>,
         diskable_md5: bool,
     ) -> std::io::Result<Self> {
-        if size >= 0
+        // Get the innermost HashReader
+        if size != Self::SIZE_PRESERVE_LAYER
             && let Some(existing_hash_reader) = inner.as_hash_reader_mut()
         {
             if existing_hash_reader.bytes_read() > 0 {
