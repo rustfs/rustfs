@@ -106,6 +106,12 @@ impl GlobalLockManager {
         // Read lock acquire timeout from environment variable
         let mut acquire_secs = rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", DEFAULT_RUSTFS_ACQUIRE_TIMEOUT);
 
+        // Enforce minimum of 1 second
+        if acquire_secs == 0 {
+            tracing::warn!("Requested lock acquire timeout {}s is below minimum 1s, using minimum", acquire_secs);
+            acquire_secs = 1;
+        }
+
         if acquire_secs > DEFAULT_RUSTFS_MAX_ACQUIRE_TIMEOUT {
             tracing::warn!(
                 "Requested lock acquire timeout {}s exceeds maximum {}, using maximum",
@@ -114,21 +120,7 @@ impl GlobalLockManager {
             );
             acquire_secs = DEFAULT_RUSTFS_MAX_ACQUIRE_TIMEOUT;
         }
-
-        let acquire_timeout = {
-            let timeout = std::time::Duration::from_secs(acquire_secs);
-            if timeout > fast_lock::MAX_ACQUIRE_TIMEOUT {
-                tracing::warn!(
-                    "Requested lock acquire timeout {}s exceeds maximum {}, using maximum",
-                    acquire_secs,
-                    fast_lock::MAX_ACQUIRE_TIMEOUT.as_secs()
-                );
-                fast_lock::MAX_ACQUIRE_TIMEOUT
-            } else {
-                timeout
-            }
-        };
-
+        let acquire_timeout = std::time::Duration::from_secs(acquire_secs);
         tracing::info!("Lock system enabled with acquire timeout: {}s", acquire_timeout.as_secs());
 
         // Create lock manager with custom configuration
