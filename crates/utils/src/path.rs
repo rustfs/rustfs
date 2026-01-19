@@ -15,10 +15,10 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-#[cfg(target_os = "windows")]
-const SLASH_SEPARATOR: char = '\\';
-#[cfg(not(target_os = "windows"))]
-const SLASH_SEPARATOR: char = '/';
+// #[cfg(target_os = "windows")]
+// const SLASH_SEPARATOR: char = '\\';
+// #[cfg(not(target_os = "windows"))]
+// const SLASH_SEPARATOR: char = '/';
 
 /// GLOBAL_DIR_SUFFIX is a special suffix used to denote directory objects
 /// in object storage systems that do not have a native directory concept.
@@ -77,6 +77,7 @@ fn normalize_to_platform_separator(s: &str) -> String {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 fn normalize_to_platform_separator(s: &str) -> String {
     s.to_string()
 }
@@ -138,12 +139,14 @@ pub fn decode_dir_object(object: &str) -> String {
 
 /// Check if the string ends with any path separator (forward slash or backslash).
 /// Accepts both separators but prefers canonical forward slash.
+#[allow(dead_code)]
 fn is_ends_with_any_sep(s: &str) -> bool {
     s.ends_with('/') || s.ends_with('\\')
 }
 
 /// Remove all path separators at the end of the string.
 /// Handles both forward slash and backslash.
+#[allow(dead_code)]
 fn trim_trailing_seps(s: &str) -> &str {
     s.trim_end_matches(|c| c == '/' || c == '\\')
 }
@@ -500,7 +503,8 @@ pub fn clean(path: &str) -> String {
 
     // FIX: Always work with forward-slash normalized paths
     let normalized_path = normalize_to_forward_slash(path);
-    let bytes = normalized_path.as_bytes();
+    let binding = normalized_path.clone();
+    let bytes = binding.as_bytes();
     let n = bytes.len();
 
     let rooted = bytes[0] == b'/';
