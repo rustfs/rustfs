@@ -280,6 +280,7 @@ pub async fn start_http_server(
         conn_builder
             .http2()
             .timer(TokioTimer::new())
+            .adaptive_window(true)
             .initial_stream_window_size(H2_INITIAL_STREAM_WINDOW_SIZE)
             .initial_connection_window_size(H2_INITIAL_CONN_WINDOW_SIZE)
             .max_frame_size(H2_MAX_FRAME_SIZE)
