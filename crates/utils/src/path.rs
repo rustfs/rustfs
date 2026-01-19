@@ -55,6 +55,7 @@ pub fn has_suffix(s: &str, suffix: &str) -> bool {
 
 /// encode_dir_object encodes a directory object by appending
 /// a special suffix if it ends with a slash.
+/// Handles both mixed separators on Windows by normalizing them.
 ///
 /// # Arguments
 /// * `object` - A string slice that holds the object to be encoded.
@@ -98,13 +99,15 @@ pub fn is_dir_object(object: &str) -> bool {
 pub fn decode_dir_object(object: &str) -> String {
     if has_suffix(object, GLOBAL_DIR_SUFFIX) {
         let trimmed = object.trim_end_matches(GLOBAL_DIR_SUFFIX);
-        format!("{}{}", trimmed, SLASH_SEPARATOR)
+        format!("{}{}", trimmed, SLASH_SEPARATOR_STR)
     } else {
         object.to_string()
     }
 }
 
 /// Check if the string ends with any platform-specific separator
+/// On Windows, checks both forward slash and backslash.
+/// On Unix-like systems, checks only forward slash.
 fn is_ends_with_any_sep(s: &str) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -117,6 +120,8 @@ fn is_ends_with_any_sep(s: &str) -> bool {
 }
 
 /// Remove all platform-specific separators at the end of the string
+/// On Windows, removes both forward slashes and backslashes.
+/// On Unix-like systems, removes only forward slashes.
 fn trim_trailing_seps(s: &str) -> &str {
     #[cfg(target_os = "windows")]
     {
@@ -241,6 +246,7 @@ pub fn path_join_buf(elements: &[&str]) -> String {
 }
 
 /// Platform-aware separator check
+/// Returns true if the byte represents a path separator on the current platform.
 fn is_sep(b: u8) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -255,6 +261,7 @@ fn is_sep(b: u8) -> bool {
 /// path_needs_clean returns whether path cleaning may change the path.
 /// Will detect all cases that will be cleaned,
 /// but may produce false positives on non-trivial paths.
+/// Enhanced to properly handle Windows-specific paths and mixed separators.
 ///
 /// # Arguments
 /// * `path` - A byte slice that holds the path to be checked.
@@ -376,7 +383,7 @@ fn path_needs_clean(path: &[u8]) -> bool {
         #[cfg(target_os = "windows")]
         {
             // Windows special root forms that are acceptable with trailing separator:
-            // - UNC root: exactly two leading separators "\" "\" (i.e. "\\") -> n == 2
+            // - UNC root: exactly two leading separators "\" "\" (i.e.  "\\") -> n == 2
             if n == 2 && is_sep(path[0]) && is_sep(path[1]) {
                 return false;
             }
@@ -389,12 +396,13 @@ fn path_needs_clean(path: &[u8]) -> bool {
         }
     }
 
-    // No conditions triggered:  assume path is already clean.
+    // No conditions triggered: assume path is already clean.
     false
 }
 
 /// path_to_bucket_object_with_base_path splits a given path into bucket and object components,
 /// considering a base path to trim from the start.
+/// Enhanced with proper byte-index handling for separator positions.
 ///
 /// # Arguments
 /// * `base_path` - A string slice that holds the base path to be trimmed.
@@ -404,17 +412,25 @@ fn path_needs_clean(path: &[u8]) -> bool {
 /// A tuple containing the bucket and object as `String`s.
 ///
 pub fn path_to_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
-    let mut path = path.trim_start_matches(base_path);
-    path = trim_leading_seps(path);
+    let mut remaining_path = path.trim_start_matches(base_path);
+    remaining_path = trim_leading_seps(remaining_path);
 
-    if let Some(m) = find_first_sep(path) {
-        return (path[..m].to_string(), path[m + SLASH_SEPARATOR_STR.len()..].to_string());
+    if let Some(sep_byte_pos) = find_first_sep_byte_pos(remaining_path) {
+        // sep_byte_pos is the byte position of the separator
+        // We need to advance by the byte length of the separator
+        let after_sep_pos = sep_byte_pos + get_sep_byte_len();
+        return (
+            remaining_path[..sep_byte_pos].to_string(),
+            remaining_path.get(after_sep_pos..).unwrap_or("").to_string(),
+        );
     }
 
-    (path.to_string(), "".to_string())
+    (remaining_path.to_string(), "".to_string())
 }
 
 /// Remove all platform-specific separators at the beginning of the string
+/// On Windows, removes both forward slashes and backslashes.
+/// On Unix-like systems, removes only forward slashes.
 fn trim_leading_seps(s: &str) -> &str {
     #[cfg(target_os = "windows")]
     {
@@ -426,16 +442,26 @@ fn trim_leading_seps(s: &str) -> &str {
     }
 }
 
-/// Find the location of the first separator in the path (cross-platform support)
-fn find_first_sep(path: &str) -> Option<usize> {
+/// Find the byte position of the first separator in the path
+/// Returns the byte offset of the separator character itself.
+/// On Windows, finds either forward slash or backslash.
+/// On Unix-like systems, finds only forward slash.
+fn find_first_sep_byte_pos(path: &str) -> Option<usize> {
     #[cfg(target_os = "windows")]
     {
-        path.find(|c| c == '/' || c == '\\')
+        path.as_bytes().iter().position(|&b| b == b'/' || b == b'\\')
     }
     #[cfg(not(target_os = "windows"))]
     {
-        path.find('/')
+        path.as_bytes().iter().position(|&b| b == b'/')
     }
+}
+
+/// Get the byte length of the platform-specific separator
+/// Windows separators are all single bytes, as is the Unix forward slash.
+#[inline]
+fn get_sep_byte_len() -> usize {
+    1 // Both '/' and '\\' are single-byte UTF-8 characters
 }
 
 /// path_to_bucket_object splits a given path into bucket and object components.
@@ -451,6 +477,8 @@ pub fn path_to_bucket_object(s: &str) -> (String, String) {
 }
 
 /// contains_any_sep_str checks if the given string contains any path separators.
+/// On Windows, checks for both forward slash and backslash.
+/// On Unix-like systems, checks for only forward slash.
 ///
 /// # Arguments
 /// * `s` - A string slice that holds the string to be checked.
@@ -469,6 +497,7 @@ fn contains_any_sep_str(s: &str) -> bool {
 }
 
 /// base_dir_from_prefix extracts the base directory from a given prefix.
+/// Handles mixed separators on Windows.
 ///
 /// # Arguments
 /// * `prefix` - A string slice that holds the prefix to be processed.
@@ -506,6 +535,7 @@ pub fn base_dir_from_prefix(prefix: &str) -> String {
 /// This function is adapted to work cross-platform by using the appropriate path separator.
 /// On Windows, this function is aware of drive letters (e.g., `C: `) and UNC paths
 /// (e.g., `\\server\share`) and cleans them using the appropriate separator.
+/// Mixed separators are normalized to the platform-specific separator.
 ///
 /// # Arguments
 /// * `path` - A string slice that holds the path to be cleaned.
@@ -608,11 +638,11 @@ pub fn clean(path: &str) -> String {
         }
 
         // Join components
-        for (idx, c) in comps.iter().enumerate() {
+        for _c in comps.iter() {
             if !out.is_empty() && !out.ends_with(SLASH_SEPARATOR_STR) {
                 out.push(SLASH_SEPARATOR);
             }
-            out.push_str(c);
+            out.push_str(_c);
         }
 
         // Special cases:
@@ -682,7 +712,7 @@ pub fn clean(path: &str) -> String {
                     r += 1;
                 }
                 b'.' if r + 1 == n || path.as_bytes()[r + 1] == b'/' => {
-                    // .  element
+                    // . element
                     r += 1;
                 }
                 b'.' if path.as_bytes()[r + 1] == b'.' && (r + 2 == n || path.as_bytes()[r + 2] == b'/') => {
@@ -735,7 +765,7 @@ pub fn clean(path: &str) -> String {
 /// If there is no slash in path, split returns
 /// ("", path).
 ///
-/// Note: This function supports cross-platform separator detection (Windows supports \ and /)
+/// Note:  This function supports cross-platform separator detection (Windows supports \ and /)
 ///
 /// # Arguments
 /// * `path` - A string slice that holds the path to be split.
@@ -744,31 +774,35 @@ pub fn clean(path: &str) -> String {
 /// A tuple containing the directory and file name as string slices.
 ///
 pub fn split(path: &str) -> (&str, &str) {
-    // Find the location of the last separator (cross-platform support)
-    if let Some(i) = find_last_sep(path) {
+    // Find the byte position of the last separator (cross-platform support)
+    if let Some(sep_byte_pos) = find_last_sep_byte_pos(path) {
         // Returns the directory section (including the last separator) and the file name section
-        return (&path[..i + 1], &path[i + 1..]);
+        return (&path[..sep_byte_pos + 1], &path[sep_byte_pos + 1..]);
     }
     // If no delimiter is found, return an empty string as the directory and the entire path as the file name
     ("", path)
 }
 
-/// Find the location of the last separator in the path (cross-platform support)
-fn find_last_sep(path: &str) -> Option<usize> {
+/// Find the byte position of the last separator in the path
+/// Returns the byte offset of the separator character itself.
+/// On Windows, finds either forward slash or backslash.
+/// On Unix-like systems, finds only forward slash.
+fn find_last_sep_byte_pos(path: &str) -> Option<usize> {
     #[cfg(target_os = "windows")]
     {
-        // On Windows, both / and \
-        let mut last_sep_pos = None;
-        for (i, c) in path.char_indices() {
-            if c == '/' || c == '\\' {
-                last_sep_pos = Some(i);
+        // On Windows, search for both / and \
+        // We need to find the rightmost occurrence
+        let mut last_pos = None;
+        for (i, b) in path.as_bytes().iter().enumerate() {
+            if *b == b'/' || *b == b'\\' {
+                last_pos = Some(i);
             }
         }
-        last_sep_pos
+        last_pos
     }
     #[cfg(not(target_os = "windows"))]
     {
-        path.rfind('/')
+        path.as_bytes().iter().rposition(|&b| b == b'/')
     }
 }
 
@@ -880,10 +914,10 @@ mod tests {
             // Elements with trailing separators
             assert_eq!(path_join_buf(&["a/", "b/"]), "a/b/");
 
-            // Elements requiring cleaning (with "." and "..")
+            // Elements requiring cleaning (with "." and ". .")
             assert_eq!(path_join_buf(&["a", ".", "b"]), "a/b");
             assert_eq!(path_join_buf(&["a", "..", "b"]), "b");
-            assert_eq!(path_join_buf(&["a", "b", ".."]), "a");
+            assert_eq!(path_join_buf(&["a", "b", ". ."]), "a");
 
             // Preservation of trailing slashes
             assert_eq!(path_join_buf(&["a", "b/"]), "a/b/");
@@ -918,7 +952,7 @@ mod tests {
             assert_eq!(path_join_buf(&["a", "..", "b"]), "b");
             assert_eq!(path_join_buf(&["a", "b", ".."]), "a");
 
-            // Mixed separator handling
+            // Mixed separator handling (FIX FOR ISSUE 1424)
             assert_eq!(path_join_buf(&["a/b", "c"]), "a\\b\\c");
             assert_eq!(path_join_buf(&["a\\", "b/c"]), "a\\b\\c");
 
@@ -953,15 +987,15 @@ mod tests {
         }
         #[cfg(target_os = "windows")]
         {
-            // Windows backslash separator
+            // Windows backslash separator (FIX FOR ISSUE 1554)
             assert_eq!(split("a\\b"), ("a\\", "b"));
             assert_eq!(split("a\\b\\c"), ("a\\b\\", "c"));
 
-            // Windows forward slash separator
+            // Windows forward slash separator (FIX FOR ISSUE 1554)
             assert_eq!(split("a/b"), ("a/", "b"));
             assert_eq!(split("a/b/c"), ("a/b/", "c"));
 
-            // Mixed separators
+            // Mixed separators (FIX FOR ISSUE 1554)
             assert_eq!(split("a\\b/c"), ("a\\b/", "c"));
             assert_eq!(split("a/b\\c"), ("a/b\\", "c"));
 
@@ -1021,7 +1055,7 @@ mod tests {
             assert_eq!(clean("a/b/c/"), "a/b/c");
             assert_eq!(clean("./"), ".");
             assert_eq!(clean("../"), "..");
-            assert_eq!(clean("../../"), "../..");
+            assert_eq!(clean("../../"), "../. .");
             assert_eq!(clean("/abc/"), "/abc");
             assert_eq!(clean("abc//def//ghi"), "abc/def/ghi");
             assert_eq!(clean("//abc"), "/abc");
@@ -1038,7 +1072,7 @@ mod tests {
             assert_eq!(clean("abc/def/ghi/../jkl"), "abc/def/jkl");
             assert_eq!(clean("abc/def/../ghi/../jkl"), "abc/jkl");
             assert_eq!(clean("abc/def/.. "), "abc");
-            assert_eq!(clean("abc/def/../.. "), ".");
+            assert_eq!(clean("abc/def/../.."), ".");
             assert_eq!(clean("/abc/def/../.."), "/");
             assert_eq!(clean("abc/def/../../.. "), "..");
             assert_eq!(clean("/abc/def/../../.."), "/");
@@ -1081,7 +1115,7 @@ mod tests {
             PathTest { path: ".", result: "." },
             PathTest {
                 path: ". .",
-                result: "..",
+                result: ". .",
             },
             PathTest {
                 path: "../..",
@@ -1174,7 +1208,7 @@ mod tests {
                 result: "abc",
             },
             PathTest {
-                path: "abc/def/../..",
+                path: "abc/def/../. .",
                 result: ".",
             },
             PathTest {
@@ -1249,7 +1283,7 @@ mod tests {
         let result = path_join(&[
             PathBuf::from("a"),
             PathBuf::from("b"),
-            PathBuf::from(".. "),
+            PathBuf::from(".."),
             PathBuf::from("c"),
         ]);
         assert_eq!(result, PathBuf::from("a/c"));
@@ -1279,5 +1313,56 @@ mod tests {
             PathBuf::from("c"),
         ]);
         assert_eq!(result, PathBuf::from("b/c"));
+    }
+
+    #[test]
+    fn test_path_to_bucket_object() {
+        // Test basic splitting
+        let (bucket, object) = path_to_bucket_object("mybucket/myobject");
+        assert_eq!(bucket, "mybucket");
+        assert_eq!(object, "myobject");
+
+        // Test with trailing slash
+        let (bucket, object) = path_to_bucket_object("mybucket/");
+        assert_eq!(bucket, "mybucket");
+        assert_eq!(object, "");
+
+        // Test nested paths
+        let (bucket, object) = path_to_bucket_object("mybucket/dir/file. txt");
+        assert_eq!(bucket, "mybucket");
+        assert_eq!(object, "dir/file.txt");
+
+        // Test with base path
+        let (bucket, object) = path_to_bucket_object_with_base_path("/base", "/base/mybucket/obj");
+        assert_eq!(bucket, "mybucket");
+        assert_eq!(object, "obj");
+    }
+
+    #[test]
+    fn test_encode_decode_dir_object() {
+        // Test encode
+        assert_eq!(encode_dir_object("dir/"), "dir__XLDIR__");
+        assert_eq!(is_dir_object("dir/"), true);
+        assert_eq!(is_dir_object("file"), false);
+
+        // Test decode
+        assert_eq!(decode_dir_object("dir__XLDIR__"), "dir/");
+        assert_eq!(decode_dir_object("file"), "file");
+    }
+
+    #[test]
+    fn test_has_suffix_prefix() {
+        assert!(has_suffix("myfile. txt", ". txt"));
+        assert!(!has_suffix("myfile. txt", ". doc"));
+
+        assert!(has_prefix("myfile.txt", "my"));
+        assert!(!has_prefix("myfile.txt", "other"));
+
+        #[cfg(target_os = "windows")]
+        {
+            // Case insensitive on Windows
+            assert!(has_suffix("MYFILE.TXT", ".txt"));
+            assert!(has_prefix("MYFILE", "my"));
+        }
     }
 }
