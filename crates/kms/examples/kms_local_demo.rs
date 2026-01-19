@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 2: Create a temporary directory for local backend
     println!("2. Setting up local backend...");
-    if !fs::metadata("examples/local_data").is_ok() {
+    if fs::metadata("examples/local_data").is_err() {
         fs::create_dir_all("examples/local_data")?;
     }
     let data_dir = std::path::PathBuf::from("examples/local_data");

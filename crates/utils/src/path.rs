@@ -246,7 +246,7 @@ fn path_needs_clean(path: &[u8]) -> bool {
     // On Windows: any forward slash indicates normalization to backslash is required.
     #[cfg(target_os = "windows")]
     {
-        if path.iter().any(|&b| b == b'/') {
+        if path.contains(&b'/') {
             return true;
         }
     }
@@ -556,7 +556,7 @@ pub fn clean(path: &str) -> String {
         }
 
         // Join components
-        for (idx, c) in comps.iter().enumerate() {
+        for c in comps.iter() {
             if !out.is_empty() && !out.ends_with(SLASH_SEPARATOR_STR) {
                 out.push(SLASH_SEPARATOR);
             }
@@ -593,11 +593,7 @@ pub fn clean(path: &str) -> String {
                     true
                 } else {
                     // drive root "C:\" length >=3 with pattern X:\
-                    if out.len() == 3 && out.as_bytes()[1] == b':' && is_sep(out.as_bytes()[2]) {
-                        true
-                    } else {
-                        false
-                    }
+                    out.len() == 3 && out.as_bytes()[1] == b':' && is_sep(out.as_bytes()[2])
                 }
             };
             if !is_root {

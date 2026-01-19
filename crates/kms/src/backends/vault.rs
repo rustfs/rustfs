@@ -594,7 +594,7 @@ impl VaultKmsBackend {
     /// Create a new VaultKmsBackend
     pub async fn new(config: KmsConfig) -> Result<Self> {
         let vault_config = match &config.backend_config {
-            crate::config::BackendConfig::Vault(vault_config) => vault_config.clone(),
+            crate::config::BackendConfig::Vault(vault_config) => (**vault_config).clone(),
             _ => return Err(KmsError::configuration_error("Expected Vault backend configuration")),
         };
 

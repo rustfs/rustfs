@@ -185,13 +185,13 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
                     .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
 
                 // root key for local backend(optional)
-                let master_key = opt.kms_local_master_key.as_ref().map_or(None, |k| Some(k.to_string()));
+                let master_key = opt.kms_local_master_key.as_ref().map(|k| k.to_string());
 
                 rustfs_kms::config::KmsConfig {
                     backend: rustfs_kms::config::KmsBackend::Local,
                     backend_config: rustfs_kms::config::BackendConfig::Local(rustfs_kms::config::LocalConfig {
                         key_dir: std::path::PathBuf::from(key_dir),
-                        master_key: master_key,
+                        master_key,
                         file_permissions: Some(0o600),
                     }),
                     default_key_id: opt.kms_default_key_id.clone(),
@@ -213,7 +213,7 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
 
                 rustfs_kms::config::KmsConfig {
                     backend: rustfs_kms::config::KmsBackend::Vault,
-                    backend_config: rustfs_kms::config::BackendConfig::Vault(rustfs_kms::config::VaultConfig {
+                    backend_config: rustfs_kms::config::BackendConfig::Vault(Box::new(rustfs_kms::config::VaultConfig {
                         address: vault_address.clone(),
                         auth_method: rustfs_kms::config::VaultAuthMethod::Token {
                             token: vault_token.clone(),
@@ -223,7 +223,7 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
                         kv_mount: "secret".to_string(),
                         key_path_prefix: "rustfs/kms/keys".to_string(),
                         tls: None,
-                    }),
+                    })),
                     default_key_id: opt.kms_default_key_id.clone(),
                     timeout: std::time::Duration::from_secs(30),
                     retry_attempts: 3,

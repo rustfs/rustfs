@@ -379,8 +379,8 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
         (request.sse_customer_algorithm, request.sse_customer_key, request.sse_customer_key_md5)
     {
         return apply_ssec_encryption_material(
-            &request.bucket,
-            &request.key,
+            request.bucket,
+            request.key,
             algorithm,
             key,
             key_md5,
@@ -394,19 +394,19 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
     // Priority 2: Managed SSE (SSE-S3 or SSE-KMS)
     let sse_config = prepare_sse_configuration(request.bucket, request.server_side_encryption, request.ssekms_key_id).await?;
 
-    if let Some(server_side_encryption) = sse_config.effective_sse {
-        if is_managed_sse(&server_side_encryption) {
-            return apply_managed_encryption_material(
-                request.bucket,
-                request.key,
-                server_side_encryption,
-                sse_config.effective_kms_key_id,
-                request.content_size,
-                request.part_number,
-            )
-            .await
-            .map(Some);
-        }
+    if let Some(server_side_encryption) = sse_config.effective_sse
+        && is_managed_sse(&server_side_encryption)
+    {
+        return apply_managed_encryption_material(
+            request.bucket,
+            request.key,
+            server_side_encryption,
+            sse_config.effective_kms_key_id,
+            request.content_size,
+            request.part_number,
+        )
+        .await
+        .map(Some);
     }
 
     // No encryption requested
@@ -462,7 +462,7 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
 
         // Verify that the provided key MD5 matches the stored MD5 for security
         let stored_md5 = request.metadata.get("x-amz-server-side-encryption-customer-key-md5");
-        verify_ssec_key_match(key_md5, stored_md5.clone())?;
+        verify_ssec_key_match(key_md5, stored_md5)?;
 
         // For multipart SSE-C objects, just validate the key but don't decrypt yet
         if is_multipart {
@@ -982,7 +982,7 @@ impl TestSseDekProvider {
     // Simple encryption of DEK
     fn encrypt_dek(dek: [u8; 32], cmk_value: [u8; 32]) -> Result<String, ApiError> {
         // Use AES-256-GCM to encrypt DEK
-        let key = Key::<Aes256Gcm>::try_from(cmk_value).map_err(|_| ApiError::from(StorageError::other("Invalid key length")))?;
+        let key = Key::<Aes256Gcm>::from(cmk_value);
 
         let cipher = Aes256Gcm::new(&key);
         let nonce = Nonce::from([0u8; 12]);
@@ -1008,7 +1008,7 @@ impl TestSseDekProvider {
             .decode(parts[1])
             .map_err(|_| ApiError::from(StorageError::other("Invalid ciphertext format")))?;
 
-        let key = Key::<Aes256Gcm>::try_from(cmk_value).map_err(|_| ApiError::from(StorageError::other("Invalid key length")))?;
+        let key = Key::<Aes256Gcm>::from(cmk_value);
         let cipher = Aes256Gcm::new(&key);
 
         let nonce_array: [u8; 12] = nonce_vec
