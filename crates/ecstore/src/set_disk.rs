@@ -6814,13 +6814,30 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
     ret
 }
 async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rustfs_madmin::StorageInfo {
+    // let mut disks = get_disks_info(disks, eps).await;
+    // disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
+    //
+    // rustfs_madmin::StorageInfo {
+    //     disks,
+    //     backend: rustfs_madmin::BackendInfo {
+    //         backend_type: rustfs_madmin::BackendByte::Erasure,
+    //         ..Default::default()
+    //     },
+    // }
     let mut disks = get_disks_info(disks, eps).await;
     disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
+
+    // Provide minimal backend shape for callers. Do NOT guess parity here since it belongs to higher-level config.
+    // Missing/empty standard_sc_data will be handled by capacity fallback logic.
+    let drives_per_set = vec![eps.len()];
+    let total_sets = vec![1];
 
     rustfs_madmin::StorageInfo {
         disks,
         backend: rustfs_madmin::BackendInfo {
             backend_type: rustfs_madmin::BackendByte::Erasure,
+            drives_per_set,
+            total_sets,
             ..Default::default()
         },
     }
