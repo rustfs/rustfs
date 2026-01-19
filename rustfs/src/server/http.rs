@@ -96,21 +96,35 @@ pub async fn start_http_server(
 
         // Common setup for both IPv4 and successful dual-stack IPv6
         let backlog = get_listen_backlog();
-        socket.set_reuse_address(true)?;
-        // Set the socket to non-blocking before passing it to Tokio.
-        socket.set_nonblocking(true)?;
-
-        // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
-        socket.set_tcp_nodelay(true)?;
-
-        // 3. Set system-level TCP KeepAlive to protect long connections
-        // Note: This sets keepalive on the LISTENING socket, which is inherited by accepted sockets on some platforms (e.g. Linux).
-        // However, we also explicitly set it on accepted sockets in the loop below to be safe and cross-platform.
         let keepalive = get_default_tcp_keepalive();
-        socket.set_tcp_keepalive(&keepalive)?;
 
-        // 4. Increase receive buffer to support BDP at GB-level throughput
-        socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
+        // Helper to configure socket with optimized parameters
+        let configure_socket = |socket: &socket2::Socket| -> Result<()> {
+            socket.set_reuse_address(true)?;
+
+            // Set the socket to non-blocking before passing it to Tokio.
+            socket.set_nonblocking(true)?;
+
+            // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
+            socket.set_tcp_nodelay(true)?;
+
+            // 2. Enable SO_REUSEPORT for better multi-core scalability on supported platforms
+            #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+            if let Err(e) = socket.set_reuse_port(true) {
+                debug!("Failed to set SO_REUSEPORT: {}", e);
+            }
+
+            // 3. Set system-level TCP KeepAlive to protect long connections
+            socket.set_tcp_keepalive(&keepalive)?;
+
+            // 4. Increase receive/send buffer to support BDP at GB-level throughput
+            socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
+            socket.set_send_buffer_size(4 * rustfs_config::MI_B)?;
+
+            Ok(())
+        };
+
+        configure_socket(&socket)?;
 
         // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
         if let Err(bind_err) = socket.bind(&server_addr.into()) {
@@ -120,13 +134,8 @@ pub async fn start_http_server(
                 let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
                 server_addr = ipv4_addr;
                 socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-                socket.set_reuse_address(true)?;
-                socket.set_nonblocking(true)?;
-                socket.set_tcp_nodelay(true)?;
-                socket.set_tcp_keepalive(&keepalive)?;
-                socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
+                configure_socket(&socket)?;
                 socket.bind(&server_addr.into())?;
-                // [FIX] Ensure fallback socket is moved to listening state as well.
                 socket.listen(backlog)?;
             } else {
                 return Err(bind_err);
@@ -261,9 +270,10 @@ pub async fn start_http_server(
         };
 
         // RustFS Transport Layer Configuration Constants - Optimized for S3 Workloads
-        const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024 * 2; // 2MB: Optimize large file throughput
-        const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 1024 * 1024 * 4; // 4MB: Link-level flow control
-        const H2_MAX_FRAME_SIZE: u32 = 16384; // 16KB: Reduce framing overhead
+        const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024 * 4; // 4MB: Optimize large file throughput
+        const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 1024 * 1024 * 8; // 8MB: Link-level flow control
+        const H2_MAX_FRAME_SIZE: u32 = 1024 * 1024; // 1MB: Reduce framing overhead for large objects
+        const H2_MAX_HEADER_LIST_SIZE: u32 = 1024 * 1024; // 1MB: Support large S3 metadata/headers
 
         let mut conn_builder = ConnBuilder::new(TokioExecutor::new());
 
@@ -285,6 +295,7 @@ pub async fn start_http_server(
             .initial_connection_window_size(H2_INITIAL_CONN_WINDOW_SIZE)
             .max_frame_size(H2_MAX_FRAME_SIZE)
             .max_concurrent_streams(Some(2048))
+            .max_header_list_size(H2_MAX_HEADER_LIST_SIZE)
             .keep_alive_interval(Some(Duration::from_secs(20)))
             .keep_alive_timeout(Duration::from_secs(10));
 
@@ -364,12 +375,18 @@ pub async fn start_http_server(
                 warn!(?err, "Failed to set TCP_KEEPALIVE");
             }
 
-            // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
+            // Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
 
-            // 4. Increase receive buffer to support BDP at GB-level throughput
+            // Enable TCP QuickAck to reduce latency for small requests
+            #[cfg(target_os = "linux")]
+            if let Err(err) = socket_ref.set_tcp_quickack(true) {
+                debug!(?err, "Failed to set TCP_QUICKACK");
+            }
+
+            // Increase receive/send buffer to support BDP at GB-level throughput
             if let Err(err) = socket_ref.set_recv_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_recv_buffer_size");
             }
@@ -448,6 +465,9 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         // Configure ALPN protocol priority
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
+        // Enable session resumption to reduce handshake overhead for returning clients
+        server_config.session_storage = Arc::new(rustls::server::ServerSessionMemoryCache::new(2048));
+
         // Log SNI requests
         if rustfs_utils::tls_key_log() {
             server_config.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -478,6 +498,9 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 
         // Configure ALPN protocol priority
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+
+        // Enable session resumption to reduce handshake overhead for returning clients
+        server_config.session_storage = Arc::new(rustls::server::ServerSessionMemoryCache::new(2048));
 
         // Log SNI requests
         if rustfs_utils::tls_key_log() {
