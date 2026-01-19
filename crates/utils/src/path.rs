@@ -30,13 +30,10 @@ pub const SLASH_SEPARATOR_STR: &str = if cfg!(target_os = "windows") { "\\" } el
 
 /// GLOBAL_DIR_SUFFIX_WITH_SLASH is the directory suffix followed by the
 /// platform-specific path separator, used to denote directory objects.
-#[cfg(target_os = "windows")]
-pub const GLOBAL_DIR_SUFFIX_WITH_SLASH: &str = "__XLDIR__\\";
-#[cfg(not(target_os = "windows"))]
 pub const GLOBAL_DIR_SUFFIX_WITH_SLASH: &str = "__XLDIR__/";
 
-/// has_suffix checks if the string `s` ends with the specified `suffix`,
-/// performing a case-insensitive comparison on Windows platforms.
+/// has_suffix checks if the string `s` ends with the specified `suffix`.
+/// For object storage compatibility, this is case-sensitive and uses forward slashes.
 ///
 /// # Arguments
 /// * `s` - A string slice that holds the string to be checked.
@@ -44,17 +41,12 @@ pub const GLOBAL_DIR_SUFFIX_WITH_SLASH: &str = "__XLDIR__/";
 ///
 /// # Returns
 /// A boolean indicating whether `s` ends with `suffix`.
-///
 pub fn has_suffix(s: &str, suffix: &str) -> bool {
-    if cfg!(target_os = "windows") {
-        s.to_lowercase().ends_with(&suffix.to_lowercase())
-    } else {
-        s.ends_with(suffix)
-    }
+    s.ends_with(suffix)
 }
 
 /// encode_dir_object encodes a directory object by appending
-/// a special suffix if it ends with a slash.
+/// a special suffix if it ends with a forward slash (object storage standard).
 ///
 /// # Arguments
 /// * `object` - A string slice that holds the object to be encoded.
@@ -63,8 +55,8 @@ pub fn has_suffix(s: &str, suffix: &str) -> bool {
 /// A `String` representing the encoded directory object.
 ///
 pub fn encode_dir_object(object: &str) -> String {
-    if has_suffix(object, SLASH_SEPARATOR_STR) {
-        format!("{}{}", object.trim_end_matches(SLASH_SEPARATOR_STR), GLOBAL_DIR_SUFFIX)
+    if has_suffix(object, "/") {
+        format!("{}{}", object.trim_end_matches('/'), GLOBAL_DIR_SUFFIX)
     } else {
         object.to_string()
     }
@@ -80,12 +72,15 @@ pub fn encode_dir_object(object: &str) -> String {
 /// A boolean indicating whether the object is a directory object.
 ///
 pub fn is_dir_object(object: &str) -> bool {
+    if object.ends_with("/") || object.ends_with(SLASH_SEPARATOR) {
+        return true;
+    }
     let obj = encode_dir_object(object);
     obj.ends_with(GLOBAL_DIR_SUFFIX)
 }
 
 /// decode_dir_object decodes a directory object by removing
-/// the special suffix if it is present.
+/// the special suffix if it is present, and appends a forward slash.
 ///
 /// # Arguments
 /// * `object` - A string slice that holds the object to be decoded.
@@ -96,7 +91,7 @@ pub fn is_dir_object(object: &str) -> bool {
 #[allow(dead_code)]
 pub fn decode_dir_object(object: &str) -> String {
     if has_suffix(object, GLOBAL_DIR_SUFFIX) {
-        format!("{}{}", object.trim_end_matches(GLOBAL_DIR_SUFFIX), SLASH_SEPARATOR)
+        format!("{}{}", object.trim_end_matches(GLOBAL_DIR_SUFFIX), '/')
     } else {
         object.to_string()
     }
@@ -1167,5 +1162,22 @@ mod tests {
             PathBuf::from("c"),
         ]);
         assert_eq!(result, PathBuf::from("b/c"));
+    }
+
+    #[test]
+    fn test_encode_decode_dir_object() {
+        // Test encode_dir_object
+        assert_eq!(encode_dir_object("folder/"), "folder__XLDIR__");
+        assert_eq!(encode_dir_object("folder"), "folder");
+        assert_eq!(encode_dir_object(""), "");
+
+        // Test decode_dir_object
+        assert_eq!(decode_dir_object("folder__XLDIR__"), "folder/");
+        assert_eq!(decode_dir_object("folder"), "folder");
+
+        // Test is_dir_object
+        assert!(is_dir_object("folder/"));
+        assert!(!is_dir_object("folder"));
+        assert!(is_dir_object("folder__XLDIR__"));
     }
 }
