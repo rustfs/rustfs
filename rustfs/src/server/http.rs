@@ -272,8 +272,8 @@ pub async fn start_http_server(
         // RustFS Transport Layer Configuration Constants - Optimized for S3 Workloads
         const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024 * 4; // 4MB: Optimize large file throughput
         const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 1024 * 1024 * 8; // 8MB: Link-level flow control
-        const H2_MAX_FRAME_SIZE: u32 = 1024 * 1024; // 1MB: Reduce framing overhead for large objects
-        const H2_MAX_HEADER_LIST_SIZE: u32 = 1024 * 1024; // 1MB: Support large S3 metadata/headers
+        const H2_MAX_FRAME_SIZE: u32 = 512 * 1024; // 512KB: Reduce framing overhead for large objects
+        const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024; // 64KB: Conservative header limit to mitigate DoS risk
 
         let mut conn_builder = ConnBuilder::new(TokioExecutor::new());
 
@@ -466,7 +466,7 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
         // Enable session resumption to reduce handshake overhead for returning clients
-        server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(2048);
+        server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
 
         // Log SNI requests
         if rustfs_utils::tls_key_log() {
@@ -500,7 +500,7 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
         // Enable session resumption to reduce handshake overhead for returning clients
-        server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(2048);
+        server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
 
         // Log SNI requests
         if rustfs_utils::tls_key_log() {
