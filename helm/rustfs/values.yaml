@@ -58,6 +58,9 @@ config:
     region: "us-east-1"
     obs_log_directory: "/logs"
     obs_environment: "develop"
+    # Optionally enable support for virtual-hosted-style requests.
+    # See more information: https://docs.rustfs.com/integration/virtual.html
+    domains: "" # e.g. "example.com"
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
