@@ -6206,7 +6206,7 @@ impl S3 for FS {
                 if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
                     return Err(S3Error::with_message(
                         S3ErrorCode::InvalidRequest,
-                        "Object Lock is not enabled for this bucket".to_string(), // 修正错误信息
+                        "Object Lock is not enabled for this bucket".to_string(),
                     ));
                 }
             }
@@ -6283,7 +6283,7 @@ impl S3 for FS {
                 if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
                     return Err(S3Error::with_message(
                         S3ErrorCode::InvalidRequest,
-                        "Object Lock is not enabled for this bucket".to_string(), // 修正错误信息
+                        "Object Lock is not enabled for this bucket".to_string(),
                     ));
                 }
             }
@@ -6346,7 +6346,7 @@ impl S3 for FS {
                 if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
                     return Err(S3Error::with_message(
                         S3ErrorCode::InvalidRequest,
-                        "Object Lock is not enabled for this bucket".to_string(), // 修正错误信息
+                        "Object Lock is not enabled for this bucket".to_string(),
                     ));
                 }
             }
@@ -6415,7 +6415,7 @@ impl S3 for FS {
                 if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
                     return Err(S3Error::with_message(
                         S3ErrorCode::InvalidRequest,
-                        "Object Lock is not enabled for this bucket".to_string(), // 修正错误信息
+                        "Object Lock is not enabled for this bucket".to_string(),
                     ));
                 }
             }
