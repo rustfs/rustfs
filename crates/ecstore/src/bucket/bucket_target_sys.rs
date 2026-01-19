@@ -23,6 +23,7 @@ use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
@@ -1094,8 +1095,7 @@ pub struct TargetClient {
 
 impl TargetClient {
     pub fn to_url(&self) -> Url {
-        let scheme = if self.secure { "https" } else { "http" };
-        Url::parse(&format!("{scheme}://{}", self.endpoint)).unwrap()
+        Url::parse(&self.endpoint).unwrap()
     }
 
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, S3ClientError> {
@@ -1104,9 +1104,17 @@ impl TargetClient {
             Err(e) => match e {
                 SdkError::ServiceError(oe) => match oe.into_err() {
                     HeadBucketError::NotFound(_) => Ok(false),
-                    other => Err(S3ClientError::new(format!(
-                        "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{other:?}"
-                    ))),
+                    other => {
+                        warn!(
+                            "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{:?}",
+                            other
+                        );
+                        let message = other.meta().meta();
+                        Err(S3ClientError::new(format!(
+                            "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{:?}",
+                            message
+                        )))
+                    }
                 },
                 SdkError::DispatchFailure(e) => Err(S3ClientError::new(format!(
                     "failed to dispatch bucket exists for bucket:{bucket} error:{e:?}"

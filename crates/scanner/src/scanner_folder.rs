@@ -168,8 +168,6 @@ impl ScannerItem {
             return;
         };
 
-        debug!("apply_actions: got lifecycle config for object: {}", self.object_path());
-
         let object_opts = object_infos
             .iter()
             .map(ObjectOpts::from_object_info)
@@ -262,14 +260,10 @@ impl ScannerItem {
         actual_size: i64,
         size_summary: &mut SizeSummary,
     ) -> i64 {
-        debug!("heal_actions: healing object: {} {}", self.object_path(), oi.name);
-
         let mut size = actual_size;
 
         if self.heal_enabled {
             size = self.apply_heal(store, oi).await;
-        } else {
-            debug!("heal_actions: heal is disabled for object: {} {}", self.object_path(), oi.name);
         }
 
         self.heal_replication(oi, size_summary).await;
@@ -279,22 +273,15 @@ impl ScannerItem {
 
     async fn heal_replication(&mut self, oi: &ObjectInfo, size_summary: &mut SizeSummary) {
         if oi.version_id.is_none_or(|v| v.is_nil()) {
-            debug!("heal_replication: no version id for object: {} {}", self.object_path(), oi.name);
             return;
         }
 
         let Some(replication) = self.replication.clone() else {
-            debug!("heal_replication: no replication config for object: {} {}", self.object_path(), oi.name);
             return;
         };
 
         let roi = queue_replication_heal_internal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
         if oi.delete_marker || oi.version_purge_status.is_empty() {
-            debug!(
-                "heal_replication: delete marker or version purge status is empty for object: {} {}",
-                self.object_path(),
-                oi.name
-            );
             return;
         }
 
@@ -355,7 +342,10 @@ impl ScannerItem {
             .heal_object(
                 self.bucket.as_str(),
                 self.object_path().as_str(),
-                oi.version_id.map(|v| v.to_string()).unwrap_or_default().as_str(),
+                oi.version_id
+                    .map(|v| if v.is_nil() { "".to_string() } else { v.to_string() })
+                    .unwrap_or_default()
+                    .as_str(),
                 &HealOpts {
                     remove: HEAL_DELETE_DANGLING,
                     scan_mode,
@@ -410,11 +400,9 @@ pub struct FolderScanner {
 impl FolderScanner {
     pub async fn should_heal(&self) -> bool {
         if self.skip_heal.load(std::sync::atomic::Ordering::Relaxed) {
-            debug!("should_heal: false skip_heal is true for root: {}", self.root);
             return false;
         }
         if self.heal_object_select == 0 {
-            debug!("should_heal: false heal_object_select is 0 for root: {}", self.root);
             return false;
         }
 
@@ -426,11 +414,9 @@ impl FolderScanner {
             .healing
         {
             self.skip_heal.store(true, std::sync::atomic::Ordering::Relaxed);
-            debug!("should_heal: false healing is true for root: {}", self.root);
             return false;
         }
 
-        debug!("should_heal: true for root: {}", self.root);
         true
     }
 
@@ -455,7 +441,6 @@ impl FolderScanner {
 
         let elapsed = self.last_update.elapsed().unwrap_or(Duration::from_secs(0));
         if elapsed < Duration::from_secs(60) {
-            debug!("send_update: done for now elapsed time is less than 60 seconds");
             return;
         }
 
@@ -467,7 +452,6 @@ impl FolderScanner {
                 error!("send_update: failed to send update: {}", e);
             }
             self.last_update = SystemTime::now();
-            debug!("send_update: sent update for folder: {}", self.new_cache.info.name);
         }
     }
 
@@ -548,7 +532,6 @@ impl FolderScanner {
             {
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
-                    debug!("scan_folder: done for now file_name is empty or . or ..");
                     continue;
                 }
 
@@ -559,38 +542,30 @@ impl FolderScanner {
                 let entry_name = path_join_buf(&[&folder.name, trim_dir_name]);
 
                 if entry_name.is_empty() || entry_name == folder.name {
-                    debug!("scan_folder: done for now entry_name is empty or equals folder name");
                     continue;
                 }
 
                 let entry_type = entry.file_type().await.map_err(|e| ScannerError::Other(e.to_string()))?;
 
                 // ok
-                debug!("scan_folder: entry_name: {:?}", entry_name);
 
                 let (bucket, prefix) = path2_bucket_object_with_base_path(self.root.as_str(), &entry_name);
                 if bucket.is_empty() {
-                    debug!("scan_folder: done for now bucket is empty");
                     break;
                 }
 
                 if is_reserved_or_invalid_bucket(&bucket, false) {
-                    debug!("scan_folder: done for now bucket is reserved or invalid");
                     break;
                 }
 
                 if ctx.is_cancelled() {
-                    debug!("scan_folder: done for now operation cancelled");
                     break;
                 }
-
-                debug!("scan_folder: bucket: {:?}, prefix: {:?}", bucket, prefix);
 
                 if entry_type.is_dir() {
                     let h = hash_path(&entry_name);
 
                     if h == this_hash {
-                        debug!("scan_folder: done for now self folder");
                         continue;
                     }
 
@@ -605,12 +580,10 @@ impl FolderScanner {
                     abandoned_children.remove(&h.key());
 
                     if exists {
-                        debug!("scan_folder: adding existing folder: {}", entry_name);
                         existing_folders.push(this);
                         self.update_cache
                             .copy_with_children(&self.old_cache, &h, &Some(this_hash.clone()));
                     } else {
-                        debug!("scan_folder: adding new folder: {}", entry_name);
                         new_folders.push(this);
                     }
                     continue;
@@ -621,18 +594,6 @@ impl FolderScanner {
                 if (self.we_sleep)() {
                     wait = Some(SystemTime::now());
                 }
-
-                debug!(
-                    "scan_folder: heal_enabled: {} next_cycle: {} heal_object_select: {} object_heal_prob_div: {} should_heal: {}",
-                    this_hash.mod_alt(
-                        self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
-                        self.heal_object_select / folder.object_heal_prob_div
-                    ),
-                    self.old_cache.info.next_cycle,
-                    self.heal_object_select,
-                    folder.object_heal_prob_div,
-                    self.should_heal().await,
-                );
 
                 let heal_enabled = this_hash.mod_alt(
                     self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
@@ -652,8 +613,6 @@ impl FolderScanner {
                     file_type: entry_type,
                 };
 
-                debug!("scan_folder: item: {:?}", item);
-
                 let sz = match self.local_disk.get_size(item.clone()).await {
                     Ok(sz) => sz,
                     Err(e) => {
@@ -671,8 +630,6 @@ impl FolderScanner {
                         continue;
                     }
                 };
-
-                debug!("scan_folder: got size for item {}: {:?}", item.path, &sz);
 
                 found_objects = true;
 
@@ -831,17 +788,15 @@ impl FolderScanner {
 
             // Scan for healing
             if abandoned_children.is_empty() || !self.should_heal().await {
-                info!("scan_folder: done for now abandoned children are empty or we are not healing");
+                debug!("scan_folder: done for now abandoned children are empty or we are not healing");
                 // If we are not heal scanning, return now.
                 break;
             }
 
             if self.disks.is_empty() || self.disks_quorum == 0 {
-                info!("scan_folder: done for now disks are empty or quorum is 0");
+                debug!("scan_folder: done for now disks are empty or quorum is 0");
                 break;
             }
-
-            debug!("scan_folder: scanning for healing abandoned children: {:?}", abandoned_children);
 
             let mut resolver = MetadataResolutionParams {
                 dir_quorum: self.disks_quorum,
@@ -859,7 +814,6 @@ impl FolderScanner {
                 let (bucket, prefix) = path2_bucket_object(name.as_str());
 
                 if bucket != resolver.bucket {
-                    debug!("scan_folder: sending heal request for bucket: {}", bucket);
                     send_heal_request(HealChannelRequest {
                         bucket: bucket.clone(),
                         ..Default::default()
@@ -885,7 +839,6 @@ impl FolderScanner {
                 let partial_tx = partial_tx.clone();
                 let finished_tx = finished_tx.clone();
 
-                debug!("scan_folder: listing path: {}/{}", bucket, prefix);
                 tokio::spawn(async move {
                     if let Err(e) = list_path_raw(
                         child_ctx_clone.clone(),
@@ -936,11 +889,9 @@ impl FolderScanner {
                 loop {
                     select! {
                         Some(entry_name) = agreed_rx.recv() => {
-                            debug!("scan_folder: list_path_raw: found object: {}/{}", bucket, entry_name);
                             (self.update_current_path)(&entry_name).await;
                         }
                         Some(entries) = partial_rx.recv() => {
-                            debug!("scan_folder: list_path_raw: found partial entries: {:?}", entries);
                             if !self.should_heal().await {
                                 child_ctx.cancel();
                                 break;
@@ -958,7 +909,6 @@ impl FolderScanner {
 
 
                            let Some(entry) = entry_option else {
-                            debug!("scan_folder: list_path_raw: found no entry");
                             break;
                            };
 
@@ -1010,11 +960,10 @@ impl FolderScanner {
 
                         }
                         Some(errs) = finished_rx.recv() => {
-                            debug!("scan_folder: list_path_raw: found finished errs: {:?}", errs);
+                            error!("scan_folder: list_path_raw: failed to get finished errs: {:?}", errs);
                             child_ctx.cancel();
                         }
                         _ = child_ctx.cancelled() => {
-                            debug!("scan_folder: list_path_raw: child context cancelled loop break");
                             break;
                         }
                     }
@@ -1185,8 +1134,6 @@ pub async fn scan_data_folder(
         parent: None,
         object_heal_prob_div: 1,
     };
-
-    warn!("scan_data_folder: folder: {:?}", folder);
 
     // Scan the folder
     match scanner.scan_folder(ctx, folder, &mut root).await {

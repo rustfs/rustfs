@@ -1327,7 +1327,7 @@ impl SetDisks {
         quorum: usize,
     ) -> disk::error::Result<FileInfo> {
         if quorum < 1 {
-            error!("find_file_info_in_quorum: quorum < 1");
+            warn!("find_file_info_in_quorum: quorum < 1");
             return Err(DiskError::ErasureReadQuorum);
         }
 
@@ -1408,7 +1408,7 @@ impl SetDisks {
         }
 
         if max_count < quorum {
-            error!("find_file_info_in_quorum: max_count < quorum, max_val={:?}", max_val);
+            warn!("find_file_info_in_quorum: max_count < quorum, max_val={:?}", max_val);
             return Err(DiskError::ErasureReadQuorum);
         }
 
@@ -1452,7 +1452,7 @@ impl SetDisks {
             return Ok(fi);
         }
 
-        error!("find_file_info_in_quorum: fileinfo not found");
+        warn!("find_file_info_in_quorum: fileinfo not found");
 
         Err(DiskError::ErasureReadQuorum)
     }
@@ -2742,6 +2742,8 @@ impl SetDisks {
                 let filter_by_etag = quorum_etag.is_some();
                 match Self::pick_valid_fileinfo(&parts_metadata, quorum_mod_time, quorum_etag.clone(), read_quorum as usize) {
                     Ok(latest_meta) => {
+                        info!("heal_object latest_meta: {:?}", latest_meta);
+
                         let (data_errs_by_disk, data_errs_by_part) = disks_with_all_parts(
                             &mut online_disks,
                             &mut parts_metadata,
@@ -2780,10 +2782,6 @@ impl SetDisks {
                         let mut disks_to_heal_count = 0;
                         let mut meta_to_heal_count = 0;
 
-                        info!(
-                            "heal_object Checking {} disks for healing needs (bucket={}, object={})",
-                            disk_len, bucket, object
-                        );
                         for index in 0..online_disks.len() {
                             let (yes, is_meta, reason) = should_heal_object_on_disk(
                                 &errs[index],
@@ -2792,18 +2790,13 @@ impl SetDisks {
                                 &latest_meta,
                             );
 
-                            info!(
-                                "heal_object Disk {} heal check: should_heal={}, reason={:?}, err={:?}, endpoint={}",
-                                index, yes, reason, errs[index], self.set_endpoints[index]
-                            );
-
                             if yes {
                                 out_dated_disks[index] = disks[index].clone();
                                 disks_to_heal_count += 1;
                                 if is_meta {
                                     meta_to_heal_count += 1;
                                 }
-                                info!("heal_object Disk {} marked for healing (endpoint={})", index, self.set_endpoints[index]);
+                                debug!("heal_object Disk {} marked for healing (endpoint={})", index, self.set_endpoints[index]);
                             }
 
                             let drive_state = match reason {
@@ -2832,25 +2825,13 @@ impl SetDisks {
                             });
                         }
 
-                        info!(
-                            "Heal check complete: {} disks need healing out of {} total (bucket={}, object={})",
-                            disks_to_heal_count, disk_len, bucket, object
-                        );
-
                         if disks_to_heal_count == 0 {
-                            info!("No disks to heal, returning early");
                             return Ok((result, None));
                         }
 
                         if opts.dry_run {
-                            info!("Dry run mode, returning early");
                             return Ok((result, None));
                         }
-
-                        info!(
-                            "Proceeding with heal: disks_to_heal_count={}, dry_run={}",
-                            disks_to_heal_count, opts.dry_run
-                        );
 
                         let mut cannot_heal = !latest_meta.deleted && disks_to_heal_count > latest_meta.erasure.parity_blocks;
                         if cannot_heal && quorum_etag.is_some() {
@@ -3000,13 +2981,9 @@ impl SetDisks {
                         let src_data_dir = latest_meta.data_dir.unwrap().to_string();
                         let dst_data_dir = latest_meta.data_dir.unwrap();
 
-                        info!(
-                            "Checking heal conditions: deleted={}, is_remote={}",
-                            latest_meta.deleted,
-                            latest_meta.is_remote()
-                        );
                         if !latest_meta.deleted && !latest_meta.is_remote() {
                             let erasure_info = latest_meta.erasure.clone();
+
                             for (part_index, part) in latest_meta.parts.iter().enumerate() {
                                 let till_offset = erasure.shard_file_offset(0, part.size, part.size);
                                 let checksum_algo = erasure_info.get_checksum_info(part.number).algorithm;
@@ -3017,8 +2994,13 @@ impl SetDisks {
                                 let mut prefer = vec![false; latest_disks.len()];
                                 for (index, disk) in latest_disks.iter().enumerate() {
                                     let this_part_errs =
-                                        Self::shuffle_check_parts(&data_errs_by_part[&index], &erasure_info.distribution);
-                                    if this_part_errs[part_index] != CHECK_PART_SUCCESS {
+                                        Self::shuffle_check_parts(&data_errs_by_part[&part_index], &erasure_info.distribution);
+                                    if this_part_errs[index] != CHECK_PART_SUCCESS {
+                                        info!(
+                                            "reading part {}: index={}, part_errs={:?}, skipping",
+                                            part.number, index, this_part_errs[part_index]
+                                        );
+                                        readers.push(None);
                                         continue;
                                     }
 
@@ -3039,12 +3021,10 @@ impl SetDisks {
                                                 readers.push(Some(reader));
                                             }
                                             Ok(None) => {
-                                                error!("heal_object disk not available");
                                                 readers.push(None);
                                                 continue;
                                             }
                                             Err(e) => {
-                                                error!("heal_object read_file err: {:?}", e);
                                                 readers.push(None);
                                                 continue;
                                             }
@@ -3065,14 +3045,8 @@ impl SetDisks {
                                     }
                                 };
                                 // create writers for all disk positions, but only for outdated disks
-                                info!(
-                                    "Creating writers: latest_disks len={}, out_dated_disks len={}",
-                                    latest_disks.len(),
-                                    out_dated_disks.len()
-                                );
                                 for (index, disk_op) in out_dated_disks.iter().enumerate() {
                                     if let Some(outdated_disk) = disk_op {
-                                        info!(disk_index = index, "Creating writer for outdated disk");
                                         let writer = match create_bitrot_writer(
                                             is_inline_buffer,
                                             Some(outdated_disk),
@@ -3090,7 +3064,7 @@ impl SetDisks {
                                         {
                                             Ok(writer) => writer,
                                             Err(err) => {
-                                                warn!(
+                                                info!(
                                                     "create_bitrot_writer  disk {}, err {:?}, skipping operation",
                                                     outdated_disk.to_string(),
                                                     err
@@ -3101,10 +3075,10 @@ impl SetDisks {
                                         };
                                         writers.push(Some(writer));
                                     } else {
-                                        info!(disk_index = index, "Skipping writer (disk not outdated)");
                                         writers.push(None);
                                     }
                                 }
+
                                 // Heal each part. erasure.Heal() will write the healed
                                 // part to .rustfs/tmp/uuid/ which needs to be renamed
                                 // later to the final location.
@@ -3157,12 +3131,6 @@ impl SetDisks {
                             }
                         }
                         // Rename from tmp location to the actual location.
-                        info!(
-                            "Starting rename phase: {} disks to process (bucket={}, object={})",
-                            out_dated_disks.iter().filter(|d| d.is_some()).count(),
-                            bucket,
-                            object
-                        );
                         for (index, outdated_disk) in out_dated_disks.iter().enumerate() {
                             if let Some(disk) = outdated_disk {
                                 // record the index of the updated disks
@@ -3170,71 +3138,15 @@ impl SetDisks {
                                 // Attempt a rename now from healed data to final location.
                                 parts_metadata[index].set_healing();
 
-                                info!(
-                                    "Renaming healed data for disk {} (endpoint={}): src_volume={}, src_path={}, dst_volume={}, dst_path={}",
-                                    index, self.set_endpoints[index], RUSTFS_META_TMP_BUCKET, tmp_id, bucket, object
-                                );
                                 let rename_result = disk
                                     .rename_data(RUSTFS_META_TMP_BUCKET, &tmp_id, parts_metadata[index].clone(), bucket, object)
                                     .await;
 
                                 if let Err(err) = &rename_result {
-                                    info!(
-                                        error = %err,
-                                        disk_index = index,
-                                        endpoint = %self.set_endpoints[index],
-                                        "Rename failed, attempting fallback"
-                                    );
-
                                     self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id)
                                         .await
                                         .map_err(DiskError::other)?;
-
-                                    // // Preserve temp files for safety
-                                    // info!(temp_uuid = %tmp_id, "Rename failed, preserving temporary files for safety");
-
-                                    // let healthy_index = latest_disks.iter().position(|d| d.is_some()).unwrap_or(0);
-
-                                    // if let Some(healthy_disk) = &latest_disks[healthy_index] {
-                                    //     let xlmeta_path = format!("{object}/xl.meta");
-
-                                    //     match healthy_disk.read_all(bucket, &xlmeta_path).await {
-                                    //         Ok(xlmeta_bytes) => {
-                                    //             if let Err(e) = disk.write_all(bucket, &xlmeta_path, xlmeta_bytes).await {
-                                    //                 info!("fallback xl.meta overwrite failed: {}", e.to_string());
-
-                                    //                 return Ok((
-                                    //                     result,
-                                    //                     Some(DiskError::other(format!("fallback xl.meta overwrite failed: {e}"))),
-                                    //                 ));
-                                    //             } else {
-                                    //                 info!("fallback xl.meta overwrite succeeded for disk {}", disk.to_string());
-                                    //             }
-                                    //         }
-
-                                    //         Err(e) => {
-                                    //             info!("read healthy xl.meta failed: {}", e.to_string());
-
-                                    //             return Ok((
-                                    //                 result,
-                                    //                 Some(DiskError::other(format!("read healthy xl.meta failed: {e}"))),
-                                    //             ));
-                                    //         }
-                                    //     }
-                                    // } else {
-                                    //     info!("no healthy disk found for xl.meta fallback overwrite");
-
-                                    //     return Ok((
-                                    //         result,
-                                    //         Some(DiskError::other("no healthy disk found for xl.meta fallback overwrite")),
-                                    //     ));
-                                    // }
                                 } else {
-                                    info!(
-                                        "Successfully renamed healed data for disk {} (endpoint={}), removing temp files from volume={}, path={}",
-                                        index, self.set_endpoints[index], RUSTFS_META_TMP_BUCKET, tmp_id
-                                    );
-
                                     self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id)
                                         .await
                                         .map_err(DiskError::other)?;
@@ -3269,10 +3181,7 @@ impl SetDisks {
 
                         Ok((result, None))
                     }
-                    Err(err) => {
-                        warn!("heal_object can not pick valid file info");
-                        Ok((result, Some(err)))
-                    }
+                    Err(err) => Ok((result, Some(err))),
                 }
             }
             Err(err) => {
@@ -6453,12 +6362,6 @@ async fn disks_with_all_parts(
     scan_mode: HealScanMode,
 ) -> disk::error::Result<(HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>)> {
     let object_name = latest_meta.name.clone();
-    debug!(
-        "disks_with_all_partsv2: starting with object_name={}, online_disks.len()={}, scan_mode={:?}",
-        object_name,
-        online_disks.len(),
-        scan_mode
-    );
 
     // Initialize dataErrsByDisk and dataErrsByPart with 0 (CHECK_PART_UNKNOWN) to match Go
     let mut data_errs_by_disk: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -6526,7 +6429,7 @@ async fn disks_with_all_parts(
         };
 
         if corrupted {
-            warn!(
+            info!(
                 "disks_with_all_partsv2: metadata is corrupted, object_name={}, index: {index}",
                 object_name
             );
@@ -6539,7 +6442,7 @@ async fn disks_with_all_parts(
 
         if erasure_distribution_reliable {
             if !meta.is_valid() {
-                warn!(
+                info!(
                     "disks_with_all_partsv2: metadata is not valid, object_name={}, index: {index}",
                     object_name
                 );
@@ -6553,7 +6456,7 @@ async fn disks_with_all_parts(
                 // Erasure distribution is not the same as onlineDisks
                 // attempt a fix if possible, assuming other entries
                 // might have the right erasure distribution.
-                warn!(
+                info!(
                     "disks_with_all_partsv2: erasure distribution is not the same as onlineDisks, object_name={}, index: {index}",
                     object_name
                 );
@@ -6573,10 +6476,6 @@ async fn disks_with_all_parts(
                 if let Some(vec) = data_errs_by_part.get_mut(&p)
                     && index < vec.len()
                 {
-                    info!(
-                        "data_errs_by_part: copy meta errors to part errors: object_name={}, index: {index}, part: {p}, part_err: {part_err}",
-                        object_name
-                    );
                     vec[index] = part_err;
                 }
             }
@@ -6620,10 +6519,6 @@ async fn disks_with_all_parts(
                     && index < vec.len()
                 {
                     vec[index] = conv_part_err_to_int(&verify_err.map(|e| e.into()));
-                    info!(
-                        "data_errs_by_part:bitrot check result: object_name={}, index: {index}, result: {}",
-                        object_name, vec[index]
-                    );
                 }
             }
             continue;
@@ -6643,18 +6538,17 @@ async fn disks_with_all_parts(
                     verify_resp = v;
                 }
                 Err(err) => {
-                    warn!("verify_file failed: {err:?}, object_name={}, index: {index}", object_name);
+                    info!("verify_file failed: {err:?}, object_name={}, index: {index}", object_name);
                     verify_err = Some(err);
                 }
             }
         } else {
             match disk.check_parts(bucket, object, meta).await {
                 Ok(v) => {
-                    info!("check_parts: verify_resp: {:?}", v);
                     verify_resp = v;
                 }
                 Err(err) => {
-                    warn!("check_parts failed: {err:?}, object_name={}, index: {index}", object_name);
+                    info!("check_parts failed: {err:?}, object_name={}, index: {index}", object_name);
                     verify_err = Some(err);
                 }
             }
@@ -6666,27 +6560,13 @@ async fn disks_with_all_parts(
                 && index < vec.len()
             {
                 if verify_err.is_some() {
-                    info!(
-                        "data_errs_by_part: verify_err: object_name={}, index: {index}, part: {p}, verify_err: {verify_err:?}",
-                        object_name
-                    );
                     vec[index] = conv_part_err_to_int(&verify_err.clone());
                 } else {
                     // Fix: verify_resp.results length is based on meta.parts, not latest_meta.parts
                     // We need to check bounds to avoid panic
                     if p < verify_resp.results.len() {
-                        info!(
-                            "data_errs_by_part: update data_errs_by_part: object_name={}, index: {}, part: {}, verify_resp.results: {:?}",
-                            object_name, index, p, verify_resp.results[p]
-                        );
                         vec[index] = verify_resp.results[p];
                     } else {
-                        debug!(
-                            "data_errs_by_part: verify_resp.results length mismatch: expected at least {}, got {}, object_name={}, index: {index}, part: {p}",
-                            p + 1,
-                            verify_resp.results.len(),
-                            object_name
-                        );
                         vec[index] = CHECK_PART_SUCCESS;
                     }
                 }
@@ -6701,10 +6581,6 @@ async fn disks_with_all_parts(
                 && *part < parts.len()
             {
                 parts[*part] = disks[*disk_idx];
-                info!(
-                    "data_errs_by_disk: update data_errs_by_disk: object_name={}, part: {part}, disk_idx: {disk_idx}, disk_err: {}",
-                    object_name, parts[*part]
-                );
             }
         }
     }
@@ -6729,6 +6605,10 @@ pub fn should_heal_object_on_disk(
     }
 
     if !meta.equals(latest_meta) {
+        warn!(
+            "should_heal_object_on_disk: metadata is outdated, object_name={}, meta: {:?}, latest_meta: {:?}",
+            meta.name, meta, latest_meta
+        );
         return (true, true, Some(DiskError::OutdatedXLMeta));
     }
 

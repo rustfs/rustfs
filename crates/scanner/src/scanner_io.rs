@@ -31,7 +31,7 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 #[async_trait::async_trait]
 pub trait ScannerIO: Send + Sync + Debug + 'static {
@@ -222,7 +222,7 @@ impl ScannerIOCache for SetDisks {
 
         let (disks, healing) = self.get_online_disks_with_healing(false).await;
         if disks.is_empty() {
-            info!("No online disks available for set");
+            debug!("nsscanner_cache: no online disks available for set");
             return Ok(());
         }
 
@@ -334,6 +334,7 @@ impl ScannerIOCache for SetDisks {
             let ctx_clone = ctx.clone();
             let store_clone_clone = self.clone();
             let bucket_result_tx_clone_clone = bucket_result_tx_clone.clone();
+            let disk_clone = disk.clone();
             futs.push(tokio::spawn(async move {
                 while let Some(bucket) = bucket_rx_mutex_clone.lock().await.recv().await {
                     if ctx_clone.is_cancelled() {
@@ -363,7 +364,7 @@ impl ScannerIOCache for SetDisks {
                         };
                     }
 
-                    warn!("nsscanner_disk: cache.info.name: {:?}", cache.info.name);
+                    debug!("nsscanner_disk: cache.info.name: {:?}", cache.info.name);
 
                     let (updates_tx, mut updates_rx) = mpsc::channel::<DataUsageEntry>(1);
 
@@ -393,8 +394,7 @@ impl ScannerIOCache for SetDisks {
 
                     let before = cache.info.last_update;
 
-                    cache = match disk
-                        .clone()
+                    cache = match disk_clone
                         .nsscanner_disk(ctx_clone.clone(), cache.clone(), Some(updates_tx), scan_mode)
                         .await
                     {
@@ -456,15 +456,11 @@ impl ScannerIOCache for SetDisks {
 
         let _ = join_all(futs).await;
 
-        warn!("nsscanner_cache: joining all futures");
-
         drop(bucket_result_tx_clone);
-
-        warn!("nsscanner_cache: dropping bucket result tx");
 
         send_update_fut.await?;
 
-        warn!("nsscanner_cache: done");
+        debug!("nsscanner_cache: done");
 
         Ok(())
     }
@@ -477,11 +473,17 @@ impl ScannerIODisk for Disk {
             return Err(StorageError::other("skip file".to_string()));
         }
 
-        debug!("get_size: reading metadata for {}/{}", &item.bucket, &item.object_path());
-
         let data = match self.read_metadata(&item.bucket, &item.object_path()).await {
             Ok(data) => data,
-            Err(e) => return Err(StorageError::other(format!("Failed to read metadata: {e}"))),
+            Err(e) => {
+                warn!(
+                    "Failed to read metadata: {e}, bucket={}, object_path={}",
+                    &item.bucket,
+                    &item.object_path()
+                );
+
+                return Err(StorageError::other("skip file".to_string()));
+            }
         };
 
         item.transform_meta_dir();
@@ -549,11 +551,6 @@ impl ScannerIODisk for Disk {
         updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache> {
-        // match self {
-        //     Disk::Local(local_disk) => local_disk.nsscanner_disk(ctx, cache, updates, scan_mode).await,
-        //     Disk::Remote(remote_disk) => remote_disk.nsscanner_disk(ctx, cache, updates, scan_mode).await,
-        // }
-
         let _guard = self.start_scan();
 
         let mut cache = cache;

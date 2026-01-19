@@ -1180,7 +1180,7 @@ pub struct ScanGuard(pub Arc<AtomicU32>);
 
 impl Drop for ScanGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -2541,7 +2541,7 @@ impl DiskAPI for LocalDisk {
         info.rotational = self.rotational;
         info.mount_path = self.path().to_str().unwrap().to_string();
         info.endpoint = self.endpoint.to_string();
-        info.scanning = self.scanning.load(Ordering::SeqCst) == 1;
+        info.scanning = self.scanning.load(Ordering::Acquire) == 1;
 
         if info.id.is_none() {
             info.id = self.get_disk_id().await.unwrap_or(None);
@@ -2551,7 +2551,7 @@ impl DiskAPI for LocalDisk {
     }
     #[tracing::instrument(skip(self))]
     fn start_scan(&self) -> ScanGuard {
-        self.scanning.fetch_add(1, Ordering::Relaxed);
+        self.scanning.fetch_add(1, Ordering::Release);
         ScanGuard(Arc::clone(&self.scanning))
     }
 
@@ -2566,7 +2566,10 @@ impl DiskAPI for LocalDisk {
         }
 
         // Fallback to direct read if cache fails
-        let (data, _) = self.read_metadata_with_dmtime(file_path).await?;
+        let (data, _) = self.read_metadata_with_dmtime(&file_path).await.map_err(|e| {
+            error!("read_metadata: error: {:?}, file_path={}", e, file_path.to_string_lossy());
+            e
+        })?;
         Ok(data.into())
     }
 }
