@@ -1328,9 +1328,9 @@ mod tests {
         // Test complex case with various path elements
         let result = path_join(&[
             PathBuf::from("a"),
-            PathBuf::from(".. "),
+            PathBuf::from(".."),
             PathBuf::from("b"),
-            PathBuf::from(". "),
+            PathBuf::from("."),
             PathBuf::from("c"),
         ]);
         assert_eq!(result, PathBuf::from("b/c"));
@@ -1349,7 +1349,7 @@ mod tests {
         assert_eq!(object, "");
 
         // Test nested paths
-        let (bucket, object) = path_to_bucket_object("mybucket/dir/file. txt");
+        let (bucket, object) = path_to_bucket_object("mybucket/dir/file.txt");
         assert_eq!(bucket, "mybucket");
         assert_eq!(object, "dir/file.txt");
 
