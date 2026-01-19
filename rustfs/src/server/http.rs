@@ -466,7 +466,7 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
         // Enable session resumption to reduce handshake overhead for returning clients
-        server_config.session_storage = Arc::new(rustls::server::ServerSessionMemoryCache::new(2048));
+        server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(2048);
 
         // Log SNI requests
         if rustfs_utils::tls_key_log() {
@@ -500,7 +500,7 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
         // Enable session resumption to reduce handshake overhead for returning clients
-        server_config.session_storage = Arc::new(rustls::server::ServerSessionMemoryCache::new(2048));
+        server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(2048);
 
         // Log SNI requests
         if rustfs_utils::tls_key_log() {
