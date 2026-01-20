@@ -53,11 +53,10 @@ config:
     address: ":9000"
     console_enable: "true"
     console_address: ":9001"
-    log_level: "debug"
-    rust_log: "debug"
+    log_level: "info"
     region: "us-east-1"
     obs_log_directory: "/logs"
-    obs_environment: "develop"
+    obs_environment: "development"
     # Optionally enable support for virtual-hosted-style requests.
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"

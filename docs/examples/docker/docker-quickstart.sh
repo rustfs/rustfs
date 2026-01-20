@@ -84,7 +84,7 @@ quick_dev() {
         -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
         -e RUSTFS_ACCESS_KEY="dev-admin" \
         -e RUSTFS_SECRET_KEY="dev-secret" \
-        -e RUST_LOG="debug" \
+        -e RUSTFS_OBS_LOGGER_LEVEL="debug" \
         -v rustfs-dev-data:/data \
         rustfs/rustfs:latest
     
