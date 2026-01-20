@@ -591,6 +591,29 @@ fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Re
     Ok(eval_metadata)
 }
 
+async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Result<()> {
+    match metadata_sys::get_object_lock_config(bucket).await {
+        Ok((cfg, _created)) => {
+            if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "Object Lock is not enabled for this bucket".to_string(),
+                ));
+            }
+        }
+        Err(err) => {
+            if err == StorageError::ConfigNotFound {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "Bucket is missing ObjectLockConfiguration".to_string(),
+                ));
+            }
+            warn!("get_object_lock_config err {:?}", err);
+        }
+    }
+    Ok(())
+}
+
 impl FS {
     pub fn new() -> Self {
         // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
@@ -3143,6 +3166,22 @@ impl S3 for FS {
         {
             response.headers.insert(header_name, header_value);
         }
+        if let Some(mode) = metadata_map
+            .get("x-amz-object-lock-mode")
+            .or_else(|| metadata_map.get("X-Amz-Object-Lock-Mode"))
+            && let Ok(header_name) = http::HeaderName::from_bytes(b"x-amz-object-lock-mode")
+            && let Ok(header_value) = HeaderValue::from_str(mode)
+        {
+            response.headers.insert(header_name, header_value);
+        }
+        if let Some(legal_hold) = metadata_map
+            .get("x-amz-object-lock-legal-hold")
+            .or_else(|| metadata_map.get("X-Amz-Object-Lock-Legal-Hold"))
+            && let Ok(header_name) = http::HeaderName::from_bytes(b"x-amz-object-lock-legal-hold")
+            && let Ok(header_value) = HeaderValue::from_str(legal_hold)
+        {
+            response.headers.insert(header_name, header_value);
+        }
 
         let result = Ok(response);
         let _ = helper.complete(&result);
@@ -5657,7 +5696,7 @@ impl S3 for FS {
                     ));
                 }
 
-                debug!("get_object_lock_config err {:?}", err);
+                warn!("get_object_lock_config err {:?}", err);
                 None
             }
         };
@@ -6201,25 +6240,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         // check object lock
-        let _ = match metadata_sys::get_object_lock_config(&bucket).await {
-            Ok((cfg, _created)) => {
-                if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidRequest,
-                        "Object Lock is not enabled for this bucket".to_string(),
-                    ));
-                }
-            }
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidRequest,
-                        "Bucket is missing ObjectLockConfiguration".to_string(),
-                    ));
-                }
-                warn!("get_object_lock_config err {:?}", err);
-            }
-        };
+        validate_bucket_object_lock_enabled(&bucket).await?;
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
@@ -6278,26 +6299,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         // check object lock
-        let _ = match metadata_sys::get_object_lock_config(&bucket).await {
-            Ok((cfg, _created)) => {
-                if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidRequest,
-                        "Object Lock is not enabled for this bucket".to_string(),
-                    ));
-                }
-            }
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidRequest,
-                        "Bucket is missing ObjectLockConfiguration".to_string(),
-                    ));
-                }
-                warn!("get_object_lock_config err {:?}", err);
-            }
-        };
-
+        validate_bucket_object_lock_enabled(&bucket).await?;
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
@@ -6341,25 +6343,7 @@ impl S3 for FS {
         };
 
         // check object lock
-        let _ = match metadata_sys::get_object_lock_config(&bucket).await {
-            Ok((cfg, _created)) => {
-                if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidRequest,
-                        "Object Lock is not enabled for this bucket".to_string(),
-                    ));
-                }
-            }
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidRequest,
-                        "Bucket is missing ObjectLockConfiguration".to_string(),
-                    ));
-                }
-                warn!("get_object_lock_config err {:?}", err);
-            }
-        };
+        validate_bucket_object_lock_enabled(&bucket).await?;
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
@@ -6410,25 +6394,7 @@ impl S3 for FS {
         };
 
         // check object lock
-        let _ = match metadata_sys::get_object_lock_config(&bucket).await {
-            Ok((cfg, _created)) => {
-                if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidRequest,
-                        "Object Lock is not enabled for this bucket".to_string(),
-                    ));
-                }
-            }
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidRequest,
-                        "Bucket is missing ObjectLockConfiguration".to_string(),
-                    ));
-                }
-                debug!("get_object_lock_config err {:?}", err);
-            }
-        };
+        validate_bucket_object_lock_enabled(&bucket).await?;
 
         // TODO: check allow
 
@@ -7001,6 +6967,58 @@ mod tests {
             err.message(),
             Some("The XML you provided was not well-formed or did not validate against our published schema")
         );
+    }
+
+    #[tokio::test]
+    async fn test_validate_bucket_object_lock_enabled() {
+        use rustfs_ecstore::bucket::metadata::BucketMetadata;
+        use rustfs_ecstore::bucket::metadata_sys::{get_object_lock_config, set_bucket_metadata};
+        use rustfs_ecstore::error::StorageError;
+        use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
+        use time::OffsetDateTime;
+
+        if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_none() {
+            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+            return;
+        }
+
+        let test_bucket = "test-bucket-object-lock";
+
+        let mut bm = BucketMetadata::new(test_bucket);
+        bm.object_lock_config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: None,
+        });
+        bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
+        set_bucket_metadata(test_bucket.to_string(), bm).await.unwrap();
+        assert!(validate_bucket_object_lock_enabled(test_bucket).await.is_ok());
+
+        let mut bm = BucketMetadata::new(test_bucket);
+        bm.object_lock_config = Some(ObjectLockConfiguration {
+            object_lock_enabled: None,
+            rule: None,
+        });
+        bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
+        set_bucket_metadata(test_bucket.to_string(), bm).await.unwrap();
+        let err = validate_bucket_object_lock_enabled(test_bucket).await.unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidRequest.as_str());
+        assert_eq!(err.message(), Some("Object Lock is not enabled for this bucket"));
+
+        let non_exist_bucket = "non-exist-bucket-object-lock";
+        let err = validate_bucket_object_lock_enabled(non_exist_bucket).await.unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidRequest.as_str());
+        assert_eq!(err.message(), Some("Bucket is missing ObjectLockConfiguration"));
+
+        let result = get_object_lock_config("init-failed-bucket").await;
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                if e == StorageError::ConfigNotFound {
+                } else {
+                    warn!("get_object_lock_config err {:?}", e);
+                }
+            }
+        }
     }
 
     // Note: S3Request structure is complex and requires many fields.
