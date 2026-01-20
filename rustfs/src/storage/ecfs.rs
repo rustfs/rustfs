@@ -4902,9 +4902,11 @@ impl S3 for FS {
         let Tagging { tag_set } = match metadata_sys::get_tagging_config(&bucket).await {
             Ok((tags, _)) => tags,
             Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(S3ErrorCode::NoSuchTagSet, "The TagSet does not exist".to_string()));
+                }
                 warn!("get_tagging_config err {:?}", &err);
-                // TODO: check not found
-                Tagging::default()
+                return Err(ApiError::from(err).into());
             }
         };
 
