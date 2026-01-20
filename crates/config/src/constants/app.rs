@@ -168,7 +168,7 @@ pub const DEFAULT_OBS_LOG_STDOUT_ENABLED: bool = false;
 pub const KI_B: usize = 1024;
 /// Constant representing 1 Mebibyte (1024 * 1024 bytes)
 /// Default value: 1048576
-pub const MI_B: usize = 1024 * 1024;
+pub const MI_B: usize = 1024 * KI_B;
 
 #[cfg(test)]
 mod tests {

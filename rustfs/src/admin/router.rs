@@ -84,6 +84,7 @@ where
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
         let path = uri.path();
+
         // Profiling endpoints
         if method == Method::GET && (path == PROFILE_CPU_PATH || path == PROFILE_MEMORY_PATH) {
             return true;
@@ -150,6 +151,8 @@ where
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        // Console requests should be handled by console router first (including OPTIONS)
+        // Console has its own CORS layer configured
         if self.console_enabled && is_console_path(req.uri.path()) {
             if let Some(console_router) = &self.console_router {
                 let mut console_router = console_router.clone();
@@ -164,11 +167,14 @@ where
         }
 
         let uri = format!("{}|{}", &req.method, req.uri.path());
+
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;
             let mut resp = op.call(req, mat.params).await?;
             resp.status = Some(resp.output.0);
-            return Ok(resp.map_output(|x| x.1));
+            let response = resp.map_output(|x| x.1);
+
+            return Ok(response);
         }
 
         Err(s3_error!(NotImplemented))

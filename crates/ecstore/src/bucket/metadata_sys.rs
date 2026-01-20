@@ -28,8 +28,8 @@ use rustfs_common::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::ReplicationConfiguration;
 use s3s::dto::{
-    BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ServerSideEncryptionConfiguration, Tagging,
-    VersioningConfiguration,
+    BucketLifecycleConfiguration, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
+    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
 };
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -108,6 +108,13 @@ pub async fn get_bucket_targets_config(bucket: &str) -> Result<BucketTargets> {
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_bucket_targets_config(bucket).await
+}
+
+pub async fn get_cors_config(bucket: &str) -> Result<(CORSConfiguration, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_cors_config(bucket).await
 }
 
 pub async fn get_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
@@ -495,6 +502,16 @@ impl BucketMetadataSys {
 
         if let Some(config) = &bm.sse_config {
             Ok((config.clone(), bm.encryption_config_updated_at))
+        } else {
+            Err(Error::ConfigNotFound)
+        }
+    }
+
+    pub async fn get_cors_config(&self, bucket: &str) -> Result<(CORSConfiguration, OffsetDateTime)> {
+        let (bm, _) = self.get_config(bucket).await?;
+
+        if let Some(config) = &bm.cors_config {
+            Ok((config.clone(), bm.cors_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
         }

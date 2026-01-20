@@ -161,6 +161,8 @@ pin_project! {
 }
 
 impl HashReader {
+    /// Used for transformation layers (compression/encryption)
+    pub const SIZE_PRESERVE_LAYER: i64 = -1;
     pub fn new(
         mut inner: Box<dyn Reader>,
         size: i64,
@@ -169,8 +171,10 @@ impl HashReader {
         sha256hex: Option<String>,
         diskable_md5: bool,
     ) -> std::io::Result<Self> {
-        // Check if it's already a HashReader and update its parameters
-        if let Some(existing_hash_reader) = inner.as_hash_reader_mut() {
+        // Get the innermost HashReader
+        if size != Self::SIZE_PRESERVE_LAYER
+            && let Some(existing_hash_reader) = inner.as_hash_reader_mut()
+        {
             if existing_hash_reader.bytes_read() > 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -212,7 +216,8 @@ impl HashReader {
             let content_sha256 = existing_hash_reader.content_sha256().clone();
             let content_sha256_hasher = existing_hash_reader.content_sha256().clone().map(|_| Sha256Hasher::new());
             let inner = existing_hash_reader.take_inner();
-            return Ok(Self {
+
+            Ok(Self {
                 inner,
                 size,
                 checksum: md5hex.clone(),
@@ -225,34 +230,36 @@ impl HashReader {
                 content_hasher,
                 checksum_on_finish: false,
                 trailer_s3s: existing_hash_reader.get_trailer().cloned(),
-            });
-        }
+            })
+        } else {
+            if size > 0 {
+                let hr = HardLimitReader::new(inner, size);
+                inner = Box::new(hr);
 
-        if size > 0 {
-            let hr = HardLimitReader::new(inner, size);
-            inner = Box::new(hr);
-            if !diskable_md5 && !inner.is_hash_reader() {
+                if !diskable_md5 && !inner.is_hash_reader() {
+                    let er = EtagReader::new(inner, md5hex.clone());
+                    inner = Box::new(er);
+                }
+            } else if !diskable_md5 {
                 let er = EtagReader::new(inner, md5hex.clone());
                 inner = Box::new(er);
             }
-        } else if !diskable_md5 {
-            let er = EtagReader::new(inner, md5hex.clone());
-            inner = Box::new(er);
+
+            Ok(Self {
+                inner,
+                size,
+                checksum: md5hex,
+                actual_size,
+                diskable_md5,
+                bytes_read: 0,
+                content_hash: None,
+                content_hasher: None,
+                content_sha256: sha256hex.clone(),
+                content_sha256_hasher: sha256hex.map(|_| Sha256Hasher::new()),
+                checksum_on_finish: false,
+                trailer_s3s: None,
+            })
         }
-        Ok(Self {
-            inner,
-            size,
-            checksum: md5hex,
-            actual_size,
-            diskable_md5,
-            bytes_read: 0,
-            content_hash: None,
-            content_hasher: None,
-            content_sha256: sha256hex.clone(),
-            content_sha256_hasher: sha256hex.clone().map(|_| Sha256Hasher::new()),
-            checksum_on_finish: false,
-            trailer_s3s: None,
-        })
     }
 
     pub fn into_inner(self) -> Box<dyn Reader> {

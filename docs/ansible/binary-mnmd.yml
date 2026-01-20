@@ -87,9 +87,7 @@
           RUSTFS_VOLUMES="http://rustfs-node{1...4}:9000/data/rustfs{0...3}"
           RUSTFS_ADDRESS=":9000"
           RUSTFS_CONSOLE_ENABLE=true
-          RUST_LOG=error
           RUSTFS_OBS_LOG_DIRECTORY="/var/logs/rustfs/"
-          RUSTFS_EXTERNAL_ADDRESS=0.0.0.0:9000
         owner: root
         group: root
         mode: '0644'
