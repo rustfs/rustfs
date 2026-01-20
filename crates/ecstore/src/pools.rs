@@ -1454,30 +1454,9 @@ pub fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_ma
         // Fallback to summing all online disks to prevent under-reporting.
         fallback_total_capacity(disks)
     }
-
-    // let mut capacity = 0;
-    // for disk in disks.iter() {
-    //     if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
-    //         continue;
-    //     }
-    //     if (disk.disk_index as usize) < info.backend.standard_sc_data[disk.pool_index as usize] {
-    //         capacity += disk.total_space as usize;
-    //     }
-    // }
-    // capacity
 }
 
 pub fn get_total_usable_capacity_free(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
-    // let mut capacity = 0;
-    // for disk in disks.iter() {
-    //     if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
-    //         continue;
-    //     }
-    //     if (disk.disk_index as usize) < info.backend.standard_sc_data[disk.pool_index as usize] {
-    //         capacity += disk.available_space as usize;
-    //     }
-    // }
-    // capacity
     if info.backend.standard_sc_data.is_empty() {
         return fallback_free_capacity(disks);
     }
