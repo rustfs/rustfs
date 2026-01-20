@@ -115,7 +115,7 @@ use rustfs_utils::{
     http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
-            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
+            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT,
             RESERVED_METADATA_PREFIX_LOWER,
         },
     },
@@ -2813,6 +2813,17 @@ impl S3 for FS {
         let content_language = metadata_map.get("content-language").cloned();
         let expires = info.expires.map(Timestamp::from);
 
+        // Get object tags count for x-amz-tagging-count header
+        // Per S3 API spec, this header should be present in HEAD object response when tags exist
+        // We need to explicitly fetch tags as they may not be included in get_object_info
+        let tag_count = match store.get_object_tags(&bucket, &key, &opts).await {
+            Ok(tags) if !tags.is_empty() => {
+                let tag_set = decode_tags(&tags);
+                tag_set.len()
+            }
+            _ => 0,
+        };
+
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -2843,7 +2854,21 @@ impl S3 for FS {
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(event_info).version_id(version_id);
 
-        let result = Ok(S3Response::new(output));
+        let mut response = S3Response::new(output);
+        // Add x-amz-tagging-count header if object has tags
+        // Per S3 API spec, this header should be present in HEAD object response when tags exist
+        if tag_count > 0 {
+            if let (Ok(header_name), Ok(header_value)) = (
+                AMZ_TAG_COUNT.parse::<http::HeaderName>(),
+                tag_count.to_string().parse::<http::HeaderValue>(),
+            ) {
+                response.headers.insert(header_name, header_value);
+            } else {
+                warn!("Failed to parse x-amz-tagging-count header, skipping");
+            }
+        }
+
+        let result = Ok(response);
         let _ = helper.complete(&result);
 
         result
