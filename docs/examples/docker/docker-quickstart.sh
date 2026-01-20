@@ -55,7 +55,6 @@ quick_basic() {
         --name rustfs-quick \
         -p 9000:9000 \
         -p 9001:9001 \
-        -e RUSTFS_EXTERNAL_ADDRESS=":9000" \
         -e RUSTFS_CORS_ALLOWED_ORIGINS="http://localhost:9001" \
         -v rustfs-quick-data:/data \
         rustfs/rustfs:latest
@@ -79,12 +78,11 @@ quick_dev() {
         --name rustfs-dev \
         -p 9010:9000 \
         -p 9011:9001 \
-        -e RUSTFS_EXTERNAL_ADDRESS=":9010" \
         -e RUSTFS_CORS_ALLOWED_ORIGINS="*" \
         -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
         -e RUSTFS_ACCESS_KEY="dev-admin" \
         -e RUSTFS_SECRET_KEY="dev-secret" \
-        -e RUST_LOG="debug" \
+        -e RUSTFS_OBS_LOGGER_LEVEL="debug" \
         -v rustfs-dev-data:/data \
         rustfs/rustfs:latest
     
@@ -110,7 +108,6 @@ quick_prod() {
         --name rustfs-prod \
         -p 9020:9000 \
         -p 127.0.0.1:9021:9001 \
-        -e RUSTFS_EXTERNAL_ADDRESS=":9020" \
         -e RUSTFS_CORS_ALLOWED_ORIGINS="https://myapp.com" \
         -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="https://admin.myapp.com" \
         -e RUSTFS_CONSOLE_RATE_LIMIT_ENABLE="true" \

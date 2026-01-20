@@ -186,6 +186,18 @@ export RUSTFS_HEAL_QUEUE_SIZE=10000
 # rustfs trust system CA certificates
 export RUSTFS_TRUST_SYSTEM_CA=true
 
+# Enable FTP server
+export RUSTFS_FTPS_ENABLE=false
+
+# Use default timeout (60 seconds)
+# No environment variable needed
+
+# Increase timeout for high-latency network storage
+#export RUSTFS_LOCK_ACQUIRE_TIMEOUT=120
+
+# Reduce timeout for low-latency local storage
+export RUSTFS_LOCK_ACQUIRE_TIMEOUT=30
+
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi

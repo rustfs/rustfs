@@ -29,6 +29,7 @@ documentation = "https://docs.rs/rustfs-lock/latest/rustfs_lock/"
 workspace = true
 
 [dependencies]
+rustfs-utils = { workspace = true }
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true

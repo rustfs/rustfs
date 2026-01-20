@@ -127,7 +127,6 @@ deploy_rustfs() {
         -e RUSTFS_CORS_ALLOWED_ORIGINS="http://localhost:$API_PORT" \
         -e RUSTFS_ACCESS_KEY="$RUSTFS_ACCESS_KEY" \
         -e RUSTFS_SECRET_KEY="$RUSTFS_SECRET_KEY" \
-        -e RUSTFS_EXTERNAL_ADDRESS=":$API_PORT" \
         "$RUSTFS_IMAGE" /data
 
     # Wait for container to start
