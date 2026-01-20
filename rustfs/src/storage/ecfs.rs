@@ -39,7 +39,7 @@ use datafusion::arrow::{
     csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
 use futures::StreamExt;
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::{counter, histogram};
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::{
@@ -135,7 +135,7 @@ use std::{
     str::FromStr,
     sync::{Arc, LazyLock},
 };
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, format_description::well_known::Rfc2822, format_description::well_known::Rfc3339};
 use tokio::{
     io::{AsyncRead, AsyncSeek},
     sync::mpsc,
@@ -531,6 +531,89 @@ fn validate_list_object_unordered_with_delimiter(delimiter: Option<&Delimiter>, 
     }
 
     Ok(())
+}
+
+fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> Result<Option<S3Response<GetObjectOutput>>, S3Error> {
+    let mod_time = match info.mod_time {
+        Some(t) if t.unix_timestamp() > 0 => t,
+        _ => return Ok(None),
+    };
+
+    let etag = match &info.etag {
+        Some(e) => e.as_str(),
+        None => return Ok(None),
+    };
+
+    if let Some(if_none_match) = headers.get("if-none-match").and_then(|v| v.to_str().ok())
+        && is_etag_equal(etag, if_none_match)
+    {
+        let mut error_headers = HeaderMap::new();
+        let etag_quoted = format!("\"{}\"", etag.trim_matches('"'));
+        error_headers.insert(
+            "etag",
+            HeaderValue::from_str(&etag_quoted).expect("Invalid ETag header value (ASCII only)"),
+        );
+        let last_modified_str = mod_time
+            .format(&Rfc2822)
+            .expect("Failed to format Last-Modified time (RFC 2822)");
+        error_headers.insert(
+            "last-modified",
+            HeaderValue::from_str(&last_modified_str).expect("Invalid Last-Modified header value"),
+        );
+
+        let mut s3_error = S3Error::new(S3ErrorCode::NotModified);
+        s3_error.set_message("Not Modified".to_string());
+        s3_error.set_status_code(StatusCode::NOT_MODIFIED);
+        s3_error.set_headers(error_headers);
+        return Err(s3_error);
+    }
+
+    // If-Modified-Since
+    if let Some(if_modified_since) = headers.get("if-modified-since").and_then(|v| v.to_str().ok())
+        && let Ok(given_time) = OffsetDateTime::parse(if_modified_since, &Rfc2822)
+        && mod_time.unix_timestamp() <= given_time.unix_timestamp()
+    {
+        let mut error_headers = HeaderMap::new();
+        let etag_quoted = format!("\"{}\"", etag.trim_matches('"'));
+        error_headers.insert("etag", HeaderValue::from_str(&etag_quoted).unwrap());
+
+        let mut s3_error = S3Error::new(S3ErrorCode::NotModified);
+        s3_error.set_message("Not Modified".to_string());
+        s3_error.set_status_code(StatusCode::NOT_MODIFIED);
+        s3_error.set_headers(error_headers);
+
+        return Err(s3_error);
+    }
+
+    // If-Match
+    let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
+    if let Some(if_match_val) = if_match
+        && !is_etag_equal(etag, if_match_val)
+    {
+        return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+    }
+
+    // If-Unmodified-Since
+    if if_match.is_none()
+        && let Some(if_unmodified_since) = headers.get("if-unmodified-since").and_then(|v| v.to_str().ok())
+        && let Ok(given_time) = OffsetDateTime::parse(if_unmodified_since, &Rfc2822)
+        && mod_time.unix_timestamp() > given_time.unix_timestamp()
+    {
+        return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+    }
+
+    Ok(None)
+}
+
+fn is_etag_equal(object_etag: &str, header_etag: &str) -> bool {
+    let header_etag = header_etag.trim();
+    if header_etag == "*" {
+        return true;
+    }
+    header_etag
+        .split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .any(|e| e == object_etag.trim_matches('"'))
 }
 
 impl FS {
@@ -2369,6 +2452,11 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
+
+        // if let Some(response) = check_preconditions(&req.headers, &info)? {
+        //     return Ok(response);
+        // }
+        check_preconditions(&req.headers, &info)?;
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in &info.parts {
@@ -6778,6 +6866,142 @@ mod tests {
         let complex_query_without_unordered = Some("abc=123&queryType=test");
         // [5] Multi-parameter query without conflict: If other parameters exist but 'allow-unordered' is missing,
         assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query_without_unordered).is_ok());
+    }
+
+    #[test]
+    fn test_is_etag_equal() {
+        // [1] Header ETag is "*", should return true (match any object ETag)
+        assert!(is_etag_equal("\"d41d8cd98f00b204e9800998ecf8427e\"", "*"));
+
+        // [2] Exact match (both with double quotes)
+        assert!(is_etag_equal(
+            "\"d41d8cd98f00b204e9800998ecf8427e\"",
+            "\"d41d8cd98f00b204e9800998ecf8427e\""
+        ));
+
+        // [3] Exact match (object ETag with quotes, header ETag without)
+        assert!(is_etag_equal("\"d41d8cd98f00b204e9800998ecf8427e\"", "d41d8cd98f00b204e9800998ecf8427e"));
+
+        // [4] Header ETag has multiple values (comma-separated), one matches
+        assert!(is_etag_equal("\"12345\"", "\"67890\", \"12345\", \"abcde\""));
+
+        // [5] Header ETag has multiple values with spaces, one matches after trim
+        assert!(is_etag_equal("\"12345\"", "  \"67890\" , \"12345\"  , \"abcde\"  "));
+
+        // [6] No match (different ETag)
+        assert!(!is_etag_equal("\"12345\"", "\"67890\""));
+
+        // [7] No match in multiple values
+        assert!(!is_etag_equal("\"12345\"", "\"67890\", \"abcde\""));
+    }
+
+    #[test]
+    fn test_check_preconditions() {
+        let valid_mod_time = OffsetDateTime::from_unix_timestamp(1700000000).unwrap();
+        let invalid_mod_time = OffsetDateTime::from_unix_timestamp(0).unwrap(); // unix_timestamp <= 0
+        let valid_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
+
+        // [1] Invalid mod_time (unix_timestamp <= 0) → return Ok(None)
+        let info1 = ObjectInfo {
+            mod_time: Some(invalid_mod_time),
+            etag: Some(valid_etag.to_string()),
+            ..Default::default()
+        };
+        let headers1 = HeaderMap::new();
+        assert!(check_preconditions(&headers1, &info1).is_ok());
+        assert!(check_preconditions(&headers1, &info1).unwrap().is_none());
+
+        // [2] Empty ETag → return Ok(None)
+        let info2 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: None,
+            ..Default::default()
+        };
+        let headers2 = HeaderMap::new();
+        assert!(check_preconditions(&headers2, &info2).is_ok());
+        assert!(check_preconditions(&headers2, &info2).unwrap().is_none());
+
+        // [3] If-None-Match matches → return Err(S3Error::NotModified)
+        let mut headers3 = HeaderMap::new();
+        headers3.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info3 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: Some(valid_etag.to_string()),
+            ..Default::default()
+        };
+        let result3 = check_preconditions(&headers3, &info3);
+        assert!(result3.is_err());
+        let err3 = result3.unwrap_err();
+        assert_eq!(err3.code(), &S3ErrorCode::NotModified);
+        assert_eq!(err3.message(), Some("Not Modified"));
+        assert_eq!(err3.status_code(), Some(StatusCode::NOT_MODIFIED));
+        assert!(err3.headers().expect("REASON").contains_key("etag"));
+
+        // [4] If-None-Match does not match → return Ok(None)
+        let mut headers4 = HeaderMap::new();
+        headers4.insert("if-none-match", HeaderValue::from_str("\"wrong-etag\"").unwrap());
+        let info4 = info3.clone();
+        assert!(check_preconditions(&headers4, &info4).is_ok());
+        assert!(check_preconditions(&headers4, &info4).unwrap().is_none());
+
+        // [5] If-Modified-Since >= mod_time → return Err(S3Error::NotModified)
+        let mut headers5 = HeaderMap::new();
+        headers5.insert(
+            "if-modified-since",
+            HeaderValue::from_str(&valid_mod_time.format(&Rfc2822).unwrap()).unwrap(),
+        );
+        let info5 = info3.clone();
+        let result5 = check_preconditions(&headers5, &info5);
+        assert!(result5.is_err());
+        let err5 = result5.unwrap_err();
+        assert_eq!(err5.code(), &S3ErrorCode::NotModified);
+
+        // [6] If-Modified-Since < mod_time → return Ok(None)
+        let earlier_time = valid_mod_time - time::Duration::hours(1);
+        let mut headers6 = HeaderMap::new();
+        headers6.insert(
+            "if-modified-since",
+            HeaderValue::from_str(&earlier_time.format(&Rfc2822).unwrap()).unwrap(),
+        );
+        let info6 = info3.clone();
+        assert!(check_preconditions(&headers6, &info6).is_ok());
+        assert!(check_preconditions(&headers6, &info6).unwrap().is_none());
+
+        // [7] If-Match does not match → return Err(S3Error::PreconditionFailed)
+        let mut headers7 = HeaderMap::new();
+        headers7.insert("if-match", HeaderValue::from_str("\"wrong-etag\"").unwrap());
+        let info7 = info3.clone();
+        let result7 = check_preconditions(&headers7, &info7);
+        assert!(result7.is_err());
+        assert_eq!(result7.unwrap_err().code(), &S3ErrorCode::PreconditionFailed);
+
+        // [8] If-Match matches → return Ok(None)
+        let mut headers8 = HeaderMap::new();
+        headers8.insert("if-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info8 = info3.clone();
+        assert!(check_preconditions(&headers8, &info8).is_ok());
+        assert!(check_preconditions(&headers8, &info8).unwrap().is_none());
+
+        // [9] If-Unmodified-Since < mod_time (no If-Match) → return Err(S3Error::PreconditionFailed)
+        let mut headers9 = HeaderMap::new();
+        headers9.insert(
+            "if-unmodified-since",
+            HeaderValue::from_str(&earlier_time.format(&Rfc2822).unwrap()).unwrap(),
+        );
+        let info9 = info3.clone();
+        let result9 = check_preconditions(&headers9, &info9);
+        assert!(result9.is_err());
+        assert_eq!(result9.unwrap_err().code(), &S3ErrorCode::PreconditionFailed);
+
+        // [10] If-Unmodified-Since >= mod_time (no If-Match) → return Ok(None)
+        let mut headers10 = HeaderMap::new();
+        headers10.insert(
+            "if-unmodified-since",
+            HeaderValue::from_str(&valid_mod_time.format(&Rfc2822).unwrap()).unwrap(),
+        );
+        let info10 = info3.clone();
+        assert!(check_preconditions(&headers10, &info10).is_ok());
+        assert!(check_preconditions(&headers10, &info10).unwrap().is_none());
     }
 
     // Note: S3Request structure is complex and requires many fields.
