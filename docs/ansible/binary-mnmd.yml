@@ -88,7 +88,6 @@
           RUSTFS_ADDRESS=":9000"
           RUSTFS_CONSOLE_ENABLE=true
           RUSTFS_OBS_LOG_DIRECTORY="/var/logs/rustfs/"
-          RUSTFS_EXTERNAL_ADDRESS=0.0.0.0:9000
         owner: root
         group: root
         mode: '0644'

@@ -69,7 +69,6 @@ deploy_basic() {
         --name rustfs-basic \
         -p 9020:9000 \
         -p 9021:9001 \
-        -e RUSTFS_EXTERNAL_ADDRESS=":9020" \
         -e RUSTFS_CORS_ALLOWED_ORIGINS="http://localhost:9021,http://127.0.0.1:9021" \
         -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
         -e RUSTFS_ACCESS_KEY="basic-access" \
@@ -100,7 +99,6 @@ deploy_development() {
         --name rustfs-dev \
         -p 9030:9000 \
         -p 9031:9001 \
-        -e RUSTFS_EXTERNAL_ADDRESS=":9030" \
         -e RUSTFS_CORS_ALLOWED_ORIGINS="*" \
         -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
         -e RUSTFS_ACCESS_KEY="dev-access" \
@@ -148,7 +146,6 @@ EOF
         -p 127.0.0.1:9041:9001 \
         -e RUSTFS_ADDRESS="0.0.0.0:9000" \
         -e RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9001" \
-        -e RUSTFS_EXTERNAL_ADDRESS=":9040" \
         -e RUSTFS_CORS_ALLOWED_ORIGINS="https://myapp.example.com" \
         -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="https://admin.example.com" \
         -e RUSTFS_ACCESS_KEY="$ACCESS_KEY" \
