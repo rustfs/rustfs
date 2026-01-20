@@ -107,12 +107,12 @@ futures-util = "0.3.31"
 pollster = "0.4.0"
 hyper = { version = "1.8.1", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
-hyper-util = { version = "0.1.19", features = ["tokio", "server-auto", "server-graceful"] }
+hyper-util = { version = "0.1.19", features = ["tokio", "server-auto", "server-graceful", "tracing"] }
 http = "1.4.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-no-provider", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
-socket2 = "0.6.1"
+socket2 = { version = "0.6.1", features = ["all"] }
 tokio = { version = "1.49.0", features = ["fs", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
 tokio-stream = { version = "0.1.18" }
@@ -132,7 +132,7 @@ flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.3"
 quick-xml = "0.39.0"
-rmcp = { version = "0.12.0" }
+rmcp = { version = "0.13.0" }
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -152,7 +152,7 @@ pbkdf2 = "0.13.0-rc.7"
 rsa = { version = "0.10.0-rc.12" }
 rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pemfile = "2.2.0"
-rustls-pki-types = "1.13.2"
+rustls-pki-types = "1.14.0"
 sha1 = "0.11.0-rc.3"
 sha2 = "0.11.0-rc.3"
 subtle = "2.6"
@@ -171,7 +171,7 @@ atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.12" }
 aws-credential-types = { version = "1.2.11" }
-aws-sdk-s3 = { version = "1.119.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.120.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-types = { version = "1.3.6" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
@@ -188,7 +188,7 @@ dunce = "1.0.5"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
 flate2 = "1.1.8"
-flexi_logger = { version = "0.31.7", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
+flexi_logger = { version = "0.31.8", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
 glob = "0.3.3"
 google-cloud-storage = "1.6.0"
 google-cloud-auth = "1.4.0"
@@ -225,7 +225,7 @@ regex = { version = "1.12.2" }
 rumqttc = { version = "0.25.1" }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { version = "0.13.0-alpha.2", features = ["minio"] }
+s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", branch = "main" }
 serial_test = "3.3.1"
 shadow-rs = { version = "1.5.0", default-features = false }
 siphasher = "1.0.1"
@@ -239,7 +239,7 @@ sysinfo = "0.37.2"
 temp-env = "0.3.6"
 tempfile = "3.24.0"
 test-case = "3.3.1"
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.4"
 tracing-error = "0.2.1"
@@ -267,9 +267,9 @@ opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_
 opentelemetry-stdout = { version = "0.31.0" }
 
 # FTP and SFTP
-libunftp = "0.21.0"
+libunftp = { version = "0.21.0" }
 russh = { version = "0.56.0", features = ["aws-lc-rs", "rsa"], default-features = false }
-russh-sftp = "2.1.1"
+russh-sftp = { version = "2.1.1" }
 ssh-key = { version = "0.7.0-rc.6", features = ["std", "rsa", "ed25519"] }
 suppaftp = { version = "7.1.0", features = ["tokio", "tokio-rustls", "rustls"] }
 rcgen = "0.14.6"

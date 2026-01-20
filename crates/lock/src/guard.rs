@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{client::LockClient, types::LockId};
+use crate::{LockClient, LockId};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
 
