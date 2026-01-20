@@ -54,7 +54,6 @@
                 - RUSTFS_ADDRESS=0.0.0.0:9000
                 - RUSTFS_CONSOLE_ENABLE=true
                 - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
-                - RUSTFS_EXTERNAL_ADDRESS=0.0.0.0:9000  # Same as internal since no port mapping
                 - RUSTFS_ACCESS_KEY=rustfsadmin
                 - RUSTFS_SECRET_KEY=rustfsadmin
                 - RUSTFS_CMD=rustfs
