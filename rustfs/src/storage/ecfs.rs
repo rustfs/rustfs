@@ -4881,11 +4881,25 @@ impl S3 for FS {
 
         let opts = &ObjectOptions::default();
 
-        store
+        // Per S3 API spec, abort_multipart_upload should return NoSuchUpload (404) when upload_id
+        // doesn't exist, even if the upload_id format appears invalid. This matches AWS S3 behavior
+        // where format validation is lenient and missing uploads return 404.
+        match store
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
             .await
-            .map_err(ApiError::from)?;
-        Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
+        {
+            Ok(_) => Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() })),
+            Err(err) => {
+                // Convert MalformedUploadID error to NoSuchUpload error code
+                // This ensures we return 404 instead of 400 for malformed/non-existent uploads
+                // Per S3 API spec, abort_multipart_upload should return 404 for missing uploads
+                // even if the upload_id format appears invalid
+                if matches!(err, StorageError::MalformedUploadID(_)) {
+                    return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
+                }
+                Err(ApiError::from(err).into())
+            }
+        }
     }
 
     #[instrument(level = "debug", skip(self))]
