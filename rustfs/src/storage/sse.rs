@@ -92,7 +92,7 @@ use s3s::dto::ServerSideEncryption;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncSeek};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::error::ApiError;
 use rustfs_ecstore::bucket::metadata_sys;
@@ -106,11 +106,31 @@ const DEFAULT_SSE_ALGORITHM: &str = "AES256";
 
 const SUPPORT_SSE_ALGORITHMS: &[&str] = &[DEFAULT_SSE_ALGORITHM];
 
+// check sse type
+#[allow(unused)]
+pub fn get_sse_type(
+    server_side_encryption: Option<&ServerSideEncryption>,
+    customer_algorithm: Option<&SSECustomerAlgorithm>,
+    customer_key: Option<&SSECustomerKey>,
+    customer_key_md5: Option<&SSECustomerKeyMD5>,
+) -> Option<SSEType> {
+    if customer_algorithm.is_some() && customer_key.is_some() && customer_key_md5.is_some() {
+        return Some(SSEType::SseC);
+    }
+
+    let sse = server_side_encryption?;
+    match sse.as_str() {
+        ServerSideEncryption::AES256 => Some(SSEType::SseS3),
+        ServerSideEncryption::AWS_KMS => Some(SSEType::SseKms),
+        _ => None,
+    }
+}
+
 /// SSE configuration resolved from request and bucket defaults
 #[derive(Debug)]
 pub struct SseConfiguration {
     /// Effective server-side encryption algorithm (after considering bucket defaults)
-    pub effective_sse: Option<ServerSideEncryption>,
+    pub effective_sse: ServerSideEncryption,
     /// Effective KMS key ID (after considering bucket defaults)
     pub effective_kms_key_id: Option<SSEKMSKeyId>,
 }
@@ -130,50 +150,128 @@ pub struct SseConfiguration {
 ///
 /// # Returns
 /// `SseConfiguration` with resolved encryption parameters and metadata headers
-pub async fn prepare_sse_configuration(
+async fn prepare_sse_configuration(
     bucket: &str,
     server_side_encryption: Option<ServerSideEncryption>,
     ssekms_key_id: Option<SSEKMSKeyId>,
-) -> Result<SseConfiguration, ApiError> {
-    use tracing::debug;
+) -> Result<Option<SseConfiguration>, ApiError> {
+    if let Some(server_side_encryption) = server_side_encryption.clone()
+        && let Some(ssekms_key_id) = ssekms_key_id
+    {
+        return Ok(Some(SseConfiguration {
+            effective_sse: server_side_encryption,
+            effective_kms_key_id: Some(ssekms_key_id),
+        }));
+    }
 
     // Get bucket default encryption configuration
-    let bucket_sse_config = metadata_sys::get_sse_config(bucket).await.ok();
-    debug!("bucket_sse_config={:?}", bucket_sse_config);
+    let bucket_sse_config_result = metadata_sys::get_sse_config(bucket).await;
+    debug!("bucket_sse_config_result={:?}", bucket_sse_config_result);
 
-    // Determine effective encryption configuration (request overrides bucket default)
-    let effective_sse = server_side_encryption.clone().or_else(|| {
-        bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-            debug!("Processing bucket SSE config: {:?}", config);
-            config.rules.first().and_then(|rule| {
-                debug!("Processing SSE rule: {:?}", rule);
-                rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                    debug!("Found SSE default: {:?}", sse);
-                    match sse.sse_algorithm.as_str() {
-                        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
-                    }
+    if let Ok((bucket_sse_config, _timestamp)) = bucket_sse_config_result {
+        let effective_sse = server_side_encryption
+            .clone()
+            .or_else(|| {
+                bucket_sse_config.rules.first().and_then(|rule| {
+                    debug!("Processing SSE rule: {:?}", rule);
+                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
+                        debug!("Found SSE default: {:?}", sse);
+                        match sse.sse_algorithm.as_str() {
+                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
+                        }
+                    })
                 })
             })
-        })
-    });
-    debug!("effective_sse={:?} (original={:?})", effective_sse, server_side_encryption);
+            .unwrap_or_else(|| ServerSideEncryption::from_static(ServerSideEncryption::AES256));
+        debug!("effective_sse={:?} (original={:?})", effective_sse, server_side_encryption);
 
-    let effective_kms_key_id = ssekms_key_id.or_else(|| {
-        bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-            config.rules.first().and_then(|rule| {
+        let effective_kms_key_id = ssekms_key_id.or_else(|| {
+            bucket_sse_config.rules.first().and_then(|rule| {
                 rule.apply_server_side_encryption_by_default
                     .as_ref()
                     .and_then(|sse| sse.kms_master_key_id.clone())
             })
-        })
-    });
+        });
 
-    Ok(SseConfiguration {
-        effective_sse,
-        effective_kms_key_id,
-    })
+        Ok(Some(SseConfiguration {
+            effective_sse,
+            effective_kms_key_id,
+        }))
+    } else if let Err(e) = bucket_sse_config_result {
+        Err(ApiError::from(e))
+    } else {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SseTypeV2 {
+    SseS3(ServerSideEncryption),
+    SseKms(ServerSideEncryption, Option<SSEKMSKeyId>),
+    SseC(SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5),
+}
+
+impl SseTypeV2 {
+    pub fn to_metadata(&self) -> HashMap<String, String> {
+        sse_configuration_to_metadata(self)
+    }
+}
+
+pub async fn prepare_sse_configuration_v2(
+    bucket: &str,
+    server_side_encryption: Option<ServerSideEncryption>,
+    customer_algorithm: Option<SSECustomerAlgorithm>,
+    customer_key: Option<SSECustomerKey>,
+    customer_key_md5: Option<SSECustomerKeyMD5>,
+    ssekms_key_id: Option<SSEKMSKeyId>,
+) -> Result<Option<SseTypeV2>, ApiError> {
+    if let Some(customer_algorithm) = customer_algorithm
+        && let Some(customer_key) = customer_key
+        && let Some(customer_key_md5) = customer_key_md5
+    {
+        return Ok(Some(SseTypeV2::SseC(customer_algorithm, customer_key, customer_key_md5)));
+    }
+
+    let sse_config = prepare_sse_configuration(bucket, server_side_encryption, ssekms_key_id).await?;
+
+    if let Some(sse_config) = sse_config {
+        return match sse_config.effective_sse.as_str() {
+            ServerSideEncryption::AES256 => Ok(Some(SseTypeV2::SseS3(sse_config.effective_sse))),
+            ServerSideEncryption::AWS_KMS => {
+                Ok(Some(SseTypeV2::SseKms(sse_config.effective_sse.clone(), sse_config.effective_kms_key_id)))
+            }
+            _ => Ok(None),
+        };
+    }
+    
+    Ok(None)
+}
+
+pub fn sse_configuration_to_metadata(sse_configuration: &SseTypeV2) -> HashMap<String, String> {
+    let mut metadata = HashMap::new();
+    match sse_configuration {
+        SseTypeV2::SseS3(sse) => {
+            metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
+        }
+        SseTypeV2::SseKms(sse, kms_key_id) => {
+            metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
+            if let Some(kms_key_id) = kms_key_id {
+                metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.to_string());
+            }
+        }
+        SseTypeV2::SseC(algorithm, _key, key_md5) => {
+            metadata.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+            metadata.insert(
+                "x-amz-server-side-encryption-customer-algorithm".to_string(),
+                algorithm.as_str().to_string(),
+            );
+            metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), key_md5.to_string());
+        }
+    }
+
+    metadata
 }
 
 // ============================================================================
@@ -203,6 +301,25 @@ pub struct EncryptionRequest<'a> {
     pub part_number: Option<usize>,
 }
 
+impl EncryptionRequest<'_> {
+    pub fn check_upload_part_customer_key_md5(
+        &self,
+        user_defined: &HashMap<String, String>,
+        customer_key_md5: Option<SSECustomerKeyMD5>,
+    ) -> Result<(), ApiError> {
+        if let Some(customer_key_md5) = customer_key_md5 {
+            // if customer_key_md5 is provided, check if it matches the metadata
+            let customer_key_md5_from_metadata = user_defined.get("x-amz-server-side-encryption-customer-key-md5");
+            if let Some(customer_key_md5_from_metadata) = customer_key_md5_from_metadata 
+                && !customer_key_md5_from_metadata.eq_ignore_ascii_case(customer_key_md5.as_str()) {
+                return Err(ApiError::from(StorageError::other("Customer key MD5 mismatch")));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Request parameters for unified decryption
 #[derive(Debug)]
 pub struct DecryptionRequest<'a> {
@@ -225,7 +342,8 @@ pub struct DecryptionRequest<'a> {
 /// Unified encryption material returned by `apply_encryption()`
 #[derive(Debug)]
 pub struct EncryptionMaterial {
-    pub encryption_type: EncryptionType,
+    #[allow(unused)]
+    pub sse_type: SSEType,
     pub server_side_encryption: ServerSideEncryption,
     pub kms_key_id: Option<SSEKMSKeyId>,
 
@@ -243,7 +361,8 @@ pub struct EncryptionMaterial {
 /// Unified decryption material returned by `apply_decryption()`
 #[derive(Debug)]
 pub struct DecryptionMaterial {
-    pub encryption_type: EncryptionType,
+    #[allow(unused)]
+    pub sse_type: SSEType,
     pub server_side_encryption: ServerSideEncryption,
     pub kms_key_id: Option<SSEKMSKeyId>,
     pub algorithm: SSECustomerAlgorithm,
@@ -264,7 +383,7 @@ pub struct DecryptionMaterial {
 
 /// Type of encryption used
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncryptionType {
+pub enum SSEType {
     /// SSE-S3 (AES256)
     SseS3,
     /// SSE-KMS (aws:kms)
@@ -328,7 +447,7 @@ impl DecryptionMaterial {
 
         debug!(
             "{:?} decryption applied: plaintext_size={}, encrypted_size={}",
-            self.encryption_type, response_content_length, encrypted_size
+            self.sse_type, response_content_length, encrypted_size
         );
 
         Ok((final_stream, response_content_length))
@@ -394,13 +513,11 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
     // Priority 2: Managed SSE (SSE-S3 or SSE-KMS)
     let sse_config = prepare_sse_configuration(request.bucket, request.server_side_encryption, request.ssekms_key_id).await?;
 
-    if let Some(server_side_encryption) = sse_config.effective_sse
-        && is_managed_sse(&server_side_encryption)
-    {
+    if let Some(sse_config) = sse_config && is_managed_sse(&sse_config.effective_sse) {
         return apply_managed_encryption_material(
             request.bucket,
             request.key,
-            server_side_encryption,
+            sse_config.effective_sse,
             sse_config.effective_kms_key_id,
             request.content_size,
             request.part_number,
@@ -463,17 +580,6 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
         // Verify that the provided key MD5 matches the stored MD5 for security
         let stored_md5 = request.metadata.get("x-amz-server-side-encryption-customer-key-md5");
         verify_ssec_key_match(key_md5, stored_md5)?;
-
-        // For multipart SSE-C objects, just validate the key but don't decrypt yet
-        if is_multipart {
-            warn!(
-                "SSE-C multipart object detected with {} parts. Currently, multipart SSE-C upload parts are not encrypted during upload_part, so no decryption is needed during GET.",
-                request.parts.len()
-            );
-
-            // Return None to indicate no decryption is needed (parts are not encrypted)
-            return Ok(None);
-        }
 
         let mut material =
             apply_ssec_decryption_material(request.bucket, request.key, request.metadata, key, key_md5, request.part_number)
@@ -539,7 +645,7 @@ async fn apply_ssec_encryption_material(
     );
 
     Ok(EncryptionMaterial {
-        encryption_type: EncryptionType::SseC,
+        sse_type: SSEType::SseC,
         server_side_encryption: ServerSideEncryption::AES256.parse().unwrap(),
         kms_key_id: None,
         algorithm: validated.algorithm,
@@ -584,7 +690,7 @@ async fn apply_ssec_decryption_material(
         .and_then(|s| s.parse::<i64>().ok());
 
     Ok(DecryptionMaterial {
-        encryption_type: EncryptionType::SseC,
+        sse_type: SSEType::SseC,
         server_side_encryption: ServerSideEncryption::AES256.parse().unwrap(), // const
         kms_key_id: None,
         algorithm: SSECustomerAlgorithm::from(algorithm),
@@ -623,9 +729,9 @@ async fn apply_managed_encryption_material(
     }
 
     let encryption_type = match server_side_encryption.as_str() {
-        "AES256" => EncryptionType::SseS3,
-        "aws:kms" => EncryptionType::SseKms,
-        _ => EncryptionType::SseS3,
+        "AES256" => SSEType::SseS3,
+        "aws:kms" => SSEType::SseKms,
+        _ => SSEType::SseS3,
     };
 
     let mut context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
@@ -702,7 +808,7 @@ async fn apply_managed_encryption_material(
     };
 
     Ok(EncryptionMaterial {
-        encryption_type,
+        sse_type: encryption_type,
         server_side_encryption,
         kms_key_id: Some(kms_key_to_use),
         algorithm,
@@ -792,13 +898,13 @@ async fn apply_managed_decryption_material(
         .and_then(|s| s.parse::<i64>().ok());
 
     let encryption_type = match server_side_encryption.as_str() {
-        ServerSideEncryption::AES256 => EncryptionType::SseS3,
-        ServerSideEncryption::AWS_KMS => EncryptionType::SseKms,
-        _ => EncryptionType::SseS3,
+        ServerSideEncryption::AES256 => SSEType::SseS3,
+        ServerSideEncryption::AWS_KMS => SSEType::SseKms,
+        _ => SSEType::SseS3,
     };
 
     Ok(Some(DecryptionMaterial {
-        encryption_type,
+        sse_type: encryption_type,
         server_side_encryption: ServerSideEncryption::from(server_side_encryption),
         kms_key_id: Some(SSEKMSKeyId::from(kms_key_id)),
         algorithm,
@@ -1740,13 +1846,13 @@ mod tests {
     #[test]
     fn test_encryption_type_enum() {
         // Test EncryptionType enum
-        assert_eq!(EncryptionType::SseS3, EncryptionType::SseS3);
-        assert_eq!(EncryptionType::SseKms, EncryptionType::SseKms);
-        assert_eq!(EncryptionType::SseC, EncryptionType::SseC);
-        assert_ne!(EncryptionType::SseS3, EncryptionType::SseKms);
+        assert_eq!(SSEType::SseS3, SSEType::SseS3);
+        assert_eq!(SSEType::SseKms, SSEType::SseKms);
+        assert_eq!(SSEType::SseC, SSEType::SseC);
+        assert_ne!(SSEType::SseS3, SSEType::SseKms);
 
         // Test Debug format
-        let debug_str = format!("{:?}", EncryptionType::SseKms);
+        let debug_str = format!("{:?}", SSEType::SseKms);
         assert!(debug_str.contains("SseKms"));
     }
 }
