@@ -119,7 +119,9 @@ use rustfs_utils::{
             AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
             AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
             AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, RESERVED_METADATA_PREFIX,
-            RESERVED_METADATA_PREFIX_LOWER,
+            RESERVED_METADATA_PREFIX_LOWER, AMZ_TAG_COUNT,
+            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT,
+            RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
         },
     },
     path::{is_dir_object, path_join_buf},
@@ -2919,6 +2921,14 @@ impl S3 for FS {
         result
     }
 
+    #[instrument(level = "debug", skip(self, _req))]
+    async fn get_object_torrent(&self, _req: S3Request<GetObjectTorrentInput>) -> S3Result<S3Response<GetObjectTorrentOutput>> {
+        // Torrent functionality is not implemented in RustFS
+        // Per S3 API test expectations, return 404 NoSuchKey (not 501 Not Implemented)
+        // This allows clients to gracefully handle the absence of torrent support
+        Err(S3Error::new(S3ErrorCode::NoSuchKey))
+    }
+
     #[instrument(level = "debug", skip(self, req))]
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
@@ -3129,6 +3139,15 @@ impl S3 for FS {
         let content_language = metadata_map.get("content-language").cloned();
         let expires = info.expires.map(Timestamp::from);
 
+        // Calculate tag count from user_tags already in ObjectInfo
+        // This avoids an additional API call since user_tags is already populated by get_object_info
+        let tag_count = if !info.user_tags.is_empty() {
+            let tag_set = decode_tags(&info.user_tags);
+            tag_set.len()
+        } else {
+            0
+        };
+
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -3165,6 +3184,19 @@ impl S3 for FS {
         // interact with objects (PUT/POST/DELETE/LIST, etc.) rely on the system-level
         // CORS layer instead. In case both are applicable, this bucket-level CORS logic
         // takes precedence for these read operations.
+        let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+
+        // Add x-amz-tagging-count header if object has tags
+        // Per S3 API spec, this header should be present in HEAD object response when tags exist
+        if tag_count > 0 {
+            let header_name = http::HeaderName::from_static(AMZ_TAG_COUNT);
+            if let Ok(header_value) = tag_count.to_string().parse::<http::HeaderValue>() {
+                response.headers.insert(header_name, header_value);
+            } else {
+                warn!("Failed to parse x-amz-tagging-count header value, skipping");
+            }
+        }
+
         let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
         if let Some(retain_date) = metadata_map
             .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
@@ -4995,11 +5027,25 @@ impl S3 for FS {
 
         let opts = &ObjectOptions::default();
 
-        store
+        // Special handling for abort_multipart_upload: Per AWS S3 API specification, this operation
+        // should return NoSuchUpload (404) when the upload_id doesn't exist, even if the format
+        // appears invalid. This differs from other multipart operations (upload_part, list_parts,
+        // complete_multipart_upload) which return InvalidArgument for malformed upload_ids.
+        // The lenient validation matches AWS S3 behavior where format validation is relaxed for
+        // abort operations to avoid leaking information about upload_id format requirements.
+        match store
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
             .await
-            .map_err(ApiError::from)?;
-        Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
+        {
+            Ok(_) => Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() })),
+            Err(err) => {
+                // Convert MalformedUploadID to NoSuchUpload for S3 API compatibility
+                if matches!(err, StorageError::MalformedUploadID(_)) {
+                    return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
+                }
+                Err(ApiError::from(err).into())
+            }
+        }
     }
 
     #[instrument(level = "debug", skip(self))]

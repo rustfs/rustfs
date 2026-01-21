@@ -219,6 +219,7 @@ impl From<StorageError> for ApiError {
             StorageError::SlowDown => S3ErrorCode::SlowDown,
             StorageError::PrefixAccessDenied(_, _) => S3ErrorCode::AccessDenied,
             StorageError::InvalidUploadIDKeyCombination(_, _) => S3ErrorCode::InvalidArgument,
+            StorageError::MalformedUploadID(_) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectNameTooLong(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectNamePrefixAsSlash(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectNotFound(_, _) => S3ErrorCode::NoSuchKey,
@@ -227,7 +228,7 @@ impl From<StorageError> for ApiError {
             StorageError::FileNotFound => S3ErrorCode::NoSuchKey,
             StorageError::FileVersionNotFound => S3ErrorCode::NoSuchVersion,
             StorageError::VersionNotFound(_, _, _) => S3ErrorCode::NoSuchVersion,
-            StorageError::InvalidUploadID(_, _, _) => S3ErrorCode::InvalidPart,
+            StorageError::InvalidUploadID(_, _, _) => S3ErrorCode::NoSuchUpload,
             StorageError::InvalidVersionID(_, _, _) => S3ErrorCode::InvalidArgument,
             StorageError::DataMovementOverwriteErr(_, _, _) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectExistsAsDirectory(_, _) => S3ErrorCode::InvalidArgument,
@@ -415,6 +416,11 @@ mod tests {
             (StorageError::VolumeNotFound, S3ErrorCode::NoSuchBucket),
             (StorageError::FileNotFound, S3ErrorCode::NoSuchKey),
             (StorageError::FileVersionNotFound, S3ErrorCode::NoSuchVersion),
+            (StorageError::MalformedUploadID("test".into()), S3ErrorCode::InvalidArgument),
+            (
+                StorageError::InvalidUploadID("bucket".into(), "object".into(), "uploadid".into()),
+                S3ErrorCode::NoSuchUpload,
+            ),
         ];
 
         for (storage_error, expected_code) in test_cases {
