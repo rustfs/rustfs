@@ -116,8 +116,10 @@ use rustfs_utils::{
     http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
-            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
-            RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
+            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
+            AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+            AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, RESERVED_METADATA_PREFIX,
+            RESERVED_METADATA_PREFIX_LOWER,
         },
     },
     path::{is_dir_object, path_join_buf},
@@ -556,6 +558,7 @@ fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Resu
             .unwrap_or_default();
 
         let now = OffsetDateTime::now_utc();
+        // This is intentional behavior. Empty string represents "retention cleared" which is different from "retention never set".Consistent with minio
         eval_metadata.insert("x-amz-object-lock-mode".to_string(), mode);
         eval_metadata.insert("x-amz-object-lock-retain-until-date".to_string(), retain_until_date);
         eval_metadata.insert(
@@ -582,7 +585,8 @@ fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Re
             None => String::default(),
         };
         let now = OffsetDateTime::now_utc();
-        eval_metadata.insert("x-amz-object-lock-legal-hold".to_string(), status);
+        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set".Consistent with minio
+        eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
         eval_metadata.insert(
             format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
             format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
@@ -609,6 +613,10 @@ async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Result<()> {
                 ));
             }
             warn!("get_object_lock_config err {:?}", err);
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to get bucket ObjectLockConfiguration".to_string(),
+            ));
         }
     }
     Ok(())
@@ -3159,25 +3167,25 @@ impl S3 for FS {
         // takes precedence for these read operations.
         let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
         if let Some(retain_date) = metadata_map
-            .get("x-amz-object-lock-retain-until-date")
-            .or_else(|| metadata_map.get("X-Amz-Object-Lock-Retain-Until-Date"))
-            && let Ok(header_name) = http::HeaderName::from_bytes(b"x-amz-object-lock-retain-until-date")
+            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE))
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.as_bytes())
             && let Ok(header_value) = HeaderValue::from_str(retain_date)
         {
             response.headers.insert(header_name, header_value);
         }
         if let Some(mode) = metadata_map
-            .get("x-amz-object-lock-mode")
-            .or_else(|| metadata_map.get("X-Amz-Object-Lock-Mode"))
-            && let Ok(header_name) = http::HeaderName::from_bytes(b"x-amz-object-lock-mode")
+            .get(AMZ_OBJECT_LOCK_MODE_LOWER)
+            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_MODE))
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_MODE_LOWER.as_bytes())
             && let Ok(header_value) = HeaderValue::from_str(mode)
         {
             response.headers.insert(header_name, header_value);
         }
         if let Some(legal_hold) = metadata_map
-            .get("x-amz-object-lock-legal-hold")
-            .or_else(|| metadata_map.get("X-Amz-Object-Lock-Legal-Hold"))
-            && let Ok(header_name) = http::HeaderName::from_bytes(b"x-amz-object-lock-legal-hold")
+            .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
+            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_LEGAL_HOLD))
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.as_bytes())
             && let Ok(header_value) = HeaderValue::from_str(legal_hold)
         {
             response.headers.insert(header_name, header_value);
@@ -5697,9 +5705,11 @@ impl S3 for FS {
                         "Object Lock configuration does not exist for this bucket".to_string(),
                     ));
                 }
-
                 warn!("get_object_lock_config err {:?}", err);
-                None
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Failed to load Object Lock configuration".to_string(),
+                ));
             }
         };
 
@@ -5742,6 +5752,10 @@ impl S3 for FS {
                     ));
                 }
                 warn!("get_object_lock_config err {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Failed to get bucket ObjectLockConfiguration".to_string(),
+                ));
             }
         };
 
@@ -6255,7 +6269,7 @@ impl S3 for FS {
 
         let legal_hold = object_info
             .user_defined
-            .get("x-amz-object-lock-legal-hold")
+            .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
             .map(|v| v.as_str().to_string());
 
         let status = if let Some(v) = legal_hold {
@@ -6944,7 +6958,7 @@ mod tests {
             status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
         };
         let on_metadata = parse_object_lock_legal_hold(Some(valid_on_legal_hold)).unwrap();
-        assert_eq!(on_metadata.get("x-amz-object-lock-legal-hold").unwrap(), "ON");
+        assert_eq!(on_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "ON");
         assert!(on_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp")));
 
         // [3] Normal case: Legal hold with valid OFF status
@@ -6952,12 +6966,12 @@ mod tests {
             status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
         };
         let off_metadata = parse_object_lock_legal_hold(Some(valid_off_legal_hold)).unwrap();
-        assert_eq!(off_metadata.get("x-amz-object-lock-legal-hold").unwrap(), "OFF");
+        assert_eq!(off_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "OFF");
 
         // [4] Normal case: Legal hold with None status (empty string for status)
         let none_status_legal_hold = ObjectLockLegalHold { status: None };
         let none_status_metadata = parse_object_lock_legal_hold(Some(none_status_legal_hold)).unwrap();
-        assert_eq!(none_status_metadata.get("x-amz-object-lock-legal-hold").unwrap(), "");
+        assert_eq!(none_status_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "");
 
         // [5] Error case: Legal hold with invalid status (non ON/OFF)
         let invalid_status_legal_hold = ObjectLockLegalHold {
@@ -6974,8 +6988,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_bucket_object_lock_enabled() {
         use rustfs_ecstore::bucket::metadata::BucketMetadata;
-        use rustfs_ecstore::bucket::metadata_sys::{get_object_lock_config, set_bucket_metadata};
-        use rustfs_ecstore::error::StorageError;
+        use rustfs_ecstore::bucket::metadata_sys::{set_bucket_metadata};
         use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
         use time::OffsetDateTime;
 
@@ -7010,17 +7023,6 @@ mod tests {
         let err = validate_bucket_object_lock_enabled(non_exist_bucket).await.unwrap_err();
         assert_eq!(err.code().as_str(), S3ErrorCode::InvalidRequest.as_str());
         assert_eq!(err.message(), Some("Bucket is missing ObjectLockConfiguration"));
-
-        let result = get_object_lock_config("init-failed-bucket").await;
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                if e == StorageError::ConfigNotFound {
-                } else {
-                    warn!("get_object_lock_config err {:?}", e);
-                }
-            }
-        }
     }
 
     // Note: S3Request structure is complex and requires many fields.
