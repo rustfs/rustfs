@@ -2164,21 +2164,6 @@ impl S3 for FS {
 
         debug!("GetObject request started with {} concurrent requests", concurrent_requests);
 
-        // Check for torrent query parameter
-        // Per S3 API spec, if ?torrent is present and torrent functionality is not implemented,
-        // we should return 404 NoSuchKey (not 501 Not Implemented)
-        // Note: This check is redundant since get_object_torrent is now implemented separately,
-        // but kept for backward compatibility in case clients use ?torrent query parameter
-        if let Some(query) = req.uri.query()
-            && (query == "torrent"
-                || query
-                    .split('&')
-                    .any(|param| param == "torrent" || param.starts_with("torrent=")))
-        {
-            // Torrent functionality is not implemented, return 404 NoSuchKey per S3 test expectations
-            return Err(S3Error::new(S3ErrorCode::NoSuchKey));
-        }
-
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, "s3:GetObject");
         // mc get 3
 
