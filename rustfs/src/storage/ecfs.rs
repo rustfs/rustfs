@@ -558,9 +558,9 @@ fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Resu
             .unwrap_or_default();
 
         let now = OffsetDateTime::now_utc();
-        // This is intentional behavior. Empty string represents "retention cleared" which is different from "retention never set".Consistent with minio
-        eval_metadata.insert("x-amz-object-lock-mode".to_string(), mode);
-        eval_metadata.insert("x-amz-object-lock-retain-until-date".to_string(), retain_until_date);
+        // This is intentional behavior. Empty string represents "retention cleared" which is different from "retention never set". Consistent with minio
+        eval_metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode);
+        eval_metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), retain_until_date);
         eval_metadata.insert(
             format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"),
             format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
@@ -585,7 +585,7 @@ fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Re
             None => String::default(),
         };
         let now = OffsetDateTime::now_utc();
-        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set".Consistent with minio
+        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set". Consistent with minio
         eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
         eval_metadata.insert(
             format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
