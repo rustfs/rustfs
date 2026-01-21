@@ -6988,7 +6988,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_bucket_object_lock_enabled() {
         use rustfs_ecstore::bucket::metadata::BucketMetadata;
-        use rustfs_ecstore::bucket::metadata_sys::{set_bucket_metadata};
+        use rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata;
         use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
         use time::OffsetDateTime;
 
