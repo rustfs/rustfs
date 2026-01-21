@@ -3041,10 +3041,11 @@ impl S3 for FS {
         let expires = info.expires.map(Timestamp::from);
 
         // Get object tags count for x-amz-tagging-count header
-        // Per S3 API spec, this header should be present in HEAD object response when tags exist
-        // We need to explicitly fetch tags as they may not be included in get_object_info
+        // Per S3 API spec, this header should be present in HEAD object response when tags exist.
+        // Note: This requires fetching tags on every HEAD request, which may impact performance.
+        // However, this is required by the S3 API specification to ensure compatibility.
         let tag_count = match store.get_object_tags(&bucket, &key, &opts).await {
-            Ok(tags) if !tags.is_empty() => {
+            Ok(tags) => {
                 let tag_set = decode_tags(&tags);
                 tag_set.len()
             }
@@ -3092,13 +3093,11 @@ impl S3 for FS {
         // Add x-amz-tagging-count header if object has tags
         // Per S3 API spec, this header should be present in HEAD object response when tags exist
         if tag_count > 0 {
-            if let (Ok(header_name), Ok(header_value)) = (
-                AMZ_TAG_COUNT.parse::<http::HeaderName>(),
-                tag_count.to_string().parse::<http::HeaderValue>(),
-            ) {
+            let header_name = http::HeaderName::from_static(AMZ_TAG_COUNT);
+            if let Ok(header_value) = tag_count.to_string().parse::<http::HeaderValue>() {
                 response.headers.insert(header_name, header_value);
             } else {
-                warn!("Failed to parse x-amz-tagging-count header, skipping");
+                warn!("Failed to parse x-amz-tagging-count header value, skipping");
             }
         }
 
