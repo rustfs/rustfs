@@ -55,6 +55,7 @@ moka = { workspace = true, features = ["future"] }
 
 # Additional dependencies
 md5 = { workspace = true }
+arc-swap = { workspace = true }
 
 # HTTP client for Vault
 reqwest = { workspace = true }

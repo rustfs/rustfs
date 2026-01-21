@@ -271,7 +271,7 @@ impl ConfigureVaultKmsRequest {
         KmsConfig {
             backend: KmsBackend::Vault,
             default_key_id: self.default_key_id.clone(),
-            backend_config: BackendConfig::Vault(VaultConfig {
+            backend_config: BackendConfig::Vault(Box::new(VaultConfig {
                 address: self.address.clone(),
                 auth_method: self.auth_method.clone(),
                 namespace: self.namespace.clone(),
@@ -288,7 +288,7 @@ impl ConfigureVaultKmsRequest {
                 } else {
                     None
                 },
-            }),
+            })),
             timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
             retry_attempts: self.retry_attempts.unwrap_or(3),
             enable_cache: self.enable_cache.unwrap_or(true),

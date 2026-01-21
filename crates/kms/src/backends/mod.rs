@@ -36,7 +36,7 @@ pub trait KmsClient: Send + Sync {
     ///
     /// # Returns
     /// Returns a DataKey containing both plaintext and encrypted key material
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKey>;
+    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKeyInfo>;
 
     /// Encrypt data directly using a master key
     ///
@@ -67,7 +67,7 @@ pub trait KmsClient: Send + Sync {
     /// * `key_id` - Unique identifier for the new key
     /// * `algorithm` - Key algorithm (e.g., "AES_256")
     /// * `context` - Optional operation context for auditing
-    async fn create_key(&self, key_id: &str, algorithm: &str, context: Option<&OperationContext>) -> Result<MasterKey>;
+    async fn create_key(&self, key_id: &str, algorithm: &str, context: Option<&OperationContext>) -> Result<MasterKeyInfo>;
 
     /// Get information about a specific key
     ///
@@ -139,7 +139,7 @@ pub trait KmsClient: Send + Sync {
     /// # Arguments
     /// * `key_id` - The key identifier
     /// * `context` - Optional operation context for auditing
-    async fn rotate_key(&self, key_id: &str, context: Option<&OperationContext>) -> Result<MasterKey>;
+    async fn rotate_key(&self, key_id: &str, context: Option<&OperationContext>) -> Result<MasterKeyInfo>;
 
     /// Health check
     ///
