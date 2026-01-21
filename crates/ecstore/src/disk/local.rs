@@ -122,7 +122,7 @@ impl LocalDisk {
         debug!("Creating local disk");
         // Use optimized path resolution instead of absolutize() for better performance
         // Use dunce::canonicalize instead of std::fs::canonicalize to avoid UNC paths on Windows
-        let root = match dunce::canonicalize(ep.get_file_path()) {
+        let root = match rustfs_utils::canonicalize(ep.get_file_path()) {
             Ok(path) => path,
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {

@@ -184,7 +184,6 @@ criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "52.0.0"
 derive_builder = "0.20.2"
-dunce = "1.0.5"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
 flate2 = "1.1.8"
@@ -212,13 +211,13 @@ nix = { version = "0.30.1", features = ["fs"] }
 nu-ansi-term = "0.50.3"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.11.0"
-object_store = "0.12.4"
+object_store = "0.12.5"
 parking_lot = "0.12.5"
 path-absolutize = "3.1.1"
 path-clean = "1.0.1"
 pin-project-lite = "0.2.16"
 pretty_assertions = "1.4.1"
-rand = { version = "0.10.0-rc.6", features = ["serde"] }
+rand = { version = "0.10.0-rc.7", features = ["serde"] }
 rayon = "1.11.0"
 reed-solomon-simd = { version = "3.1.0" }
 regex = { version = "1.12.2" }
@@ -227,7 +226,7 @@ rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
 s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", branch = "main" }
 serial_test = "3.3.1"
-shadow-rs = { version = "1.5.0", default-features = false }
+shadow-rs = { version = "1.6.0", default-features = false }
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 smartstring = "1.0.1"
@@ -254,7 +253,7 @@ walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
 windows = { version = "0.62.2" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
-zip = "7.1.0"
+zip = "7.2.0"
 zstd = "0.13.3"
 
 # Observability and Metrics
@@ -272,7 +271,7 @@ russh = { version = "0.56.0", features = ["aws-lc-rs", "rsa"], default-features 
 russh-sftp = { version = "2.1.1" }
 ssh-key = { version = "0.7.0-rc.6", features = ["std", "rsa", "ed25519"] }
 suppaftp = { version = "7.1.0", features = ["tokio", "tokio-rustls", "rustls"] }
-rcgen = "0.14.6"
+rcgen = "0.14.7"
 
 # Performance Analysis and Memory Profiling
 mimalloc = "0.1"

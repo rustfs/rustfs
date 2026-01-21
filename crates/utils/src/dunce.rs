@@ -58,7 +58,7 @@ use std::{
 ///
 /// ```
 /// use std::path::Path;
-/// use utils::dunce::simplified;
+/// use rustfs_utils::simplified;
 ///
 /// #[cfg(windows)]
 /// {
