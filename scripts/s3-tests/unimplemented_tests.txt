@@ -167,7 +167,6 @@ test_ignore_public_acls
 # PublicAccessBlock and tag validation tests
 test_block_public_policy
 test_block_public_policy_with_principal
-test_get_obj_head_tagging
 test_get_public_block_deny_bucket_policy
 test_get_undefined_public_block
 test_put_excess_key_tags
@@ -180,4 +179,3 @@ test_set_get_del_bucket_policy
 # Object attributes and torrent tests
 test_create_bucket_no_ownership_controls
 test_get_checksum_object_attributes
-test_get_object_torrent
