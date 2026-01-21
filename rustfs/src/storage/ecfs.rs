@@ -4457,11 +4457,25 @@ impl S3 for FS {
 
         let opts = &ObjectOptions::default();
 
-        store
+        // Special handling for abort_multipart_upload: Per AWS S3 API specification, this operation
+        // should return NoSuchUpload (404) when the upload_id doesn't exist, even if the format
+        // appears invalid. This differs from other multipart operations (upload_part, list_parts,
+        // complete_multipart_upload) which return InvalidArgument for malformed upload_ids.
+        // The lenient validation matches AWS S3 behavior where format validation is relaxed for
+        // abort operations to avoid leaking information about upload_id format requirements.
+        match store
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
             .await
-            .map_err(ApiError::from)?;
-        Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
+        {
+            Ok(_) => Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() })),
+            Err(err) => {
+                // Convert MalformedUploadID to NoSuchUpload for S3 API compatibility
+                if matches!(err, StorageError::MalformedUploadID(_)) {
+                    return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
+                }
+                Err(ApiError::from(err).into())
+            }
+        }
     }
 
     #[instrument(level = "debug", skip(self))]
