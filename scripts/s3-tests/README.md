@@ -12,11 +12,20 @@ Run the local S3 compatibility test script:
 
 The script will automatically:
 
-1. Build RustFS (if needed)
-2. Start the service
-3. Wait for it to be ready
-4. Run S3 compatibility tests
-5. Collect results in `artifacts/s3tests-single/`
+1. **Check prerequisites**: Verify port availability (unless in existing mode)
+2. **Build/Start RustFS**:
+   - Build mode (default): Compile with `cargo build --release` (skips if binary is recent < 30 min)
+   - Binary mode: Use specified or default binary path
+   - Docker mode: Build Docker image and start container
+   - Existing mode: Skip startup, connect to running service
+3. **Wait for readiness**: Multi-step health check (process/container → port → log → S3 API)
+4. **Prepare environment**:
+   - Generate s3tests configuration from template
+   - Provision alt user via admin API
+   - Clone s3-tests repository if missing
+   - Install missing dependencies (awscurl, tox, gettext)
+5. **Run tests**: Execute ceph s3-tests via tox with configured filters
+6. **Collect results**: Save logs and test results in `artifacts/s3tests-${TEST_MODE}/`
 
 ## Deployment Modes
 
@@ -35,7 +44,13 @@ DEPLOY_MODE=build ./scripts/s3-tests/run.sh
 ./scripts/s3-tests/run.sh --no-cache
 ```
 
-**Note**: In build mode, if the binary exists and was compiled less than 30 minutes ago, compilation will be skipped unless `--no-cache` is specified.
+**Behavior**:
+- Automatically compiles RustFS binary if it doesn't exist
+- If binary exists and was compiled less than **30 minutes** ago, compilation is skipped (unless `--no-cache` is specified)
+- Automatically starts the service after compilation
+- Automatically clones s3-tests repository if missing
+- Automatically installs missing dependencies (awscurl, tox, gettext)
+- **Automatic Cleanup**: Process is automatically stopped when script exits
 
 ### 2. Binary File Mode
 
@@ -49,6 +64,13 @@ DEPLOY_MODE=binary ./scripts/s3-tests/run.sh
 DEPLOY_MODE=binary RUSTFS_BINARY=./target/release/rustfs ./scripts/s3-tests/run.sh
 ```
 
+**Behavior**:
+- Uses existing binary file (must exist, script will not compile)
+- Automatically starts the service using the specified binary
+- Automatically clones s3-tests repository if missing
+- Automatically installs missing dependencies (awscurl, tox, gettext)
+- **Automatic Cleanup**: Process is automatically stopped when script exits
+
 ### 3. Docker Mode
 
 Build Docker image and run in container:
@@ -56,6 +78,13 @@ Build Docker image and run in container:
 ```bash
 DEPLOY_MODE=docker ./scripts/s3-tests/run.sh
 ```
+
+**Behavior**:
+- Automatically builds Docker image using `Dockerfile.source`
+- Creates Docker network (`rustfs-net`) if it doesn't exist
+- Automatically clones s3-tests repository if missing
+- Automatically installs missing dependencies (awscurl, tox, gettext)
+- **Automatic Cleanup**: Container and network are automatically removed when script exits
 
 ### 4. Existing Service Mode
 
@@ -67,6 +96,18 @@ DEPLOY_MODE=existing S3_HOST=127.0.0.1 S3_PORT=9000 ./scripts/s3-tests/run.sh
 # Connect to remote service
 DEPLOY_MODE=existing S3_HOST=192.168.1.100 S3_PORT=9000 ./scripts/s3-tests/run.sh
 ```
+
+**Behavior**:
+- Skips service startup and port availability checks
+- Connects directly to the specified service endpoint
+- Automatically clones s3-tests repository if missing
+- Automatically installs missing dependencies (awscurl, tox, gettext)
+- **Note**: The service must already have the alt user (`rustfsalt`) provisioned, or the script will provision it automatically
+
+**Automatic Cleanup**: The script uses trap handlers to automatically clean up resources when it exits (success or failure):
+- Stops RustFS process (build/binary mode)
+- Stops and removes Docker container (docker mode)
+- Removes Docker network (docker mode)
 
 ## Configuration Options
 
@@ -102,7 +143,10 @@ DEPLOY_MODE=existing S3_HOST=192.168.1.100 S3_PORT=9000 ./scripts/s3-tests/run.s
 - `TEST_MODE`: Test mode (default: `single`)
 - `MAXFAIL`: Stop after N failures (default: `1`)
 - `XDIST`: Enable parallel execution with N workers (default: `0`, disabled)
-- `MARKEXPR`: pytest marker expression for filtering tests (default: exclude unsupported features)
+- `MARKEXPR`: pytest marker expression for filtering tests
+  - Default: `not lifecycle and not versioning and not s3website and not bucket_logging and not encryption`
+  - Excludes features not yet supported by RustFS to reduce test execution time
+  - Can be customized to test specific features or remove exclusions
 
 ### Configuration Files
 
@@ -119,19 +163,28 @@ DEPLOY_MODE=existing S3_HOST=192.168.1.100 S3_PORT=9000 ./scripts/s3-tests/run.s
 
 ```bash
 # Basic usage - compiles and runs automatically
+# Skips compilation if binary exists and is less than 30 minutes old
 ./scripts/s3-tests/run.sh
 
-# Force rebuild (skip cache check)
+# Force rebuild (skip cache check, always compile)
 ./scripts/s3-tests/run.sh --no-cache
 
 # Run all tests, stop after 50 failures
 MAXFAIL=50 ./scripts/s3-tests/run.sh
 
 # Enable parallel execution (4 worker processes)
+# Automatically installs pytest-xdist if needed
 XDIST=4 ./scripts/s3-tests/run.sh
 
 # Use custom data storage location
+# Data will be stored in /tmp/test-data/rustfs-single/
 DATA_ROOT=/tmp ./scripts/s3-tests/run.sh
+
+# Run specific test markers (e.g., test multipart uploads only)
+MARKEXPR="multipart" ./scripts/s3-tests/run.sh
+
+# Remove feature exclusions (test all features, including unsupported ones)
+MARKEXPR="" ./scripts/s3-tests/run.sh
 ```
 
 ### Binary File Mode
@@ -163,14 +216,20 @@ DEPLOY_MODE=docker XDIST=4 ./scripts/s3-tests/run.sh
 ### Existing Service Mode
 
 ```bash
-# Connect to locally running service
+# Connect to locally running service (default: 127.0.0.1:9000)
 DEPLOY_MODE=existing ./scripts/s3-tests/run.sh
 
 # Connect to remote service
 DEPLOY_MODE=existing S3_HOST=192.168.1.100 S3_PORT=9000 ./scripts/s3-tests/run.sh
 
-# Test specific features
+# Test specific features (custom marker expression)
 DEPLOY_MODE=existing MARKEXPR="not lifecycle and not versioning" ./scripts/s3-tests/run.sh
+
+# Use custom credentials
+DEPLOY_MODE=existing \
+  S3_ACCESS_KEY=myaccesskey \
+  S3_SECRET_KEY=mysecretkey \
+  ./scripts/s3-tests/run.sh
 ```
 
 ### Custom Configuration Files
@@ -206,25 +265,109 @@ less artifacts/s3tests-single/rustfs-single/rustfs.log
 
 ## Prerequisites
 
-### Required
+### Required System Dependencies
 
-- Docker (for docker mode only)
-- Python 3 (for running s3-tests)
-- `nc` (netcat) or `timeout` command (for port checking)
+The following dependencies must be installed manually on your system:
 
-### Auto-installed
+#### All Deployment Modes
 
-The script will automatically install the following dependencies if missing:
+- **Python 3**: Required for running s3-tests
+  - Check: `python3 --version`
+  - Install:
+    - macOS: Usually pre-installed, or `brew install python3`
+    - Linux: `apt-get install python3` or `yum install python3`
 
-- `awscurl` (for S3 API calls and user provisioning)
-- `tox` (for running s3-tests in isolated environment)
-- `gettext-base` (for `envsubst` - config file generation)
-  - On macOS: `brew install gettext`
-  - On Linux: `apt-get install gettext-base`
+- **Git**: Required for cloning s3-tests repository
+  - Check: `git --version`
+  - Install:
+    - macOS: Usually pre-installed, or `brew install git`
+    - Linux: `apt-get install git` or `yum install git`
+
+- **Port checking tools**: One of the following for port availability checks
+  - `nc` (netcat): `apt-get install netcat` or `brew install netcat`
+  - OR `timeout` command: Usually pre-installed on Linux
+  - OR bash built-in TCP redirection support
+
+#### Docker Mode Only
+
+- **Docker**: Required only when using `DEPLOY_MODE=docker`
+  - Check: `docker --version`
+  - Install: [Docker Installation Guide](https://docs.docker.com/get-docker/)
+
+#### Build Mode Only
+
+- **Rust toolchain**: Required when using `DEPLOY_MODE=build` (default)
+  - Check: `rustc --version` and `cargo --version`
+  - Install: [Rust Installation Guide](https://www.rust-lang.org/tools/install)
+
+### Auto-installed Dependencies
+
+The script will automatically install the following dependencies if missing (no manual action required):
+
+- **awscurl**: For S3 API calls and user provisioning
+  - Installed via: `python3 -m pip install --user --upgrade pip awscurl`
+  - Location: `$HOME/.local/bin/awscurl`
+
+- **tox**: For running s3-tests in isolated Python environment
+  - Installed via: `python3 -m pip install --user --upgrade pip tox`
+  - Location: `$HOME/.local/bin/tox`
+
+- **gettext-base**: For `envsubst` command (config file generation)
+  - macOS: Automatically installs via `brew install gettext`
+  - Linux: Automatically installs via `sudo apt-get install gettext-base`
+  - **Note**: macOS installation may require manual intervention if brew fails
+
+- **s3-tests repository**: Automatically cloned if not present
+  - Source: `https://github.com/ceph/s3-tests.git`
+  - Location: `${PROJECT_ROOT}/s3-tests`
+
+**Note**: The script adds `$HOME/.local/bin` to `PATH` automatically, so auto-installed Python tools are accessible.
 
 ### Proxy Configuration
 
-The script automatically disables proxy for localhost requests to avoid interference. All proxy environment variables (`http_proxy`, `https_proxy`, etc.) are unset at script startup.
+The script automatically disables proxy for localhost requests to avoid interference. All proxy environment variables (`http_proxy`, `https_proxy`, `HTTP_PROXY`, `HTTPS_PROXY`) are unset at script startup. The `NO_PROXY` variable is set to `127.0.0.1,localhost,::1`.
+
+## Cleanup
+
+The test script automatically cleans up processes and containers when it exits. However, if you need to manually clean up:
+
+### Using the Cleanup Script
+
+A dedicated cleanup script is available to clean up test resources:
+
+```bash
+# Clean up port 9000 and test data directory
+./scripts/s3-tests/cleanup.sh
+
+# Use custom port and host
+S3_PORT=9001 S3_HOST=127.0.0.1 ./scripts/s3-tests/cleanup.sh
+```
+
+The cleanup script will:
+- Kill any process using the specified port (default: 9000)
+- Clean test data directory at `target/test-data/rustfs-single/`
+- Verify port is released
+
+### Manual Cleanup
+
+If the cleanup script doesn't work or you need more control:
+
+```bash
+# Kill process on port 9000
+lsof -ti:9000 | xargs kill -9
+
+# Or use netstat/ss
+kill -9 $(netstat -tuln | grep :9000 | awk '{print $7}' | cut -d'/' -f1)
+
+# Remove test data
+rm -rf target/test-data/rustfs-single/
+
+# Stop Docker container (if using docker mode)
+docker rm -f rustfs-single
+
+# Remove Docker network (if using docker mode)
+docker network rm rustfs-net
+```
 
 ## Troubleshooting
 
