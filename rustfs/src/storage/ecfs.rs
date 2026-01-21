@@ -27,8 +27,7 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::sse::{
     DecryptionRequest, EncryptionRequest, InMemoryAsyncReader, SseTypeV2, decrypt_managed_encryption_key,
-    prepare_sse_configuration_v2, sse_decryption, sse_encryption,
-    strip_managed_encryption_metadata,
+    prepare_sse_configuration_v2, sse_decryption, sse_encryption, strip_managed_encryption_metadata,
 };
 use crate::storage::{
     access::{ReqInfo, authorize_request},
@@ -3691,9 +3690,8 @@ impl S3 for FS {
             .user_defined
             .get("x-amz-server-side-encryption")
             .map(|s| {
-                ServerSideEncryption::from_str(s).map_err(|e| {
-                    ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}")))
-                })
+                ServerSideEncryption::from_str(s)
+                    .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
             })
             .transpose()?;
         let ssekms_key_id = fi
@@ -3975,9 +3973,8 @@ impl S3 for FS {
             .user_defined
             .get("x-amz-server-side-encryption")
             .map(|s| {
-                ServerSideEncryption::from_str(s).map_err(|e| {
-                    ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}")))
-                })
+                ServerSideEncryption::from_str(s)
+                    .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
             })
             .transpose()?;
         let ssekms_key_id = mp_info

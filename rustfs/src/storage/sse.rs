@@ -245,7 +245,7 @@ pub async fn prepare_sse_configuration_v2(
             _ => Ok(None),
         };
     }
-    
+
     Ok(None)
 }
 
@@ -310,8 +310,9 @@ impl EncryptionRequest<'_> {
         if let Some(customer_key_md5) = customer_key_md5 {
             // if customer_key_md5 is provided, check if it matches the metadata
             let customer_key_md5_from_metadata = user_defined.get("x-amz-server-side-encryption-customer-key-md5");
-            if let Some(customer_key_md5_from_metadata) = customer_key_md5_from_metadata 
-                && !customer_key_md5_from_metadata.eq_ignore_ascii_case(customer_key_md5.as_str()) {
+            if let Some(customer_key_md5_from_metadata) = customer_key_md5_from_metadata
+                && !customer_key_md5_from_metadata.eq_ignore_ascii_case(customer_key_md5.as_str())
+            {
                 return Err(ApiError::from(StorageError::other("Customer key MD5 mismatch")));
             }
         }
@@ -513,7 +514,9 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
     // Priority 2: Managed SSE (SSE-S3 or SSE-KMS)
     let sse_config = prepare_sse_configuration(request.bucket, request.server_side_encryption, request.ssekms_key_id).await?;
 
-    if let Some(sse_config) = sse_config && is_managed_sse(&sse_config.effective_sse) {
+    if let Some(sse_config) = sse_config
+        && is_managed_sse(&sse_config.effective_sse)
+    {
         return apply_managed_encryption_material(
             request.bucket,
             request.key,
