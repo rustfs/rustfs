@@ -3441,8 +3441,6 @@ impl S3 for FS {
             })
             .collect();
 
-        let key_count = objects.len() as i32;
-
         let common_prefixes = object_infos
             .prefixes
             .into_iter()
@@ -3469,7 +3467,9 @@ impl S3 for FS {
 
         let output = ListObjectVersionsOutput {
             is_truncated: Some(object_infos.is_truncated),
-            max_keys: Some(key_count),
+            // max_keys should be the requested maximum number of keys, not the actual count returned
+            // Per AWS S3 API spec, this field represents the maximum number of keys returned in the response
+            max_keys: Some(max_keys),
             delimiter,
             name: Some(bucket),
             prefix: Some(prefix),
