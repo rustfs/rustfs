@@ -106,7 +106,6 @@ test_versioning_obj_suspend_versions
 
 # Teardown issues (list_object_versions on non-versioned buckets)
 # These tests pass but have cleanup issues with list_object_versions
-test_bucket_list_delimiter_basic
 test_bucket_list_encoding_basic
 test_bucket_listv2_delimiter_alt
 test_bucket_listv2_delimiter_basic
