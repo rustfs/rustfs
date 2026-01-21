@@ -148,7 +148,7 @@ fn is_ends_with_any_sep(s: &str) -> bool {
 /// Handles both forward slash and backslash.
 #[allow(dead_code)]
 fn trim_trailing_seps(s: &str) -> &str {
-    s.trim_end_matches(|c| c == '/' || c == '\\')
+    s.trim_end_matches(['/', '\\'])
 }
 
 /// retain_slash ensures that the given string `s` ends with a forward slash.
@@ -823,8 +823,8 @@ mod tests {
     #[test]
     fn test_encode_decode_dir_object() {
         assert_eq!(encode_dir_object("dir/"), "dir__XLDIR__");
-        assert_eq!(is_dir_object("dir/"), true);
-        assert_eq!(is_dir_object("file"), false);
+        assert!(is_dir_object("dir/"));
+        assert!(!is_dir_object("file"));
 
         assert_eq!(decode_dir_object("dir__XLDIR__"), "dir/");
         assert_eq!(decode_dir_object("file"), "file");
