@@ -167,7 +167,6 @@ test_ignore_public_acls
 # PublicAccessBlock and tag validation tests
 test_block_public_policy
 test_block_public_policy_with_principal
-test_get_obj_head_tagging
 test_get_public_block_deny_bucket_policy
 test_get_undefined_public_block
 test_put_excess_key_tags
