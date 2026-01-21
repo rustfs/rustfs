@@ -3040,16 +3040,13 @@ impl S3 for FS {
         let content_language = metadata_map.get("content-language").cloned();
         let expires = info.expires.map(Timestamp::from);
 
-        // Get object tags count for x-amz-tagging-count header
-        // Per S3 API spec, this header should be present in HEAD object response when tags exist.
-        // Note: This requires fetching tags on every HEAD request, which may impact performance.
-        // However, this is required by the S3 API specification to ensure compatibility.
-        let tag_count = match store.get_object_tags(&bucket, &key, &opts).await {
-            Ok(tags) => {
-                let tag_set = decode_tags(&tags);
-                tag_set.len()
-            }
-            _ => 0,
+        // Calculate tag count from user_tags already in ObjectInfo
+        // This avoids an additional API call since user_tags is already populated by get_object_info
+        let tag_count = if !info.user_tags.is_empty() {
+            let tag_set = decode_tags(&info.user_tags);
+            tag_set.len()
+        } else {
+            0
         };
 
         let output = HeadObjectOutput {
