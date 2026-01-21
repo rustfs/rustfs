@@ -116,8 +116,10 @@ use rustfs_utils::{
     http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
-            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT,
-            RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
+            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
+            AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+            AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT, RESERVED_METADATA_PREFIX,
+            RESERVED_METADATA_PREFIX_LOWER,
         },
     },
     path::{is_dir_object, path_join_buf},
@@ -530,6 +532,93 @@ fn validate_list_object_unordered_with_delimiter(delimiter: Option<&Delimiter>, 
         ));
     }
 
+    Ok(())
+}
+
+fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
+    let mut eval_metadata = HashMap::new();
+
+    if let Some(v) = retention {
+        let mode = match v.mode {
+            Some(mode) => match mode.as_str() {
+                ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE => mode.as_str().to_string(),
+                _ => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::MalformedXML,
+                        "The XML you provided was not well-formed or did not validate against our published schema".to_string(),
+                    ));
+                }
+            },
+            None => String::default(),
+        };
+
+        let retain_until_date = v
+            .retain_until_date
+            .map(|v| OffsetDateTime::from(v).format(&Rfc3339).unwrap())
+            .unwrap_or_default();
+
+        let now = OffsetDateTime::now_utc();
+        // This is intentional behavior. Empty string represents "retention cleared" which is different from "retention never set". Consistent with minio
+        eval_metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode);
+        eval_metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), retain_until_date);
+        eval_metadata.insert(
+            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"),
+            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+        );
+    }
+    Ok(eval_metadata)
+}
+
+fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
+    let mut eval_metadata = HashMap::new();
+    if let Some(v) = legal_hold {
+        let status = match v.status {
+            Some(status) => match status.as_str() {
+                ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON => status.as_str().to_string(),
+                _ => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::MalformedXML,
+                        "The XML you provided was not well-formed or did not validate against our published schema".to_string(),
+                    ));
+                }
+            },
+            None => String::default(),
+        };
+        let now = OffsetDateTime::now_utc();
+        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set". Consistent with minio
+        eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
+        eval_metadata.insert(
+            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
+            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+        );
+    }
+    Ok(eval_metadata)
+}
+
+async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Result<()> {
+    match metadata_sys::get_object_lock_config(bucket).await {
+        Ok((cfg, _created)) => {
+            if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "Object Lock is not enabled for this bucket".to_string(),
+                ));
+            }
+        }
+        Err(err) => {
+            if err == StorageError::ConfigNotFound {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "Bucket is missing ObjectLockConfiguration".to_string(),
+                ));
+            }
+            warn!("get_object_lock_config err {:?}", err);
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to get bucket ObjectLockConfiguration".to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -3277,6 +3366,30 @@ impl S3 for FS {
                 warn!("Failed to parse x-amz-tagging-count header value, skipping");
             }
         }
+        if let Some(retain_date) = metadata_map
+            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE))
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.as_bytes())
+            && let Ok(header_value) = HeaderValue::from_str(retain_date)
+        {
+            response.headers.insert(header_name, header_value);
+        }
+        if let Some(mode) = metadata_map
+            .get(AMZ_OBJECT_LOCK_MODE_LOWER)
+            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_MODE))
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_MODE_LOWER.as_bytes())
+            && let Ok(header_value) = HeaderValue::from_str(mode)
+        {
+            response.headers.insert(header_name, header_value);
+        }
+        if let Some(legal_hold) = metadata_map
+            .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
+            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_LEGAL_HOLD))
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.as_bytes())
+            && let Ok(header_value) = HeaderValue::from_str(legal_hold)
+        {
+            response.headers.insert(header_name, header_value);
+        }
 
         let result = Ok(response);
         let _ = helper.complete(&result);
@@ -5806,9 +5919,11 @@ impl S3 for FS {
                         "Object Lock configuration does not exist for this bucket".to_string(),
                     ));
                 }
-
-                debug!("get_object_lock_config err {:?}", err);
-                None
+                warn!("get_object_lock_config err {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Failed to load Object Lock configuration".to_string(),
+                ));
             }
         };
 
@@ -5840,6 +5955,23 @@ impl S3 for FS {
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
+
+        let _ = match metadata_sys::get_object_lock_config(&bucket).await {
+            Ok(_) => {}
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidBucketState,
+                        "Object Lock configuration cannot be enabled on existing buckets".to_string(),
+                    ));
+                }
+                warn!("get_object_lock_config err {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Failed to get bucket ObjectLockConfiguration".to_string(),
+                ));
+            }
+        };
 
         let data = try_!(serialize(&input_cfg));
 
@@ -6338,7 +6470,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
+        validate_bucket_object_lock_enabled(&bucket).await?;
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
@@ -6351,7 +6483,7 @@ impl S3 for FS {
 
         let legal_hold = object_info
             .user_defined
-            .get("x-amz-object-lock-legal-hold")
+            .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
             .map(|v| v.as_str().to_string());
 
         let status = if let Some(v) = legal_hold {
@@ -6397,24 +6529,12 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
-
+        validate_bucket_object_lock_enabled(&bucket).await?;
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
 
-        let mut eval_metadata = HashMap::new();
-        let legal_hold = legal_hold
-            .map(|v| v.status.map(|v| v.as_str().to_string()))
-            .unwrap_or_default()
-            .unwrap_or("OFF".to_string());
-
-        let now = OffsetDateTime::now_utc();
-        eval_metadata.insert("x-amz-object-lock-legal-hold".to_string(), legal_hold);
-        eval_metadata.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
-            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
-        );
+        let eval_metadata = parse_object_lock_legal_hold(legal_hold)?;
 
         let popts = ObjectOptions {
             mod_time: opts.mod_time,
@@ -6453,7 +6573,7 @@ impl S3 for FS {
         };
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
+        validate_bucket_object_lock_enabled(&bucket).await?;
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
@@ -6504,26 +6624,11 @@ impl S3 for FS {
         };
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
+        validate_bucket_object_lock_enabled(&bucket).await?;
 
         // TODO: check allow
 
-        let mut eval_metadata = HashMap::new();
-
-        if let Some(v) = retention {
-            let mode = v.mode.map(|v| v.as_str().to_string()).unwrap_or_default();
-            let retain_until_date = v
-                .retain_until_date
-                .map(|v| OffsetDateTime::from(v).format(&Rfc3339).unwrap())
-                .unwrap_or_default();
-            let now = OffsetDateTime::now_utc();
-            eval_metadata.insert("x-amz-object-lock-mode".to_string(), mode);
-            eval_metadata.insert("x-amz-object-lock-retain-until-date".to_string(), retain_until_date);
-            eval_metadata.insert(
-                format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"),
-                format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
-            );
-        }
+        let eval_metadata = parse_object_lock_retention(retention)?;
 
         let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
@@ -6995,6 +7100,143 @@ mod tests {
         let complex_query_without_unordered = Some("abc=123&queryType=test");
         // [5] Multi-parameter query without conflict: If other parameters exist but 'allow-unordered' is missing,
         assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query_without_unordered).is_ok());
+    }
+
+    #[test]
+    fn test_parse_object_lock_retention() {
+        use time::macros::datetime;
+        // [1] Normal case: No retention specified (empty metadata)
+        assert!(parse_object_lock_retention(None).is_ok());
+        assert!(parse_object_lock_retention(None).unwrap().is_empty());
+
+        // [2] Normal case: Retention with valid COMPLIANCE mode
+        let valid_compliance_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+        };
+        let compliance_metadata = parse_object_lock_retention(Some(valid_compliance_retention)).unwrap();
+        assert_eq!(compliance_metadata.get("x-amz-object-lock-mode").unwrap(), "COMPLIANCE");
+        assert_eq!(
+            compliance_metadata.get("x-amz-object-lock-retain-until-date").unwrap(),
+            "2025-01-01T00:00:00Z"
+        );
+        assert!(
+            compliance_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"))
+        );
+
+        // [3] Normal case: Retention with valid GOVERNANCE mode
+        let valid_governance_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+        };
+        let governance_metadata = parse_object_lock_retention(Some(valid_governance_retention)).unwrap();
+        assert_eq!(governance_metadata.get("x-amz-object-lock-mode").unwrap(), "GOVERNANCE");
+
+        // [4] Normal case: Retention with None mode (empty string for mode)
+        let none_mode_retention = ObjectLockRetention {
+            mode: None,
+            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+        };
+        let none_mode_metadata = parse_object_lock_retention(Some(none_mode_retention)).unwrap();
+        assert_eq!(none_mode_metadata.get("x-amz-object-lock-mode").unwrap(), "");
+
+        // [5] Normal case: Retention with None retain_until_date (empty string for date)
+        let none_date_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: None,
+        };
+        let none_date_metadata = parse_object_lock_retention(Some(none_date_retention)).unwrap();
+        assert_eq!(none_date_metadata.get("x-amz-object-lock-retain-until-date").unwrap(), "");
+
+        // [6] Error case: Retention with invalid mode (non COMPLIANCE/GOVERNANCE)
+        let invalid_mode_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static("INVALID_MODE")),
+            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+        };
+        let err = parse_object_lock_retention(Some(invalid_mode_retention)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
+        assert_eq!(
+            err.message(),
+            Some("The XML you provided was not well-formed or did not validate against our published schema")
+        );
+    }
+
+    #[test]
+    fn test_parse_object_lock_legal_hold() {
+        // [1] Normal case: No legal hold specified (empty metadata)
+        assert!(parse_object_lock_legal_hold(None).is_ok());
+        assert!(parse_object_lock_legal_hold(None).unwrap().is_empty());
+
+        // [2] Normal case: Legal hold with valid ON status
+        let valid_on_legal_hold = ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
+        };
+        let on_metadata = parse_object_lock_legal_hold(Some(valid_on_legal_hold)).unwrap();
+        assert_eq!(on_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "ON");
+        assert!(on_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp")));
+
+        // [3] Normal case: Legal hold with valid OFF status
+        let valid_off_legal_hold = ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
+        };
+        let off_metadata = parse_object_lock_legal_hold(Some(valid_off_legal_hold)).unwrap();
+        assert_eq!(off_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "OFF");
+
+        // [4] Normal case: Legal hold with None status (empty string for status)
+        let none_status_legal_hold = ObjectLockLegalHold { status: None };
+        let none_status_metadata = parse_object_lock_legal_hold(Some(none_status_legal_hold)).unwrap();
+        assert_eq!(none_status_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "");
+
+        // [5] Error case: Legal hold with invalid status (non ON/OFF)
+        let invalid_status_legal_hold = ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static("INVALID_STATUS")),
+        };
+        let err = parse_object_lock_legal_hold(Some(invalid_status_legal_hold)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
+        assert_eq!(
+            err.message(),
+            Some("The XML you provided was not well-formed or did not validate against our published schema")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_bucket_object_lock_enabled() {
+        use rustfs_ecstore::bucket::metadata::BucketMetadata;
+        use rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata;
+        use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
+        use time::OffsetDateTime;
+
+        if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_none() {
+            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+            return;
+        }
+
+        let test_bucket = "test-bucket-object-lock";
+
+        let mut bm = BucketMetadata::new(test_bucket);
+        bm.object_lock_config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: None,
+        });
+        bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
+        set_bucket_metadata(test_bucket.to_string(), bm).await.unwrap();
+        assert!(validate_bucket_object_lock_enabled(test_bucket).await.is_ok());
+
+        let mut bm = BucketMetadata::new(test_bucket);
+        bm.object_lock_config = Some(ObjectLockConfiguration {
+            object_lock_enabled: None,
+            rule: None,
+        });
+        bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
+        set_bucket_metadata(test_bucket.to_string(), bm).await.unwrap();
+        let err = validate_bucket_object_lock_enabled(test_bucket).await.unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidRequest.as_str());
+        assert_eq!(err.message(), Some("Object Lock is not enabled for this bucket"));
+
+        let non_exist_bucket = "non-exist-bucket-object-lock";
+        let err = validate_bucket_object_lock_enabled(non_exist_bucket).await.unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidRequest.as_str());
+        assert_eq!(err.message(), Some("Bucket is missing ObjectLockConfiguration"));
     }
 
     #[test]
