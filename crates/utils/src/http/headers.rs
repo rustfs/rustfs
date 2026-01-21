@@ -67,8 +67,11 @@ pub const AMZ_COPY_SOURCE_VERSION_ID: &str = "X-Amz-Copy-Source-Version-Id";
 pub const AMZ_COPY_SOURCE_RANGE: &str = "X-Amz-Copy-Source-Range";
 pub const AMZ_METADATA_DIRECTIVE: &str = "X-Amz-Metadata-Directive";
 pub const AMZ_OBJECT_LOCK_MODE: &str = "X-Amz-Object-Lock-Mode";
+pub const AMZ_OBJECT_LOCK_MODE_LOWER: &str = "x-amz-object-lock-mode";
 pub const AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE: &str = "X-Amz-Object-Lock-Retain-Until-Date";
+pub const AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER: &str = "x-amz-object-lock-retain-until-date";
 pub const AMZ_OBJECT_LOCK_LEGAL_HOLD: &str = "X-Amz-Object-Lock-Legal-Hold";
+pub const AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER: &str = "x-amz-object-lock-legal-hold";
 pub const AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE: &str = "X-Amz-Bypass-Governance-Retention";
 pub const AMZ_BUCKET_REPLICATION_STATUS: &str = "X-Amz-Replication-Status";
 
