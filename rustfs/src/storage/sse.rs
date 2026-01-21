@@ -96,6 +96,7 @@ use tracing::{debug, error};
 
 use crate::error::ApiError;
 use rustfs_ecstore::bucket::metadata_sys;
+use rustfs_ecstore::error::Error;
 use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
 
 // ============================================================================
@@ -200,7 +201,10 @@ async fn prepare_sse_configuration(
             effective_kms_key_id,
         }))
     } else if let Err(e) = bucket_sse_config_result {
-        Err(ApiError::from(e))
+        match e {
+            Error::ConfigNotFound => Ok(None),
+            _ => Err(ApiError::from(e)),
+        }
     } else {
         Ok(None)
     }
