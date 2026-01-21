@@ -116,7 +116,7 @@ use rustfs_utils::{
     http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
-            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT,
+            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
             RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
         },
     },
@@ -3040,15 +3040,6 @@ impl S3 for FS {
         let content_language = metadata_map.get("content-language").cloned();
         let expires = info.expires.map(Timestamp::from);
 
-        // Calculate tag count from user_tags already in ObjectInfo
-        // This avoids an additional API call since user_tags is already populated by get_object_info
-        let tag_count = if !info.user_tags.is_empty() {
-            let tag_set = decode_tags(&info.user_tags);
-            tag_set.len()
-        } else {
-            0
-        };
-
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -3085,19 +3076,7 @@ impl S3 for FS {
         // interact with objects (PUT/POST/DELETE/LIST, etc.) rely on the system-level
         // CORS layer instead. In case both are applicable, this bucket-level CORS logic
         // takes precedence for these read operations.
-        let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
-
-        // Add x-amz-tagging-count header if object has tags
-        // Per S3 API spec, this header should be present in HEAD object response when tags exist
-        if tag_count > 0 {
-            let header_name = http::HeaderName::from_static(AMZ_TAG_COUNT);
-            if let Ok(header_value) = tag_count.to_string().parse::<http::HeaderValue>() {
-                response.headers.insert(header_name, header_value);
-            } else {
-                warn!("Failed to parse x-amz-tagging-count header value, skipping");
-            }
-        }
-
+        let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
         let result = Ok(response);
         let _ = helper.complete(&result);
 
