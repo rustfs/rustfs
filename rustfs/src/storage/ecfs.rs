@@ -118,10 +118,8 @@ use rustfs_utils::{
         headers::{
             AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
             AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-            AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, RESERVED_METADATA_PREFIX,
-            RESERVED_METADATA_PREFIX_LOWER, AMZ_TAG_COUNT,
-            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT,
-            RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
+            AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT, RESERVED_METADATA_PREFIX,
+            RESERVED_METADATA_PREFIX_LOWER,
         },
     },
     path::{is_dir_object, path_join_buf},
@@ -3196,8 +3194,6 @@ impl S3 for FS {
                 warn!("Failed to parse x-amz-tagging-count header value, skipping");
             }
         }
-
-        let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
         if let Some(retain_date) = metadata_map
             .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
             .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE))
