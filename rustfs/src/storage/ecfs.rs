@@ -4890,10 +4890,7 @@ impl S3 for FS {
         {
             Ok(_) => Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() })),
             Err(err) => {
-                // Convert MalformedUploadID error to NoSuchUpload error code
-                // This ensures we return 404 instead of 400 for malformed/non-existent uploads
-                // Per S3 API spec, abort_multipart_upload should return 404 for missing uploads
-                // even if the upload_id format appears invalid
+                // Convert MalformedUploadID to NoSuchUpload to maintain S3 API compatibility
                 if matches!(err, StorageError::MalformedUploadID(_)) {
                     return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
                 }
