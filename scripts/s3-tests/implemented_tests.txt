@@ -138,3 +138,4 @@ test_ranged_request_empty_object
 test_ranged_request_invalid_range
 test_set_multipart_tagging
 test_upload_part_copy_percent_encoded_key
+test_api_error_from_storage_error_mappings
