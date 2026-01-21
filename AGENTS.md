@@ -98,3 +98,4 @@ Do not commit secrets or cloud credentials; prefer environment variables or vaul
 - NEVER create files unless they're absolutely necessary for achieving your goal
 - ALWAYS prefer editing an existing file to creating a new one
 - NEVER proactively create documentation files (*.md) or README files unless explicitly requested
+- NEVER commit PR description files (e.g., PR_DESCRIPTION.md): These are temporary reference files for creating pull requests and should remain local only
