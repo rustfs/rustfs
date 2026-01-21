@@ -428,6 +428,13 @@ impl ECStore {
             result.forward_past(opts.marker);
         }
 
+        // Check if list_path returned entries equal to limit, which indicates more objects exist
+        // This is more accurate than checking get_objects.len() because get_objects may be filtered
+        // (e.g., directories filtered out), so its length may be less than the actual entries count
+        // We need to check this before calling from_meta_cache_entries_sorted_versions which consumes entries
+        let entries_count = list_result.entries.as_ref().map(|e| e.entries().len()).unwrap_or(0);
+        let limit = opts.limit;
+
         let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
@@ -441,7 +448,11 @@ impl ECStore {
             if max_keys > 0 && get_objects.len() > max_keys as usize {
                 get_objects.truncate(max_keys as usize);
                 true
+            } else if entries_count >= limit as usize {
+                // If entries count equals limit, there are more objects
+                true
             } else {
+                // Otherwise, check if there are any objects and no error
                 list_result.err.is_none() && !get_objects.is_empty()
             }
         };
