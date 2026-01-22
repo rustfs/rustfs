@@ -1,0 +1,17 @@
+{
+  "name": "unsafe-checker",
+  "version": "1.0.0",
+  "description": "Unsafe Rust code review and safety abstraction checker",
+  "source": "https://github.com/Rust-Coding-Guidelines/rust-coding-guidelines-zh",
+  "lastUpdated": "2026-01-16",
+  "ruleCount": 47,
+  "sections": [
+    { "id": "general", "name": "General Principles", "count": 3 },
+    { "id": "safety", "name": "Safety Abstraction", "count": 11 },
+    { "id": "ptr", "name": "Raw Pointers", "count": 6 },
+    { "id": "union", "name": "Union", "count": 2 },
+    { "id": "mem", "name": "Memory Layout", "count": 6 },
+    { "id": "ffi", "name": "FFI", "count": 18 },
+    { "id": "io", "name": "I/O Safety", "count": 1 }
+  ]
+}

@@ -19,3 +19,6 @@ data:
   {{- else }}
   RUSTFS_VOLUMES: "/data"
   {{- end }}
+  {{- if .Values.config.rustfs.domains }}
+  RUSTFS_SERVER_DOMAINS: {{ .Values.config.rustfs.domains | quote }}
+  {{- end }}

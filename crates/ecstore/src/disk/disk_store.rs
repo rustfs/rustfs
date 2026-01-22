@@ -15,7 +15,8 @@
 use crate::disk::{
     CheckPartsResp, DeleteOptions, DiskAPI, DiskError, DiskInfo, DiskInfoOptions, DiskLocation, Endpoint, Error,
     FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, Result, UpdateMetadataOpts, VolumeInfo,
-    WalkDirOptions, local::LocalDisk,
+    WalkDirOptions,
+    local::{LocalDisk, ScanGuard},
 };
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
@@ -259,6 +260,7 @@ impl LocalDiskWrapper {
                     let test_obj = format!("health-check-{}", Uuid::new_v4());
                     if Self::perform_health_check(disk.clone(), &TEST_BUCKET, &test_obj, &TEST_DATA, true, CHECK_TIMEOUT_DURATION).await.is_err() && health.swap_ok_to_faulty() {
                         // Health check failed, disk is considered faulty
+                        warn!("health check: failed, disk is considered faulty");
 
                         health.increment_waiting(); // Balance the increment from failed operation
 
@@ -429,7 +431,7 @@ impl LocalDiskWrapper {
     {
         // Check if disk is faulty
         if self.health.is_faulty() {
-            warn!("disk {} health is faulty, returning error", self.to_string());
+            warn!("local disk {} health is faulty, returning error", self.to_string());
             return Err(DiskError::FaultyDisk);
         }
 
@@ -476,6 +478,15 @@ impl LocalDiskWrapper {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        self.track_disk_health(|| async { self.disk.read_metadata(volume, path).await }, Duration::ZERO)
+            .await
+    }
+
+    fn start_scan(&self) -> ScanGuard {
+        self.disk.start_scan()
+    }
+
     fn to_string(&self) -> String {
         self.disk.to_string()
     }

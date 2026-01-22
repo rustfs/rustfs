@@ -180,6 +180,13 @@ pub async fn created_at(bucket: &str) -> Result<OffsetDateTime> {
     bucket_meta_sys.created_at(bucket).await
 }
 
+pub async fn list_bucket_targets(bucket: &str) -> Result<BucketTargets> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_bucket_targets_config(bucket).await
+}
+
 #[derive(Debug)]
 pub struct BucketMetadataSys {
     metadata_map: RwLock<HashMap<String, Arc<BucketMetadata>>>,
