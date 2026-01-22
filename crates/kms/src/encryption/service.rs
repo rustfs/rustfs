@@ -19,6 +19,7 @@ use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
 use base64::Engine;
+use jiff::Zoned;
 use rand::random;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -339,7 +340,7 @@ impl ObjectEncryptionService {
             iv,
             tag: Some(tag),
             encryption_context: context,
-            encrypted_at: chrono::Utc::now(),
+            encrypted_at: Zoned::now(),
             original_size,
             encrypted_data_key: data_key.ciphertext_blob,
         };
@@ -482,7 +483,7 @@ impl ObjectEncryptionService {
             iv,
             tag: Some(tag),
             encryption_context: context,
-            encrypted_at: chrono::Utc::now(),
+            encrypted_at: Zoned::now(),
             original_size,
             encrypted_data_key: Vec::new(), // Empty for SSE-C
         };
@@ -695,7 +696,7 @@ impl ObjectEncryptionService {
             iv,
             tag,
             encryption_context,
-            encrypted_at: chrono::Utc::now(),
+            encrypted_at: Zoned::now(),
             original_size: 0, // Not available from headers
             encrypted_data_key,
         })
@@ -809,7 +810,7 @@ mod tests {
             iv: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             tag: Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             encryption_context: HashMap::from([("bucket".to_string(), "test-bucket".to_string())]),
-            encrypted_at: chrono::Utc::now(),
+            encrypted_at: Zoned::now(),
             original_size: 100,
             encrypted_data_key: vec![1, 2, 3, 4],
         };

@@ -14,7 +14,6 @@
 
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use crate::{admin, config, version};
-use chrono::Datelike;
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_notify::notifier_global;
@@ -26,7 +25,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 #[instrument]
 pub(crate) fn print_server_info() {
-    let current_year = chrono::Utc::now().year();
+    let current_year = jiff::Zoned::now().year();
     // Use custom macros to print server information
     info!("RustFS Object Storage Server");
     info!("Copyright: 2024-{} RustFS, Inc", current_year);

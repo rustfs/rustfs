@@ -61,6 +61,7 @@ rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
+rustfs-scanner = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
@@ -98,6 +99,7 @@ rustls-pemfile = { workspace = true }
 
 # Time and Date
 chrono = { workspace = true }
+jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 
 # Utilities and Tools
