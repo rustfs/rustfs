@@ -1005,6 +1005,41 @@ impl FileMeta {
         }
     }
 
+    pub fn get_file_info_versions(&self, volume: &str, path: &str, include_free_versions: bool) -> Result<FileInfoVersions> {
+        let mut versions = self.into_file_info_versions(volume, path, true)?;
+
+        let mut n = 0;
+
+        let mut versions_vec = Vec::new();
+
+        for fi in versions.versions.iter() {
+            if fi.tier_free_version() {
+                if !include_free_versions {
+                    versions.free_versions.push(fi.clone());
+                }
+            } else {
+                if !include_free_versions {
+                    versions_vec.push(fi.clone());
+                }
+                n += 1;
+            }
+        }
+
+        if !include_free_versions {
+            versions.versions = versions_vec;
+        }
+
+        for fi in versions.free_versions.iter_mut() {
+            fi.num_versions = n;
+        }
+
+        Ok(versions)
+    }
+
+    pub fn get_all_file_info_versions(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfoVersions> {
+        self.into_file_info_versions(volume, path, all_parts)
+    }
+
     pub fn into_file_info_versions(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfoVersions> {
         let mut versions = Vec::new();
         for version in self.versions.iter() {

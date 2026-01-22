@@ -132,7 +132,7 @@ impl Operation for HealthCheckHandler {
         let health_info = json!({
             "status": "ok",
             "service": "rustfs-endpoint",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": jiff::Zoned::now().to_string(),
             "version": env!("CARGO_PKG_VERSION")
         });
 
@@ -696,7 +696,6 @@ impl Stream for MetricsStream {
     type Item = Result<Bytes, StdError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        info!("MetricsStream poll_next");
         let this = Pin::into_inner(self);
         this.inner.poll_next_unpin(cx)
     }
@@ -758,7 +757,6 @@ impl Operation for MetricsHandler {
         let body = Body::from(in_stream);
         spawn(async move {
             while n > 0 {
-                info!("loop, n: {n}");
                 let mut m = RealtimeMetrics::default();
                 let m_local = collect_local_metrics(types, &opts).await;
                 m.merge(m_local);
@@ -775,7 +773,6 @@ impl Operation for MetricsHandler {
                 // todo write resp
                 match serde_json::to_vec(&m) {
                     Ok(re) => {
-                        info!("got metrics, send it to client, m: {m:?}");
                         let _ = tx.send(Ok(Bytes::from(re))).await;
                     }
                     Err(e) => {

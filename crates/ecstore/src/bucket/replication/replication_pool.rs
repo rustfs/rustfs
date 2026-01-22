@@ -13,12 +13,15 @@
 // limitations under the License.
 
 use crate::StorageAPI;
+use crate::bucket::bucket_target_sys::BucketTargetSys;
+use crate::bucket::metadata_sys;
 use crate::bucket::replication::ResyncOpts;
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::replicate_delete;
 use crate::bucket::replication::replicate_object;
 use crate::bucket::replication::replication_resyncer::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationResyncer,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationConfig, ReplicationResyncer,
+    get_heal_replicate_object_info,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::read_config;
@@ -34,8 +37,10 @@ use rustfs_filemeta::ReplicationStatusType;
 use rustfs_filemeta::ReplicationType;
 use rustfs_filemeta::ReplicationWorkerOperation;
 use rustfs_filemeta::ResyncDecision;
+use rustfs_filemeta::VersionPurgeStatusType;
 use rustfs_filemeta::replication_statuses_map;
 use rustfs_filemeta::version_purge_statuses_map;
+use rustfs_filemeta::{REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE};
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use std::any::Any;
 use std::sync::Arc;
@@ -1038,6 +1043,155 @@ pub async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
             stats
                 .update(&dv.bucket, &ri, ReplicationStatusType::Pending, ReplicationStatusType::Empty)
                 .await;
+        }
+    }
+}
+
+/// QueueReplicationHeal is a wrapper for queue_replication_heal_internal
+pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u32) {
+    // ignore modtime zero objects
+    if oi.mod_time.is_none() || oi.mod_time == Some(OffsetDateTime::UNIX_EPOCH) {
+        return;
+    }
+
+    let rcfg = match metadata_sys::get_replication_config(bucket).await {
+        Ok((config, _)) => config,
+        Err(err) => {
+            warn!("Failed to get replication config for bucket {}: {}", bucket, err);
+
+            return;
+        }
+    };
+
+    let tgts = match BucketTargetSys::get().list_bucket_targets(bucket).await {
+        Ok(targets) => Some(targets),
+        Err(err) => {
+            warn!("Failed to list bucket targets for bucket {}: {}", bucket, err);
+            None
+        }
+    };
+
+    let rcfg_wrapper = ReplicationConfig::new(Some(rcfg), tgts);
+    queue_replication_heal_internal(bucket, oi, rcfg_wrapper, retry_count).await;
+}
+
+/// queue_replication_heal_internal enqueues objects that failed replication OR eligible for resyncing through
+/// an ongoing resync operation or via existing objects replication configuration setting.
+pub async fn queue_replication_heal_internal(
+    _bucket: &str,
+    oi: ObjectInfo,
+    rcfg: ReplicationConfig,
+    retry_count: u32,
+) -> ReplicateObjectInfo {
+    let mut roi = ReplicateObjectInfo::default();
+
+    // ignore modtime zero objects
+    if oi.mod_time.is_none() || oi.mod_time == Some(OffsetDateTime::UNIX_EPOCH) {
+        return roi;
+    }
+
+    if rcfg.config.is_none() || rcfg.remotes.is_none() {
+        return roi;
+    }
+
+    roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+    roi.retry_count = retry_count;
+
+    if !roi.dsc.replicate_any() {
+        return roi;
+    }
+
+    // early return if replication already done, otherwise we need to determine if this
+    // version is an existing object that needs healing.
+    if roi.replication_status == ReplicationStatusType::Completed
+        && roi.version_purge_status.is_empty()
+        && !roi.existing_obj_resync.must_resync()
+    {
+        return roi;
+    }
+
+    if roi.delete_marker || !roi.version_purge_status.is_empty() {
+        let (version_id, dm_version_id) = if roi.version_purge_status.is_empty() {
+            (None, roi.version_id)
+        } else {
+            (roi.version_id, None)
+        };
+
+        let dv = DeletedObjectReplicationInfo {
+            delete_object: crate::store_api::DeletedObject {
+                object_name: roi.name.clone(),
+                delete_marker_version_id: dm_version_id,
+                version_id,
+                replication_state: roi.replication_state.clone(),
+                delete_marker_mtime: roi.mod_time,
+                delete_marker: roi.delete_marker,
+                ..Default::default()
+            },
+            bucket: roi.bucket.clone(),
+            op_type: ReplicationType::Heal,
+            event_type: REPLICATE_HEAL_DELETE.to_string(),
+            ..Default::default()
+        };
+
+        // heal delete marker replication failure or versioned delete replication failure
+        if roi.replication_status == ReplicationStatusType::Pending
+            || roi.replication_status == ReplicationStatusType::Failed
+            || roi.version_purge_status == VersionPurgeStatusType::Failed
+            || roi.version_purge_status == VersionPurgeStatusType::Pending
+        {
+            if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+                pool.queue_replica_delete_task(dv).await;
+            }
+            return roi;
+        }
+
+        // if replication status is Complete on DeleteMarker and existing object resync required
+        let existing_obj_resync = roi.existing_obj_resync.clone();
+        if existing_obj_resync.must_resync()
+            && (roi.replication_status == ReplicationStatusType::Completed || roi.replication_status.is_empty())
+        {
+            queue_replicate_deletes_wrapper(dv, existing_obj_resync).await;
+            return roi;
+        }
+
+        return roi;
+    }
+
+    if roi.existing_obj_resync.must_resync() {
+        roi.op_type = ReplicationType::ExistingObject;
+    }
+
+    match roi.replication_status {
+        ReplicationStatusType::Pending | ReplicationStatusType::Failed => {
+            roi.event_type = REPLICATE_HEAL.to_string();
+            if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+                pool.queue_replica_task(roi.clone()).await;
+            }
+            return roi;
+        }
+        _ => {}
+    }
+
+    if roi.existing_obj_resync.must_resync() {
+        roi.event_type = REPLICATE_EXISTING.to_string();
+        if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+            pool.queue_replica_task(roi.clone()).await;
+        }
+    }
+
+    roi
+}
+
+/// Wrapper function for queueing replicate deletes with resync decision
+async fn queue_replicate_deletes_wrapper(doi: DeletedObjectReplicationInfo, existing_obj_resync: ResyncDecision) {
+    for (k, v) in existing_obj_resync.targets.iter() {
+        if v.replicate {
+            let mut dv = doi.clone();
+            dv.reset_id = v.reset_id.clone();
+            dv.target_arn = k.clone();
+            if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+                pool.queue_replica_delete_task(dv).await;
+            }
         }
     }
 }
