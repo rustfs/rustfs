@@ -5735,8 +5735,14 @@ impl StorageAPI for SetDisks {
             ..Default::default()
         };
 
+        // Build a lookup map for O(1) part resolution instead of O(n) find() in the loop
+        // This optimizes from O(n^2) to O(n) when processing many parts
+        use std::collections::HashMap;
+        let part_lookup: HashMap<usize, &rustfs_filemeta::ObjectPartInfo> =
+            curr_fi.parts.iter().map(|part| (part.number, part)).collect();
+
         for (i, p) in uploaded_parts.iter().enumerate() {
-            let Some(ext_part) = curr_fi.parts.iter().find(|v| v.number == p.part_num) else {
+            let Some(ext_part) = part_lookup.get(&p.part_num) else {
                 error!(
                     "complete_multipart_upload part not found: part_id={}, bucket={}, object={}",
                     p.part_num, bucket, object
