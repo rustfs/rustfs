@@ -132,7 +132,7 @@ pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
                 let id = std::thread::current().id();
                 println!(
                     "RustFS Worker Thread running - initializing resources time: {:?}, thread id: {:?}",
-                    chrono::Utc::now().to_rfc3339(),
+                    jiff::Zoned::now().to_string(),
                     id
                 );
             })
@@ -140,7 +140,7 @@ pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
                 let id = std::thread::current().id();
                 println!(
                     "RustFS Worker Thread stopping - cleaning up resources time: {:?}, thread id: {:?}",
-                    chrono::Utc::now().to_rfc3339(),
+                    jiff::Zoned::now().to_string(),
                     id
                 )
             });

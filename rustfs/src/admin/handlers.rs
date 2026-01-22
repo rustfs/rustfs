@@ -132,7 +132,7 @@ impl Operation for HealthCheckHandler {
         let health_info = json!({
             "status": "ok",
             "service": "rustfs-endpoint",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": jiff::Zoned::now().to_string(),
             "version": env!("CARGO_PKG_VERSION")
         });
 
@@ -1211,7 +1211,7 @@ impl Operation for ListRemoteTargetHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header))
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header));
     }
 }
 
