@@ -7502,7 +7502,7 @@ mod tests {
         assert!(result13.is_err());
         assert_eq!(result13.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
     }
-    
+
     // Note: S3Request structure is complex and requires many fields.
     // For real testing, we would need proper integration test setup.
     // Removing this test as it requires too much S3 infrastructure setup.
