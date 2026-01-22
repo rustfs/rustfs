@@ -389,10 +389,10 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
     }
 
     #[cfg(not(feature = "ftps"))]
-{
-    debug!("FTPS system not available (ftps feature not enabled)");
-    Ok(None)
-}
+    {
+        debug!("FTPS system not available (ftps feature not enabled)");
+        Ok(None)
+    }
 }
 
 /// Initialize the SFTP system
@@ -457,8 +457,8 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
     }
 
     #[cfg(not(feature = "sftp"))]
-{
-    debug!("SFTP system not available (sftp feature not enabled)");
-    Ok(None)
-}
+    {
+        debug!("SFTP system not available (sftp feature not enabled)");
+        Ok(None)
+    }
 }

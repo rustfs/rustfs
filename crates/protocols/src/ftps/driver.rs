@@ -99,10 +99,14 @@ where
         }
 
         let mut list_result = Vec::new();
-        match self.storage.list_buckets(
-            &session_context.principal.user_identity.credentials.access_key,
-            &session_context.principal.user_identity.credentials.secret_key
-        ).await {
+        match self
+            .storage
+            .list_buckets(
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key,
+            )
+            .await
+        {
             Ok(output) => {
                 if let Some(buckets) = output.buckets {
                     for bucket in buckets {
@@ -155,12 +159,16 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         if let Some(key) = key {
-            match self.storage.head_object(
-                &bucket,
-                &key,
-                &session_context.principal.user_identity.credentials.access_key,
-                &session_context.principal.user_identity.credentials.secret_key
-            ).await {
+            match self
+                .storage
+                .head_object(
+                    &bucket,
+                    &key,
+                    &session_context.principal.user_identity.credentials.access_key,
+                    &session_context.principal.user_identity.credentials.secret_key,
+                )
+                .await
+            {
                 Ok(output) => {
                     let size = output.content_length.unwrap_or(0) as u64;
                     let modified = output.last_modified.map(|dt| {
@@ -183,11 +191,15 @@ where
         } else {
             // Directory metadata - use HeadBucket
             let bucket_clone = bucket.clone();
-            match self.storage.head_bucket(
-                &bucket,
-                &session_context.principal.user_identity.credentials.access_key,
-                &session_context.principal.user_identity.credentials.secret_key
-            ).await {
+            match self
+                .storage
+                .head_bucket(
+                    &bucket,
+                    &session_context.principal.user_identity.credentials.access_key,
+                    &session_context.principal.user_identity.credentials.secret_key,
+                )
+                .await
+            {
                 Ok(_) => Ok(FtpsMetadata {
                     size: 0,
                     modified: Some(std::time::SystemTime::now()),
@@ -237,11 +249,15 @@ where
                 Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
             })?;
 
-        match self.storage.list_objects_v2(
-            list_input,
-            &session_context.principal.user_identity.credentials.access_key,
-            &session_context.principal.user_identity.credentials.secret_key
-        ).await {
+        match self
+            .storage
+            .list_objects_v2(
+                list_input,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key,
+            )
+            .await
+        {
             Ok(output) => {
                 let mut fileinfos = Vec::new();
 
@@ -314,13 +330,17 @@ where
 
         let key = key.ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot get directory"))?;
 
-        match self.storage.get_object(
-            &bucket,
-            &key,
-            &session_context.principal.user_identity.credentials.access_key,
-            &session_context.principal.user_identity.credentials.secret_key,
-            Some(start_pos)  // Pass start_pos for range request
-        ).await {
+        match self
+            .storage
+            .get_object(
+                &bucket,
+                &key,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key,
+                Some(start_pos), // Pass start_pos for range request
+            )
+            .await
+        {
             Ok(output) => {
                 let body = output
                     .body
@@ -366,7 +386,10 @@ where
 
         // Check if this is an append operation (start_pos > 0)
         if start_pos > 0 {
-            return Err(Error::new(ErrorKind::CommandNotImplemented, "Append operations (start_pos > 0) are not supported with S3 backend"));
+            return Err(Error::new(
+                ErrorKind::CommandNotImplemented,
+                "Append operations (start_pos > 0) are not supported with S3 backend",
+            ));
         }
 
         // Authorize the operation
@@ -400,11 +423,15 @@ where
             .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build PutObjectInput"))?;
 
-        match self.storage.put_object(
-            put_input,
-            &session_context.principal.user_identity.credentials.access_key,
-            &session_context.principal.user_identity.credentials.secret_key
-        ).await {
+        match self
+            .storage
+            .put_object(
+                put_input,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key,
+            )
+            .await
+        {
             Ok(_output) => {
                 Ok(file_size as u64) // Return the size of the uploaded object
             }
@@ -426,12 +453,16 @@ where
 
         if let Some(key) = key {
             // Delete file
-            match self.storage.delete_object(
-                &bucket,
-                &key,
-                &session_context.principal.user_identity.credentials.access_key,
-                &session_context.principal.user_identity.credentials.secret_key
-            ).await {
+            match self
+                .storage
+                .delete_object(
+                    &bucket,
+                    &key,
+                    &session_context.principal.user_identity.credentials.access_key,
+                    &session_context.principal.user_identity.credentials.secret_key,
+                )
+                .await
+            {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     error!("Failed to delete file '{}': {}", path_str, e);
@@ -454,11 +485,15 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Create bucket for directory
-        match self.storage.create_bucket(
-            &bucket,
-            &session_context.principal.user_identity.credentials.access_key,
-            &session_context.principal.user_identity.credentials.secret_key
-        ).await {
+        match self
+            .storage
+            .create_bucket(
+                &bucket,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key,
+            )
+            .await
+        {
             Ok(_) => {
                 debug!("Successfully created directory/bucket '{}'", path_str);
                 Ok(())
@@ -479,11 +514,15 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Delete bucket for directory
-        match self.storage.delete_bucket(
-            &bucket,
-            &session_context.principal.user_identity.credentials.access_key,
-            &session_context.principal.user_identity.credentials.secret_key
-        ).await {
+        match self
+            .storage
+            .delete_bucket(
+                &bucket,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key,
+            )
+            .await
+        {
             Ok(_) => {
                 debug!("Successfully removed directory/bucket '{}'", path_str);
                 Ok(())
@@ -504,11 +543,15 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Check if bucket exists
-        match self.storage.head_bucket(
-            &bucket,
-            &session_context.principal.user_identity.credentials.access_key,
-            &session_context.principal.user_identity.credentials.secret_key
-        ).await {
+        match self
+            .storage
+            .head_bucket(
+                &bucket,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key,
+            )
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => {
                 error!("CWD to '{}' failed: {}", path_str, e);

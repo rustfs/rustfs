@@ -425,11 +425,27 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ftps_shutdown_tx, sftp_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(
+                &state_manager,
+                s3_shutdown_tx,
+                console_shutdown_tx,
+                ftps_shutdown_tx,
+                sftp_shutdown_tx,
+                ctx.clone(),
+            )
+            .await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ftps_shutdown_tx, sftp_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(
+                &state_manager,
+                s3_shutdown_tx,
+                console_shutdown_tx,
+                ftps_shutdown_tx,
+                sftp_shutdown_tx,
+                ctx.clone(),
+            )
+            .await;
         }
     }
 

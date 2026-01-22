@@ -160,11 +160,15 @@ where
             .map_err(|_| StatusCode::PermissionDenied)?;
 
         match action {
-            S3Action::HeadBucket => match self.storage.head_bucket(
-                &bucket,
-                &self.session_context.principal.user_identity.credentials.access_key,
-                &self.session_context.principal.user_identity.credentials.secret_key
-            ).await {
+            S3Action::HeadBucket => match self
+                .storage
+                .head_bucket(
+                    &bucket,
+                    &self.session_context.principal.user_identity.credentials.access_key,
+                    &self.session_context.principal.user_identity.credentials.secret_key,
+                )
+                .await
+            {
                 Ok(_) => {
                     let mut attrs = FileAttributes::default();
                     attrs.set_dir(true);
@@ -178,12 +182,16 @@ where
 
             S3Action::HeadObject => {
                 let key = key_opt.expect("key_opt should be Some for HeadObject action");
-                match self.storage.head_object(
-                    &bucket,
-                    &key,
-                    &self.session_context.principal.user_identity.credentials.access_key,
-                    &self.session_context.principal.user_identity.credentials.secret_key
-                ).await {
+                match self
+                    .storage
+                    .head_object(
+                        &bucket,
+                        &key,
+                        &self.session_context.principal.user_identity.credentials.access_key,
+                        &self.session_context.principal.user_identity.credentials.secret_key,
+                    )
+                    .await
+                {
                     Ok(out) => {
                         let mut attrs = FileAttributes::default();
                         attrs.set_dir(false);
@@ -342,11 +350,15 @@ where
                         .build()
                         .unwrap();
 
-                    let result = match this.storage.put_object(
-                        input,
-                        &this.session_context.principal.user_identity.credentials.access_key,
-                        &this.session_context.principal.user_identity.credentials.secret_key
-                    ).await {
+                    let result = match this
+                        .storage
+                        .put_object(
+                            input,
+                            &this.session_context.principal.user_identity.credentials.access_key,
+                            &this.session_context.principal.user_identity.credentials.secret_key,
+                        )
+                        .await
+                    {
                         Ok(_) => Status {
                             id,
                             status_code: StatusCode::Ok,
@@ -395,13 +407,17 @@ where
                 }
             };
 
-            match this.storage.get_object(
-                &bucket,
-                &key,
-                &this.session_context.principal.user_identity.credentials.access_key,
-                &this.session_context.principal.user_identity.credentials.secret_key,
-                None  // SFTP doesn't use start_pos for partial reads
-            ).await {
+            match this
+                .storage
+                .get_object(
+                    &bucket,
+                    &key,
+                    &this.session_context.principal.user_identity.credentials.access_key,
+                    &this.session_context.principal.user_identity.credentials.secret_key,
+                    None, // SFTP doesn't use start_pos for partial reads
+                )
+                .await
+            {
                 Ok(output) => {
                     let mut data = Vec::with_capacity(len as usize);
                     if let Some(body) = output.body {
@@ -495,13 +511,17 @@ where
                     .map_err(|_| StatusCode::PermissionDenied)?;
 
                 // List all buckets
-                let output = this.storage.list_buckets(
-                    &this.session_context.principal.user_identity.credentials.access_key,
-                    &this.session_context.principal.user_identity.credentials.secret_key
-                ).await.map_err(|e| {
-                    error!("SFTP Opendir - failed to list buckets: {}", e);
-                    StatusCode::Failure
-                })?;
+                let output = this
+                    .storage
+                    .list_buckets(
+                        &this.session_context.principal.user_identity.credentials.access_key,
+                        &this.session_context.principal.user_identity.credentials.secret_key,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("SFTP Opendir - failed to list buckets: {}", e);
+                        StatusCode::Failure
+                    })?;
 
                 let mut files = Vec::new();
                 if let Some(buckets) = output.buckets {
@@ -557,11 +577,15 @@ where
             let input = builder.build().map_err(|_| StatusCode::Failure)?;
 
             let mut files = Vec::new();
-            match this.storage.list_objects_v2(
-                input,
-                &this.session_context.principal.user_identity.credentials.access_key,
-                &this.session_context.principal.user_identity.credentials.secret_key
-            ).await {
+            match this
+                .storage
+                .list_objects_v2(
+                    input,
+                    &this.session_context.principal.user_identity.credentials.access_key,
+                    &this.session_context.principal.user_identity.credentials.secret_key,
+                )
+                .await
+            {
                 Ok(output) => {
                     if let Some(prefixes) = output.common_prefixes {
                         for p in prefixes {
@@ -660,15 +684,18 @@ where
                     .await
                     .map_err(|_| StatusCode::PermissionDenied)?;
 
-                this.storage.delete_object(
-                    &bucket,
-                    &key,
-                    &this.session_context.principal.user_identity.credentials.access_key,
-                    &this.session_context.principal.user_identity.credentials.secret_key
-                ).await.map_err(|e| {
-                    error!("SFTP REMOVE - failed to delete object: {}", e);
-                    StatusCode::Failure
-                })?;
+                this.storage
+                    .delete_object(
+                        &bucket,
+                        &key,
+                        &this.session_context.principal.user_identity.credentials.access_key,
+                        &this.session_context.principal.user_identity.credentials.secret_key,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("SFTP REMOVE - failed to delete object: {}", e);
+                        StatusCode::Failure
+                    })?;
 
                 Ok(Status {
                     id,
@@ -690,11 +717,15 @@ where
                     ..Default::default()
                 };
 
-                match this.storage.list_objects_v2(
-                    list_input,
-                    &this.session_context.principal.user_identity.credentials.access_key,
-                    &this.session_context.principal.user_identity.credentials.secret_key
-                ).await {
+                match this
+                    .storage
+                    .list_objects_v2(
+                        list_input,
+                        &this.session_context.principal.user_identity.credentials.access_key,
+                        &this.session_context.principal.user_identity.credentials.secret_key,
+                    )
+                    .await
+                {
                     Ok(output) => {
                         if let Some(objects) = output.contents
                             && !objects.is_empty()
@@ -714,11 +745,15 @@ where
                 }
 
                 // Bucket is empty, delete it
-                match this.storage.delete_bucket(
-                    &bucket,
-                    &this.session_context.principal.user_identity.credentials.access_key,
-                    &this.session_context.principal.user_identity.credentials.secret_key
-                ).await {
+                match this
+                    .storage
+                    .delete_bucket(
+                        &bucket,
+                        &this.session_context.principal.user_identity.credentials.access_key,
+                        &this.session_context.principal.user_identity.credentials.secret_key,
+                    )
+                    .await
+                {
                     Ok(_) => Ok(Status {
                         id,
                         status_code: StatusCode::Ok,
@@ -766,11 +801,15 @@ where
                     ..Default::default()
                 };
 
-                match this.storage.put_object(
-                    input,
-                    &this.session_context.principal.user_identity.credentials.access_key,
-                    &this.session_context.principal.user_identity.credentials.secret_key
-                ).await {
+                match this
+                    .storage
+                    .put_object(
+                        input,
+                        &this.session_context.principal.user_identity.credentials.access_key,
+                        &this.session_context.principal.user_identity.credentials.secret_key,
+                    )
+                    .await
+                {
                     Ok(_) => Ok(Status {
                         id,
                         status_code: StatusCode::Ok,
@@ -794,11 +833,15 @@ where
                     .await
                     .map_err(|_| StatusCode::PermissionDenied)?;
 
-                match this.storage.create_bucket(
-                    &bucket,
-                    &this.session_context.principal.user_identity.credentials.access_key,
-                    &this.session_context.principal.user_identity.credentials.secret_key
-                ).await {
+                match this
+                    .storage
+                    .create_bucket(
+                        &bucket,
+                        &this.session_context.principal.user_identity.credentials.access_key,
+                        &this.session_context.principal.user_identity.credentials.secret_key,
+                    )
+                    .await
+                {
                     Ok(_) => Ok(Status {
                         id,
                         status_code: StatusCode::Ok,

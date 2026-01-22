@@ -20,6 +20,15 @@ use s3s::{S3, S3Request, S3Result};
 use tokio_stream::Stream;
 use tracing::trace;
 
+/// Request parameters for creating S3 requests
+#[derive(Debug)]
+struct RequestParams<'a> {
+    bucket: Option<String>,
+    object: Option<String>,
+    access_key: &'a str,
+    secret_key: &'a str,
+}
+
 /// Protocol storage client that implements the StorageBackend trait
 #[derive(Clone, Debug)]
 pub struct ProtocolStorageClient {
@@ -39,28 +48,25 @@ impl ProtocolStorageClient {
         input: T,
         method: Method,
         uri: http::Uri,
-        bucket: Option<String>,
-        object: Option<String>,
-        access_key: &str,
-        secret_key: &str,
+        params: RequestParams<'_>,
     ) -> S3Result<S3Request<T>> {
         let mut extensions = http::Extensions::default();
 
         let is_owner = if let Some(global_cred) = rustfs_credentials::get_global_action_cred() {
-            access_key == global_cred.access_key
+            params.access_key == global_cred.access_key
         } else {
             false
         };
 
         let credentials = Some(s3s::auth::Credentials {
-            access_key: access_key.to_string(),
-            secret_key: secret_key.to_string().into(),
+            access_key: params.access_key.to_string(),
+            secret_key: params.secret_key.to_string().into(),
         });
 
         extensions.insert(crate::storage::access::ReqInfo {
             cred: Some(rustfs_credentials::Credentials {
-                access_key: access_key.to_string(),
-                secret_key: secret_key.to_string(),
+                access_key: params.access_key.to_string(),
+                secret_key: params.secret_key.to_string(),
                 session_token: String::new(),
                 expiration: None,
                 status: String::new(),
@@ -71,8 +77,8 @@ impl ProtocolStorageClient {
                 description: None,
             }),
             is_owner,
-            bucket,
-            object,
+            bucket: params.bucket,
+            object: params.object,
             version_id: None,
             region: None,
         });
@@ -96,31 +102,47 @@ impl ProtocolStorageClient {
 impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageClient {
     type Error = s3s::S3Error;
 
-    async fn get_object(&self, bucket: &str, key: &str, access_key: &str, secret_key: &str, start_pos: Option<u64>) -> Result<GetObjectOutput, Self::Error> {
-        trace!("Protocol storage client GetObject request: bucket={}, key={}, start_pos={:?}", bucket, key, start_pos);
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        access_key: &str,
+        secret_key: &str,
+        start_pos: Option<u64>,
+    ) -> Result<GetObjectOutput, Self::Error> {
+        trace!(
+            "Protocol storage client GetObject request: bucket={}, key={}, start_pos={:?}",
+            bucket, key, start_pos
+        );
 
-        let mut builder = GetObjectInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string());
+        let mut builder = GetObjectInput::builder().bucket(bucket.to_string()).key(key.to_string());
 
         // Add range header if start_pos is specified
         if let Some(start) = start_pos {
             let range = s3s::dto::Range::Int {
                 first: start,
-                last: None,  // Read to end of file
+                last: None, // Read to end of file
             };
             builder = builder.range(Some(range));
         }
 
-        let input = builder
-            .build()
-            .map_err(|e| {
-                s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build GetObjectInput: {}", e))
-            })?;
+        let input = builder.build().map_err(|e| {
+            s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build GetObjectInput: {}", e))
+        })?;
 
         let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
         let req = self
-            .create_request(input, Method::GET, uri, Some(bucket.to_string()), Some(key.to_string()), access_key, secret_key)
+            .create_request(
+                input,
+                Method::GET,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket.to_string()),
+                    object: Some(key.to_string()),
+                    access_key,
+                    secret_key,
+                },
+            )
             .await?;
 
         match self.fs.get_object(req).await {
@@ -129,7 +151,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
     }
 
-    async fn put_object(&self, input: PutObjectInput, access_key: &str, secret_key: &str) -> Result<PutObjectOutput, Self::Error> {
+    async fn put_object(
+        &self,
+        input: PutObjectInput,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<PutObjectOutput, Self::Error> {
         trace!("Protocol storage client PutObject request: bucket={}, key={:?}", input.bucket, input.key);
 
         let bucket = input.bucket.clone();
@@ -147,7 +174,17 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
 
         let req = self
-            .create_request(input, Method::PUT, uri, Some(bucket), Some(key), access_key, secret_key)
+            .create_request(
+                input,
+                Method::PUT,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket),
+                    object: Some(key),
+                    access_key,
+                    secret_key,
+                },
+            )
             .await?;
         let req = S3Request { headers, ..req };
 
@@ -157,7 +194,13 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
     }
 
-    async fn delete_object(&self, bucket: &str, key: &str, access_key: &str, secret_key: &str) -> Result<DeleteObjectOutput, Self::Error> {
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<DeleteObjectOutput, Self::Error> {
         trace!("Protocol storage client DeleteObject request: bucket={}, key={}", bucket, key);
 
         let input = DeleteObjectInput::builder()
@@ -170,7 +213,17 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
         let req = self
-            .create_request(input, Method::DELETE, uri, Some(bucket.to_string()), Some(key.to_string()), access_key, secret_key)
+            .create_request(
+                input,
+                Method::DELETE,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket.to_string()),
+                    object: Some(key.to_string()),
+                    access_key,
+                    secret_key,
+                },
+            )
             .await?;
 
         match self.fs.delete_object(req).await {
@@ -179,7 +232,13 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
     }
 
-    async fn head_object(&self, bucket: &str, key: &str, access_key: &str, secret_key: &str) -> Result<HeadObjectOutput, Self::Error> {
+    async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<HeadObjectOutput, Self::Error> {
         trace!("Protocol storage client HeadObject request: bucket={}, key={}", bucket, key);
 
         let input = HeadObjectInput::builder()
@@ -192,7 +251,17 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
         let req = self
-            .create_request(input, Method::HEAD, uri, Some(bucket.to_string()), Some(key.to_string()), access_key, secret_key)
+            .create_request(
+                input,
+                Method::HEAD,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket.to_string()),
+                    object: Some(key.to_string()),
+                    access_key,
+                    secret_key,
+                },
+            )
             .await?;
 
         match self.fs.head_object(req).await {
@@ -210,7 +279,17 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let uri: http::Uri = format!("/{}", bucket).parse().unwrap_or_default();
         let req = self
-            .create_request(input, Method::HEAD, uri, Some(bucket.to_string()), None, access_key, secret_key)
+            .create_request(
+                input,
+                Method::HEAD,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket.to_string()),
+                    object: None,
+                    access_key,
+                    secret_key,
+                },
+            )
             .await?;
 
         match self.fs.head_bucket(req).await {
@@ -219,12 +298,29 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
     }
 
-    async fn list_objects_v2(&self, input: ListObjectsV2Input, access_key: &str, secret_key: &str) -> Result<ListObjectsV2Output, Self::Error> {
+    async fn list_objects_v2(
+        &self,
+        input: ListObjectsV2Input,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<ListObjectsV2Output, Self::Error> {
         trace!("Protocol storage client ListObjectsV2 request: bucket={}", input.bucket);
 
         let bucket = input.bucket.clone();
         let uri: http::Uri = format!("/{}?list-type=2", bucket).parse().unwrap_or_default();
-        let req = self.create_request(input, Method::GET, uri, Some(bucket), None, access_key, secret_key).await?;
+        let req = self
+            .create_request(
+                input,
+                Method::GET,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket),
+                    object: None,
+                    access_key,
+                    secret_key,
+                },
+            )
+            .await?;
 
         match self.fs.list_objects_v2(req).await {
             Ok(response) => Ok(response.output),
@@ -240,7 +336,17 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         })?;
 
         let req = self
-            .create_request(input, Method::GET, http::Uri::from_static("/"), None, None, access_key, secret_key)
+            .create_request(
+                input,
+                Method::GET,
+                http::Uri::from_static("/"),
+                RequestParams {
+                    bucket: None,
+                    object: None,
+                    access_key,
+                    secret_key,
+                },
+            )
             .await?;
 
         match self.fs.list_buckets(req).await {
@@ -258,7 +364,17 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let uri: http::Uri = format!("/{}", bucket).parse().unwrap_or_default();
         let req = self
-            .create_request(input, Method::PUT, uri, Some(bucket.to_string()), None, access_key, secret_key)
+            .create_request(
+                input,
+                Method::PUT,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket.to_string()),
+                    object: None,
+                    access_key,
+                    secret_key,
+                },
+            )
             .await?;
 
         match self.fs.create_bucket(req).await {
@@ -276,7 +392,17 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let uri: http::Uri = format!("/{}", bucket).parse().unwrap_or_default();
         let req = self
-            .create_request(input, Method::DELETE, uri, Some(bucket.to_string()), None, access_key, secret_key)
+            .create_request(
+                input,
+                Method::DELETE,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket.to_string()),
+                    object: None,
+                    access_key,
+                    secret_key,
+                },
+            )
             .await?;
 
         match self.fs.delete_bucket(req).await {

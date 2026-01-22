@@ -40,6 +40,7 @@ pub mod network {
 }
 
 /// SFTP constants
+#[cfg(feature = "sftp")]
 pub mod sftp {
     pub const INITIAL_HANDLE_ID: u32 = 1;
     pub const HANDLE_ID_PREFIX: &str = "handle_";
@@ -57,6 +58,7 @@ pub mod sftp {
 }
 
 /// FTPS constants
+#[cfg(feature = "ftps")]
 pub mod ftps {
     pub const PORT_RANGE_SEPARATOR: &str = "-";
     pub const PASSIVE_PORTS_PART_COUNT: usize = 2;
@@ -65,9 +67,12 @@ pub mod ftps {
 /// Default configuration values
 pub mod defaults {
     /// Default protocol addresses
+    #[cfg(feature = "ftps")]
     pub const DEFAULT_FTPS_ADDRESS: &str = "0.0.0.0:8021";
+    #[cfg(feature = "sftp")]
     pub const DEFAULT_SFTP_ADDRESS: &str = "0.0.0.0:8022";
 
     /// Default FTPS passive port range
+    #[cfg(feature = "ftps")]
     pub const DEFAULT_FTPS_PASSIVE_PORTS: &str = "40000-50000";
 }
