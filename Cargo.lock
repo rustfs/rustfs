@@ -7652,6 +7652,7 @@ dependencies = [
  "rustfs-rio",
  "rustfs-s3select-api",
  "rustfs-s3select-query",
+ "rustfs-scanner",
  "rustfs-targets",
  "rustfs-utils",
  "rustfs-zip",
@@ -8194,6 +8195,39 @@ dependencies = [
  "snafu 0.8.9",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-scanner"
+version = "0.0.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "http 1.4.0",
+ "path-clean",
+ "rand 0.10.0-rc.6",
+ "rmp-serde",
+ "rustfs-common",
+ "rustfs-config",
+ "rustfs-ecstore",
+ "rustfs-filemeta",
+ "rustfs-madmin",
+ "rustfs-utils",
+ "s3s",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "thiserror 2.0.17",
+ "time",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
