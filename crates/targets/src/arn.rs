@@ -129,6 +129,8 @@ impl ARN {
     }
 
     /// Parsing ARN from string
+    /// Only accepts ARNs with the RustFS prefix: "arn:rustfs:sqs:"
+    /// Format: arn:rustfs:sqs:{region}:{id}:{name}
     pub fn parse(s: &str) -> Result<Self, TargetError> {
         if !s.starts_with(ARN_PREFIX) {
             return Err(TargetError::InvalidARN(s.to_string()));

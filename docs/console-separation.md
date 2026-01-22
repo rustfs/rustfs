@@ -47,12 +47,7 @@ RustFS implements complete separation between the console web interface and the 
 
 ```
 Browser → Console (9001) → API Endpoint (9000) → Storage Backend
-                ↓
-        External Address Configuration
-        (RUSTFS_EXTERNAL_ADDRESS)
 ```
-
-The console communicates with the API endpoint using the `RUSTFS_EXTERNAL_ADDRESS` parameter, which is critical for Docker deployments with port mapping.
 
 ## Quick Start
 
@@ -74,7 +69,6 @@ rustfs /data/volume
 docker run -d \
   --name rustfs \
   -p 9020:9000 -p 9021:9001 \
-  -e RUSTFS_EXTERNAL_ADDRESS=":9020" \
   rustfs/rustfs:latest
 
 # Access points:
@@ -103,7 +97,6 @@ Use our enhanced deployment script for production-ready setup:
 | `address` | `RUSTFS_ADDRESS` | `:9000` | S3 API endpoint bind address |
 | `console_address` | `RUSTFS_CONSOLE_ADDRESS` | `:9001` | Console service bind address |
 | `console_enable` | `RUSTFS_CONSOLE_ENABLE` | `true` | Enable/disable console service |
-| `external_address` | `RUSTFS_EXTERNAL_ADDRESS` | `:9000` | External endpoint address for console→API communication |
 
 ### CORS Configuration
 
@@ -130,7 +123,6 @@ Use our enhanced deployment script for production-ready setup:
 
 ### Important Notes
 
-- **External Address**: Critical for Docker deployments. Must match the host-mapped API port.
 - **TLS Configuration**: Console uses shared TLS certificates from `RUSTFS_TLS_PATH` (no separate cert config needed).
 - **Environment Priority**: Console security settings are read directly from environment variables.
 
@@ -157,7 +149,6 @@ docker run -d \
   --name rustfs-basic \
   -p 9020:9000 \  # API: host 9020 → container 9000
   -p 9021:9001 \  # Console: host 9021 → container 9001
-  -e RUSTFS_EXTERNAL_ADDRESS=":9020" \  # Critical: must match host API port
   -e RUSTFS_CORS_ALLOWED_ORIGINS="http://localhost:9021" \
   -v rustfs-data:/data \
   rustfs/rustfs:latest
@@ -223,12 +214,10 @@ The compose configuration provides:
 docker run -d \
   --name rustfs-dev \
   -p 9000:9000 -p 9001:9001 \
-  -e RUSTFS_EXTERNAL_ADDRESS=":9000" \
   -e RUSTFS_CORS_ALLOWED_ORIGINS="*" \
   -e RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
   -e RUSTFS_ACCESS_KEY="dev-admin" \
   -e RUSTFS_SECRET_KEY="dev-secret" \
-  -e RUST_LOG="debug" \
   -v rustfs-dev-data:/data \
   rustfs/rustfs:latest
 ```
@@ -319,8 +308,6 @@ spec:
           value: "0.0.0.0:9000"
         - name: RUSTFS_CONSOLE_ADDRESS
           value: "0.0.0.0:9001"
-        - name: RUSTFS_EXTERNAL_ADDRESS
-          value: ":9000"
         - name: RUSTFS_CORS_ALLOWED_ORIGINS
           value: "*"
         - name: RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS
@@ -766,19 +753,11 @@ docker run -d \
 
 **Symptoms**: Console UI shows connection errors, "Failed to load data" messages.
 
-**Cause**: Incorrect `RUSTFS_EXTERNAL_ADDRESS` configuration.
-
 **Solutions**:
 
 ```bash
-# For Docker with port mapping 9020:9000 (API) and 9021:9001 (Console)
-RUSTFS_EXTERNAL_ADDRESS=":9020"  # Must match the mapped host API port
-
-# For direct access without port mapping
-RUSTFS_EXTERNAL_ADDRESS=":9000"  # Must match the API service port
-
 # For Kubernetes or complex networking
-RUSTFS_EXTERNAL_ADDRESS="http://rustfs-service:9000"  # Use service name
+# Use service name or proper endpoint URL
 ```
 
 **Debug steps**:
@@ -880,13 +859,13 @@ docker run -v /host/path/to/certs:/certs:ro rustfs/rustfs:latest
 docker logs rustfs-container
 
 # Enable debug logging
-docker run -e RUST_LOG=debug rustfs/rustfs:latest
+docker run rustfs/rustfs:latest
 
 # Check configuration
 docker exec rustfs-container env | grep RUSTFS
 
 # Test configuration outside Docker
-RUST_LOG=debug rustfs --help
+rustfs --help
 ```
 
 #### 6. Health Check Failures
@@ -1023,7 +1002,6 @@ RUSTFS_ADDRESS=":9000"
 # New separated configuration
 RUSTFS_ADDRESS=":9000"           # API port (unchanged)
 RUSTFS_CONSOLE_ADDRESS=":9001"   # Console port (new)
-RUSTFS_EXTERNAL_ADDRESS=":9000"  # For console→API communication
 ```
 
 ##### 2. Update Firewall Rules
@@ -1047,7 +1025,6 @@ docker run -p 9000:9000 rustfs/rustfs:legacy
 docker run \
   -p 9000:9000 \    # API port
   -p 9001:9001 \    # Console port  
-  -e RUSTFS_EXTERNAL_ADDRESS=":9000" \
   rustfs/rustfs:latest
 ```
 
@@ -1080,7 +1057,6 @@ docker run -d \
   --name rustfs-new \
   -p 9000:9000 \
   -p 9001:9001 \
-  -e RUSTFS_EXTERNAL_ADDRESS=":9000" \
   -e RUSTFS_CORS_ALLOWED_ORIGINS="http://localhost:9001" \
   -v rustfs-data:/data \
   rustfs/rustfs:latest
@@ -1142,7 +1118,6 @@ docker run rustfs/rustfs:legacy-tag
 ```bash
 # New variables (add these)
 export RUSTFS_CONSOLE_ADDRESS=":9001"
-export RUSTFS_EXTERNAL_ADDRESS=":9000"
 export RUSTFS_CORS_ALLOWED_ORIGINS="*"
 export RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*"
 
@@ -1259,9 +1234,6 @@ aws s3 ls --endpoint-url http://localhost:9000
    # Allow all origins for development
    RUSTFS_CORS_ALLOWED_ORIGINS="*"
    RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*"
-   
-   # Enable debug logging
-   RUST_LOG="debug"
    ```
 
 2. **Hot Reload Support**

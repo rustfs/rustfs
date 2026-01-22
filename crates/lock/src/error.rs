@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::types::LockId;
+use crate::LockId;
 use std::time::Duration;
 use thiserror::Error;
 
