@@ -2833,7 +2833,7 @@ impl SetDisks {
                             return Ok((result, None));
                         }
 
-                        let mut cannot_heal = !latest_meta.deleted && disks_to_heal_count > latest_meta.erasure.parity_blocks;
+                        let mut cannot_heal = !latest_meta.deleted && meta_to_heal_count > latest_meta.erasure.parity_blocks;
                         if cannot_heal && quorum_etag.is_some() {
                             cannot_heal = false;
                         }
