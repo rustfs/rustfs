@@ -32,7 +32,7 @@ workspace = true
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 uuid = { workspace = true, features = ["serde"] }
-chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }

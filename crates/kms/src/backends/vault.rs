@@ -21,6 +21,8 @@ use crate::error::{KmsError, Result};
 use crate::types::*;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
+use jiff::Zoned;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -49,7 +51,7 @@ struct VaultKeyData {
     /// Key usage type
     usage: KeyUsage,
     /// Key creation timestamp
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: Zoned,
     /// Key status
     status: KeyStatus,
     /// Key version
@@ -217,9 +219,9 @@ impl VaultKmsClient {
         let key_data = VaultKeyData {
             algorithm: existing_key_data.algorithm.clone(),
             usage: request.key_usage.clone(),
-            created_at: existing_key_data.created_at,
-            status: existing_key_data.status,
-            version: existing_key_data.version,
+            created_at: Zoned::now(),
+            status: KeyStatus::Active,
+            version: 1,
             description: request.description.clone(),
             metadata: existing_key_data.metadata.clone(),
             tags: request.tags.clone(),
@@ -306,7 +308,7 @@ impl KmsClient for VaultKmsClient {
             encrypted_key: encrypted_key.clone(),
             nonce,
             encryption_context: request.encryption_context.clone(),
-            created_at: chrono::Utc::now(),
+            created_at: Zoned::now(),
         };
 
         // Serialize the envelope as the ciphertext
@@ -391,7 +393,7 @@ impl KmsClient for VaultKmsClient {
         let key_data = VaultKeyData {
             algorithm: algorithm.to_string(),
             usage: KeyUsage::EncryptDecrypt,
-            created_at: chrono::Utc::now(),
+            created_at: Zoned::now(),
             status: KeyStatus::Active,
             version: 1,
             description: None,
@@ -547,7 +549,7 @@ impl KmsClient for VaultKmsClient {
             description: None, // Rotate preserves existing description (would need key lookup)
             metadata: key_data.metadata,
             created_at: key_data.created_at,
-            rotated_at: Some(chrono::Utc::now()),
+            rotated_at: Some(Zoned::now()),
             created_by: None,
         };
 
@@ -638,7 +640,7 @@ impl KmsBackend for VaultKmsBackend {
             key_state: KeyState::Enabled,
             key_usage: request.key_usage,
             description: request.description,
-            creation_date: chrono::Utc::now(),
+            creation_date: Zoned::now(),
             deletion_date: None,
             origin: "VAULT".to_string(),
             key_manager: "VAULT".to_string(),
@@ -753,7 +755,7 @@ impl KmsBackend for VaultKmsBackend {
             } else {
                 // For non-pending keys, mark as PendingDeletion
                 key_metadata.key_state = KeyState::PendingDeletion;
-                key_metadata.deletion_date = Some(chrono::Utc::now());
+                key_metadata.deletion_date = Some(Zoned::now());
 
                 // Update the key metadata in Vault storage to reflect the new state
                 self.update_key_metadata_in_storage(key_id, &key_metadata).await?;
@@ -769,14 +771,14 @@ impl KmsBackend for VaultKmsBackend {
                 ));
             }
 
-            let deletion_date = chrono::Utc::now() + chrono::Duration::days(days as i64);
+            let deletion_date = Zoned::now() + jiff::Span::new().days(days as i64);
             key_metadata.key_state = KeyState::PendingDeletion;
-            key_metadata.deletion_date = Some(deletion_date);
+            key_metadata.deletion_date = Some(deletion_date.clone());
 
             // Update the key metadata in Vault storage to reflect the new state
             self.update_key_metadata_in_storage(key_id, &key_metadata).await?;
 
-            Some(deletion_date.to_rfc3339())
+            Some(deletion_date.to_string())
         };
 
         Ok(DeleteKeyResponse {

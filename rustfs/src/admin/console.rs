@@ -555,7 +555,7 @@ async fn health_check(method: Method) -> Response {
             let body_json = json!({
                 "status": health_status,
                 "service": "rustfs-console",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": jiff::Zoned::now().to_string(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "details": details,
                 "uptime": std::time::SystemTime::now()

@@ -38,7 +38,6 @@ use crate::storage::{
 };
 // base64 imports moved to sse module
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use datafusion::arrow::{
     csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
@@ -2993,7 +2992,7 @@ impl S3 for FS {
         // Per S3 API spec, this header should be present in HEAD object response when tags exist
         if tag_count > 0 {
             let header_name = http::HeaderName::from_static(AMZ_TAG_COUNT);
-            if let Ok(header_value) = tag_count.to_string().parse::<http::HeaderValue>() {
+            if let Ok(header_value) = tag_count.to_string().parse::<HeaderValue>() {
                 response.headers.insert(header_name, header_value);
             } else {
                 warn!("Failed to parse x-amz-tagging-count header value, skipping");
@@ -3653,9 +3652,7 @@ impl S3 for FS {
 
         if dsc.replicate_any() {
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
-            let now: DateTime<Utc> = Utc::now();
-            let formatted_time = now.to_rfc3339();
-            opts.user_defined.insert(k, formatted_time);
+            opts.user_defined.insert(k, jiff::Zoned::now().to_string());
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
             opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
         }
@@ -7365,7 +7362,7 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::QueueConfiguration {
+            Some(vec![QueueConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 queue_arn: invalid_arn.to_string(),
                 filter: None,
@@ -7391,7 +7388,7 @@ mod tests {
 
         let result = process_topic_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::TopicConfiguration {
+            Some(vec![TopicConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 topic_arn: invalid_arn.to_string(),
                 filter: None,
@@ -7417,7 +7414,7 @@ mod tests {
 
         let result = process_lambda_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::LambdaFunctionConfiguration {
+            Some(vec![LambdaFunctionConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 lambda_function_arn: invalid_arn.to_string(),
                 filter: None,
@@ -7443,7 +7440,7 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::QueueConfiguration {
+            Some(vec![QueueConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 queue_arn: valid_arn.to_string(),
                 filter: None,

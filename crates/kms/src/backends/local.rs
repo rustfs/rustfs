@@ -25,6 +25,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
 };
 use async_trait::async_trait;
+use jiff::Zoned;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -55,13 +56,25 @@ struct StoredMasterKey {
     status: KeyStatus,
     description: Option<String>,
     metadata: HashMap<String, String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    rotated_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: Zoned,
+    rotated_at: Option<Zoned>,
     created_by: Option<String>,
     /// Encrypted key material (32 bytes encoded in base64 for AES-256)
     encrypted_key_material: String,
     /// Nonce used for encryption
     nonce: Vec<u8>,
+}
+
+/// Data key envelope stored with each data key generation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataKeyEnvelope {
+    key_id: String,
+    master_key_id: String,
+    key_spec: String,
+    encrypted_key: Vec<u8>,
+    nonce: Vec<u8>,
+    encryption_context: HashMap<String, String>,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl LocalKmsClient {
@@ -192,8 +205,8 @@ impl LocalKmsClient {
             status: master_key.status.clone(),
             description: master_key.description.clone(),
             metadata: master_key.metadata.clone(),
-            created_at: master_key.created_at,
-            rotated_at: master_key.rotated_at,
+            created_at: master_key.created_at.clone(),
+            rotated_at: master_key.rotated_at.clone(),
             created_by: master_key.created_by.clone(),
             encrypted_key_material,
             nonce,
@@ -266,7 +279,7 @@ impl KmsClient for LocalKmsClient {
             encrypted_key: encrypted_key.clone(),
             nonce,
             encryption_context: request.encryption_context.clone(),
-            created_at: chrono::Utc::now(),
+            created_at: Zoned::now(),
         };
 
         // Serialize the envelope as the ciphertext
@@ -514,7 +527,7 @@ impl KmsClient for LocalKmsClient {
 
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.version += 1;
-        master_key.rotated_at = Some(chrono::Utc::now());
+        master_key.rotated_at = Some(Zoned::now());
 
         // Generate new key material
         let key_material = generate_key_material(&master_key.algorithm)?;
@@ -602,7 +615,7 @@ impl KmsBackend for LocalKmsBackend {
             key_state: KeyState::Enabled,
             key_usage: request.key_usage,
             description: request.description,
-            creation_date: chrono::Utc::now(),
+            creation_date: Zoned::now(),
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
@@ -722,7 +735,7 @@ impl KmsBackend for LocalKmsBackend {
                 key_usage: master_key.usage,
                 key_state: KeyState::PendingDeletion, // AWS KMS compatibility
                 creation_date: master_key.created_at,
-                deletion_date: Some(chrono::Utc::now()),
+                deletion_date: Some(Zoned::now()),
                 key_manager: "CUSTOMER".to_string(),
                 origin: "AWS_KMS".to_string(),
                 tags: master_key.metadata,
@@ -740,10 +753,10 @@ impl KmsBackend for LocalKmsBackend {
                 return Err(KmsError::invalid_parameter("pending_window_in_days must be between 7 and 30".to_string()));
             }
 
-            let deletion_date = chrono::Utc::now() + chrono::Duration::days(days as i64);
+            let deletion_date = Zoned::now() + jiff::Span::new().days(days as i64);
             master_key.status = KeyStatus::PendingDeletion;
 
-            (Some(deletion_date.to_rfc3339()), Some(deletion_date))
+            (Some(deletion_date.to_string()), Some(deletion_date))
         };
 
         // Save the updated key to disk - preserve existing key material!
