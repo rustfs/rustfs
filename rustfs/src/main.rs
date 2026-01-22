@@ -71,7 +71,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn main() -> Result<()> {
+fn main() {
     let runtime = server::get_tokio_runtime_builder()
         .build()
         .expect("Failed to build Tokio runtime");
@@ -79,8 +79,8 @@ fn main() -> Result<()> {
     if let Err(ref e) = result {
         eprintln!("{} Server encountered an error and is shutting down: {}", jiff::Zoned::now(), e);
         error!("Server encountered an error and is shutting down: {}", e);
+        std::process::exit(1);
     }
-    result
 }
 async fn async_main() -> Result<()> {
     // Parse the obtained parameters
