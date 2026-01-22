@@ -34,7 +34,6 @@ use crate::storage::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use datafusion::arrow::{
     csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
@@ -319,7 +318,7 @@ async fn create_managed_encryption_material(
         iv: data_key.nonce.to_vec(),
         tag: None,
         encryption_context: context.encryption_context.clone(),
-        encrypted_at: Utc::now(),
+        encrypted_at: jiff::Zoned::now(),
         original_size: if original_size >= 0 { original_size as u64 } else { 0 },
         encrypted_data_key,
     };
@@ -4105,9 +4104,7 @@ impl S3 for FS {
 
         if dsc.replicate_any() {
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
-            let now: DateTime<Utc> = Utc::now();
-            let formatted_time = now.to_rfc3339();
-            opts.user_defined.insert(k, formatted_time);
+            opts.user_defined.insert(k, jiff::Zoned::now().to_string());
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
             opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
         }
