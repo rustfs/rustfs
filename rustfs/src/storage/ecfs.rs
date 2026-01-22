@@ -4010,6 +4010,12 @@ impl S3 for FS {
             }
 
             opts.want_checksum = hrd.checksum();
+            opts.user_defined.insert(
+                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
+                CompressionAlgorithm::default().to_string(),
+            );
+            opts.user_defined
+                .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
             size = HashReader::SIZE_PRESERVE_LAYER;
