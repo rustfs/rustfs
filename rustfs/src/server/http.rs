@@ -169,7 +169,7 @@ pub async fn start_http_server(
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("{protocol}://{local_ip_str}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
-    let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
     if opt.console_enable {
         admin::console::init_console_cfg(local_ip, server_port);
 

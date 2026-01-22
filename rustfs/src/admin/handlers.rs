@@ -132,7 +132,7 @@ impl Operation for HealthCheckHandler {
         let health_info = json!({
             "status": "ok",
             "service": "rustfs-endpoint",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": jiff::Zoned::now().to_string(),
             "version": env!("CARGO_PKG_VERSION")
         });
 

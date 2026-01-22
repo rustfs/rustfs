@@ -99,6 +99,7 @@ rustls-pemfile = { workspace = true }
 
 # Time and Date
 chrono = { workspace = true }
+jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 
 # Utilities and Tools
