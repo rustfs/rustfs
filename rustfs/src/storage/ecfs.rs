@@ -3359,7 +3359,7 @@ impl S3 for FS {
         // Per S3 API spec, this header should be present in HEAD object response when tags exist
         if tag_count > 0 {
             let header_name = http::HeaderName::from_static(AMZ_TAG_COUNT);
-            if let Ok(header_value) = tag_count.to_string().parse::<http::HeaderValue>() {
+            if let Ok(header_value) = tag_count.to_string().parse::<HeaderValue>() {
                 response.headers.insert(header_name, header_value);
             } else {
                 warn!("Failed to parse x-amz-tagging-count header value, skipping");
@@ -7804,7 +7804,7 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::QueueConfiguration {
+            Some(vec![QueueConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 queue_arn: invalid_arn.to_string(),
                 filter: None,
@@ -7830,7 +7830,7 @@ mod tests {
 
         let result = process_topic_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::TopicConfiguration {
+            Some(vec![TopicConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 topic_arn: invalid_arn.to_string(),
                 filter: None,
@@ -7856,7 +7856,7 @@ mod tests {
 
         let result = process_lambda_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::LambdaFunctionConfiguration {
+            Some(vec![LambdaFunctionConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 lambda_function_arn: invalid_arn.to_string(),
                 filter: None,
@@ -7882,7 +7882,7 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::QueueConfiguration {
+            Some(vec![QueueConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 queue_arn: valid_arn.to_string(),
                 filter: None,

@@ -55,6 +55,7 @@ use rustfs_policy::policy::action::AdminAction;
 use rustfs_policy::policy::action::S3Action;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_utils::path::path_join;
+use rustfs_utils::{get_env_bool, get_env_usize};
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
@@ -1208,7 +1209,7 @@ impl Operation for ListRemoteTargetHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header));
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header))
     }
 }
 
