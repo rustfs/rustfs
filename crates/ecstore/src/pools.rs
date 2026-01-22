@@ -442,11 +442,11 @@ impl PoolMeta {
     }
 }
 
-fn path2_bucket_object(name: &str) -> (String, String) {
+pub fn path2_bucket_object(name: &str) -> (String, String) {
     path2_bucket_object_with_base_path("", name)
 }
 
-fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
+pub fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
     // Trim the base path and leading slash
     let trimmed_path = path
         .strip_prefix(base_path)
@@ -454,7 +454,9 @@ fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, S
         .strip_prefix(SLASH_SEPARATOR_STR)
         .unwrap_or(path);
     // Find the position of the first '/'
-    let pos = trimmed_path.find(SLASH_SEPARATOR_STR).unwrap_or(trimmed_path.len());
+    let Some(pos) = trimmed_path.find(SLASH_SEPARATOR_STR) else {
+        return (trimmed_path.to_string(), "".to_string());
+    };
     // Split into bucket and prefix
     let bucket = &trimmed_path[0..pos];
     let prefix = &trimmed_path[pos + 1..]; // +1 to skip the '/' character if it exists

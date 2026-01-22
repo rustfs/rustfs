@@ -23,6 +23,7 @@ use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
@@ -1094,8 +1095,7 @@ pub struct TargetClient {
 
 impl TargetClient {
     pub fn to_url(&self) -> Url {
-        let scheme = if self.secure { "https" } else { "http" };
-        Url::parse(&format!("{scheme}://{}", self.endpoint)).unwrap()
+        Url::parse(&self.endpoint).unwrap()
     }
 
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, S3ClientError> {
@@ -1104,9 +1104,17 @@ impl TargetClient {
             Err(e) => match e {
                 SdkError::ServiceError(oe) => match oe.into_err() {
                     HeadBucketError::NotFound(_) => Ok(false),
-                    other => Err(S3ClientError::new(format!(
-                        "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{other:?}"
-                    ))),
+                    other => {
+                        warn!(
+                            "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{:?}",
+                            other
+                        );
+                        let message = other.meta().meta();
+                        Err(S3ClientError::new(format!(
+                            "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{:?}",
+                            message
+                        )))
+                    }
                 },
                 SdkError::DispatchFailure(e) => Err(S3ClientError::new(format!(
                     "failed to dispatch bucket exists for bucket:{bucket} error:{e:?}"
@@ -1154,9 +1162,16 @@ impl TargetClient {
         body: ByteStream,
         opts: &PutObjectOptions,
     ) -> Result<(), S3ClientError> {
-        let headers = opts.header();
+        let mut headers = opts.header();
 
         let builder = self.client.put_object();
+
+        let version_id = opts.internal.source_version_id.clone();
+        if !version_id.is_empty()
+            && let Ok(header_value) = HeaderValue::from_str(&version_id)
+        {
+            headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
+        }
 
         match builder
             .bucket(bucket)
@@ -1185,9 +1200,33 @@ impl TargetClient {
         &self,
         bucket: &str,
         object: &str,
-        _opts: &PutObjectOptions,
+        opts: &PutObjectOptions,
     ) -> Result<String, S3ClientError> {
-        match self.client.create_multipart_upload().bucket(bucket).key(object).send().await {
+        let mut headers = HeaderMap::new();
+        let version_id = opts.internal.source_version_id.clone();
+        if !version_id.is_empty()
+            && let Ok(header_value) = HeaderValue::from_str(&version_id)
+        {
+            headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
+        }
+
+        match self
+            .client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(object)
+            .customize()
+            .map_request(move |mut req| {
+                for (k, v) in headers.clone().into_iter() {
+                    let key_str = k.unwrap().as_str().to_string();
+                    let value_str = v.to_str().unwrap_or("").to_string();
+                    req.headers_mut().insert(key_str, value_str);
+                }
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+        {
             Ok(res) => Ok(res.upload_id.unwrap_or_default()),
             Err(e) => Err(e.into()),
         }
