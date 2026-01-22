@@ -3803,8 +3803,8 @@ impl S3 for FS {
             sse_customer_key_md5,
             ssekms_key_id,
             content_md5,
-            if_match,
-            if_none_match,
+            
+            
             ..
         } = input;
 
@@ -3835,46 +3835,6 @@ impl S3 for FS {
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
-                }
-            }
-        }
-
-        if if_match.is_some() || if_none_match.is_some() {
-            let Some(store) = new_object_layer_fn() else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-            };
-
-            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-                Ok(info) => {
-                    if !info.delete_marker {
-                        if let Some(ifmatch) = if_match
-                            && let Some(strong_etag) = ifmatch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                        if let Some(ifnonematch) = if_none_match
-                            && let Some(strong_etag) = ifnonematch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                    }
-                }
-                Err(err) => {
-                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                        return Err(ApiError::from(err).into());
-                    }
-
-                    if if_match.is_some() && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
-                        return Err(ApiError::from(err).into());
-                    }
                 }
             }
         }
@@ -4939,50 +4899,10 @@ impl S3 for FS {
             bucket,
             key,
             upload_id,
-            if_match,
-            if_none_match,
+            
+            
             ..
         } = input;
-
-        if if_match.is_some() || if_none_match.is_some() {
-            let Some(store) = new_object_layer_fn() else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-            };
-
-            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-                Ok(info) => {
-                    if !info.delete_marker {
-                        if let Some(ifmatch) = if_match
-                            && let Some(strong_etag) = ifmatch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                        if let Some(ifnonematch) = if_none_match
-                            && let Some(strong_etag) = ifnonematch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                    }
-                }
-                Err(err) => {
-                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                        return Err(ApiError::from(err).into());
-                    }
-
-                    if if_match.is_some() && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
-                        return Err(ApiError::from(err).into());
-                    }
-                }
-            }
-        }
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 

@@ -2286,20 +2286,10 @@ impl StorageAPI for ECStore {
 
         let mut futures = Vec::with_capacity(self.pools.len());
         for pool in self.pools.iter() {
-            //TODO: IsSuspended
+            if self.is_suspended(pool.pool_idx).await {
+                continue;
+            }
             futures.push(pool.heal_object(bucket, &object, version_id, opts));
-            // futures.push(async move {
-            // match pool.heal_object(bucket, &object, version_id, opts).await {
-            //     Ok((mut result, err)) => {
-            //         result.object = utils::path::decode_dir_object(&result.object);
-            //         results.write().await.insert(idx, result);
-            //         errs.write().await[idx] = err;
-            //     }
-            //     Err(err) => {
-            //         errs.write().await[idx] = Some(err);
-            //     }
-            // }
-            // });
         }
         let results = join_all(futures).await;
 

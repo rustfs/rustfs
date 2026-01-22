@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::{Instant, interval};
 
@@ -23,6 +24,55 @@ use crate::fast_lock::{
     shard::LockShard,
     types::{BatchLockRequest, BatchLockResult, LockConfig, LockResult, ObjectKey, ObjectLockInfo, ObjectLockRequest},
 };
+
+#[derive(Debug)]
+pub struct NamespaceLockGuard<'a> {
+    key: ObjectKey,
+    owner: Arc<str>,
+    shard: &'a Arc<LockShard>,
+}
+
+impl<'a> NamespaceLockGuard<'a> {
+    pub fn new(key: ObjectKey, owner: impl Into<Arc<str>>, shard: &'a Arc<LockShard>) -> Self {
+        Self {
+            key,
+            owner: owner.into(),
+            shard,
+        }
+    }
+}
+
+impl<'a> NamespaceLockGuard<'a> {
+    pub async fn get_write_lock(&self, timeout: Duration) -> Result<FastLockGuard, LockResult> {
+        let request = ObjectLockRequest::new_write(self.key.bucket.clone(), self.key.object.clone(), self.owner.clone())
+            .with_acquire_timeout(timeout)
+            .with_lock_timeout(timeout);
+        match self.shard.acquire_lock(&request).await {
+            Ok(()) => {
+                let guard = FastLockGuard::new(request.key, request.mode, request.owner, self.shard.clone());
+                // Register guard to prevent premature cleanup
+                self.shard.register_guard(guard.guard_id());
+                Ok(guard)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn get_read_lock(&self, timeout: Duration) -> Result<FastLockGuard, LockResult> {
+        let request = ObjectLockRequest::new_read(self.key.bucket.clone(), self.key.object.clone(), self.owner.clone())
+            .with_acquire_timeout(timeout)
+            .with_lock_timeout(timeout);
+        match self.shard.acquire_lock(&request).await {
+            Ok(()) => {
+                let guard = FastLockGuard::new(request.key, request.mode, request.owner, self.shard.clone());
+                // Register guard to prevent premature cleanup
+                self.shard.register_guard(guard.guard_id());
+                Ok(guard)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
 
 /// High-performance object lock manager
 #[derive(Debug)]
@@ -60,6 +110,17 @@ impl FastObjectLockManager {
         // Start background cleanup task
         manager.start_cleanup_task();
         manager
+    }
+
+    pub fn new_ns_lock<'a>(
+        &'a self,
+        bucket: impl Into<Arc<str>>,
+        object: impl Into<Arc<str>>,
+        owner: impl Into<Arc<str>>,
+    ) -> NamespaceLockGuard<'a> {
+        let key = ObjectKey::new(bucket.into(), object.into());
+        let shard = self.get_shard(&key);
+        NamespaceLockGuard::new(key, owner.into(), shard)
     }
 
     /// Acquire object lock
