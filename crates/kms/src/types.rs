@@ -14,7 +14,7 @@
 
 //! Core type definitions for KMS operations
 
-use jiff::{Timestamp, Zoned};
+use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
