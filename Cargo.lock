@@ -4916,6 +4916,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "jiff"
+version = "0.2.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e67e8da4c49d6d9909fe03361f9b620f58898859f5c7aded68351e85e71ecf50"
+dependencies = [
+ "jiff-static",
+ "jiff-tzdb-platform",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0c84ee7f197eca9a86c6fd6cb771e55eb991632f15f2bc3ca6ec838929e6e78"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68971ebff725b9e2ca27a601c5eb38a4c5d64422c4cbab0c535f248087eda5c2"
+
+[[package]]
+name = "jiff-tzdb-platform"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
+dependencies = [
+ "jiff-tzdb",
+]
+
+[[package]]
 name = "jobserver"
 version = "0.1.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6595,6 +6636,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f89776e4d69bb58bc6993e99ffa1d11f228b839984854c7daeb5d37f87cbe950"
 
 [[package]]
+name = "portable-atomic-util"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8a2f0d8d040d7848a709caf78912debcc3f33ee4b3cac47d73d1e1069e83507"
+dependencies = [
+ "portable-atomic",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7617,6 +7667,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jemalloc_pprof",
+ "jiff",
  "libc",
  "libsystemd",
  "libunftp",
@@ -7652,6 +7703,7 @@ dependencies = [
  "rustfs-rio",
  "rustfs-s3select-api",
  "rustfs-s3select-query",
+ "rustfs-scanner",
  "rustfs-targets",
  "rustfs-utils",
  "rustfs-zip",
@@ -7958,7 +8010,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chacha20poly1305",
- "chrono",
+ "jiff",
  "md5 0.8.0",
  "moka",
  "rand 0.10.0-rc.6",
@@ -8194,6 +8246,39 @@ dependencies = [
  "snafu 0.8.9",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-scanner"
+version = "0.0.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "http 1.4.0",
+ "path-clean",
+ "rand 0.10.0-rc.6",
+ "rmp-serde",
+ "rustfs-common",
+ "rustfs-config",
+ "rustfs-ecstore",
+ "rustfs-filemeta",
+ "rustfs-madmin",
+ "rustfs-utils",
+ "s3s",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

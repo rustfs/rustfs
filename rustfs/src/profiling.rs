@@ -54,7 +54,6 @@ pub async fn dump_memory_pprof_now() -> Result<std::path::PathBuf, String> {
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 mod linux_impl {
-    use chrono::Utc;
     use jemalloc_pprof::PROF_CTL;
     use pprof::protos::Message;
     use rustfs_config::{
@@ -104,7 +103,7 @@ mod linux_impl {
 
     /// Generate timestamp string for filenames
     fn ts() -> String {
-        Utc::now().format("%Y%m%dT%H%M%S").to_string()
+        jiff::Zoned::now().strftime("%Y%m%dT%H%M%S").to_string()
     }
 
     /// Write pprof report to file in protobuf format
