@@ -81,6 +81,14 @@ fn build_rustfs_binary() {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&workspace).args(["build", "--bin", "rustfs"]);
 
+    // Read features from environment variable for e2e tests
+    if let Ok(features) = std::env::var("RUSTFS_BUILD_FEATURES")
+        && !features.is_empty()
+    {
+        cmd.arg("--features").arg(&features);
+        info!("Building with features: {}", features);
+    }
+
     if !cfg!(debug_assertions) {
         cmd.arg("--release");
     }

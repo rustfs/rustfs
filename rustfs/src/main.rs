@@ -19,6 +19,7 @@ mod error;
 mod init;
 mod license;
 mod profiling;
+#[cfg(any(feature = "ftps", feature = "sftp"))]
 mod protocols;
 mod server;
 mod storage;
@@ -27,8 +28,7 @@ mod version;
 
 // Ensure the correct path for parse_license is imported
 use crate::init::{
-    add_bucket_notification_configuration, init_buffer_profile_system, init_ftp_system, init_kms_system, init_sftp_system,
-    init_update_check, print_server_info,
+    add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
 };
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
@@ -72,6 +72,11 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "ftps")]
+use crate::init::init_ftps_system;
+#[cfg(feature = "sftp")]
+use crate::init::init_sftp_system;
 
 fn main() -> Result<()> {
     let runtime = server::get_tokio_runtime_builder()
@@ -268,14 +273,18 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
 
-    // Create a shutdown channel for FTP/SFTP services
-    let (ftp_sftp_shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-
-    // Initialize FTP system if enabled
-    init_ftp_system(ftp_sftp_shutdown_tx.clone()).await.map_err(Error::other)?;
-
+    // Initialize FTPS system if enabled
+    #[cfg(feature = "ftps")]
+    match init_ftps_system().await {
+        Ok(_) => info!("FTPS system initialized successfully"),
+        Err(e) => error!("Failed to initialize FTPS system: {}", e),
+    }
     // Initialize SFTP system if enabled
-    init_sftp_system(ftp_sftp_shutdown_tx.clone()).await.map_err(Error::other)?;
+    #[cfg(feature = "sftp")]
+    match init_sftp_system().await {
+        Ok(_) => info!("SFTP system initialized successfully"),
+        Err(e) => error!("Failed to initialize SFTP system: {}", e),
+    }
 
     // Initialize buffer profiling system
     init_buffer_profile_system(&opt);
@@ -378,11 +387,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ftp_sftp_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ftp_sftp_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
         }
     }
 
@@ -395,7 +404,6 @@ async fn handle_shutdown(
     state_manager: &ServiceStateManager,
     s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
-    ftp_sftp_shutdown_tx: tokio::sync::broadcast::Sender<()>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -461,9 +469,6 @@ async fn handle_shutdown(
 
     // Wait for the worker thread to complete the cleaning work
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
-
-    // Send shutdown signal to FTP/SFTP services
-    let _ = ftp_sftp_shutdown_tx.send(());
 
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);

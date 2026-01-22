@@ -12,6 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! SFTP protocol implementation
-pub mod handler;
+pub mod config;
+pub mod driver;
 pub mod server;

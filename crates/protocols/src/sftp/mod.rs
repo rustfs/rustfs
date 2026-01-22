@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! FTPS protocol implementation
-
-pub mod driver;
+pub mod config;
+pub mod handler;
 pub mod server;

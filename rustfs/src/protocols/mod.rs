@@ -13,7 +13,5 @@
 // limitations under the License.
 
 pub mod client;
-pub mod ftps;
-pub mod gateway;
-pub mod session;
-pub mod sftp;
+
+pub use client::ProtocolStorageClient;

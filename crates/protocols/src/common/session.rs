@@ -13,7 +13,15 @@
 // limitations under the License.
 
 use rustfs_policy::auth::UserIdentity;
+use std::net::IpAddr;
 use std::sync::Arc;
+
+/// Protocol types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Ftps,
+    Sftp,
+}
 
 /// Protocol principal representing an authenticated user
 #[derive(Debug, Clone)]
@@ -23,13 +31,37 @@ pub struct ProtocolPrincipal {
 }
 
 impl ProtocolPrincipal {
-    /// Create a new protocol principal
     pub fn new(user_identity: Arc<UserIdentity>) -> Self {
         Self { user_identity }
     }
-
-    /// Get the access key for this principal
     pub fn access_key(&self) -> &str {
         &self.user_identity.credentials.access_key
+    }
+}
+
+/// Session context for protocol operations
+#[derive(Debug, Clone)]
+pub struct SessionContext {
+    /// The protocol principal (authenticated user)
+    pub principal: ProtocolPrincipal,
+    /// The protocol type
+    pub protocol: Protocol,
+    /// The source IP address
+    pub source_ip: IpAddr,
+}
+
+impl SessionContext {
+    /// Create a new session context
+    pub fn new(principal: ProtocolPrincipal, protocol: Protocol, source_ip: IpAddr) -> Self {
+        Self {
+            principal,
+            protocol,
+            source_ip,
+        }
+    }
+
+    /// Get the access key for this session
+    pub fn access_key(&self) -> &str {
+        self.principal.access_key()
     }
 }
