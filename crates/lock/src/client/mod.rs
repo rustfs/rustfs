@@ -15,13 +15,9 @@
 pub mod local;
 // pub mod remote;
 
+use crate::{LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
-
-use crate::{
-    error::Result,
-    types::{LockId, LockInfo, LockRequest, LockResponse, LockStats},
-};
 
 /// Lock client trait
 #[async_trait]
@@ -35,8 +31,8 @@ pub trait LockClient: Send + Sync + std::fmt::Debug {
     /// Acquire lock (generic method)
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
         match request.lock_type {
-            crate::types::LockType::Exclusive => self.acquire_exclusive(request).await,
-            crate::types::LockType::Shared => self.acquire_shared(request).await,
+            LockType::Exclusive => self.acquire_exclusive(request).await,
+            LockType::Shared => self.acquire_shared(request).await,
         }
     }
 
@@ -83,13 +79,13 @@ impl ClientFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LockType;
+    use crate::LockType;
 
     #[tokio::test]
     async fn test_local_client_basic_operations() {
         let client = ClientFactory::create_local();
 
-        let request = crate::types::LockRequest::new("test-resource", LockType::Exclusive, "test-owner");
+        let request = LockRequest::new("test-resource", LockType::Exclusive, "test-owner");
 
         // Test lock acquisition
         let response = client.acquire_exclusive(&request).await;

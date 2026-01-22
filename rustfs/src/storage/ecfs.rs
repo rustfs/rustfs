@@ -39,7 +39,7 @@ use datafusion::arrow::{
     csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
 use futures::StreamExt;
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::{counter, histogram};
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::{
@@ -116,8 +116,10 @@ use rustfs_utils::{
     http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
-            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
-            RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
+            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
+            AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+            AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT, RESERVED_METADATA_PREFIX,
+            RESERVED_METADATA_PREFIX_LOWER,
         },
     },
     path::{is_dir_object, path_join_buf},
@@ -135,7 +137,7 @@ use std::{
     str::FromStr,
     sync::{Arc, LazyLock},
 };
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, format_description::well_known::Rfc2822, format_description::well_known::Rfc3339};
 use tokio::{
     io::{AsyncRead, AsyncSeek},
     sync::mpsc,
@@ -531,6 +533,263 @@ fn validate_list_object_unordered_with_delimiter(delimiter: Option<&Delimiter>, 
     }
 
     Ok(())
+}
+
+fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
+    let mut eval_metadata = HashMap::new();
+
+    if let Some(v) = retention {
+        let mode = match v.mode {
+            Some(mode) => match mode.as_str() {
+                ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE => mode.as_str().to_string(),
+                _ => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::MalformedXML,
+                        "The XML you provided was not well-formed or did not validate against our published schema".to_string(),
+                    ));
+                }
+            },
+            None => String::default(),
+        };
+
+        let retain_until_date = v
+            .retain_until_date
+            .map(|v| OffsetDateTime::from(v).format(&Rfc3339).unwrap())
+            .unwrap_or_default();
+
+        let now = OffsetDateTime::now_utc();
+        // This is intentional behavior. Empty string represents "retention cleared" which is different from "retention never set". Consistent with minio
+        eval_metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode);
+        eval_metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), retain_until_date);
+        eval_metadata.insert(
+            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"),
+            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+        );
+    }
+    Ok(eval_metadata)
+}
+
+fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
+    let mut eval_metadata = HashMap::new();
+    if let Some(v) = legal_hold {
+        let status = match v.status {
+            Some(status) => match status.as_str() {
+                ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON => status.as_str().to_string(),
+                _ => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::MalformedXML,
+                        "The XML you provided was not well-formed or did not validate against our published schema".to_string(),
+                    ));
+                }
+            },
+            None => String::default(),
+        };
+        let now = OffsetDateTime::now_utc();
+        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set". Consistent with minio
+        eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
+        eval_metadata.insert(
+            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
+            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+        );
+    }
+    Ok(eval_metadata)
+}
+
+async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Result<()> {
+    match metadata_sys::get_object_lock_config(bucket).await {
+        Ok((cfg, _created)) => {
+            if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "Object Lock is not enabled for this bucket".to_string(),
+                ));
+            }
+        }
+        Err(err) => {
+            if err == StorageError::ConfigNotFound {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "Bucket is missing ObjectLockConfiguration".to_string(),
+                ));
+            }
+            warn!("get_object_lock_config err {:?}", err);
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to get bucket ObjectLockConfiguration".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates HTTP conditional request headers for a single object according to
+/// RFC 7232 and S3 API semantics.
+///
+/// This function evaluates the following headers, if present, in the standard
+/// conditional request order:
+/// - `If-Match`
+/// - `If-None-Match`
+/// - `If-Modified-Since`
+/// - `If-Unmodified-Since`
+///
+/// The `headers` parameter provides the incoming HTTP request headers, and
+/// `info` supplies the object's current metadata (ETag and modification time)
+/// used to evaluate those preconditions.
+///
+/// The function returns `Ok(())` if either no relevant conditional headers are
+/// set or all specified preconditions are satisfied. If any precondition fails,
+/// it returns an `Err(S3Error)` with an appropriate S3 error code (for example,
+/// `PreconditionFailed` for failed `If-Match` / `If-Unmodified-Since`, or
+/// `NotModified` for `If-None-Match` / `If-Modified-Since` when the resource
+/// has not changed), allowing the caller to translate this into the correct
+/// HTTP response.
+fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3Result<()> {
+    let mod_time = info.mod_time;
+    let etag = info.etag.as_deref();
+
+    if mod_time.is_none() && etag.is_none() {
+        return Ok(());
+    }
+
+    // If-Match: requires ETag to exist
+    if let Some(if_match_val) = headers.get("if-match").and_then(|v| v.to_str().ok()) {
+        match etag {
+            Some(e) if is_etag_equal(e, if_match_val) => {}
+            _ => return Err(S3Error::new(S3ErrorCode::PreconditionFailed)),
+        }
+    }
+
+    // If-Unmodified-Since (only when If-Match is absent)
+    if headers.get("if-match").is_none()
+        && let Some(t) = mod_time
+        && let Some(if_unmodified_since) = headers.get("if-unmodified-since").and_then(|v| v.to_str().ok())
+        && let Ok(given_time) = OffsetDateTime::parse(if_unmodified_since, &Rfc2822)
+        && t > given_time.add(time::Duration::seconds(1))
+    {
+        return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+    }
+
+    // If-None-Match
+    if let Some(if_none_match) = headers.get("if-none-match").and_then(|v| v.to_str().ok())
+        && let Some(e) = etag
+        && is_etag_equal(e, if_none_match)
+    {
+        let mut error_headers = HeaderMap::new();
+        if let Ok(etag_header) = parse_etag(e) {
+            error_headers.insert("etag", etag_header);
+        }
+        if let Some(t) = mod_time
+            && let Ok(last_modified_str) = t.format(&Rfc2822)
+            && let Ok(last_modified_header) = HeaderValue::from_str(&last_modified_str)
+        {
+            error_headers.insert("last-modified", last_modified_header);
+        }
+
+        let mut s3_error = S3Error::new(S3ErrorCode::NotModified);
+        s3_error.set_message("Not Modified".to_string());
+        s3_error.set_status_code(StatusCode::NOT_MODIFIED);
+        s3_error.set_headers(error_headers);
+        return Err(s3_error);
+    }
+
+    // If-Modified-Since (only when If-None-Match is absent - RFC 7232)
+    if headers.get("if-none-match").is_none()
+        && let Some(t) = mod_time
+        && let Some(if_modified_since) = headers.get("if-modified-since").and_then(|v| v.to_str().ok())
+        && let Ok(given_time) = OffsetDateTime::parse(if_modified_since, &Rfc2822)
+        && t < given_time.add(time::Duration::seconds(1))
+    {
+        let mut error_headers = HeaderMap::new();
+        if let Some(e) = etag
+            && let Ok(etag_header) = parse_etag(e)
+        {
+            error_headers.insert("etag", etag_header);
+        }
+        if let Ok(last_modified_str) = t.format(&Rfc2822)
+            && let Ok(last_modified_header) = HeaderValue::from_str(&last_modified_str)
+        {
+            error_headers.insert("last-modified", last_modified_header);
+        }
+
+        let mut s3_error = S3Error::new(S3ErrorCode::NotModified);
+        s3_error.set_message("Not Modified".to_string());
+        s3_error.set_status_code(StatusCode::NOT_MODIFIED);
+        s3_error.set_headers(error_headers);
+
+        return Err(s3_error);
+    }
+
+    Ok(())
+}
+
+/// Compares an object ETag with an ETag value from an HTTP header.
+///
+/// This helper implements HTTP ETag comparison semantics for headers such as
+/// `If-Match` and `If-None-Match`:
+/// - Supports the wildcard `*`, which matches any `object_etag`.
+/// - Supports comma-separated ETag lists (e.g., `"etag1", "etag2"`), returning
+///   `true` if any entry matches `object_etag`.
+/// - Automatically trims surrounding whitespace and double quotes from both the
+///   header entries and `object_etag` before comparison.
+///
+/// # Parameters
+/// - `object_etag`: The ETag associated with the stored object.
+/// - `header_etag`: The raw ETag header value received in the request, which may
+///   be a wildcard, a single ETag, or a comma-separated list of ETags.
+///
+/// # Returns
+/// `true` if the header value matches the object ETag according to the above
+/// HTTP ETag comparison rules, otherwise `false`.
+fn is_etag_equal(object_etag: &str, header_etag: &str) -> bool {
+    let header_etag = header_etag.trim();
+    if header_etag == "*" {
+        return true;
+    }
+    header_etag
+        .split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .any(|e| e == object_etag.trim_matches('"'))
+}
+
+/// Converts an object ETag string into an HTTP `HeaderValue` for use in response headers.
+///
+/// This function normalizes ETag values by ensuring they are wrapped in double quotes,
+/// which is the standard HTTP ETag format according to RFC 7232. If the input ETag
+/// already contains quotes, they are removed before adding new quotes to avoid duplication.
+///
+/// # Parameters
+/// - `object_etag`: The ETag string, which may or may not already be wrapped in quotes.
+///   Must not be empty after removing quotes.
+///
+/// # Returns
+/// - `Ok(HeaderValue)`: The normalized ETag value wrapped in double quotes, ready for use
+///   in HTTP response headers.
+/// - `Err(S3Error)`: Returns `InvalidArgument` if the ETag value is empty (after removing quotes)
+///   or contains characters that cannot be represented in an HTTP header value.
+///
+/// # Note
+/// When this function returns an error, callers should log the error but continue with
+/// the operation (e.g., return NotModified without the ETag header) rather than propagating
+/// the InvalidArgument error, as the original operation semantics should be preserved.
+pub fn parse_etag(object_etag: &str) -> Result<HeaderValue, S3Error> {
+    let etag_trimmed = object_etag.trim_matches('"');
+
+    if etag_trimmed.trim().is_empty() {
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "ETag cannot be empty".to_string()));
+    }
+
+    let etag_quoted = format!("\"{}\"", etag_trimmed);
+
+    HeaderValue::from_str(&etag_quoted).map_err(|e| {
+        warn!(
+            "Failed to convert ETag to HeaderValue (ETag: {}): {}. The ETag header will be omitted from the response.",
+            etag_quoted, e
+        );
+        S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("Invalid ETag header value (ETag: {}): {}", etag_quoted, e),
+        )
+    })
 }
 
 impl FS {
@@ -2370,6 +2629,8 @@ impl S3 for FS {
 
         let info = reader.object_info;
 
+        check_preconditions(&req.headers, &info)?;
+
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in &info.parts {
             debug!(
@@ -2830,6 +3091,14 @@ impl S3 for FS {
         result
     }
 
+    #[instrument(level = "debug", skip(self, _req))]
+    async fn get_object_torrent(&self, _req: S3Request<GetObjectTorrentInput>) -> S3Result<S3Response<GetObjectTorrentOutput>> {
+        // Torrent functionality is not implemented in RustFS
+        // Per S3 API test expectations, return 404 NoSuchKey (not 501 Not Implemented)
+        // This allows clients to gracefully handle the absence of torrent support
+        Err(S3Error::new(S3ErrorCode::NoSuchKey))
+    }
+
     #[instrument(level = "debug", skip(self, req))]
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
@@ -3040,6 +3309,15 @@ impl S3 for FS {
         let content_language = metadata_map.get("content-language").cloned();
         let expires = info.expires.map(Timestamp::from);
 
+        // Calculate tag count from user_tags already in ObjectInfo
+        // This avoids an additional API call since user_tags is already populated by get_object_info
+        let tag_count = if !info.user_tags.is_empty() {
+            let tag_set = decode_tags(&info.user_tags);
+            tag_set.len()
+        } else {
+            0
+        };
+
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -3076,7 +3354,43 @@ impl S3 for FS {
         // interact with objects (PUT/POST/DELETE/LIST, etc.) rely on the system-level
         // CORS layer instead. In case both are applicable, this bucket-level CORS logic
         // takes precedence for these read operations.
-        let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+        let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+
+        // Add x-amz-tagging-count header if object has tags
+        // Per S3 API spec, this header should be present in HEAD object response when tags exist
+        if tag_count > 0 {
+            let header_name = http::HeaderName::from_static(AMZ_TAG_COUNT);
+            if let Ok(header_value) = tag_count.to_string().parse::<http::HeaderValue>() {
+                response.headers.insert(header_name, header_value);
+            } else {
+                warn!("Failed to parse x-amz-tagging-count header value, skipping");
+            }
+        }
+        if let Some(retain_date) = metadata_map
+            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE))
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.as_bytes())
+            && let Ok(header_value) = HeaderValue::from_str(retain_date)
+        {
+            response.headers.insert(header_name, header_value);
+        }
+        if let Some(mode) = metadata_map
+            .get(AMZ_OBJECT_LOCK_MODE_LOWER)
+            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_MODE))
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_MODE_LOWER.as_bytes())
+            && let Ok(header_value) = HeaderValue::from_str(mode)
+        {
+            response.headers.insert(header_name, header_value);
+        }
+        if let Some(legal_hold) = metadata_map
+            .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
+            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_LEGAL_HOLD))
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.as_bytes())
+            && let Ok(header_value) = HeaderValue::from_str(legal_hold)
+        {
+            response.headers.insert(header_name, header_value);
+        }
+
         let result = Ok(response);
         let _ = helper.complete(&result);
 
@@ -4881,11 +5195,25 @@ impl S3 for FS {
 
         let opts = &ObjectOptions::default();
 
-        store
+        // Special handling for abort_multipart_upload: Per AWS S3 API specification, this operation
+        // should return NoSuchUpload (404) when the upload_id doesn't exist, even if the format
+        // appears invalid. This differs from other multipart operations (upload_part, list_parts,
+        // complete_multipart_upload) which return InvalidArgument for malformed upload_ids.
+        // The lenient validation matches AWS S3 behavior where format validation is relaxed for
+        // abort operations to avoid leaking information about upload_id format requirements.
+        match store
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
             .await
-            .map_err(ApiError::from)?;
-        Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
+        {
+            Ok(_) => Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() })),
+            Err(err) => {
+                // Convert MalformedUploadID to NoSuchUpload for S3 API compatibility
+                if matches!(err, StorageError::MalformedUploadID(_)) {
+                    return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
+                }
+                Err(ApiError::from(err).into())
+            }
+        }
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -4902,9 +5230,11 @@ impl S3 for FS {
         let Tagging { tag_set } = match metadata_sys::get_tagging_config(&bucket).await {
             Ok((tags, _)) => tags,
             Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(S3ErrorCode::NoSuchTagSet, "The TagSet does not exist".to_string()));
+                }
                 warn!("get_tagging_config err {:?}", &err);
-                // TODO: check not found
-                Tagging::default()
+                return Err(ApiError::from(err).into());
             }
         };
 
@@ -5589,9 +5919,11 @@ impl S3 for FS {
                         "Object Lock configuration does not exist for this bucket".to_string(),
                     ));
                 }
-
-                debug!("get_object_lock_config err {:?}", err);
-                None
+                warn!("get_object_lock_config err {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Failed to load Object Lock configuration".to_string(),
+                ));
             }
         };
 
@@ -5623,6 +5955,23 @@ impl S3 for FS {
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
+
+        let _ = match metadata_sys::get_object_lock_config(&bucket).await {
+            Ok(_) => {}
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidBucketState,
+                        "Object Lock configuration cannot be enabled on existing buckets".to_string(),
+                    ));
+                }
+                warn!("get_object_lock_config err {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Failed to get bucket ObjectLockConfiguration".to_string(),
+                ));
+            }
+        };
 
         let data = try_!(serialize(&input_cfg));
 
@@ -6121,7 +6470,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
+        validate_bucket_object_lock_enabled(&bucket).await?;
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
@@ -6134,7 +6483,7 @@ impl S3 for FS {
 
         let legal_hold = object_info
             .user_defined
-            .get("x-amz-object-lock-legal-hold")
+            .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
             .map(|v| v.as_str().to_string());
 
         let status = if let Some(v) = legal_hold {
@@ -6180,24 +6529,12 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
-
+        validate_bucket_object_lock_enabled(&bucket).await?;
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
 
-        let mut eval_metadata = HashMap::new();
-        let legal_hold = legal_hold
-            .map(|v| v.status.map(|v| v.as_str().to_string()))
-            .unwrap_or_default()
-            .unwrap_or("OFF".to_string());
-
-        let now = OffsetDateTime::now_utc();
-        eval_metadata.insert("x-amz-object-lock-legal-hold".to_string(), legal_hold);
-        eval_metadata.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
-            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
-        );
+        let eval_metadata = parse_object_lock_legal_hold(legal_hold)?;
 
         let popts = ObjectOptions {
             mod_time: opts.mod_time,
@@ -6236,7 +6573,7 @@ impl S3 for FS {
         };
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
+        validate_bucket_object_lock_enabled(&bucket).await?;
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
@@ -6287,26 +6624,11 @@ impl S3 for FS {
         };
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
+        validate_bucket_object_lock_enabled(&bucket).await?;
 
         // TODO: check allow
 
-        let mut eval_metadata = HashMap::new();
-
-        if let Some(v) = retention {
-            let mode = v.mode.map(|v| v.as_str().to_string()).unwrap_or_default();
-            let retain_until_date = v
-                .retain_until_date
-                .map(|v| OffsetDateTime::from(v).format(&Rfc3339).unwrap())
-                .unwrap_or_default();
-            let now = OffsetDateTime::now_utc();
-            eval_metadata.insert("x-amz-object-lock-mode".to_string(), mode);
-            eval_metadata.insert("x-amz-object-lock-retain-until-date".to_string(), retain_until_date);
-            eval_metadata.insert(
-                format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"),
-                format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
-            );
-        }
+        let eval_metadata = parse_object_lock_retention(retention)?;
 
         let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
@@ -6778,6 +7100,410 @@ mod tests {
         let complex_query_without_unordered = Some("abc=123&queryType=test");
         // [5] Multi-parameter query without conflict: If other parameters exist but 'allow-unordered' is missing,
         assert!(validate_list_object_unordered_with_delimiter(delimiter_some, complex_query_without_unordered).is_ok());
+    }
+
+    #[test]
+    fn test_parse_object_lock_retention() {
+        use time::macros::datetime;
+        // [1] Normal case: No retention specified (empty metadata)
+        assert!(parse_object_lock_retention(None).is_ok());
+        assert!(parse_object_lock_retention(None).unwrap().is_empty());
+
+        // [2] Normal case: Retention with valid COMPLIANCE mode
+        let valid_compliance_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+        };
+        let compliance_metadata = parse_object_lock_retention(Some(valid_compliance_retention)).unwrap();
+        assert_eq!(compliance_metadata.get("x-amz-object-lock-mode").unwrap(), "COMPLIANCE");
+        assert_eq!(
+            compliance_metadata.get("x-amz-object-lock-retain-until-date").unwrap(),
+            "2025-01-01T00:00:00Z"
+        );
+        assert!(
+            compliance_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"))
+        );
+
+        // [3] Normal case: Retention with valid GOVERNANCE mode
+        let valid_governance_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+        };
+        let governance_metadata = parse_object_lock_retention(Some(valid_governance_retention)).unwrap();
+        assert_eq!(governance_metadata.get("x-amz-object-lock-mode").unwrap(), "GOVERNANCE");
+
+        // [4] Normal case: Retention with None mode (empty string for mode)
+        let none_mode_retention = ObjectLockRetention {
+            mode: None,
+            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+        };
+        let none_mode_metadata = parse_object_lock_retention(Some(none_mode_retention)).unwrap();
+        assert_eq!(none_mode_metadata.get("x-amz-object-lock-mode").unwrap(), "");
+
+        // [5] Normal case: Retention with None retain_until_date (empty string for date)
+        let none_date_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: None,
+        };
+        let none_date_metadata = parse_object_lock_retention(Some(none_date_retention)).unwrap();
+        assert_eq!(none_date_metadata.get("x-amz-object-lock-retain-until-date").unwrap(), "");
+
+        // [6] Error case: Retention with invalid mode (non COMPLIANCE/GOVERNANCE)
+        let invalid_mode_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static("INVALID_MODE")),
+            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+        };
+        let err = parse_object_lock_retention(Some(invalid_mode_retention)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
+        assert_eq!(
+            err.message(),
+            Some("The XML you provided was not well-formed or did not validate against our published schema")
+        );
+    }
+
+    #[test]
+    fn test_parse_object_lock_legal_hold() {
+        // [1] Normal case: No legal hold specified (empty metadata)
+        assert!(parse_object_lock_legal_hold(None).is_ok());
+        assert!(parse_object_lock_legal_hold(None).unwrap().is_empty());
+
+        // [2] Normal case: Legal hold with valid ON status
+        let valid_on_legal_hold = ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
+        };
+        let on_metadata = parse_object_lock_legal_hold(Some(valid_on_legal_hold)).unwrap();
+        assert_eq!(on_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "ON");
+        assert!(on_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp")));
+
+        // [3] Normal case: Legal hold with valid OFF status
+        let valid_off_legal_hold = ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
+        };
+        let off_metadata = parse_object_lock_legal_hold(Some(valid_off_legal_hold)).unwrap();
+        assert_eq!(off_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "OFF");
+
+        // [4] Normal case: Legal hold with None status (empty string for status)
+        let none_status_legal_hold = ObjectLockLegalHold { status: None };
+        let none_status_metadata = parse_object_lock_legal_hold(Some(none_status_legal_hold)).unwrap();
+        assert_eq!(none_status_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "");
+
+        // [5] Error case: Legal hold with invalid status (non ON/OFF)
+        let invalid_status_legal_hold = ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static("INVALID_STATUS")),
+        };
+        let err = parse_object_lock_legal_hold(Some(invalid_status_legal_hold)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
+        assert_eq!(
+            err.message(),
+            Some("The XML you provided was not well-formed or did not validate against our published schema")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_bucket_object_lock_enabled() {
+        use rustfs_ecstore::bucket::metadata::BucketMetadata;
+        use rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata;
+        use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
+        use time::OffsetDateTime;
+
+        if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_none() {
+            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+            return;
+        }
+
+        let test_bucket = "test-bucket-object-lock";
+
+        let mut bm = BucketMetadata::new(test_bucket);
+        bm.object_lock_config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: None,
+        });
+        bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
+        set_bucket_metadata(test_bucket.to_string(), bm).await.unwrap();
+        assert!(validate_bucket_object_lock_enabled(test_bucket).await.is_ok());
+
+        let mut bm = BucketMetadata::new(test_bucket);
+        bm.object_lock_config = Some(ObjectLockConfiguration {
+            object_lock_enabled: None,
+            rule: None,
+        });
+        bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
+        set_bucket_metadata(test_bucket.to_string(), bm).await.unwrap();
+        let err = validate_bucket_object_lock_enabled(test_bucket).await.unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidRequest.as_str());
+        assert_eq!(err.message(), Some("Object Lock is not enabled for this bucket"));
+
+        let non_exist_bucket = "non-exist-bucket-object-lock";
+        let err = validate_bucket_object_lock_enabled(non_exist_bucket).await.unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidRequest.as_str());
+        assert_eq!(err.message(), Some("Bucket is missing ObjectLockConfiguration"));
+    }
+
+    #[test]
+    fn test_is_etag_equal() {
+        // [1] Header ETag is "*", should return true (match any object ETag)
+        assert!(is_etag_equal("\"d41d8cd98f00b204e9800998ecf8427e\"", "*"));
+
+        // [2] Exact match (both with double quotes)
+        assert!(is_etag_equal(
+            "\"d41d8cd98f00b204e9800998ecf8427e\"",
+            "\"d41d8cd98f00b204e9800998ecf8427e\""
+        ));
+
+        // [3] Exact match (object ETag with quotes, header ETag without)
+        assert!(is_etag_equal("\"d41d8cd98f00b204e9800998ecf8427e\"", "d41d8cd98f00b204e9800998ecf8427e"));
+
+        // [4] Header ETag has multiple values (comma-separated), one matches
+        assert!(is_etag_equal("\"12345\"", "\"67890\", \"12345\", \"abcde\""));
+
+        // [5] Header ETag has multiple values with spaces, one matches after trim
+        assert!(is_etag_equal("\"12345\"", "  \"67890\" , \"12345\"  , \"abcde\"  "));
+
+        // [6] No match (different ETag)
+        assert!(!is_etag_equal("\"12345\"", "\"67890\""));
+
+        // [7] No match in multiple values
+        assert!(!is_etag_equal("\"12345\"", "\"67890\", \"abcde\""));
+    }
+
+    #[test]
+    fn test_check_preconditions() {
+        let valid_mod_time = OffsetDateTime::from_unix_timestamp(1700000000).unwrap();
+        let valid_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
+        let wrong_etag = "\"wrong-etag-123456\"";
+
+        // [1] Both mod_time and etag are None → early return Ok()
+        let info1 = ObjectInfo {
+            mod_time: None,
+            etag: None,
+            ..Default::default()
+        };
+        let headers1 = HeaderMap::new();
+        assert!(check_preconditions(&headers1, &info1).is_ok());
+
+        // [2] No conditional headers with etag=None → Ok()
+        let info2 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: None,
+            ..Default::default()
+        };
+        let headers2 = HeaderMap::new();
+        assert!(check_preconditions(&headers2, &info2).is_ok());
+
+        // [3] If-None-Match matches → return Err(S3Error::NotModified)
+        let mut headers3 = HeaderMap::new();
+        headers3.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info3 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: Some(valid_etag.to_string()),
+            ..Default::default()
+        };
+        let result3 = check_preconditions(&headers3, &info3);
+        assert!(result3.is_err());
+        let err3 = result3.unwrap_err();
+        assert_eq!(err3.code(), &S3ErrorCode::NotModified);
+        assert_eq!(err3.message(), Some("Not Modified"));
+        assert_eq!(err3.status_code(), Some(StatusCode::NOT_MODIFIED));
+
+        // [4] If-None-Match does not match → return Ok()
+        let mut headers4 = HeaderMap::new();
+        headers4.insert("if-none-match", HeaderValue::from_str("\"wrong-etag\"").unwrap());
+        let info4 = info3.clone();
+        assert!(check_preconditions(&headers4, &info4).is_ok());
+
+        // [5] If-Modified-Since >= mod_time → return Err(S3Error::NotModified)
+        let mut headers5 = HeaderMap::new();
+        headers5.insert(
+            "if-modified-since",
+            HeaderValue::from_str(&valid_mod_time.format(&Rfc2822).unwrap()).unwrap(),
+        );
+        let info5 = info3.clone();
+        let result5 = check_preconditions(&headers5, &info5);
+        assert!(result5.is_err());
+        let err5 = result5.unwrap_err();
+        assert_eq!(err5.code(), &S3ErrorCode::NotModified);
+
+        // [6] If-Modified-Since < mod_time → return Ok()
+        let earlier_time = valid_mod_time - time::Duration::hours(1);
+        let mut headers6 = HeaderMap::new();
+        headers6.insert(
+            "if-modified-since",
+            HeaderValue::from_str(&earlier_time.format(&Rfc2822).unwrap()).unwrap(),
+        );
+        let info6 = info3.clone();
+        assert!(check_preconditions(&headers6, &info6).is_ok());
+
+        // [7] If-Match does not match → return Err(S3Error::PreconditionFailed)
+        let mut headers7 = HeaderMap::new();
+        headers7.insert("if-match", HeaderValue::from_str("\"wrong-etag\"").unwrap());
+        let info7 = info3.clone();
+        let result7 = check_preconditions(&headers7, &info7);
+        assert!(result7.is_err());
+        assert_eq!(result7.unwrap_err().code(), &S3ErrorCode::PreconditionFailed);
+
+        // [8] If-Match matches → return Ok()
+        let mut headers8 = HeaderMap::new();
+        headers8.insert("if-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info8 = info3.clone();
+        assert!(check_preconditions(&headers8, &info8).is_ok());
+
+        // [9] If-Unmodified-Since < mod_time (no If-Match) → return Err(S3Error::PreconditionFailed)
+        let mut headers9 = HeaderMap::new();
+        headers9.insert(
+            "if-unmodified-since",
+            HeaderValue::from_str(&earlier_time.format(&Rfc2822).unwrap()).unwrap(),
+        );
+        let info9 = info3.clone();
+        let result9 = check_preconditions(&headers9, &info9);
+        assert!(result9.is_err());
+        assert_eq!(result9.unwrap_err().code(), &S3ErrorCode::PreconditionFailed);
+
+        // [10] If-Unmodified-Since >= mod_time (no If-Match) → return Ok()
+        let mut headers10 = HeaderMap::new();
+        headers10.insert(
+            "if-unmodified-since",
+            HeaderValue::from_str(&valid_mod_time.format(&Rfc2822).unwrap()).unwrap(),
+        );
+        let info10 = info3.clone();
+        assert!(check_preconditions(&headers10, &info10).is_ok());
+
+        // [11] If-Match (mismatch) + If-None-Match (match) → return Err(S3Error::PreconditionFailed)
+        let mut headers11 = HeaderMap::new();
+        headers11.insert("if-match", HeaderValue::from_str(wrong_etag).unwrap());
+        headers11.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info11 = info3.clone();
+        let result11 = check_preconditions(&headers11, &info11);
+        assert!(result11.is_err());
+        let err11 = result11.unwrap_err();
+        assert_eq!(err11.code(), &S3ErrorCode::PreconditionFailed);
+        assert_ne!(err11.code(), &S3ErrorCode::NotModified);
+
+        // [12] If-Match (match) + If-None-Match (match) → return Err(S3Error::NotModified)
+        let mut headers12 = HeaderMap::new();
+        headers12.insert("if-match", HeaderValue::from_str(valid_etag).unwrap());
+        headers12.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info12 = info3.clone();
+        let result12 = check_preconditions(&headers12, &info12);
+        assert!(result12.is_err());
+        let err12 = result12.unwrap_err();
+        assert_eq!(err12.code(), &S3ErrorCode::NotModified);
+        assert_ne!(err12.code(), &S3ErrorCode::PreconditionFailed);
+
+        // [13] If-None-Match (match) + If-Modified-Since → NotModified (If-Modified-Since ignored)
+        let mut headers13 = HeaderMap::new();
+        headers13.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        headers13.insert(
+            "if-modified-since",
+            HeaderValue::from_str(&earlier_time.format(&Rfc2822).unwrap()).unwrap(),
+        );
+        let info13 = info3.clone();
+        let result13 = check_preconditions(&headers13, &info13);
+        assert!(result13.is_err());
+        assert_eq!(result13.unwrap_err().code(), &S3ErrorCode::NotModified);
+
+        // [14] If-None-Match (no match) + If-Modified-Since → Ok (If-Modified-Since ignored)
+        let mut headers14 = HeaderMap::new();
+        headers14.insert("if-none-match", HeaderValue::from_str("\"wrong-etag\"").unwrap());
+        headers14.insert(
+            "if-modified-since",
+            HeaderValue::from_str(&valid_mod_time.format(&Rfc2822).unwrap()).unwrap(),
+        );
+        let info14 = info3.clone();
+        assert!(check_preconditions(&headers14, &info14).is_ok());
+
+        // [15] If-Match with no ETag → PreconditionFailed
+        let mut headers15 = HeaderMap::new();
+        headers15.insert("if-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info15 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: None,
+            ..Default::default()
+        };
+        let result15 = check_preconditions(&headers15, &info15);
+        assert!(result15.is_err());
+        assert_eq!(result15.unwrap_err().code(), &S3ErrorCode::PreconditionFailed);
+
+        // [16] If-None-Match with no ETag → Ok (no match possible)
+        let mut headers16 = HeaderMap::new();
+        headers16.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info16 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: None,
+            ..Default::default()
+        };
+        assert!(check_preconditions(&headers16, &info16).is_ok());
+
+        // [17] mod_time None, etag exists, If-Match matches → Ok
+        let mut headers17 = HeaderMap::new();
+        headers17.insert("if-match", HeaderValue::from_str(valid_etag).unwrap());
+        let info17 = ObjectInfo {
+            mod_time: None,
+            etag: Some(valid_etag.to_string()),
+            ..Default::default()
+        };
+        assert!(check_preconditions(&headers17, &info17).is_ok());
+    }
+
+    #[test]
+    fn test_parse_etag() {
+        // [1] ETag without quotes → adds quotes
+        let result1 = parse_etag("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        assert_eq!(result1.to_str().unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+
+        // [2] ETag with quotes → normalizes to single set of quotes
+        let result2 = parse_etag("\"d41d8cd98f00b204e9800998ecf8427e\"").unwrap();
+        assert_eq!(result2.to_str().unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+
+        // [3] ETag with multiple quotes → removes all and adds single set
+        let result3 = parse_etag("\"\"\"d41d8cd98f00b204e9800998ecf8427e\"\"\"").unwrap();
+        assert_eq!(result3.to_str().unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+
+        // [4] Empty string → returns error
+        let result4 = parse_etag("");
+        assert!(result4.is_err());
+        assert_eq!(result4.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [5] String with only quotes → returns error
+        let result5 = parse_etag("\"\"");
+        assert!(result5.is_err());
+        assert_eq!(result5.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [6] ETag with quotes only at start → removes and adds quotes
+        let result6 = parse_etag("\"d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        assert_eq!(result6.to_str().unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+
+        // [7] ETag with quotes only at end → removes and adds quotes
+        let result7 = parse_etag("d41d8cd98f00b204e9800998ecf8427e\"").unwrap();
+        assert_eq!(result7.to_str().unwrap(), "\"d41d8cd98f00b204e9800998ecf8427e\"");
+
+        // [8] ETag with newline character → returns error (invalid header value)
+        let result8 = parse_etag("d41d8cd98f00b204e9800998ecf8427e\n");
+        assert!(result8.is_err());
+        assert_eq!(result8.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [9] ETag with null byte → returns error (invalid header value)
+        let result9 = parse_etag("d41d8cd98f00b204e9800998ecf8427e\0");
+        assert!(result9.is_err());
+        assert_eq!(result9.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [10] ETag with carriage return → returns error (invalid header value)
+        let result10 = parse_etag("d41d8cd98f00b204e9800998ecf8427e\r");
+        assert!(result10.is_err());
+        assert_eq!(result10.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [11] ETag with whitespace → preserves content, adds quotes
+        let result11 = parse_etag("  d41d8cd98f00b204e9800998ecf8427e  ").unwrap();
+        assert_eq!(result11.to_str().unwrap(), "\"  d41d8cd98f00b204e9800998ecf8427e  \"");
+
+        // [12] ETag with only whitespace (no quotes) → returns error
+        let result12 = parse_etag("   ");
+        assert!(result12.is_err());
+        assert_eq!(result12.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+
+        // [13] ETag with only whitespace (with quotes) → returns error
+        let result13 = parse_etag("\"   \"");
+        assert!(result13.is_err());
+        assert_eq!(result13.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
     }
 
     // Note: S3Request structure is complex and requires many fields.

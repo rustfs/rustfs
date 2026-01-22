@@ -83,6 +83,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # 3) copy full sources (this is the main cache invalidation point)
 COPY . .
 
+# Generate static files
+
+RUN ./rustfs/scripts/static.sh
+
 # Cargo build configuration for lean release artifacts
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
