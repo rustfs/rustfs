@@ -34,7 +34,6 @@ use crate::storage::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use datafusion::arrow::{
     csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
@@ -319,7 +318,7 @@ async fn create_managed_encryption_material(
         iv: data_key.nonce.to_vec(),
         tag: None,
         encryption_context: context.encryption_context.clone(),
-        encrypted_at: Utc::now(),
+        encrypted_at: jiff::Zoned::now(),
         original_size: if original_size >= 0 { original_size as u64 } else { 0 },
         encrypted_data_key,
     };
@@ -3360,7 +3359,7 @@ impl S3 for FS {
         // Per S3 API spec, this header should be present in HEAD object response when tags exist
         if tag_count > 0 {
             let header_name = http::HeaderName::from_static(AMZ_TAG_COUNT);
-            if let Ok(header_value) = tag_count.to_string().parse::<http::HeaderValue>() {
+            if let Ok(header_value) = tag_count.to_string().parse::<HeaderValue>() {
                 response.headers.insert(header_name, header_value);
             } else {
                 warn!("Failed to parse x-amz-tagging-count header value, skipping");
@@ -3726,8 +3725,6 @@ impl S3 for FS {
             })
             .collect();
 
-        let key_count = objects.len() as i32;
-
         let common_prefixes = object_infos
             .prefixes
             .into_iter()
@@ -3754,7 +3751,9 @@ impl S3 for FS {
 
         let output = ListObjectVersionsOutput {
             is_truncated: Some(object_infos.is_truncated),
-            max_keys: Some(key_count),
+            // max_keys should be the requested maximum number of keys, not the actual count returned
+            // Per AWS S3 API spec, this field represents the maximum number of keys that can be returned in the response
+            max_keys: Some(max_keys),
             delimiter,
             name: Some(bucket),
             prefix: Some(prefix),
@@ -4105,9 +4104,7 @@ impl S3 for FS {
 
         if dsc.replicate_any() {
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
-            let now: DateTime<Utc> = Utc::now();
-            let formatted_time = now.to_rfc3339();
-            opts.user_defined.insert(k, formatted_time);
+            opts.user_defined.insert(k, jiff::Zoned::now().to_string());
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
             opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
         }
@@ -7807,7 +7804,7 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::QueueConfiguration {
+            Some(vec![QueueConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 queue_arn: invalid_arn.to_string(),
                 filter: None,
@@ -7833,7 +7830,7 @@ mod tests {
 
         let result = process_topic_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::TopicConfiguration {
+            Some(vec![TopicConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 topic_arn: invalid_arn.to_string(),
                 filter: None,
@@ -7859,7 +7856,7 @@ mod tests {
 
         let result = process_lambda_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::LambdaFunctionConfiguration {
+            Some(vec![LambdaFunctionConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 lambda_function_arn: invalid_arn.to_string(),
                 filter: None,
@@ -7885,7 +7882,7 @@ mod tests {
 
         let result = process_queue_configurations(
             &mut event_rules,
-            Some(vec![s3s::dto::QueueConfiguration {
+            Some(vec![QueueConfiguration {
                 events: vec!["s3:ObjectCreated:*".to_string().into()],
                 queue_arn: valid_arn.to_string(),
                 filter: None,
