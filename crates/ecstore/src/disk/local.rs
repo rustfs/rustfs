@@ -82,7 +82,7 @@ pub struct LocalDisk {
     pub format_info: RwLock<FormatInfo>,
     pub endpoint: Endpoint,
     pub disk_info_cache: Arc<Cache<DiskInfo>>,
-    pub scanning: AtomicU32,
+    pub scanning: Arc<AtomicU32>,
     pub rotational: bool,
     pub fstype: String,
     pub major: u64,
@@ -209,7 +209,7 @@ impl LocalDisk {
             format_path,
             format_info: RwLock::new(format_info),
             disk_info_cache: Arc::new(cache),
-            scanning: AtomicU32::new(0),
+            scanning: Arc::new(AtomicU32::new(0)),
             rotational: Default::default(),
             fstype: Default::default(),
             minor: Default::default(),
@@ -664,6 +664,7 @@ impl LocalDisk {
                 match self.read_metadata_with_dmtime(meta_path).await {
                     Ok(res) => Ok(res),
                     Err(err) => {
+                        warn!("read_raw: error: {:?}", err);
                         if err == Error::FileNotFound
                             && !skip_access_checks(volume_dir.as_ref().to_string_lossy().to_string().as_str())
                             && let Err(e) = access(volume_dir.as_ref()).await
@@ -685,20 +686,6 @@ impl LocalDisk {
         }
 
         Ok((buf, mtime))
-    }
-
-    async fn read_metadata(&self, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        // Try to use cached file content reading for better performance, with safe fallback
-        let path = file_path.as_ref().to_path_buf();
-
-        // First, try the cache
-        if let Ok(bytes) = get_global_file_cache().get_file_content(path.clone()).await {
-            return Ok(bytes.to_vec());
-        }
-
-        // Fallback to direct read if cache fails
-        let (data, _) = self.read_metadata_with_dmtime(file_path.as_ref()).await?;
-        Ok(data)
     }
 
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
@@ -1052,7 +1039,7 @@ impl LocalDisk {
 
             if entry.ends_with(STORAGE_FORMAT_FILE) {
                 let metadata = self
-                    .read_metadata(self.get_object_path(bucket, format!("{}/{}", &current, &entry).as_str())?)
+                    .read_metadata(bucket, format!("{}/{}", &current, &entry).as_str())
                     .await?;
 
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
@@ -1068,7 +1055,7 @@ impl LocalDisk {
 
                 out.write_obj(&MetaCacheEntry {
                     name: name.clone(),
-                    metadata,
+                    metadata: metadata.to_vec(),
                     ..Default::default()
                 })
                 .await?;
@@ -1135,14 +1122,14 @@ impl LocalDisk {
 
             let fname = format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE);
 
-            match self.read_metadata(self.get_object_path(&opts.bucket, fname.as_str())?).await {
+            match self.read_metadata(&opts.bucket, fname.as_str()).await {
                 Ok(res) => {
                     if is_dir_obj {
                         meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
                         meta.name.push_str(SLASH_SEPARATOR_STR);
                     }
 
-                    meta.metadata = res;
+                    meta.metadata = res.to_vec();
 
                     out.write_obj(&meta).await?;
 
@@ -1186,6 +1173,14 @@ impl LocalDisk {
         }
 
         Ok(())
+    }
+}
+
+pub struct ScanGuard(pub Arc<AtomicU32>);
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -1579,6 +1574,8 @@ impl DiskAPI for LocalDisk {
                 .as_str(),
             )?;
 
+            info!("check_parts: part_path: {:?}", &part_path);
+
             match lstat(&part_path).await {
                 Ok(st) => {
                     if st.is_dir() {
@@ -1593,6 +1590,8 @@ impl DiskAPI for LocalDisk {
                     resp.results[i] = CHECK_PART_SUCCESS;
                 }
                 Err(err) => {
+                    info!("check_parts: failed to stat file: {:?}, error: {:?}", &part_path, &err);
+
                     let e: DiskError = to_file_error(err).into();
 
                     if e == DiskError::FileNotFound {
@@ -1882,19 +1881,20 @@ impl DiskAPI for LocalDisk {
         let mut objs_returned = 0;
 
         if opts.base_dir.ends_with(SLASH_SEPARATOR_STR) {
-            let fpath = self.get_object_path(
-                &opts.bucket,
-                path_join_buf(&[
-                    format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR_STR), GLOBAL_DIR_SUFFIX).as_str(),
-                    STORAGE_FORMAT_FILE,
-                ])
-                .as_str(),
-            )?;
-
-            if let Ok(data) = self.read_metadata(fpath).await {
+            if let Ok(data) = self
+                .read_metadata(
+                    &opts.bucket,
+                    path_join_buf(&[
+                        format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR_STR), GLOBAL_DIR_SUFFIX).as_str(),
+                        STORAGE_FORMAT_FILE,
+                    ])
+                    .as_str(),
+                )
+                .await
+            {
                 let meta = MetaCacheEntry {
                     name: opts.base_dir.clone(),
-                    metadata: data,
+                    metadata: data.to_vec(),
                     ..Default::default()
                 };
                 out.write_obj(&meta).await?;
@@ -2541,13 +2541,36 @@ impl DiskAPI for LocalDisk {
         info.rotational = self.rotational;
         info.mount_path = self.path().to_str().unwrap().to_string();
         info.endpoint = self.endpoint.to_string();
-        info.scanning = self.scanning.load(Ordering::SeqCst) == 1;
+        info.scanning = self.scanning.load(Ordering::Acquire) == 1;
 
         if info.id.is_none() {
             info.id = self.get_disk_id().await.unwrap_or(None);
         }
 
         Ok(info)
+    }
+    #[tracing::instrument(skip(self))]
+    fn start_scan(&self) -> ScanGuard {
+        self.scanning.fetch_add(1, Ordering::Release);
+        ScanGuard(Arc::clone(&self.scanning))
+    }
+
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        // Try to use cached file content reading for better performance, with safe fallback
+        let file_path = self.get_object_path(volume, path)?;
+        // let file_path = file_path.join(Path::new(STORAGE_FORMAT_FILE));
+
+        // First, try the cache
+        if let Ok(bytes) = get_global_file_cache().get_file_content(file_path.clone()).await {
+            return Ok(bytes);
+        }
+
+        // Fallback to direct read if cache fails
+        let (data, _) = self.read_metadata_with_dmtime(&file_path).await.map_err(|e| {
+            error!("read_metadata: error: {:?}, file_path={}", e, file_path.to_string_lossy());
+            e
+        })?;
+        Ok(data.into())
     }
 }
 

@@ -183,7 +183,7 @@ impl HealChannelProcessor {
                 HealType::Object {
                     bucket: request.bucket.clone(),
                     object: prefix.clone(),
-                    version_id: None,
+                    version_id: request.object_version_id.clone(),
                 }
             } else {
                 HealType::Bucket {
@@ -366,6 +366,7 @@ mod tests {
             id: "test-id".to_string(),
             bucket: "test-bucket".to_string(),
             object_prefix: None,
+            object_version_id: None,
             disk: None,
             priority: HealChannelPriority::Normal,
             scan_mode: None,
@@ -394,6 +395,7 @@ mod tests {
             id: "test-id".to_string(),
             bucket: "test-bucket".to_string(),
             object_prefix: Some("test-object".to_string()),
+            object_version_id: None,
             disk: None,
             priority: HealChannelPriority::High,
             scan_mode: Some(HealScanMode::Deep),
@@ -425,6 +427,7 @@ mod tests {
             id: "test-id".to_string(),
             bucket: "test-bucket".to_string(),
             object_prefix: None,
+            object_version_id: None,
             disk: Some("pool_0_set_1".to_string()),
             priority: HealChannelPriority::Critical,
             scan_mode: None,
@@ -453,6 +456,7 @@ mod tests {
             id: "test-id".to_string(),
             bucket: "test-bucket".to_string(),
             object_prefix: None,
+            object_version_id: None,
             disk: Some("invalid-disk-id".to_string()),
             priority: HealChannelPriority::Normal,
             scan_mode: None,
@@ -488,6 +492,7 @@ mod tests {
                 id: "test-id".to_string(),
                 bucket: "test-bucket".to_string(),
                 object_prefix: None,
+                object_version_id: None,
                 disk: None,
                 priority: channel_priority,
                 scan_mode: None,
@@ -516,6 +521,7 @@ mod tests {
             id: "test-id".to_string(),
             bucket: "test-bucket".to_string(),
             object_prefix: None,
+            object_version_id: None,
             disk: None,
             priority: HealChannelPriority::Normal,
             scan_mode: None,
@@ -545,6 +551,7 @@ mod tests {
             id: "test-id".to_string(),
             bucket: "test-bucket".to_string(),
             object_prefix: Some("".to_string()), // Empty prefix should be treated as bucket heal
+            object_version_id: None,
             disk: None,
             priority: HealChannelPriority::Normal,
             scan_mode: None,

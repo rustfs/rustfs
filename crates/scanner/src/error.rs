@@ -12,10 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod bucket_lifecycle_audit;
-pub mod bucket_lifecycle_ops;
-pub mod evaluator;
-pub mod lifecycle;
-pub mod rule;
-pub mod tier_last_day_stats;
-pub mod tier_sweeper;
+use thiserror::Error;
+
+/// Scanner-related errors
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ScannerError {
+    /// Configuration error
+    #[error("Configuration error: {0}")]
+    Config(String),
+
+    /// I/O error
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Serialization error
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    /// Generic error
+    #[error("Scanner error: {0}")]
+    Other(String),
+}

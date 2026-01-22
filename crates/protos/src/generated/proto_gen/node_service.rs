@@ -438,6 +438,24 @@ pub struct DeletePathsResponse {
     pub error: ::core::option::Option<Error>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadMetadataRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub volume: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub path: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadMetadataResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, optional, tag = "2")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub data: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UpdateMetadataRequest {
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
@@ -1524,6 +1542,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "UpdateMetadata"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn read_metadata(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReadMetadataRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReadMetadataResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ReadMetadata");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ReadMetadata"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn write_metadata(
             &mut self,
             request: impl tonic::IntoRequest<super::WriteMetadataRequest>,
@@ -2403,6 +2436,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::UpdateMetadataRequest>,
         ) -> std::result::Result<tonic::Response<super::UpdateMetadataResponse>, tonic::Status>;
+        async fn read_metadata(
+            &self,
+            request: tonic::Request<super::ReadMetadataRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReadMetadataResponse>, tonic::Status>;
         async fn write_metadata(
             &self,
             request: tonic::Request<super::WriteMetadataRequest>,
@@ -3398,6 +3435,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = UpdateMetadataSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ReadMetadata" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReadMetadataSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ReadMetadataRequest> for ReadMetadataSvc<T> {
+                        type Response = super::ReadMetadataResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ReadMetadataRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::read_metadata(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReadMetadataSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
