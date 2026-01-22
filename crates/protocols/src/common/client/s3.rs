@@ -20,21 +20,21 @@ pub trait StorageBackend: Send + Sync {
     /// Error type for this storage backend
     type Error: std::error::Error + Send + Sync + 'static;
     /// Get object content and metadata
-    async fn get_object(&self, bucket: &str, key: &str) -> Result<GetObjectOutput, Self::Error>;
+    async fn get_object(&self, bucket: &str, key: &str, access_key: &str, secret_key: &str, start_pos: Option<u64>) -> Result<GetObjectOutput, Self::Error>;
     /// Put object content with metadata
-    async fn put_object(&self, input: PutObjectInput) -> Result<PutObjectOutput, Self::Error>;
+    async fn put_object(&self, input: PutObjectInput, access_key: &str, secret_key: &str) -> Result<PutObjectOutput, Self::Error>;
     /// Delete an object
-    async fn delete_object(&self, bucket: &str, key: &str) -> Result<DeleteObjectOutput, Self::Error>;
+    async fn delete_object(&self, bucket: &str, key: &str, access_key: &str, secret_key: &str) -> Result<DeleteObjectOutput, Self::Error>;
     /// Get object metadata without content
-    async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, Self::Error>;
+    async fn head_object(&self, bucket: &str, key: &str, access_key: &str, secret_key: &str) -> Result<HeadObjectOutput, Self::Error>;
     /// Check if bucket exists and get metadata
-    async fn head_bucket(&self, bucket: &str) -> Result<HeadBucketOutput, Self::Error>;
+    async fn head_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<HeadBucketOutput, Self::Error>;
     /// List objects in a bucket with pagination
-    async fn list_objects_v2(&self, input: ListObjectsV2Input) -> Result<ListObjectsV2Output, Self::Error>;
+    async fn list_objects_v2(&self, input: ListObjectsV2Input, access_key: &str, secret_key: &str) -> Result<ListObjectsV2Output, Self::Error>;
     /// List all buckets (requires authentication)
-    async fn list_buckets(&self, secret_key: &str) -> Result<ListBucketsOutput, Self::Error>;
+    async fn list_buckets(&self, access_key: &str, secret_key: &str) -> Result<ListBucketsOutput, Self::Error>;
     /// Create a new bucket
-    async fn create_bucket(&self, bucket: &str) -> Result<CreateBucketOutput, Self::Error>;
+    async fn create_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<CreateBucketOutput, Self::Error>;
     /// Delete a bucket (must be empty)
-    async fn delete_bucket(&self, bucket: &str) -> Result<DeleteBucketOutput, Self::Error>;
+    async fn delete_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<DeleteBucketOutput, Self::Error>;
 }

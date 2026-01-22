@@ -325,7 +325,7 @@ pub(crate) fn init_buffer_profile_system(opt: &config::Opt) {
 /// the server in a background task.s
 #[cfg(feature = "ftps")]
 #[instrument(skip_all)]
-pub async fn init_ftps_system() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
@@ -338,7 +338,7 @@ pub async fn init_ftps_system() -> Result<(), Box<dyn std::error::Error + Send +
         let ftps_enable = rustfs_utils::get_env_bool(ENV_FTPS_ENABLE, false);
         if !ftps_enable {
             debug!("FTPS system is disabled");
-            return Ok(());
+            return Ok(None);
         }
 
         // Parse FTPS address
@@ -365,7 +365,7 @@ pub async fn init_ftps_system() -> Result<(), Box<dyn std::error::Error + Send +
 
         // Create FTPS server with protocol storage client
         let fs = crate::storage::ecfs::FS::new();
-        let storage_client = ProtocolStorageClient::new(fs, "rustfsadmin".to_string());
+        let storage_client = ProtocolStorageClient::new(fs);
         let server: FtpsServer<crate::protocols::ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
 
         // Log server configuration
@@ -375,25 +375,25 @@ pub async fn init_ftps_system() -> Result<(), Box<dyn std::error::Error + Send +
             server.config().passive_ports
         );
 
-        // Start FTPS server in background task
-        // Note: FTPS server will handle its own shutdown gracefully
+        // Start FTPS server in background task with proper shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
         tokio::spawn(async move {
-            // Create a dummy shutdown receiver that never receives
-            let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
             if let Err(e) = server.start(shutdown_rx).await {
                 error!("FTPS server error: {}", e);
             }
+            info!("FTPS server shutdown completed");
         });
 
         info!("FTPS system initialized successfully");
-        Ok(())
+        Ok(Some(shutdown_tx))
     }
 
     #[cfg(not(feature = "ftps"))]
-    {
-        debug!("FTPS system not available (ftps feature not enabled)");
-        Ok(())
-    }
+{
+    debug!("FTPS system not available (ftps feature not enabled)");
+    Ok(None)
+}
 }
 
 /// Initialize the SFTP system
@@ -403,7 +403,7 @@ pub async fn init_ftps_system() -> Result<(), Box<dyn std::error::Error + Send +
 /// the server in a background task.
 #[cfg(feature = "sftp")]
 #[instrument(skip_all)]
-pub async fn init_sftp_system() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{ENV_SFTP_ADDRESS, ENV_SFTP_AUTHORIZED_KEYS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY};
@@ -413,7 +413,7 @@ pub async fn init_sftp_system() -> Result<(), Box<dyn std::error::Error + Send +
         let sftp_enable = rustfs_utils::get_env_bool(ENV_SFTP_ENABLE, false);
         if !sftp_enable {
             debug!("SFTP system is disabled");
-            return Ok(());
+            return Ok(None);
         }
 
         // Parse SFTP address
@@ -437,29 +437,29 @@ pub async fn init_sftp_system() -> Result<(), Box<dyn std::error::Error + Send +
 
         // Create SFTP server with protocol storage client
         let fs = crate::storage::ecfs::FS::new();
-        let storage_client = ProtocolStorageClient::new(fs, "rustfsadmin".to_string());
+        let storage_client = ProtocolStorageClient::new(fs);
         let server: SftpServer<crate::protocols::ProtocolStorageClient> = SftpServer::new(config, storage_client)?;
 
         // Log server configuration
         info!("SFTP server configured on {}", server.config().bind_addr);
 
-        // Start SFTP server in background task
-        // Note: SFTP server will handle its own shutdown gracefully
+        // Start SFTP server in background task with proper shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
         tokio::spawn(async move {
-            // Create a dummy shutdown receiver that never receives
-            let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
             if let Err(e) = server.start(shutdown_rx).await {
                 error!("SFTP server error: {}", e);
             }
+            info!("SFTP server shutdown completed");
         });
 
         info!("SFTP system initialized successfully");
-        Ok(())
+        Ok(Some(shutdown_tx))
     }
 
     #[cfg(not(feature = "sftp"))]
-    {
-        debug!("SFTP system not available (sftp feature not enabled)");
-        Ok(())
-    }
+{
+    debug!("SFTP system not available (sftp feature not enabled)");
+    Ok(None)
+}
 }

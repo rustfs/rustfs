@@ -99,9 +99,10 @@ where
         }
 
         let mut list_result = Vec::new();
-        let secret_key = &session_context.principal.user_identity.credentials.secret_key;
-
-        match self.storage.list_buckets(secret_key).await {
+        match self.storage.list_buckets(
+            &session_context.principal.user_identity.credentials.access_key,
+            &session_context.principal.user_identity.credentials.secret_key
+        ).await {
             Ok(output) => {
                 if let Some(buckets) = output.buckets {
                     for bucket in buckets {
@@ -145,15 +146,21 @@ where
 {
     type Metadata = FtpsMetadata;
 
-    async fn metadata<P: AsRef<Path> + Send>(&self, _user: &super::server::FtpsUser, path: P) -> Result<Self::Metadata> {
+    async fn metadata<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, path: P) -> Result<Self::Metadata> {
         let path_str = path.as_ref().to_string_lossy();
+        let session_context = &user.session_context;
 
         let (bucket, key) = self
             .parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         if let Some(key) = key {
-            match self.storage.head_object(&bucket, &key).await {
+            match self.storage.head_object(
+                &bucket,
+                &key,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key
+            ).await {
                 Ok(output) => {
                     let size = output.content_length.unwrap_or(0) as u64;
                     let modified = output.last_modified.map(|dt| {
@@ -176,7 +183,11 @@ where
         } else {
             // Directory metadata - use HeadBucket
             let bucket_clone = bucket.clone();
-            match self.storage.head_bucket(&bucket).await {
+            match self.storage.head_bucket(
+                &bucket,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key
+            ).await {
                 Ok(_) => Ok(FtpsMetadata {
                     size: 0,
                     modified: Some(std::time::SystemTime::now()),
@@ -226,7 +237,11 @@ where
                 Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
             })?;
 
-        match self.storage.list_objects_v2(list_input).await {
+        match self.storage.list_objects_v2(
+            list_input,
+            &session_context.principal.user_identity.credentials.access_key,
+            &session_context.principal.user_identity.credentials.secret_key
+        ).await {
             Ok(output) => {
                 let mut fileinfos = Vec::new();
 
@@ -286,11 +301,12 @@ where
 
     async fn get<P: AsRef<Path> + Send>(
         &self,
-        _user: &super::server::FtpsUser,
+        user: &super::server::FtpsUser,
         path: P,
-        _start_pos: u64,
+        start_pos: u64,
     ) -> Result<Box<dyn AsyncRead + Send + Sync + Unpin>> {
         let path_str = path.as_ref().to_string_lossy();
+        let session_context = &user.session_context;
 
         let (bucket, key) = self
             .parse_s3_path(&path_str)
@@ -298,7 +314,13 @@ where
 
         let key = key.ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot get directory"))?;
 
-        match self.storage.get_object(&bucket, &key).await {
+        match self.storage.get_object(
+            &bucket,
+            &key,
+            &session_context.principal.user_identity.credentials.access_key,
+            &session_context.principal.user_identity.credentials.secret_key,
+            Some(start_pos)  // Pass start_pos for range request
+        ).await {
             Ok(output) => {
                 let body = output
                     .body
@@ -331,16 +353,21 @@ where
         user: &super::server::FtpsUser,
         bytes: R,
         path: P,
-        _start_pos: u64,
+        start_pos: u64,
     ) -> Result<u64> {
         let path_str = path.as_ref().to_string_lossy();
+        let session_context = &user.session_context;
+
         let (bucket, key) = self
             .parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         let key = key.ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot put to directory"))?;
-        // Get session context from user
-        let session_context = &user.session_context;
+
+        // Check if this is an append operation (start_pos > 0)
+        if start_pos > 0 {
+            return Err(Error::new(ErrorKind::CommandNotImplemented, "Append operations (start_pos > 0) are not supported with S3 backend"));
+        }
 
         // Authorize the operation
         authorize_operation(session_context, &S3Action::PutObject, &bucket, Some(&key))
@@ -373,7 +400,11 @@ where
             .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build PutObjectInput"))?;
 
-        match self.storage.put_object(put_input).await {
+        match self.storage.put_object(
+            put_input,
+            &session_context.principal.user_identity.credentials.access_key,
+            &session_context.principal.user_identity.credentials.secret_key
+        ).await {
             Ok(_output) => {
                 Ok(file_size as u64) // Return the size of the uploaded object
             }
@@ -386,6 +417,7 @@ where
 
     async fn del<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         let path_str = path.as_ref().to_string_lossy();
+        let session_context = &user.session_context;
         debug!("FTPS delete request for user '{}' path '{}'", user.username, path_str);
 
         let (bucket, key) = self
@@ -394,7 +426,12 @@ where
 
         if let Some(key) = key {
             // Delete file
-            match self.storage.delete_object(&bucket, &key).await {
+            match self.storage.delete_object(
+                &bucket,
+                &key,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key
+            ).await {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     error!("Failed to delete file '{}': {}", path_str, e);
@@ -409,6 +446,7 @@ where
 
     async fn mkd<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         let path_str = path.as_ref().to_string_lossy();
+        let session_context = &user.session_context;
         debug!("FTPS mkdir request for user '{}' path '{}'", user.username, path_str);
 
         let (bucket, _key) = self
@@ -416,7 +454,11 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Create bucket for directory
-        match self.storage.create_bucket(&bucket).await {
+        match self.storage.create_bucket(
+            &bucket,
+            &session_context.principal.user_identity.credentials.access_key,
+            &session_context.principal.user_identity.credentials.secret_key
+        ).await {
             Ok(_) => {
                 debug!("Successfully created directory/bucket '{}'", path_str);
                 Ok(())
@@ -428,14 +470,20 @@ where
         }
     }
 
-    async fn rmd<P: AsRef<Path> + Send>(&self, _user: &super::server::FtpsUser, path: P) -> Result<()> {
+    async fn rmd<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         let path_str = path.as_ref().to_string_lossy();
+        let session_context = &user.session_context;
+
         let (bucket, _key) = self
             .parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Delete bucket for directory
-        match self.storage.delete_bucket(&bucket).await {
+        match self.storage.delete_bucket(
+            &bucket,
+            &session_context.principal.user_identity.credentials.access_key,
+            &session_context.principal.user_identity.credentials.secret_key
+        ).await {
             Ok(_) => {
                 debug!("Successfully removed directory/bucket '{}'", path_str);
                 Ok(())
@@ -447,14 +495,20 @@ where
         }
     }
 
-    async fn cwd<P: AsRef<Path> + Send>(&self, _user: &super::server::FtpsUser, path: P) -> Result<()> {
+    async fn cwd<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         let path_str = path.as_ref().to_string_lossy();
+        let session_context = &user.session_context;
+
         let (bucket, _key) = self
             .parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Check if bucket exists
-        match self.storage.head_bucket(&bucket).await {
+        match self.storage.head_bucket(
+            &bucket,
+            &session_context.principal.user_identity.credentials.access_key,
+            &session_context.principal.user_identity.credentials.secret_key
+        ).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 error!("CWD to '{}' failed: {}", path_str, e);

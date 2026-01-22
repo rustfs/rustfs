@@ -30,6 +30,12 @@ mod version;
 use crate::init::{
     add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
 };
+
+#[cfg(feature = "ftps")]
+use crate::init::init_ftps_system;
+#[cfg(feature = "sftp")]
+use crate::init::init_sftp_system;
+
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
@@ -71,10 +77,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(feature = "ftps")]
-use crate::init::init_ftps_system;
-#[cfg(feature = "sftp")]
-use crate::init::init_sftp_system;
 
 fn main() -> Result<()> {
     let runtime = server::get_tokio_runtime_builder()
@@ -273,16 +275,43 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Initialize FTPS system if enabled
     #[cfg(feature = "ftps")]
-    match init_ftps_system().await {
-        Ok(_) => info!("FTPS system initialized successfully"),
-        Err(e) => error!("Failed to initialize FTPS system: {}", e),
-    }
+    let ftps_shutdown_tx = match init_ftps_system().await {
+        Ok(Some(tx)) => {
+            info!("FTPS system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("FTPS system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize FTPS system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "ftps"))]
+    let ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+
     // Initialize SFTP system if enabled
     #[cfg(feature = "sftp")]
-    match init_sftp_system().await {
-        Ok(_) => info!("SFTP system initialized successfully"),
-        Err(e) => error!("Failed to initialize SFTP system: {}", e),
-    }
+    let sftp_shutdown_tx = match init_sftp_system().await {
+        Ok(Some(tx)) => {
+            info!("SFTP system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("SFTP system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize SFTP system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "sftp"))]
+    let sftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
 
     // Initialize buffer profiling system
     init_buffer_profile_system(&opt);
@@ -391,11 +420,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ftps_shutdown_tx, sftp_shutdown_tx, ctx.clone()).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ftps_shutdown_tx, sftp_shutdown_tx, ctx.clone()).await;
         }
     }
 
@@ -408,6 +437,8 @@ async fn handle_shutdown(
     state_manager: &ServiceStateManager,
     s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    sftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -441,6 +472,23 @@ async fn handle_shutdown(
             target: "rustfs::main::handle_shutdown",
             "Background services were disabled, skipping AHM shutdown"
         );
+    }
+
+    // Shutdown FTPS and SFTP servers
+    if let Some(ftps_shutdown_tx) = ftps_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down FTPS server..."
+        );
+        let _ = ftps_shutdown_tx.send(());
+    }
+
+    if let Some(sftp_shutdown_tx) = sftp_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down SFTP server..."
+        );
+        let _ = sftp_shutdown_tx.send(());
     }
 
     // Stop the notification system
