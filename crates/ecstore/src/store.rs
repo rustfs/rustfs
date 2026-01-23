@@ -69,6 +69,7 @@ use rand::Rng as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
+use rustfs_lock::FastLockGuard;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
@@ -1204,6 +1205,10 @@ lazy_static! {
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
     #[instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
+        self.pools[0].new_ns_lock(bucket, object).await
+    }
+    #[instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
         let (standard_sc_parity, rr_sc_parity) = {
             if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
@@ -1825,16 +1830,16 @@ impl StorageAPI for ECStore {
             if self.is_suspended(pool.pool_idx).await {
                 continue;
             }
-            match pool
+            return match pool
                 .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
                 .await
             {
-                Ok(res) => return Ok(res),
+                Ok(res) => Ok(res),
                 Err(err) => {
                     if is_err_invalid_upload_id(&err) {
                         continue;
                     }
-                    return Err(err);
+                    Err(err)
                 }
             };
         }
@@ -2204,7 +2209,7 @@ impl StorageAPI for ECStore {
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
         check_del_obj_args(bucket, object)?;
 
-        let object = rustfs_utils::path::encode_dir_object(object);
+        let object = encode_dir_object(object);
 
         if self.single_pool() {
             return self.pools[0]
@@ -2324,17 +2329,15 @@ impl StorageAPI for ECStore {
 
         // No pool returned a nil error, return the first non 'not found' error
         for (index, err) in errs.iter().enumerate() {
-            match err {
+            return match err {
                 Some(err) => {
                     if is_err_object_not_found(err) || is_err_version_not_found(err) {
                         continue;
                     }
-                    return Ok((ress.remove(index), Some(err.clone())));
+                    Ok((ress.remove(index), Some(err.clone())))
                 }
-                None => {
-                    return Ok((ress.remove(index), None));
-                }
-            }
+                None => Ok((ress.remove(index), None)),
+            };
         }
 
         // At this stage, all errors are 'not found'

@@ -32,6 +32,7 @@ pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
 use crate::disk::disk_store::LocalDiskWrapper;
+use crate::disk::local::ScanGuard;
 use crate::rpc::RemoteDisk;
 use bytes::Bytes;
 use endpoint::Endpoint;
@@ -395,6 +396,20 @@ impl DiskAPI for Disk {
             Disk::Remote(remote_disk) => remote_disk.disk_info(opts).await,
         }
     }
+
+    fn start_scan(&self) -> ScanGuard {
+        match self {
+            Disk::Local(local_disk) => local_disk.start_scan(),
+            Disk::Remote(remote_disk) => remote_disk.start_scan(),
+        }
+    }
+
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        match self {
+            Disk::Local(local_disk) => local_disk.read_metadata(volume, path).await,
+            Disk::Remote(remote_disk) => remote_disk.read_metadata(volume, path).await,
+        }
+    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
@@ -458,6 +473,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -489,6 +505,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
+    fn start_scan(&self) -> ScanGuard;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -692,6 +709,10 @@ pub fn conv_part_err_to_int(err: &Option<Error>) -> usize {
 
 pub fn has_part_err(part_errs: &[usize]) -> bool {
     part_errs.iter().any(|err| *err != CHECK_PART_SUCCESS)
+}
+
+pub fn count_part_not_success(part_errs: &[usize]) -> usize {
+    part_errs.iter().filter(|err| **err != CHECK_PART_SUCCESS).count()
 }
 
 #[cfg(test)]

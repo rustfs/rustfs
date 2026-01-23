@@ -13,8 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
-
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
@@ -44,17 +42,17 @@ use rustfs_common::{
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
-
+use rustfs_lock::FastLockGuard;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
-
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{error, info};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Sets {
@@ -366,6 +364,10 @@ impl ObjectIO for Sets {
 
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
+    #[tracing::instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
+        self.disk_set[0].new_ns_lock(bucket, object).await
+    }
     #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
         unimplemented!()

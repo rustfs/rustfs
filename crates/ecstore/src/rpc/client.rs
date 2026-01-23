@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::error::Error;
-
+use crate::rpc::{TONIC_RPC_PREFIX, gen_signature_headers};
 use http::Method;
 use rustfs_common::GLOBAL_CONN_MAP;
 use rustfs_protos::{create_new_channel, proto_gen::node_service::node_service_client::NodeServiceClient};
+use std::error::Error;
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
 use tracing::debug;
-
-use crate::rpc::{TONIC_RPC_PREFIX, gen_signature_headers};
 
 /// 3. Subsequent calls will attempt fresh connections
 /// 4. If node is still down, connection will fail fast (3s timeout)

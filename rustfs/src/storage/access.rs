@@ -68,6 +68,16 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                     deny_only: false,
                 })
                 .await
+            && !PolicySys::is_allowed(&BucketPolicyArgs {
+                bucket: req_info.bucket.as_deref().unwrap_or(""),
+                action: Action::S3Action(S3Action::DeleteObjectVersionAction),
+                is_owner: req_info.is_owner,
+                account: &cred.access_key,
+                groups: &cred.groups,
+                conditions: &conditions,
+                object: req_info.object.as_deref().unwrap_or(""),
+            })
+            .await
         {
             return Err(s3_error!(AccessDenied, "Access Denied"));
         }
@@ -89,8 +99,22 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             return Ok(());
         }
 
-        if action == Action::S3Action(S3Action::ListBucketVersionsAction)
-            && iam_store
+        if PolicySys::is_allowed(&BucketPolicyArgs {
+            bucket: req_info.bucket.as_deref().unwrap_or(""),
+            action,
+            is_owner: req_info.is_owner,
+            account: &cred.access_key,
+            groups: &cred.groups,
+            conditions: &conditions,
+            object: req_info.object.as_deref().unwrap_or(""),
+        })
+        .await
+        {
+            return Ok(());
+        }
+
+        if action == Action::S3Action(S3Action::ListBucketVersionsAction) {
+            if iam_store
                 .is_allowed(&Args {
                     account: &cred.access_key,
                     groups: &cred.groups,
@@ -103,8 +127,23 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                     deny_only: false,
                 })
                 .await
-        {
-            return Ok(());
+            {
+                return Ok(());
+            }
+
+            if PolicySys::is_allowed(&BucketPolicyArgs {
+                bucket: req_info.bucket.as_deref().unwrap_or(""),
+                action: Action::S3Action(S3Action::ListBucketAction),
+                is_owner: req_info.is_owner,
+                account: &cred.access_key,
+                groups: &cred.groups,
+                conditions: &conditions,
+                object: req_info.object.as_deref().unwrap_or(""),
+            })
+            .await
+            {
+                return Ok(());
+            }
         }
     } else {
         let conditions = get_condition_values(
@@ -303,7 +342,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketCorsAction)).await
+        authorize_request(req, Action::S3Action(S3Action::DeleteBucketCorsAction)).await
     }
 
     /// Checks whether the DeleteBucketEncryption request has accesses to the resources.
@@ -817,11 +856,14 @@ impl S3Access for FS {
         authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await
     }
 
-    /// Checks whether the ListObjectVersions request has accesses to the resources.
+    /// Checks whether the `ListObjectVersions` request is authorized for the requested bucket.
     ///
-    /// This method returns `Ok(())` by default.
-    async fn list_object_versions(&self, _req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
-        Ok(())
+    /// Returns `Ok(())` if the request is allowed, or an error if access is denied or another
+    /// authorization-related issue occurs.
+    async fn list_object_versions(&self, req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
     }
 
     /// Checks whether the ListObjects request has accesses to the resources.

@@ -617,11 +617,7 @@ impl FileMeta {
     // delete_version deletes version, returns data_dir
     #[tracing::instrument(skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
-        let vid = if fi.version_id.is_none() {
-            Some(Uuid::nil())
-        } else {
-            Some(fi.version_id.unwrap())
-        };
+        let vid = fi.version_id.or(Some(Uuid::nil()));
 
         let mut ventry = FileMetaVersion::default();
         if fi.deleted {
@@ -1003,6 +999,41 @@ impl FileMeta {
         } else {
             Err(Error::FileVersionNotFound)
         }
+    }
+
+    pub fn get_file_info_versions(&self, volume: &str, path: &str, include_free_versions: bool) -> Result<FileInfoVersions> {
+        let mut versions = self.into_file_info_versions(volume, path, true)?;
+
+        let mut n = 0;
+
+        let mut versions_vec = Vec::new();
+
+        for fi in versions.versions.iter() {
+            if fi.tier_free_version() {
+                if !include_free_versions {
+                    versions.free_versions.push(fi.clone());
+                }
+            } else {
+                if !include_free_versions {
+                    versions_vec.push(fi.clone());
+                }
+                n += 1;
+            }
+        }
+
+        if !include_free_versions {
+            versions.versions = versions_vec;
+        }
+
+        for fi in versions.free_versions.iter_mut() {
+            fi.num_versions = n;
+        }
+
+        Ok(versions)
+    }
+
+    pub fn get_all_file_info_versions(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfoVersions> {
+        self.into_file_info_versions(volume, path, all_parts)
     }
 
     pub fn into_file_info_versions(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfoVersions> {
@@ -1694,15 +1725,13 @@ impl From<FileMetaVersion> for FileMetaVersionHeader {
             f
         };
 
-        let (ec_n, ec_m) = {
-            if value.version_type == VersionType::Object && value.object.is_some() {
-                (
-                    value.object.as_ref().unwrap().erasure_n as u8,
-                    value.object.as_ref().unwrap().erasure_m as u8,
-                )
-            } else {
-                (0, 0)
-            }
+        let (ec_n, ec_m) = if value.version_type == VersionType::Object {
+            value
+                .object
+                .as_ref()
+                .map_or((0, 0), |o| (o.erasure_n as u8, o.erasure_m as u8))
+        } else {
+            (0, 0)
         };
 
         Self {

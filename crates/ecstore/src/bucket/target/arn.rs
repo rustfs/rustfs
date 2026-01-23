@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::BucketTargetType;
+use crate::bucket::target::BucketTargetType;
 use std::fmt::Display;
 use std::str::FromStr;
 

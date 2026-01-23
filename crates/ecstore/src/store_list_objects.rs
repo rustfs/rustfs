@@ -34,7 +34,7 @@ use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
 };
-use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
+use rustfs_utils::path::{self, SLASH_SEPARATOR_STR, base_dir_from_prefix};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self};
@@ -132,7 +132,7 @@ impl ListPathOptions {
             return;
         }
 
-        let s = SLASH_SEPARATOR.chars().next().unwrap_or_default();
+        let s = SLASH_SEPARATOR_STR.chars().next().unwrap_or_default();
         self.filter_prefix = {
             let fp = self.prefix.trim_start_matches(&self.base_dir).trim_matches(s);
 
@@ -346,7 +346,7 @@ impl ECStore {
             if let Some(delimiter) = &delimiter {
                 if obj.is_dir && obj.mod_time.is_none() {
                     let mut found = false;
-                    if delimiter != SLASH_SEPARATOR {
+                    if delimiter != SLASH_SEPARATOR_STR {
                         for p in prefixes.iter() {
                             if found {
                                 break;
@@ -410,13 +410,13 @@ impl ECStore {
             ..Default::default()
         };
 
-        let mut list_result = match self.list_path(&opts).await {
-            Ok(res) => res,
-            Err(err) => MetaCacheEntriesSortedResult {
+        let mut list_result = self
+            .list_path(&opts)
+            .await
+            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
                 err: Some(err.into()),
                 ..Default::default()
-            },
-        };
+            });
 
         if let Some(err) = list_result.err.clone()
             && err != rustfs_filemeta::Error::Unexpected
@@ -427,6 +427,13 @@ impl ECStore {
         if let Some(result) = list_result.entries.as_mut() {
             result.forward_past(opts.marker);
         }
+
+        // Check if list_path returned entries equal to limit, which indicates more objects exist
+        // This is more accurate than checking get_objects.len() because get_objects may be filtered
+        // (e.g., directories filtered out), so its length may be less than the actual entries count
+        // We need to check this before calling from_meta_cache_entries_sorted_versions which consumes entries
+        let entries_count = list_result.entries.as_ref().map(|e| e.entries().len()).unwrap_or(0);
+        let limit = opts.limit;
 
         let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
@@ -441,7 +448,11 @@ impl ECStore {
             if max_keys > 0 && get_objects.len() > max_keys as usize {
                 get_objects.truncate(max_keys as usize);
                 true
+            } else if entries_count >= limit as usize {
+                // If entries count equals limit, there are more objects
+                true
             } else {
+                // Otherwise, check if there are any objects and no error
                 list_result.err.is_none() && !get_objects.is_empty()
             }
         };
@@ -470,7 +481,7 @@ impl ECStore {
             if let Some(delimiter) = &delimiter {
                 if obj.is_dir && obj.mod_time.is_none() {
                     let mut found = false;
-                    if delimiter != SLASH_SEPARATOR {
+                    if delimiter != SLASH_SEPARATOR_STR {
                         for p in prefixes.iter() {
                             if found {
                                 break;
@@ -502,7 +513,7 @@ impl ECStore {
         // warn!("list_path opt {:?}", &o);
 
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
-        // if opts.prefix.ends_with(SLASH_SEPARATOR) {
+        // if opts.prefix.ends_with(SLASH_SEPARATOR_STR) {
         //     return Err(Error::msg("eof"));
         // }
 
@@ -520,11 +531,11 @@ impl ECStore {
             return Err(Error::Unexpected);
         }
 
-        if o.prefix.starts_with(SLASH_SEPARATOR) {
+        if o.prefix.starts_with(SLASH_SEPARATOR_STR) {
             return Err(Error::Unexpected);
         }
 
-        let slash_separator = Some(SLASH_SEPARATOR.to_owned());
+        let slash_separator = Some(SLASH_SEPARATOR_STR.to_owned());
 
         o.include_directories = o.separator == slash_separator;
 
@@ -774,8 +785,8 @@ impl ECStore {
                     let mut filter_prefix = {
                         prefix
                             .trim_start_matches(&path)
-                            .trim_start_matches(SLASH_SEPARATOR)
-                            .trim_end_matches(SLASH_SEPARATOR)
+                            .trim_start_matches(SLASH_SEPARATOR_STR)
+                            .trim_end_matches(SLASH_SEPARATOR_STR)
                             .to_owned()
                     };
 
@@ -988,7 +999,7 @@ async fn gather_results(
         }
 
         if let Some(marker) = &opts.marker
-            && &entry.name < marker
+            && &entry.name <= marker
         {
             continue;
         }
@@ -1130,7 +1141,7 @@ async fn merge_entry_channels(
                     if path::clean(&best_entry.name) == path::clean(&other_entry.name) {
                         let dir_matches = best_entry.is_dir() && other_entry.is_dir();
                         let suffix_matches =
-                            best_entry.name.ends_with(SLASH_SEPARATOR) == other_entry.name.ends_with(SLASH_SEPARATOR);
+                            best_entry.name.ends_with(SLASH_SEPARATOR_STR) == other_entry.name.ends_with(SLASH_SEPARATOR_STR);
 
                         if dir_matches && suffix_matches {
                             to_merge.push(other_idx);
@@ -1476,7 +1487,6 @@ mod test {
     // use crate::error::Error;
     // use crate::metacache::writer::MetacacheReader;
     // use crate::set_disk::SetDisks;
-    // use crate::store::ECStore;
     // use crate::store_list_objects::ListPathOptions;
     // use crate::store_list_objects::WalkOptions;
     // use crate::store_list_objects::WalkVersionsSortOrder;

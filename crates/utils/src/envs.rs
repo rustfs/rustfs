@@ -363,14 +363,23 @@ pub fn get_env_opt_str(key: &str) -> Option<String> {
 /// - `bool`: The parsed boolean value if successful, otherwise the default value.
 ///
 pub fn get_env_bool(key: &str, default: bool) -> bool {
-    env::var(key)
-        .ok()
-        .and_then(|v| match v.to_lowercase().as_str() {
-            "1" | "t" | "T" | "true" | "TRUE" | "True" | "on" | "ON" | "On" | "enabled" => Some(true),
-            "0" | "f" | "F" | "false" | "FALSE" | "False" | "off" | "OFF" | "Off" | "disabled" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(default)
+    env::var(key).ok().and_then(|v| parse_bool_str(&v)).unwrap_or(default)
+}
+
+/// Parse a string into a boolean value.
+///
+/// #Parameters
+/// - `s`: The string to parse.
+///
+/// #Returns
+/// - `Option<bool>`: The parsed boolean value if successful, otherwise None.
+///
+fn parse_bool_str(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "t" | "true" | "on" | "yes" | "ok" | "success" | "active" | "enabled" => Some(true),
+        "0" | "f" | "false" | "off" | "no" | "not_ok" | "failure" | "inactive" | "disabled" => Some(false),
+        _ => None,
+    }
 }
 
 /// Retrieve an environment variable as a boolean, returning None if not set or parsing fails.
@@ -382,9 +391,5 @@ pub fn get_env_bool(key: &str, default: bool) -> bool {
 /// - `Option<bool>`: The parsed boolean value if successful, otherwise None.
 ///
 pub fn get_env_opt_bool(key: &str) -> Option<bool> {
-    env::var(key).ok().and_then(|v| match v.to_lowercase().as_str() {
-        "1" | "t" | "T" | "true" | "TRUE" | "True" | "on" | "ON" | "On" | "enabled" => Some(true),
-        "0" | "f" | "F" | "false" | "FALSE" | "False" | "off" | "OFF" | "Off" | "disabled" => Some(false),
-        _ => None,
-    })
+    env::var(key).ok().and_then(|v| parse_bool_str(&v))
 }

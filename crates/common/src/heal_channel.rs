@@ -50,7 +50,7 @@ impl Display for HealItemType {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum DriveState {
     Ok,
     Offline,
@@ -59,7 +59,7 @@ pub enum DriveState {
     PermissionDenied,
     Faulty,
     RootMount,
-    Unknown,
+    Unknown(String),
     Unformatted, // only returned by disk
 }
 
@@ -73,8 +73,24 @@ impl DriveState {
             DriveState::PermissionDenied => "permission-denied",
             DriveState::Faulty => "faulty",
             DriveState::RootMount => "root-mount",
-            DriveState::Unknown => "unknown",
+            DriveState::Unknown(reason) => reason,
             DriveState::Unformatted => "unformatted",
+        }
+    }
+}
+
+impl Clone for DriveState {
+    fn clone(&self) -> Self {
+        match self {
+            DriveState::Unknown(reason) => DriveState::Unknown(reason.clone()),
+            DriveState::Ok => DriveState::Ok,
+            DriveState::Offline => DriveState::Offline,
+            DriveState::Corrupt => DriveState::Corrupt,
+            DriveState::Missing => DriveState::Missing,
+            DriveState::PermissionDenied => DriveState::PermissionDenied,
+            DriveState::Faulty => DriveState::Faulty,
+            DriveState::RootMount => DriveState::RootMount,
+            DriveState::Unformatted => DriveState::Unformatted,
         }
     }
 }
@@ -212,6 +228,8 @@ pub struct HealChannelRequest {
     pub bucket: String,
     /// Object prefix (optional)
     pub object_prefix: Option<String>,
+    /// Object version ID (optional)
+    pub object_version_id: Option<String>,
     /// Force start heal
     pub force_start: bool,
     /// Priority
@@ -346,6 +364,7 @@ pub fn create_heal_request(
         id: Uuid::new_v4().to_string(),
         bucket,
         object_prefix,
+        object_version_id: None,
         force_start,
         priority: priority.unwrap_or_default(),
         pool_index: None,
@@ -374,6 +393,7 @@ pub fn create_heal_request_with_options(
         id: Uuid::new_v4().to_string(),
         bucket,
         object_prefix,
+        object_version_id: None,
         force_start,
         priority: priority.unwrap_or_default(),
         pool_index,
@@ -501,6 +521,7 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
         bucket: "".to_string(),
         object_prefix: None,
         disk: Some(set_disk_id),
+        object_version_id: None,
         force_start: false,
         priority: priority.unwrap_or_default(),
         pool_index: None,
