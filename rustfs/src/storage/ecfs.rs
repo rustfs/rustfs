@@ -4985,7 +4985,7 @@ impl S3 for FS {
 
         let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
 
-        let uploaded_parts = multipart_upload
+        let uploaded_parts_vec = multipart_upload
             .parts
             .unwrap_or_default()
             .into_iter()
@@ -4993,9 +4993,23 @@ impl S3 for FS {
             .collect::<Vec<_>>();
 
         // is part number sorted?
-        if !uploaded_parts.is_sorted_by_key(|p| p.part_num) {
+        if !uploaded_parts_vec.is_sorted_by_key(|p| p.part_num) {
             return Err(s3_error!(InvalidPart, "Part numbers must be sorted"));
         }
+
+        // Handle duplicate part numbers: according to S3 specification, when the same part number
+        // is uploaded multiple times, the last uploaded part (in the list order) should be used.
+        // This can happen in concurrent upload scenarios where a part is re-uploaded before completion.
+        // We deduplicate by keeping the last occurrence of each part number using a HashMap.
+        use std::collections::HashMap;
+        let mut part_map: HashMap<usize, CompletePart> = HashMap::new();
+        for part in uploaded_parts_vec {
+            part_map.insert(part.part_num, part);
+        }
+
+        // Reconstruct the parts list in sorted order, keeping only the last occurrence of each part number
+        let mut uploaded_parts: Vec<CompletePart> = part_map.into_values().collect();
+        uploaded_parts.sort_by_key(|p| p.part_num);
 
         // TODO: check object lock
 
