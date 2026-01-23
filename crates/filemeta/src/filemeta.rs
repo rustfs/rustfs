@@ -1725,16 +1725,13 @@ impl From<FileMetaVersion> for FileMetaVersionHeader {
             f
         };
 
-        let (ec_n, ec_m) = {
-            if value.version_type == VersionType::Object {
-                if let Some(obj) = &value.object {
-                    (obj.erasure_n as u8, obj.erasure_m as u8)
-                } else {
-                    (0, 0)
-                }
-            } else {
-                (0, 0)
-            }
+        let (ec_n, ec_m) = if value.version_type == VersionType::Object {
+            value
+                .object
+                .as_ref()
+                .map_or((0, 0), |obj| (obj.erasure_n as u8, obj.erasure_m as u8))
+        } else {
+            (0, 0)
         };
 
         Self {
