@@ -4641,9 +4641,9 @@ impl StorageAPI for SetDisks {
 
         let (metas, errs) = {
             if let Some(vid) = opts.version_id.as_ref() {
-                Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), true, false).await?
+                Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), false, false).await?
             } else {
-                Self::read_all_xl(&disks, bucket, object, true, false).await
+                Self::read_all_xl(&disks, bucket, object, false, false).await
             }
         };
 
