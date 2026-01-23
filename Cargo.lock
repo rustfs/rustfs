@@ -5646,9 +5646,9 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.30.1"
+version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+checksum = "225e7cfe711e0ba79a68baeddb2982723e4235247aefce1482f2f16c27865b66"
 dependencies = [
  "bitflags 2.10.0",
  "cfg-if",
@@ -5923,9 +5923,9 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.12.4"
+version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c1be0c6c22ec0817cdc77d3842f721a17fd30ab6965001415b5402a74e6b740"
+checksum = "fbfbfff40aeccab00ec8a910b57ca8ecf4319b335c542f2edcd19dd25a1e2a00"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7162,9 +7162,9 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
-version = "0.14.6"
+version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ec0a99f2de91c3cddc84b37e7db80e4d96b743e05607f647eb236fc0455907f"
+checksum = "10b99e0098aa4082912d4c649628623db6aba77335e4f4569ff5083a6448b32e"
 dependencies = [
  "pem",
  "ring",
@@ -8339,7 +8339,7 @@ dependencies = [
  "lz4",
  "md-5 0.11.0-rc.3",
  "netif",
- "nix 0.30.1",
+ "nix 0.31.1",
  "rand 0.10.0-rc.6",
  "regex",
  "rustfs-config",
@@ -8970,9 +8970,9 @@ dependencies = [
 
 [[package]]
 name = "shadow-rs"
-version = "1.5.0"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff351910f271e7065781b6b4f0f43cb515d474d812f31176a0246d9058e47d5d"
+checksum = "9b6fc9c7545235794143a8a63c1388de47039e859b90973cdc69be3649350d0d"
 dependencies = [
  "cargo_metadata",
  "const_format",
@@ -9187,9 +9187,9 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
 name = "socket2"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17129e116933cf371d018bb80ae557e889637989d8638274fb25622827b03881"
+checksum = "86f4aa3ad99f2088c990dfa82d367e19cb29268ed67c574d10d0a4bfe71f07e0"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
@@ -9814,6 +9814,7 @@ checksum = "f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd"
 dependencies = [
  "deranged",
  "itoa",
+ "js-sys",
  "libc",
  "num-conv",
  "num_threads",
@@ -10278,6 +10279,12 @@ name = "twox-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+
+[[package]]
+name = "typed-path"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e43ffa54726cdc9ea78392023ffe9fe9cf9ac779e1c6fcb0d23f9862e3879d20"
 
 [[package]]
 name = "typeid"
@@ -11291,9 +11298,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.1.0"
+version = "7.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9013f1222db8a6d680f13a7ccdc60a781199cd09c2fa4eff58e728bb181757fc"
+checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
 dependencies = [
  "aes 0.8.4",
  "bzip2",
@@ -11311,6 +11318,7 @@ dependencies = [
  "ppmd-rust",
  "sha1 0.10.6",
  "time",
+ "typed-path",
  "zeroize",
  "zopfli",
  "zstd",
