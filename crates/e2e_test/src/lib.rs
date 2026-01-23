@@ -50,3 +50,5 @@ mod policy;
 
 #[cfg(test)]
 mod protocols;
+#[cfg(test)]
+mod compression_test;
