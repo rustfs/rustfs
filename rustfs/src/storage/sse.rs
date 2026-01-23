@@ -301,8 +301,11 @@ pub struct EncryptionRequest<'a> {
     pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
     /// Content size (for metadata)
     pub content_size: i64,
+
     /// Part number (for multipart upload, None for single-part)
     pub part_number: Option<usize>,
+    pub part_key: Option<String>,
+    pub part_nonce: Option<String>,
 }
 
 impl EncryptionRequest<'_> {
@@ -528,6 +531,8 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
             sse_config.effective_kms_key_id,
             request.content_size,
             request.part_number,
+            request.part_key,
+            request.part_nonce,
         )
         .await
         .map(Some);
@@ -644,6 +649,8 @@ async fn apply_ssec_encryption_material(
 
     // Build metadata
     let mut metadata = HashMap::new();
+
+    metadata.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
     metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), validated.algorithm.clone());
     metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), validated.key_md5.clone());
     metadata.insert(
@@ -716,6 +723,7 @@ async fn apply_ssec_decryption_material(
 // Internal Implementation - Managed SSE (SSE-S3 / SSE-KMS)
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_managed_encryption_material(
     bucket: &str,
     key: &str,
@@ -723,6 +731,8 @@ async fn apply_managed_encryption_material(
     kms_key_id: Option<SSEKMSKeyId>,
     content_size: i64,
     part_number: Option<usize>,
+    part_key: Option<String>,
+    part_nonce: Option<String>,
 ) -> Result<EncryptionMaterial, ApiError> {
     // For multipart, we only generate keys at CompleteMultipartUpload
     // During UploadPart, we use the same base nonce with incremented counter
@@ -759,12 +769,42 @@ async fn apply_managed_encryption_material(
         .clone()
         .ok_or_else(|| ApiError::from(StorageError::other("No KMS key available for managed server-side encryption")))?;
 
-    // Use factory pattern to get provider (test or production mode)
     let provider = get_sse_dek_provider().await?;
-    let (data_key, encrypted_data_key) = provider
-        .generate_sse_dek(bucket, key, &kms_key_to_use)
-        .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {e}"))))?;
+
+    let (data_key, encrypted_data_key) = if let Some(part_number) = part_number
+        && let Some(part_nonce) = part_nonce
+        && let Some(part_key) = part_key
+        && part_number > 1
+    {
+        let _base_nonce = BASE64_STANDARD
+            .decode(part_nonce.as_bytes())
+            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decode nonce: {e}"))))?;
+        if _base_nonce.len() != 12 {
+            return Err(ApiError::from(StorageError::other("Invalid encryption nonce length; expected 12 bytes")));
+        }
+        let mut base_nonce_array = [0u8; 12];
+        base_nonce_array.copy_from_slice(&_base_nonce[..12]);
+        let encrypted_data_key = BASE64_STANDARD
+            .decode(part_key.as_bytes())
+            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decode data key: {e}"))))?;
+        let _data_key = provider
+            .decrypt_sse_dek(encrypted_data_key.as_slice(), &kms_key_to_use)
+            .await?;
+        let data_key = DataKey {
+            plaintext_key: _data_key,
+            nonce: derive_part_nonce(base_nonce_array, part_number),
+        };
+
+        // load original data key from metadata
+        (data_key, encrypted_data_key)
+    } else {
+        // Use factory pattern to get provider (test or production mode)
+        let (data_key, encrypted_data_key) = provider
+            .generate_sse_dek(bucket, key, &kms_key_to_use)
+            .await
+            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {e}"))))?;
+        (data_key, encrypted_data_key)
+    };
 
     let algorithm = DEFAULT_SSE_ALGORITHM.to_string();
 
@@ -1220,6 +1260,15 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
     Ok(provider)
 }
 
+// check encryption metadata
+pub fn check_encryption_metadata(metadata: &HashMap<String, String>) -> bool {
+    if !metadata.contains_key("x-rustfs-encryption-key") && !metadata.contains_key("x-amz-server-side-encryption") {
+        return false;
+    }
+
+    true
+}
+
 /// Reset the global SSE DEK provider (for testing only)
 ///
 /// Note: OnceLock doesn't support reset in stable Rust.
@@ -1239,47 +1288,6 @@ pub fn reset_sse_dek_provider() {
 #[inline]
 pub fn is_managed_sse(server_side_encryption: &ServerSideEncryption) -> bool {
     matches!(server_side_encryption.as_str(), "AES256" | "aws:kms")
-}
-
-/// Decrypt managed encryption key from object metadata
-///
-/// **DEPRECATED**: Use `apply_decryption()` instead for unified API
-pub async fn decrypt_managed_encryption_key(
-    bucket: &str,
-    key: &str,
-    metadata: &HashMap<String, String>,
-) -> Result<Option<([u8; 32], [u8; 12], Option<i64>)>, ApiError> {
-    if !metadata.contains_key("x-rustfs-encryption-key") {
-        return Ok(None);
-    }
-
-    let Some(service) = get_global_encryption_service().await else {
-        return Err(ApiError::from(StorageError::other("KMS encryption service is not initialized")));
-    };
-
-    let parsed = service
-        .headers_to_metadata(metadata)
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to parse encryption metadata: {e}"))))?;
-
-    if parsed.iv.len() != 12 {
-        return Err(ApiError::from(StorageError::other("Invalid encryption nonce length; expected 12 bytes")));
-    }
-
-    let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
-    let data_key = service
-        .decrypt_data_key(&parsed.encrypted_data_key, &context)
-        .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {e}"))))?;
-
-    let key_bytes = data_key.plaintext_key;
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&parsed.iv[..12]);
-
-    let original_size = metadata
-        .get("x-rustfs-encryption-original-size")
-        .and_then(|s| s.parse::<i64>().ok());
-
-    Ok(Some((key_bytes, nonce, original_size)))
 }
 
 /// Strip managed encryption metadata from object metadata

@@ -26,7 +26,7 @@ use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::sse::{
-    DecryptionRequest, EncryptionRequest, InMemoryAsyncReader, SseTypeV2, decrypt_managed_encryption_key,
+    DecryptionRequest, EncryptionRequest, InMemoryAsyncReader, SseTypeV2, check_encryption_metadata,
     prepare_sse_configuration_v2, sse_decryption, sse_encryption, strip_managed_encryption_metadata,
 };
 use crate::storage::{
@@ -1056,6 +1056,8 @@ impl S3 for FS {
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
             part_number: None,
+            part_key: None,
+            part_nonce: None,
         };
 
         let (requested_sse, requested_kms_key_id) = match sse_encryption(encryption_request).await? {
@@ -1065,7 +1067,7 @@ impl S3 for FS {
 
                 // Apply encryption wrapper
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, -1, actual_size, None, None, false).map_err(ApiError::from)?;
+                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false).map_err(ApiError::from)?;
 
                 // Merge encryption metadata
                 src_info.user_defined.extend(material.metadata);
@@ -3301,6 +3303,8 @@ impl S3 for FS {
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
             part_number: None,
+            part_key: None,
+            part_nonce: None,
         };
 
         let (effective_sse, effective_kms_key_id) = match sse_encryption(encryption_request).await? {
@@ -3310,7 +3314,7 @@ impl S3 for FS {
 
                 // Apply encryption wrapper
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, -1, actual_size, None, None, false).map_err(ApiError::from)?;
+                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false).map_err(ApiError::from)?;
 
                 // Merge encryption metadata
                 metadata.extend(material.metadata);
@@ -3606,9 +3610,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         // Check if managed encryption will be applied
-        let will_apply_managed_encryption = decrypt_managed_encryption_key(&bucket, &key, &fi.user_defined)
-            .await?
-            .is_some();
+        let will_apply_managed_encryption = check_encryption_metadata(&fi.user_defined);
 
         // If managed encryption will be applied, and we have Content-Length, buffer the entire body
         // This is necessary because encryption changes the data size, which causes Content-Length mismatches
@@ -3698,7 +3700,8 @@ impl S3 for FS {
             .user_defined
             .get("x-amz-server-side-encryption-aws-kms-key-id")
             .map(|s| s.to_string());
-
+        let part_key = fi.user_defined.get("x-rustfs-encryption-key").cloned();
+        let part_nonce = fi.user_defined.get("x-rustfs-encryption-iv").cloned();
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -3709,6 +3712,8 @@ impl S3 for FS {
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
             part_number: Some(part_id),
+            part_key,
+            part_nonce,
         };
 
         encryption_request.check_upload_part_customer_key_md5(&fi.user_defined, sse_customer_key_md5.clone())?;
@@ -3720,7 +3725,7 @@ impl S3 for FS {
 
                 // Apply encryption wrapper
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, -1, actual_size, None, None, false).map_err(ApiError::from)?;
+                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false).map_err(ApiError::from)?;
 
                 // Merge encryption metadata
                 fi.user_defined.extend(material.metadata);
@@ -3981,7 +3986,8 @@ impl S3 for FS {
             .user_defined
             .get("x-amz-server-side-encryption-aws-kms-key-id")
             .map(|s| s.to_string());
-
+        let part_key = mp_info.user_defined.get("x-rustfs-encryption-key").cloned();
+        let part_nonce = mp_info.user_defined.get("x-rustfs-encryption-iv").cloned();
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -3992,6 +3998,8 @@ impl S3 for FS {
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
             part_number: Some(part_id),
+            part_key,
+            part_nonce,
         };
 
         encryption_request.check_upload_part_customer_key_md5(&mp_info.user_defined, sse_customer_key_md5.clone())?;
@@ -4003,7 +4011,7 @@ impl S3 for FS {
 
                 // Apply encryption wrapper
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, -1, actual_size, None, None, false).map_err(ApiError::from)?;
+                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false).map_err(ApiError::from)?;
 
                 // Merge encryption metadata
                 mp_info.user_defined.extend(material.metadata);
