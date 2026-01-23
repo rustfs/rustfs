@@ -4640,19 +4640,10 @@ impl StorageAPI for SetDisks {
         let disks = self.get_disks_internal().await;
 
         let (metas, errs) = {
-            if opts.version_id.is_some() {
-                Self::read_all_fileinfo(
-                    &disks,
-                    "",
-                    bucket,
-                    object,
-                    opts.version_id.as_ref().unwrap().to_string().as_str(),
-                    false,
-                    false,
-                )
-                .await?
+            if let Some(vid) = opts.version_id.as_ref() {
+                Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), true, false).await?
             } else {
-                Self::read_all_xl(&disks, bucket, object, false, false).await
+                Self::read_all_xl(&disks, bucket, object, true, false).await
             }
         };
 
@@ -5680,20 +5671,12 @@ impl StorageAPI for SetDisks {
                 return Err(Error::other("checksum type not found"));
             };
 
-            if opts.want_checksum.is_some()
-                && !opts.want_checksum.as_ref().is_some_and(|v| {
-                    v.checksum_type
-                        .is(rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct))
-                })
-            {
-                return Err(Error::other(format!(
-                    "checksum type mismatch, got {:?}, want {:?}",
-                    opts.want_checksum.as_ref().unwrap(),
-                    rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct)
-                )));
-            }
-
             checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct);
+            if let Some(want) = opts.want_checksum.as_ref()
+                && !want.checksum_type.is(checksum_type)
+            {
+                return Err(Error::other(format!("checksum type mismatch, got {:?}, want {:?}", want, checksum_type)));
+            }
         }
 
         for (i, part) in object_parts.iter().enumerate() {
