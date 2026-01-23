@@ -55,7 +55,7 @@ pub struct UpdateCheckResult {
     /// Latest version information
     pub latest_version: Option<VersionInfo>,
     /// Check time
-    pub check_time: chrono::DateTime<chrono::Utc>,
+    pub check_time: jiff::Zoned,
 }
 
 /// Version checker
@@ -146,7 +146,7 @@ impl VersionChecker {
             update_available,
             current_version,
             latest_version: Some(version_info),
-            check_time: chrono::Utc::now(),
+            check_time: jiff::Zoned::now(),
         };
 
         if result.update_available {
@@ -194,8 +194,6 @@ mod tests {
 
     #[test]
     fn test_update_check_result() {
-        use chrono::Utc;
-
         // Test creating UpdateCheckResult with update available
         let version_info = VersionInfo {
             version: "1.2.0".to_string(),
@@ -204,12 +202,12 @@ mod tests {
             download_url: Some("https://github.com/rustfs/rustfs/releases/tag/v1.2.0".to_string()),
         };
 
-        let check_time = Utc::now();
+        let check_time = jiff::Zoned::now();
         let result = UpdateCheckResult {
             update_available: true,
             current_version: "1.1.0".to_string(),
             latest_version: Some(version_info.clone()),
-            check_time,
+            check_time: check_time.clone(),
         };
 
         debug!("Update check result: {:?}", serde_json::to_string(&result).unwrap());
@@ -253,7 +251,7 @@ mod tests {
                 release_notes: None,
                 download_url: None,
             }),
-            check_time: Utc::now(),
+            check_time: jiff::Zoned::now(),
         };
 
         assert!(!no_update_result.update_available);
@@ -264,7 +262,7 @@ mod tests {
             update_available: false,
             current_version: "1.1.0".to_string(),
             latest_version: None,
-            check_time: Utc::now(),
+            check_time: jiff::Zoned::now(),
         };
 
         assert!(!error_result.update_available);

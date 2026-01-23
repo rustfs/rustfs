@@ -71,11 +71,16 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn main() -> Result<()> {
+fn main() {
     let runtime = server::get_tokio_runtime_builder()
         .build()
         .expect("Failed to build Tokio runtime");
-    runtime.block_on(async_main())
+    let result = runtime.block_on(async_main());
+    if let Err(ref e) = result {
+        eprintln!("{} Server encountered an error and is shutting down: {}", jiff::Zoned::now(), e);
+        error!("Server encountered an error and is shutting down: {}", e);
+        std::process::exit(1);
+    }
 }
 async fn async_main() -> Result<()> {
     // Parse the obtained parameters
@@ -365,9 +370,10 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_update_check();
 
     println!(
-        "RustFS server started successfully at {}, current time: {}",
+        "RustFS server version: {} started successfully at {}, current time: {}",
+        version::get_version(),
         &server_address,
-        chrono::offset::Utc::now().to_string()
+        jiff::Zoned::now()
     );
     info!(target: "rustfs::main::run","server started successfully at {}", &server_address);
     // 4. Mark as Full Ready now that critical components are warm

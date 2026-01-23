@@ -163,6 +163,7 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # Time and Date
 chrono = { version = "0.4.43", features = ["serde"] }
 humantime = "2.3.0"
+jiff = { version = "0.2.18", features = ["serde"] }
 time = { version = "0.3.45", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Utilities and Tools
