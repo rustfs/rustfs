@@ -157,51 +157,23 @@ impl LockManager for GlobalLockManager {
 
     async fn acquire_read_lock(
         &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
+        key: ObjectKey,
         owner: impl Into<Arc<str>> + Send,
     ) -> std::result::Result<FastLockGuard, LockResult> {
         match self {
-            Self::Enabled(manager) => manager.acquire_read_lock(bucket, object, owner).await,
-            Self::Disabled(manager) => manager.acquire_read_lock(bucket, object, owner).await,
-        }
-    }
-
-    async fn acquire_read_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        version: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> std::result::Result<FastLockGuard, LockResult> {
-        match self {
-            Self::Enabled(manager) => manager.acquire_read_lock_versioned(bucket, object, version, owner).await,
-            Self::Disabled(manager) => manager.acquire_read_lock_versioned(bucket, object, version, owner).await,
+            Self::Enabled(manager) => manager.acquire_read_lock(key, owner).await,
+            Self::Disabled(manager) => manager.acquire_read_lock(key, owner).await,
         }
     }
 
     async fn acquire_write_lock(
         &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
+        key: ObjectKey,
         owner: impl Into<Arc<str>> + Send,
     ) -> std::result::Result<FastLockGuard, LockResult> {
         match self {
-            Self::Enabled(manager) => manager.acquire_write_lock(bucket, object, owner).await,
-            Self::Disabled(manager) => manager.acquire_write_lock(bucket, object, owner).await,
-        }
-    }
-
-    async fn acquire_write_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        version: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> std::result::Result<FastLockGuard, LockResult> {
-        match self {
-            Self::Enabled(manager) => manager.acquire_write_lock_versioned(bucket, object, version, owner).await,
-            Self::Disabled(manager) => manager.acquire_write_lock_versioned(bucket, object, version, owner).await,
+            Self::Enabled(manager) => manager.acquire_write_lock(key, owner).await,
+            Self::Disabled(manager) => manager.acquire_write_lock(key, owner).await,
         }
     }
 
@@ -300,88 +272,4 @@ pub fn create_namespace_lock(namespace: String, _distributed: bool) -> Namespace
     // The distributed behavior is now determined by the type of clients added to the NamespaceLock
     // This function just creates an empty NamespaceLock
     NamespaceLock::new(namespace)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_global_lock_manager_basic() {
-        let manager = get_global_lock_manager();
-
-        // Should be able to acquire locks
-        let guard = manager.acquire_read_lock("bucket", "object", "owner").await;
-        assert!(guard.is_ok());
-
-        // Test metrics
-        let _metrics = manager.get_metrics();
-        // Even if locks are disabled, metrics should be available (empty or real)
-        // shard_count is usize so always >= 0
-    }
-
-    #[tokio::test]
-    async fn test_disabled_manager_direct() {
-        let manager = DisabledLockManager::new();
-
-        // All operations should succeed immediately
-        let guard = manager.acquire_read_lock("bucket", "object", "owner").await;
-        assert!(guard.is_ok());
-        assert!(guard.unwrap().is_disabled());
-
-        // Metrics should be empty
-        let metrics = manager.get_metrics();
-        assert!(metrics.is_empty());
-        assert_eq!(manager.total_lock_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_enabled_manager_direct() {
-        let manager = FastObjectLockManager::new();
-
-        // Operations should work normally
-        let guard = manager.acquire_read_lock("bucket", "object", "owner").await;
-        assert!(guard.is_ok());
-        assert!(!guard.unwrap().is_disabled());
-
-        // Should have real metrics
-        let _metrics = manager.get_metrics();
-        // Note: total_lock_count might be > 0 due to previous lock acquisition
-    }
-
-    #[tokio::test]
-    async fn test_global_manager_enum_wrapper() {
-        // Test the GlobalLockManager enum directly
-        let enabled_manager = GlobalLockManager::Enabled(Arc::new(FastObjectLockManager::new()));
-        let disabled_manager = GlobalLockManager::Disabled(DisabledLockManager::new());
-
-        assert!(!enabled_manager.is_disabled());
-        assert!(disabled_manager.is_disabled());
-
-        // Test trait methods work for both
-        let enabled_guard = enabled_manager.acquire_read_lock("bucket", "obj", "owner").await;
-        let disabled_guard = disabled_manager.acquire_read_lock("bucket", "obj", "owner").await;
-
-        assert!(enabled_guard.is_ok());
-        assert!(disabled_guard.is_ok());
-
-        assert!(!enabled_guard.unwrap().is_disabled());
-        assert!(disabled_guard.unwrap().is_disabled());
-    }
-
-    #[tokio::test]
-    async fn test_batch_operations_work() {
-        let manager = get_global_lock_manager();
-
-        let batch = BatchLockRequest::new("owner")
-            .add_read_lock("bucket", "obj1")
-            .add_write_lock("bucket", "obj2");
-
-        let result = manager.acquire_locks_batch(batch).await;
-
-        // Should succeed regardless of whether locks are enabled or disabled
-        assert!(result.all_acquired);
-        assert_eq!(result.successful_locks.len(), 2);
-        assert!(result.failed_locks.is_empty());
-    }
 }

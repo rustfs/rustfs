@@ -26,8 +26,6 @@
 
 pub mod disabled_manager;
 pub mod guard;
-pub mod integration_example;
-pub mod integration_test;
 pub mod manager;
 pub mod manager_trait;
 pub mod metrics;

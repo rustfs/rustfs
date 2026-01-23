@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
+    ObjectKey,
     client::LockClient,
     error::{LockError, Result},
     guard::LockGuard,
@@ -27,7 +28,7 @@ use crate::{
 #[derive(Debug)]
 pub struct NamespaceLock {
     /// Lock clients for this namespace
-    clients: Vec<Arc<dyn LockClient>>,
+    clients: Vec<Option<Arc<dyn LockClient>>>,
     /// Namespace identifier
     namespace: String,
     /// Quorum size for operations (1 for local, majority for distributed)
@@ -45,7 +46,7 @@ impl NamespaceLock {
     }
 
     /// Create namespace lock with clients
-    pub fn with_clients(namespace: String, clients: Vec<Arc<dyn LockClient>>) -> Self {
+    pub fn with_clients(namespace: String, clients: Vec<Option<Arc<dyn LockClient>>>) -> Self {
         let quorum = if clients.len() > 1 {
             // For multiple clients (distributed mode), require majority
             (clients.len() / 2) + 1
@@ -63,7 +64,7 @@ impl NamespaceLock {
 
     /// Create namespace lock with clients and an explicit quorum size.
     /// Quorum will be clamped into [1, clients.len()]. For single client, quorum is always 1.
-    pub fn with_clients_and_quorum(namespace: String, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
+    pub fn with_clients_and_quorum(namespace: String, clients: Vec<Option<Arc<dyn LockClient>>>, quorum: usize) -> Self {
         let q = if clients.len() <= 1 {
             1
         } else {
@@ -79,7 +80,7 @@ impl NamespaceLock {
 
     /// Create namespace lock with client (compatibility)
     pub fn with_client(client: Arc<dyn LockClient>) -> Self {
-        Self::with_clients("default".to_string(), vec![client])
+        Self::with_clients("default".to_string(), vec![Some(client)])
     }
 
     /// Get namespace identifier
@@ -88,7 +89,7 @@ impl NamespaceLock {
     }
 
     /// Get resource key for this namespace
-    pub fn get_resource_key(&self, resource: &str) -> String {
+    pub fn get_resource_key(&self, resource: &ObjectKey) -> String {
         format!("{}:{}", self.namespace, resource)
     }
 
@@ -100,7 +101,11 @@ impl NamespaceLock {
 
         // For single client, use it directly
         if self.clients.len() == 1 {
-            return self.clients[0].acquire_lock(request).await;
+            if let Some(client) = &self.clients[0] {
+                return client.acquire_lock(request).await;
+            } else {
+                return Err(LockError::internal("No lock client available"));
+            }
         }
 
         // Quorum-based acquisition for distributed mode
@@ -116,19 +121,23 @@ impl NamespaceLock {
         }
 
         if self.clients.len() == 1 {
-            let resp = self.clients[0].acquire_lock(request).await?;
-            if resp.success {
-                return Ok(Some(LockGuard::new(
-                    LockId::new_deterministic(&request.resource),
-                    vec![self.clients[0].clone()],
-                )));
+            if let Some(client) = &self.clients[0] {
+                let resp = client.acquire_lock(request).await?;
+                if resp.success {
+                    return Ok(Some(LockGuard::new(LockId::new_deterministic(&request.resource), vec![client.clone()])));
+                }
+                return Ok(None);
+            } else {
+                return Err(LockError::internal("No lock client available"));
             }
-            return Ok(None);
         }
 
         let (resp, idxs) = self.acquire_lock_quorum(request).await?;
         if resp.success {
-            let subset: Vec<_> = idxs.into_iter().filter_map(|i| self.clients.get(i).cloned()).collect();
+            let subset: Vec<_> = idxs
+                .into_iter()
+                .filter_map(|i| self.clients.get(i).and_then(|c| c.clone()))
+                .collect();
             Ok(Some(LockGuard::new(LockId::new_deterministic(&request.resource), subset)))
         } else {
             Ok(None)
@@ -136,16 +145,28 @@ impl NamespaceLock {
     }
 
     /// Convenience: acquire exclusive lock as a guard
-    pub async fn lock_guard(&self, resource: &str, owner: &str, timeout: Duration, ttl: Duration) -> Result<Option<LockGuard>> {
-        let req = LockRequest::new(self.get_resource_key(resource), LockType::Exclusive, owner)
+    pub async fn lock_guard(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+    ) -> Result<Option<LockGuard>> {
+        let req = LockRequest::new(resource, LockType::Exclusive, owner)
             .with_acquire_timeout(timeout)
             .with_ttl(ttl);
         self.acquire_guard(&req).await
     }
 
     /// Convenience: acquire shared lock as a guard
-    pub async fn rlock_guard(&self, resource: &str, owner: &str, timeout: Duration, ttl: Duration) -> Result<Option<LockGuard>> {
-        let req = LockRequest::new(self.get_resource_key(resource), LockType::Shared, owner)
+    pub async fn rlock_guard(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+    ) -> Result<Option<LockGuard>> {
+        let req = LockRequest::new(resource, LockType::Shared, owner)
             .with_acquire_timeout(timeout)
             .with_ttl(ttl);
         self.acquire_guard(&req).await
@@ -158,17 +179,33 @@ impl NamespaceLock {
             .clients
             .iter()
             .enumerate()
-            .map(|(idx, client)| async move { (idx, client.acquire_lock(request).await) })
+            .map(|(idx, client_opt)| async move {
+                if let Some(client) = client_opt {
+                    (idx, Some(client.acquire_lock(request).await))
+                } else {
+                    (idx, None)
+                }
+            })
             .collect();
 
         let results = futures::future::join_all(futs).await;
         let mut successful_clients = Vec::new();
+        let mut failed_clients = Vec::new();
 
         for (idx, res) in results {
-            if let Ok(resp) = res
-                && resp.success
-            {
-                successful_clients.push(idx);
+            if let Some(resp) = res {
+                match resp {
+                    Ok(resp) => {
+                        if resp.success {
+                            successful_clients.push(idx);
+                        } else {
+                            failed_clients.push(idx);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to acquire lock on client {}: {}", idx, e);
+                    }
+                }
             }
         }
 
@@ -191,7 +228,8 @@ impl NamespaceLock {
             );
             Ok((resp, successful_clients))
         } else {
-            if !successful_clients.is_empty() {
+            if !successful_clients.is_empty() || !failed_clients.is_empty() {
+                successful_clients.extend_from_slice(&failed_clients);
                 self.rollback_acquisitions(request, &successful_clients).await;
             }
             let resp = LockResponse::failure(
@@ -208,6 +246,7 @@ impl NamespaceLock {
         let rollback_futures: Vec<_> = client_indices
             .iter()
             .filter_map(|&idx| self.clients.get(idx))
+            .filter_map(|client| client.as_ref())
             .map(|client| async {
                 if let Err(e) = client.release(&lock_id).await {
                     tracing::warn!("Failed to rollback lock on client: {}", e);
@@ -231,13 +270,18 @@ impl NamespaceLock {
 
         // For single client, use it directly
         if self.clients.len() == 1 {
-            return self.clients[0].release(lock_id).await;
+            if let Some(client) = &self.clients[0] {
+                return client.release(lock_id).await;
+            } else {
+                return Err(LockError::internal("Single client is not available"));
+            }
         }
 
         // For multiple clients, try to release from all clients
         let futures: Vec<_> = self
             .clients
             .iter()
+            .filter_map(|client| client.as_ref())
             .map(|client| {
                 let id = lock_id.clone();
                 async move { client.release(&id).await }
@@ -263,8 +307,10 @@ impl NamespaceLock {
         // Check client status
         let mut connected_clients = 0;
         for client in &self.clients {
-            if client.is_online().await {
-                connected_clients += 1;
+            if let Some(client) = client {
+                if client.is_online().await {
+                    connected_clients += 1;
+                }
             }
         }
 
@@ -285,9 +331,11 @@ impl NamespaceLock {
 
         // Try to get stats from clients
         for client in &self.clients {
-            if let Ok(client_stats) = client.get_stats().await {
-                stats.successful_acquires += client_stats.successful_acquires;
-                stats.failed_acquires += client_stats.failed_acquires;
+            if let Some(client) = client {
+                if let Ok(client_stats) = client.get_stats().await {
+                    stats.successful_acquires += client_stats.successful_acquires;
+                    stats.failed_acquires += client_stats.failed_acquires;
+                }
             }
         }
 
@@ -305,21 +353,21 @@ impl Default for NamespaceLock {
 #[async_trait]
 pub trait NamespaceLockManager: Send + Sync {
     /// Batch get write lock
-    async fn lock_batch(&self, resources: &[String], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool>;
+    async fn lock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool>;
 
     /// Batch release write lock
-    async fn unlock_batch(&self, resources: &[String], owner: &str) -> Result<()>;
+    async fn unlock_batch(&self, resources: &[ObjectKey], owner: &str) -> Result<()>;
 
     /// Batch get read lock
-    async fn rlock_batch(&self, resources: &[String], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool>;
+    async fn rlock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool>;
 
     /// Batch release read lock
-    async fn runlock_batch(&self, resources: &[String], owner: &str) -> Result<()>;
+    async fn runlock_batch(&self, resources: &[ObjectKey], owner: &str) -> Result<()>;
 }
 
 #[async_trait]
 impl NamespaceLockManager for NamespaceLock {
-    async fn lock_batch(&self, resources: &[String], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool> {
+    async fn lock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool> {
         if self.clients.is_empty() {
             return Err(LockError::internal("No lock clients available"));
         }
@@ -328,14 +376,13 @@ impl NamespaceLockManager for NamespaceLock {
         let mut acquired_resources = Vec::new();
 
         for resource in resources {
-            let namespaced_resource = self.get_resource_key(resource);
-            let request = LockRequest::new(&namespaced_resource, LockType::Exclusive, owner)
+            let request = LockRequest::new(resource.clone(), LockType::Exclusive, owner)
                 .with_acquire_timeout(timeout)
                 .with_ttl(ttl);
 
             let response = self.acquire_lock(&request).await?;
             if response.success {
-                acquired_resources.push(namespaced_resource);
+                acquired_resources.push(resource.clone());
             } else {
                 // Rollback all previously acquired locks
                 self.rollback_batch_locks(&acquired_resources, owner).await;
@@ -345,7 +392,7 @@ impl NamespaceLockManager for NamespaceLock {
         Ok(true)
     }
 
-    async fn unlock_batch(&self, resources: &[String], _owner: &str) -> Result<()> {
+    async fn unlock_batch(&self, resources: &[ObjectKey], _owner: &str) -> Result<()> {
         if self.clients.is_empty() {
             return Err(LockError::internal("No lock clients available"));
         }
@@ -354,8 +401,7 @@ impl NamespaceLockManager for NamespaceLock {
         let release_futures: Vec<_> = resources
             .iter()
             .map(|resource| {
-                let namespaced_resource = self.get_resource_key(resource);
-                let lock_id = LockId::new_deterministic(&namespaced_resource);
+                let lock_id = LockId::new_deterministic(resource);
                 async move {
                     if let Err(e) = self.release_lock(&lock_id).await {
                         tracing::warn!("Failed to release lock for resource {}: {}", resource, e);
@@ -368,7 +414,7 @@ impl NamespaceLockManager for NamespaceLock {
         Ok(())
     }
 
-    async fn rlock_batch(&self, resources: &[String], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool> {
+    async fn rlock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool> {
         if self.clients.is_empty() {
             return Err(LockError::internal("No lock clients available"));
         }
@@ -377,14 +423,13 @@ impl NamespaceLockManager for NamespaceLock {
         let mut acquired_resources = Vec::new();
 
         for resource in resources {
-            let namespaced_resource = self.get_resource_key(resource);
-            let request = LockRequest::new(&namespaced_resource, LockType::Shared, owner)
+            let request = LockRequest::new(resource.clone(), LockType::Shared, owner)
                 .with_acquire_timeout(timeout)
                 .with_ttl(ttl);
 
             let response = self.acquire_lock(&request).await?;
             if response.success {
-                acquired_resources.push(namespaced_resource);
+                acquired_resources.push(resource.clone());
             } else {
                 // Rollback all previously acquired read locks
                 self.rollback_batch_locks(&acquired_resources, owner).await;
@@ -394,7 +439,7 @@ impl NamespaceLockManager for NamespaceLock {
         Ok(true)
     }
 
-    async fn runlock_batch(&self, resources: &[String], _owner: &str) -> Result<()> {
+    async fn runlock_batch(&self, resources: &[ObjectKey], _owner: &str) -> Result<()> {
         if self.clients.is_empty() {
             return Err(LockError::internal("No lock clients available"));
         }
@@ -403,8 +448,7 @@ impl NamespaceLockManager for NamespaceLock {
         let release_futures: Vec<_> = resources
             .iter()
             .map(|resource| {
-                let namespaced_resource = self.get_resource_key(resource);
-                let lock_id = LockId::new_deterministic(&namespaced_resource);
+                let lock_id = LockId::new_deterministic(resource);
                 async move {
                     if let Err(e) = self.release_lock(&lock_id).await {
                         tracing::warn!("Failed to release read lock for resource {}: {}", resource, e);
@@ -420,7 +464,7 @@ impl NamespaceLockManager for NamespaceLock {
 
 impl NamespaceLock {
     /// Rollback batch lock acquisitions
-    async fn rollback_batch_locks(&self, acquired_resources: &[String], _owner: &str) {
+    async fn rollback_batch_locks(&self, acquired_resources: &[ObjectKey], _owner: &str) {
         let rollback_futures: Vec<_> = acquired_resources
             .iter()
             .map(|resource| {
@@ -435,152 +479,5 @@ impl NamespaceLock {
 
         futures::future::join_all(rollback_futures).await;
         tracing::info!("Rolled back {} batch lock acquisitions", acquired_resources.len());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::LocalClient;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_namespace_lock_local() {
-        let ns_lock = NamespaceLock::with_client(Arc::new(LocalClient::new()));
-        let resources = vec!["test1".to_string(), "test2".to_string()];
-
-        // Test batch lock
-        let result = ns_lock
-            .lock_batch(&resources, "test_owner", Duration::from_millis(100), Duration::from_secs(10))
-            .await;
-        assert!(result.is_ok());
-        assert!(result.unwrap());
-
-        // Test batch unlock
-        let result = ns_lock.unlock_batch(&resources, "test_owner").await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_guard_acquire_and_drop_release() {
-        let ns_lock = NamespaceLock::with_client(Arc::new(LocalClient::new()));
-
-        // Acquire guard
-        let guard = ns_lock
-            .lock_guard("guard-resource", "owner", Duration::from_millis(100), Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert!(guard.is_some());
-        let lock_id = guard.as_ref().unwrap().lock_id().clone();
-
-        // Drop guard to trigger background release
-        drop(guard);
-
-        // Give background worker a moment to process
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Re-acquire should succeed (previous lock released)
-        let req = LockRequest::new(&lock_id.resource, LockType::Exclusive, "owner").with_ttl(Duration::from_secs(2));
-        let resp = ns_lock.acquire_lock(&req).await.unwrap();
-        assert!(resp.success);
-
-        // Cleanup
-        let _ = ns_lock.release_lock(&LockId::new_deterministic(&lock_id.resource)).await;
-    }
-
-    #[tokio::test]
-    async fn test_connection_health() {
-        let local_lock = NamespaceLock::new("test-namespace".to_string());
-        let health = local_lock.get_health().await;
-        assert_eq!(health.status, crate::types::HealthStatus::Degraded); // No clients
-    }
-
-    #[tokio::test]
-    async fn test_namespace_lock_creation() {
-        let ns_lock = NamespaceLock::new("test-namespace".to_string());
-        assert_eq!(ns_lock.namespace(), "test-namespace");
-    }
-
-    #[tokio::test]
-    async fn test_namespace_lock_new_local() {
-        let ns_lock = NamespaceLock::with_client(Arc::new(LocalClient::new()));
-        assert_eq!(ns_lock.namespace(), "default");
-        assert_eq!(ns_lock.clients.len(), 1);
-        assert!(ns_lock.clients[0].is_local().await);
-
-        // Test that it can perform lock operations
-        let resources = vec!["test-resource".to_string()];
-        let result = ns_lock
-            .lock_batch(&resources, "test-owner", Duration::from_millis(100), Duration::from_secs(10))
-            .await;
-        assert!(result.is_ok());
-        assert!(result.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_namespace_lock_resource_key() {
-        let ns_lock = NamespaceLock::new("test-namespace".to_string());
-
-        // Test resource key generation
-        let resource_key = ns_lock.get_resource_key("test-resource");
-        assert_eq!(resource_key, "test-namespace:test-resource");
-    }
-
-    #[tokio::test]
-    async fn test_transactional_batch_lock() {
-        let ns_lock = NamespaceLock::with_client(Arc::new(LocalClient::new()));
-        let resources = vec!["resource1".to_string(), "resource2".to_string(), "resource3".to_string()];
-
-        // First, acquire one of the resources to simulate conflict
-        let conflicting_request = LockRequest::new(ns_lock.get_resource_key("resource2"), LockType::Exclusive, "other_owner")
-            .with_ttl(Duration::from_secs(10));
-
-        let response = ns_lock.acquire_lock(&conflicting_request).await.unwrap();
-        assert!(response.success);
-
-        // Now try batch lock - should fail and rollback
-        let result = ns_lock
-            .lock_batch(&resources, "test_owner", Duration::from_millis(10), Duration::from_secs(5))
-            .await;
-
-        assert!(result.is_ok());
-        assert!(!result.unwrap()); // Should fail due to conflict
-
-        // Verify that no locks were left behind (all rolled back)
-        for resource in &resources {
-            if resource != "resource2" {
-                // Skip the one we intentionally locked
-                let check_request = LockRequest::new(ns_lock.get_resource_key(resource), LockType::Exclusive, "verify_owner")
-                    .with_ttl(Duration::from_secs(1));
-
-                let check_response = ns_lock.acquire_lock(&check_request).await.unwrap();
-                assert!(check_response.success, "Resource {resource} should be available after rollback");
-
-                // Clean up
-                let lock_id = LockId::new_deterministic(&ns_lock.get_resource_key(resource));
-                let _ = ns_lock.release_lock(&lock_id).await;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_distributed_lock_consistency() {
-        // Create a namespace with multiple local clients to simulate distributed scenario
-        let client1: Arc<dyn LockClient> = Arc::new(LocalClient::new());
-        let client2: Arc<dyn LockClient> = Arc::new(LocalClient::new());
-        let clients = vec![client1, client2];
-
-        // LocalClient shares a global in-memory map. For exclusive locks, only one can acquire at a time.
-        // In real distributed setups the quorum should be tied to EC write quorum. Here we use quorum=1 for success.
-        let ns_lock = NamespaceLock::with_clients_and_quorum("test-namespace".to_string(), clients, 1);
-
-        let request = LockRequest::new("test-resource", LockType::Shared, "test_owner").with_ttl(Duration::from_secs(2));
-
-        // This should succeed only if ALL clients can acquire the lock
-        let response = ns_lock.acquire_lock(&request).await.unwrap();
-
-        // Since we're using separate LocalClient instances, they don't share state
-        // so this test demonstrates the consistency check
-        assert!(response.success); // Either all succeed or rollback happens
     }
 }

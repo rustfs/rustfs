@@ -759,13 +759,13 @@ mod tests {
         let shard = LockShard::new(0);
 
         // First acquire a lock that will block the batch operation
-        let blocking_request = ObjectLockRequest::new_write("bucket", "obj1", "blocking_owner");
+        let blocking_request = ObjectLockRequest::new_write(ObjectKey::new("bucket", "obj1"), "blocking_owner");
         shard.acquire_lock(&blocking_request).await.unwrap();
 
         // Now try a batch operation that should fail and clean up properly
         let requests = vec![
-            ObjectLockRequest::new_read("bucket", "obj2", "batch_owner"), // This should succeed
-            ObjectLockRequest::new_write("bucket", "obj1", "batch_owner"), // This should fail due to existing lock
+            ObjectLockRequest::new_read(ObjectKey::new("bucket", "obj2"), "batch_owner"), // This should succeed
+            ObjectLockRequest::new_write(ObjectKey::new("bucket", "obj1"), "batch_owner"), // This should fail due to existing lock
         ];
 
         let result = shard.acquire_locks_batch(requests, true).await;

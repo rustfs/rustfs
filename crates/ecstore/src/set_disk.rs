@@ -73,9 +73,10 @@ use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
     RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
 };
-use rustfs_lock::FastLockGuard;
+use rustfs_lock::LockClient;
 use rustfs_lock::fast_lock::manager::NamespaceLockGuard;
 use rustfs_lock::fast_lock::types::LockResult;
+use rustfs_lock::{FastLockGuard, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
@@ -132,6 +133,7 @@ pub struct SetDisks {
     pub pool_index: usize,
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
+    pub lockers: Vec<Option<Arc<dyn LockClient>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +164,7 @@ impl SetDisks {
         pool_index: usize,
         set_endpoints: Vec<Endpoint>,
         format: FormatV3,
+        lockers: Vec<Option<Arc<dyn LockClient>>>,
     ) -> Arc<Self> {
         Arc::new(SetDisks {
             fast_lock_manager,
@@ -174,6 +177,7 @@ impl SetDisks {
             format,
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
+            lockers,
         })
     }
 
@@ -3953,7 +3957,17 @@ impl ObjectIO for SetDisks {
 impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock<'a>(&'a self, bucket: &str, object: &str) -> Result<NamespaceLockGuard<'a>> {
-        Ok(self.fast_lock_manager.new_ns_lock(bucket, object, self.locker_owner.as_str()))
+        let mut write_quorum = self.set_drive_count - self.default_parity_count;
+        if write_quorum == self.default_parity_count {
+            write_quorum += 1;
+        }
+        let set_lock = rustfs_lock::NamespaceLock::with_clients_and_quorum(
+            format!("set-{}-{}", self.pool_index, self.set_index),
+            self.lockers.clone(),
+            write_quorum,
+        );
+
+        todo!()
     }
 
     #[tracing::instrument(skip(self))]
@@ -4186,7 +4200,7 @@ impl StorageAPI for SetDisks {
         let mut unique_objects: HashSet<String> = HashSet::new();
         for dobj in &objects {
             if unique_objects.insert(dobj.object_name.clone()) {
-                batch = batch.add_write_lock(bucket, dobj.object_name.clone());
+                batch = batch.add_write_lock(rustfs_lock::ObjectKey::new(bucket, dobj.object_name.clone()));
             }
         }
 

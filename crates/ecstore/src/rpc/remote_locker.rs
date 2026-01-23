@@ -307,7 +307,7 @@ impl LockClient for RemoteClient {
                     // We can't determine the exact details remotely, so return a generic status
                     Ok(Some(LockInfo {
                         id: lock_id.clone(),
-                        resource: lock_id.as_str().to_string(),
+                        resource: lock_id.resource.clone(),
                         lock_type: LockType::Exclusive, // We can't know the exact type
                         status: LockStatus::Acquired,
                         owner: "unknown".to_string(), // Remote client can't determine owner
@@ -324,7 +324,7 @@ impl LockClient for RemoteClient {
                 // Communication error or lock is held
                 Ok(Some(LockInfo {
                     id: lock_id.clone(),
-                    resource: lock_id.as_str().to_string(),
+                    resource: lock_id.resource.clone(),
                     lock_type: LockType::Exclusive,
                     status: LockStatus::Acquired,
                     owner: "unknown".to_string(),

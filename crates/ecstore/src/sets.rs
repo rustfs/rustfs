@@ -13,8 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::endpoint::Endpoint;
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
+use crate::rpc::RemoteClient;
 use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::{
     disk::{
@@ -42,6 +44,7 @@ use rustfs_common::{
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
+use rustfs_lock::client::{LockClient, local::LocalClient};
 use rustfs_lock::fast_lock::manager::NamespaceLockGuard;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
@@ -79,6 +82,26 @@ impl Drop for Sets {
     }
 }
 
+/// create unique lock clients for the endpoints
+pub fn create_unique_clients(endpoints: &[Endpoint]) -> HashMap<String, Arc<dyn LockClient>> {
+    let mut unique_endpoints: HashMap<String, &Endpoint> = HashMap::new();
+
+    for endpoint in endpoints {
+        unique_endpoints.insert(endpoint.host_port(), endpoint);
+    }
+
+    let mut clients = HashMap::new();
+    for (key, endpoint) in unique_endpoints {
+        if endpoint.is_local {
+            clients.insert(key, Arc::new(LocalClient::new()) as Arc<dyn LockClient>);
+        } else {
+            clients.insert(key, Arc::new(RemoteClient::new(endpoint.url.to_string())) as Arc<dyn LockClient>);
+        }
+    }
+
+    clients
+}
+
 impl Sets {
     #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, parity_count))]
     pub async fn new(
@@ -91,35 +114,31 @@ impl Sets {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
-        let mut unique: Vec<Vec<String>> = (0..set_count).map(|_| vec![]).collect();
-
-        for (idx, endpoint) in endpoints.endpoints.as_ref().iter().enumerate() {
-            let set_idx = idx / set_drive_count;
-            if endpoint.is_local && !unique[set_idx].contains(&"local".to_string()) {
-                unique[set_idx].push("local".to_string());
-            }
-
-            if !endpoint.is_local {
-                let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap());
-                if !unique[set_idx].contains(&host_port) {
-                    unique[set_idx].push(host_port);
-                }
-            }
-        }
+        let lock_clients = create_unique_clients(endpoints.endpoints.as_ref());
 
         let mut disk_set = Vec::with_capacity(set_count);
 
         // Create fast lock manager for high performance
         let fast_lock_manager = Arc::new(rustfs_lock::FastObjectLockManager::new());
 
+        // let mut set_lockers = Vec::with_capacity(set_count);
+
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
+            let mut set_lock_clients: Vec<Option<Arc<dyn LockClient>>> = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
                 let mut disk = disks[idx].clone();
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
+
+                if let Some(lock_client) = lock_clients.get(&endpoint.host_port()) {
+                    set_lock_clients.push(Some(lock_client.clone()));
+                } else {
+                    set_lock_clients.push(None);
+                }
+
                 set_endpoints.push(endpoint);
 
                 if disk.is_none() {
@@ -163,8 +182,17 @@ impl Sets {
                 }
             }
 
-            // Note: write_quorum was used for the old lock system, no longer needed with FastLock
-            let _write_quorum = set_drive_count - parity_count;
+            // let mut write_quorum = set_drive_count - parity_count;
+            // if write_quorum == parity_count {
+            //     write_quorum += 1;
+            // }
+            // let set_lock = rustfs_lock::NamespaceLock::with_clients_and_quorum(
+            //     format!("set-{pool_idx}-{i}"),
+            //     set_lock_clients,
+            //     write_quorum,
+            // );
+
+            // set_lockers.push(set_lock);
 
             let set_disks = SetDisks::new(
                 fast_lock_manager.clone(),
@@ -176,6 +204,7 @@ impl Sets {
                 pool_idx,
                 set_endpoints,
                 fm.clone(),
+                set_lock_clients,
             )
             .await;
 

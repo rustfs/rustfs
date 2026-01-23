@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 /// Object key for version-aware locking
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectKey {
     pub bucket: Arc<str>,
     pub object: Arc<str>,
@@ -198,9 +198,9 @@ pub struct ObjectLockRequest {
 }
 
 impl ObjectLockRequest {
-    pub fn new_read(bucket: impl Into<Arc<str>>, object: impl Into<Arc<str>>, owner: impl Into<Arc<str>>) -> Self {
+    pub fn new_read(key: ObjectKey, owner: impl Into<Arc<str>>) -> Self {
         Self {
-            key: ObjectKey::new(bucket, object),
+            key,
             mode: LockMode::Shared,
             owner: owner.into(),
             acquire_timeout: crate::fast_lock::DEFAULT_ACQUIRE_TIMEOUT,
@@ -209,9 +209,9 @@ impl ObjectLockRequest {
         }
     }
 
-    pub fn new_write(bucket: impl Into<Arc<str>>, object: impl Into<Arc<str>>, owner: impl Into<Arc<str>>) -> Self {
+    pub fn new_write(key: ObjectKey, owner: impl Into<Arc<str>>) -> Self {
         Self {
-            key: ObjectKey::new(bucket, object),
+            key,
             mode: LockMode::Exclusive,
             owner: owner.into(),
             acquire_timeout: crate::fast_lock::DEFAULT_ACQUIRE_TIMEOUT,
@@ -317,15 +317,13 @@ impl BatchLockRequest {
         }
     }
 
-    pub fn add_read_lock(mut self, bucket: impl Into<Arc<str>>, object: impl Into<Arc<str>>) -> Self {
-        self.requests
-            .push(ObjectLockRequest::new_read(bucket, object, self.owner.clone()));
+    pub fn add_read_lock(mut self, key: ObjectKey) -> Self {
+        self.requests.push(ObjectLockRequest::new_read(key, self.owner.clone()));
         self
     }
 
-    pub fn add_write_lock(mut self, bucket: impl Into<Arc<str>>, object: impl Into<Arc<str>>) -> Self {
-        self.requests
-            .push(ObjectLockRequest::new_write(bucket, object, self.owner.clone()));
+    pub fn add_write_lock(mut self, key: ObjectKey) -> Self {
+        self.requests.push(ObjectLockRequest::new_write(key, self.owner.clone()));
         self
     }
 
@@ -366,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_lock_request() {
-        let req = ObjectLockRequest::new_read("bucket", "object", "owner")
+        let req = ObjectLockRequest::new_read(ObjectKey::new("bucket", "object"), "owner")
             .with_version("v1")
             .with_priority(LockPriority::High);
 
@@ -378,8 +376,8 @@ mod tests {
     #[test]
     fn test_batch_request() {
         let batch = BatchLockRequest::new("owner")
-            .add_read_lock("bucket", "obj1")
-            .add_write_lock("bucket", "obj2");
+            .add_read_lock(ObjectKey::new("bucket", "obj1"))
+            .add_write_lock(ObjectKey::new("bucket", "obj2"));
 
         assert_eq!(batch.requests.len(), 2);
         assert_eq!(batch.requests[0].mode, LockMode::Shared);

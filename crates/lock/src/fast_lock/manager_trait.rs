@@ -31,38 +31,10 @@ pub trait LockManager: Send + Sync {
     async fn acquire_lock(&self, request: ObjectLockRequest) -> Result<FastLockGuard, LockResult>;
 
     /// Acquire shared (read) lock
-    async fn acquire_read_lock(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult>;
-
-    /// Acquire shared (read) lock for specific version
-    async fn acquire_read_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        version: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult>;
+    async fn acquire_read_lock(&self, key: ObjectKey, owner: impl Into<Arc<str>> + Send) -> Result<FastLockGuard, LockResult>;
 
     /// Acquire exclusive (write) lock
-    async fn acquire_write_lock(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult>;
-
-    /// Acquire exclusive (write) lock for specific version
-    async fn acquire_write_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        version: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult>;
+    async fn acquire_write_lock(&self, key: ObjectKey, owner: impl Into<Arc<str>> + Send) -> Result<FastLockGuard, LockResult>;
 
     /// Acquire multiple locks atomically
     async fn acquire_locks_batch(&self, batch_request: BatchLockRequest) -> BatchLockResult;
