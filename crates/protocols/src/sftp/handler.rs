@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::fs::{File as TokioFile, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
+use tokio_util::io::StreamReader;
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
@@ -394,7 +395,7 @@ where
         id: u32,
         handle: String,
         _offset: u64,
-        len: u32,
+        _len: u32,
     ) -> impl Future<Output = Result<Data, Self::Error>> + Send {
         let this = self.clone();
         async move {
@@ -414,15 +415,15 @@ where
                     &key,
                     &this.session_context.principal.user_identity.credentials.access_key,
                     &this.session_context.principal.user_identity.credentials.secret_key,
-                    None, // SFTP doesn't use start_pos for partial reads
+                    None,
                 )
                 .await
             {
                 Ok(output) => {
-                    let mut data = Vec::with_capacity(len as usize);
+                    let mut data = Vec::new();
                     if let Some(body) = output.body {
                         let stream = body.map_err(std::io::Error::other);
-                        let mut reader = tokio_util::io::StreamReader::new(stream);
+                        let mut reader = StreamReader::new(stream);
                         let _ = reader.read_to_end(&mut data).await;
                     }
                     Ok(Data { id, data })
@@ -590,18 +591,14 @@ where
                     if let Some(prefixes) = output.common_prefixes {
                         for p in prefixes {
                             if let Some(prefix_str) = p.prefix {
-                                let name = prefix_str
-                                    .trim_end_matches('/')
-                                    .split('/')
-                                    .next_back()
-                                    .unwrap_or("")
-                                    .to_string();
+                                let full_path = prefix_str.trim_end_matches('/');
+                                let name = full_path.split('/').next_back().unwrap_or("").to_string();
                                 if !name.is_empty() {
                                     let mut attrs = FileAttributes::default();
                                     attrs.set_dir(true);
                                     attrs.permissions = Some(0o755);
                                     files.push(File {
-                                        filename: name.clone(),
+                                        filename: full_path.to_string(),
                                         longname: format!("drwxr-xr-x 1 rustfs rustfs 0 Jan 1 1970 {}", name),
                                         attrs,
                                     });
@@ -627,7 +624,7 @@ where
                                     attrs.mtime = Some(dt.unix_timestamp() as u32);
                                 }
                                 files.push(File {
-                                    filename: name.clone(),
+                                    filename: key.clone(),
                                     longname: format!("-rw-r--r-- 1 rustfs rustfs {} Jan 1 1970 {}", size, name),
                                     attrs,
                                 });

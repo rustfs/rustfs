@@ -102,7 +102,31 @@ where
         if let Some(cert) = &self.config.cert_file {
             if let Some(key) = &self.config.key_file {
                 debug!("Enabling FTPS with cert: {} and key: {}", cert, key);
-                server_builder = server_builder.ftps(cert, key);
+
+                // If CA file is specified, create a combined certificate chain
+                let final_cert = if let Some(ca_file) = &self.config.ca_file {
+                    debug!("Using CA certificate: {}", ca_file);
+
+                    // Read and combine certificates
+                    let cert_content = tokio::fs::read_to_string(cert)
+                        .await
+                        .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to read cert file: {}", e)))?;
+                    let ca_content = tokio::fs::read_to_string(ca_file)
+                        .await
+                        .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to read CA file: {}", e)))?;
+
+                    // Create combined certificate file
+                    let combined_cert_path = format!("{}.combined", cert);
+                    tokio::fs::write(&combined_cert_path, format!("{}\n{}", cert_content, ca_content))
+                        .await
+                        .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to write combined cert: {}", e)))?;
+
+                    combined_cert_path
+                } else {
+                    cert.clone()
+                };
+
+                server_builder = server_builder.ftps(&final_cert, key);
 
                 if self.config.ftps_required {
                     info!("FTPS is explicitly required for all connections");

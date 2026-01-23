@@ -28,6 +28,15 @@ pub trait StorageBackend: Send + Sync {
         secret_key: &str,
         start_pos: Option<u64>,
     ) -> Result<GetObjectOutput, Self::Error>;
+    async fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        access_key: &str,
+        secret_key: &str,
+        start_pos: u64,
+        length: u64,
+    ) -> Result<GetObjectOutput, Self::Error>;
     /// Put object content with metadata
     async fn put_object(&self, input: PutObjectInput, access_key: &str, secret_key: &str)
     -> Result<PutObjectOutput, Self::Error>;

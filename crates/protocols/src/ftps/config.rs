@@ -43,6 +43,8 @@ pub struct FtpsConfig {
     pub cert_file: Option<String>,
     /// Private key file path
     pub key_file: Option<String>,
+    /// CA certificate file path for client certificate verification
+    pub ca_file: Option<String>,
 }
 
 impl FtpsConfig {
@@ -110,6 +112,7 @@ impl Default for FtpsConfig {
             ftps_required: false,
             cert_file: None,
             key_file: None,
+            ca_file: None,
         }
     }
 }

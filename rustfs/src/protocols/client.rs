@@ -383,6 +383,55 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
     }
 
+    async fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        access_key: &str,
+        secret_key: &str,
+        start_pos: u64,
+        length: u64,
+    ) -> Result<GetObjectOutput, Self::Error> {
+        trace!(
+            "Protocol storage client GetObjectRange request: bucket={}, key={}, start={}, length={}",
+            bucket, key, start_pos, length
+        );
+
+        let range = s3s::dto::Range::Int {
+            first: start_pos,
+            last: Some(start_pos + length - 1),
+        };
+
+        let input = GetObjectInput::builder()
+            .bucket(bucket.to_string())
+            .key(key.to_string())
+            .range(Some(range))
+            .build()
+            .map_err(|e| {
+                s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build GetObjectInput: {}", e))
+            })?;
+
+        let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
+        let req = self
+            .create_request(
+                input,
+                Method::GET,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket.to_string()),
+                    object: Some(key.to_string()),
+                    access_key,
+                    secret_key,
+                },
+            )
+            .await?;
+
+        match self.fs.get_object(req).await {
+            Ok(response) => Ok(response.output),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn delete_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<DeleteBucketOutput, Self::Error> {
         trace!("Protocol storage client DeleteBucket request: bucket={}", bucket);
 

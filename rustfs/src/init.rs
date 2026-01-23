@@ -328,7 +328,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
-            DEFAULT_FTPS_ADDRESS, ENV_FTPS_ADDRESS, ENV_FTPS_CERTS_FILE, ENV_FTPS_ENABLE, ENV_FTPS_EXTERNAL_IP,
+            DEFAULT_FTPS_ADDRESS, ENV_FTPS_ADDRESS, ENV_FTPS_CA_FILE, ENV_FTPS_CERTS_FILE, ENV_FTPS_ENABLE, ENV_FTPS_EXTERNAL_IP,
             ENV_FTPS_KEY_FILE, ENV_FTPS_PASSIVE_PORTS,
         };
         use rustfs_protocols::{FtpsConfig, FtpsServer};
@@ -349,6 +349,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
         // Get FTPS configuration from environment variables
         let cert_file = rustfs_utils::get_env_opt_str(ENV_FTPS_CERTS_FILE);
         let key_file = rustfs_utils::get_env_opt_str(ENV_FTPS_KEY_FILE);
+        let ca_file = rustfs_utils::get_env_opt_str(ENV_FTPS_CA_FILE);
         let passive_ports = rustfs_utils::get_env_opt_str(ENV_FTPS_PASSIVE_PORTS);
         let external_ip = rustfs_utils::get_env_opt_str(ENV_FTPS_EXTERNAL_IP);
 
@@ -360,6 +361,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
             ftps_required: true,
             cert_file,
             key_file,
+            ca_file,
         };
 
         // Create FTPS server with protocol storage client
