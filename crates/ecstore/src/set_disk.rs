@@ -74,6 +74,7 @@ use rustfs_filemeta::{
     RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
 };
 use rustfs_lock::FastLockGuard;
+use rustfs_lock::fast_lock::manager::NamespaceLockGuard;
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
@@ -117,6 +118,7 @@ pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
+const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct SetDisks {
@@ -2633,7 +2635,13 @@ impl SetDisks {
         };
 
         let write_lock_guard = if !opts.no_lock {
-            Some(self.new_ns_lock(bucket, object).await?)
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+                StorageError::other(format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error(bucket, object, "write", &e)
+                ))
+            })?)
         } else {
             None
         };
@@ -3281,11 +3289,12 @@ impl SetDisks {
         remove: bool,
     ) -> Result<(HealResultItem, Option<DiskError>)> {
         let _write_lock_guard = self
-            .fast_lock_manager
-            .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+            .new_ns_lock(bucket, object)
+            .await?
+            .get_write_lock(LOCK_ACQUIRE_TIMEOUT)
             .await
             .map_err(|e| {
-                let message = self.format_lock_error(bucket, object, "write", &e);
+                let message = format!("Failed to acquire write lock: {}", self.format_lock_error(bucket, object, "write", &e));
                 DiskError::other(message)
             })?;
 
@@ -3583,10 +3592,16 @@ impl ObjectIO for SetDisks {
         // Acquire a shared read-lock early to protect read consistency
         let read_lock_guard = if !opts.no_lock {
             Some(
-                self.fast_lock_manager
-                    .acquire_read_lock(bucket, object, self.locker_owner.as_str())
+                self.new_ns_lock(bucket, object)
+                    .await?
+                    .get_read_lock(LOCK_ACQUIRE_TIMEOUT)
                     .await
-                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "read", &e)))?,
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "Failed to acquire read lock: {}",
+                            self.format_lock_error(bucket, object, "read", &e)
+                        ))
+                    })?,
             )
         } else {
             None
@@ -3674,7 +3689,13 @@ impl ObjectIO for SetDisks {
 
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if !opts.no_lock {
-                object_lock_guard = Some(self.new_ns_lock(bucket, object).await?);
+                let ns_lock = self.new_ns_lock(bucket, object).await?;
+                object_lock_guard = Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+                    StorageError::other(format!(
+                        "Failed to acquire write lock: {}",
+                        self.format_lock_error(bucket, object, "write", &e)
+                    ))
+                })?);
             }
 
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -3882,7 +3903,13 @@ impl ObjectIO for SetDisks {
         drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
 
         if !opts.no_lock && object_lock_guard.is_none() {
-            object_lock_guard = Some(self.new_ns_lock(bucket, object).await?);
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            object_lock_guard = Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+                StorageError::other(format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error(bucket, object, "write", &e)
+                ))
+            })?);
         }
 
         let (online_disks, _, op_old_dir) = Self::rename_data(
@@ -3925,11 +3952,8 @@ impl ObjectIO for SetDisks {
 #[async_trait::async_trait]
 impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
-        self.fast_lock_manager
-            .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-            .await
-            .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))
+    async fn new_ns_lock<'a>(&'a self, bucket: &str, object: &str) -> Result<NamespaceLockGuard<'a>> {
+        Ok(self.fast_lock_manager.new_ns_lock(bucket, object, self.locker_owner.as_str()))
     }
 
     #[tracing::instrument(skip(self))]
@@ -3991,10 +4015,16 @@ impl StorageAPI for SetDisks {
 
         // Guard lock for source object metadata update
         let _lock_guard = self
-            .fast_lock_manager
-            .acquire_write_lock(src_bucket, src_object, self.locker_owner.as_str())
+            .new_ns_lock(src_bucket, src_object)
+            .await?
+            .get_write_lock(LOCK_ACQUIRE_TIMEOUT)
             .await
-            .map_err(|e| Error::other(self.format_lock_error(src_bucket, src_object, "write", &e)))?;
+            .map_err(|e| {
+                Error::other(format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error(src_bucket, src_object, "write", &e)
+                ))
+            })?;
 
         let disks = self.get_disks_internal().await;
 
@@ -4348,10 +4378,16 @@ impl StorageAPI for SetDisks {
         // Guard lock for single object delete
         let _lock_guard = if !opts.delete_prefix {
             Some(
-                self.fast_lock_manager
-                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                self.new_ns_lock(bucket, object)
+                    .await?
+                    .get_write_lock(LOCK_ACQUIRE_TIMEOUT)
                     .await
-                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "Failed to acquire write lock: {}",
+                            self.format_lock_error(bucket, object, "write", &e)
+                        ))
+                    })?,
             )
         } else {
             None
@@ -4528,10 +4564,16 @@ impl StorageAPI for SetDisks {
         // Acquire a shared read-lock to protect consistency during info fetch
         let _read_lock_guard = if !opts.no_lock {
             Some(
-                self.fast_lock_manager
-                    .acquire_read_lock(bucket, object, self.locker_owner.as_str())
+                self.new_ns_lock(bucket, object)
+                    .await?
+                    .get_read_lock(LOCK_ACQUIRE_TIMEOUT)
                     .await
-                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "read", &e)))?,
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "Failed to acquire read lock: {}",
+                            self.format_lock_error(bucket, object, "read", &e)
+                        ))
+                    })?,
             )
         } else {
             None
@@ -4578,10 +4620,16 @@ impl StorageAPI for SetDisks {
         // Guard lock for metadata update
         let _lock_guard = if !opts.no_lock {
             Some(
-                self.fast_lock_manager
-                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                self.new_ns_lock(bucket, object)
+                    .await?
+                    .get_write_lock(LOCK_ACQUIRE_TIMEOUT)
                     .await
-                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "Failed to acquire write lock: {}",
+                            self.format_lock_error(bucket, object, "write", &e)
+                        ))
+                    })?,
             )
         } else {
             None
@@ -5415,7 +5463,13 @@ impl StorageAPI for SetDisks {
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             let object_lock_guard = if !opts.no_lock {
-                Some(self.new_ns_lock(bucket, object).await?)
+                let ns_lock = self.new_ns_lock(bucket, object).await?;
+                Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+                    StorageError::other(format!(
+                        "Failed to acquire write lock: {}",
+                        self.format_lock_error(bucket, object, "write", &e)
+                    ))
+                })?)
             } else {
                 None
             };
@@ -5585,7 +5639,13 @@ impl StorageAPI for SetDisks {
         // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if !opts.no_lock {
-                object_lock_guard = Some(self.new_ns_lock(bucket, object).await?);
+                let ns_lock = self.new_ns_lock(bucket, object).await?;
+                object_lock_guard = Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+                    StorageError::other(format!(
+                        "Failed to acquire write lock: {}",
+                        self.format_lock_error(bucket, object, "write", &e)
+                    ))
+                })?);
             }
 
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -5923,7 +5983,13 @@ impl StorageAPI for SetDisks {
         }
 
         if !opts.no_lock && object_lock_guard.is_none() {
-            object_lock_guard = Some(self.new_ns_lock(bucket, object).await?);
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            object_lock_guard = Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+                StorageError::other(format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error(bucket, object, "write", &e)
+                ))
+            })?);
         }
 
         self.cleanup_multipart_path(&parts).await;
@@ -6012,82 +6078,14 @@ impl StorageAPI for SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        // let mut effective_object = object.to_string();
-        //
-        // // Optimization: Only attempt correction if the name looks suspicious (quotes or URL encoded)
-        // // and the original object does NOT exist.
-        // let has_quotes = (effective_object.starts_with('\'') && effective_object.ends_with('\''))
-        //     || (effective_object.starts_with('"') && effective_object.ends_with('"'));
-        // let has_percent = effective_object.contains('%');
-        //
-        // if has_quotes || has_percent {
-        //     let disks = self.disks.read().await;
-        //     // 1. Check if the original object exists (lightweight check)
-        //     let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, &effective_object, version_id, false, false).await?;
-        //
-        //     if DiskError::is_all_not_found(&errs) {
-        //         // Original not found. Try candidates.
-        //         let mut candidates = Vec::new();
-        //
-        //         // Candidate 1: URL Decoded (Priority for web access issues)
-        //         if has_percent {
-        //             if let Ok(decoded) = urlencoding::decode(&effective_object) {
-        //                 if decoded != effective_object {
-        //                     candidates.push(decoded.to_string());
-        //                 }
-        //             }
-        //         }
-        //
-        //         // Candidate 2: Quote Stripped (For shell copy-paste issues)
-        //         if has_quotes && effective_object.len() >= 2 {
-        //             candidates.push(effective_object[1..effective_object.len() - 1].to_string());
-        //         }
-        //
-        //         // Check candidates
-        //         for candidate in candidates {
-        //             let (_, errs_cand) =
-        //                 Self::read_all_fileinfo(&disks, "", bucket, &candidate, version_id, false, false).await?;
-        //
-        //             if !DiskError::is_all_not_found(&errs_cand) {
-        //                 info!(
-        //                     "Heal request for object '{}' failed (not found). Auto-corrected to '{}'.",
-        //                     effective_object, candidate
-        //                 );
-        //                 effective_object = candidate;
-        //                 break; // Found a match, stop searching
-        //             }
-        //         }
-        //     }
-        // }
-        // let object = effective_object.as_str();
-
         let _write_lock_guard = if !opts.no_lock {
-            let _lock_guard = self.new_ns_lock(bucket, object).await?;
-            Some(_lock_guard)
-
-            // let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
-            // let mut skip_lock = false;
-            // if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key)
-            //     && lock_info.owner.as_ref() == self.locker_owner.as_str()
-            //     && matches!(lock_info.mode, rustfs_lock::fast_lock::types::LockMode::Exclusive)
-            // {
-            //     debug!(
-            //         "Reusing existing exclusive lock for heal operation on {}/{} held by {}",
-            //         bucket, object, self.locker_owner
-            //     );
-            //     skip_lock = true;
-            // }
-            // if skip_lock {
-            //     None
-            // } else {
-            //     info!(?opts, "Starting heal_object");
-            //     Some(
-            //         self.fast_lock_manager
-            //             .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-            //             .await
-            //             .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
-            //     )
-            // }
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+                StorageError::other(format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error(bucket, object, "write", &e)
+                ))
+            })?)
         } else {
             None
         };

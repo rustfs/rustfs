@@ -69,7 +69,7 @@ use rand::Rng as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
-use rustfs_lock::FastLockGuard;
+use rustfs_lock::fast_lock::manager::NamespaceLockGuard;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
@@ -1205,7 +1205,7 @@ lazy_static! {
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
     #[instrument(skip(self))]
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
+    async fn new_ns_lock<'a>(&'a self, bucket: &str, object: &str) -> Result<NamespaceLockGuard<'a>> {
         self.pools[0].new_ns_lock(bucket, object).await
     }
     #[instrument(skip(self))]

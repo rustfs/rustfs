@@ -3803,8 +3803,6 @@ impl S3 for FS {
             sse_customer_key_md5,
             ssekms_key_id,
             content_md5,
-            
-            
             ..
         } = input;
 
@@ -4899,8 +4897,6 @@ impl S3 for FS {
             bucket,
             key,
             upload_id,
-            
-            
             ..
         } = input;
 
