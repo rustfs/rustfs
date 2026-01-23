@@ -49,6 +49,6 @@ mod content_encoding_test;
 mod policy;
 
 #[cfg(test)]
-mod protocols;
-#[cfg(test)]
 mod compression_test;
+#[cfg(test)]
+mod protocols;

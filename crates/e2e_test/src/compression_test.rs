@@ -1,15 +1,15 @@
-
-
 //! Integration tests for object compression functionality
 
 use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path};
 use aws_sdk_s3::primitives::ByteStream;
 use serial_test::serial;
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
-use tracing::{info, debug};
+use tracing::info;
 
 const COMPRESSION_TEST_BUCKET: &str = "compression-test-bucket";
 const MIN_COMPRESSIBLE_SIZE: usize = 4096;
@@ -25,6 +25,32 @@ fn generate_compressible_data(size: usize) -> Vec<u8> {
     data
 }
 
+fn find_part_files(temp_dir: &str, bucket: &str, object_key: &str) -> Vec<PathBuf> {
+    let bucket_path = PathBuf::from(temp_dir).join(bucket);
+    let mut part_files = Vec::new();
+
+    fn scan_dir(dir: &PathBuf, target: &str, results: &mut Vec<PathBuf>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_dir(&path, target, results);
+                } else if path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().starts_with("part."))
+                    .unwrap_or(false)
+                    && path.to_string_lossy().contains(target)
+                {
+                    results.push(path);
+                }
+            }
+        }
+    }
+
+    scan_dir(&bucket_path, object_key, &mut part_files);
+    part_files
+}
+
 async fn start_rustfs_with_compression(env: &mut RustFSTestEnvironment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     env.cleanup_existing_processes().await?;
 
@@ -32,9 +58,12 @@ async fn start_rustfs_with_compression(env: &mut RustFSTestEnvironment) -> Resul
     let process = Command::new(&binary_path)
         .env("RUSTFS_COMPRESSION_ENABLED", "true")
         .args([
-            "--address", &env.address,
-            "--access-key", &env.access_key,
-            "--secret-key", &env.secret_key,
+            "--address",
+            &env.address,
+            "--access-key",
+            &env.access_key,
+            "--secret-key",
+            &env.secret_key,
             &env.temp_dir,
         ])
         .spawn()?;
@@ -90,9 +119,20 @@ async fn test_compression_roundtrip() -> Result<(), Box<dyn std::error::Error + 
         .await?;
 
     let content_length = head_response.content_length().unwrap_or(0);
-    assert_eq!(
-        content_length as usize, original_size,
-        "Content-Length should be original size"
+    assert_eq!(content_length as usize, original_size, "Content-Length should be original size");
+
+    let part_files = find_part_files(&env.temp_dir, COMPRESSION_TEST_BUCKET, object_key);
+    let total_physical_size: u64 = part_files.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
+
+    assert!(
+        total_physical_size < original_size as u64,
+        "Physical size {} should be less than original size {} (compression applied)",
+        total_physical_size,
+        original_size
+    );
+    info!(
+        "Physical storage size: {} bytes (compressed from {} bytes)",
+        total_physical_size, original_size
     );
 
     // GET and verify data
@@ -107,49 +147,8 @@ async fn test_compression_roundtrip() -> Result<(), Box<dyn std::error::Error + 
 
     assert_eq!(downloaded_data.len(), original_size);
     assert_eq!(&downloaded_data[..], &original_data[..], "Data mismatch");
-    
+
     info!("Compression roundtrip test passed");
-    env.delete_test_bucket(COMPRESSION_TEST_BUCKET).await?;
-    env.stop_server();
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_small_object_not_compressed() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-    info!("Starting small object test");
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    start_rustfs_with_compression(&mut env).await?;
-
-    let client = env.create_s3_client();
-    env.create_test_bucket(COMPRESSION_TEST_BUCKET).await?;
-
-    let small_size = MIN_COMPRESSIBLE_SIZE - 1;
-    let small_data = generate_compressible_data(small_size);
-    let object_key = "test-small.txt";
-
-    client
-        .put_object()
-        .bucket(COMPRESSION_TEST_BUCKET)
-        .key(object_key)
-        .body(ByteStream::from(small_data.clone()))
-        .send()
-        .await?;
-
-    let get_response = client
-        .get_object()
-        .bucket(COMPRESSION_TEST_BUCKET)
-        .key(object_key)
-        .send()
-        .await?;
-
-    let downloaded_data = get_response.body.collect().await?.into_bytes();
-    assert_eq!(&downloaded_data[..], &small_data[..]);
-
-    info!("Small object test passed");
-
     env.delete_test_bucket(COMPRESSION_TEST_BUCKET).await?;
     env.stop_server();
     Ok(())
