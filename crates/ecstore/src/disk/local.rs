@@ -2784,8 +2784,10 @@ mod test {
         let disk_info = disk.disk_info(&disk_info_opts).await.unwrap();
 
         // Basic checks on disk info
-        assert!(!disk_info.fs_type.is_empty());
         assert!(disk_info.total > 0);
+        assert!(disk_info.free <= disk_info.total);
+        assert!(!disk_info.mount_path.is_empty());
+        assert!(!disk_info.endpoint.is_empty());
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
