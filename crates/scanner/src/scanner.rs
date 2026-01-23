@@ -126,11 +126,17 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
 }
 
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
-    // TODO: leader lock
+    // Acquire leader lock (write lock) to ensure only one scanner runs
     let _guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
-        Ok(guard) => guard,
+        Ok(ns_lock) => match ns_lock.get_write_lock(Duration::from_secs(30)).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                error!("run_data_scanner: other node is running, failed to acquire leader write lock: {:?}", e);
+                return Ok(());
+            }
+        },
         Err(e) => {
-            error!("run_data_scanner: other node is running, failed to acquire leader lock: {e}");
+            error!("run_data_scanner: failed to create namespace lock: {e}");
             return Ok(());
         }
     };
