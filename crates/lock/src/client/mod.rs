@@ -15,26 +15,15 @@
 pub mod local;
 // pub mod remote;
 
-use crate::{LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, Result};
+use crate::{LockId, LockInfo, LockRequest, LockResponse, LockStats, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 
 /// Lock client trait
 #[async_trait]
 pub trait LockClient: Send + Sync + std::fmt::Debug {
-    /// Acquire exclusive lock
-    async fn acquire_exclusive(&self, request: &LockRequest) -> Result<LockResponse>;
-
-    /// Acquire shared lock
-    async fn acquire_shared(&self, request: &LockRequest) -> Result<LockResponse>;
-
     /// Acquire lock (generic method)
-    async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
-        match request.lock_type {
-            LockType::Exclusive => self.acquire_exclusive(request).await,
-            LockType::Shared => self.acquire_shared(request).await,
-        }
-    }
+    async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse>;
 
     /// Release lock
     async fn release(&self, lock_id: &LockId) -> Result<bool>;

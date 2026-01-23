@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -306,11 +305,9 @@ impl NamespaceLock {
 
         // Check client status
         let mut connected_clients = 0;
-        for client in &self.clients {
-            if let Some(client) = client {
-                if client.is_online().await {
-                    connected_clients += 1;
-                }
+        for client in self.clients.iter().flatten() {
+            if client.is_online().await {
+                connected_clients += 1;
             }
         }
 
@@ -330,12 +327,10 @@ impl NamespaceLock {
         let mut stats = crate::types::LockStats::default();
 
         // Try to get stats from clients
-        for client in &self.clients {
-            if let Some(client) = client {
-                if let Ok(client_stats) = client.get_stats().await {
-                    stats.successful_acquires += client_stats.successful_acquires;
-                    stats.failed_acquires += client_stats.failed_acquires;
-                }
+        for client in self.clients.iter().flatten() {
+            if let Ok(client_stats) = client.get_stats().await {
+                stats.successful_acquires += client_stats.successful_acquires;
+                stats.failed_acquires += client_stats.failed_acquires;
             }
         }
 
@@ -349,135 +344,135 @@ impl Default for NamespaceLock {
     }
 }
 
-/// Namespace lock manager trait
-#[async_trait]
-pub trait NamespaceLockManager: Send + Sync {
-    /// Batch get write lock
-    async fn lock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool>;
+// /// Namespace lock manager trait
+// #[async_trait]
+// pub trait NamespaceLockManager: Send + Sync {
+//     /// Batch get write lock
+//     async fn lock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool>;
 
-    /// Batch release write lock
-    async fn unlock_batch(&self, resources: &[ObjectKey], owner: &str) -> Result<()>;
+//     /// Batch release write lock
+//     async fn unlock_batch(&self, resources: &[ObjectKey], owner: &str) -> Result<()>;
 
-    /// Batch get read lock
-    async fn rlock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool>;
+//     /// Batch get read lock
+//     async fn rlock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool>;
 
-    /// Batch release read lock
-    async fn runlock_batch(&self, resources: &[ObjectKey], owner: &str) -> Result<()>;
-}
+//     /// Batch release read lock
+//     async fn runlock_batch(&self, resources: &[ObjectKey], owner: &str) -> Result<()>;
+// }
 
-#[async_trait]
-impl NamespaceLockManager for NamespaceLock {
-    async fn lock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool> {
-        if self.clients.is_empty() {
-            return Err(LockError::internal("No lock clients available"));
-        }
+// #[async_trait]
+// impl NamespaceLockManager for NamespaceLock {
+//     async fn lock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool> {
+//         if self.clients.is_empty() {
+//             return Err(LockError::internal("No lock clients available"));
+//         }
 
-        // Transactional batch lock: all resources must be locked or none
-        let mut acquired_resources = Vec::new();
+//         // Transactional batch lock: all resources must be locked or none
+//         let mut acquired_resources = Vec::new();
 
-        for resource in resources {
-            let request = LockRequest::new(resource.clone(), LockType::Exclusive, owner)
-                .with_acquire_timeout(timeout)
-                .with_ttl(ttl);
+//         for resource in resources {
+//             let request = LockRequest::new(resource.clone(), LockType::Exclusive, owner)
+//                 .with_acquire_timeout(timeout)
+//                 .with_ttl(ttl);
 
-            let response = self.acquire_lock(&request).await?;
-            if response.success {
-                acquired_resources.push(resource.clone());
-            } else {
-                // Rollback all previously acquired locks
-                self.rollback_batch_locks(&acquired_resources, owner).await;
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
+//             let response = self.acquire_lock(&request).await?;
+//             if response.success {
+//                 acquired_resources.push(resource.clone());
+//             } else {
+//                 // Rollback all previously acquired locks
+//                 self.rollback_batch_locks(&acquired_resources, owner).await;
+//                 return Ok(false);
+//             }
+//         }
+//         Ok(true)
+//     }
 
-    async fn unlock_batch(&self, resources: &[ObjectKey], _owner: &str) -> Result<()> {
-        if self.clients.is_empty() {
-            return Err(LockError::internal("No lock clients available"));
-        }
+//     async fn unlock_batch(&self, resources: &[ObjectKey], _owner: &str) -> Result<()> {
+//         if self.clients.is_empty() {
+//             return Err(LockError::internal("No lock clients available"));
+//         }
 
-        // Release all locks (best effort)
-        let release_futures: Vec<_> = resources
-            .iter()
-            .map(|resource| {
-                let lock_id = LockId::new_deterministic(resource);
-                async move {
-                    if let Err(e) = self.release_lock(&lock_id).await {
-                        tracing::warn!("Failed to release lock for resource {}: {}", resource, e);
-                    }
-                }
-            })
-            .collect();
+//         // Release all locks (best effort)
+//         let release_futures: Vec<_> = resources
+//             .iter()
+//             .map(|resource| {
+//                 let lock_id = LockId::new_deterministic(resource);
+//                 async move {
+//                     if let Err(e) = self.release_lock(&lock_id).await {
+//                         tracing::warn!("Failed to release lock for resource {}: {}", resource, e);
+//                     }
+//                 }
+//             })
+//             .collect();
 
-        futures::future::join_all(release_futures).await;
-        Ok(())
-    }
+//         futures::future::join_all(release_futures).await;
+//         Ok(())
+//     }
 
-    async fn rlock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool> {
-        if self.clients.is_empty() {
-            return Err(LockError::internal("No lock clients available"));
-        }
+//     async fn rlock_batch(&self, resources: &[ObjectKey], owner: &str, timeout: Duration, ttl: Duration) -> Result<bool> {
+//         if self.clients.is_empty() {
+//             return Err(LockError::internal("No lock clients available"));
+//         }
 
-        // Transactional batch read lock: all resources must be locked or none
-        let mut acquired_resources = Vec::new();
+//         // Transactional batch read lock: all resources must be locked or none
+//         let mut acquired_resources = Vec::new();
 
-        for resource in resources {
-            let request = LockRequest::new(resource.clone(), LockType::Shared, owner)
-                .with_acquire_timeout(timeout)
-                .with_ttl(ttl);
+//         for resource in resources {
+//             let request = LockRequest::new(resource.clone(), LockType::Shared, owner)
+//                 .with_acquire_timeout(timeout)
+//                 .with_ttl(ttl);
 
-            let response = self.acquire_lock(&request).await?;
-            if response.success {
-                acquired_resources.push(resource.clone());
-            } else {
-                // Rollback all previously acquired read locks
-                self.rollback_batch_locks(&acquired_resources, owner).await;
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
+//             let response = self.acquire_lock(&request).await?;
+//             if response.success {
+//                 acquired_resources.push(resource.clone());
+//             } else {
+//                 // Rollback all previously acquired read locks
+//                 self.rollback_batch_locks(&acquired_resources, owner).await;
+//                 return Ok(false);
+//             }
+//         }
+//         Ok(true)
+//     }
 
-    async fn runlock_batch(&self, resources: &[ObjectKey], _owner: &str) -> Result<()> {
-        if self.clients.is_empty() {
-            return Err(LockError::internal("No lock clients available"));
-        }
+//     async fn runlock_batch(&self, resources: &[ObjectKey], _owner: &str) -> Result<()> {
+//         if self.clients.is_empty() {
+//             return Err(LockError::internal("No lock clients available"));
+//         }
 
-        // Release all read locks (best effort)
-        let release_futures: Vec<_> = resources
-            .iter()
-            .map(|resource| {
-                let lock_id = LockId::new_deterministic(resource);
-                async move {
-                    if let Err(e) = self.release_lock(&lock_id).await {
-                        tracing::warn!("Failed to release read lock for resource {}: {}", resource, e);
-                    }
-                }
-            })
-            .collect();
+//         // Release all read locks (best effort)
+//         let release_futures: Vec<_> = resources
+//             .iter()
+//             .map(|resource| {
+//                 let lock_id = LockId::new_deterministic(resource);
+//                 async move {
+//                     if let Err(e) = self.release_lock(&lock_id).await {
+//                         tracing::warn!("Failed to release read lock for resource {}: {}", resource, e);
+//                     }
+//                 }
+//             })
+//             .collect();
 
-        futures::future::join_all(release_futures).await;
-        Ok(())
-    }
-}
+//         futures::future::join_all(release_futures).await;
+//         Ok(())
+//     }
+// }
 
-impl NamespaceLock {
-    /// Rollback batch lock acquisitions
-    async fn rollback_batch_locks(&self, acquired_resources: &[ObjectKey], _owner: &str) {
-        let rollback_futures: Vec<_> = acquired_resources
-            .iter()
-            .map(|resource| {
-                let lock_id = LockId::new_deterministic(resource);
-                async move {
-                    if let Err(e) = self.release_lock(&lock_id).await {
-                        tracing::warn!("Failed to rollback lock for resource {}: {}", resource, e);
-                    }
-                }
-            })
-            .collect();
+// impl NamespaceLock {
+//     /// Rollback batch lock acquisitions
+//     async fn rollback_batch_locks(&self, acquired_resources: &[ObjectKey], _owner: &str) {
+//         let rollback_futures: Vec<_> = acquired_resources
+//             .iter()
+//             .map(|resource| {
+//                 let lock_id = LockId::new_deterministic(resource);
+//                 async move {
+//                     if let Err(e) = self.release_lock(&lock_id).await {
+//                         tracing::warn!("Failed to rollback lock for resource {}: {}", resource, e);
+//                     }
+//                 }
+//             })
+//             .collect();
 
-        futures::future::join_all(rollback_futures).await;
-        tracing::info!("Rolled back {} batch lock acquisitions", acquired_resources.len());
-    }
-}
+//         futures::future::join_all(rollback_futures).await;
+//         tracing::info!("Rolled back {} batch lock acquisitions", acquired_resources.len());
+//     }
+// }

@@ -47,7 +47,7 @@ pub use crate::{
     },
     guard::LockGuard,
     // Main components
-    namespace::{NamespaceLock, NamespaceLockManager},
+    namespace::NamespaceLock,
     // Core types
     types::{
         HealthInfo, HealthStatus, LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockStatus,

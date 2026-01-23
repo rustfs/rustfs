@@ -84,13 +84,14 @@ impl RemoteClient {
 
 #[async_trait]
 impl LockClient for RemoteClient {
-    async fn acquire_exclusive(&self, request: &LockRequest) -> Result<LockResponse> {
+    async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
         info!("remote acquire_exclusive for {}", request.resource);
         let mut client = self.get_client().await?;
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
+
         let resp = client
             .lock(req)
             .await
@@ -128,55 +129,6 @@ impl LockClient for RemoteClient {
             // Lock acquisition failed
             Ok(LockResponse::failure(
                 "Lock acquisition failed on remote server".to_string(),
-                std::time::Duration::ZERO,
-            ))
-        }
-    }
-
-    async fn acquire_shared(&self, request: &LockRequest) -> Result<LockResponse> {
-        info!("remote acquire_shared for {}", request.resource);
-        let mut client = self.get_client().await?;
-        let req = Request::new(GenerallyLockRequest {
-            args: serde_json::to_string(&request)
-                .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
-        });
-        let resp = client
-            .r_lock(req)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
-            .into_inner();
-
-        // Check for explicit error first
-        if let Some(error_info) = resp.error_info {
-            return Err(LockError::internal(error_info));
-        }
-
-        // Check if the lock acquisition was successful
-        if resp.success {
-            // Save the lock information for later release
-            let mut locks = self.active_locks.write().await;
-            locks.insert(request.lock_id.clone(), request.owner.clone());
-
-            Ok(LockResponse::success(
-                LockInfo {
-                    id: request.lock_id.clone(),
-                    resource: request.resource.clone(),
-                    lock_type: request.lock_type,
-                    status: LockStatus::Acquired,
-                    owner: request.owner.clone(),
-                    acquired_at: std::time::SystemTime::now(),
-                    expires_at: std::time::SystemTime::now() + request.ttl,
-                    last_refreshed: std::time::SystemTime::now(),
-                    metadata: request.metadata.clone(),
-                    priority: request.priority,
-                    wait_start_time: None,
-                },
-                std::time::Duration::ZERO,
-            ))
-        } else {
-            // Lock acquisition failed
-            Ok(LockResponse::failure(
-                "Shared lock acquisition failed on remote server".to_string(),
                 std::time::Duration::ZERO,
             ))
         }

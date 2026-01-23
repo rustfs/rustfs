@@ -1462,7 +1462,7 @@ impl Node for NodeService {
             }
         };
 
-        match self.lock_manager.acquire_exclusive(&args).await {
+        match self.lock_manager.acquire_lock(&args).await {
             Ok(result) => Ok(Response::new(GenerallyLockResponse {
                 success: result.success,
                 error_info: None,
@@ -1516,7 +1516,7 @@ impl Node for NodeService {
             }
         };
 
-        match self.lock_manager.acquire_shared(&args).await {
+        match self.lock_manager.acquire_lock(&args).await {
             Ok(result) => Ok(Response::new(GenerallyLockResponse {
                 success: result.success,
                 error_info: None,
