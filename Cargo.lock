@@ -8220,7 +8220,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "time",
  "tokio",
  "tokio-test",
