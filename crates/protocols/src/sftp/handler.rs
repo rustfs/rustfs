@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::fs::{File as TokioFile, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{debug, error, trace};
@@ -390,13 +390,7 @@ where
         }
     }
 
-    fn read(
-        &mut self,
-        id: u32,
-        handle: String,
-        _offset: u64,
-        _len: u32,
-    ) -> impl Future<Output = Result<Data, Self::Error>> + Send {
+    fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> impl Future<Output = Result<Data, Self::Error>> + Send {
         let this = self.clone();
         async move {
             let (bucket, key) = {
@@ -415,7 +409,7 @@ where
                     &key,
                     &this.session_context.principal.user_identity.credentials.access_key,
                     &this.session_context.principal.user_identity.credentials.secret_key,
-                    None,
+                    Some(offset),
                 )
                 .await
             {
@@ -424,14 +418,28 @@ where
                     if let Some(body) = output.body {
                         let stream = body.map_err(std::io::Error::other);
                         let mut reader = StreamReader::new(stream);
-                        let _ = reader.read_to_end(&mut data).await;
+
+                        // Read only len bytes
+                        let mut buffer = vec![0u8; len as usize];
+                        let mut total_read = 0;
+
+                        while total_read < len as usize {
+                            use tokio::io::AsyncReadExt;
+                            let n = reader
+                                .read(&mut buffer[total_read..])
+                                .await
+                                .map_err(|_| StatusCode::Failure)?;
+                            if n == 0 {
+                                break; // EOF
+                            }
+                            total_read += n;
+                        }
+
+                        data.extend_from_slice(&buffer[..total_read]);
                     }
                     Ok(Data { id, data })
                 }
-                Err(e) => {
-                    debug!("S3 Read failed: {}", e);
-                    Ok(Data { id, data: Vec::new() })
-                }
+                Err(_) => Err(StatusCode::Eof),
             }
         }
     }

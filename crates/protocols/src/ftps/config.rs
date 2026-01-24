@@ -66,6 +66,13 @@ impl FtpsConfig {
             return Err(FtpsInitError::InvalidConfig(format!("Key file not found: {}", path)));
         }
 
+        // Validate CA file exists if specified
+        if let Some(path) = &self.ca_file
+            && !tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
+            return Err(FtpsInitError::InvalidConfig(format!("CA file not found: {}", path)));
+        }
+
         // Validate passive ports format
         if self.passive_ports.is_some() {
             self.parse_passive_ports()?;

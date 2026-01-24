@@ -43,11 +43,13 @@ pub struct SftpConfig {
 impl SftpConfig {
     /// Validates the configuration
     pub async fn validate(&self) -> Result<(), SftpInitError> {
-        // Validate private key file exists if specified
-        if let Some(path) = &self.key_file
-            && !tokio::fs::try_exists(path).await.unwrap_or(false)
-        {
-            return Err(SftpInitError::InvalidConfig(format!("Private key file not found: {}", path)));
+        // Host key file is required for SFTP server
+        if let Some(path) = &self.key_file {
+            if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+                return Err(SftpInitError::InvalidConfig(format!("Private key file not found: {}", path)));
+            }
+        } else {
+            return Err(SftpInitError::InvalidConfig("Host key file must be provided for SFTP server".to_string()));
         }
 
         // Validate certificate file exists if specified
@@ -57,17 +59,11 @@ impl SftpConfig {
             return Err(SftpInitError::InvalidConfig(format!("Certificate file not found: {}", path)));
         }
 
-        // Validate authorized keys file exists if key auth is required
-        if self.require_key_auth {
-            if let Some(path) = &self.authorized_keys_file {
-                if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-                    return Err(SftpInitError::InvalidConfig(format!("Authorized keys file not found: {}", path)));
-                }
-            } else {
-                return Err(SftpInitError::InvalidConfig(
-                    "Key authentication is required but no authorized keys file specified".to_string(),
-                ));
-            }
+        // Validate authorized keys file exists if provided
+        if let Some(path) = &self.authorized_keys_file
+            && !tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
+            return Err(SftpInitError::InvalidConfig(format!("Authorized keys file not found: {}", path)));
         }
 
         Ok(())

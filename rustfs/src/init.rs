@@ -364,6 +364,9 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
             ca_file,
         };
 
+        // Validate FTPS configuration
+        config.validate().await?;
+
         // Create FTPS server with protocol storage client
         let fs = crate::storage::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
@@ -388,12 +391,6 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
 
         info!("FTPS system initialized successfully");
         Ok(Some(shutdown_tx))
-    }
-
-    #[cfg(not(feature = "ftps"))]
-    {
-        debug!("FTPS system not available (ftps feature not enabled)");
-        Ok(None)
     }
 }
 
@@ -436,6 +433,9 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
             authorized_keys_file,
         };
 
+        // Validate SFTP configuration
+        config.validate().await?;
+
         // Create SFTP server with protocol storage client
         let fs = crate::storage::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
@@ -456,11 +456,5 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
 
         info!("SFTP system initialized successfully");
         Ok(Some(shutdown_tx))
-    }
-
-    #[cfg(not(feature = "sftp"))]
-    {
-        debug!("SFTP system not available (sftp feature not enabled)");
-        Ok(None)
     }
 }
