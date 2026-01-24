@@ -20,6 +20,7 @@ use rustfs_ecstore::bucket::policy_sys::PolicySys;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_policy::policy::{Args, BucketPolicyArgs};
+use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
@@ -187,6 +188,15 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     }
 
     Err(s3_error!(AccessDenied, "Access Denied"))
+}
+
+/// Check if the request has the x-amz-bypass-governance-retention header set to true
+pub fn has_bypass_governance_header(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 #[async_trait::async_trait]
@@ -448,7 +458,14 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await
+        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await?;
+
+        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
+        if has_bypass_governance_header(&req.headers) {
+            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
+        }
+
+        Ok(())
     }
 
     /// Checks whether the DeleteObjectTagging request has accesses to the resources.
@@ -471,7 +488,15 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = None;
         req_info.version_id = None;
-        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await
+
+        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await?;
+
+        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
+        if has_bypass_governance_header(&req.headers) {
+            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
+        }
+
+        Ok(())
     }
 
     /// Checks whether the DeletePublicAccessBlock request has accesses to the resources.
@@ -1113,15 +1138,20 @@ impl S3Access for FS {
     }
 
     /// Checks whether the PutObjectRetention request has accesses to the resources.
-    ///
-    /// This method returns `Ok(())` by default.
     async fn put_object_retention(&self, req: &mut S3Request<PutObjectRetentionInput>) -> S3Result<()> {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+
+        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
+        if has_bypass_governance_header(&req.headers) {
+            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
+        }
+
+        Ok(())
     }
 
     /// Checks whether the PutObjectTagging request has accesses to the resources.
