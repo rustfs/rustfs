@@ -5736,7 +5736,9 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let cfg = match PolicySys::get(&bucket).await {
+        // Return the raw policy JSON as originally stored to preserve exact format.
+        // This ensures GET returns the same document that was PUT, matching S3 behavior.
+        let (policy_str, _) = match metadata_sys::get_bucket_policy_raw(&bucket).await {
             Ok(res) => res,
             Err(err) => {
                 if StorageError::ConfigNotFound == err {
@@ -5746,9 +5748,9 @@ impl S3 for FS {
             }
         };
 
-        let policies = try_!(serde_json::to_string(&cfg));
-
-        Ok(S3Response::new(GetBucketPolicyOutput { policy: Some(policies) }))
+        Ok(S3Response::new(GetBucketPolicyOutput {
+            policy: Some(policy_str),
+        }))
     }
 
     async fn put_bucket_policy(&self, req: S3Request<PutBucketPolicyInput>) -> S3Result<S3Response<PutBucketPolicyOutput>> {
@@ -5773,7 +5775,9 @@ impl S3 for FS {
             return Err(s3_error!(InvalidPolicyDocument));
         }
 
-        let data = serde_json::to_vec(&cfg).map_err(|e| s3_error!(InternalError, "parse policy failed {:?}", e))?;
+        // Store the original policy string as-is to preserve the exact JSON format.
+        // This ensures GET returns the same document that was PUT.
+        let data = policy.into_bytes();
 
         metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
             .await
