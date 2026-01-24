@@ -17,7 +17,7 @@
 # - Metadata: User-defined metadata
 # - Conditional GET: If-Match, If-None-Match, If-Modified-Since
 #
-# Total: 119 tests
+# Total: 123 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -101,6 +101,7 @@ test_bucketv2_notexist
 test_bucketv2_policy_another_bucket
 test_get_bucket_policy_status
 test_get_nonpublicpolicy_principal_bucket_policy_status
+test_set_get_del_bucket_policy
 test_get_object_ifmatch_good
 test_get_object_ifmodifiedsince_good
 test_get_object_ifunmodifiedsince_failed

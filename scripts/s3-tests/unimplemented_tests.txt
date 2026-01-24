@@ -173,7 +173,6 @@ test_put_excess_tags
 test_put_excess_val_tags
 test_put_get_delete_public_block
 test_put_public_block
-test_set_get_del_bucket_policy
 
 # Object attributes and torrent tests
 test_create_bucket_no_ownership_controls
