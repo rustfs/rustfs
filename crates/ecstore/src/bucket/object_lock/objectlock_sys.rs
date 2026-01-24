@@ -75,7 +75,7 @@ pub fn check_retention_for_modification(
         _ => false,
     };
 
-    // COMPLIANCE mode: cannot modify retention at all when shortening
+    // COMPLIANCE mode: cannot shorten retention at all (even with bypass)
     // Can only extend the retention period
     if mode_str == ObjectLockRetentionMode::COMPLIANCE {
         if is_shortening {
@@ -88,12 +88,19 @@ pub fn check_retention_for_modification(
         return None;
     }
 
-    // GOVERNANCE mode: can be bypassed with permission
-    if mode_str == ObjectLockRetentionMode::GOVERNANCE && !bypass_governance {
-        return Some(ObjectLockBlockReason::Retention {
-            mode: mode_str.to_string(),
-            retain_until: existing_retain_until,
-        });
+    // GOVERNANCE mode: extending is always allowed, shortening requires bypass
+    // This matches AWS S3 behavior where:
+    // - Extending retention: allowed without bypass permission
+    // - Shortening/removing retention: requires bypass permission
+    if mode_str == ObjectLockRetentionMode::GOVERNANCE {
+        if is_shortening && !bypass_governance {
+            return Some(ObjectLockBlockReason::Retention {
+                mode: mode_str.to_string(),
+                retain_until: existing_retain_until,
+            });
+        }
+        // Extending retention or shortening with bypass is allowed
+        return None;
     }
 
     None
@@ -433,8 +440,8 @@ mod tests {
     }
 
     #[test]
-    fn test_check_retention_for_modification_governance_without_bypass() {
-        // GOVERNANCE mode without bypass - modification should be blocked
+    fn test_check_retention_for_modification_governance_shorten_without_bypass() {
+        // GOVERNANCE mode - shortening retention without bypass should be blocked
         let mut user_defined = std::collections::HashMap::new();
         let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(30);
         user_defined.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
@@ -445,14 +452,16 @@ mod tests {
                 .unwrap(),
         );
 
+        // Shortening from 30 days to 15 days without bypass should be blocked
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(15));
         let result = check_retention_for_modification(&user_defined, new_retain, false);
         assert!(result.is_some());
     }
 
     #[test]
-    fn test_check_retention_for_modification_governance_with_bypass() {
-        // GOVERNANCE mode with bypass - modification should be allowed
+    fn test_check_retention_for_modification_governance_extend_without_bypass() {
+        // GOVERNANCE mode - extending retention without bypass should be allowed
+        // This matches AWS S3 behavior where extending is always allowed
         let mut user_defined = std::collections::HashMap::new();
         let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(30);
         user_defined.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
@@ -463,6 +472,25 @@ mod tests {
                 .unwrap(),
         );
 
+        // Extending from 30 days to 60 days without bypass should be allowed
+        let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(60));
+        assert!(check_retention_for_modification(&user_defined, new_retain, false).is_none());
+    }
+
+    #[test]
+    fn test_check_retention_for_modification_governance_shorten_with_bypass() {
+        // GOVERNANCE mode - shortening retention with bypass should be allowed
+        let mut user_defined = std::collections::HashMap::new();
+        let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(30);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            existing_retain
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+
+        // Shortening from 30 days to 15 days with bypass should be allowed
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(15));
         assert!(check_retention_for_modification(&user_defined, new_retain, true).is_none());
     }
