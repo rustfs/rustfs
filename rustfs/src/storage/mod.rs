@@ -23,3 +23,8 @@ pub mod tonic_service;
 
 #[cfg(test)]
 mod concurrent_get_object_test;
+mod ecfs_extend;
+#[cfg(test)]
+mod ecfs_test;
+
+pub(crate) use ecfs_extend::*;
