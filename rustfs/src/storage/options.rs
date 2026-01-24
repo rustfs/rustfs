@@ -444,6 +444,10 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "x-amz-tagging",
         "expires",
         "x-amz-replication-status",
+        // Object Lock headers - required for S3 Object Lock functionality
+        "x-amz-object-lock-mode",
+        "x-amz-object-lock-retain-until-date",
+        "x-amz-object-lock-legal-hold",
     ]
 });
 
@@ -1021,10 +1025,13 @@ mod tests {
             "x-amz-tagging",
             "expires",
             "x-amz-replication-status",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-object-lock-legal-hold",
         ];
 
         assert_eq!(*SUPPORTED_HEADERS, expected_headers);
-        assert_eq!(SUPPORTED_HEADERS.len(), 9);
+        assert_eq!(SUPPORTED_HEADERS.len(), 12);
     }
 
     #[test]

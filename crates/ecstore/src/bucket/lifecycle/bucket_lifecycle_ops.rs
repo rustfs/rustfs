@@ -22,7 +22,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc}
 use crate::bucket::lifecycle::lifecycle::{self, ExpirationOptions, Lifecycle, TransitionOptions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier};
-use crate::bucket::object_lock::objectlock_sys::enforce_retention_for_deletion;
+use crate::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
 use crate::bucket::{metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::error::Error;
@@ -1041,7 +1041,8 @@ pub async fn eval_action_from_lifecycle(
             if oi.version_id.is_none() {
                 return lifecycle::Event::default();
             }
-            if lock_enabled && enforce_retention_for_deletion(oi) {
+            // Lifecycle operations should never bypass governance retention
+            if lock_enabled && check_object_lock_for_deletion(&oi.bucket, oi, false).await.is_some() {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
                     info!(
