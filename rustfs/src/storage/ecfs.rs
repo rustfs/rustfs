@@ -17,18 +17,18 @@ use crate::config::workload_profiles::get_global_buffer_config;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::concurrency::{
-    get_concurrency_aware_buffer_size, get_concurrency_manager, CachedGetObject, ConcurrencyManager, GetObjectGuard,
+    CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
+use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
-    access::{authorize_request, has_bypass_governance_header, ReqInfo},
+    access::{ReqInfo, authorize_request, has_bypass_governance_header},
     options::{
         copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
         get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
     },
 };
-use crate::storage::{build_post_object_success_response, entity};
 use crate::storage::{
     check_preconditions, create_managed_encryption_material, decrypt_managed_encryption_key, decrypt_multipart_managed_stream,
     derive_part_nonce, get_buffer_size_opt_in, get_validated_store, has_replication_rules, is_managed_sse,
@@ -36,20 +36,19 @@ use crate::storage::{
     process_topic_configurations, strip_managed_encryption_metadata, validate_bucket_object_lock_enabled,
     validate_list_object_unordered_with_delimiter, validate_object_key, wrap_response_with_cors,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use datafusion::arrow::{
-    csv::WriterBuilder as CsvWriterBuilder, json::writer::JsonArray, json::WriterBuilder as JsonWriterBuilder,
+    csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::{counter, histogram};
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
-use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
-            bucket_lifecycle_ops::{post_restore_opts, validate_transition_tier, RestoreRequestOps},
+            bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts, validate_transition_tier},
             lifecycle::{self, Lifecycle, TransitionOptions},
         },
         metadata::{
@@ -58,12 +57,12 @@ use rustfs_ecstore::{
         },
         metadata_sys,
         metadata_sys::get_replication_config,
-        object_lock::objectlock_sys::{check_object_lock_for_deletion, check_retention_for_modification, BucketObjectLockSys},
+        object_lock::objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, check_retention_for_modification},
         policy_sys::PolicySys,
         quota::QuotaOperation,
         replication::{
-            check_replicate_delete, get_must_replicate_options, must_replicate, schedule_replication,
-            schedule_replication_delete, DeletedObjectReplicationInfo,
+            DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate,
+            schedule_replication, schedule_replication_delete,
         },
         tagging::{decode_tags, encode_tags},
         utils::serialize,
@@ -71,11 +70,11 @@ use rustfs_ecstore::{
         versioning_sys::BucketVersioningSys,
     },
     client::object_api_utils::to_s3s_etag,
-    compress::{is_compressible, MIN_COMPRESSIBLE_SIZE},
+    compress::{MIN_COMPRESSIBLE_SIZE, is_compressible},
     disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
-    error::{is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, StorageError},
+    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
-    set_disk::{is_valid_storage_class, MAX_PARTS_COUNT},
+    set_disk::{MAX_PARTS_COUNT, is_valid_storage_class},
     store_api::{
         BucketOptions,
         CompletePart,
@@ -92,11 +91,11 @@ use rustfs_ecstore::{
         // RESERVED_METADATA_PREFIX,
     },
 };
+use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
 use rustfs_filemeta::RestoreStatusOps;
-use rustfs_filemeta::{ObjectPartInfo, REPLICATE_INCOMING_DELETE};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
 use rustfs_kms::DataKey;
-use rustfs_notify::{notifier_global, EventArgsBuilder};
+use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Validator},
@@ -108,25 +107,25 @@ use rustfs_s3select_api::{
 };
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::{
-    arn::{TargetIDError, ARN},
     EventName,
+    arn::{ARN, TargetIDError},
 };
 use rustfs_utils::{
-    extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent, http::{
+    CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
+    http::{
+        AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
             AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
             AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
             AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT, RESERVED_METADATA_PREFIX,
             RESERVED_METADATA_PREFIX_LOWER,
-        }, AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE,
-        AMZ_CHECKSUM_TYPE,
+        },
     },
     path::{is_dir_object, path_join_buf},
-    CompressionAlgorithm,
 };
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
-use s3s::{dto::*, s3_error, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, S3};
+use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::convert::Infallible;
 use std::ops::Add;
 use std::{
@@ -136,8 +135,7 @@ use std::{
     str::FromStr,
     sync::{Arc, LazyLock},
 };
-use time::format_description::well_known::Rfc2822;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     io::{AsyncRead, AsyncSeek},
     sync::mpsc,
@@ -1516,7 +1514,6 @@ impl S3 for FS {
         }
 
         let metadata = extract_metadata(&req.headers);
-
         // Clone version_id before it's moved
         let version_id_clone = version_id.clone();
 
@@ -2239,7 +2236,9 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let cfg = match PolicySys::get(&bucket).await {
+        // Return the raw policy JSON as originally stored to preserve exact format.
+        // This ensures GET returns the same document that was PUT, matching S3 behavior.
+        let (policy_str, _) = match metadata_sys::get_bucket_policy_raw(&bucket).await {
             Ok(res) => res,
             Err(err) => {
                 if StorageError::ConfigNotFound == err {
@@ -2249,9 +2248,9 @@ impl S3 for FS {
             }
         };
 
-        let policies = try_!(serde_json::to_string(&cfg));
-
-        Ok(S3Response::new(GetBucketPolicyOutput { policy: Some(policies) }))
+        Ok(S3Response::new(GetBucketPolicyOutput {
+            policy: Some(policy_str),
+        }))
     }
 
     async fn get_bucket_policy_status(
@@ -4696,6 +4695,7 @@ impl S3 for FS {
         if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
             let algorithm = CompressionAlgorithm::default();
             metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), algorithm.to_string());
+
             metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
             let mut hrd = HashReader::new(reader, size as i64, size as i64, md5hex, sha256hex, false).map_err(ApiError::from)?;
@@ -5061,6 +5061,20 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
+        // When Object Lock is enabled, automatically enable versioning if not already enabled
+        // This matches AWS S3 and MinIO behavior
+        let versioning_config = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
+        if !versioning_config.enabled() {
+            let enable_versioning_config = VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            };
+            let versioning_data = try_!(serialize(&enable_versioning_config));
+            metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
+                .await
+                .map_err(ApiError::from)?;
+        }
+
         Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
 
@@ -5084,7 +5098,41 @@ impl S3 for FS {
         // check object lock
         validate_bucket_object_lock_enabled(&bucket).await?;
 
-        // TODO: check allow
+        // Extract new retain_until_date for validation
+        let new_retain_until = retention
+            .as_ref()
+            .and_then(|r| r.retain_until_date.as_ref())
+            .map(|d| OffsetDateTime::from(d.clone()));
+
+        // Check if object already has retention and if modification is allowed
+        // This follows AWS S3 and MinIO behavior:
+        // - COMPLIANCE mode: can only extend retention period, never shorten
+        // - GOVERNANCE mode: requires bypass header to modify/shorten retention
+        //
+        // TODO: Known race condition (fix in future PR)
+        // There's a TOCTOU (time-of-check-time-of-use) window between retention check here
+        // and the actual update at put_object_metadata. In theory:
+        //   Thread A: reads GOVERNANCE mode, checks bypass header
+        //   Thread B: updates retention to COMPLIANCE mode
+        //   Thread A: modifies retention, bypassing what is now COMPLIANCE mode
+        // This violates S3 spec that COMPLIANCE cannot be modified even with bypass.
+        // Fix options:
+        // 1. Pass expected retention mode to storage layer, verify before update
+        // 2. Use optimistic concurrency with version/etag checks
+        // 3. Perform check within the same lock scope as update in storage layer
+        // Current mitigation: Storage layer has fast_lock_manager which provides some protection
+        let check_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+
+        if let Ok(existing_obj_info) = store.get_object_info(&bucket, &key, &check_opts).await {
+            let bypass_governance = has_bypass_governance_header(&req.headers);
+            if let Some(block_reason) =
+                check_retention_for_modification(&existing_obj_info.user_defined, new_retain_until, bypass_governance)
+            {
+                return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
+            }
+        }
 
         let eval_metadata = parse_object_lock_retention(retention)?;
 
@@ -5948,1877 +5996,5 @@ impl S3 for FS {
         };
 
         Ok(S3Response::new(output))
-    }
-
-    #[instrument(level = "debug", skip(self, req))]
-    async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
-        let ListPartsInput {
-            bucket,
-            key,
-            upload_id,
-            part_number_marker,
-            max_parts,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let part_number_marker = part_number_marker.map(|x| x as usize);
-        let max_parts = match max_parts {
-            Some(parts) => {
-                if !(1..=1000).contains(&parts) {
-                    return Err(s3_error!(InvalidArgument, "max-parts must be between 1 and 1000"));
-                }
-                parts as usize
-            }
-            None => 1000,
-        };
-
-        let res = store
-            .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let output = ListPartsOutput {
-            bucket: Some(res.bucket),
-            key: Some(res.object),
-            upload_id: Some(res.upload_id),
-            parts: Some(
-                res.parts
-                    .into_iter()
-                    .map(|p| Part {
-                        e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
-                        last_modified: p.last_mod.map(Timestamp::from),
-                        part_number: Some(p.part_num as i32),
-                        size: Some(p.size as i64),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            initiator: Some(Initiator {
-                id: RUSTFS_OWNER.id.clone(),
-                display_name: RUSTFS_OWNER.display_name.clone(),
-            }),
-            is_truncated: Some(res.is_truncated),
-            next_part_number_marker: res.next_part_number_marker.try_into().ok(),
-            max_parts: res.max_parts.try_into().ok(),
-            part_number_marker: res.part_number_marker.try_into().ok(),
-            storage_class: if res.storage_class.is_empty() {
-                None
-            } else {
-                Some(res.storage_class.into())
-            },
-            ..Default::default()
-        };
-        Ok(S3Response::new(output))
-    }
-
-    async fn list_multipart_uploads(
-        &self,
-        req: S3Request<ListMultipartUploadsInput>,
-    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
-        let ListMultipartUploadsInput {
-            bucket,
-            prefix,
-            delimiter,
-            key_marker,
-            upload_id_marker,
-            max_uploads,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let prefix = prefix.unwrap_or_default();
-
-        let max_uploads = max_uploads.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
-
-        if let Some(key_marker) = &key_marker
-            && !key_marker.starts_with(prefix.as_str())
-        {
-            return Err(s3_error!(NotImplemented, "Invalid key marker"));
-        }
-
-        let result = store
-            .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
-            .await
-            .map_err(ApiError::from)?;
-
-        let output = ListMultipartUploadsOutput {
-            bucket: Some(bucket),
-            prefix: Some(prefix),
-            delimiter: result.delimiter,
-            key_marker: result.key_marker,
-            upload_id_marker: result.upload_id_marker,
-            max_uploads: Some(result.max_uploads as i32),
-            is_truncated: Some(result.is_truncated),
-            uploads: Some(
-                result
-                    .uploads
-                    .into_iter()
-                    .map(|u| MultipartUpload {
-                        key: Some(u.object),
-                        upload_id: Some(u.upload_id),
-                        initiated: u.initiated.map(Timestamp::from),
-
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            common_prefixes: Some(
-                result
-                    .common_prefixes
-                    .into_iter()
-                    .map(|c| CommonPrefix { prefix: Some(c) })
-                    .collect(),
-            ),
-            ..Default::default()
-        };
-
-        Ok(S3Response::new(output))
-    }
-
-    #[instrument(level = "debug", skip(self, req))]
-    async fn complete_multipart_upload(
-        &self,
-        req: S3Request<CompleteMultipartUploadInput>,
-    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
-        let input = req.input;
-        let CompleteMultipartUploadInput {
-            multipart_upload,
-            bucket,
-            key,
-            upload_id,
-            if_match,
-            if_none_match,
-            ..
-        } = input;
-
-        if if_match.is_some() || if_none_match.is_some() {
-            let Some(store) = new_object_layer_fn() else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-            };
-
-            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-                Ok(info) => {
-                    if !info.delete_marker {
-                        if let Some(ifmatch) = if_match
-                            && let Some(strong_etag) = ifmatch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                        if let Some(ifnonematch) = if_none_match
-                            && let Some(strong_etag) = ifnonematch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                    }
-                }
-                Err(err) => {
-                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                        return Err(ApiError::from(err).into());
-                    }
-
-                    if if_match.is_some() && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
-                        return Err(ApiError::from(err).into());
-                    }
-                }
-            }
-        }
-
-        let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
-
-        let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
-
-        let uploaded_parts_vec = multipart_upload
-            .parts
-            .unwrap_or_default()
-            .into_iter()
-            .map(CompletePart::from)
-            .collect::<Vec<_>>();
-
-        // is part number sorted?
-        if !uploaded_parts_vec.is_sorted_by_key(|p| p.part_num) {
-            return Err(s3_error!(InvalidPart, "Part numbers must be sorted"));
-        }
-
-        // Handle duplicate part numbers: according to S3 specification, when the same part number
-        // is uploaded multiple times, the last uploaded part (in the list order) should be used.
-        // This can happen in concurrent upload scenarios where a part is re-uploaded before completion.
-        // We deduplicate by keeping the last occurrence of each part number using a HashMap.
-        use std::collections::HashMap;
-        let mut part_map: HashMap<usize, CompletePart> = HashMap::new();
-        for part in uploaded_parts_vec {
-            part_map.insert(part.part_num, part);
-        }
-
-        // Reconstruct the parts list in sorted order, keeping only the last occurrence of each part number
-        let mut uploaded_parts: Vec<CompletePart> = part_map.into_values().collect();
-        uploaded_parts.sort_by_key(|p| p.part_num);
-
-        // TODO: check object lock
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        // TDD: Get multipart info to extract encryption configuration before completing
-        info!(
-            "TDD: Attempting to get multipart info for bucket={}, key={}, upload_id={}",
-            bucket, key, upload_id
-        );
-
-        let multipart_info = store
-            .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        info!("TDD: Got multipart info successfully");
-        info!("TDD: Multipart info metadata: {:?}", multipart_info.user_defined);
-
-        // TDD: Extract encryption information from multipart upload metadata
-        let server_side_encryption = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption")
-            .map(|s| ServerSideEncryption::from(s.clone()));
-        info!(
-            "TDD: Raw encryption from metadata: {:?} -> parsed: {:?}",
-            multipart_info.user_defined.get("x-amz-server-side-encryption"),
-            server_side_encryption
-        );
-
-        let ssekms_key_id = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .cloned();
-
-        info!(
-            "TDD: Extracted encryption info - SSE: {:?}, KMS Key: {:?}",
-            server_side_encryption, ssekms_key_id
-        );
-
-        let obj_info = store
-            .clone()
-            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        // check quota after completing multipart upload
-        if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
-
-            match quota_checker
-                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
-                .await
-            {
-                Ok(check_result) => {
-                    if !check_result.allowed {
-                        // Quota exceeded, delete the completed object
-                        let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidRequest,
-                            format!(
-                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage,
-                                check_result.quota_limit.unwrap_or(0)
-                            ),
-                        ));
-                    }
-                    // Update quota tracking after successful multipart upload
-                    if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
-                        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
-                    }
-                }
-                Err(e) => {
-                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
-                }
-            }
-        }
-
-        // Invalidate cache for the completed multipart object
-        let manager = get_concurrency_manager();
-        let mpu_bucket = bucket.clone();
-        let mpu_key = key.clone();
-        let mpu_version = obj_info.version_id.map(|v| v.to_string());
-        let mpu_version_clone = mpu_version.clone();
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
-                .await;
-        });
-
-        info!(
-            "TDD: Creating output with SSE: {:?}, KMS Key: {:?}",
-            server_side_encryption, ssekms_key_id
-        );
-
-        let mut checksum_crc32 = input.checksum_crc32;
-        let mut checksum_crc32c = input.checksum_crc32c;
-        let mut checksum_sha1 = input.checksum_sha1;
-        let mut checksum_sha256 = input.checksum_sha256;
-        let mut checksum_crc64nvme = input.checksum_crc64nvme;
-        let mut checksum_type = input.checksum_type;
-
-        // checksum
-        let (checksums, _is_multipart) = obj_info
-            .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
-            .map_err(ApiError::from)?;
-
-        for (key, checksum) in checksums {
-            if key == AMZ_CHECKSUM_TYPE {
-                checksum_type = Some(ChecksumType::from(checksum));
-                continue;
-            }
-
-            match rustfs_rio::ChecksumType::from_string(key.as_str()) {
-                rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
-                rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
-                rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
-                rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
-                rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
-                _ => (),
-            }
-        }
-
-        let output = CompleteMultipartUploadOutput {
-            bucket: Some(bucket.clone()),
-            key: Some(key.clone()),
-            e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some("us-east-1".to_string()),
-            server_side_encryption: server_side_encryption.clone(), // TDD: Return encryption info
-            ssekms_key_id: ssekms_key_id.clone(),                   // TDD: Return KMS key ID if present
-            checksum_crc32: checksum_crc32.clone(),
-            checksum_crc32c: checksum_crc32c.clone(),
-            checksum_sha1: checksum_sha1.clone(),
-            checksum_sha256: checksum_sha256.clone(),
-            checksum_crc64nvme: checksum_crc64nvme.clone(),
-            checksum_type: checksum_type.clone(),
-            version_id: mpu_version,
-            ..Default::default()
-        };
-        info!(
-            "TDD: Created output: SSE={:?}, KMS={:?}",
-            output.server_side_encryption, output.ssekms_key_id
-        );
-
-        let helper_output = entity::CompleteMultipartUploadOutput {
-            bucket: Some(bucket.clone()),
-            key: Some(key.clone()),
-            e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some("us-east-1".to_string()),
-            server_side_encryption, // TDD: Return encryption info
-            ssekms_key_id,          // TDD: Return KMS key ID if present
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
-            checksum_type,
-            ..Default::default()
-        };
-
-        let mt2 = HashMap::new();
-        let repoptions =
-            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
-
-        let dsc = must_replicate(&bucket, &key, repoptions).await;
-
-        if dsc.replicate_any() {
-            warn!("need multipart replication");
-            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
-        }
-        info!(
-            "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
-            output.server_side_encryption, output.ssekms_key_id
-        );
-        let helper_result = Ok(S3Response::new(helper_output));
-        let _ = helper.complete(&helper_result);
-        Ok(S3Response::new(output))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn abort_multipart_upload(
-        &self,
-        req: S3Request<AbortMultipartUploadInput>,
-    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let AbortMultipartUploadInput {
-            bucket, key, upload_id, ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let opts = &ObjectOptions::default();
-
-        // Special handling for abort_multipart_upload: Per AWS S3 API specification, this operation
-        // should return NoSuchUpload (404) when the upload_id doesn't exist, even if the format
-        // appears invalid. This differs from other multipart operations (upload_part, list_parts,
-        // complete_multipart_upload) which return InvalidArgument for malformed upload_ids.
-        // The lenient validation matches AWS S3 behavior where format validation is relaxed for
-        // abort operations to avoid leaking information about upload_id format requirements.
-        match store
-            .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
-            .await
-        {
-            Ok(_) => Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() })),
-            Err(err) => {
-                // Convert MalformedUploadID to NoSuchUpload for S3 API compatibility
-                if matches!(err, StorageError::MalformedUploadID(_)) {
-                    return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
-                }
-                Err(ApiError::from(err).into())
-            }
-        }
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
-        let bucket = req.input.bucket.clone();
-        // check bucket exists.
-        let _bucket = self
-            .head_bucket(req.map_input(|input| HeadBucketInput {
-                bucket: input.bucket,
-                expected_bucket_owner: None,
-            }))
-            .await?;
-
-        let Tagging { tag_set } = match metadata_sys::get_tagging_config(&bucket).await {
-            Ok((tags, _)) => tags,
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(S3ErrorCode::NoSuchTagSet, "The TagSet does not exist".to_string()));
-                }
-                warn!("get_tagging_config err {:?}", &err);
-                return Err(ApiError::from(err).into());
-            }
-        };
-
-        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn put_bucket_tagging(&self, req: S3Request<PutBucketTaggingInput>) -> S3Result<S3Response<PutBucketTaggingOutput>> {
-        let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let data = try_!(serialize(&tagging));
-
-        metadata_sys::update(&bucket, BUCKET_TAGGING_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(Default::default()))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn delete_bucket_tagging(
-        &self,
-        req: S3Request<DeleteBucketTaggingInput>,
-    ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-        let DeleteBucketTaggingInput { bucket, .. } = req.input;
-
-        metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
-        let bucket = req.input.bucket.clone();
-        // check bucket exists.
-        let _bucket = self
-            .head_bucket(req.map_input(|input| HeadBucketInput {
-                bucket: input.bucket,
-                expected_bucket_owner: None,
-            }))
-            .await?;
-
-        let cors_configuration = match metadata_sys::get_cors_config(&bucket).await {
-            Ok((config, _)) => config,
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::NoSuchCORSConfiguration,
-                        "The CORS configuration does not exist".to_string(),
-                    ));
-                }
-                warn!("get_cors_config err {:?}", &err);
-                return Err(ApiError::from(err).into());
-            }
-        };
-
-        Ok(S3Response::new(GetBucketCorsOutput {
-            cors_rules: Some(cors_configuration.cors_rules),
-        }))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
-        let PutBucketCorsInput {
-            bucket,
-            cors_configuration,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let data = try_!(serialize(&cors_configuration));
-
-        metadata_sys::update(&bucket, BUCKET_CORS_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(PutBucketCorsOutput::default()))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn delete_bucket_cors(&self, req: S3Request<DeleteBucketCorsInput>) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
-        let DeleteBucketCorsInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        metadata_sys::delete(&bucket, BUCKET_CORS_CONFIG)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(DeleteBucketCorsOutput {}))
-    }
-
-    #[instrument(level = "debug", skip(self, req))]
-    async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, "s3:PutObjectTagging");
-        let PutObjectTaggingInput {
-            bucket,
-            key: object,
-            tagging,
-            ..
-        } = req.input.clone();
-
-        if tagging.tag_set.len() > 10 {
-            // TOTO: Note that Amazon S3 limits the maximum number of tags to 10 tags per object.
-            // Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html
-            // Reference: https://docs.aws.amazon.com/zh_cn/AmazonS3/latest/API/API_PutObjectTagging.html
-            // https://github.com/minio/mint/blob/master/run/core/aws-sdk-go-v2/main.go#L1647
-            error!("Tag set exceeds maximum of 10 tags: {}", tagging.tag_set.len());
-            return Err(s3_error!(InvalidTag, "Cannot have more than 10 tags per object"));
-        }
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
-        for tag in &tagging.tag_set {
-            let key = tag.key.as_ref().filter(|k| !k.is_empty()).ok_or_else(|| {
-                error!("Empty tag key");
-                s3_error!(InvalidTag, "Tag key cannot be empty")
-            })?;
-
-            if key.len() > 128 {
-                error!("Tag key too long: {} bytes", key.len());
-                return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
-            }
-
-            let value = tag.value.as_ref().ok_or_else(|| {
-                error!("Null tag value");
-                s3_error!(InvalidTag, "Tag value cannot be null")
-            })?;
-
-            if value.is_empty() {
-                error!("Empty tag value");
-                return Err(s3_error!(InvalidTag, "Tag value cannot be empty"));
-            }
-
-            if value.len() > 256 {
-                error!("Tag value too long: {} bytes", value.len());
-                return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
-            }
-
-            if !tag_keys.insert(key) {
-                error!("Duplicate tag key: {}", key);
-                return Err(s3_error!(InvalidTag, "Cannot provide multiple Tags with the same key"));
-            }
-        }
-
-        let tags = encode_tags(tagging.tag_set);
-        debug!("Encoded tags: {}", tags);
-
-        // TODO: getOpts, Replicate
-        // Support versioned objects
-        let version_id = req.input.version_id.clone();
-        let opts = ObjectOptions {
-            version_id: self.parse_version_id(version_id)?.map(Into::into),
-            ..Default::default()
-        };
-
-        store.put_object_tags(&bucket, &object, &tags, &opts).await.map_err(|e| {
-            error!("Failed to put object tags: {}", e);
-            counter!("rustfs.put_object_tagging.failure").increment(1);
-            ApiError::from(e)
-        })?;
-
-        // Invalidate cache for the tagged object
-        let manager = get_concurrency_manager();
-        let version_id = req.input.version_id.clone();
-        let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&bucket, &object, version_id.as_deref())
-                .await;
-            debug!("Cache invalidated for tagged object: {}", cache_key);
-        });
-
-        // Add metrics
-        counter!("rustfs.put_object_tagging.success").increment(1);
-
-        let version_id_resp = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id_resp);
-
-        let result = Ok(S3Response::new(PutObjectTaggingOutput {
-            version_id: req.input.version_id.clone(),
-        }));
-        let _ = helper.complete(&result);
-        let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
-        result
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
-        let start_time = std::time::Instant::now();
-        let GetObjectTaggingInput { bucket, key: object, .. } = req.input;
-
-        info!("Starting get_object_tagging for bucket: {}, object: {}", bucket, object);
-
-        let Some(store) = new_object_layer_fn() else {
-            error!("Store not initialized");
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        // Support versioned objects
-        let version_id = req.input.version_id.clone();
-        let opts = ObjectOptions {
-            version_id: self.parse_version_id(version_id)?.map(Into::into),
-            ..Default::default()
-        };
-
-        let tags = store.get_object_tags(&bucket, &object, &opts).await.map_err(|e| {
-            if is_err_object_not_found(&e) {
-                error!("Object not found: {}", e);
-                return s3_error!(NoSuchKey);
-            }
-            error!("Failed to get object tags: {}", e);
-            ApiError::from(e).into()
-        })?;
-
-        let tag_set = decode_tags(tags.as_str());
-        debug!("Decoded tag set: {:?}", tag_set);
-
-        // Add metrics
-        counter!("rustfs.get_object_tagging.success").increment(1);
-        let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
-        Ok(S3Response::new(GetObjectTaggingOutput {
-            tag_set,
-            version_id: req.input.version_id.clone(),
-        }))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn delete_object_tagging(
-        &self,
-        req: S3Request<DeleteObjectTaggingInput>,
-    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedDeleteTagging, "s3:DeleteObjectTagging");
-        let DeleteObjectTaggingInput {
-            bucket,
-            key: object,
-            version_id,
-            ..
-        } = req.input.clone();
-
-        let Some(store) = new_object_layer_fn() else {
-            error!("Store not initialized");
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        // Support versioned objects
-        let version_id_for_parse = version_id.clone();
-        let opts = ObjectOptions {
-            version_id: self.parse_version_id(version_id_for_parse)?.map(Into::into),
-            ..Default::default()
-        };
-
-        // TODO: Replicate (keep the original TODO, if further replication logic is needed)
-        store.delete_object_tags(&bucket, &object, &opts).await.map_err(|e| {
-            error!("Failed to delete object tags: {}", e);
-            ApiError::from(e)
-        })?;
-
-        // Invalidate cache for the deleted tagged object
-        let manager = get_concurrency_manager();
-        let version_id_clone = version_id.clone();
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&bucket, &object, version_id_clone.as_deref())
-                .await;
-            debug!(
-                "Cache invalidated for deleted tagged object: bucket={}, object={}, version_id={:?}",
-                bucket, object, version_id_clone
-            );
-        });
-
-        // Add metrics
-        counter!("rustfs.delete_object_tagging.success").increment(1);
-
-        let version_id_resp = version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id_resp);
-
-        let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
-        let _ = helper.complete(&result);
-        let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "delete").record(duration.as_secs_f64());
-        result
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn get_bucket_versioning(
-        &self,
-        req: S3Request<GetBucketVersioningInput>,
-    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        let GetBucketVersioningInput { bucket, .. } = req.input;
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let VersioningConfiguration { status, .. } = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
-
-        Ok(S3Response::new(GetBucketVersioningOutput {
-            status,
-            ..Default::default()
-        }))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn put_bucket_versioning(
-        &self,
-        req: S3Request<PutBucketVersioningInput>,
-    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
-        let PutBucketVersioningInput {
-            bucket,
-            versioning_configuration,
-            ..
-        } = req.input;
-
-        // TODO: check other sys
-        // check site replication enable
-        // check bucket object lock enable
-        // check replication suspended
-
-        let data = try_!(serialize(&versioning_configuration));
-
-        metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        // TODO: globalSiteReplicationSys.BucketMetaHook
-
-        Ok(S3Response::new(PutBucketVersioningOutput {}))
-    }
-
-    async fn get_bucket_policy_status(
-        &self,
-        req: S3Request<GetBucketPolicyStatusInput>,
-    ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
-        let GetBucketPolicyStatusInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None, remote_addr);
-
-        let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
-            bucket: &bucket,
-            action: Action::S3Action(S3Action::ListBucketAction),
-            is_owner: false,
-            account: "",
-            groups: &None,
-            conditions: &conditions,
-            object: "",
-        })
-        .await;
-
-        let write_only = PolicySys::is_allowed(&BucketPolicyArgs {
-            bucket: &bucket,
-            action: Action::S3Action(S3Action::PutObjectAction),
-            is_owner: false,
-            account: "",
-            groups: &None,
-            conditions: &conditions,
-            object: "",
-        })
-        .await;
-
-        let is_public = read_only && write_only;
-
-        let output = GetBucketPolicyStatusOutput {
-            policy_status: Some(PolicyStatus {
-                is_public: Some(is_public),
-            }),
-        };
-
-        Ok(S3Response::new(output))
-    }
-
-    async fn get_bucket_policy(&self, req: S3Request<GetBucketPolicyInput>) -> S3Result<S3Response<GetBucketPolicyOutput>> {
-        let GetBucketPolicyInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let cfg = match PolicySys::get(&bucket).await {
-            Ok(res) => res,
-            Err(err) => {
-                if StorageError::ConfigNotFound == err {
-                    return Err(s3_error!(NoSuchBucketPolicy));
-                }
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, err.to_string()));
-            }
-        };
-
-        let policies = try_!(serde_json::to_string(&cfg));
-
-        Ok(S3Response::new(GetBucketPolicyOutput { policy: Some(policies) }))
-    }
-
-    async fn put_bucket_policy(&self, req: S3Request<PutBucketPolicyInput>) -> S3Result<S3Response<PutBucketPolicyOutput>> {
-        let PutBucketPolicyInput { bucket, policy, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        // warn!("input policy {}", &policy);
-
-        let cfg: BucketPolicy =
-            serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?;
-
-        if let Err(err) = cfg.is_valid() {
-            warn!("put_bucket_policy err input {:?}, {:?}", &policy, err);
-            return Err(s3_error!(InvalidPolicyDocument));
-        }
-
-        let data = serde_json::to_vec(&cfg).map_err(|e| s3_error!(InternalError, "parse policy failed {:?}", e))?;
-
-        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(PutBucketPolicyOutput {}))
-    }
-
-    async fn delete_bucket_policy(
-        &self,
-        req: S3Request<DeleteBucketPolicyInput>,
-    ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
-        let DeleteBucketPolicyInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        metadata_sys::delete(&bucket, BUCKET_POLICY_CONFIG)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(DeleteBucketPolicyOutput {}))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn get_bucket_lifecycle_configuration(
-        &self,
-        req: S3Request<GetBucketLifecycleConfigurationInput>,
-    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
-        let GetBucketLifecycleConfigurationInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
-            Ok((cfg, _)) => cfg.rules,
-            Err(_err) => {
-                // Return NoSuchLifecycleConfiguration error as expected by S3 clients
-                // This fixes issue #990 where Ansible S3 roles fail with KeyError: 'Rules'
-                return Err(s3_error!(NoSuchLifecycleConfiguration));
-            }
-        };
-
-        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
-            rules: Some(rules),
-            ..Default::default()
-        }))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn put_bucket_lifecycle_configuration(
-        &self,
-        req: S3Request<PutBucketLifecycleConfigurationInput>,
-    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
-        let PutBucketLifecycleConfigurationInput {
-            bucket,
-            lifecycle_configuration,
-            ..
-        } = req.input;
-
-        let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
-
-        let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
-        if let Ok(rcfg) = rcfg
-            && let Err(err) = input_cfg.validate(&rcfg.0).await
-        {
-            //return Err(S3Error::with_message(S3ErrorCode::Custom("BucketLockValidateFailed".into()), err.to_string()));
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
-        }
-
-        if let Err(err) = validate_transition_tier(&input_cfg).await {
-            //warn!("lifecycle_configuration add failed, err: {:?}", err);
-            return Err(S3Error::with_message(S3ErrorCode::Custom("CustomError".into()), err.to_string()));
-        }
-
-        let data = try_!(serialize(&input_cfg));
-        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn delete_bucket_lifecycle(
-        &self,
-        req: S3Request<DeleteBucketLifecycleInput>,
-    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
-        let DeleteBucketLifecycleInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        metadata_sys::delete(&bucket, BUCKET_LIFECYCLE_CONFIG)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
-    }
-
-    async fn get_bucket_encryption(
-        &self,
-        req: S3Request<GetBucketEncryptionInput>,
-    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
-        let GetBucketEncryptionInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let server_side_encryption_configuration = match metadata_sys::get_sse_config(&bucket).await {
-            Ok((cfg, _)) => Some(cfg),
-            Err(err) => {
-                // if BucketMetadataError::BucketLifecycleNotFound.is(&err) {
-                //     return Err(s3_error!(ErrNoSuchBucketSSEConfig));
-                // }
-                warn!("get_sse_config err {:?}", err);
-                None
-            }
-        };
-
-        Ok(S3Response::new(GetBucketEncryptionOutput {
-            server_side_encryption_configuration,
-        }))
-    }
-
-    async fn put_bucket_encryption(
-        &self,
-        req: S3Request<PutBucketEncryptionInput>,
-    ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
-        let PutBucketEncryptionInput {
-            bucket,
-            server_side_encryption_configuration,
-            ..
-        } = req.input;
-
-        info!("sse_config {:?}", &server_side_encryption_configuration);
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        // TODO: check kms
-
-        let data = try_!(serialize(&server_side_encryption_configuration));
-        metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
-    }
-
-    async fn delete_bucket_encryption(
-        &self,
-        req: S3Request<DeleteBucketEncryptionInput>,
-    ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
-        let DeleteBucketEncryptionInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-        metadata_sys::delete(&bucket, BUCKET_SSECONFIG)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn get_object_lock_configuration(
-        &self,
-        req: S3Request<GetObjectLockConfigurationInput>,
-    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
-        let GetObjectLockConfigurationInput { bucket, .. } = req.input;
-
-        let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
-            Ok((cfg, _created)) => Some(cfg),
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::ObjectLockConfigurationNotFoundError,
-                        "Object Lock configuration does not exist for this bucket".to_string(),
-                    ));
-                }
-                warn!("get_object_lock_config err {:?}", err);
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "Failed to load Object Lock configuration".to_string(),
-                ));
-            }
-        };
-
-        // warn!("object_lock_configuration {:?}", &object_lock_configuration);
-
-        Ok(S3Response::new(GetObjectLockConfigurationOutput {
-            object_lock_configuration,
-        }))
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn put_object_lock_configuration(
-        &self,
-        req: S3Request<PutObjectLockConfigurationInput>,
-    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
-        let PutObjectLockConfigurationInput {
-            bucket,
-            object_lock_configuration,
-            ..
-        } = req.input;
-
-        let Some(input_cfg) = object_lock_configuration else { return Err(s3_error!(InvalidArgument)) };
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let _ = match metadata_sys::get_object_lock_config(&bucket).await {
-            Ok(_) => {}
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidBucketState,
-                        "Object Lock configuration cannot be enabled on existing buckets".to_string(),
-                    ));
-                }
-                warn!("get_object_lock_config err {:?}", err);
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "Failed to get bucket ObjectLockConfiguration".to_string(),
-                ));
-            }
-        };
-
-        let data = try_!(serialize(&input_cfg));
-
-        metadata_sys::update(&bucket, OBJECT_LOCK_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
-    }
-
-    async fn get_bucket_replication(
-        &self,
-        req: S3Request<GetBucketReplicationInput>,
-    ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
-        let GetBucketReplicationInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let rcfg = match get_replication_config(&bucket).await {
-            Ok((cfg, _created)) => Some(cfg),
-            Err(err) => {
-                error!("get_replication_config err {:?}", err);
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::ReplicationConfigurationNotFoundError,
-                        "replication not found".to_string(),
-                    ));
-                }
-                return Err(ApiError::from(err).into());
-            }
-        };
-
-        if rcfg.is_none() {
-            return Err(S3Error::with_message(
-                S3ErrorCode::ReplicationConfigurationNotFoundError,
-                "replication not found".to_string(),
-            ));
-        }
-
-        // Ok(S3Response::new(GetBucketReplicationOutput {
-        //     replication_configuration: rcfg,
-        // }))
-
-        if rcfg.is_some() {
-            Ok(S3Response::new(GetBucketReplicationOutput {
-                replication_configuration: rcfg,
-            }))
-        } else {
-            let rep = ReplicationConfiguration {
-                role: "".to_string(),
-                rules: vec![],
-            };
-            Ok(S3Response::new(GetBucketReplicationOutput {
-                replication_configuration: Some(rep),
-            }))
-        }
-    }
-
-    async fn put_bucket_replication(
-        &self,
-        req: S3Request<PutBucketReplicationInput>,
-    ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        let PutBucketReplicationInput {
-            bucket,
-            replication_configuration,
-            ..
-        } = req.input;
-        warn!("put bucket replication");
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        // TODO: check enable, versioning enable
-        let data = try_!(serialize(&replication_configuration));
-
-        metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(PutBucketReplicationOutput::default()))
-    }
-
-    async fn delete_bucket_replication(
-        &self,
-        req: S3Request<DeleteBucketReplicationInput>,
-    ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
-        let DeleteBucketReplicationInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-        metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
-            .await
-            .map_err(ApiError::from)?;
-
-        // TODO: remove targets
-        error!("delete bucket");
-
-        Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
-    }
-
-    async fn get_bucket_notification_configuration(
-        &self,
-        req: S3Request<GetBucketNotificationConfigurationInput>,
-    ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
-        let GetBucketNotificationConfigurationInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let has_notification_config = metadata_sys::get_notification_config(&bucket).await.unwrap_or_else(|err| {
-            warn!("get_notification_config err {:?}", err);
-            None
-        });
-
-        // TODO: valid target list
-
-        if let Some(NotificationConfiguration {
-            event_bridge_configuration,
-            lambda_function_configurations,
-            queue_configurations,
-            topic_configurations,
-        }) = has_notification_config
-        {
-            Ok(S3Response::new(GetBucketNotificationConfigurationOutput {
-                event_bridge_configuration,
-                lambda_function_configurations,
-                queue_configurations,
-                topic_configurations,
-            }))
-        } else {
-            Ok(S3Response::new(GetBucketNotificationConfigurationOutput::default()))
-        }
-    }
-
-    async fn put_bucket_notification_configuration(
-        &self,
-        req: S3Request<PutBucketNotificationConfigurationInput>,
-    ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
-        let PutBucketNotificationConfigurationInput {
-            bucket,
-            notification_configuration,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        //  Verify that the bucket exists
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        //  Persist the new notification configuration
-        let data = try_!(serialize(&notification_configuration));
-        metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        // Determine region (BucketInfo has no region field) -> use global region or default
-        let region = rustfs_ecstore::global::get_global_region().unwrap_or_else(|| req.region.clone().unwrap_or_default());
-
-        // Purge old rules and resolve new rules in parallel
-        let clear_rules = notifier_global::clear_bucket_notification_rules(&bucket);
-        let parse_rules = async {
-            let mut event_rules = Vec::new();
-
-            process_queue_configurations(&mut event_rules, notification_configuration.queue_configurations.clone(), |arn_str| {
-                ARN::parse(arn_str)
-                    .map(|arn| arn.target_id)
-                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-            })?;
-            process_topic_configurations(&mut event_rules, notification_configuration.topic_configurations.clone(), |arn_str| {
-                ARN::parse(arn_str)
-                    .map(|arn| arn.target_id)
-                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-            })?;
-            process_lambda_configurations(
-                &mut event_rules,
-                notification_configuration.lambda_function_configurations.clone(),
-                |arn_str| {
-                    ARN::parse(arn_str)
-                        .map(|arn| arn.target_id)
-                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                },
-            )?;
-
-            Ok::<_, TargetIDError>(event_rules)
-        };
-
-        let (clear_result, event_rules_result) = tokio::join!(clear_rules, parse_rules);
-
-        clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
-        let event_rules =
-            event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
-        warn!("notify event rules: {:?}", &event_rules);
-
-        // Add a new notification rule
-        notifier_global::add_event_specific_rules(&bucket, &region, &event_rules)
-            .await
-            .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
-
-        Ok(S3Response::new(PutBucketNotificationConfigurationOutput {}))
-    }
-
-    async fn get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
-        let GetBucketAclInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let grants = vec![Grant {
-            grantee: Some(Grantee {
-                type_: Type::from_static(Type::CANONICAL_USER),
-                display_name: None,
-                email_address: None,
-                id: None,
-                uri: None,
-            }),
-            permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
-        }];
-
-        Ok(S3Response::new(GetBucketAclOutput {
-            grants: Some(grants),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-        }))
-    }
-
-    async fn put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
-        let PutBucketAclInput {
-            bucket,
-            acl,
-            access_control_policy,
-            ..
-        } = req.input;
-
-        // TODO:checkRequestAuthType
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        if let Some(canned_acl) = acl {
-            if canned_acl.as_str() != BucketCannedACL::PRIVATE {
-                return Err(s3_error!(NotImplemented));
-            }
-        } else {
-            let is_full_control = access_control_policy.is_some_and(|v| {
-                v.grants.is_some_and(|gs| {
-                    //
-                    !gs.is_empty()
-                        && gs.first().is_some_and(|g| {
-                            g.to_owned()
-                                .permission
-                                .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)
-                        })
-                })
-            });
-
-            if !is_full_control {
-                return Err(s3_error!(NotImplemented));
-            }
-        }
-        Ok(S3Response::new(PutBucketAclOutput::default()))
-    }
-
-    async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
-        let GetObjectAclInput { bucket, key, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
-        }
-
-        let grants = vec![Grant {
-            grantee: Some(Grantee {
-                type_: Type::from_static(Type::CANONICAL_USER),
-                display_name: None,
-                email_address: None,
-                id: None,
-                uri: None,
-            }),
-            permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
-        }];
-
-        Ok(S3Response::new(GetObjectAclOutput {
-            grants: Some(grants),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            ..Default::default()
-        }))
-    }
-
-    async fn get_object_attributes(
-        &self,
-        req: S3Request<GetObjectAttributesInput>,
-    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, "s3:GetObjectAttributes");
-        let GetObjectAttributesInput { bucket, key, .. } = req.input.clone();
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        if let Err(e) = store
-            .get_object_reader(&bucket, &key, None, HeaderMap::new(), &ObjectOptions::default())
-            .await
-        {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
-        }
-
-        let output = GetObjectAttributesOutput {
-            delete_marker: None,
-            object_parts: None,
-            ..Default::default()
-        };
-
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper
-            .object(ObjectInfo {
-                name: key.clone(),
-                bucket,
-                ..Default::default()
-            })
-            .version_id(version_id);
-
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
-    }
-
-    async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
-        let PutObjectAclInput {
-            bucket,
-            key,
-            acl,
-            access_control_policy,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
-        }
-
-        if let Some(canned_acl) = acl {
-            if canned_acl.as_str() != BucketCannedACL::PRIVATE {
-                return Err(s3_error!(NotImplemented));
-            }
-        } else {
-            let is_full_control = access_control_policy.is_some_and(|v| {
-                v.grants.is_some_and(|gs| {
-                    //
-                    !gs.is_empty()
-                        && gs.first().is_some_and(|g| {
-                            g.to_owned()
-                                .permission
-                                .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)
-                        })
-                })
-            });
-
-            if !is_full_control {
-                return Err(s3_error!(NotImplemented));
-            }
-        }
-        Ok(S3Response::new(PutObjectAclOutput::default()))
-    }
-
-    async fn select_object_content(
-        &self,
-        req: S3Request<SelectObjectContentInput>,
-    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
-        info!("handle select_object_content");
-
-        let input = Arc::new(req.input);
-        info!("{:?}", input);
-
-        let db = get_global_db((*input).clone(), false).await.map_err(|e| {
-            error!("get global db failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
-        let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
-        let result = db
-            .execute(&query)
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
-
-        let results = result.result().chunk_result().await.unwrap().to_vec();
-
-        let mut buffer = Vec::new();
-        if input.request.output_serialization.csv.is_some() {
-            let mut csv_writer = CsvWriterBuilder::new().with_header(false).build(&mut buffer);
-            for batch in results {
-                csv_writer
-                    .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "can't encode output to csv. e: {}", e.to_string()))?;
-            }
-        } else if input.request.output_serialization.json.is_some() {
-            let mut json_writer = JsonWriterBuilder::new()
-                .with_explicit_nulls(true)
-                .build::<_, JsonArray>(&mut buffer);
-            for batch in results {
-                json_writer
-                    .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "can't encode output to json. e: {}", e.to_string()))?;
-            }
-            json_writer
-                .finish()
-                .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
-        } else {
-            return Err(s3_error!(
-                InvalidArgument,
-                "Unsupported output format. Supported formats are CSV and JSON"
-            ));
-        }
-
-        let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
-        let stream = ReceiverStream::new(rx);
-        tokio::spawn(async move {
-            let _ = tx
-                .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
-                .await;
-            let _ = tx
-                .send(Ok(SelectObjectContentEvent::Records(RecordsEvent {
-                    payload: Some(Bytes::from(buffer)),
-                })))
-                .await;
-            let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
-
-            drop(tx);
-        });
-
-        Ok(S3Response::new(SelectObjectContentOutput {
-            payload: Some(SelectObjectContentEventStream::new(stream)),
-        }))
-    }
-    async fn get_object_legal_hold(
-        &self,
-        req: S3Request<GetObjectLegalHoldInput>,
-    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, "s3:GetObjectLegalHold");
-        let GetObjectLegalHoldInput {
-            bucket, key, version_id, ..
-        } = req.input.clone();
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let _ = store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        // check object lock
-        validate_bucket_object_lock_enabled(&bucket).await?;
-
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-
-        let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
-            error!("get_object_info failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
-
-        let legal_hold = object_info
-            .user_defined
-            .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
-            .map(|v| v.as_str().to_string());
-
-        let status = if let Some(v) = legal_hold {
-            v
-        } else {
-            ObjectLockLegalHoldStatus::OFF.to_string()
-        };
-
-        let output = GetObjectLegalHoldOutput {
-            legal_hold: Some(ObjectLockLegalHold {
-                status: Some(ObjectLockLegalHoldStatus::from(status)),
-            }),
-        };
-
-        let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
-        helper = helper.object(object_info).version_id(version_id);
-
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
-    }
-
-    async fn put_object_legal_hold(
-        &self,
-        req: S3Request<PutObjectLegalHoldInput>,
-    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, "s3:PutObjectLegalHold");
-        let PutObjectLegalHoldInput {
-            bucket,
-            key,
-            legal_hold,
-            version_id,
-            ..
-        } = req.input.clone();
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let _ = store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        // check object lock
-        validate_bucket_object_lock_enabled(&bucket).await?;
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-
-        let eval_metadata = parse_object_lock_legal_hold(legal_hold)?;
-
-        let popts = ObjectOptions {
-            mod_time: opts.mod_time,
-            version_id: opts.version_id,
-            eval_metadata: Some(eval_metadata),
-            ..Default::default()
-        };
-
-        let info = store.put_object_metadata(&bucket, &key, &popts).await.map_err(|e| {
-            error!("put_object_metadata failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
-
-        let output = PutObjectLegalHoldOutput {
-            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
-        };
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.object(info).version_id(version_id);
-
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
-    }
-
-    async fn get_object_retention(
-        &self,
-        req: S3Request<GetObjectRetentionInput>,
-    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, "s3:GetObjectRetention");
-        let GetObjectRetentionInput {
-            bucket, key, version_id, ..
-        } = req.input.clone();
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        // check object lock
-        validate_bucket_object_lock_enabled(&bucket).await?;
-
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-
-        let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
-            error!("get_object_info failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
-
-        let mode = object_info
-            .user_defined
-            .get("x-amz-object-lock-mode")
-            .map(|v| ObjectLockRetentionMode::from(v.as_str().to_string()));
-
-        let retain_until_date = object_info
-            .user_defined
-            .get("x-amz-object-lock-retain-until-date")
-            .and_then(|v| OffsetDateTime::parse(v.as_str(), &Rfc3339).ok())
-            .map(Timestamp::from);
-
-        let output = GetObjectRetentionOutput {
-            retention: Some(ObjectLockRetention { mode, retain_until_date }),
-        };
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.object(object_info).version_id(version_id);
-
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
-    }
-
-    async fn put_object_retention(
-        &self,
-        req: S3Request<PutObjectRetentionInput>,
-    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, "s3:PutObjectRetention");
-        let PutObjectRetentionInput {
-            bucket,
-            key,
-            retention,
-            version_id,
-            ..
-        } = req.input.clone();
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        // check object lock
-        validate_bucket_object_lock_enabled(&bucket).await?;
-
-        // TODO: check allow
-
-        let eval_metadata = parse_object_lock_retention(retention)?;
-
-        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-        opts.eval_metadata = Some(eval_metadata);
-
-        let object_info = store.put_object_metadata(&bucket, &key, &opts).await.map_err(|e| {
-            error!("put_object_metadata failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
-
-        let output = PutObjectRetentionOutput {
-            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
-        };
-
-        let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
-        helper = helper.object(object_info).version_id(version_id);
-
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
     }
 }

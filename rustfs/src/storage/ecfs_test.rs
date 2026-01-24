@@ -14,16 +14,14 @@
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::config::workload_profiles::WorkloadProfile;
-    use crate::storage::ecfs::{
-        FS, RUSTFS_OWNER, apply_cors_headers, process_lambda_configurations, process_queue_configurations,
-        process_topic_configurations,
-    };
+    use crate::storage::ecfs::FS;
+    use crate::storage::ecfs::RUSTFS_OWNER;
     use crate::storage::{
-        check_preconditions, get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal, parse_etag,
-        parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
-        validate_list_object_unordered_with_delimiter,
+        apply_cors_headers, check_preconditions, get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal,
+        matches_origin_pattern, parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention,
+        process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
     };
     use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
@@ -392,33 +390,33 @@ mod tests {
         assert!(parse_object_lock_retention(None).is_ok());
         assert!(parse_object_lock_retention(None).unwrap().is_empty());
 
-        // [2] Normal case: Retention with valid COMPLIANCE mode
+        // [2] Normal case: Retention with valid COMPLIANCE mode (future date)
         let valid_compliance_retention = ObjectLockRetention {
             mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let compliance_metadata = parse_object_lock_retention(Some(valid_compliance_retention)).unwrap();
         assert_eq!(compliance_metadata.get("x-amz-object-lock-mode").unwrap(), "COMPLIANCE");
         assert_eq!(
             compliance_metadata.get("x-amz-object-lock-retain-until-date").unwrap(),
-            "2025-01-01T00:00:00Z"
+            "2030-01-01T00:00:00Z"
         );
         assert!(
             compliance_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"))
         );
 
-        // [3] Normal case: Retention with valid GOVERNANCE mode
+        // [3] Normal case: Retention with valid GOVERNANCE mode (future date)
         let valid_governance_retention = ObjectLockRetention {
             mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let governance_metadata = parse_object_lock_retention(Some(valid_governance_retention)).unwrap();
         assert_eq!(governance_metadata.get("x-amz-object-lock-mode").unwrap(), "GOVERNANCE");
 
-        // [4] Normal case: Retention with None mode (empty string for mode)
+        // [4] Normal case: Retention with None mode (empty string for mode, date not validated)
         let none_mode_retention = ObjectLockRetention {
             mode: None,
-            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let none_mode_metadata = parse_object_lock_retention(Some(none_mode_retention)).unwrap();
         assert_eq!(none_mode_metadata.get("x-amz-object-lock-mode").unwrap(), "");
@@ -434,7 +432,7 @@ mod tests {
         // [6] Error case: Retention with invalid mode (non COMPLIANCE/GOVERNANCE)
         let invalid_mode_retention = ObjectLockRetention {
             mode: Some(ObjectLockRetentionMode::from_static("INVALID_MODE")),
-            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let err = parse_object_lock_retention(Some(invalid_mode_retention)).unwrap_err();
         assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
@@ -442,6 +440,15 @@ mod tests {
             err.message(),
             Some("The XML you provided was not well-formed or did not validate against our published schema")
         );
+
+        // [7] Error case: Retention with past date should fail
+        let past_date_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: Some(datetime!(2020-01-01 00:00:00 UTC).into()),
+        };
+        let err = parse_object_lock_retention(Some(past_date_retention)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
+        assert_eq!(err.message(), Some("The retain until date must be in the future"));
     }
 
     #[test]

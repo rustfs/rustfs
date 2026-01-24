@@ -77,8 +77,7 @@ pub(crate) enum PostObjectSuccessAction {
 /// Parse success action from Presigned POST form fields.
 ///
 /// Integration point (manual):
-/// - In the PostPolicy handler, after parsing form fields, call this function
-///  to determine the desired success action.
+/// - In the PostPolicy handler, after parsing form fields, call this function to determine the desired success action.
 ///
 /// # Arguments
 /// * `fields` - HashMap of form fields from the POST request
@@ -134,11 +133,8 @@ pub(crate) fn parse_success_action_from_form_fields(fields: &HashMap<String, Str
 /// Notes:
 /// - For 204: empty body
 /// - For 303: empty body + Location header
-/// - For 200: empty body (some clients accept this); you may optionally return
-///           XML/HTML body if you already implement it.
-/// - For 201: prefer returning PostResponse XML; if not available, empty body
-///           still satisfies most clients, but strict tests may require XML.
-///           If you have a PostResponse serializer already, plug it in here.
+/// - For 200: empty body (some clients accept this); you may optionally return XML/HTML body if you already implement it.
+/// - For 201: prefer returning PostResponse XML; if not available, empty body still satisfies most clients, but strict tests may require XML. If you have a PostResponse serializer already, plug it in here.
 #[allow(dead_code)]
 pub(crate) fn build_post_object_success_response(
     form_fields: &HashMap<String, String>,
@@ -536,12 +532,23 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
             None => String::default(),
         };
 
-        let retain_until_date = v
-            .retain_until_date
-            .map(|v| OffsetDateTime::from(v).format(&Rfc3339).unwrap())
-            .unwrap_or_default();
-
         let now = OffsetDateTime::now_utc();
+        // Validate retain_until_date is in the future (S3 requirement)
+        // Only validate when both mode and date are provided (not clearing retention)
+        let retain_until_date = if let Some(date) = v.retain_until_date {
+            let retain_until = OffsetDateTime::from(date);
+            // Only validate future date when mode is set (not clearing retention)
+            if !mode.is_empty() && retain_until <= now {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "The retain until date must be in the future".to_string(),
+                ));
+            }
+            retain_until.format(&Rfc3339).unwrap()
+        } else {
+            String::default()
+        };
+
         // This is intentional behavior. Empty string represents "retention cleared" which is different from "retention never set". Consistent with minio
         eval_metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode);
         eval_metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), retain_until_date);
