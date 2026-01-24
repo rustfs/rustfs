@@ -367,4 +367,59 @@ mod tests {
 
         env.stop_server();
     }
+
+    /// Test ListObjectsV2 with max_keys=0
+    ///
+    /// S3 semantics: when max_keys is 0, the response should include no objects
+    /// and IsTruncated should be false.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_max_keys_zero() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 with max_keys=0");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-max-keys-zero";
+
+        // Create bucket
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Create 2 objects
+        let test_objects = ["alpha.txt", "beta.txt"];
+        for key in &test_objects {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(*key)
+                .body(ByteStream::from_static(b"test content"))
+                .send()
+                .await
+                .expect("Failed to put object");
+        }
+
+        // List with max_keys=0
+        let result = client.list_objects_v2().bucket(bucket).max_keys(0).send().await;
+
+        assert!(result.is_ok(), "Failed to list objects: {:?}", result.err());
+
+        let output = result.unwrap();
+        let contents = output.contents();
+
+        assert!(contents.is_empty(), "Expected no objects when max_keys=0");
+
+        let is_truncated = output.is_truncated().unwrap_or(false);
+        assert!(!is_truncated, "IsTruncated should be false when max_keys=0");
+
+        assert!(
+            output.next_continuation_token().is_none(),
+            "NextContinuationToken should be None when max_keys=0"
+        );
+
+        info!("Test passed: max_keys=0 returns no objects and IsTruncated=false");
+
+        env.stop_server();
+    }
 }
