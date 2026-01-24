@@ -61,8 +61,8 @@ use rustfs_ecstore::{
         policy_sys::PolicySys,
         quota::QuotaOperation,
         replication::{
-            DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options,
-            must_replicate, schedule_replication, schedule_replication_delete,
+            DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate,
+            schedule_replication, schedule_replication_delete,
         },
         tagging::{decode_tags, encode_tags},
         utils::serialize,
@@ -4417,7 +4417,7 @@ impl S3 for FS {
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 
-    // #[instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
         if req
