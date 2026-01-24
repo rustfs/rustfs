@@ -19,7 +19,6 @@ use crate::server::RemoteAddr;
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
-use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
@@ -29,6 +28,7 @@ use crate::storage::{
         get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
     },
 };
+use crate::storage::{build_post_object_success_response, entity};
 use crate::storage::{
     check_preconditions, create_managed_encryption_material, decrypt_managed_encryption_key, decrypt_multipart_managed_stream,
     derive_part_nonce, get_buffer_size_opt_in, get_validated_store, has_replication_rules, is_managed_sse,
@@ -4844,6 +4844,30 @@ impl S3 for FS {
             version_id: put_version,
             ..Default::default()
         };
+
+        // TODO fix response for POST Policy (multipart/form-data) ，wait s3s crate update,fix issue #1564
+        // // If it is a POST Policy(multipart/form-data) path, the PutObjectInput carries the success_action_* field
+        // // Here, the response is uniformly rewritten, with the default being 204, redirect prioritizing 303, and status supporting 200/201/204
+        // if input.success_action_status.is_some() || input.success_action_redirect.is_some() {
+        //     let mut form_fields = HashMap::<String, String>::new();
+        //     if let Some(v) = &input.success_action_status {
+        //         form_fields.insert("success_action_status".to_string(), v.to_string());
+        //     }
+        //     if let Some(v) = &input.success_action_redirect {
+        //         form_fields.insert("success_action_redirect".to_string(), v.to_string());
+        //     }
+        //
+        //     // obj_info.etag has been converted to e_tag (s3s etag) above, so try to pass the original string here
+        //     let etag_str = e_tag.as_ref().map(|v| v.as_str());
+        //
+        //     // Returns using POST semantics: 204/303/201/200
+        //     let resp = build_post_object_success_response(&form_fields, &bucket, &key, etag_str, None)?;
+        //
+        //     // Keep helper event complete (note: (StatusCode, Body) is returned here instead of PutObjectOutput)
+        //     let result = Ok(resp);
+        //     let _ = helper.complete(&result);
+        //     return result;
+        // }
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);

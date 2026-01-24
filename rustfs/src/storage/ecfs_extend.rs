@@ -62,20 +62,35 @@ use tracing::{debug, warn};
 ///
 /// Reference:
 /// https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectPOST.html
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum PostObjectSuccessAction {
+    #[default]
     NoContent204,
     Ok200,
     Created201,
-    Redirect303 { location: String },
+    Redirect303 {
+        location: String,
+    },
 }
 
-impl Default for PostObjectSuccessAction {
-    fn default() -> Self {
-        Self::NoContent204
-    }
-}
-
+/// Parse success action from Presigned POST form fields.
+///
+/// Integration point (manual):
+/// - In the PostPolicy handler, after parsing form fields, call this function
+///  to determine the desired success action.
+///
+/// # Arguments
+/// * `fields` - HashMap of form fields from the POST request
+///
+/// # Returns
+/// * `S3Result<PostObjectSuccessAction>` - Parsed success action or error
+///
+/// Notes:
+/// - Follows AWS S3 behavior: `success_action_redirect` takes precedence over `success_action_status`.
+/// - Validates `success_action_status` values; invalid values result in MalformedPOSTRequest error.
+///
+#[allow(dead_code)]
 pub(crate) fn parse_success_action_from_form_fields(fields: &HashMap<String, String>) -> S3Result<PostObjectSuccessAction> {
     // 1) success_action_redirect wins over success_action_status (AWS compatible behavior).
     if let Some(loc) = fields
@@ -124,6 +139,7 @@ pub(crate) fn parse_success_action_from_form_fields(fields: &HashMap<String, Str
 /// - For 201: prefer returning PostResponse XML; if not available, empty body
 ///           still satisfies most clients, but strict tests may require XML.
 ///           If you have a PostResponse serializer already, plug it in here.
+#[allow(dead_code)]
 pub(crate) fn build_post_object_success_response(
     form_fields: &HashMap<String, String>,
     // These are optional; used if you want to return richer responses for 200/201.
