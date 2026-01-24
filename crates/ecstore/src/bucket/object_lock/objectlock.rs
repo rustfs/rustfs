@@ -32,10 +32,8 @@ pub fn utc_now_ntp() -> OffsetDateTime {
 }
 
 pub fn get_object_retention_meta(meta: &HashMap<String, String>) -> ObjectLockRetention {
-    // Try lowercase key first, then original case (safe fallback with .get())
-    let mode_str = meta
-        .get(X_AMZ_OBJECT_LOCK_MODE.as_str().to_lowercase().as_str())
-        .or_else(|| meta.get(X_AMZ_OBJECT_LOCK_MODE.as_str()));
+    // Note: X_AMZ_OBJECT_LOCK_MODE.as_str() is already lowercase ("x-amz-object-lock-mode")
+    let mode_str = meta.get(X_AMZ_OBJECT_LOCK_MODE.as_str());
 
     let Some(mode_str) = mode_str else {
         return ObjectLockRetention {
@@ -52,10 +50,7 @@ pub fn get_object_retention_meta(meta: &HashMap<String, String>) -> ObjectLockRe
         };
     };
 
-    // Try lowercase key first, then original case (safe fallback with .get())
-    let till_str = meta
-        .get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_lowercase().as_str())
-        .or_else(|| meta.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()));
+    let till_str = meta.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
 
     let retain_until_date = till_str
         .and_then(|s| OffsetDateTime::parse(s, &format_description::well_known::Iso8601::DEFAULT).ok())
@@ -68,10 +63,8 @@ pub fn get_object_retention_meta(meta: &HashMap<String, String>) -> ObjectLockRe
 }
 
 pub fn get_object_legalhold_meta(meta: &HashMap<String, String>) -> ObjectLockLegalHold {
-    // Try lowercase key first, then original case (safe fallback with .get())
-    let hold_str = meta
-        .get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_lowercase().as_str())
-        .or_else(|| meta.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()));
+    // Note: X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str() is already lowercase
+    let hold_str = meta.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str());
 
     match hold_str.and_then(|s| parse_legalhold_status(s)) {
         Some(status) => ObjectLockLegalHold { status: Some(status) },

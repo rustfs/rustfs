@@ -1042,7 +1042,7 @@ pub async fn eval_action_from_lifecycle(
                 return lifecycle::Event::default();
             }
             // Lifecycle operations should never bypass governance retention
-            if lock_enabled && check_object_lock_for_deletion(&oi.bucket, oi, false).await {
+            if lock_enabled && check_object_lock_for_deletion(&oi.bucket, oi, false).await.is_some() {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
                     info!(

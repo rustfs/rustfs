@@ -53,10 +53,7 @@ use rustfs_ecstore::{
         },
         metadata_sys,
         metadata_sys::get_replication_config,
-        object_lock::{
-            objectlock,
-            objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion},
-        },
+        object_lock::objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, check_retention_for_modification},
         policy_sys::PolicySys,
         quota::QuotaOperation,
         replication::{
@@ -554,12 +551,24 @@ fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Resu
             None => String::default(),
         };
 
-        let retain_until_date = v
-            .retain_until_date
-            .map(|v| OffsetDateTime::from(v).format(&Rfc3339).unwrap())
-            .unwrap_or_default();
-
         let now = OffsetDateTime::now_utc();
+
+        // Validate retain_until_date is in the future (S3 requirement)
+        // Only validate when both mode and date are provided (not clearing retention)
+        let retain_until_date = if let Some(date) = v.retain_until_date {
+            let retain_until = OffsetDateTime::from(date);
+            // Only validate future date when mode is set (not clearing retention)
+            if !mode.is_empty() && retain_until <= now {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "The retain until date must be in the future".to_string(),
+                ));
+            }
+            retain_until.format(&Rfc3339).unwrap()
+        } else {
+            String::default()
+        };
+
         // This is intentional behavior. Empty string represents "retention cleared" which is different from "retention never set". Consistent with minio
         eval_metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode);
         eval_metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), retain_until_date);
@@ -1988,7 +1997,11 @@ impl S3 for FS {
         };
 
         // Check Object Lock retention before deletion
-        // Get object info first to check retention
+        // TODO: Future optimization (separate PR) - If performance becomes critical under high delete load:
+        // 1. Integrate OptimizedFileCache (file_cache.rs) into the read_version() path
+        // 2. Or add a lightweight get_object_lock_info() that only fetches retention metadata
+        // 3. Or use combined get-and-delete in storage layer with retention check callback
+        // Note: The project has OptimizedFileCache with moka, but get_object_info doesn't use it yet
         let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
@@ -1998,11 +2011,8 @@ impl S3 for FS {
                 // Check for bypass governance retention header (permission already verified in access.rs)
                 let bypass_governance = has_bypass_governance_header(&req.headers);
 
-                if check_object_lock_for_deletion(&bucket, &obj_info, bypass_governance).await {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::AccessDenied,
-                        "Object is retained and cannot be deleted until the retention period expires",
-                    ));
+                if let Some(block_reason) = check_object_lock_for_deletion(&bucket, &obj_info, bypass_governance).await {
+                    return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
                 }
             }
             Err(err) => {
@@ -2210,11 +2220,15 @@ impl S3 for FS {
             };
 
             // Check Object Lock retention before deletion
-            if gerr.is_none() && check_object_lock_for_deletion(&bucket, &goi, bypass_governance).await {
+            // NOTE: Unlike single DeleteObject, this reuses the get_object_info result from quota
+            // tracking above, so no additional storage operation is required for the retention check.
+            if gerr.is_none()
+                && let Some(block_reason) = check_object_lock_for_deletion(&bucket, &goi, bypass_governance).await
+            {
                 delete_results[idx].error = Some(Error {
                     code: Some("AccessDenied".to_string()),
                     key: Some(obj_id.key.clone()),
-                    message: Some("Object is retained and cannot be deleted until the retention period expires".to_string()),
+                    message: Some(block_reason.error_message()),
                     version_id: version_id.clone(),
                 });
                 continue;
@@ -6697,46 +6711,39 @@ impl S3 for FS {
         // check object lock
         validate_bucket_object_lock_enabled(&bucket).await?;
 
+        // Extract new retain_until_date for validation
+        let new_retain_until = retention
+            .as_ref()
+            .and_then(|r| r.retain_until_date.as_ref())
+            .map(|d| OffsetDateTime::from(d.clone()));
+
         // Check if object already has retention and if modification is allowed
         // This follows AWS S3 and MinIO behavior:
-        // - COMPLIANCE mode: cannot modify retention (even with bypass header)
-        // - GOVERNANCE mode: requires bypass header to modify retention
+        // - COMPLIANCE mode: can only extend retention period, never shorten
+        // - GOVERNANCE mode: requires bypass header to modify/shorten retention
+        //
+        // TODO: Known race condition (fix in future PR)
+        // There's a TOCTOU (time-of-check-time-of-use) window between retention check here
+        // and the actual update at put_object_metadata. In theory:
+        //   Thread A: reads GOVERNANCE mode, checks bypass header
+        //   Thread B: updates retention to COMPLIANCE mode
+        //   Thread A: modifies retention, bypassing what is now COMPLIANCE mode
+        // This violates S3 spec that COMPLIANCE cannot be modified even with bypass.
+        // Fix options:
+        // 1. Pass expected retention mode to storage layer, verify before update
+        // 2. Use optimistic concurrency with version/etag checks
+        // 3. Perform check within the same lock scope as update in storage layer
+        // Current mitigation: Storage layer has fast_lock_manager which provides some protection
         let check_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
 
         if let Ok(existing_obj_info) = store.get_object_info(&bucket, &key, &check_opts).await {
-            let existing_retention = objectlock::get_object_retention_meta(&existing_obj_info.user_defined);
-
-            if let Some(mode) = existing_retention.mode {
-                let mode_str = mode.as_str();
-
-                // Check if retention period is still active
-                let now = objectlock::utc_now_ntp();
-                let retention_active = if let Some(retain_until_date) = existing_retention.retain_until_date {
-                    OffsetDateTime::from(retain_until_date).unix_timestamp() > now.unix_timestamp()
-                } else {
-                    false
-                };
-
-                if retention_active {
-                    if mode_str == ObjectLockRetentionMode::COMPLIANCE {
-                        // COMPLIANCE mode: cannot modify retention, even with bypass header
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::AccessDenied,
-                            "Cannot modify retention in COMPLIANCE mode",
-                        ));
-                    } else if mode_str == ObjectLockRetentionMode::GOVERNANCE {
-                        // GOVERNANCE mode: need bypass header to modify retention
-                        // (permission for bypass already verified in access.rs)
-                        if !has_bypass_governance_header(&req.headers) {
-                            return Err(S3Error::with_message(
-                                S3ErrorCode::AccessDenied,
-                                "Cannot modify retention in GOVERNANCE mode without x-amz-bypass-governance-retention header",
-                            ));
-                        }
-                    }
-                }
+            let bypass_governance = has_bypass_governance_header(&req.headers);
+            if let Some(block_reason) =
+                check_retention_for_modification(&existing_obj_info.user_defined, new_retain_until, bypass_governance)
+            {
+                return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
             }
         }
 
@@ -7221,33 +7228,33 @@ mod tests {
         assert!(parse_object_lock_retention(None).is_ok());
         assert!(parse_object_lock_retention(None).unwrap().is_empty());
 
-        // [2] Normal case: Retention with valid COMPLIANCE mode
+        // [2] Normal case: Retention with valid COMPLIANCE mode (future date)
         let valid_compliance_retention = ObjectLockRetention {
             mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let compliance_metadata = parse_object_lock_retention(Some(valid_compliance_retention)).unwrap();
         assert_eq!(compliance_metadata.get("x-amz-object-lock-mode").unwrap(), "COMPLIANCE");
         assert_eq!(
             compliance_metadata.get("x-amz-object-lock-retain-until-date").unwrap(),
-            "2025-01-01T00:00:00Z"
+            "2030-01-01T00:00:00Z"
         );
         assert!(
             compliance_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"))
         );
 
-        // [3] Normal case: Retention with valid GOVERNANCE mode
+        // [3] Normal case: Retention with valid GOVERNANCE mode (future date)
         let valid_governance_retention = ObjectLockRetention {
             mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let governance_metadata = parse_object_lock_retention(Some(valid_governance_retention)).unwrap();
         assert_eq!(governance_metadata.get("x-amz-object-lock-mode").unwrap(), "GOVERNANCE");
 
-        // [4] Normal case: Retention with None mode (empty string for mode)
+        // [4] Normal case: Retention with None mode (empty string for mode, date not validated)
         let none_mode_retention = ObjectLockRetention {
             mode: None,
-            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let none_mode_metadata = parse_object_lock_retention(Some(none_mode_retention)).unwrap();
         assert_eq!(none_mode_metadata.get("x-amz-object-lock-mode").unwrap(), "");
@@ -7263,7 +7270,7 @@ mod tests {
         // [6] Error case: Retention with invalid mode (non COMPLIANCE/GOVERNANCE)
         let invalid_mode_retention = ObjectLockRetention {
             mode: Some(ObjectLockRetentionMode::from_static("INVALID_MODE")),
-            retain_until_date: Some(datetime!(2025-01-01 00:00:00 UTC).into()),
+            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let err = parse_object_lock_retention(Some(invalid_mode_retention)).unwrap_err();
         assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
@@ -7271,6 +7278,15 @@ mod tests {
             err.message(),
             Some("The XML you provided was not well-formed or did not validate against our published schema")
         );
+
+        // [7] Error case: Retention with past date should fail
+        let past_date_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: Some(datetime!(2020-01-01 00:00:00 UTC).into()),
+        };
+        let err = parse_object_lock_retention(Some(past_date_retention)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
+        assert_eq!(err.message(), Some("The retain until date must be in the future"));
     }
 
     #[test]

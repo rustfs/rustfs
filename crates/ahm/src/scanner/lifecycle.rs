@@ -128,7 +128,7 @@ impl ScannerItem {
         for fi in overflow_versions.iter() {
             let obj = ObjectInfo::from_file_info(fi, &self.bucket, &self.object_name, versioned);
             // Lifecycle operations should never bypass governance retention
-            if lock_enabled && check_object_lock_for_deletion(&self.bucket, &obj, false).await {
+            if lock_enabled && check_object_lock_for_deletion(&self.bucket, &obj, false).await.is_some() {
                 /*if self.debug {
                     if obj.version_id.is_some() {
                         info!("lifecycle: {} v({}) is locked, not deleting\n", obj.name, obj.version_id.expect("err"));

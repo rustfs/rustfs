@@ -38,89 +38,194 @@ impl BucketObjectLockSys {
 }
 
 /// Check if a retention period is still active based on mode and retain_until_date
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn is_retention_active(mode: &str, retain_until_date: Option<s3s::dto::Date>) -> bool {
+pub fn is_retention_active(mode: &str, retain_until_date: Option<&s3s::dto::Date>) -> bool {
     if mode != ObjectLockRetentionMode::COMPLIANCE && mode != ObjectLockRetentionMode::GOVERNANCE {
         return false;
     }
     if let Some(retain_until) = retain_until_date {
         let now = objectlock::utc_now_ntp();
-        return OffsetDateTime::from(retain_until).unix_timestamp() > now.unix_timestamp();
+        return OffsetDateTime::from(retain_until.clone()).unix_timestamp() > now.unix_timestamp();
     }
     false
 }
 
-/// Add years to an OffsetDateTime, correctly handling leap years.
-/// If the source date is Feb 29 and the target year is not a leap year,
-/// it will fall back to Feb 28 of the target year.
-pub(crate) fn add_years(dt: OffsetDateTime, years: i32) -> OffsetDateTime {
-    let target_year = dt.year() + years;
-    // Try to replace the year directly
-    if let Ok(new_dt) = dt.replace_year(target_year) {
-        return new_dt;
+/// Check if retention modification is blocked for the given object.
+pub fn check_retention_for_modification(
+    user_defined: &std::collections::HashMap<String, String>,
+    new_retain_until: Option<OffsetDateTime>,
+    bypass_governance: bool,
+) -> Option<ObjectLockBlockReason> {
+    let retention = objectlock::get_object_retention_meta(user_defined);
+
+    let Some(mode) = &retention.mode else {
+        return None;
+    };
+
+    let mode_str = mode.as_str();
+    if !is_retention_active(mode_str, retention.retain_until_date.as_ref()) {
+        return None;
     }
-    // Handle Feb 29 -> non-leap year case: use Feb 28
-    if dt.month() == time::Month::February
-        && dt.day() == 29
-        && let Ok(new_dt) = dt.replace_day(28).and_then(|d| d.replace_year(target_year))
-    {
-        return new_dt;
+
+    let existing_retain_until = retention.retain_until_date.as_ref().map(|d| OffsetDateTime::from(d.clone()));
+
+    // Check if new retention period is shorter than existing
+    let is_shortening = match (&existing_retain_until, &new_retain_until) {
+        (Some(existing), Some(new)) => new < existing,
+        (Some(_), None) => true, // Clearing retention is shortening
+        _ => false,
+    };
+
+    // COMPLIANCE mode: cannot modify retention at all when shortening
+    // Can only extend the retention period
+    if mode_str == ObjectLockRetentionMode::COMPLIANCE {
+        if is_shortening {
+            return Some(ObjectLockBlockReason::Retention {
+                mode: mode_str.to_string(),
+                retain_until: existing_retain_until,
+            });
+        }
+        // Extending retention in COMPLIANCE mode is allowed
+        return None;
     }
-    // Fallback: iteratively add years one at a time to handle edge cases correctly
-    // This is more accurate than multiplying by 365 days
-    let mut result = dt;
-    let step = if years > 0 { 1 } else { -1 };
-    for _ in 0..years.abs() {
-        let next_year = result.year() + step;
-        result = if let Ok(new_dt) = result.replace_year(next_year) {
-            new_dt
-        } else {
-            // Feb 29 -> non-leap year: use Feb 28
-            result
-                .replace_day(28)
-                .and_then(|d| d.replace_year(next_year))
-                .unwrap_or(result)
-        };
+
+    // GOVERNANCE mode: can be bypassed with permission
+    if mode_str == ObjectLockRetentionMode::GOVERNANCE && !bypass_governance {
+        return Some(ObjectLockBlockReason::Retention {
+            mode: mode_str.to_string(),
+            retain_until: existing_retain_until,
+        });
     }
-    result
+
+    None
 }
 
-/// Check if object deletion should be blocked due to Object Lock.
-/// This checks:
-/// 1. Legal hold status (cannot be bypassed)
-/// 2. Explicit retention on the object (from object metadata)
-/// 3. Default retention from bucket configuration (calculated from object creation time)
+pub(crate) fn add_years(dt: OffsetDateTime, years: i32) -> OffsetDateTime {
+    let target_year = dt.year() + years;
+    dt.replace_year(target_year)
+        .or_else(|_| {
+            // Feb 29 -> non-leap year: use Feb 28
+            dt.replace_day(28).and_then(|d| d.replace_year(target_year))
+        })
+        .unwrap_or(dt)
+}
+
+/// Check if an object has legal hold enabled.
+/// Returns true if legal hold is ON.
+fn has_legal_hold(user_defined: &std::collections::HashMap<String, String>) -> bool {
+    let lhold = objectlock::get_object_legalhold_meta(user_defined);
+    matches!(lhold.status, Some(ref st) if st.as_str() == ObjectLockLegalHoldStatus::ON)
+}
+
+/// Check if an object is locked based on its metadata.
+/// This is a common function used by both lifecycle evaluation and deletion checks.
 ///
 /// # Arguments
-/// * `bucket` - The bucket name
-/// * `obj_info` - Object information
-/// * `bypass_governance` - If true, GOVERNANCE mode retention can be bypassed (requires permission check by caller)
+/// * `user_defined` - The object's user-defined metadata
+/// * `is_delete_marker` - Whether the object is a delete marker
 ///
+/// # Returns
+/// * `true` if the object is locked (cannot be deleted/modified)
+/// * `false` if the object is not locked
+pub fn is_object_locked_by_metadata(user_defined: &std::collections::HashMap<String, String>, is_delete_marker: bool) -> bool {
+    // Delete markers are never locked
+    if is_delete_marker {
+        return false;
+    }
+
+    // Check legal hold - always blocks if ON
+    if has_legal_hold(user_defined) {
+        return true;
+    }
+
+    // Check retention - reuse is_retention_active to avoid code duplication
+    let ret = objectlock::get_object_retention_meta(user_defined);
+    if let Some(mode) = &ret.mode
+        && is_retention_active(mode.as_str(), ret.retain_until_date.as_ref())
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Reason why object deletion is blocked by Object Lock
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectLockBlockReason {
+    /// Object has legal hold enabled (must be explicitly removed)
+    LegalHold,
+    /// Object is under retention until the specified date
+    Retention {
+        mode: String,
+        retain_until: Option<OffsetDateTime>,
+    },
+}
+
+impl ObjectLockBlockReason {
+    /// Get a user-friendly error message for this block reason
+    pub fn error_message(&self) -> String {
+        match self {
+            ObjectLockBlockReason::LegalHold => {
+                "Object has a legal hold and cannot be deleted. Remove the legal hold first.".to_string()
+            }
+            ObjectLockBlockReason::Retention { mode, retain_until } => {
+                if let Some(until) = retain_until {
+                    format!("Object is under {} retention and cannot be deleted until {}", mode, until)
+                } else {
+                    format!("Object is under {} retention and cannot be deleted", mode)
+                }
+            }
+        }
+    }
+}
+
+/// Check if retention blocks deletion based on mode and bypass permission.
+/// Returns Some(ObjectLockBlockReason) if blocked, None if allowed.
+fn check_retention_blocks_deletion(
+    mode_str: &str,
+    retain_until: Option<OffsetDateTime>,
+    bypass_governance: bool,
+) -> Option<ObjectLockBlockReason> {
+    // COMPLIANCE mode cannot be bypassed; GOVERNANCE can only be bypassed with permission
+    let can_bypass = mode_str == ObjectLockRetentionMode::GOVERNANCE && bypass_governance;
+    if !can_bypass {
+        return Some(ObjectLockBlockReason::Retention {
+            mode: mode_str.to_string(),
+            retain_until,
+        });
+    }
+    None
+}
+
 /// # S3 Standard Behavior
 /// - COMPLIANCE mode: Cannot be deleted even with bypass header
 /// - GOVERNANCE mode: Can be deleted if bypass_governance is true (caller must verify s3:BypassGovernanceRetention permission)
 /// - Legal Hold: Cannot be bypassed regardless of mode
-pub async fn check_object_lock_for_deletion(bucket: &str, obj_info: &ObjectInfo, bypass_governance: bool) -> bool {
+pub async fn check_object_lock_for_deletion(
+    bucket: &str,
+    obj_info: &ObjectInfo,
+    bypass_governance: bool,
+) -> Option<ObjectLockBlockReason> {
     if obj_info.delete_marker {
-        return false;
+        return None;
     }
 
-    // 1. Check legal hold - cannot be bypassed
-    let lhold = objectlock::get_object_legalhold_meta(&obj_info.user_defined);
-    if matches!(lhold.status, Some(st) if st.as_str() == ObjectLockLegalHoldStatus::ON) {
-        return true;
+    // 1. Check legal hold - cannot be bypassed (reuse has_legal_hold)
+    if has_legal_hold(&obj_info.user_defined) {
+        return Some(ObjectLockBlockReason::LegalHold);
     }
 
     // 2. Check explicit retention
     let explicit_ret = objectlock::get_object_retention_meta(&obj_info.user_defined);
     if let Some(mode) = &explicit_ret.mode {
         let mode_str = mode.as_str();
-        if is_retention_active(mode_str, explicit_ret.retain_until_date) {
-            // COMPLIANCE mode cannot be bypassed; GOVERNANCE can only be bypassed with permission
-            let can_bypass = mode_str == ObjectLockRetentionMode::GOVERNANCE && bypass_governance;
-            if !can_bypass {
-                return true;
-            }
+        if is_retention_active(mode_str, explicit_ret.retain_until_date.as_ref())
+            && let Some(reason) = check_retention_blocks_deletion(
+                mode_str,
+                explicit_ret.retain_until_date.map(OffsetDateTime::from),
+                bypass_governance,
+            )
+        {
+            return Some(reason);
         }
     }
 
@@ -139,21 +244,19 @@ pub async fn check_object_lock_for_deletion(bucket: &str, obj_info: &ObjectInfo,
                 } else if let Some(years) = default_retention.years {
                     add_years(mod_time, years)
                 } else {
-                    return false; // No retention period specified
+                    return None; // No retention period specified
                 };
 
-                if retain_until.unix_timestamp() > now.unix_timestamp() {
-                    // COMPLIANCE mode cannot be bypassed; GOVERNANCE can only be bypassed with permission
-                    let can_bypass = mode_str == ObjectLockRetentionMode::GOVERNANCE && bypass_governance;
-                    if !can_bypass {
-                        return true; // Object is still under retention
-                    }
+                if retain_until.unix_timestamp() > now.unix_timestamp()
+                    && let Some(reason) = check_retention_blocks_deletion(mode_str, Some(retain_until), bypass_governance)
+                {
+                    return Some(reason);
                 }
             }
         }
     }
 
-    false
+    None
 }
 
 #[cfg(test)]
@@ -247,10 +350,10 @@ mod tests {
         let future_date = OffsetDateTime::now_utc() + time::Duration::days(30);
         let s3_date = s3s::dto::Date::from(future_date);
 
-        assert!(is_retention_active(ObjectLockRetentionMode::COMPLIANCE, Some(s3_date)));
+        assert!(is_retention_active(ObjectLockRetentionMode::COMPLIANCE, Some(&s3_date)));
         let future_date = OffsetDateTime::now_utc() + time::Duration::days(30);
         let s3_date = s3s::dto::Date::from(future_date);
-        assert!(is_retention_active(ObjectLockRetentionMode::GOVERNANCE, Some(s3_date)));
+        assert!(is_retention_active(ObjectLockRetentionMode::GOVERNANCE, Some(&s3_date)));
     }
 
     #[test]
@@ -259,9 +362,164 @@ mod tests {
         let past_date = OffsetDateTime::now_utc() - time::Duration::days(30);
         let s3_date = s3s::dto::Date::from(past_date);
 
-        assert!(!is_retention_active(ObjectLockRetentionMode::COMPLIANCE, Some(s3_date)));
+        assert!(!is_retention_active(ObjectLockRetentionMode::COMPLIANCE, Some(&s3_date)));
         let past_date = OffsetDateTime::now_utc() - time::Duration::days(30);
         let s3_date = s3s::dto::Date::from(past_date);
-        assert!(!is_retention_active(ObjectLockRetentionMode::GOVERNANCE, Some(s3_date)));
+        assert!(!is_retention_active(ObjectLockRetentionMode::GOVERNANCE, Some(&s3_date)));
+    }
+
+    #[test]
+    fn test_check_retention_for_modification_no_existing_retention() {
+        // No existing retention - modification should be allowed
+        let user_defined = std::collections::HashMap::new();
+        let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(30));
+        assert!(check_retention_for_modification(&user_defined, new_retain, false).is_none());
+    }
+
+    #[test]
+    fn test_check_retention_for_modification_compliance_extend() {
+        // COMPLIANCE mode - extending retention should be allowed
+        let mut user_defined = std::collections::HashMap::new();
+        let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(30);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            existing_retain
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+
+        // Extending by another 30 days should be allowed
+        let new_retain = Some(existing_retain + time::Duration::days(30));
+        assert!(check_retention_for_modification(&user_defined, new_retain, false).is_none());
+    }
+
+    #[test]
+    fn test_check_retention_for_modification_compliance_shorten() {
+        // COMPLIANCE mode - shortening retention should be blocked
+        let mut user_defined = std::collections::HashMap::new();
+        let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(60);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            existing_retain
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+
+        // Shortening to 30 days should be blocked
+        let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(30));
+        let result = check_retention_for_modification(&user_defined, new_retain, false);
+        assert!(result.is_some());
+        assert!(matches!(result, Some(ObjectLockBlockReason::Retention { .. })));
+    }
+
+    #[test]
+    fn test_check_retention_for_modification_compliance_clear() {
+        // COMPLIANCE mode - clearing retention should be blocked
+        let mut user_defined = std::collections::HashMap::new();
+        let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(30);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            existing_retain
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+
+        // Clearing (None) should be blocked
+        let result = check_retention_for_modification(&user_defined, None, false);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_check_retention_for_modification_governance_without_bypass() {
+        // GOVERNANCE mode without bypass - modification should be blocked
+        let mut user_defined = std::collections::HashMap::new();
+        let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(30);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            existing_retain
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+
+        let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(15));
+        let result = check_retention_for_modification(&user_defined, new_retain, false);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_check_retention_for_modification_governance_with_bypass() {
+        // GOVERNANCE mode with bypass - modification should be allowed
+        let mut user_defined = std::collections::HashMap::new();
+        let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(30);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            existing_retain
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+
+        let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(15));
+        assert!(check_retention_for_modification(&user_defined, new_retain, true).is_none());
+    }
+
+    #[test]
+    fn test_is_object_locked_by_metadata_delete_marker() {
+        // Delete markers are never locked
+        let user_defined = std::collections::HashMap::new();
+        assert!(!is_object_locked_by_metadata(&user_defined, true));
+    }
+
+    #[test]
+    fn test_is_object_locked_by_metadata_legal_hold_on() {
+        // Legal hold ON should be locked
+        let mut user_defined = std::collections::HashMap::new();
+        user_defined.insert("x-amz-object-lock-legal-hold".to_string(), "ON".to_string());
+        assert!(is_object_locked_by_metadata(&user_defined, false));
+    }
+
+    #[test]
+    fn test_is_object_locked_by_metadata_legal_hold_off() {
+        // Legal hold OFF should not be locked
+        let mut user_defined = std::collections::HashMap::new();
+        user_defined.insert("x-amz-object-lock-legal-hold".to_string(), "OFF".to_string());
+        assert!(!is_object_locked_by_metadata(&user_defined, false));
+    }
+
+    #[test]
+    fn test_is_object_locked_by_metadata_retention_active() {
+        // Active retention should be locked
+        let mut user_defined = std::collections::HashMap::new();
+        let future_date = OffsetDateTime::now_utc() + time::Duration::days(30);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            future_date.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+        assert!(is_object_locked_by_metadata(&user_defined, false));
+    }
+
+    #[test]
+    fn test_is_object_locked_by_metadata_retention_expired() {
+        // Expired retention should not be locked
+        let mut user_defined = std::collections::HashMap::new();
+        let past_date = OffsetDateTime::now_utc() - time::Duration::days(30);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            past_date.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+        assert!(!is_object_locked_by_metadata(&user_defined, false));
+    }
+
+    #[test]
+    fn test_is_object_locked_by_metadata_no_lock() {
+        // No lock settings should not be locked
+        let user_defined = std::collections::HashMap::new();
+        assert!(!is_object_locked_by_metadata(&user_defined, false));
     }
 }
