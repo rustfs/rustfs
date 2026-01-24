@@ -4646,10 +4646,8 @@ impl S3 for FS {
         let mut sha256hex = get_content_sha256(&req.headers);
 
         if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
-            metadata.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
-                CompressionAlgorithm::default().to_string(),
-            );
+            let algorithm = CompressionAlgorithm::default();
+            metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), algorithm.to_string());
             metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
             let mut hrd = HashReader::new(reader, size as i64, size as i64, md5hex, sha256hex, false).map_err(ApiError::from)?;
@@ -4659,8 +4657,12 @@ impl S3 for FS {
             }
 
             opts.want_checksum = hrd.checksum();
+            opts.user_defined
+                .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), algorithm.to_string());
+            opts.user_defined
+                .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
-            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
+            reader = Box::new(CompressReader::new(hrd, algorithm));
             size = HashReader::SIZE_PRESERVE_LAYER;
             md5hex = None;
             sha256hex = None;
