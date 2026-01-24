@@ -88,16 +88,13 @@ pub fn optimal_part_info(object_size: i64, configured_part_size: u64) -> Result<
         }
     } else {
         let min_part = MIN_PART_SIZE as f64;
-        // Calculate minimum required part size to fit within MAX_PARTS_COUNT
         part_size_flt = (object_size as f64 / MAX_PARTS_COUNT as f64).ceil();
-        // Ensure part size is at least MIN_PART_SIZE
         part_size_flt = part_size_flt.max(min_part);
-        // Round up to the nearest multiple of MIN_PART_SIZE
         part_size_flt = (part_size_flt / min_part).ceil() * min_part;
     }
 
     let total_parts_count = (object_size as f64 / part_size_flt).ceil() as i64;
-    let part_size = part_size_flt.ceil() as i64;
+    let part_size = part_size_flt as i64;
     let last_part_size = object_size - (total_parts_count - 1) * part_size;
     Ok((total_parts_count, part_size, last_part_size))
 }
