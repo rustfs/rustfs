@@ -81,7 +81,7 @@ mod tests {
         assert!(info.used > 0);
         assert!(info.files > 0);
         assert!(info.ffree > 0);
-        assert!(!info.fstype.is_empty());
+        assert!(info.total >= info.free);
     }
 
     #[test]

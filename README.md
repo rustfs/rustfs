@@ -152,10 +152,11 @@ For developers who want to build RustFS Docker images from source with multi-arc
 ```
 
 The `docker-buildx.sh` script supports:
-\- **Multi-architecture builds**: `linux/amd64`, `linux/arm64`
-\- **Automatic version detection**: Uses git tags or commit hashes
-\- **Registry flexibility**: Supports Docker Hub, GitHub Container Registry, etc.
-\- **Build optimization**: Includes caching and parallel builds
+
+- **Multi-architecture builds**: `linux/amd64`, `linux/arm64`
+- **Automatic version detection**: Uses git tags or commit hashes
+- **Registry flexibility**: Supports Docker Hub, GitHub Container Registry, etc.
+- **Build optimization**: Includes caching and parallel builds
 
 You can also use Make targets for convenience:
 
