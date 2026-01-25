@@ -14,15 +14,12 @@
 
 use std::sync::Arc;
 
-use s3s::dto::{
-    BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
-};
+use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled};
 use time::OffsetDateTime;
 use tracing::info;
 
 use crate::bucket::lifecycle::lifecycle::{Event, Lifecycle, ObjectOpts};
-use crate::bucket::object_lock::ObjectLockStatusExt;
-use crate::bucket::object_lock::objectlock::{get_object_legalhold_meta, get_object_retention_meta, utc_now_ntp};
+use crate::bucket::object_lock::objectlock_sys::is_object_locked_by_metadata;
 use crate::bucket::replication::ReplicationConfig;
 use rustfs_common::metrics::IlmAction;
 
@@ -75,9 +72,10 @@ impl Evaluator {
     }
 
     /// IsObjectLocked checks if it is appropriate to remove an
-    /// object according to locking configuration when this is lifecycle/ bucket quota asking.
-    /// (copied over from enforceRetentionForDeletion)
+    /// object according to locking configuration when this is lifecycle/bucket quota asking.
+    /// Uses the common `is_object_locked_by_metadata` function for consistency.
     pub fn is_object_locked(&self, obj: &ObjectOpts) -> bool {
+        // First check if object lock is enabled for this bucket
         if self.lock_retention.as_ref().is_none_or(|v| {
             v.object_lock_enabled
                 .as_ref()
@@ -86,31 +84,8 @@ impl Evaluator {
             return false;
         }
 
-        if obj.delete_marker {
-            return false;
-        }
-
-        let lhold = get_object_legalhold_meta(obj.user_defined.clone());
-        if lhold
-            .status
-            .is_some_and(|v| v.valid() && v.as_str() == ObjectLockLegalHoldStatus::ON)
-        {
-            return true;
-        }
-
-        let ret = get_object_retention_meta(obj.user_defined.clone());
-        if ret
-            .mode
-            .is_some_and(|v| matches!(v.as_str(), ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE))
-        {
-            let t = utc_now_ntp();
-            if let Some(retain_until) = ret.retain_until_date
-                && OffsetDateTime::from(retain_until).gt(&t)
-            {
-                return true;
-            }
-        }
-        false
+        // Use the common function to check if the object is locked
+        is_object_locked_by_metadata(&obj.user_defined, obj.delete_marker)
     }
 
     /// eval will return a lifecycle event for each object in objs for a given time.

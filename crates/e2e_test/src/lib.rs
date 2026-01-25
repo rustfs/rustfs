@@ -53,4 +53,10 @@ mod list_objects_v2_pagination_test;
 mod policy;
 
 #[cfg(test)]
+mod compression_test;
+#[cfg(test)]
 mod protocols;
+
+// Object Lock tests
+#[cfg(test)]
+mod object_lock;
