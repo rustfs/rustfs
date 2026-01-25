@@ -256,19 +256,21 @@ impl ECStore {
         max_keys: i32,
         incl_deleted: bool,
     ) -> Result<ListObjectsInfo> {
+        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
-            limit: max_keys_plus_one(max_keys, marker.is_some()),
+            // Always request max_keys + 1 to detect if there are more results
+            limit: effective_max_keys,
             marker,
             incl_deleted,
             ask_disks: "strict".to_owned(), //TODO: from config
             ..Default::default()
         };
 
-        // use get
-        if !opts.prefix.is_empty() && opts.limit == 1 && opts.marker.is_none() {
+        // Optimization: use get for single object lookup with exact prefix
+        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
             match self
                 .get_object_info(
                     &opts.bucket,
@@ -322,14 +324,16 @@ impl ECStore {
         )
         .await;
 
-        let is_truncated = {
-            if max_keys > 0 && get_objects.len() > max_keys as usize {
-                get_objects.truncate(max_keys as usize);
-                true
-            } else {
-                list_result.err.is_none() && !get_objects.is_empty()
-            }
-        };
+        // Determine if there are more results: we requested max_keys + 1, so if we got more
+        // than max_keys, there are more results available
+        let mut is_truncated = false;
+        if max_keys <= 0 {
+            get_objects.clear();
+        } else if get_objects.len() > max_keys as usize {
+            is_truncated = true;
+            // Truncate to max_keys if we have more results
+            get_objects.truncate(max_keys as usize);
+        }
 
         let next_marker = {
             if is_truncated {
@@ -397,12 +401,13 @@ impl ECStore {
             None
         };
 
-        // if marker set, limit +1
+        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
+        // Always request max_keys + 1 to detect if there are more results
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
-            limit: max_keys_plus_one(max_keys, marker.is_some()),
+            limit: effective_max_keys,
             marker,
             incl_deleted: true,
             ask_disks: "strict".to_owned(),
@@ -437,14 +442,16 @@ impl ECStore {
         )
         .await;
 
-        let is_truncated = {
-            if max_keys > 0 && get_objects.len() > max_keys as usize {
-                get_objects.truncate(max_keys as usize);
-                true
-            } else {
-                list_result.err.is_none() && !get_objects.is_empty()
-            }
-        };
+        // Determine if there are more results: we requested max_keys + 1, so if we got more
+        // than max_keys, there are more results available
+        let mut is_truncated = false;
+        if max_keys <= 0 {
+            get_objects.clear();
+        } else if get_objects.len() > max_keys as usize {
+            is_truncated = true;
+            // Truncate to max_keys if we have more results
+            get_objects.truncate(max_keys as usize);
+        }
 
         let (next_marker, next_version_idmarker) = {
             if is_truncated {

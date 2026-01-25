@@ -96,6 +96,15 @@ pub async fn get_bucket_policy(bucket: &str) -> Result<(BucketPolicy, OffsetDate
     bucket_meta_sys.get_bucket_policy(bucket).await
 }
 
+/// Returns the raw JSON string of the bucket policy as originally stored.
+/// This preserves the exact format of the policy document as it was PUT.
+pub async fn get_bucket_policy_raw(bucket: &str) -> Result<(String, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_bucket_policy_raw(bucket).await
+}
+
 pub async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
@@ -452,6 +461,20 @@ impl BucketMetadataSys {
             Ok((config.clone(), bm.policy_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
+        }
+    }
+
+    /// Returns the raw JSON string of the bucket policy as originally stored.
+    /// This preserves the exact format of the policy document as it was PUT.
+    pub async fn get_bucket_policy_raw(&self, bucket: &str) -> Result<(String, OffsetDateTime)> {
+        let (bm, _) = self.get_config(bucket).await?;
+
+        if bm.policy_config_json.is_empty() {
+            Err(Error::ConfigNotFound)
+        } else {
+            let policy_str = String::from_utf8(bm.policy_config_json.clone())
+                .map_err(|e| Error::other(format!("invalid UTF-8 in policy JSON: {}", e)))?;
+            Ok((policy_str, bm.policy_config_updated_at))
         }
     }
 

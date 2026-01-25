@@ -44,9 +44,19 @@ mod special_chars_test;
 #[cfg(test)]
 mod content_encoding_test;
 
+// ListObjectsV2 pagination test (Issue #1596)
+#[cfg(test)]
+mod list_objects_v2_pagination_test;
+
 // Policy variables tests
 #[cfg(test)]
 mod policy;
 
 #[cfg(test)]
+mod compression_test;
+#[cfg(test)]
 mod protocols;
+
+// Object Lock tests
+#[cfg(test)]
+mod object_lock;

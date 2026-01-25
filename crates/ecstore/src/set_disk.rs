@@ -4640,17 +4640,8 @@ impl StorageAPI for SetDisks {
         let disks = self.get_disks_internal().await;
 
         let (metas, errs) = {
-            if opts.version_id.is_some() {
-                Self::read_all_fileinfo(
-                    &disks,
-                    "",
-                    bucket,
-                    object,
-                    opts.version_id.as_ref().unwrap().to_string().as_str(),
-                    false,
-                    false,
-                )
-                .await?
+            if let Some(vid) = opts.version_id.as_ref() {
+                Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), false, false).await?
             } else {
                 Self::read_all_xl(&disks, bucket, object, false, false).await
             }
@@ -5680,20 +5671,12 @@ impl StorageAPI for SetDisks {
                 return Err(Error::other("checksum type not found"));
             };
 
-            if opts.want_checksum.is_some()
-                && !opts.want_checksum.as_ref().is_some_and(|v| {
-                    v.checksum_type
-                        .is(rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct))
-                })
-            {
-                return Err(Error::other(format!(
-                    "checksum type mismatch, got {:?}, want {:?}",
-                    opts.want_checksum.as_ref().unwrap(),
-                    rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct)
-                )));
-            }
-
             checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct);
+            if let Some(want) = opts.want_checksum.as_ref()
+                && !want.checksum_type.is(checksum_type)
+            {
+                return Err(Error::other(format!("checksum type mismatch, got {:?}, want {:?}", want, checksum_type)));
+            }
         }
 
         for (i, part) in object_parts.iter().enumerate() {
@@ -5735,17 +5718,20 @@ impl StorageAPI for SetDisks {
             ..Default::default()
         };
 
+        // Build a lookup map for O(1) part resolution instead of O(n) find() in the loop
+        // This optimizes from O(n^2) to O(n) when processing many parts
+        use std::collections::HashMap;
+        let part_lookup: HashMap<usize, &rustfs_filemeta::ObjectPartInfo> =
+            curr_fi.parts.iter().map(|part| (part.number, part)).collect();
+
         for (i, p) in uploaded_parts.iter().enumerate() {
-            let has_part = curr_fi.parts.iter().find(|v| v.number == p.part_num);
-            if has_part.is_none() {
+            let Some(ext_part) = part_lookup.get(&p.part_num) else {
                 error!(
-                    "complete_multipart_upload has_part.is_none() {:?}, part_id={}, bucket={}, object={}",
-                    has_part, p.part_num, bucket, object
+                    "complete_multipart_upload part not found: part_id={}, bucket={}, object={}",
+                    p.part_num, bucket, object
                 );
                 return Err(Error::InvalidPart(p.part_num, "".to_owned(), p.etag.clone().unwrap_or_default()));
-            }
-
-            let ext_part = &curr_fi.parts[i];
+            };
             info!(target:"rustfs_ecstore::set_disk", part_number = p.part_num, part_size = ext_part.size, part_actual_size = ext_part.actual_size, "Completing multipart part");
 
             // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
