@@ -482,12 +482,12 @@ pub fn base_dir_from_prefix(prefix: &str) -> String {
 /// by purely lexical processing.  It applies the following rules:
 ///
 /// 1. Replace multiple slashes with a single slash.
-/// 2. Eliminate each .  path name element (the current directory).
-/// 3. Eliminate each inner ..  path name element (the parent directory)
-///    along with the non-..  element that precedes it.
+/// 2. Eliminate each . path name element (the current directory).
+/// 3. Eliminate each inner .. path name element (the parent directory)
+///    along with the non-.. element that precedes it.
 /// 4.  Eliminate ..  elements that begin a rooted path.
 ///
-/// If the result is an empty string, returns ". ".
+/// If the result is an empty string, returns ".".
 /// Always uses forward slash in output for consistency.
 ///
 /// # Arguments
@@ -557,7 +557,7 @@ pub fn clean(path: &str) -> String {
     }
 
     if out.w == 0 {
-        return ". ".to_string();
+        return ".".to_string();
     }
 
     let result = out.string();
@@ -692,8 +692,8 @@ mod tests {
         assert_eq!(path_join_buf(&["a", "b", "c"]), "a/b/c");
         assert_eq!(path_join_buf(&["a/", "b/"]), "a/b/");
         assert_eq!(path_join_buf(&["a", ".", "b"]), "a/b");
-        assert_eq!(path_join_buf(&["a", ". .", "b"]), "b");
-        assert_eq!(path_join_buf(&["a", "b", ". ."]), "a");
+        assert_eq!(path_join_buf(&["a", "..", "b"]), "b");
+        assert_eq!(path_join_buf(&["a", "b", ".."]), "a");
         assert_eq!(path_join_buf(&["a", "b/"]), "a/b/");
         assert_eq!(path_join_buf(&["a/", "b/"]), "a/b/");
         assert_eq!(path_join_buf(&["a", "", "b"]), "a/b");
