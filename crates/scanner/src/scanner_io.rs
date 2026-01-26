@@ -22,7 +22,7 @@ use rustfs_ecstore::set_disk::SetDisks;
 use rustfs_ecstore::store_api::{BucketInfo, BucketOptions, ObjectInfo};
 use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
-use rustfs_utils::path::{SLASH_SEPARATOR_STR, path_join_buf};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -469,7 +469,7 @@ impl ScannerIOCache for SetDisks {
 #[async_trait::async_trait]
 impl ScannerIODisk for Disk {
     async fn get_size(&self, mut item: ScannerItem) -> Result<SizeSummary> {
-        if !item.path.ends_with(&format!("{SLASH_SEPARATOR_STR}{STORAGE_FORMAT_FILE}")) {
+        if !item.path.ends_with(&format!("{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}")) {
             return Err(StorageError::other("skip file".to_string()));
         }
 

@@ -83,7 +83,7 @@ use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX, 
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
-    path::{SLASH_SEPARATOR_STR, encode_dir_object, has_suffix, path_join_buf},
+    path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
 use rustfs_workers::workers::Workers;
 use s3s::header::X_AMZ_RESTORE;
@@ -5232,7 +5232,7 @@ impl StorageAPI for SetDisks {
                 &upload_id_path,
                 fi.data_dir.map(|v| v.to_string()).unwrap_or_default().as_str(),
             ]),
-            SLASH_SEPARATOR_STR
+            SLASH_SEPARATOR
         );
 
         let mut part_numbers = match Self::list_parts(&online_disks, &part_path, read_quorum).await {
@@ -5370,7 +5370,7 @@ impl StorageAPI for SetDisks {
         let mut populated_upload_ids = HashSet::new();
 
         for upload_id in upload_ids.iter() {
-            let upload_id = upload_id.trim_end_matches(SLASH_SEPARATOR_STR).to_string();
+            let upload_id = upload_id.trim_end_matches(SLASH_SEPARATOR).to_string();
             if populated_upload_ids.contains(&upload_id) {
                 continue;
             }
@@ -6125,7 +6125,7 @@ impl StorageAPI for SetDisks {
             None
         };
 
-        if has_suffix(object, SLASH_SEPARATOR_STR) {
+        if has_suffix(object, SLASH_SEPARATOR) {
             let (result, err) = self.heal_object_dir_locked(bucket, object, opts.dry_run, opts.remove).await?;
             return Ok((result, err.map(|e| e.into())));
         }
@@ -6672,6 +6672,16 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
     ret
 }
 async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rustfs_madmin::StorageInfo {
+    // let mut disks = get_disks_info(disks, eps).await;
+    // disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
+    //
+    // rustfs_madmin::StorageInfo {
+    //     disks,
+    //     backend: rustfs_madmin::BackendInfo {
+    //         backend_type: rustfs_madmin::BackendByte::Erasure,
+    //         ..Default::default()
+    //     },
+    // }
     let mut disks = get_disks_info(disks, eps).await;
     disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
 
