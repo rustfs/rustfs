@@ -296,7 +296,7 @@ pub fn path_to_bucket_object_with_base_path(base_path: &str, path: &str) -> (Str
 
     // 3. Find split point
     let idx = if cfg!(target_os = "windows") {
-        p.find(|c| c == '/' || c == '\\')
+        p.find(['/', '\\'])
     } else {
         p.find('/')
     };
@@ -352,7 +352,7 @@ pub fn base_dir_from_prefix(prefix: &str) -> String {
     }
 
     let has_separator = if cfg!(target_os = "windows") {
-        prefix.contains('/') || prefix.contains('\\')
+        prefix.contains(['/', '\\'])
     } else {
         prefix.contains('/')
     };
@@ -516,7 +516,7 @@ pub fn clean(path: &str) -> String {
 pub fn split(path: &str) -> (&str, &str) {
     // Find the last occurrence of the separator
     let idx = if cfg!(target_os = "windows") {
-        path.rfind(|c| c == '/' || c == '\\')
+        path.rfind(['/', '\\'])
     } else {
         path.rfind('/')
     };
