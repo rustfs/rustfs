@@ -117,9 +117,9 @@ pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
 
 pub fn path_join_buf(elements: &[&str]) -> String {
     let trailing_slash = !elements.is_empty()
-        && elements
-            .last()
-            .is_some_and(|last| last.ends_with(SLASH_SEPARATOR) || (cfg!(target_os = "windows") && last.ends_with('\\')));
+        && elements.last().is_some_and(|last| {
+            last.ends_with(SLASH_SEPARATOR) || (cfg!(target_os = "windows") && last.ends_with('\\'))
+        });
 
     let len = elements.iter().map(|s| s.len()).sum::<usize>() + elements.len();
     let mut dst = String::with_capacity(len);
@@ -204,6 +204,9 @@ fn path_needs_clean(path: &[u8]) -> bool {
                 }
                 // copy element
                 while r < n && path[r] != b'/' {
+                    if cfg!(target_os = "windows") && path[r] == b'\\' {
+                        return true;
+                    }
                     w += 1;
                     r += 1;
                 }
@@ -241,7 +244,14 @@ pub fn base_dir_from_prefix(prefix: &str) -> String {
     if base_dir == "." || base_dir == "./" || base_dir == "/" {
         base_dir = "".to_owned();
     }
-    if !prefix.contains('/') {
+
+    let has_separator = if cfg!(target_os = "windows") {
+        prefix.contains('/') || prefix.contains('\\')
+    } else {
+        prefix.contains('/')
+    };
+
+    if !has_separator {
         base_dir = "".to_owned();
     }
     if !base_dir.is_empty() && !base_dir.ends_with(SLASH_SEPARATOR) {
@@ -371,12 +381,18 @@ pub fn clean(path: &str) -> String {
 }
 
 pub fn split(path: &str) -> (&str, &str) {
-    // Find the last occurrence of the '/' character
-    if let Some(i) = path.rfind('/') {
-        // Return the directory (up to and including the last '/') and the file name
+    // Find the last occurrence of the separator
+    let idx = if cfg!(target_os = "windows") {
+        path.rfind(|c| c == '/' || c == '\\')
+    } else {
+        path.rfind('/')
+    };
+
+    if let Some(i) = idx {
+        // Return the directory (up to and including the last separator) and the file name
         return (&path[..i + 1], &path[i + 1..]);
     }
-    // If no '/' is found, return an empty string for the directory and the whole path as the file name
+    // If no separator is found, return an empty string for the directory and the whole path as the file name
     (path, "")
 }
 
@@ -686,5 +702,28 @@ mod tests {
             PathBuf::from("c"),
         ]);
         assert_eq!(result, PathBuf::from("b/c"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_windows_paths() {
+        // Test clean with backslashes
+        assert_eq!(clean("a\\b\\c"), "a/b/c");
+        assert_eq!(clean("a\\b/c"), "a/b/c");
+        assert_eq!(clean("a\\.\\b"), "a/b");
+        assert_eq!(clean("a\\b\\..\\c"), "a/c");
+        assert_eq!(clean("\\a\\b"), "/a/b");
+        assert_eq!(clean("a\\\\b"), "a/b");
+
+        // Test path_join with backslashes
+        let result = path_join(&[PathBuf::from("a"), PathBuf::from("b\\c")]);
+        assert_eq!(result, PathBuf::from("a/b/c"));
+
+        // Test trailing backslash
+        let result = path_join(&[PathBuf::from("a"), PathBuf::from("b\\")]);
+        assert_eq!(result, PathBuf::from("a/b/"));
+
+        // Test path_needs_clean
+        assert!(path_needs_clean(b"a\\b"));
     }
 }
