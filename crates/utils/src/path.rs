@@ -314,7 +314,11 @@ pub fn clean(path: &str) -> String {
 
                 // Copy element
                 while r < n && path.as_bytes()[r] != b'/' {
-                    out.append(path.as_bytes()[r]);
+                    if cfg!(target_os = "windows") && path.as_bytes()[r] == b'\\' {
+                        out.append(b'/');
+                    } else {
+                        out.append(path.as_bytes()[r]);
+                    }
                     r += 1;
                 }
             }
