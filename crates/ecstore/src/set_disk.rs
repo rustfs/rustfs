@@ -2998,7 +2998,7 @@ impl SetDisks {
                                     if this_part_errs[index] != CHECK_PART_SUCCESS {
                                         info!(
                                             "reading part {}: index={}, part_errs={:?}, skipping",
-                                            part.number, index, this_part_errs[part_index]
+                                            part.number, index, this_part_errs[index]
                                         );
                                         readers.push(None);
                                         continue;
