@@ -22,10 +22,14 @@ pub const SLASH_SEPARATOR: &str = "/";
 pub const GLOBAL_DIR_SUFFIX_WITH_SLASH: &str = "__XLDIR__/";
 
 #[inline]
-fn is_separator(c: u8) -> bool {
+pub fn is_separator(c: u8) -> bool {
     c == b'/' || (cfg!(target_os = "windows") && c == b'\\')
 }
 
+/// Checks if the string `s` ends with `suffix`.
+///
+/// On Windows, this comparison is case-insensitive.
+/// On other platforms, it is case-sensitive.
 pub fn has_suffix(s: &str, suffix: &str) -> bool {
     if cfg!(target_os = "windows") {
         s.to_lowercase().ends_with(&suffix.to_lowercase())
@@ -34,6 +38,11 @@ pub fn has_suffix(s: &str, suffix: &str) -> bool {
     }
 }
 
+/// Encodes a directory object name by replacing the trailing slash with `GLOBAL_DIR_SUFFIX`.
+///
+/// If the object name ends with a slash, it is considered a directory object.
+/// The trailing slash is removed and `GLOBAL_DIR_SUFFIX` is appended.
+/// If it does not end with a slash, the name is returned as is.
 pub fn encode_dir_object(object: &str) -> String {
     if has_suffix(object, SLASH_SEPARATOR) {
         format!("{}{}", object.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX)
@@ -42,11 +51,18 @@ pub fn encode_dir_object(object: &str) -> String {
     }
 }
 
+/// Checks if the given object name represents a directory object.
+///
+/// Returns true if the object name ends with `GLOBAL_DIR_SUFFIX`.
 pub fn is_dir_object(object: &str) -> bool {
     let obj = encode_dir_object(object);
     obj.ends_with(GLOBAL_DIR_SUFFIX)
 }
 
+/// Decodes a directory object name by replacing `GLOBAL_DIR_SUFFIX` with a trailing slash.
+///
+/// If the object name ends with `GLOBAL_DIR_SUFFIX`, it is replaced with a slash.
+/// Otherwise, the name is returned as is.
 #[allow(dead_code)]
 pub fn decode_dir_object(object: &str) -> String {
     if has_suffix(object, GLOBAL_DIR_SUFFIX) {
@@ -56,6 +72,11 @@ pub fn decode_dir_object(object: &str) -> String {
     }
 }
 
+/// Ensures that the string ends with a trailing slash if it is not empty.
+///
+/// If the string is empty, it is returned as is.
+/// If it already ends with a slash, it is returned as is.
+/// Otherwise, a slash is appended.
 pub fn retain_slash(s: &str) -> String {
     if s.is_empty() {
         return s.to_string();
@@ -67,10 +88,15 @@ pub fn retain_slash(s: &str) -> String {
     }
 }
 
+/// Checks if string `s` starts with `prefix` using case-insensitive comparison.
 pub fn strings_has_prefix_fold(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && (s[..prefix.len()] == *prefix || s[..prefix.len()].eq_ignore_ascii_case(prefix))
 }
 
+/// Checks if string `s` starts with `prefix`.
+///
+/// On Windows, this comparison is case-insensitive.
+/// On other platforms, it is case-sensitive.
 pub fn has_prefix(s: &str, prefix: &str) -> bool {
     if cfg!(target_os = "windows") {
         return strings_has_prefix_fold(s, prefix);
@@ -79,6 +105,12 @@ pub fn has_prefix(s: &str, prefix: &str) -> bool {
     s.starts_with(prefix)
 }
 
+/// Joins multiple path components into a single `PathBuf`.
+///
+/// This function normalizes the path separators to forward slashes (`/`) internally
+/// and cleans the path (resolving `.` and `..`).
+///
+/// On Windows, backslashes in input components are treated as separators and normalized.
 pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
     let trailing_slash = !elem.is_empty()
         && elem.last().is_some_and(|last| {
@@ -86,7 +118,8 @@ pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
             s.ends_with(SLASH_SEPARATOR) || (cfg!(target_os = "windows") && s.ends_with('\\'))
         });
 
-    let mut dst = String::new();
+    let len = elem.iter().map(|s| s.as_ref().to_string_lossy().len()).sum::<usize>() + elem.len();
+    let mut dst = String::with_capacity(len);
     let mut added = 0;
 
     for e in elem {
@@ -115,11 +148,17 @@ pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
     dst.into()
 }
 
+/// Joins multiple string path components into a single `String`.
+///
+/// This function normalizes the path separators to forward slashes (`/`) internally
+/// and cleans the path (resolving `.` and `..`).
+///
+/// On Windows, backslashes in input components are treated as separators and normalized.
 pub fn path_join_buf(elements: &[&str]) -> String {
     let trailing_slash = !elements.is_empty()
-        && elements.last().is_some_and(|last| {
-            last.ends_with(SLASH_SEPARATOR) || (cfg!(target_os = "windows") && last.ends_with('\\'))
-        });
+        && elements
+            .last()
+            .is_some_and(|last| last.ends_with(SLASH_SEPARATOR) || (cfg!(target_os = "windows") && last.ends_with('\\')));
 
     let len = elements.iter().map(|s| s.len()).sum::<usize>() + elements.len();
     let mut dst = String::with_capacity(len);
@@ -226,19 +265,86 @@ fn path_needs_clean(path: &[u8]) -> bool {
     false
 }
 
-pub fn path_to_bucket_object_with_base_path(bash_path: &str, path: &str) -> (String, String) {
-    let path = path.trim_start_matches(bash_path).trim_start_matches(SLASH_SEPARATOR);
-    if let Some(m) = path.find(SLASH_SEPARATOR) {
-        return (path[..m].to_string(), path[m + SLASH_SEPARATOR.len()..].to_string());
+/// Splits a path into bucket and object names, removing a specified base path.
+///
+/// The path is first trimmed of the `base_path` prefix and any leading slashes.
+/// Then it is split at the first slash into bucket and object.
+/// If no slash is found, the whole path is returned as the bucket name, and object name is empty.
+///
+/// On Windows, this function handles backslashes as separators and performs case-insensitive prefix matching for `base_path`.
+/// The returned bucket and object names are normalized to use forward slashes.
+pub fn path_to_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
+    let mut p = path;
+
+    // 1. Trim base_path
+    if cfg!(target_os = "windows") {
+        if strings_has_prefix_fold(p, base_path) {
+            p = &p[base_path.len()..];
+        }
+    } else if p.starts_with(base_path) {
+        p = &p[base_path.len()..];
     }
 
-    (path.to_string(), "".to_string())
+    // 2. Trim leading separators
+    while let Some(c) = p.chars().next() {
+        if is_separator(c as u8) {
+            p = &p[c.len_utf8()..];
+        } else {
+            break;
+        }
+    }
+
+    // 3. Find split point
+    let idx = if cfg!(target_os = "windows") {
+        p.find(|c| c == '/' || c == '\\')
+    } else {
+        p.find('/')
+    };
+
+    match idx {
+        Some(i) => {
+            let bucket = &p[..i];
+            let object = &p[i + 1..]; // Skip the separator
+
+            // Normalize separators on Windows
+            let bucket = if cfg!(target_os = "windows") {
+                bucket.replace('\\', "/")
+            } else {
+                bucket.to_string()
+            };
+            let object = if cfg!(target_os = "windows") {
+                object.replace('\\', "/")
+            } else {
+                object.to_string()
+            };
+
+            (bucket, object)
+        }
+        None => {
+            let bucket = if cfg!(target_os = "windows") {
+                p.replace('\\', "/")
+            } else {
+                p.to_string()
+            };
+            (bucket, "".to_string())
+        }
+    }
 }
 
+/// Splits a path into bucket and object names.
+///
+/// The path is trimmed of any leading slashes.
+/// Then it is split at the first slash into bucket and object.
+/// If no slash is found, the whole path is returned as the bucket name, and object name is empty.
 pub fn path_to_bucket_object(s: &str) -> (String, String) {
     path_to_bucket_object_with_base_path("", s)
 }
 
+/// Extracts the base directory from a prefix string.
+///
+/// It returns the directory part of the prefix.
+/// If the prefix does not contain a separator, or resolves to root/current dir, an empty string is returned.
+/// The result ensures a trailing slash if not empty.
 pub fn base_dir_from_prefix(prefix: &str) -> String {
     let mut base_dir = dir(prefix).to_owned();
     if base_dir == "." || base_dir == "./" || base_dir == "/" {
@@ -260,6 +366,7 @@ pub fn base_dir_from_prefix(prefix: &str) -> String {
     base_dir
 }
 
+/// A helper struct for lazy buffer allocation during string processing.
 pub struct LazyBuf {
     s: String,
     buf: Option<Vec<u8>>,
@@ -267,10 +374,12 @@ pub struct LazyBuf {
 }
 
 impl LazyBuf {
+    /// Creates a new `LazyBuf` with the given source string.
     pub fn new(s: String) -> Self {
         LazyBuf { s, buf: None, w: 0 }
     }
 
+    /// Returns the byte at index `i`, either from the buffer or the source string.
     pub fn index(&self, i: usize) -> u8 {
         if let Some(ref buf) = self.buf {
             buf[i]
@@ -279,6 +388,11 @@ impl LazyBuf {
         }
     }
 
+    /// Appends a byte to the buffer.
+    ///
+    /// If the buffer hasn't been allocated yet, it checks if the byte matches the source string
+    /// at the current write position. If it matches, it just advances the write position.
+    /// If it doesn't match, it allocates the buffer and copies the prefix.
     pub fn append(&mut self, c: u8) {
         if self.buf.is_none() {
             if self.w < self.s.len() && self.s.as_bytes()[self.w] == c {
@@ -296,6 +410,7 @@ impl LazyBuf {
         }
     }
 
+    /// Returns the resulting string.
     pub fn string(&self) -> String {
         if let Some(ref buf) = self.buf {
             String::from_utf8(buf[..self.w].to_vec()).unwrap()
@@ -305,6 +420,18 @@ impl LazyBuf {
     }
 }
 
+/// Returns the shortest path name equivalent to the given path.
+///
+/// It applies the following rules iteratively until no further processing can be done:
+/// 1. Replace multiple separators with a single one.
+/// 2. Eliminate each `.` path name element (the current directory).
+/// 3. Eliminate each inner `..` path name element (the parent directory) along with the non-`..` element that precedes it.
+/// 4. Eliminate `..` elements that begin a rooted path: that is, replace `/..` by `/` at the beginning of a path.
+///
+/// On Windows, backslashes are converted to forward slashes.
+/// The returned path ends in a slash only if it represents a root directory, such as `/` on Unix or `C:/` on Windows.
+///
+/// If the result of this process is an empty string, `clean` returns the string `.`.
 pub fn clean(path: &str) -> String {
     if path.is_empty() {
         return ".".to_string();
@@ -380,6 +507,12 @@ pub fn clean(path: &str) -> String {
     out.string()
 }
 
+/// Splits path immediately following the final separator, separating it into a directory and file name component.
+///
+/// If there is no separator in path, `split` returns an empty dir and file set to path.
+/// The returned values have the property that path = dir + file.
+///
+/// On Windows, both `/` and `\` are treated as separators.
 pub fn split(path: &str) -> (&str, &str) {
     // Find the last occurrence of the separator
     let idx = if cfg!(target_os = "windows") {
@@ -396,11 +529,18 @@ pub fn split(path: &str) -> (&str, &str) {
     (path, "")
 }
 
+/// Returns all but the last element of path, typically the path's directory.
+///
+/// After dropping the final element, `dir` calls `clean` on the path and trails the result.
+/// If the path is empty, `dir` returns ".".
+/// If the path consists entirely of separators, `dir` returns a single separator.
+/// The returned path does not end in a separator unless it is the root directory.
 pub fn dir(path: &str) -> String {
     let (a, _) = split(path);
     clean(a)
 }
 
+/// Trims double quotes from an ETag string.
 pub fn trim_etag(etag: &str) -> String {
     etag.trim_matches('"').to_string()
 }
@@ -725,5 +865,14 @@ mod tests {
 
         // Test path_needs_clean
         assert!(path_needs_clean(b"a\\b"));
+
+        // Test path_to_bucket_object_with_base_path
+        let (bucket, object) = path_to_bucket_object_with_base_path("C:\\tmp", "C:\\tmp\\bucket\\object");
+        assert_eq!(bucket, "bucket");
+        assert_eq!(object, "object");
+
+        let (bucket, object) = path_to_bucket_object_with_base_path("c:\\tmp", "C:\\tmp\\bucket\\object");
+        assert_eq!(bucket, "bucket");
+        assert_eq!(object, "object");
     }
 }
