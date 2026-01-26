@@ -40,8 +40,8 @@ use rustfs_filemeta::{
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
 use rustfs_utils::path::{
-    GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR_STR, clean, decode_dir_object, encode_dir_object,
-    has_suffix, path_join, path_join_buf,
+    GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, decode_dir_object, encode_dir_object, has_suffix,
+    path_join, path_join_buf,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -555,7 +555,7 @@ impl LocalDisk {
                 .err()
         };
 
-        if immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR_STR) {
+        if immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR) {
             let trash_path2 = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
             let _ = rename_all(
                 encode_dir_object(delete_path.to_string_lossy().as_ref()),
@@ -1022,16 +1022,15 @@ impl LocalDisk {
                 continue;
             }
 
-            if entry.ends_with(SLASH_SEPARATOR_STR) {
+            if entry.ends_with(SLASH_SEPARATOR) {
                 if entry.ends_with(GLOBAL_DIR_SUFFIX_WITH_SLASH) {
-                    let entry =
-                        format!("{}{}", entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR_STR);
+                    let entry = format!("{}{}", entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR);
                     dir_objes.insert(entry.clone());
                     *item = entry;
                     continue;
                 }
 
-                *item = entry.trim_end_matches(SLASH_SEPARATOR_STR).to_owned();
+                *item = entry.trim_end_matches(SLASH_SEPARATOR).to_owned();
                 continue;
             }
 
@@ -1043,7 +1042,7 @@ impl LocalDisk {
                     .await?;
 
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
-                let name = entry.trim_end_matches(SLASH_SEPARATOR_STR);
+                let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
 
                 // if opts.limit > 0
@@ -1126,7 +1125,7 @@ impl LocalDisk {
                 Ok(res) => {
                     if is_dir_obj {
                         meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
-                        meta.name.push_str(SLASH_SEPARATOR_STR);
+                        meta.name.push_str(SLASH_SEPARATOR);
                     }
 
                     meta.metadata = res.to_vec();
@@ -1144,7 +1143,7 @@ impl LocalDisk {
                         // NOT an object, append to stack (with slash)
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
-                            meta.name.push_str(SLASH_SEPARATOR_STR);
+                            meta.name.push_str(SLASH_SEPARATOR);
                             dir_stack.push(meta.name);
                         }
                     }
@@ -1625,8 +1624,8 @@ impl DiskAPI for LocalDisk {
             super::fs::access_std(&dst_volume_dir).map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?
         }
 
-        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR_STR);
-        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR_STR);
+        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
+        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
 
         if !src_is_dir && dst_is_dir || src_is_dir && !dst_is_dir {
             warn!(
@@ -1692,8 +1691,8 @@ impl DiskAPI for LocalDisk {
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
-        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR_STR);
-        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR_STR);
+        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
+        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
         if (dst_is_dir || src_is_dir) && (!dst_is_dir || !src_is_dir) {
             return Err(Error::from(DiskError::FileAccessDenied));
         }
@@ -1844,7 +1843,7 @@ impl DiskAPI for LocalDisk {
         }
 
         let volume_dir = self.get_bucket_path(volume)?;
-        let dir_path_abs = self.get_object_path(volume, dir_path.trim_start_matches(SLASH_SEPARATOR_STR))?;
+        let dir_path_abs = self.get_object_path(volume, dir_path.trim_start_matches(SLASH_SEPARATOR))?;
 
         let entries = match os::read_dir(&dir_path_abs, count).await {
             Ok(res) => res,
@@ -1880,12 +1879,12 @@ impl DiskAPI for LocalDisk {
 
         let mut objs_returned = 0;
 
-        if opts.base_dir.ends_with(SLASH_SEPARATOR_STR) {
+        if opts.base_dir.ends_with(SLASH_SEPARATOR) {
             if let Ok(data) = self
                 .read_metadata(
                     &opts.bucket,
                     path_join_buf(&[
-                        format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR_STR), GLOBAL_DIR_SUFFIX).as_str(),
+                        format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX).as_str(),
                         STORAGE_FORMAT_FILE,
                     ])
                     .as_str(),
@@ -2135,7 +2134,7 @@ impl DiskAPI for LocalDisk {
         let entries = os::read_dir(&self.root, -1).await.map_err(to_volume_error)?;
 
         for entry in entries {
-            if !has_suffix(&entry, SLASH_SEPARATOR_STR) || !Self::is_valid_volname(clean(&entry).as_str()) {
+            if !has_suffix(&entry, SLASH_SEPARATOR) || !Self::is_valid_volname(clean(&entry).as_str()) {
                 continue;
             }
 
@@ -2357,7 +2356,7 @@ impl DiskAPI for LocalDisk {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
-        if path.starts_with(SLASH_SEPARATOR_STR) {
+        if path.starts_with(SLASH_SEPARATOR) {
             return self
                 .delete(
                     volume,
@@ -2418,7 +2417,7 @@ impl DiskAPI for LocalDisk {
         if !meta.versions.is_empty() {
             let buf = meta.marshal_msg()?;
             return self
-                .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR_STR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
+                .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
                 .await;
         }
 
@@ -2428,11 +2427,11 @@ impl DiskAPI for LocalDisk {
         {
             let src_path = path_join(&[
                 file_path.as_path(),
-                Path::new(format!("{old_data_dir}{SLASH_SEPARATOR_STR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()),
+                Path::new(format!("{old_data_dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()),
             ]);
             let dst_path = path_join(&[
                 file_path.as_path(),
-                Path::new(format!("{path}{SLASH_SEPARATOR_STR}{STORAGE_FORMAT_FILE}").as_str()),
+                Path::new(format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str()),
             ]);
             return rename_all(src_path, dst_path, file_path).await;
         }
@@ -2584,7 +2583,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
         if root_disk_threshold > 0 {
             disk_info.total <= root_disk_threshold
         } else {
-            is_root_disk(&drive_path, SLASH_SEPARATOR_STR).unwrap_or_default()
+            is_root_disk(&drive_path, SLASH_SEPARATOR).unwrap_or_default()
         }
     } else {
         false

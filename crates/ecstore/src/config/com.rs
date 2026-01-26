@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use rustfs_config::DEFAULT_DELIMITER;
-use rustfs_utils::path::SLASH_SEPARATOR_STR;
+use rustfs_utils::path::SLASH_SEPARATOR;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -29,7 +29,7 @@ const CONFIG_FILE: &str = "config.json";
 
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
 
-static CONFIG_BUCKET: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR_STR}{CONFIG_PREFIX}"));
+static CONFIG_BUCKET: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{CONFIG_PREFIX}"));
 
 static SUB_SYSTEMS_DYNAMIC: LazyLock<HashSet<String>> = LazyLock::new(|| {
     let mut h = HashSet::new();
@@ -129,7 +129,7 @@ async fn new_and_save_server_config<S: StorageAPI>(api: Arc<S>) -> Result<Config
 }
 
 fn get_config_file() -> String {
-    format!("{CONFIG_PREFIX}{SLASH_SEPARATOR_STR}{CONFIG_FILE}")
+    format!("{CONFIG_PREFIX}{SLASH_SEPARATOR}{CONFIG_FILE}")
 }
 
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
