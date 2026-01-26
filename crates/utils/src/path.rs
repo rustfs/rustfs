@@ -88,7 +88,10 @@ pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
 }
 
 pub fn path_join_buf(elements: &[&str]) -> String {
-    let trailing_slash = !elements.is_empty() && elements.last().is_some_and(|last| last.ends_with(SLASH_SEPARATOR));
+    let trailing_slash = !elements.is_empty()
+        && elements.last().is_some_and(|last| {
+            last.ends_with(SLASH_SEPARATOR) || (cfg!(target_os = "windows") && last.ends_with('\\'))
+        });
 
     let mut dst = String::new();
     let mut added = 0;
@@ -123,6 +126,10 @@ pub fn path_join_buf(elements: &[&str]) -> String {
 /// but may produce false positives on non-trivial paths.
 fn path_needs_clean(path: &[u8]) -> bool {
     if path.is_empty() {
+        return true;
+    }
+
+    if cfg!(target_os = "windows") && path.contains(&b'\\') {
         return true;
     }
 

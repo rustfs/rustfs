@@ -269,8 +269,22 @@ impl LocalDisk {
     }
 
     async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
-        let trash = path_join(&[root, RUSTFS_META_TMP_DELETED_BUCKET.into()]);
-        let mut entries = fs::read_dir(&trash).await?;
+        #[cfg(windows)]
+        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.replace('/', "\\");
+        #[cfg(not(windows))]
+        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.to_string();
+
+        let trash = root.join(trash_path);
+        let mut entries = match fs::read_dir(&trash).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() == ErrorKind::NotFound {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        };
+
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.is_empty() || name == "." || name == ".." {
@@ -279,7 +293,7 @@ impl LocalDisk {
 
             let file_type = entry.file_type().await?;
 
-            let path = path_join(&[trash.clone(), name.into()]);
+            let path = trash.join(name);
 
             if file_type.is_dir() {
                 if let Err(e) = tokio::fs::remove_dir_all(path).await
@@ -416,7 +430,7 @@ impl LocalDisk {
     pub fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
         #[cfg(windows)]
         let bucket_path = self.root.join(bucket.replace('/', "\\"));
-        #[cfg(not(windows)]
+        #[cfg(not(windows))]
         let bucket_path = self.root.join(bucket);
 
         self.check_valid_path(&bucket_path)?;
