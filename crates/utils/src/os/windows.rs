@@ -44,7 +44,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     }
 
     let total = total_number_of_bytes;
-    let free = total_number_of_free_bytes;
+    let free = free_bytes_available;
 
     if free > total {
         return Err(Error::other(format!(
@@ -180,8 +180,6 @@ pub fn get_drive_stats(_major: u32, _minor: u32) -> std::io::Result<IOStats> {
 
 #[cfg(test)]
 mod tests {
-    use crate::os::{get_info, same_disk};
-
     #[cfg(target_os = "windows")]
     #[test]
     fn test_get_info_valid_path() {
