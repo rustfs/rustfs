@@ -169,12 +169,31 @@ impl ErasureInfo {
 
     /// Check if this ErasureInfo equals another ErasureInfo
     pub fn equals(&self, other: &ErasureInfo) -> bool {
-        self.algorithm == other.algorithm
-            && self.data_blocks == other.data_blocks
-            && self.parity_blocks == other.parity_blocks
-            && self.block_size == other.block_size
-            && self.index == other.index
-            && self.distribution == other.distribution
+        if self.algorithm != other.algorithm {
+            return false;
+        }
+
+        if self.data_blocks != other.data_blocks {
+            return false;
+        }
+
+        if self.parity_blocks != other.parity_blocks {
+            return false;
+        }
+
+        if self.block_size != other.block_size {
+            return false;
+        }
+
+        if self.distribution.len() != other.distribution.len() {
+            return false;
+        }
+        for (i, v) in self.distribution.iter().enumerate() {
+            if v != &other.distribution[i] {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -438,21 +457,28 @@ impl FileInfo {
     pub fn equals(&self, other: &FileInfo) -> bool {
         // Check if both are compressed or both are not compressed
         if self.is_compressed() != other.is_compressed() {
+            tracing::warn!("equals: is_compressed is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check transition info
         if !self.transition_info_equals(other) {
+            tracing::warn!("equals: transition_info_equals is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check mod time
         if self.mod_time != other.mod_time {
+            tracing::warn!("equals: mod_time is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check erasure info
-        self.erasure.equals(&other.erasure)
+        if !self.erasure.equals(&other.erasure) {
+            tracing::warn!("equals: erasure is not equal, object_name={}", self.name);
+            return false;
+        }
+        true
     }
 
     /// Check if transition related information are equal

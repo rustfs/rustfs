@@ -38,7 +38,7 @@ use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_rio::{HashReader, WarpReader};
-use rustfs_utils::path::{SLASH_SEPARATOR_STR, encode_dir_object, path_join};
+use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use rustfs_workers::workers::Workers;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -442,19 +442,21 @@ impl PoolMeta {
     }
 }
 
-fn path2_bucket_object(name: &str) -> (String, String) {
+pub fn path2_bucket_object(name: &str) -> (String, String) {
     path2_bucket_object_with_base_path("", name)
 }
 
-fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
+pub fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
     // Trim the base path and leading slash
     let trimmed_path = path
         .strip_prefix(base_path)
         .unwrap_or(path)
-        .strip_prefix(SLASH_SEPARATOR_STR)
+        .strip_prefix(SLASH_SEPARATOR)
         .unwrap_or(path);
     // Find the position of the first '/'
-    let pos = trimmed_path.find(SLASH_SEPARATOR_STR).unwrap_or(trimmed_path.len());
+    let Some(pos) = trimmed_path.find(SLASH_SEPARATOR) else {
+        return (trimmed_path.to_string(), "".to_string());
+    };
     // Split into bucket and prefix
     let bucket = &trimmed_path[0..pos];
     let prefix = &trimmed_path[pos + 1..]; // +1 to skip the '/' character if it exists
@@ -1384,28 +1386,109 @@ impl SetDisks {
     }
 }
 
+fn is_disk_online_state(state: &str) -> bool {
+    // The disk state strings are produced from rustfs_utils::os::get_drive_stats or DiskError::to_string().
+    // Conventionally, online is "ok"/"online" (may evolve). Be conservative:
+    // - Treat empty as unknown -> include it (to avoid dropping capacity).
+    // - Exclude explicit offline-ish states.
+    let s = state.trim().to_lowercase();
+    if s.is_empty() {
+        return true;
+    }
+    if s.contains("offline") {
+        return false;
+    }
+    if s.contains("not found") || s.contains("disk not found") {
+        return false;
+    }
+    true
+}
+
+fn fallback_total_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
+    disks
+        .iter()
+        .filter(|d| is_disk_online_state(&d.state))
+        .map(|d| d.total_space as usize)
+        .sum()
+}
+
+fn fallback_free_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
+    disks
+        .iter()
+        .filter(|d| is_disk_online_state(&d.state))
+        .map(|d| d.available_space as usize)
+        .sum()
+}
+
 pub fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
-    let mut capacity = 0;
+    // If backend info is missing or inconsistent, do a safe fallback to avoid reporting nonsense.
+    if info.backend.standard_sc_data.is_empty() {
+        return fallback_total_capacity(disks);
+    }
+
+    let mut capacity = 0usize;
+    let mut matched_any = false;
+
     for disk in disks.iter() {
-        if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
+        if disk.pool_index < 0 {
             continue;
         }
-        if (disk.disk_index as usize) < info.backend.standard_sc_data[disk.pool_index as usize] {
+        let pool_idx = disk.pool_index as usize;
+        if info.backend.standard_sc_data.len() <= pool_idx {
+            continue;
+        }
+
+        let usable_disks_per_set = info.backend.standard_sc_data[pool_idx];
+        if usable_disks_per_set == 0 {
+            continue;
+        }
+
+        if (disk.disk_index as usize) < usable_disks_per_set {
+            matched_any = true;
             capacity += disk.total_space as usize;
         }
     }
-    capacity
+
+    if matched_any {
+        capacity
+    } else {
+        // Even if standard_sc_data exists, it might not match disk indexes due to upstream bugs.
+        // Fallback to summing all online disks to prevent under-reporting.
+        fallback_total_capacity(disks)
+    }
 }
 
 pub fn get_total_usable_capacity_free(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
-    let mut capacity = 0;
+    if info.backend.standard_sc_data.is_empty() {
+        return fallback_free_capacity(disks);
+    }
+
+    let mut capacity = 0usize;
+    let mut matched_any = false;
+
     for disk in disks.iter() {
-        if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
+        if disk.pool_index < 0 {
             continue;
         }
-        if (disk.disk_index as usize) < info.backend.standard_sc_data[disk.pool_index as usize] {
+        let pool_idx = disk.pool_index as usize;
+        if info.backend.standard_sc_data.len() <= pool_idx {
+            continue;
+        }
+
+        let usable_disks_per_set = info.backend.standard_sc_data[pool_idx];
+        if usable_disks_per_set == 0 {
+            continue;
+        }
+
+        if (disk.disk_index as usize) < usable_disks_per_set {
+            matched_any = true;
             capacity += disk.available_space as usize;
         }
     }
-    capacity
+
+    if matched_any {
+        capacity
+    } else {
+        fallback_free_capacity(disks)
+    }
 }

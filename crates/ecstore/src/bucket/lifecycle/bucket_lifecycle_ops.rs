@@ -22,7 +22,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc}
 use crate::bucket::lifecycle::lifecycle::{self, ExpirationOptions, Lifecycle, TransitionOptions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier};
-use crate::bucket::object_lock::objectlock_sys::enforce_retention_for_deletion;
+use crate::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
 use crate::bucket::{metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::error::Error;
@@ -953,7 +953,7 @@ impl LifecycleOps for ObjectInfo {
         lifecycle::ObjectOpts {
             name: self.name.clone(),
             user_tags: self.user_tags.clone(),
-            version_id: self.version_id.map(|v| v.to_string()).unwrap_or_default(),
+            version_id: self.version_id.clone(),
             mod_time: self.mod_time,
             size: self.size as usize,
             is_latest: self.is_latest,
@@ -1041,7 +1041,8 @@ pub async fn eval_action_from_lifecycle(
             if oi.version_id.is_none() {
                 return lifecycle::Event::default();
             }
-            if lock_enabled && enforce_retention_for_deletion(oi) {
+            // Lifecycle operations should never bypass governance retention
+            if lock_enabled && check_object_lock_for_deletion(&oi.bucket, oi, false).await.is_some() {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
                     info!(
@@ -1067,7 +1068,7 @@ pub async fn eval_action_from_lifecycle(
     event
 }
 
-async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     if oi.delete_marker || oi.is_dir {
         return false;
     }
@@ -1161,7 +1162,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     true
 }
 
-async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let mut expiry_state = GLOBAL_ExpiryState.write().await;
     expiry_state.enqueue_by_days(oi, event, src).await;
     true

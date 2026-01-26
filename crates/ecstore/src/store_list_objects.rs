@@ -34,7 +34,7 @@ use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
 };
-use rustfs_utils::path::{self, SLASH_SEPARATOR_STR, base_dir_from_prefix};
+use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self};
@@ -132,7 +132,7 @@ impl ListPathOptions {
             return;
         }
 
-        let s = SLASH_SEPARATOR_STR.chars().next().unwrap_or_default();
+        let s = SLASH_SEPARATOR.chars().next().unwrap_or_default();
         self.filter_prefix = {
             let fp = self.prefix.trim_start_matches(&self.base_dir).trim_matches(s);
 
@@ -256,19 +256,21 @@ impl ECStore {
         max_keys: i32,
         incl_deleted: bool,
     ) -> Result<ListObjectsInfo> {
+        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
-            limit: max_keys_plus_one(max_keys, marker.is_some()),
+            // Always request max_keys + 1 to detect if there are more results
+            limit: effective_max_keys,
             marker,
             incl_deleted,
             ask_disks: "strict".to_owned(), //TODO: from config
             ..Default::default()
         };
 
-        // use get
-        if !opts.prefix.is_empty() && opts.limit == 1 && opts.marker.is_none() {
+        // Optimization: use get for single object lookup with exact prefix
+        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
             match self
                 .get_object_info(
                     &opts.bucket,
@@ -322,14 +324,16 @@ impl ECStore {
         )
         .await;
 
-        let is_truncated = {
-            if max_keys > 0 && get_objects.len() > max_keys as usize {
-                get_objects.truncate(max_keys as usize);
-                true
-            } else {
-                list_result.err.is_none() && !get_objects.is_empty()
-            }
-        };
+        // Determine if there are more results: we requested max_keys + 1, so if we got more
+        // than max_keys, there are more results available
+        let mut is_truncated = false;
+        if max_keys <= 0 {
+            get_objects.clear();
+        } else if get_objects.len() > max_keys as usize {
+            is_truncated = true;
+            // Truncate to max_keys if we have more results
+            get_objects.truncate(max_keys as usize);
+        }
 
         let next_marker = {
             if is_truncated {
@@ -346,7 +350,7 @@ impl ECStore {
             if let Some(delimiter) = &delimiter {
                 if obj.is_dir && obj.mod_time.is_none() {
                     let mut found = false;
-                    if delimiter != SLASH_SEPARATOR_STR {
+                    if delimiter != SLASH_SEPARATOR {
                         for p in prefixes.iter() {
                             if found {
                                 break;
@@ -397,12 +401,13 @@ impl ECStore {
             None
         };
 
-        // if marker set, limit +1
+        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
+        // Always request max_keys + 1 to detect if there are more results
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
-            limit: max_keys_plus_one(max_keys, marker.is_some()),
+            limit: effective_max_keys,
             marker,
             incl_deleted: true,
             ask_disks: "strict".to_owned(),
@@ -437,14 +442,16 @@ impl ECStore {
         )
         .await;
 
-        let is_truncated = {
-            if max_keys > 0 && get_objects.len() > max_keys as usize {
-                get_objects.truncate(max_keys as usize);
-                true
-            } else {
-                list_result.err.is_none() && !get_objects.is_empty()
-            }
-        };
+        // Determine if there are more results: we requested max_keys + 1, so if we got more
+        // than max_keys, there are more results available
+        let mut is_truncated = false;
+        if max_keys <= 0 {
+            get_objects.clear();
+        } else if get_objects.len() > max_keys as usize {
+            is_truncated = true;
+            // Truncate to max_keys if we have more results
+            get_objects.truncate(max_keys as usize);
+        }
 
         let (next_marker, next_version_idmarker) = {
             if is_truncated {
@@ -470,7 +477,7 @@ impl ECStore {
             if let Some(delimiter) = &delimiter {
                 if obj.is_dir && obj.mod_time.is_none() {
                     let mut found = false;
-                    if delimiter != SLASH_SEPARATOR_STR {
+                    if delimiter != SLASH_SEPARATOR {
                         for p in prefixes.iter() {
                             if found {
                                 break;
@@ -502,7 +509,7 @@ impl ECStore {
         // warn!("list_path opt {:?}", &o);
 
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
-        // if opts.prefix.ends_with(SLASH_SEPARATOR_STR) {
+        // if opts.prefix.ends_with(SLASH_SEPARATOR) {
         //     return Err(Error::msg("eof"));
         // }
 
@@ -520,11 +527,11 @@ impl ECStore {
             return Err(Error::Unexpected);
         }
 
-        if o.prefix.starts_with(SLASH_SEPARATOR_STR) {
+        if o.prefix.starts_with(SLASH_SEPARATOR) {
             return Err(Error::Unexpected);
         }
 
-        let slash_separator = Some(SLASH_SEPARATOR_STR.to_owned());
+        let slash_separator = Some(SLASH_SEPARATOR.to_owned());
 
         o.include_directories = o.separator == slash_separator;
 
@@ -774,8 +781,8 @@ impl ECStore {
                     let mut filter_prefix = {
                         prefix
                             .trim_start_matches(&path)
-                            .trim_start_matches(SLASH_SEPARATOR_STR)
-                            .trim_end_matches(SLASH_SEPARATOR_STR)
+                            .trim_start_matches(SLASH_SEPARATOR)
+                            .trim_end_matches(SLASH_SEPARATOR)
                             .to_owned()
                     };
 
@@ -1130,7 +1137,7 @@ async fn merge_entry_channels(
                     if path::clean(&best_entry.name) == path::clean(&other_entry.name) {
                         let dir_matches = best_entry.is_dir() && other_entry.is_dir();
                         let suffix_matches =
-                            best_entry.name.ends_with(SLASH_SEPARATOR_STR) == other_entry.name.ends_with(SLASH_SEPARATOR_STR);
+                            best_entry.name.ends_with(SLASH_SEPARATOR) == other_entry.name.ends_with(SLASH_SEPARATOR);
 
                         if dir_matches && suffix_matches {
                             to_merge.push(other_idx);

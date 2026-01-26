@@ -16,7 +16,7 @@ use crate::admin::console::is_console_path;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{ADMIN_PREFIX, RPC_PREFIX};
-use crate::storage::ecfs;
+use crate::storage::apply_cors_headers;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
 use hyper::body::Incoming;
 use std::future::Future;
@@ -229,7 +229,7 @@ where
                 if ConditionalCorsLayer::is_s3_path(&path)
                     && !bucket.is_empty()
                     && cors_origins.is_some()
-                    && let Some(cors_headers) = ecfs::apply_cors_headers(&bucket, &method_clone, &request_headers_clone).await
+                    && let Some(cors_headers) = apply_cors_headers(&bucket, &method_clone, &request_headers_clone).await
                 {
                     for (key, value) in cors_headers.iter() {
                         response.headers_mut().insert(key, value.clone());

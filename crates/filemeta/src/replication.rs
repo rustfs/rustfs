@@ -708,7 +708,7 @@ pub fn parse_replicate_decision(_bucket: &str, s: &str) -> std::io::Result<Repli
     // }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicateObjectInfo {
     pub name: String,
     pub size: i64,

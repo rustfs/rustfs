@@ -17,7 +17,7 @@
 # - Metadata: User-defined metadata
 # - Conditional GET: If-Match, If-None-Match, If-Modified-Since
 #
-# Total: 118 tests
+# Total: 123 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -63,6 +63,7 @@ test_bucket_list_prefix_none
 test_bucket_list_prefix_not_exist
 test_bucket_list_prefix_unreadable
 test_bucket_list_special_prefix
+test_bucket_list_delimiter_basic
 test_bucket_list_delimiter_alt
 test_bucket_list_delimiter_dot
 test_bucket_list_delimiter_empty
@@ -100,6 +101,7 @@ test_bucketv2_notexist
 test_bucketv2_policy_another_bucket
 test_get_bucket_policy_status
 test_get_nonpublicpolicy_principal_bucket_policy_status
+test_set_get_del_bucket_policy
 test_get_object_ifmatch_good
 test_get_object_ifmodifiedsince_good
 test_get_object_ifunmodifiedsince_failed
@@ -120,6 +122,7 @@ test_object_copy_bucket_not_found
 test_object_copy_key_not_found
 test_object_copy_not_owned_object_bucket
 test_object_head_zero_bytes
+test_get_obj_head_tagging
 test_object_metadata_replaced_on_put
 test_object_put_authenticated
 test_object_read_not_exist
@@ -137,3 +140,5 @@ test_ranged_request_empty_object
 test_ranged_request_invalid_range
 test_set_multipart_tagging
 test_upload_part_copy_percent_encoded_key
+test_api_error_from_storage_error_mappings
+test_get_object_torrent

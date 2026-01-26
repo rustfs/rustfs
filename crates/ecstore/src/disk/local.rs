@@ -40,8 +40,8 @@ use rustfs_filemeta::{
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
 use rustfs_utils::path::{
-    GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR_STR, clean, decode_dir_object, encode_dir_object,
-    has_suffix, path_join, path_join_buf,
+    GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, decode_dir_object, encode_dir_object, has_suffix,
+    path_join, path_join_buf,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -82,7 +82,7 @@ pub struct LocalDisk {
     pub format_info: RwLock<FormatInfo>,
     pub endpoint: Endpoint,
     pub disk_info_cache: Arc<Cache<DiskInfo>>,
-    pub scanning: AtomicU32,
+    pub scanning: Arc<AtomicU32>,
     pub rotational: bool,
     pub fstype: String,
     pub major: u64,
@@ -122,7 +122,7 @@ impl LocalDisk {
         debug!("Creating local disk");
         // Use optimized path resolution instead of absolutize() for better performance
         // Use dunce::canonicalize instead of std::fs::canonicalize to avoid UNC paths on Windows
-        let root = match dunce::canonicalize(ep.get_file_path()) {
+        let root = match rustfs_utils::canonicalize(ep.get_file_path()) {
             Ok(path) => path,
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
@@ -209,7 +209,7 @@ impl LocalDisk {
             format_path,
             format_info: RwLock::new(format_info),
             disk_info_cache: Arc::new(cache),
-            scanning: AtomicU32::new(0),
+            scanning: Arc::new(AtomicU32::new(0)),
             rotational: Default::default(),
             fstype: Default::default(),
             minor: Default::default(),
@@ -269,8 +269,22 @@ impl LocalDisk {
     }
 
     async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
-        let trash = path_join(&[root, RUSTFS_META_TMP_DELETED_BUCKET.into()]);
-        let mut entries = fs::read_dir(&trash).await?;
+        #[cfg(windows)]
+        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.replace('/', "\\");
+        #[cfg(not(windows))]
+        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.to_string();
+
+        let trash = root.join(trash_path);
+        let mut entries = match fs::read_dir(&trash).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() == ErrorKind::NotFound {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        };
+
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.is_empty() || name == "." || name == ".." {
@@ -279,7 +293,7 @@ impl LocalDisk {
 
             let file_type = entry.file_type().await?;
 
-            let path = path_join(&[trash.clone(), name.into()]);
+            let path = trash.join(name);
 
             if file_type.is_dir() {
                 if let Err(e) = tokio::fs::remove_dir_all(path).await
@@ -362,7 +376,14 @@ impl LocalDisk {
         let abs_path = if path_ref.is_absolute() {
             path_ref.to_path_buf()
         } else {
-            self.root.join(path_ref)
+            #[cfg(windows)]
+            {
+                self.root.join(path_str.replace('/', "\\"))
+            }
+            #[cfg(not(windows))]
+            {
+                self.root.join(path_ref)
+            }
         };
 
         // Normalize path components to avoid filesystem calls
@@ -396,14 +417,22 @@ impl LocalDisk {
             path_join_buf(&[bucket, key])
         };
 
+        #[cfg(windows)]
+        let path = self.root.join(cache_key.replace('/', "\\"));
+        #[cfg(not(windows))]
         let path = self.root.join(cache_key);
+
         self.check_valid_path(&path)?;
         Ok(path)
     }
 
     // Get the absolute path of a bucket
     pub fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
+        #[cfg(windows)]
+        let bucket_path = self.root.join(bucket.replace('/', "\\"));
+        #[cfg(not(windows))]
         let bucket_path = self.root.join(bucket);
+
         self.check_valid_path(&bucket_path)?;
         Ok(bucket_path)
     }
@@ -440,7 +469,11 @@ impl LocalDisk {
         if !cache_misses.is_empty() {
             let mut new_entries = Vec::new();
             for (i, _bucket, _key, cache_key) in cache_misses {
+                #[cfg(windows)]
+                let path = self.root.join(cache_key.replace('/', "\\"));
+                #[cfg(not(windows))]
                 let path = self.root.join(&cache_key);
+
                 results.push((i, path.clone()));
                 new_entries.push((cache_key, path));
             }
@@ -555,7 +588,7 @@ impl LocalDisk {
                 .err()
         };
 
-        if immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR_STR) {
+        if immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR) {
             let trash_path2 = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
             let _ = rename_all(
                 encode_dir_object(delete_path.to_string_lossy().as_ref()),
@@ -664,6 +697,7 @@ impl LocalDisk {
                 match self.read_metadata_with_dmtime(meta_path).await {
                     Ok(res) => Ok(res),
                     Err(err) => {
+                        warn!("read_raw: error: {:?}", err);
                         if err == Error::FileNotFound
                             && !skip_access_checks(volume_dir.as_ref().to_string_lossy().to_string().as_str())
                             && let Err(e) = access(volume_dir.as_ref()).await
@@ -685,20 +719,6 @@ impl LocalDisk {
         }
 
         Ok((buf, mtime))
-    }
-
-    async fn read_metadata(&self, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        // Try to use cached file content reading for better performance, with safe fallback
-        let path = file_path.as_ref().to_path_buf();
-
-        // First, try the cache
-        if let Ok(bytes) = get_global_file_cache().get_file_content(path.clone()).await {
-            return Ok(bytes.to_vec());
-        }
-
-        // Fallback to direct read if cache fails
-        let (data, _) = self.read_metadata_with_dmtime(file_path.as_ref()).await?;
-        Ok(data)
     }
 
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
@@ -1035,16 +1055,15 @@ impl LocalDisk {
                 continue;
             }
 
-            if entry.ends_with(SLASH_SEPARATOR_STR) {
+            if entry.ends_with(SLASH_SEPARATOR) {
                 if entry.ends_with(GLOBAL_DIR_SUFFIX_WITH_SLASH) {
-                    let entry =
-                        format!("{}{}", entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR_STR);
+                    let entry = format!("{}{}", entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR);
                     dir_objes.insert(entry.clone());
                     *item = entry;
                     continue;
                 }
 
-                *item = entry.trim_end_matches(SLASH_SEPARATOR_STR).to_owned();
+                *item = entry.trim_end_matches(SLASH_SEPARATOR).to_owned();
                 continue;
             }
 
@@ -1052,11 +1071,11 @@ impl LocalDisk {
 
             if entry.ends_with(STORAGE_FORMAT_FILE) {
                 let metadata = self
-                    .read_metadata(self.get_object_path(bucket, format!("{}/{}", &current, &entry).as_str())?)
+                    .read_metadata(bucket, format!("{}/{}", &current, &entry).as_str())
                     .await?;
 
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
-                let name = entry.trim_end_matches(SLASH_SEPARATOR_STR);
+                let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
 
                 // if opts.limit > 0
@@ -1068,7 +1087,7 @@ impl LocalDisk {
 
                 out.write_obj(&MetaCacheEntry {
                     name: name.clone(),
-                    metadata,
+                    metadata: metadata.to_vec(),
                     ..Default::default()
                 })
                 .await?;
@@ -1135,14 +1154,14 @@ impl LocalDisk {
 
             let fname = format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE);
 
-            match self.read_metadata(self.get_object_path(&opts.bucket, fname.as_str())?).await {
+            match self.read_metadata(&opts.bucket, fname.as_str()).await {
                 Ok(res) => {
                     if is_dir_obj {
                         meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
-                        meta.name.push_str(SLASH_SEPARATOR_STR);
+                        meta.name.push_str(SLASH_SEPARATOR);
                     }
 
-                    meta.metadata = res;
+                    meta.metadata = res.to_vec();
 
                     out.write_obj(&meta).await?;
 
@@ -1157,7 +1176,7 @@ impl LocalDisk {
                         // NOT an object, append to stack (with slash)
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
-                            meta.name.push_str(SLASH_SEPARATOR_STR);
+                            meta.name.push_str(SLASH_SEPARATOR);
                             dir_stack.push(meta.name);
                         }
                     }
@@ -1186,6 +1205,14 @@ impl LocalDisk {
         }
 
         Ok(())
+    }
+}
+
+pub struct ScanGuard(pub Arc<AtomicU32>);
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -1579,6 +1606,8 @@ impl DiskAPI for LocalDisk {
                 .as_str(),
             )?;
 
+            info!("check_parts: part_path: {:?}", &part_path);
+
             match lstat(&part_path).await {
                 Ok(st) => {
                     if st.is_dir() {
@@ -1593,6 +1622,8 @@ impl DiskAPI for LocalDisk {
                     resp.results[i] = CHECK_PART_SUCCESS;
                 }
                 Err(err) => {
+                    info!("check_parts: failed to stat file: {:?}, error: {:?}", &part_path, &err);
+
                     let e: DiskError = to_file_error(err).into();
 
                     if e == DiskError::FileNotFound {
@@ -1626,8 +1657,8 @@ impl DiskAPI for LocalDisk {
             super::fs::access_std(&dst_volume_dir).map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?
         }
 
-        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR_STR);
-        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR_STR);
+        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
+        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
 
         if !src_is_dir && dst_is_dir || src_is_dir && !dst_is_dir {
             warn!(
@@ -1693,8 +1724,8 @@ impl DiskAPI for LocalDisk {
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
-        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR_STR);
-        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR_STR);
+        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
+        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
         if (dst_is_dir || src_is_dir) && (!dst_is_dir || !src_is_dir) {
             return Err(Error::from(DiskError::FileAccessDenied));
         }
@@ -1845,7 +1876,7 @@ impl DiskAPI for LocalDisk {
         }
 
         let volume_dir = self.get_bucket_path(volume)?;
-        let dir_path_abs = self.get_object_path(volume, dir_path.trim_start_matches(SLASH_SEPARATOR_STR))?;
+        let dir_path_abs = self.get_object_path(volume, dir_path.trim_start_matches(SLASH_SEPARATOR))?;
 
         let entries = match os::read_dir(&dir_path_abs, count).await {
             Ok(res) => res,
@@ -1881,20 +1912,21 @@ impl DiskAPI for LocalDisk {
 
         let mut objs_returned = 0;
 
-        if opts.base_dir.ends_with(SLASH_SEPARATOR_STR) {
-            let fpath = self.get_object_path(
-                &opts.bucket,
-                path_join_buf(&[
-                    format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR_STR), GLOBAL_DIR_SUFFIX).as_str(),
-                    STORAGE_FORMAT_FILE,
-                ])
-                .as_str(),
-            )?;
-
-            if let Ok(data) = self.read_metadata(fpath).await {
+        if opts.base_dir.ends_with(SLASH_SEPARATOR) {
+            if let Ok(data) = self
+                .read_metadata(
+                    &opts.bucket,
+                    path_join_buf(&[
+                        format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX).as_str(),
+                        STORAGE_FORMAT_FILE,
+                    ])
+                    .as_str(),
+                )
+                .await
+            {
                 let meta = MetaCacheEntry {
                     name: opts.base_dir.clone(),
-                    metadata: data,
+                    metadata: data.to_vec(),
                     ..Default::default()
                 };
                 out.write_obj(&meta).await?;
@@ -2135,7 +2167,7 @@ impl DiskAPI for LocalDisk {
         let entries = os::read_dir(&self.root, -1).await.map_err(to_volume_error)?;
 
         for entry in entries {
-            if !has_suffix(&entry, SLASH_SEPARATOR_STR) || !Self::is_valid_volname(clean(&entry).as_str()) {
+            if !has_suffix(&entry, SLASH_SEPARATOR) || !Self::is_valid_volname(clean(&entry).as_str()) {
                 continue;
             }
 
@@ -2357,7 +2389,7 @@ impl DiskAPI for LocalDisk {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
-        if path.starts_with(SLASH_SEPARATOR_STR) {
+        if path.starts_with(SLASH_SEPARATOR) {
             return self
                 .delete(
                     volume,
@@ -2418,7 +2450,7 @@ impl DiskAPI for LocalDisk {
         if !meta.versions.is_empty() {
             let buf = meta.marshal_msg()?;
             return self
-                .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR_STR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
+                .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
                 .await;
         }
 
@@ -2428,11 +2460,11 @@ impl DiskAPI for LocalDisk {
         {
             let src_path = path_join(&[
                 file_path.as_path(),
-                Path::new(format!("{old_data_dir}{SLASH_SEPARATOR_STR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()),
+                Path::new(format!("{old_data_dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()),
             ]);
             let dst_path = path_join(&[
                 file_path.as_path(),
-                Path::new(format!("{path}{SLASH_SEPARATOR_STR}{STORAGE_FORMAT_FILE}").as_str()),
+                Path::new(format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str()),
             ]);
             return rename_all(src_path, dst_path, file_path).await;
         }
@@ -2541,13 +2573,36 @@ impl DiskAPI for LocalDisk {
         info.rotational = self.rotational;
         info.mount_path = self.path().to_str().unwrap().to_string();
         info.endpoint = self.endpoint.to_string();
-        info.scanning = self.scanning.load(Ordering::SeqCst) == 1;
+        info.scanning = self.scanning.load(Ordering::Acquire) == 1;
 
         if info.id.is_none() {
             info.id = self.get_disk_id().await.unwrap_or(None);
         }
 
         Ok(info)
+    }
+    #[tracing::instrument(skip(self))]
+    fn start_scan(&self) -> ScanGuard {
+        self.scanning.fetch_add(1, Ordering::Release);
+        ScanGuard(Arc::clone(&self.scanning))
+    }
+
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        // Try to use cached file content reading for better performance, with safe fallback
+        let file_path = self.get_object_path(volume, path)?;
+        // let file_path = file_path.join(Path::new(STORAGE_FORMAT_FILE));
+
+        // First, try the cache
+        if let Ok(bytes) = get_global_file_cache().get_file_content(file_path.clone()).await {
+            return Ok(bytes);
+        }
+
+        // Fallback to direct read if cache fails
+        let (data, _) = self.read_metadata_with_dmtime(&file_path).await.map_err(|e| {
+            error!("read_metadata: error: {:?}, file_path={}", e, file_path.to_string_lossy());
+            e
+        })?;
+        Ok(data.into())
     }
 }
 
@@ -2561,7 +2616,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
         if root_disk_threshold > 0 {
             disk_info.total <= root_disk_threshold
         } else {
-            is_root_disk(&drive_path, SLASH_SEPARATOR_STR).unwrap_or_default()
+            is_root_disk(&drive_path, SLASH_SEPARATOR).unwrap_or_default()
         }
     } else {
         false
@@ -2761,8 +2816,10 @@ mod test {
         let disk_info = disk.disk_info(&disk_info_opts).await.unwrap();
 
         // Basic checks on disk info
-        assert!(!disk_info.fs_type.is_empty());
         assert!(disk_info.total > 0);
+        assert!(disk_info.free <= disk_info.total);
+        assert!(!disk_info.mount_path.is_empty());
+        assert!(!disk_info.endpoint.is_empty());
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;

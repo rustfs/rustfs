@@ -85,7 +85,7 @@ pub(crate) async fn start_audit_system() -> AuditResult<()> {
             info!(
                 target: "rustfs::main::start_audit_system",
                 "Audit system started successfully with time: {}.",
-                chrono::Utc::now()
+                jiff::Zoned::now()
             );
             Ok(())
         }
@@ -114,7 +114,7 @@ pub(crate) async fn stop_audit_system() -> AuditResult<()> {
         // Prepare before stopping
         system.close().await?;
         // Record after stopping
-        info!("Audit system stopped at {}", chrono::Utc::now());
+        info!("Audit system stopped at {}", jiff::Zoned::now());
         Ok(())
     } else {
         warn!("Audit system not initialized, cannot stop");

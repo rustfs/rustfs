@@ -9,7 +9,8 @@ metadata:
 spec:
   containers:
     - name: wget
-      image: busybox
+      image: "{{ .Values.initStep.image.repository }}:{{ .Values.initStep.image.tag }}"
+      imagePullPolicy: {{ .Values.initStep.image.pullPolicy }}
       command: ['wget']
       args: ['-O', '/dev/null', '{{ include "rustfs.fullname" . }}-svc:{{ .Values.service.endpoint.port }}/health']
   restartPolicy: Never
