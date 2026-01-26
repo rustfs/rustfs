@@ -190,7 +190,6 @@ criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "52.1.0"
 derive_builder = "0.20.2"
-dunce = "1.0.5"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
 flate2 = "1.1.8"
@@ -212,7 +211,7 @@ matchit = "0.9.1"
 md-5 = "0.11.0-rc.3"
 md5 = "0.8.0"
 mime_guess = "2.0.5"
-moka = { version = "0.12.12", features = ["future"] }
+moka = { version = "0.12.13", features = ["future"] }
 netif = "0.1.6"
 nix = { version = "0.31.1", features = ["fs"] }
 nu-ansi-term = "0.50.3"

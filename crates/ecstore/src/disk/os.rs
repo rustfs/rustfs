@@ -15,7 +15,7 @@
 use crate::disk::error::DiskError;
 use crate::disk::error::Result;
 use crate::disk::error_conv::to_file_error;
-use rustfs_utils::path::SLASH_SEPARATOR_STR;
+use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     io,
     path::{Component, Path},
@@ -116,7 +116,7 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> std::io::Result<Vec
         if file_type.is_file() {
             volumes.push(name);
         } else if file_type.is_dir() {
-            volumes.push(format!("{name}{SLASH_SEPARATOR_STR}"));
+            volumes.push(format!("{name}{SLASH_SEPARATOR}"));
         }
         count -= 1;
         if count == 0 {

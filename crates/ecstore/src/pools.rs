@@ -38,7 +38,7 @@ use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_rio::{HashReader, WarpReader};
-use rustfs_utils::path::{SLASH_SEPARATOR_STR, encode_dir_object, path_join};
+use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use rustfs_workers::workers::Workers;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -451,10 +451,10 @@ pub fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (Strin
     let trimmed_path = path
         .strip_prefix(base_path)
         .unwrap_or(path)
-        .strip_prefix(SLASH_SEPARATOR_STR)
+        .strip_prefix(SLASH_SEPARATOR)
         .unwrap_or(path);
     // Find the position of the first '/'
-    let Some(pos) = trimmed_path.find(SLASH_SEPARATOR_STR) else {
+    let Some(pos) = trimmed_path.find(SLASH_SEPARATOR) else {
         return (trimmed_path.to_string(), "".to_string());
     };
     // Split into bucket and prefix
