@@ -36,6 +36,8 @@ pub struct SftpConfig {
     pub cert_file: Option<String>,
     /// Private key file path
     pub key_file: Option<String>,
+    /// Private key directory path (supports multiple host keys)
+    pub key_dir: Option<String>,
     /// Authorized keys file path
     pub authorized_keys_file: Option<String>,
 }
@@ -43,25 +45,36 @@ pub struct SftpConfig {
 impl SftpConfig {
     /// Validates the configuration
     pub async fn validate(&self) -> Result<(), SftpInitError> {
-        // Host key file is required for SFTP server
+        // Host key configuration (either single file or directory)
+        let has_single_key = self.key_file.is_some();
+        let has_key_dir = self.key_dir.is_some();
+
+        if !has_single_key && !has_key_dir {
+            return Err(SftpInitError::InvalidConfig("Either key_file or key_dir must be provided for SFTP server".to_string()));
+        }
+
         if let Some(path) = &self.key_file {
-            if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+            if !std::path::Path::new(path).exists() {
                 return Err(SftpInitError::InvalidConfig(format!("Private key file not found: {}", path)));
             }
-        } else {
-            return Err(SftpInitError::InvalidConfig("Host key file must be provided for SFTP server".to_string()));
+        }
+
+        if let Some(path) = &self.key_dir {
+            if !std::path::Path::new(path).exists() {
+                return Err(SftpInitError::InvalidConfig(format!("Private key directory not found: {}", path)));
+            }
         }
 
         // Validate certificate file exists if specified
         if let Some(path) = &self.cert_file
-            && !tokio::fs::try_exists(path).await.unwrap_or(false)
+            && !std::path::Path::new(path).exists()
         {
             return Err(SftpInitError::InvalidConfig(format!("Certificate file not found: {}", path)));
         }
 
         // Validate authorized keys file exists if provided
         if let Some(path) = &self.authorized_keys_file
-            && !tokio::fs::try_exists(path).await.unwrap_or(false)
+            && !std::path::Path::new(path).exists()
         {
             return Err(SftpInitError::InvalidConfig(format!("Authorized keys file not found: {}", path)));
         }
@@ -77,6 +90,7 @@ impl Default for SftpConfig {
             require_key_auth: true,
             cert_file: None,
             key_file: None,
+            key_dir: None,
             authorized_keys_file: None,
         }
     }

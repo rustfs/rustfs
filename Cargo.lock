@@ -8176,6 +8176,7 @@ dependencies = [
  "rustfs-iam",
  "rustfs-policy",
  "rustfs-utils",
+ "rustls",
  "s3s",
  "serde_json",
  "ssh-key",

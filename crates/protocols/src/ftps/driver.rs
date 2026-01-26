@@ -437,7 +437,10 @@ where
             }
             Err(e) => {
                 error!("FTPS put - S3 error details: {:?}", e);
-                Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot put to directory"))
+                Err(Error::new(
+                    ErrorKind::PermanentFileNotAvailable,
+                    format!("Failed to upload object: {:?}", e),
+                ))
             }
         }
     }

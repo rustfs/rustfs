@@ -27,7 +27,7 @@ categories = ["network-programming", "filesystem"]
 
 [features]
 default = []
-ftps = ["libunftp", "suppaftp"]
+ftps = ["libunftp", "suppaftp", "rustls"]
 sftp = ["russh", "russh-sftp", "ssh-key"]
 
 [dependencies]
@@ -63,6 +63,7 @@ s3s = { workspace = true }
 # FTPS specific dependencies (optional)
 libunftp = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 
 # SFTP specific dependencies (optional)
 russh = { workspace = true, optional = true }

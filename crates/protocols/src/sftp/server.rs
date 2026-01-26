@@ -20,7 +20,7 @@ use crate::sftp::config::{SftpConfig, SftpInitError};
 use crate::sftp::handler::SftpHandler;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use russh::ChannelId;
-use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey, PublicKeyBase64};
+use russh::keys::{Algorithm, HashAlg, PublicKey, PublicKeyBase64};
 use russh::server::{Auth, Handler, Server as RusshServer, Session};
 use ssh_key::Certificate;
 use ssh_key::certificate::CertType;
@@ -40,7 +40,7 @@ type ServerError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Clone)]
 pub struct SftpServer<S> {
     config: SftpConfig,
-    key_pair: Arc<PrivateKey>,
+    key_pairs: Arc<Vec<russh::keys::PrivateKey>>,
     trusted_certificates: Arc<Vec<ssh_key::PublicKey>>,
     authorized_keys: Arc<Vec<String>>,
     storage: S,
@@ -48,13 +48,48 @@ pub struct SftpServer<S> {
 
 impl<S: StorageBackend + Clone + Send + Sync + 'static> SftpServer<S> {
     pub fn new(config: SftpConfig, storage: S) -> Result<Self, SftpInitError> {
-        let key_pair = if let Some(key_file) = &config.key_file {
+        // Load host keys - support both single file and directory with multiple keys
+        let mut key_pairs: Vec<russh::keys::PrivateKey> = Vec::new();
+
+        if let Some(key_dir) = &config.key_dir {
+            // Load all keys from directory
+            info!("Loading host keys from directory: {}", key_dir);
+            let dir_entries = std::fs::read_dir(key_dir)
+                .map_err(|e| SftpInitError::InvalidConfig(format!("Failed to read key directory: {}", e)))?;
+
+            for entry in dir_entries {
+                let entry = entry
+                    .map_err(|e| SftpInitError::InvalidConfig(format!("Failed to read directory entry: {}", e)))?;
+                let path = entry.path();
+                if path.is_file() {
+                    match russh::keys::load_secret_key(&path, None) {
+                        Ok(key) => {
+                            info!("Loaded host key: {:?}", path.file_name());
+                            key_pairs.push(key);
+                        }
+                        Err(e) => {
+                            debug!("Skipping non-key file {:?}: {}", path.file_name(), e);
+                        }
+                    }
+                }
+            }
+
+            if key_pairs.is_empty() {
+                return Err(SftpInitError::InvalidConfig("No valid host keys found in directory".to_string()));
+            }
+        } else if let Some(key_file) = &config.key_file {
+            // Load single key file
             let path = Path::new(key_file);
-            russh::keys::load_secret_key(path, None)
-                .map_err(|e| SftpInitError::InvalidConfig(format!("Failed to load host key: {}", e)))?
-        } else {
-            return Err(SftpInitError::InvalidConfig("Host key file must be provided for SFTP server".to_string()));
-        };
+            let key_pair = russh::keys::load_secret_key(path, None)
+                .map_err(|e| SftpInitError::InvalidConfig(format!("Failed to load host key: {}", e)))?;
+            key_pairs.push(key_pair);
+        }
+
+        if key_pairs.is_empty() {
+            return Err(SftpInitError::InvalidConfig("No host keys configured".to_string()));
+        }
+
+        info!("Loaded {} host key(s) for SFTP", key_pairs.len());
 
         let trusted_certificates = if let Some(cert_file) = &config.cert_file {
             info!("Loading trusted CA certificates from: {}", cert_file);
@@ -82,7 +117,7 @@ impl<S: StorageBackend + Clone + Send + Sync + 'static> SftpServer<S> {
 
         Ok(Self {
             config,
-            key_pair: Arc::new(key_pair),
+            key_pairs: Arc::new(key_pairs),
             trusted_certificates: Arc::new(trusted_certificates),
             authorized_keys: Arc::new(authorized_keys),
             storage,
@@ -124,7 +159,11 @@ impl<S: StorageBackend + Clone + Send + Sync + 'static> SftpServer<S> {
 
     fn make_ssh_config(&self) -> russh::server::Config {
         let mut config = russh::server::Config::default();
-        config.keys.push(self.key_pair.as_ref().clone());
+
+        // Add all host keys to support multiple algorithms/key types
+        for key_pair in self.key_pairs.iter() {
+            config.keys.push(key_pair.clone());
+        }
 
         config.preferred.key = Cow::Borrowed(&[
             Algorithm::Ed25519,

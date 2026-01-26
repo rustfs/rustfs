@@ -99,9 +99,42 @@ where
         }
 
         // Configure FTPS / TLS
-        if let Some(cert) = &self.config.cert_file {
+        if let Some(cert_dir) = &self.config.cert_dir {
+            debug!("Enabling FTPS with multi-certificate support from directory: {}", cert_dir);
+
+            // Load all certificates from directory
+            let cert_key_pairs = rustfs_utils::load_all_certs_from_directory(cert_dir)
+                .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to load certificates: {}", e)))?;
+
+            if cert_key_pairs.is_empty() {
+                return Err(FtpsInitError::InvalidConfig(
+                    "No valid certificates found in directory".into()
+                ));
+            }
+
+            debug!("Loaded {} certificates for FTPS", cert_key_pairs.len());
+
+            // Create multi-certificate resolver with SNI support
+            let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)
+                .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to create certificate resolver: {}", e)))?;
+
+            // Build ServerConfig with SNI support
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(std::sync::Arc::new(resolver));
+
+            server_builder = server_builder.ftps_manual::<std::path::PathBuf>(std::sync::Arc::new(server_config));
+
+            if self.config.ftps_required {
+                info!("FTPS is explicitly required for all connections");
+                server_builder = server_builder.ftps_required(FtpsRequired::All, FtpsRequired::All);
+            }
+
+        } else if let Some(cert) = &self.config.cert_file {
             if let Some(key) = &self.config.key_file {
-                debug!("Enabling FTPS with cert: {} and key: {}", cert, key);
+                debug!("Enabling FTPS with single cert: {} and key: {}", cert, key);
 
                 // If CA file is specified, create a combined certificate chain
                 let final_cert = if let Some(ca_file) = &self.config.ca_file {

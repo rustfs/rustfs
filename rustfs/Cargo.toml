@@ -56,7 +56,7 @@ rustfs-madmin = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
-rustfs-protocols = { workspace = true, optional = true }
+rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio.workspace = true
 rustfs-s3select-api = { workspace = true }

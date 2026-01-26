@@ -41,6 +41,8 @@ pub struct FtpsConfig {
     pub ftps_required: bool,
     /// Certificate file path
     pub cert_file: Option<String>,
+    /// Certificate directory path (supports multiple certificates)
+    pub cert_dir: Option<String>,
     /// Private key file path
     pub key_file: Option<String>,
     /// CA certificate file path for client certificate verification
@@ -50,11 +52,17 @@ pub struct FtpsConfig {
 impl FtpsConfig {
     /// Validates the configuration
     pub async fn validate(&self) -> Result<(), FtpsInitError> {
-        if self.ftps_required && (self.cert_file.is_none() || self.key_file.is_none()) {
-            return Err(FtpsInitError::InvalidConfig(
-                "FTPS is required but certificate or key file is missing".to_string(),
-            ));
+        if self.ftps_required {
+            let has_single_cert = self.cert_file.is_some() && self.key_file.is_some();
+            let has_cert_dir = self.cert_dir.is_some();
+
+            if !has_single_cert && !has_cert_dir {
+                return Err(FtpsInitError::InvalidConfig(
+                    "FTPS is required but certificate configuration is missing".to_string(),
+                ));
+            }
         }
+
         if let Some(path) = &self.cert_file
             && !tokio::fs::try_exists(path).await.unwrap_or(false)
         {
@@ -64,6 +72,11 @@ impl FtpsConfig {
             && !tokio::fs::try_exists(path).await.unwrap_or(false)
         {
             return Err(FtpsInitError::InvalidConfig(format!("Key file not found: {}", path)));
+        }
+        if let Some(path) = &self.cert_dir
+            && !tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
+            return Err(FtpsInitError::InvalidConfig(format!("Certificate directory not found: {}", path)));
         }
 
         // Validate CA file exists if specified
@@ -118,6 +131,7 @@ impl Default for FtpsConfig {
             external_ip: None,
             ftps_required: false,
             cert_file: None,
+            cert_dir: None,
             key_file: None,
             ca_file: None,
         }

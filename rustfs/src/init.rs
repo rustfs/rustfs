@@ -328,7 +328,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
-            DEFAULT_FTPS_ADDRESS, ENV_FTPS_ADDRESS, ENV_FTPS_CA_FILE, ENV_FTPS_CERTS_FILE, ENV_FTPS_ENABLE, ENV_FTPS_EXTERNAL_IP,
+            DEFAULT_FTPS_ADDRESS, ENV_FTPS_ADDRESS, ENV_FTPS_CA_FILE, ENV_FTPS_CERTS_FILE, ENV_FTPS_CERTS_DIR, ENV_FTPS_ENABLE, ENV_FTPS_EXTERNAL_IP,
             ENV_FTPS_KEY_FILE, ENV_FTPS_PASSIVE_PORTS,
         };
         use rustfs_protocols::{FtpsConfig, FtpsServer};
@@ -348,6 +348,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
 
         // Get FTPS configuration from environment variables
         let cert_file = rustfs_utils::get_env_opt_str(ENV_FTPS_CERTS_FILE);
+        let cert_dir = rustfs_utils::get_env_opt_str(ENV_FTPS_CERTS_DIR);
         let key_file = rustfs_utils::get_env_opt_str(ENV_FTPS_KEY_FILE);
         let ca_file = rustfs_utils::get_env_opt_str(ENV_FTPS_CA_FILE);
         let passive_ports = rustfs_utils::get_env_opt_str(ENV_FTPS_PASSIVE_PORTS);
@@ -360,6 +361,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
             external_ip,
             ftps_required: true,
             cert_file,
+            cert_dir,
             key_file,
             ca_file,
         };
@@ -404,7 +406,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
 pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
-        use rustfs_config::{ENV_SFTP_ADDRESS, ENV_SFTP_AUTHORIZED_KEYS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY};
+        use rustfs_config::{ENV_SFTP_ADDRESS, ENV_SFTP_AUTHORIZED_KEYS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY, ENV_SFTP_HOST_KEY_DIR};
         use rustfs_protocols::{SftpConfig, SftpServer};
         use std::net::SocketAddr;
         // Check if SFTP is enabled
@@ -422,6 +424,7 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
 
         // Get SFTP configuration from environment variables
         let host_key_file = rustfs_utils::get_env_opt_str(ENV_SFTP_HOST_KEY);
+        let host_key_dir = rustfs_utils::get_env_opt_str(ENV_SFTP_HOST_KEY_DIR);
         let authorized_keys_file = rustfs_utils::get_env_opt_str(ENV_SFTP_AUTHORIZED_KEYS);
 
         // Create SFTP configuration
@@ -430,6 +433,7 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
             require_key_auth: true,
             cert_file: None,
             key_file: host_key_file,
+            key_dir: host_key_dir,
             authorized_keys_file,
         };
 
