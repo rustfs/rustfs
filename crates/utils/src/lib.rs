@@ -90,7 +90,4 @@ mod dunce;
 #[cfg(feature = "path")]
 pub use dunce::*;
 mod envs;
-mod mask;
-
 pub use envs::*;
-pub use mask::*;

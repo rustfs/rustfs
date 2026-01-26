@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use std::io::Error;
 use std::sync::OnceLock;
 use time::OffsetDateTime;
@@ -223,11 +224,41 @@ pub struct Credentials {
     pub description: Option<String>,
 }
 
-impl std::fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+/// A wrapper struct for masking sensitive strings in Debug implementations.
+/// It avoids allocating a new String just for formatting.
+pub struct Masked<'a>(pub Option<&'a str>);
+
+impl<'a> fmt::Debug for Masked<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            None => Ok(()),
+            Some(s) => {
+                let len = s.len();
+                if len == 0 {
+                    Ok(())
+                } else if len == 1 {
+                    write!(f, "***")
+                } else if len == 2 {
+                    write!(f, "{}***|{}", &s[0..1], len)
+                } else {
+                    write!(f, "{}***{}|{}", &s[0..1], &s[len - 1..], len)
+                }
+            }
+        }
+    }
+}
+
+impl<'a> fmt::Display for Masked<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Credentials")
             .field("access_key", &self.access_key)
-            .field("secret_key", &Credentials::mask_sensitive(Some(&self.secret_key)))
+            .field("secret_key", &Masked(Some(&self.secret_key)))
             .field("session_token", &self.session_token)
             .field("expiration", &self.expiration)
             .field("status", &self.status)
@@ -285,28 +316,6 @@ impl Credentials {
 
     pub fn is_owner(&self) -> bool {
         false
-    }
-
-    /// Mask sensitive information in Option<String>
-    ///
-    /// # Arguments
-    /// * `s` - Optional reference to a String to mask
-    /// # Returns
-    /// * `String` - The masked string
-    ///
-    pub fn mask_sensitive(s: Option<&String>) -> String {
-        match s {
-            None => String::new(),
-            Some(s) => {
-                let chars: Vec<char> = s.chars().collect();
-                let n = chars.len();
-                match n {
-                    0 => String::new(),
-                    1 => format!("{}***|{}", chars[0], n),
-                    _ => format!("{}***{}|{}", chars[0], chars[n - 1], n),
-                }
-            }
-        }
     }
 }
 
