@@ -209,7 +209,7 @@ pub fn get_rpc_token() -> String {
 /// - name: Optional name string
 /// - description: Optional description string
 ///
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Credentials {
     pub access_key: String,
     pub secret_key: String,
@@ -221,6 +221,23 @@ pub struct Credentials {
     pub claims: Option<HashMap<String, Value>>,
     pub name: Option<String>,
     pub description: Option<String>,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access_key", &self.access_key)
+            .field("secret_key", &Credentials::mask_sensitive(Some(&self.secret_key)))
+            .field("session_token", &self.session_token)
+            .field("expiration", &self.expiration)
+            .field("status", &self.status)
+            .field("parent_user", &self.parent_user)
+            .field("groups", &self.groups)
+            .field("claims", &self.claims)
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -268,6 +285,28 @@ impl Credentials {
 
     pub fn is_owner(&self) -> bool {
         false
+    }
+
+    /// Mask sensitive information in Option<String>
+    ///
+    /// # Arguments
+    /// * `s` - Optional reference to a String to mask
+    /// # Returns
+    /// * `String` - The masked string
+    ///
+    pub fn mask_sensitive(s: Option<&String>) -> String {
+        match s {
+            None => String::new(),
+            Some(s) => {
+                let chars: Vec<char> = s.chars().collect();
+                let n = chars.len();
+                match n {
+                    0 => String::new(),
+                    1 => format!("{}***|{}", chars[0], n),
+                    _ => format!("{}***{}|{}", chars[0], chars[n - 1], n),
+                }
+            }
+        }
     }
 }
 
