@@ -25,6 +25,7 @@ use crate::client::{
 };
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
+use http_body_util::BodyExt;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 use s3s::dto::Owner;
@@ -83,18 +84,29 @@ impl TransitionClient {
             )
             .await?;
 
-        if resp.status() != http::StatusCode::OK {
-            let b = resp.body().bytes().expect("err").to_vec();
-            return Err(std::io::Error::other(http_resp_to_error_response(&resp, b, bucket_name, object_name)));
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
+        let mut body_vec = Vec::new();
+        let mut body = resp.into_body();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            if let Some(data) = frame.data_ref() {
+                body_vec.extend_from_slice(data);
+            }
         }
 
-        let b = resp
-            .body_mut()
-            .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
-            .await
-            .unwrap()
-            .to_vec();
-        let mut res = match quick_xml::de::from_str::<AccessControlPolicy>(&String::from_utf8(b).unwrap()) {
+        if resp_status != http::StatusCode::OK {
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                resp_status,
+                &h,
+                body_vec,
+                bucket_name,
+                object_name,
+            )));
+        }
+
+        let mut res = match quick_xml::de::from_str::<AccessControlPolicy>(&String::from_utf8(body_vec).unwrap()) {
             Ok(result) => result,
             Err(err) => {
                 return Err(std::io::Error::other(err.to_string()));

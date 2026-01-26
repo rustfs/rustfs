@@ -24,8 +24,10 @@ use crate::client::{
     api_get_options::GetObjectOptions,
     transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
-use bytes::Bytes;
 use http::HeaderMap;
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
 use s3s::dto::RestoreRequest;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -107,9 +109,25 @@ impl TransitionClient {
             )
             .await?;
 
-        let b = resp.body().bytes().expect("err").to_vec();
-        if resp.status() != http::StatusCode::ACCEPTED && resp.status() != http::StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(&resp, b, bucket_name, "")));
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
+        let mut body_vec = Vec::new();
+        let mut body = resp.into_body();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            if let Some(data) = frame.data_ref() {
+                body_vec.extend_from_slice(data);
+            }
+        }
+        if resp_status != http::StatusCode::ACCEPTED && resp_status != http::StatusCode::OK {
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                resp_status,
+                &h,
+                body_vec,
+                bucket_name,
+                "",
+            )));
         }
         Ok(())
     }

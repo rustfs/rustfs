@@ -15,13 +15,13 @@
 use heed::byteorder::BigEndian;
 use heed::types::*;
 use heed::{BoxedError, BytesDecode, BytesEncode, Database, DatabaseFlags, Env, EnvOpenOptions};
-use rustfs_ahm::scanner::local_scan::{self, LocalObjectRecord, LocalScanOutcome};
 use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
     store_api::{MakeBucketOptions, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader, StorageAPI},
 };
+use rustfs_scanner::scanner::local_scan::{self, LocalObjectRecord, LocalScanOutcome};
 use serial_test::serial;
 use std::{
     borrow::Cow,
