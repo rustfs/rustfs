@@ -141,10 +141,10 @@ docker compose --profile observability up -d
 ```
 
 `docker-buildx.sh` 脚本支持：
-\- **多架构构建**: `linux/amd64`, `linux/arm64`
-\- **自动版本检测**: 使用 git tags 或 commit hash
-\- **灵活的仓库支持**: 支持 Docker Hub, GitHub Container Registry 等
-\- **构建优化**: 包含缓存和并行构建
+- **多架构构建**: `linux/amd64`, `linux/arm64`
+- **自动版本检测**: 使用 git tags 或 commit hash
+- **灵活的仓库支持**: 支持 Docker Hub, GitHub Container Registry 等
+- **构建优化**: 包含缓存和并行构建
 
 为了方便起见，您也可以使用 Make 命令：
 

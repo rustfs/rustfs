@@ -168,8 +168,8 @@ async fn run(opt: config::Opt) -> Result<()> {
             info!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
         }
         Err(e) => {
-            let msg = format!("init_global_action_credentials failed: {e:?}");
-            error!("{msg}");
+            let msg = format!("init global action credentials failed: {e:?}");
+            error!(target: "rustfs::main::run","{msg}");
             return Err(Error::other(msg));
         }
     };
