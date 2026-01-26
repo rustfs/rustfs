@@ -26,7 +26,7 @@ pub use local_snapshot::{
 use rustfs_common::data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
-use rustfs_utils::path::SLASH_SEPARATOR_STR;
+use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, hash_map::Entry},
     sync::{Arc, OnceLock},
@@ -37,7 +37,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 // Data usage storage constants
-pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR_STR;
+pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
@@ -61,17 +61,17 @@ fn cache_updating() -> &'static CacheUpdating {
 lazy_static::lazy_static! {
     pub static ref DATA_USAGE_BUCKET: String = format!("{}{}{}",
         crate::disk::RUSTFS_META_BUCKET,
-        SLASH_SEPARATOR_STR,
+        SLASH_SEPARATOR,
         crate::disk::BUCKET_META_PREFIX
     );
     pub static ref DATA_USAGE_OBJ_NAME_PATH: String = format!("{}{}{}",
         crate::disk::BUCKET_META_PREFIX,
-        SLASH_SEPARATOR_STR,
+        SLASH_SEPARATOR,
         DATA_USAGE_OBJ_NAME
     );
     pub static ref DATA_USAGE_BLOOM_NAME_PATH: String = format!("{}{}{}",
         crate::disk::BUCKET_META_PREFIX,
-        SLASH_SEPARATOR_STR,
+        SLASH_SEPARATOR,
         DATA_USAGE_BLOOM_NAME
     );
 }
