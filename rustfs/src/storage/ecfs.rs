@@ -4373,7 +4373,7 @@ impl S3 for FS {
 
         if let Err(err) = cfg.is_valid() {
             warn!("put_bucket_policy err input {:?}, {:?}", &policy, err);
-            return Err(s3_error!(InvalidPolicyDocument));
+            return Err(s3_error!(MalformedPolicy));
         }
 
         let data = serde_json::to_vec(&cfg).map_err(|e| s3_error!(InternalError, "parse policy failed {:?}", e))?;

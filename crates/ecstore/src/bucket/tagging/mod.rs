@@ -22,7 +22,7 @@ pub fn decode_tags(tags: &str) -> Vec<Tag> {
     let mut list = Vec::new();
 
     for (k, v) in values {
-        if k.is_empty() || v.is_empty() {
+        if k.is_empty() {
             continue;
         }
 
@@ -31,7 +31,7 @@ pub fn decode_tags(tags: &str) -> Vec<Tag> {
             value: Some(v.to_string()),
         });
     }
-
+    list.sort_by(|a, b| a.key.cmp(&b.key));
     list
 }
 
@@ -39,7 +39,7 @@ pub fn decode_tags_to_map(tags: &str) -> HashMap<String, String> {
     let mut list = HashMap::new();
 
     for (k, v) in form_urlencoded::parse(tags.as_bytes()) {
-        if k.is_empty() || v.is_empty() {
+        if k.is_empty() {
             continue;
         }
 

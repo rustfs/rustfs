@@ -28,6 +28,7 @@ use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions}
 use rustfs_policy::service_type::ServiceType;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
+use rustfs_utils::http::RESERVED_METADATA_PREFIX;
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_REQUEST;
@@ -368,7 +369,7 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
     let mut filtered_metadata = HashMap::new();
     for (k, v) in metadata {
         // Skip internal/reserved metadata
-        if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
+        if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) || k.starts_with(RESERVED_METADATA_PREFIX) {
             continue;
         }
 
