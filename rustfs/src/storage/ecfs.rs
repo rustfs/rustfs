@@ -531,7 +531,7 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
         let input = req.input;
         let CompleteMultipartUploadInput {
             multipart_upload,
@@ -782,12 +782,18 @@ impl S3 for FS {
 
         if dsc.replicate_any() {
             warn!("need multipart replication");
-            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
+            schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
         }
         info!(
             "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
             output.server_side_encryption, output.ssekms_key_id
         );
+
+        // Set object info for event notification
+        helper = helper.object(obj_info.clone()).version_id(
+            obj_info.version_id.map(|v| v.to_string()).unwrap_or_default()
+        );
+
         let helper_result = Ok(S3Response::new(helper_output));
         let _ = helper.complete(&helper_result);
         Ok(S3Response::new(output))
