@@ -531,7 +531,8 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
         let input = req.input;
         let CompleteMultipartUploadInput {
             multipart_upload,
@@ -790,9 +791,9 @@ impl S3 for FS {
         );
 
         // Set object info for event notification
-        helper = helper.object(obj_info.clone()).version_id(
-            obj_info.version_id.map(|v| v.to_string()).unwrap_or_default()
-        );
+        helper = helper
+            .object(obj_info.clone())
+            .version_id(obj_info.version_id.map(|v| v.to_string()).unwrap_or_default());
 
         let helper_result = Ok(S3Response::new(helper_output));
         let _ = helper.complete(&helper_result);
