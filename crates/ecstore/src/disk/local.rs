@@ -15,18 +15,18 @@
 use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::{
-    conv_part_err_to_int, endpoint::Endpoint, error::{DiskError, Error, FileAccessDeniedWithContext, Result}, error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error}, format::FormatV3,
-    fs::{access, lstat, lstat_std, remove, remove_all_std, remove_std, rename, O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY}, os, os::{check_path_length, is_empty_dir, is_root_disk, rename_all}, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions,
-    DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND,
-    CHECK_PART_SUCCESS,
-    CHECK_PART_UNKNOWN,
-    CHECK_PART_VOLUME_NOT_FOUND,
-    RUSTFS_META_BUCKET,
-    RUSTFS_META_TMP_DELETED_BUCKET,
-    STORAGE_FORMAT_FILE,
-    STORAGE_FORMAT_FILE_BACKUP,
+    BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
+    CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
+    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts,
+    VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    endpoint::Endpoint,
+    error::{DiskError, Error, FileAccessDeniedWithContext, Result},
+    error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
+    format::FormatV3,
+    fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
+    os,
+    os::{check_path_length, is_empty_dir, is_root_disk, rename_all},
 };
 use crate::erasure_coding::bitrot_verify;
 use crate::file_cache::{get_global_file_cache, prefetch_metadata_patterns, read_metadata_cached};
@@ -34,15 +34,15 @@ use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use bytes::Bytes;
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
-    get_file_info, read_xl_meta_no_data, Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts,
-    RawFileInfo, UpdateFn,
-};
-use rustfs_utils::os::get_info;
-use rustfs_utils::path::{
-    clean, decode_dir_object, encode_dir_object, has_suffix, path_join, path_join_buf, GLOBAL_DIR_SUFFIX,
-    GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR,
+    Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
+    get_file_info, read_xl_meta_no_data,
 };
 use rustfs_utils::HashAlgorithm;
+use rustfs_utils::os::get_info;
+use rustfs_utils::path::{
+    GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, decode_dir_object, encode_dir_object, has_suffix,
+    path_join, path_join_buf,
+};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;

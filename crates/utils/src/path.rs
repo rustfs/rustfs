@@ -21,6 +21,11 @@ pub const SLASH_SEPARATOR: &str = "/";
 
 pub const GLOBAL_DIR_SUFFIX_WITH_SLASH: &str = "__XLDIR__/";
 
+#[inline]
+fn is_separator(c: u8) -> bool {
+    c == b'/' || (cfg!(target_os = "windows") && c == b'\\')
+}
+
 pub fn has_suffix(s: &str, suffix: &str) -> bool {
     if cfg!(target_os = "windows") {
         s.to_lowercase().ends_with(&suffix.to_lowercase())
@@ -75,25 +80,49 @@ pub fn has_prefix(s: &str, prefix: &str) -> bool {
 }
 
 pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
-    path_join_buf(
-        elem.iter()
-            .map(|p| p.as_ref().to_string_lossy().into_owned())
-            .collect::<Vec<String>>()
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<&str>>()
-            .as_slice(),
-    )
-    .into()
+    let trailing_slash = !elem.is_empty()
+        && elem.last().is_some_and(|last| {
+            let s = last.as_ref().to_string_lossy();
+            s.ends_with(SLASH_SEPARATOR) || (cfg!(target_os = "windows") && s.ends_with('\\'))
+        });
+
+    let mut dst = String::new();
+    let mut added = 0;
+
+    for e in elem {
+        let s = e.as_ref().to_string_lossy();
+        if added > 0 || !s.is_empty() {
+            if added > 0 {
+                dst.push_str(SLASH_SEPARATOR);
+            }
+            dst.push_str(&s);
+            added += s.len();
+        }
+    }
+
+    if path_needs_clean(dst.as_bytes()) {
+        let mut clean_path = clean(&dst);
+        if trailing_slash {
+            clean_path.push_str(SLASH_SEPARATOR);
+        }
+        return clean_path.into();
+    }
+
+    if trailing_slash {
+        dst.push_str(SLASH_SEPARATOR);
+    }
+
+    dst.into()
 }
 
 pub fn path_join_buf(elements: &[&str]) -> String {
     let trailing_slash = !elements.is_empty()
-        && elements.last().is_some_and(|last| {
-            last.ends_with(SLASH_SEPARATOR) || (cfg!(target_os = "windows") && last.ends_with('\\'))
-        });
+        && elements
+            .last()
+            .is_some_and(|last| last.ends_with(SLASH_SEPARATOR) || (cfg!(target_os = "windows") && last.ends_with('\\')));
 
-    let mut dst = String::new();
+    let len = elements.iter().map(|s| s.len()).sum::<usize>() + elements.len();
+    let mut dst = String::with_capacity(len);
     let mut added = 0;
 
     for e in elements {
@@ -129,6 +158,7 @@ fn path_needs_clean(path: &[u8]) -> bool {
         return true;
     }
 
+    // Check for backslashes on Windows
     if cfg!(target_os = "windows") && path.contains(&b'\\') {
         return true;
     }
@@ -270,7 +300,7 @@ pub fn clean(path: &str) -> String {
         return ".".to_string();
     }
 
-    let rooted = path.starts_with('/');
+    let rooted = path.starts_with('/') || (cfg!(target_os = "windows") && path.starts_with('\\'));
     let n = path.len();
     let mut out = LazyBuf::new(path.to_string());
     let mut r = 0;
@@ -283,51 +313,51 @@ pub fn clean(path: &str) -> String {
     }
 
     while r < n {
-        match path.as_bytes()[r] {
-            b'/' => {
-                // Empty path element
-                r += 1;
-            }
-            b'.' if r + 1 == n || path.as_bytes()[r + 1] == b'/' => {
-                // . element
-                r += 1;
-            }
-            b'.' if path.as_bytes()[r + 1] == b'.' && (r + 2 == n || path.as_bytes()[r + 2] == b'/') => {
-                // .. element: remove to last /
-                r += 2;
+        let c = path.as_bytes()[r];
 
-                if out.w > dotdot {
-                    // Can backtrack
+        if is_separator(c) {
+            // Empty path element
+            r += 1;
+        } else if c == b'.' && (r + 1 == n || is_separator(path.as_bytes()[r + 1])) {
+            // . element
+            r += 1;
+        } else if c == b'.'
+            && (r + 1 < n && path.as_bytes()[r + 1] == b'.')
+            && (r + 2 == n || is_separator(path.as_bytes()[r + 2]))
+        {
+            // .. element: remove to last /
+            r += 2;
+
+            if out.w > dotdot {
+                // Can backtrack
+                out.w -= 1;
+                while out.w > dotdot && out.index(out.w) != b'/' {
                     out.w -= 1;
-                    while out.w > dotdot && out.index(out.w) != b'/' {
-                        out.w -= 1;
-                    }
-                } else if !rooted {
-                    // Cannot backtrack but not rooted, so append .. element.
-                    if out.w > 0 {
-                        out.append(b'/');
-                    }
-                    out.append(b'.');
-                    out.append(b'.');
-                    dotdot = out.w;
                 }
-            }
-            _ => {
-                // Real path element.
-                // Add slash if needed
-                if (rooted && out.w != 1) || (!rooted && out.w != 0) {
+            } else if !rooted {
+                // Cannot backtrack but not rooted, so append .. element.
+                if out.w > 0 {
                     out.append(b'/');
                 }
+                out.append(b'.');
+                out.append(b'.');
+                dotdot = out.w;
+            }
+        } else {
+            // Real path element.
+            // Add slash if needed
+            if (rooted && out.w != 1) || (!rooted && out.w != 0) {
+                out.append(b'/');
+            }
 
-                // Copy element
-                while r < n && path.as_bytes()[r] != b'/' {
-                    if cfg!(target_os = "windows") && path.as_bytes()[r] == b'\\' {
-                        out.append(b'/');
-                    } else {
-                        out.append(path.as_bytes()[r]);
-                    }
-                    r += 1;
+            // Copy element
+            while r < n {
+                let c = path.as_bytes()[r];
+                if is_separator(c) {
+                    break;
                 }
+                out.append(c);
+                r += 1;
             }
         }
     }
