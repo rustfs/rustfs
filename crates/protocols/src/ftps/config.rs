@@ -39,12 +39,10 @@ pub struct FtpsConfig {
     pub external_ip: Option<String>,
     /// Whether FTPS is required
     pub ftps_required: bool,
-    /// Certificate file path
-    pub cert_file: Option<String>,
+    /// Whether TLS is enabled (default: true)
+    pub tls_enabled: bool,
     /// Certificate directory path (supports multiple certificates)
     pub cert_dir: Option<String>,
-    /// Private key file path
-    pub key_file: Option<String>,
     /// CA certificate file path for client certificate verification
     pub ca_file: Option<String>,
 }
@@ -52,27 +50,12 @@ pub struct FtpsConfig {
 impl FtpsConfig {
     /// Validates the configuration
     pub async fn validate(&self) -> Result<(), FtpsInitError> {
-        if self.ftps_required {
-            let has_single_cert = self.cert_file.is_some() && self.key_file.is_some();
-            let has_cert_dir = self.cert_dir.is_some();
-
-            if !has_single_cert && !has_cert_dir {
-                return Err(FtpsInitError::InvalidConfig(
-                    "FTPS is required but certificate configuration is missing".to_string(),
-                ));
-            }
+        if self.ftps_required && self.cert_dir.is_none() {
+            return Err(FtpsInitError::InvalidConfig(
+                "FTPS is required but certificate directory is missing".to_string(),
+            ));
         }
 
-        if let Some(path) = &self.cert_file
-            && !tokio::fs::try_exists(path).await.unwrap_or(false)
-        {
-            return Err(FtpsInitError::InvalidConfig(format!("Certificate file not found: {}", path)));
-        }
-        if let Some(path) = &self.key_file
-            && !tokio::fs::try_exists(path).await.unwrap_or(false)
-        {
-            return Err(FtpsInitError::InvalidConfig(format!("Key file not found: {}", path)));
-        }
         if let Some(path) = &self.cert_dir
             && !tokio::fs::try_exists(path).await.unwrap_or(false)
         {
@@ -130,9 +113,8 @@ impl Default for FtpsConfig {
             passive_ports: Some(crate::constants::defaults::DEFAULT_FTPS_PASSIVE_PORTS.to_string()),
             external_ip: None,
             ftps_required: false,
-            cert_file: None,
+            tls_enabled: true,
             cert_dir: None,
-            key_file: None,
             ca_file: None,
         }
     }

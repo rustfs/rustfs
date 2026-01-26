@@ -82,10 +82,11 @@ pub async fn test_sftp_core_operations() -> Result<()> {
     let ssh_dir = PathBuf::from(&env.temp_dir).join("ssh");
     fs::create_dir_all(&ssh_dir).await?;
 
-    let host_key_path = ssh_dir.join("ssh_host_rsa_key");
+    let host_key_dir = &ssh_dir;
 
     // Generate SSH host key
     info!("Generating SSH host key...");
+    let host_key_path = ssh_dir.join("ssh_host_rsa_key");
     let output = Command::new("ssh-keygen")
         .arg("-t")
         .arg("rsa")
@@ -139,7 +140,7 @@ pub async fn test_sftp_core_operations() -> Result<()> {
     let mut server_process = TokioCommand::new(&binary_path)
         .env("RUSTFS_SFTP_ENABLE", "true")
         .env("RUSTFS_SFTP_ADDRESS", SFTP_ADDRESS)
-        .env("RUSTFS_SFTP_HOST_KEY", &host_key_path)
+        .env("RUSTFS_SFTP_HOST_KEY_DIR", host_key_dir)
         .env("RUSTFS_SFTP_AUTHORIZED_KEYS", &auth_keys_path)
         .arg(&env.temp_dir)
         .spawn()?;

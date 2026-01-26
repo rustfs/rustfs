@@ -34,8 +34,6 @@ pub struct SftpConfig {
     pub require_key_auth: bool,
     /// Certificate file path
     pub cert_file: Option<String>,
-    /// Private key file path
-    pub key_file: Option<String>,
     /// Private key directory path (supports multiple host keys)
     pub key_dir: Option<String>,
     /// Authorized keys file path
@@ -45,24 +43,17 @@ pub struct SftpConfig {
 impl SftpConfig {
     /// Validates the configuration
     pub async fn validate(&self) -> Result<(), SftpInitError> {
-        // Host key configuration (either single file or directory)
-        let has_single_key = self.key_file.is_some();
+        // Host key configuration
         let has_key_dir = self.key_dir.is_some();
 
-        if !has_single_key && !has_key_dir {
-            return Err(SftpInitError::InvalidConfig("Either key_file or key_dir must be provided for SFTP server".to_string()));
+        if !has_key_dir {
+            return Err(SftpInitError::InvalidConfig("key_dir must be provided for SFTP server".to_string()));
         }
 
-        if let Some(path) = &self.key_file {
-            if !std::path::Path::new(path).exists() {
-                return Err(SftpInitError::InvalidConfig(format!("Private key file not found: {}", path)));
-            }
-        }
-
-        if let Some(path) = &self.key_dir {
-            if !std::path::Path::new(path).exists() {
-                return Err(SftpInitError::InvalidConfig(format!("Private key directory not found: {}", path)));
-            }
+        if let Some(path) = &self.key_dir
+            && !std::path::Path::new(path).exists()
+        {
+            return Err(SftpInitError::InvalidConfig(format!("Private key directory not found: {}", path)));
         }
 
         // Validate certificate file exists if specified
@@ -89,7 +80,6 @@ impl Default for SftpConfig {
             bind_addr: crate::constants::defaults::DEFAULT_SFTP_ADDRESS.parse().unwrap(),
             require_key_auth: true,
             cert_file: None,
-            key_file: None,
             key_dir: None,
             authorized_keys_file: None,
         }

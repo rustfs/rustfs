@@ -512,7 +512,6 @@ async fn handle_shutdown(
         let _ = sftp_shutdown_tx.send(());
     }
 
-    
     // Stop the notification system
     info!(
         target: "rustfs::main::handle_shutdown",

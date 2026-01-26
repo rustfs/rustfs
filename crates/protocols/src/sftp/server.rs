@@ -58,8 +58,7 @@ impl<S: StorageBackend + Clone + Send + Sync + 'static> SftpServer<S> {
                 .map_err(|e| SftpInitError::InvalidConfig(format!("Failed to read key directory: {}", e)))?;
 
             for entry in dir_entries {
-                let entry = entry
-                    .map_err(|e| SftpInitError::InvalidConfig(format!("Failed to read directory entry: {}", e)))?;
+                let entry = entry.map_err(|e| SftpInitError::InvalidConfig(format!("Failed to read directory entry: {}", e)))?;
                 let path = entry.path();
                 if path.is_file() {
                     match russh::keys::load_secret_key(&path, None) {
@@ -77,23 +76,17 @@ impl<S: StorageBackend + Clone + Send + Sync + 'static> SftpServer<S> {
             if key_pairs.is_empty() {
                 return Err(SftpInitError::InvalidConfig("No valid host keys found in directory".to_string()));
             }
-        } else if let Some(key_file) = &config.key_file {
-            // Load single key file
-            let path = Path::new(key_file);
-            let key_pair = russh::keys::load_secret_key(path, None)
-                .map_err(|e| SftpInitError::InvalidConfig(format!("Failed to load host key: {}", e)))?;
-            key_pairs.push(key_pair);
         }
 
         if key_pairs.is_empty() {
-            return Err(SftpInitError::InvalidConfig("No host keys configured".to_string()));
+            return Err(SftpInitError::InvalidConfig("No valid host keys found in directory".to_string()));
         }
 
         info!("Loaded {} host key(s) for SFTP", key_pairs.len());
 
-        let trusted_certificates = if let Some(cert_file) = &config.cert_file {
-            info!("Loading trusted CA certificates from: {}", cert_file);
-            load_trusted_certificates(cert_file)
+        let trusted_certificates = if let Some(ca_file) = &config.cert_file {
+            info!("Loading trusted CA certificates from: {}", ca_file);
+            load_trusted_certificates(ca_file)
                 .map_err(|e| SftpInitError::InvalidConfig(format!("Failed to load certificates: {}", e)))?
         } else {
             if config.require_key_auth {
