@@ -264,8 +264,7 @@ async fn create_test_tier(server: u32) {
                 ..Default::default()
             })
         } else if server == 2 {
-            let test_minio_server = std::env::var("TEST_MINIO_SERVER")
-                .unwrap_or_else(|_| "localhost:9000".to_string());
+            let test_minio_server = std::env::var("TEST_MINIO_SERVER").unwrap_or_else(|_| "localhost:9000".to_string());
             Some(TierMinIO {
                 access_key: "minioadmin".to_string(),
                 secret_key: "minioadmin".to_string(),
