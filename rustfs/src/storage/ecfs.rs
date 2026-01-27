@@ -5201,7 +5201,6 @@ impl S3 for FS {
                 s3_error!(InvalidTag, "Tag value cannot be null")
             })?;
 
-
             if value.len() > 256 {
                 error!("Tag value too long: {} bytes", value.len());
                 return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));

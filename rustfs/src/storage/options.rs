@@ -28,7 +28,6 @@ use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions}
 use rustfs_policy::service_type::ServiceType;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
-use rustfs_utils::http::RESERVED_METADATA_PREFIX;
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_REQUEST;
@@ -382,7 +381,7 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
         if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
             continue;
         }
-        
+
         // Skip standard HTTP headers (they are returned as separate headers, not metadata)
         if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {
             continue;
