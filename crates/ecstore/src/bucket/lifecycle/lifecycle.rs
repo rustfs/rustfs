@@ -21,7 +21,7 @@
 use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
-    ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
+    ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition, TransitionStorageClass,
 };
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -240,7 +240,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
                         }
                     }
-                        }
+                }
             }*/
         }
         for (i, _) in self.rules.iter().enumerate() {
@@ -333,7 +333,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                         if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
                             events.push(Event {
                                 action: IlmAction::DeleteVersionAction,
-                                rule_id: rule.id.clone().expect("err!"),
+                                rule_id: rule.id.clone().unwrap_or_default(),
                                 due: Some(now),
                                 noncurrent_days: 0,
                                 newer_noncurrent_versions: 0,
@@ -347,7 +347,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
                                 events.push(Event {
                                     action: IlmAction::DeleteVersionAction,
-                                    rule_id: rule.id.clone().expect("err!"),
+                                    rule_id: rule.id.clone().unwrap_or_default(),
                                     due: Some(expected_expiry),
                                     noncurrent_days: 0,
                                     newer_noncurrent_versions: 0,
@@ -368,7 +368,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                     if now.unix_timestamp() >= due.unix_timestamp() {
                                         events.push(Event {
                                             action: IlmAction::DelMarkerDeleteAllVersionsAction,
-                                            rule_id: rule.id.clone().expect("err!"),
+                                            rule_id: rule.id.clone().unwrap_or_default(),
                                             due: Some(due),
                                             noncurrent_days: 0,
                                             newer_noncurrent_versions: 0,
@@ -401,7 +401,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                     if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
                                         events.push(Event {
                                             action: IlmAction::DeleteVersionAction,
-                                            rule_id: rule.id.clone().expect("err!"),
+                                            rule_id: rule.id.clone().unwrap_or_default(),
                                             due: Some(expected_expiry),
                                             noncurrent_days: 0,
                                             newer_noncurrent_versions: 0,
@@ -424,7 +424,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                     if now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp() {
                                         events.push(Event {
                                             action: IlmAction::TransitionVersionAction,
-                                            rule_id: rule.id.clone().expect("err!"),
+                                            rule_id: rule.id.clone().unwrap_or_default(),
                                             due,
                                             storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
                                                 .storage_class
@@ -458,7 +458,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 info!("eval_inner: expiration by date - date0={:?}", date0);
                                 events.push(Event {
                                     action: IlmAction::DeleteAction,
-                                    rule_id: rule.id.clone().expect("err!"),
+                                    rule_id: rule.id.clone().unwrap_or_default(),
                                     due: Some(date0),
                                     noncurrent_days: 0,
                                     newer_noncurrent_versions: 0,
@@ -479,7 +479,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 info!("eval_inner: object should expire, adding DeleteAction");
                                 let mut event = Event {
                                     action: IlmAction::DeleteAction,
-                                    rule_id: rule.id.clone().expect("err!"),
+                                    rule_id: rule.id.clone().unwrap_or_default(),
                                     due: Some(expected_expiry),
                                     noncurrent_days: 0,
                                     newer_noncurrent_versions: 0,
@@ -504,9 +504,9 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 if now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp() {
                                     events.push(Event {
                                         action: IlmAction::TransitionAction,
-                                        rule_id: rule.id.clone().expect("err!"),
+                                        rule_id: rule.id.clone().unwrap_or_default(),
                                         due,
-                                        storage_class: transitions[0].storage_class.clone().expect("err!").as_str().to_string(),
+                                        storage_class: transitions[0].storage_class.clone().unwrap_or(TransitionStorageClass::from_static("")).as_str().to_string(),
                                         noncurrent_days: 0,
                                         newer_noncurrent_versions: 0,
                                     });
@@ -520,9 +520,9 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
         if events.len() > 0 {
             events.sort_by(|a, b| {
-                if now.unix_timestamp() > a.due.expect("err!").unix_timestamp()
-                    && now.unix_timestamp() > b.due.expect("err").unix_timestamp()
-                    || a.due.expect("err").unix_timestamp() == b.due.expect("err").unix_timestamp()
+                if now.unix_timestamp() > a.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp()
+                    && now.unix_timestamp() > b.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp()
+                    || a.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp() == b.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp()
                 {
                     match a.action {
                         IlmAction::DeleteAllVersionsAction
@@ -545,7 +545,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     return Ordering::Less;
                 }
 
-                if a.due.expect("err").unix_timestamp() < b.due.expect("err").unix_timestamp() {
+                if a.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp() < b.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp() {
                     return Ordering::Less;
                 }
                 return Ordering::Greater;
@@ -566,8 +566,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
                         }
                         return Event {
                             action: IlmAction::DeleteVersionAction,
-                            rule_id: rule.id.clone().expect("err"),
-                            noncurrent_days: noncurrent_version_expiration.noncurrent_days.expect("noncurrent_days err.") as u32,
+                            rule_id: rule.id.clone().unwrap_or_default(),
+                            noncurrent_days: noncurrent_version_expiration.noncurrent_days.unwrap_or(0) as u32,
                             newer_noncurrent_versions: newer_noncurrent_versions as usize,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
@@ -575,8 +575,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     } else {
                         return Event {
                             action: IlmAction::DeleteVersionAction,
-                            rule_id: rule.id.clone().expect("err"),
-                            noncurrent_days: noncurrent_version_expiration.noncurrent_days.expect("noncurrent_days err.") as u32,
+                            rule_id: rule.id.clone().unwrap_or_default(),
+                            noncurrent_days: noncurrent_version_expiration.noncurrent_days.unwrap_or(0) as u32,
                             newer_noncurrent_versions: 0,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
