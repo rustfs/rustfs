@@ -791,9 +791,10 @@ impl S3 for FS {
         );
 
         // Set object info for event notification
-        helper = helper
-            .object(obj_info.clone())
-            .version_id(obj_info.version_id.map(|v| v.to_string()).unwrap_or_default());
+        helper = helper.object(obj_info.clone());
+        if let Some(version_id) = &mpu_version {
+            helper = helper.version_id(version_id.clone());
+        }
 
         let helper_result = Ok(S3Response::new(helper_output));
         let _ = helper.complete(&helper_result);
