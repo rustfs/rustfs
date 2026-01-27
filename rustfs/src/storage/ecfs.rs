@@ -111,7 +111,7 @@ use rustfs_targets::{
     arn::{ARN, TargetIDError},
 };
 use rustfs_utils::{
-    CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_port,
+    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
     get_request_user_agent,
     http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
@@ -388,7 +388,7 @@ impl FS {
                     event_name: EventName::ObjectCreatedPut,
                     bucket_name: bucket.clone(),
                     object: _obj_info.clone(),
-                    req_params: extract_req_params_header(&req.headers),
+                    req_params: extract_params_header(&req.headers),
                     resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
                     version_id: version_id.clone(),
                     host: get_request_host(&req.headers),
@@ -2034,7 +2034,7 @@ impl S3 for FS {
                         },
                     )
                     .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
-                    .req_params(extract_req_params_header(&req_headers))
+                    .req_params(extract_params_header(&req_headers))
                     .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
                     .host(get_request_host(&req_headers))
                     .user_agent(get_request_user_agent(&req_headers))

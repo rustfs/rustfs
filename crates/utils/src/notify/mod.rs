@@ -27,6 +27,7 @@ pub fn extract_req_params<T>(req: &S3Request<T>) -> HashMap<String, String> {
 
 /// Extract request parameters from hyper::HeaderMap, mainly header information.
 /// This function is useful when you have a raw HTTP request and need to extract parameters.
+#[deprecated(since = "0.1.0", note = "Use extract_params_header instead")]
 pub fn extract_req_params_header(head: &HeaderMap) -> HashMap<String, String> {
     extract_params_header(head)
 }
@@ -63,6 +64,7 @@ pub fn get_request_host(headers: &HeaderMap) -> String {
 /// 2. host header (parse port)
 ///    If host has no port, try to deduce from x-forwarded-proto (http->80, https->443)
 /// 3. port header
+///
 /// If the port cannot be determined, returns 0.
 pub fn get_request_port(headers: &HeaderMap) -> u16 {
     // 1. Try x-forwarded-port
@@ -84,12 +86,11 @@ pub fn get_request_port(headers: &HeaderMap) -> u16 {
                 None => true,
             };
 
-            if valid_colon {
-                if let Ok(port) = host[idx + 1..].parse::<u16>() {
-                    if port > 0 {
-                        return port;
-                    }
-                }
+            if valid_colon
+                && let Ok(port) = host[idx + 1..].parse::<u16>()
+                && port > 0
+            {
+                return port;
             }
         }
 
