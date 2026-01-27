@@ -108,7 +108,8 @@ use rustfs_targets::{
     arn::{ARN, TargetIDError},
 };
 use rustfs_utils::{
-    CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
+    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
+    get_request_user_agent,
     http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
@@ -670,10 +671,11 @@ impl FS {
                     event_name: EventName::ObjectCreatedPut,
                     bucket_name: bucket.clone(),
                     object: _obj_info.clone(),
-                    req_params: extract_req_params_header(&req.headers),
+                    req_params: extract_params_header(&req.headers),
                     resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
                     version_id: version_id.clone(),
                     host: get_request_host(&req.headers),
+                    port: get_request_port(&req.headers),
                     user_agent: get_request_user_agent(&req.headers),
                 };
 
@@ -1022,11 +1024,12 @@ impl S3 for FS {
             }
         }
 
+        let region = rustfs_ecstore::global::get_global_region().unwrap_or_else(|| "us-east-1".to_string());
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some("us-east-1".to_string()),
+            location: Some(region.clone()),
             server_side_encryption: server_side_encryption.clone(), // TDD: Return encryption info
             ssekms_key_id: ssekms_key_id.clone(),                   // TDD: Return KMS key ID if present
             checksum_crc32: checksum_crc32.clone(),
@@ -1047,7 +1050,7 @@ impl S3 for FS {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some("us-east-1".to_string()),
+            location: Some(region),
             server_side_encryption, // TDD: Return encryption info
             ssekms_key_id,          // TDD: Return KMS key ID if present
             checksum_crc32,
@@ -1060,10 +1063,10 @@ impl S3 for FS {
         };
 
         let mt2 = HashMap::new();
-        let repoptions =
+        let replicate_options =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
 
-        let dsc = must_replicate(&bucket, &key, repoptions).await;
+        let dsc = must_replicate(&bucket, &key, replicate_options).await;
 
         if dsc.replicate_any() {
             warn!("need multipart replication");
@@ -1075,7 +1078,7 @@ impl S3 for FS {
         );
 
         // Set object info for event notification
-        helper = helper.object(obj_info.clone());
+        helper = helper.object(obj_info);
         if let Some(version_id) = &mpu_version_for_event {
             helper = helper.version_id(version_id.clone());
         }
@@ -2263,7 +2266,7 @@ impl S3 for FS {
                         },
                     )
                     .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
-                    .req_params(extract_req_params_header(&req_headers))
+                    .req_params(extract_params_header(&req_headers))
                     .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
                     .host(get_request_host(&req_headers))
                     .user_agent(get_request_user_agent(&req_headers))
