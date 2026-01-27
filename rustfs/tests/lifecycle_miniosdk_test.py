@@ -30,7 +30,7 @@ Settings = namedtuple("Settings", ['oss_endpoint',
     'oss_secure',
     'oss_region'])
 settings = Settings(
-    oss_endpoint = "m1ddns.pvtool.com:9000",
+    oss_endpoint=os.getenv("TEST_RUSTFS_SERVER"),
     oss_access_key = "rustfsadmin",
     oss_secret_key = "rustfsadmin",
     oss_bucket_name = "mblock99",

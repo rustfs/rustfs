@@ -6,7 +6,7 @@
   tasks:
     - name: Configure S3 bucket lifecycle
       community.aws.s3_lifecycle:
-        endpoint_url: "http://m1ddns.pvtool.com:9000"
+        endpoint_url: "http://www.example.com:9000"
         access_key: "rustfsadmin"
         secret_key: "rustfsadmin"
         name: "mblock"

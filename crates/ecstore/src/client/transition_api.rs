@@ -324,8 +324,9 @@ impl TransitionClient {
                     body_vec.extend_from_slice(data);
                 }
             }
-            warn!("err_body: {}", String::from_utf8(body_vec).unwrap());
-            Err(std::io::Error::other("http_client call error."))
+            let body_str = String::from_utf8_lossy(&body_vec);
+            warn!("err_body: {}", body_str);
+            Err(std::io::Error::other(format!("http_client call error: {}", body_str)))
         } else {
             Ok(resp)
         }
