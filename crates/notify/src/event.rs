@@ -212,7 +212,6 @@ impl Event {
             },
             object: Object {
                 key: key_name,
-                user_metadata: None,
                 version_id,
                 sequencer,
                 ..Default::default()
