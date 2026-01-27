@@ -4666,7 +4666,7 @@ impl S3 for FS {
 
         // query-meta is only enabled for SigV4 presigned PutObject
         let auth_type = crate::auth::get_request_auth_type(&req.headers);
-        let extra_kv = extract_metadata_extra_from_presigned_putobject_query(&req.uri, &req.methd, auth_type)
+        let extra_kv = extract_metadata_extra_from_presigned_putobject_query(&req.uri, &req.method, auth_type)
             .map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
 
         extract_metadata_from_mime_with_object_name_and_extra_kv(&req.headers, &mut metadata, true, Some(&key), extra_kv);
