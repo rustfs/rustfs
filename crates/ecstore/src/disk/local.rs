@@ -2598,10 +2598,7 @@ impl DiskAPI for LocalDisk {
         }
 
         // Fallback to direct read if cache fails
-        let (data, _) = self.read_metadata_with_dmtime(&file_path).await.map_err(|e| {
-            error!("read_metadata: error: {:?}, file_path={}", e, file_path.to_string_lossy());
-            e
-        })?;
+        let (data, _) = self.read_metadata_with_dmtime(&file_path).await?;
         Ok(data.into())
     }
 }
