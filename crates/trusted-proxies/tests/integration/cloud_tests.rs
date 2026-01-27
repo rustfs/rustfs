@@ -14,6 +14,7 @@
 
 use rustfs_trusted_proxies::cloud::detector::CloudDetector;
 use rustfs_trusted_proxies::cloud::metadata::AwsMetadataFetcher;
+use rustfs_trusted_proxies::CloudMetadataFetcher;
 use std::time::Duration;
 
 #[tokio::test]
@@ -25,6 +26,6 @@ async fn test_cloud_detector_disabled() {
 
 #[tokio::test]
 async fn test_aws_metadata_fetcher() {
-    let fetcher = AwsMetadataFetcher::new();
+    let fetcher = AwsMetadataFetcher::new(Duration::from_secs(5));
     assert_eq!(fetcher.provider_name(), "aws");
 }

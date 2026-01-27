@@ -27,7 +27,7 @@ categories = ["network-programming", "security", "web-programming"]
 [dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 http = { workspace = true }
 tower-http = { workspace = true }
 ipnetwork = { workspace = true }

@@ -275,7 +275,7 @@ impl ProxyValidator {
     }
 
     /// Parses the X-Forwarded-For header into a list of IP addresses.
-    fn parse_x_forwarded_for(header_value: &str) -> Vec<IpAddr> {
+    pub fn parse_x_forwarded_for(header_value: &str) -> Vec<IpAddr> {
         header_value
             .split(',')
             .map(|s| s.trim())

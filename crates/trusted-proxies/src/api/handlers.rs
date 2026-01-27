@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 pub async fn health_check() -> impl IntoResponse {
     Json(json!({
         "status": "healthy",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "timestamp": jiff::Timestamp::now().to_string(),
         "service": "trusted-proxy",
         "version": env!("CARGO_PKG_VERSION"),
     }))
@@ -87,7 +87,7 @@ pub async fn client_info(State(_state): State<AppState>, req: Request) -> impl I
                     "forwarded_proto": info.forwarded_proto,
                 },
                 "warnings": info.warnings,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": jiff::Timestamp::now().to_string(),
             });
 
             Json(response).into_response()
@@ -129,7 +129,7 @@ pub async fn proxy_test(req: Request) -> Json<Value> {
         "method": req.method().to_string(),
         "uri": req.uri().to_string(),
         "proxy_headers": headers,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "timestamp": jiff::Timestamp::now().to_string(),
     }))
 }
 

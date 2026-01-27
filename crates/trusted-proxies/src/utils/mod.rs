@@ -69,7 +69,7 @@ impl Utils {
 
     /// Returns the current UTC timestamp in RFC 3339 format.
     pub fn current_timestamp() -> String {
-        chrono::Utc::now().to_rfc3339()
+        jiff::Timestamp::now().to_string()
     }
 
     /// Safely retrieves an environment variable.

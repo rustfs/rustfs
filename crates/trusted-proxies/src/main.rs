@@ -14,11 +14,10 @@
 
 //! Main application entry point for the RustFS Trusted Proxies service.
 
+use axum::{routing::get, Router};
 use std::sync::Arc;
-
-use axum::{Router, routing::get};
 use tokio::net::TcpListener;
-use tracing::{Level, info};
+use tracing::{info, Level};
 use tracing_subscriber::EnvFilter;
 
 mod api;

@@ -20,101 +20,101 @@ use std::str::FromStr;
 
 // ==================== Base Proxy Configuration ====================
 /// Environment variable for the proxy validation mode.
-pub const ENV_PROXY_VALIDATION_MODE: &str = "TRUSTED_PROXY_VALIDATION_MODE";
+pub const ENV_PROXY_VALIDATION_MODE: &str = "RUSTFS_TRUSTED_PROXY_VALIDATION_MODE";
 /// Default validation mode is "hop_by_hop".
 pub const DEFAULT_PROXY_VALIDATION_MODE: &str = "hop_by_hop";
 
 /// Environment variable to enable RFC 7239 "Forwarded" header support.
-pub const ENV_PROXY_ENABLE_RFC7239: &str = "TRUSTED_PROXY_ENABLE_RFC7239";
+pub const ENV_PROXY_ENABLE_RFC7239: &str = "RUSTFS_TRUSTED_PROXY_ENABLE_RFC7239";
 /// RFC 7239 support is enabled by default.
 pub const DEFAULT_PROXY_ENABLE_RFC7239: bool = true;
 
 /// Environment variable for the maximum allowed proxy hops.
-pub const ENV_PROXY_MAX_HOPS: &str = "TRUSTED_PROXY_MAX_HOPS";
+pub const ENV_PROXY_MAX_HOPS: &str = "RUSTFS_TRUSTED_PROXY_MAX_HOPS";
 /// Default maximum hops is 10.
 pub const DEFAULT_PROXY_MAX_HOPS: usize = 10;
 
 /// Environment variable to enable proxy chain continuity checks.
-pub const ENV_PROXY_CHAIN_CONTINUITY_CHECK: &str = "TRUSTED_PROXY_CHAIN_CONTINUITY_CHECK";
+pub const ENV_PROXY_CHAIN_CONTINUITY_CHECK: &str = "RUSTFS_TRUSTED_PROXY_CHAIN_CONTINUITY_CHECK";
 /// Continuity checks are enabled by default.
 pub const DEFAULT_PROXY_CHAIN_CONTINUITY_CHECK: bool = true;
 
 /// Environment variable to enable logging of failed proxy validations.
-pub const ENV_PROXY_LOG_FAILED_VALIDATIONS: &str = "TRUSTED_PROXY_LOG_FAILED_VALIDATIONS";
+pub const ENV_PROXY_LOG_FAILED_VALIDATIONS: &str = "RUSTFS_TRUSTED_PROXY_LOG_FAILED_VALIDATIONS";
 /// Logging of failed validations is enabled by default.
 pub const DEFAULT_PROXY_LOG_FAILED_VALIDATIONS: bool = true;
 
 // ==================== Trusted Proxy Networks ====================
 /// Environment variable for the list of trusted proxy networks (comma-separated IP/CIDR).
-pub const ENV_TRUSTED_PROXIES: &str = "TRUSTED_PROXY_NETWORKS";
+pub const ENV_TRUSTED_PROXIES: &str = "RUSTFS_TRUSTED_PROXY_NETWORKS";
 /// Default trusted networks include localhost and common private ranges.
 pub const DEFAULT_TRUSTED_PROXIES: &str = "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8";
 
 /// Environment variable for additional trusted proxy networks (production specific).
-pub const ENV_EXTRA_TRUSTED_PROXIES: &str = "TRUSTED_PROXY_EXTRA_NETWORKS";
+pub const ENV_EXTRA_TRUSTED_PROXIES: &str = "RUSTFS_TRUSTED_PROXY_EXTRA_NETWORKS";
 /// No extra trusted networks by default.
 pub const DEFAULT_EXTRA_TRUSTED_PROXIES: &str = "";
 
 /// Environment variable for private network ranges used in internal validation.
-pub const ENV_PRIVATE_NETWORKS: &str = "TRUSTED_PROXY_PRIVATE_NETWORKS";
+pub const ENV_PRIVATE_NETWORKS: &str = "RUSTFS_TRUSTED_PROXY_PRIVATE_NETWORKS";
 /// Default private networks include common RFC 1918 and RFC 4193 ranges.
 pub const DEFAULT_PRIVATE_NETWORKS: &str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8";
 
 // ==================== Cache Configuration ====================
 /// Environment variable for the proxy validation cache capacity.
-pub const ENV_CACHE_CAPACITY: &str = "TRUSTED_PROXY_CACHE_CAPACITY";
+pub const ENV_CACHE_CAPACITY: &str = "RUSTFS_TRUSTED_PROXY_CACHE_CAPACITY";
 /// Default cache capacity is 10,000 entries.
 pub const DEFAULT_CACHE_CAPACITY: usize = 10_000;
 
 /// Environment variable for the cache entry time-to-live (TTL) in seconds.
-pub const ENV_CACHE_TTL_SECONDS: &str = "TRUSTED_PROXY_CACHE_TTL_SECONDS";
+pub const ENV_CACHE_TTL_SECONDS: &str = "RUSTFS_TRUSTED_PROXY_CACHE_TTL_SECONDS";
 /// Default cache TTL is 300 seconds (5 minutes).
 pub const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
 
 /// Environment variable for the cache cleanup interval in seconds.
-pub const ENV_CACHE_CLEANUP_INTERVAL: &str = "TRUSTED_PROXY_CACHE_CLEANUP_INTERVAL";
+pub const ENV_CACHE_CLEANUP_INTERVAL: &str = "RUSTFS_TRUSTED_PROXY_CACHE_CLEANUP_INTERVAL";
 /// Default cleanup interval is 60 seconds.
 pub const DEFAULT_CACHE_CLEANUP_INTERVAL: u64 = 60;
 
 // ==================== Monitoring Configuration ====================
 /// Environment variable to enable Prometheus metrics.
-pub const ENV_METRICS_ENABLED: &str = "TRUSTED_PROXY_METRICS_ENABLED";
+pub const ENV_METRICS_ENABLED: &str = "RUSTFS_TRUSTED_PROXY_METRICS_ENABLED";
 /// Metrics are enabled by default.
 pub const DEFAULT_METRICS_ENABLED: bool = true;
 
 /// Environment variable for the application log level.
-pub const ENV_LOG_LEVEL: &str = "TRUSTED_PROXY_LOG_LEVEL";
+pub const ENV_LOG_LEVEL: &str = "RUSTFS_TRUSTED_PROXY_LOG_LEVEL";
 /// Default log level is "info".
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Environment variable to enable structured JSON logging.
-pub const ENV_STRUCTURED_LOGGING: &str = "TRUSTED_PROXY_STRUCTURED_LOGGING";
+pub const ENV_STRUCTURED_LOGGING: &str = "RUSTFS_TRUSTED_PROXY_STRUCTURED_LOGGING";
 /// Structured logging is disabled by default.
 pub const DEFAULT_STRUCTURED_LOGGING: bool = false;
 
 /// Environment variable to enable distributed tracing.
-pub const ENV_TRACING_ENABLED: &str = "TRUSTED_PROXY_TRACING_ENABLED";
+pub const ENV_TRACING_ENABLED: &str = "RUSTFS_TRUSTED_PROXY_TRACING_ENABLED";
 /// Tracing is enabled by default.
 pub const DEFAULT_TRACING_ENABLED: bool = true;
 
 // ==================== Cloud Integration ====================
 /// Environment variable to enable automatic cloud metadata discovery.
-pub const ENV_CLOUD_METADATA_ENABLED: &str = "TRUSTED_PROXY_CLOUD_METADATA_ENABLED";
+pub const ENV_CLOUD_METADATA_ENABLED: &str = "RUSTFS_TRUSTED_PROXY_CLOUD_METADATA_ENABLED";
 /// Cloud metadata discovery is disabled by default.
 pub const DEFAULT_CLOUD_METADATA_ENABLED: bool = false;
 
 /// Environment variable for the cloud metadata request timeout in seconds.
-pub const ENV_CLOUD_METADATA_TIMEOUT: &str = "TRUSTED_PROXY_CLOUD_METADATA_TIMEOUT";
+pub const ENV_CLOUD_METADATA_TIMEOUT: &str = "RUSTFS_TRUSTED_PROXY_CLOUD_METADATA_TIMEOUT";
 /// Default cloud metadata timeout is 5 seconds.
 pub const DEFAULT_CLOUD_METADATA_TIMEOUT: u64 = 5;
 
 /// Environment variable to enable Cloudflare IP range integration.
-pub const ENV_CLOUDFLARE_IPS_ENABLED: &str = "TRUSTED_PROXY_CLOUDFLARE_IPS_ENABLED";
+pub const ENV_CLOUDFLARE_IPS_ENABLED: &str = "RUSTFS_TRUSTED_PROXY_CLOUDFLARE_IPS_ENABLED";
 /// Cloudflare integration is disabled by default.
 pub const DEFAULT_CLOUDFLARE_IPS_ENABLED: bool = false;
 
 /// Environment variable to force a specific cloud provider (overrides auto-detection).
-pub const ENV_CLOUD_PROVIDER_FORCE: &str = "TRUSTED_PROXY_CLOUD_PROVIDER_FORCE";
+pub const ENV_CLOUD_PROVIDER_FORCE: &str = "RUSTFS_TRUSTED_PROXY_CLOUD_PROVIDER_FORCE";
 /// No forced provider by default.
 pub const DEFAULT_CLOUD_PROVIDER_FORCE: &str = "";
 

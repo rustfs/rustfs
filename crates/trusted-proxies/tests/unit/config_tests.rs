@@ -17,8 +17,11 @@ use rustfs_trusted_proxies::config::{ConfigLoader, TrustedProxy, TrustedProxyCon
 use std::net::IpAddr;
 
 #[test]
+#[allow(unsafe_code)]
 fn test_config_loader_default() {
-    std::env::remove_var(ENV_TRUSTED_PROXIES);
+    unsafe {
+        std::env::remove_var(ENV_TRUSTED_PROXIES);
+    }
     let config = ConfigLoader::from_env_or_default();
     assert_eq!(config.server_addr.port(), 3000);
     assert!(!config.proxy.proxies.is_empty());
@@ -28,11 +31,20 @@ fn test_config_loader_default() {
 }
 
 #[test]
+#[allow(unsafe_code)]
 fn test_config_loader_env_vars() {
-    std::env::set_var(ENV_TRUSTED_PROXIES, "192.168.1.0/24,10.0.0.0/8");
-    std::env::set_var("TRUSTED_PROXY_VALIDATION_MODE", "strict");
-    std::env::set_var("TRUSTED_PROXY_MAX_HOPS", "5");
-    std::env::set_var("SERVER_PORT", "8080");
+    unsafe {
+        std::env::set_var(ENV_TRUSTED_PROXIES, "192.168.1.0/24,10.0.0.0/8");
+    }
+    unsafe {
+        std::env::set_var("TRUSTED_PROXY_VALIDATION_MODE", "strict");
+    }
+    unsafe {
+        std::env::set_var("TRUSTED_PROXY_MAX_HOPS", "5");
+    }
+    unsafe {
+        std::env::set_var("SERVER_PORT", "8080");
+    }
 
     let config = ConfigLoader::from_env();
 
@@ -41,10 +53,18 @@ fn test_config_loader_env_vars() {
         assert_eq!(config.proxy.validation_mode, ValidationMode::Strict);
         assert_eq!(config.proxy.max_hops, 5);
 
-        std::env::remove_var(ENV_TRUSTED_PROXIES);
-        std::env::remove_var("TRUSTED_PROXY_VALIDATION_MODE");
-        std::env::remove_var("TRUSTED_PROXY_MAX_HOPS");
-        std::env::remove_var("SERVER_PORT");
+        unsafe {
+            std::env::remove_var(ENV_TRUSTED_PROXIES);
+        }
+        unsafe {
+            std::env::remove_var("TRUSTED_PROXY_VALIDATION_MODE");
+        }
+        unsafe {
+            std::env::remove_var("TRUSTED_PROXY_MAX_HOPS");
+        }
+        unsafe {
+            std::env::remove_var("SERVER_PORT");
+        }
     } else {
         panic!("Failed to load configuration from environment variables");
     }
