@@ -391,6 +391,7 @@ impl FS {
                     resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
                     version_id: version_id.clone(),
                     host: get_request_host(&req.headers),
+                    port: get_request_port(&req.headers),
                     user_agent: get_request_user_agent(&req.headers),
                 };
 
@@ -788,6 +789,7 @@ impl S3 for FS {
             "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
             output.server_side_encryption, output.ssekms_key_id
         );
+        helper.object(obj_info);
         let helper_result = Ok(S3Response::new(helper_output));
         let _ = helper.complete(&helper_result);
         Ok(S3Response::new(output))
