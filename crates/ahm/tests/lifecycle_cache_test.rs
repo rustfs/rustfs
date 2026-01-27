@@ -16,15 +16,19 @@ use heed::byteorder::BigEndian;
 use heed::types::*;
 use heed::{BoxedError, BytesDecode, BytesEncode, Database, DatabaseFlags, Env, EnvOpenOptions};
 use rustfs_ahm::scanner::local_scan::{self, LocalObjectRecord, LocalScanOutcome};
+use rustfs_common::metrics::IlmAction;
 use rustfs_ecstore::{
+    bucket::lifecycle::lifecycle::{self, Event, Lifecycle, LifecycleCalculate, TRANSITION_COMPLETE, expected_expiry_time},
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
     store_api::{MakeBucketOptions, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader, StorageAPI},
 };
+use s3s::dto::BucketLifecycleConfiguration;
 use serial_test::serial;
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     path::PathBuf,
     sync::{Arc, Once, OnceLock},
 };
@@ -495,8 +499,21 @@ mod serial_tests {
                             object_name,
                         } = &elm.1;
                         println!("cache row:{ver_no} {ver_id} {mod_time} {type_:?} {object_name}");
+                        let lifecycle_config = match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
+                            Ok(bucket_meta) => {
+                                if let Some(lifecycle_config) = bucket_meta.lifecycle_config.clone() {
+                                    lifecycle_config
+                                } else {
+                                    panic!("❌ lifecycle_config metadata retrieved error");
+                                }
+                            }
+                            Err(e) => {
+                                panic!("❌ Error retrieving bucket metadata: {e:?}");
+                            }
+                        };
                         //eval_inner(&oi.to_lifecycle_opts(), OffsetDateTime::now_utc()).await;
-                        eval_inner(
+                        /*eval_inner(
+                            lifecycle_config,
                             &lifecycle::ObjectOpts {
                                 name: oi.name.clone(),
                                 user_tags: oi.user_tags.clone(),
@@ -513,9 +530,8 @@ mod serial_tests {
                                 ..Default::default()
                             },
                             OffsetDateTime::now_utc(),
-                            0
                         )
-                        .await;
+                        .await;*/
                     }
                     println!("row:{row:?}");
                 }
@@ -528,7 +544,7 @@ mod serial_tests {
     }
 }
 
-async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event {
+async fn eval_inner(lifecycle_config: &BucketLifecycleConfiguration, obj: &lifecycle::ObjectOpts, now: OffsetDateTime) -> Event {
     let mut events = Vec::<Event>::new();
     info!(
         "eval_inner: object={}, mod_time={:?}, now={:?}, is_latest={}, delete_marker={}",
@@ -557,7 +573,7 @@ async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event {
         }
     }
 
-    if let Some(ref lc_rules) = self.filter_rules(obj).await {
+    if let Some(ref lc_rules) = lifecycle_config.filter_rules(obj).await {
         for rule in lc_rules.iter() {
             if obj.expired_object_deletemarker() {
                 if let Some(expiration) = rule.expiration.as_ref() {
@@ -676,10 +692,10 @@ async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event {
                 obj.is_latest,
                 obj.delete_marker,
                 obj.version_id,
-                (obj.is_latest || obj.version_id.is_empty()) && !obj.delete_marker
+                (obj.is_latest || obj.version_id.is_none_or(|v| v.is_nil())) && !obj.delete_marker
             );
             // Allow expiration for latest objects OR non-versioned objects (empty version_id)
-            if (obj.is_latest || obj.version_id.is_empty()) && !obj.delete_marker {
+            if (obj.is_latest || obj.version_id.is_none_or(|v| v.is_nil())) && !obj.delete_marker {
                 info!("eval_inner: entering expiration check");
                 if let Some(ref expiration) = rule.expiration {
                     if let Some(ref date) = expiration.date {
