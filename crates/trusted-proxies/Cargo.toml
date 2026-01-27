@@ -41,7 +41,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 tower = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
 uuid = { workspace = true, features = ["v4"] }
 regex = { workspace = true }
 lazy_static = { workspace = true }
