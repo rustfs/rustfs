@@ -1315,7 +1315,7 @@ mod tests {
         // %FF is invalid UTF-8 when percent-decoded into bytes.
         let uri: Uri = "/b/k?x-amz-meta-a=%FF".parse().unwrap();
         let err = extract_query_meta_from_uri(&uri).unwrap_err();
-        assert!(err.to_string().to_ascii_lowercase().contains("utf-8"));
+        assert!(err.message().unwrap().to_ascii_lowercase().contains("utf-8"));
     }
 
     #[test]
@@ -1323,7 +1323,7 @@ mod tests {
         // newline is not allowed
         let uri: Uri = "/b/k?x-amz-meta-a=hello%0Aworld".parse().unwrap();
         let err = extract_query_meta_from_uri(&uri).unwrap_err();
-        assert!(err.to_string().to_ascii_lowercase().contains("printable"));
+        assert!(err.message().unwrap().to_ascii_lowercase().contains("printable"));
     }
 
     #[test]
@@ -1331,14 +1331,14 @@ mod tests {
         let big = "a".repeat(QUERY_META_MAX_ENTRY_BYTES + 1);
         let uri: Uri = format!("/b/k?x-amz-meta-a={big}").parse().unwrap();
         let err = extract_query_meta_from_uri(&uri).unwrap_err();
-        assert!(err.to_string().to_ascii_lowercase().contains("entry too large"));
+        assert!(err.message().unwrap().to_ascii_lowercase().contains("entry too large"));
     }
 
     #[test]
     fn test_extract_query_meta_enforces_total_limit() {
         // Make many small entries to exceed total.
         let mut qs = String::new();
-        for i in 0..200 {
+        for i in 0..1000 {
             if !qs.is_empty() {
                 qs.push('&');
             }
@@ -1346,6 +1346,6 @@ mod tests {
         }
         let uri: Uri = format!("/b/k?{qs}").parse().unwrap();
         let err = extract_query_meta_from_uri(&uri).unwrap_err();
-        assert!(err.to_string().to_ascii_lowercase().contains("total too large"));
+        assert!(err.message().unwrap().to_ascii_lowercase().contains("total too large"));
     }
 }
