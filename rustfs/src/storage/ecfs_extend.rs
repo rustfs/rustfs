@@ -47,9 +47,13 @@ use std::collections::HashMap;
 use std::ops::Add;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use time::format_description::well_known::{Rfc2822, Rfc3339};
+use time::format_description::well_known::Rfc3339;
+use time::{format_description::FormatItem, macros::format_description};
 use tokio::io::AsyncRead;
 use tracing::{debug, warn};
+
+const RFC1123: &[FormatItem<'_>] =
+    format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
 /// =======================
 /// Presigned POST helpers
@@ -614,7 +618,7 @@ pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Resul
 }
 
 /// Validates HTTP conditional request headers for a single object according to
-/// RFC 7232 and S3 API semantics.
+/// RFC 7232 (HTTP/1.1 conditional requests) and S3 API semantics.
 ///
 /// This function evaluates the following headers, if present, in the standard
 /// conditional request order:
@@ -654,7 +658,7 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
     if headers.get("if-match").is_none()
         && let Some(t) = mod_time
         && let Some(if_unmodified_since) = headers.get("if-unmodified-since").and_then(|v| v.to_str().ok())
-        && let Ok(given_time) = OffsetDateTime::parse(if_unmodified_since, &Rfc2822)
+        && let Ok(given_time) = time::PrimitiveDateTime::parse(if_unmodified_since, &RFC1123).map(|dt| dt.assume_utc())
         && t > given_time.add(time::Duration::seconds(1))
     {
         return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
@@ -670,7 +674,7 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
             error_headers.insert("etag", etag_header);
         }
         if let Some(t) = mod_time
-            && let Ok(last_modified_str) = t.format(&Rfc2822)
+            && let Ok(last_modified_str) = t.format(&RFC1123)
             && let Ok(last_modified_header) = HeaderValue::from_str(&last_modified_str)
         {
             error_headers.insert("last-modified", last_modified_header);
@@ -683,11 +687,11 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
         return Err(s3_error);
     }
 
-    // If-Modified-Since (only when If-None-Match is absent - RFC 7232)
+    // If-Modified-Since (only when If-None-Match is absent — semantics per RFC 7232; dates use RFC 1123 format)
     if headers.get("if-none-match").is_none()
         && let Some(t) = mod_time
         && let Some(if_modified_since) = headers.get("if-modified-since").and_then(|v| v.to_str().ok())
-        && let Ok(given_time) = OffsetDateTime::parse(if_modified_since, &Rfc2822)
+        && let Ok(given_time) = time::PrimitiveDateTime::parse(if_modified_since, &RFC1123).map(|dt| dt.assume_utc())
         && t < given_time.add(time::Duration::seconds(1))
     {
         let mut error_headers = HeaderMap::new();
@@ -696,7 +700,7 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
         {
             error_headers.insert("etag", etag_header);
         }
-        if let Ok(last_modified_str) = t.format(&Rfc2822)
+        if let Ok(last_modified_str) = t.format(&RFC1123)
             && let Ok(last_modified_header) = HeaderValue::from_str(&last_modified_str)
         {
             error_headers.insert("last-modified", last_modified_header);
