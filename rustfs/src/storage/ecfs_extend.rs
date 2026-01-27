@@ -618,7 +618,7 @@ pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Resul
 }
 
 /// Validates HTTP conditional request headers for a single object according to
-/// RFC 1123 and S3 API semantics.
+/// RFC 7232 (HTTP/1.1 conditional requests) and S3 API semantics.
 ///
 /// This function evaluates the following headers, if present, in the standard
 /// conditional request order:
@@ -687,7 +687,7 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
         return Err(s3_error);
     }
 
-    // If-Modified-Since (only when If-None-Match is absent - RFC 1123)
+    // If-Modified-Since (only when If-None-Match is absent — semantics per RFC 7232; dates use RFC 1123 format)
     if headers.get("if-none-match").is_none()
         && let Some(t) = mod_time
         && let Some(if_modified_since) = headers.get("if-modified-since").and_then(|v| v.to_str().ok())
