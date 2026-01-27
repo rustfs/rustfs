@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use std::io::Error;
 use std::sync::OnceLock;
 use time::OffsetDateTime;
@@ -28,6 +29,37 @@ static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
 /// Global RPC authentication token
 pub static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
 
+/// Error type for credentials operations
+#[derive(Debug)]
+pub enum CredentialsError {
+    /// Credentials already initialized
+    AlreadyInitialized,
+    /// Failed to generate access key
+    AccessKeyGenerationFailed(Error),
+    /// Failed to generate secret key
+    SecretKeyGenerationFailed(Error),
+}
+
+impl fmt::Display for CredentialsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CredentialsError::AlreadyInitialized => write!(f, "Credentials already initialized"),
+            CredentialsError::AccessKeyGenerationFailed(e) => write!(f, "Failed to generate access key: {}", e),
+            CredentialsError::SecretKeyGenerationFailed(e) => write!(f, "Failed to generate secret key: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for CredentialsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CredentialsError::AccessKeyGenerationFailed(e) => Some(e),
+            CredentialsError::SecretKeyGenerationFailed(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 /// Initialize the global action credentials
 ///
 /// # Arguments
@@ -35,15 +67,17 @@ pub static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
 /// * `sk` - Optional secret key
 ///
 /// # Returns
-/// * `Result<(), Box<Credentials>>` - Ok if successful, Err with existing credentials if already initialized
-///
-/// # Panics
-/// This function panics if automatic credential generation fails when `ak` or `sk`
-/// are `None`, for example if the random number generator fails while calling
-/// `gen_access_key` or `gen_secret_key`.
-pub fn init_global_action_credentials(ak: Option<String>, sk: Option<String>) -> Result<(), Box<Credentials>> {
-    let ak = ak.unwrap_or_else(|| gen_access_key(20).expect("Failed to generate access key"));
-    let sk = sk.unwrap_or_else(|| gen_secret_key(32).expect("Failed to generate secret key"));
+/// * `Result<(), CredentialsError>` - Ok if successful, Err if already initialized or generation failed
+pub fn init_global_action_credentials(ak: Option<String>, sk: Option<String>) -> Result<(), CredentialsError> {
+    let ak = match ak {
+        Some(k) => k,
+        None => gen_access_key(20).map_err(CredentialsError::AccessKeyGenerationFailed)?,
+    };
+
+    let sk = match sk {
+        Some(k) => k,
+        None => gen_secret_key(32).map_err(CredentialsError::SecretKeyGenerationFailed)?,
+    };
 
     let cred = Credentials {
         access_key: ak,
@@ -51,12 +85,7 @@ pub fn init_global_action_credentials(ak: Option<String>, sk: Option<String>) ->
         ..Default::default()
     };
 
-    GLOBAL_ACTIVE_CRED.set(cred).map_err(|e| {
-        Box::new(Credentials {
-            access_key: e.access_key.clone(),
-            ..Default::default()
-        })
-    })
+    GLOBAL_ACTIVE_CRED.set(cred).map_err(|_| CredentialsError::AlreadyInitialized)
 }
 
 /// Get the global action credentials
@@ -195,6 +224,36 @@ pub fn get_rpc_token() -> String {
         .clone()
 }
 
+/// A wrapper struct for masking sensitive strings in Debug implementations.
+/// It avoids allocating a new String just for formatting.
+pub struct Masked<'a>(pub Option<&'a str>);
+
+impl<'a> fmt::Debug for Masked<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            None => Ok(()),
+            Some(s) => {
+                let len = s.len();
+                if len == 0 {
+                    Ok(())
+                } else if len == 1 {
+                    write!(f, "***")
+                } else if len == 2 {
+                    write!(f, "{}***|{}", &s[0..1], len)
+                } else {
+                    write!(f, "{}***{}|{}", &s[0..1], &s[len - 1..], len)
+                }
+            }
+        }
+    }
+}
+
+impl<'a> fmt::Display for Masked<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
 /// Credentials structure
 ///
 /// Fields:
@@ -209,7 +268,7 @@ pub fn get_rpc_token() -> String {
 /// - name: Optional name string
 /// - description: Optional description string
 ///
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Credentials {
     pub access_key: String,
     pub secret_key: String,
@@ -221,6 +280,23 @@ pub struct Credentials {
     pub claims: Option<HashMap<String, Value>>,
     pub name: Option<String>,
     pub description: Option<String>,
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access_key", &self.access_key)
+            .field("secret_key", &Masked(Some(&self.secret_key)))
+            .field("session_token", &self.session_token)
+            .field("expiration", &self.expiration)
+            .field("status", &self.status)
+            .field("parent_user", &self.parent_user)
+            .field("groups", &self.groups)
+            .field("claims", &self.claims)
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -382,5 +458,29 @@ mod tests {
             assert_eq!(ak.len(), 20);
             assert_eq!(sk.len(), 32);
         }
+    }
+
+    #[test]
+    fn test_masked_debug() {
+        // Test None
+        assert_eq!(format!("{:?}", Masked(None)), "");
+
+        // Test empty string
+        assert_eq!(format!("{:?}", Masked(Some(""))), "");
+
+        // Test length 1
+        assert_eq!(format!("{:?}", Masked(Some("a"))), "***");
+
+        // Test length 2
+        assert_eq!(format!("{:?}", Masked(Some("ab"))), "a***|2");
+
+        // Test length 3
+        assert_eq!(format!("{:?}", Masked(Some("abc"))), "a***c|3");
+
+        // Test length 4
+        assert_eq!(format!("{:?}", Masked(Some("abcd"))), "a***d|4");
+
+        // Test longer string
+        assert_eq!(format!("{:?}", Masked(Some("secretpassword"))), "s***d|14");
     }
 }

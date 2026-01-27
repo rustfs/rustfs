@@ -168,32 +168,22 @@ impl std::fmt::Debug for Opt {
             .field("address", &self.address)
             .field("server_domains", &self.server_domains)
             .field("access_key", &self.access_key)
-            .field("secret_key", &Opt::mask_sensitive(Some(&self.secret_key))) // Hide sensitive values
+            .field("secret_key", &rustfs_credentials::Masked(Some(&self.secret_key))) // Hide sensitive values
             .field("console_enable", &self.console_enable)
             .field("console_address", &self.console_address)
             .field("obs_endpoint", &self.obs_endpoint)
             .field("tls_path", &self.tls_path)
-            .field("license", &Opt::mask_sensitive(self.license.as_ref()))
+            .field("license", &rustfs_credentials::Masked(self.license.as_deref()))
             .field("region", &self.region)
             .field("kms_enable", &self.kms_enable)
             .field("kms_backend", &self.kms_backend)
             .field("kms_key_dir", &self.kms_key_dir)
             .field("kms_vault_address", &self.kms_vault_address)
-            .field("kms_vault_token", &Opt::mask_sensitive(self.kms_vault_token.as_ref()))
+            .field("kms_vault_token", &rustfs_credentials::Masked(self.kms_vault_token.as_deref()))
             .field("kms_default_key_id", &self.kms_default_key_id)
             .field("buffer_profile_disable", &self.buffer_profile_disable)
             .field("buffer_profile", &self.buffer_profile)
             .finish()
-    }
-}
-
-impl Opt {
-    /// Mask sensitive information in Option<String>
-    fn mask_sensitive(s: Option<&String>) -> String {
-        match s {
-            None => "".to_string(),
-            Some(s) => format!("{}***{}|{}", s.chars().next().unwrap_or('*'), s.chars().last().unwrap_or('*'), s.len()),
-        }
     }
 }
 

@@ -44,7 +44,7 @@ use rustfs_policy::policy::{
     BucketPolicy,
     action::{Action, AdminAction},
 };
-use rustfs_utils::path::{SLASH_SEPARATOR_STR, path_join_buf};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
     dto::{
@@ -423,7 +423,7 @@ impl Operation for ImportBucketMetadata {
         // Extract bucket names
         let mut bucket_names = Vec::new();
         for (file_path, _) in &file_contents {
-            let file_path_split = file_path.split(SLASH_SEPARATOR_STR).collect::<Vec<&str>>();
+            let file_path_split = file_path.split(SLASH_SEPARATOR).collect::<Vec<&str>>();
 
             if file_path_split.len() < 2 {
                 warn!("file path is invalid: {}", file_path);
@@ -462,7 +462,7 @@ impl Operation for ImportBucketMetadata {
 
         // Second pass: process file contents
         for (file_path, content) in file_contents {
-            let file_path_split = file_path.split(SLASH_SEPARATOR_STR).collect::<Vec<&str>>();
+            let file_path_split = file_path.split(SLASH_SEPARATOR).collect::<Vec<&str>>();
 
             if file_path_split.len() < 2 {
                 warn!("file path is invalid: {}", file_path);
