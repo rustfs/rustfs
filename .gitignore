@@ -6,6 +6,8 @@
 /test
 /logs
 /data
+/docs
+/rustfs-data/
 .devcontainer
 rustfs/static/*
 !rustfs/static/.gitkeep
