@@ -21,7 +21,7 @@ use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_targets::EventName;
 use rustfs_utils::{
-    extract_req_params, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
+    extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
 use s3s::{S3Request, S3Response, S3Result};
 use std::future::Future;
@@ -96,8 +96,9 @@ impl OperationHelper {
         // object is a placeholder that must be set later using the `object()` method.
         let event_builder = EventArgsBuilder::new(event, bucket, ObjectInfo::default())
             .host(get_request_host(&req.headers))
+            .port(get_request_port(&req.headers))
             .user_agent(get_request_user_agent(&req.headers))
-            .req_params(extract_req_params_header(&req.headers));
+            .req_params(extract_params_header(&req.headers));
 
         Self {
             audit_builder: Some(audit_builder),
