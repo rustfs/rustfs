@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::error::Error;
+use crate::disk::error::Error;
 
 pub static OBJECT_OP_IGNORED_ERRS: &[Error] = &[
     Error::DiskNotFound,

@@ -13,19 +13,19 @@
 // limitations under the License.
 
 use super::{DiskInfo, IOStats};
-use nix::sys::{stat::stat, statfs::statfs};
+use nix::sys::{stat::stat, statvfs::statvfs};
 use std::io::Error;
 use std::path::Path;
 
 /// Returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let path_display = p.as_ref().display();
-    let stat = statfs(p.as_ref())?;
+    let stat = statvfs(p.as_ref())?;
 
-    let bsize = stat.block_size() as u64;
-    let bfree = stat.blocks_free();
-    let bavail = stat.blocks_available();
-    let blocks = stat.blocks();
+    let bsize = stat.block_size();
+    let bfree = stat.blocks_free() as u64;
+    let bavail = stat.blocks_available() as u64;
+    let blocks = stat.blocks() as u64;
 
     let reserved = match bfree.checked_sub(bavail) {
         Some(reserved) => reserved,
@@ -59,9 +59,9 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         total,
         free,
         used,
-        files: stat.files(),
-        ffree: stat.files_free(),
-        fstype: stat.filesystem_type_name().to_string(),
+        files: stat.files() as u64,
+        ffree: stat.files_free() as u64,
+        // Statvfs does not provide a way to return the filesystem as name.
         ..Default::default()
     })
 }

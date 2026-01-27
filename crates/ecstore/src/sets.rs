@@ -13,8 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
-
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
@@ -44,17 +42,17 @@ use rustfs_common::{
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
-
+use rustfs_lock::FastLockGuard;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
-
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{error, info};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Sets {
@@ -367,6 +365,10 @@ impl ObjectIO for Sets {
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
     #[tracing::instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
+        self.disk_set[0].new_ns_lock(bucket, object).await
+    }
+    #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
         unimplemented!()
     }
@@ -491,12 +493,12 @@ impl StorageAPI for Sets {
         let cp_src_dst_same = path_join_buf(&[src_bucket, src_object]) == path_join_buf(&[dst_bucket, dst_object]);
 
         if cp_src_dst_same {
-            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id) {
-                if src_vid == dst_vid {
-                    return src_set
-                        .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-                        .await;
-                }
+            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
+                && src_vid == dst_vid
+            {
+                return src_set
+                    .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+                    .await;
             }
 
             if !dst_opts.versioned && src_opts.version_id.is_none() {
@@ -823,10 +825,10 @@ impl StorageAPI for Sets {
                         Ok((m, n)) => (m, n),
                         Err(_) => continue,
                     };
-                    if let Some(set) = self.disk_set.get(m) {
-                        if let Some(Some(disk)) = set.disks.read().await.get(n) {
-                            let _ = disk.close().await;
-                        }
+                    if let Some(set) = self.disk_set.get(m)
+                        && let Some(Some(disk)) = set.disks.read().await.get(n)
+                    {
+                        let _ = disk.close().await;
                     }
 
                     if let Some(Some(disk)) = disks.get(index) {
@@ -980,25 +982,24 @@ fn new_heal_format_sets(
     let mut current_disks_info = vec![vec![DiskInfo::default(); set_drive_count]; set_count];
     for (i, set) in ref_format.erasure.sets.iter().enumerate() {
         for j in 0..set.len() {
-            if let Some(Some(err)) = errs.get(i * set_drive_count + j) {
-                if *err == DiskError::UnformattedDisk {
-                    let mut fm = FormatV3::new(set_count, set_drive_count);
-                    fm.id = ref_format.id;
-                    fm.format = ref_format.format.clone();
-                    fm.version = ref_format.version.clone();
-                    fm.erasure.this = ref_format.erasure.sets[i][j];
-                    fm.erasure.sets = ref_format.erasure.sets.clone();
-                    fm.erasure.version = ref_format.erasure.version.clone();
-                    fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
-                    new_formats[i][j] = Some(fm);
-                }
+            if let Some(Some(err)) = errs.get(i * set_drive_count + j)
+                && *err == DiskError::UnformattedDisk
+            {
+                let mut fm = FormatV3::new(set_count, set_drive_count);
+                fm.id = ref_format.id;
+                fm.format = ref_format.format.clone();
+                fm.version = ref_format.version.clone();
+                fm.erasure.this = ref_format.erasure.sets[i][j];
+                fm.erasure.sets = ref_format.erasure.sets.clone();
+                fm.erasure.version = ref_format.erasure.version.clone();
+                fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
+                new_formats[i][j] = Some(fm);
             }
-            if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j]) {
-                if let Some(info) = &format.disk_info {
-                    if !info.endpoint.is_empty() {
-                        current_disks_info[i][j] = info.clone();
-                    }
-                }
+            if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j])
+                && let Some(info) = &format.disk_info
+                && !info.endpoint.is_empty()
+            {
+                current_disks_info[i][j] = info.clone();
             }
         }
     }

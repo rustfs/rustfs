@@ -269,6 +269,7 @@ async fn version_handler() -> impl IntoResponse {
 /// - 200 OK with JSON body containing the console configuration if initialized.
 /// - 500 Internal Server Error if configuration is not initialized.
 #[instrument(fields(uri))]
+#[allow(dead_code)]
 async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme
     let scheme = headers
@@ -367,35 +368,35 @@ async fn _setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<R
     debug!("Found TLS directory for console, checking for certificates");
 
     // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
-    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
-        if !cert_key_pairs.is_empty() {
-            debug!(
-                "Found {} certificates for console, creating SNI-aware multi-cert resolver",
-                cert_key_pairs.len()
-            );
+    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path)
+        && !cert_key_pairs.is_empty()
+    {
+        debug!(
+            "Found {} certificates for console, creating SNI-aware multi-cert resolver",
+            cert_key_pairs.len()
+        );
 
-            // Create an SNI-enabled certificate resolver
-            let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
+        // Create an SNI-enabled certificate resolver
+        let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
 
-            // Configure the server to enable SNI support
-            let mut server_config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(resolver));
+        // Configure the server to enable SNI support
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver));
 
-            // Configure ALPN protocol priority
-            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+        // Configure ALPN protocol priority
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
-            // Log SNI requests
-            if rustfs_utils::tls_key_log() {
-                server_config.key_log = Arc::new(rustls::KeyLogFile::new());
-            }
-
-            info!(target: "rustfs::console::tls", "Console TLS enabled with multi-certificate SNI support");
-            return Ok(Some(RustlsConfig::from_config(Arc::new(server_config))));
+        // Log SNI requests
+        if rustfs_utils::tls_key_log() {
+            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
+
+        info!(target: "rustfs::console::tls", "Console TLS enabled with multi-certificate SNI support");
+        return Ok(Some(RustlsConfig::from_config(Arc::new(server_config))));
     }
 
     // 2. Revert to the traditional single-certificate mode
@@ -482,7 +483,6 @@ fn setup_console_middleware_stack(
     let mut app = Router::new()
         .route(FAVICON_PATH, get(static_handler))
         .route(&format!("{CONSOLE_PREFIX}/license"), get(license_handler))
-        .route(&format!("{CONSOLE_PREFIX}/config.json"), get(config_handler))
         .route(&format!("{CONSOLE_PREFIX}/version"), get(version_handler))
         .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
@@ -555,7 +555,7 @@ async fn health_check(method: Method) -> Response {
             let body_json = json!({
                 "status": health_status,
                 "service": "rustfs-console",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": jiff::Zoned::now().to_string(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "details": details,
                 "uptime": std::time::SystemTime::now()

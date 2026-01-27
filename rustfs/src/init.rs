@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
+use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use crate::{admin, config, version};
-use chrono::Datelike;
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_notify::notifier_global;
@@ -26,7 +25,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 #[instrument]
 pub(crate) fn print_server_info() {
-    let current_year = chrono::Utc::now().year();
+    let current_year = jiff::Zoned::now().year();
     // Use custom macros to print server information
     info!("RustFS Object Storage Server");
     info!("Copyright: 2024-{} RustFS, Inc", current_year);
@@ -116,21 +115,29 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
                     "Bucket '{}' has existing notification configuration: {:?}", bucket, cfg);
 
                 let mut event_rules = Vec::new();
-                process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), |arn_str| {
+                if let Err(e) = process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), |arn_str| {
                     ARN::parse(arn_str)
                         .map(|arn| arn.target_id)
                         .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                });
-                process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), |arn_str| {
+                }) {
+                    error!("Failed to parse queue notification config for bucket '{}': {:?}", bucket, e);
+                }
+                if let Err(e) = process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), |arn_str| {
                     ARN::parse(arn_str)
                         .map(|arn| arn.target_id)
                         .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                });
-                process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), |arn_str| {
-                    ARN::parse(arn_str)
-                        .map(|arn| arn.target_id)
-                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                });
+                }) {
+                    error!("Failed to parse topic notification config for bucket '{}': {:?}", bucket, e);
+                }
+                if let Err(e) =
+                    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), |arn_str| {
+                        ARN::parse(arn_str)
+                            .map(|arn| arn.target_id)
+                            .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+                    })
+                {
+                    error!("Failed to parse lambda notification config for bucket '{}': {:?}", bucket, e);
+                }
 
                 if let Err(e) = notifier_global::add_event_specific_rules(bucket, region, &event_rules)
                     .await
@@ -320,32 +327,38 @@ pub(crate) fn init_buffer_profile_system(opt: &config::Opt) {
 /// as other services and MUST integrate with the global shutdown system.
 #[instrument(skip_all)]
 pub async fn init_ftp_system(
-    opt: &crate::config::Opt,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::protocols::ftps::server::{FtpsConfig, FtpsServer};
     use std::net::SocketAddr;
 
     // Check if FTPS is enabled
-    if !opt.ftps_enable {
+    let ftps_enable = rustfs_utils::get_env_bool(rustfs_config::ENV_FTPS_ENABLE, false);
+    if !ftps_enable {
         debug!("FTPS system is disabled");
         return Ok(());
     }
 
     // Parse FTPS address
-    let addr: SocketAddr = opt
-        .ftps_address
+    let ftps_address_str = rustfs_utils::get_env_str(rustfs_config::ENV_FTPS_ADDRESS, rustfs_config::DEFAULT_FTPS_ADDRESS);
+    let addr: SocketAddr = ftps_address_str
         .parse()
-        .map_err(|e| format!("Invalid FTPS address '{}': {}", opt.ftps_address, e))?;
+        .map_err(|e| format!("Invalid FTPS address '{ftps_address_str}': {e}"))?;
+
+    // Get FTPS configuration from environment variables
+    let cert_file = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_CERTS_FILE);
+    let key_file = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_KEY_FILE);
+    let passive_ports = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_PASSIVE_PORTS);
+    let external_ip = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_EXTERNAL_IP);
 
     // Create FTPS configuration
     let config = FtpsConfig {
         bind_addr: addr,
-        passive_ports: opt.ftps_passive_ports.clone(),
-        external_ip: opt.ftps_external_ip.clone(),
+        passive_ports,
+        external_ip,
         ftps_required: true,
-        cert_file: opt.ftps_certs_file.clone(),
-        key_file: opt.ftps_key_file.clone(),
+        cert_file,
+        key_file,
     };
 
     // Create FTPS server
@@ -380,31 +393,35 @@ pub async fn init_ftp_system(
 /// as other services and MUST integrate with the global shutdown system.
 #[instrument(skip_all)]
 pub async fn init_sftp_system(
-    opt: &config::Opt,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::protocols::sftp::server::{SftpConfig, SftpServer};
     use std::net::SocketAddr;
 
     // Check if SFTP is enabled
-    if !opt.sftp_enable {
+    let sftp_enable = rustfs_utils::get_env_bool(rustfs_config::ENV_SFTP_ENABLE, false);
+    if !sftp_enable {
         debug!("SFTP system is disabled");
         return Ok(());
     }
 
     // Parse SFTP address
-    let addr: SocketAddr = opt
-        .sftp_address
+    let sftp_address_str = rustfs_utils::get_env_str(rustfs_config::ENV_SFTP_ADDRESS, rustfs_config::DEFAULT_SFTP_ADDRESS);
+    let addr: SocketAddr = sftp_address_str
         .parse()
-        .map_err(|e| format!("Invalid SFTP address '{}': {}", opt.sftp_address, e))?;
+        .map_err(|e| format!("Invalid SFTP address '{sftp_address_str}': {e}"))?;
+
+    // Get SFTP configuration from environment variables
+    let host_key = rustfs_utils::get_env_opt_str(rustfs_config::ENV_SFTP_HOST_KEY);
+    let authorized_keys = rustfs_utils::get_env_opt_str(rustfs_config::ENV_SFTP_AUTHORIZED_KEYS);
 
     // Create SFTP configuration
     let config = SftpConfig {
         bind_addr: addr,
-        require_key_auth: false,                                // TODO: Add key auth configuration
-        cert_file: None,                                        // CA certificates for client certificate authentication
-        key_file: opt.sftp_host_key.clone(),                    // SFTP server host key
-        authorized_keys_file: opt.sftp_authorized_keys.clone(), // Pre-loaded authorized SSH public keys
+        require_key_auth: false,               // TODO: Add key auth configuration
+        cert_file: None,                       // CA certificates for client certificate authentication
+        key_file: host_key,                    // SFTP server host key
+        authorized_keys_file: authorized_keys, // Pre-loaded authorized SSH public keys
     };
 
     // Create SFTP server

@@ -32,6 +32,7 @@ use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::target::BucketTarget;
+use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::data_usage::{
     aggregate_local_snapshots, compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend,
@@ -41,7 +42,6 @@ use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
-use rustfs_ecstore::store::is_valid_object_prefix;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
@@ -83,6 +83,7 @@ pub mod kms_keys;
 pub mod policies;
 pub mod pools;
 pub mod profile;
+pub mod quota;
 pub mod rebalance;
 pub mod service_account;
 pub mod sts;
@@ -131,7 +132,7 @@ impl Operation for HealthCheckHandler {
         let health_info = json!({
             "status": "ok",
             "service": "rustfs-endpoint",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": jiff::Zoned::now().to_string(),
             "version": env!("CARGO_PKG_VERSION")
         });
 
@@ -211,7 +212,7 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         let conditions = get_condition_values(&req.headers, &cred_clone, None, None, remote_addr);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
@@ -407,7 +408,7 @@ impl Operation for ServerInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
@@ -455,7 +456,7 @@ impl Operation for StorageInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
@@ -498,7 +499,7 @@ impl Operation for DataUsageInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let remote_addr = req.extensions.get::<RemoteAddr>().map(|a| a.0);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
@@ -636,50 +637,50 @@ fn extract_metrics_init_params(uri: &Uri) -> MetricsParams {
         for param in params {
             let mut parts = param.split('=');
             if let Some(key) = parts.next() {
-                if key == "disks" {
-                    if let Some(value) = parts.next() {
-                        mp.disks = value.to_string();
-                    }
+                if key == "disks"
+                    && let Some(value) = parts.next()
+                {
+                    mp.disks = value.to_string();
                 }
-                if key == "hosts" {
-                    if let Some(value) = parts.next() {
-                        mp.hosts = value.to_string();
-                    }
+                if key == "hosts"
+                    && let Some(value) = parts.next()
+                {
+                    mp.hosts = value.to_string();
                 }
-                if key == "interval" {
-                    if let Some(value) = parts.next() {
-                        mp.tick = value.to_string();
-                    }
+                if key == "interval"
+                    && let Some(value) = parts.next()
+                {
+                    mp.tick = value.to_string();
                 }
-                if key == "n" {
-                    if let Some(value) = parts.next() {
-                        mp.n = value.parse::<u64>().unwrap_or(u64::MAX);
-                    }
+                if key == "n"
+                    && let Some(value) = parts.next()
+                {
+                    mp.n = value.parse::<u64>().unwrap_or(u64::MAX);
                 }
-                if key == "types" {
-                    if let Some(value) = parts.next() {
-                        mp.types = value.parse::<u32>().unwrap_or_default();
-                    }
+                if key == "types"
+                    && let Some(value) = parts.next()
+                {
+                    mp.types = value.parse::<u32>().unwrap_or_default();
                 }
-                if key == "by-disk" {
-                    if let Some(value) = parts.next() {
-                        mp.by_disk = value.to_string();
-                    }
+                if key == "by-disk"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_disk = value.to_string();
                 }
-                if key == "by-host" {
-                    if let Some(value) = parts.next() {
-                        mp.by_host = value.to_string();
-                    }
+                if key == "by-host"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_host = value.to_string();
                 }
-                if key == "by-jobID" {
-                    if let Some(value) = parts.next() {
-                        mp.by_job_id = value.to_string();
-                    }
+                if key == "by-jobID"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_job_id = value.to_string();
                 }
-                if key == "by-depID" {
-                    if let Some(value) = parts.next() {
-                        mp.by_dep_id = value.to_string();
-                    }
+                if key == "by-depID"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_dep_id = value.to_string();
                 }
             }
         }
@@ -695,7 +696,6 @@ impl Stream for MetricsStream {
     type Item = Result<Bytes, StdError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        info!("MetricsStream poll_next");
         let this = Pin::into_inner(self);
         this.inner.poll_next_unpin(cx)
     }
@@ -757,7 +757,6 @@ impl Operation for MetricsHandler {
         let body = Body::from(in_stream);
         spawn(async move {
             while n > 0 {
-                info!("loop, n: {n}");
                 let mut m = RealtimeMetrics::default();
                 let m_local = collect_local_metrics(types, &opts).await;
                 m.merge(m_local);
@@ -774,7 +773,6 @@ impl Operation for MetricsHandler {
                 // todo write resp
                 match serde_json::to_vec(&m) {
                     Ok(re) => {
-                        info!("got metrics, send it to client, m: {m:?}");
                         let _ = tx.send(Ok(Bytes::from(re))).await;
                     }
                     Err(e) => {
@@ -830,10 +828,10 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
         for param in params {
             let mut parts = param.split('=');
             if let Some(key) = parts.next() {
-                if key == "clientToken" {
-                    if let Some(value) = parts.next() {
-                        hip.client_token = value.to_string();
-                    }
+                if key == "clientToken"
+                    && let Some(value) = parts.next()
+                {
+                    hip.client_token = value.to_string();
                 }
                 if key == "forceStart" && parts.next().is_some() {
                     hip.force_start = true;

@@ -112,8 +112,6 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        let deny_only = constant_time_eq(&cred.access_key, &target_user) || constant_time_eq(&cred.parent_user, &target_user);
-
         if !iam_store
             .is_allowed(&Args {
                 account: &cred.access_key,
@@ -125,12 +123,12 @@ impl Operation for AddServiceAccount {
                     &cred,
                     None,
                     None,
-                    req.extensions.get::<RemoteAddr>().map(|a| a.0),
+                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
                 ),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
-                deny_only,
+                deny_only: false, // Always require explicit Allow permission
             })
             .await
         {
@@ -282,7 +280,7 @@ impl Operation for UpdateServiceAccount {
                     &cred,
                     None,
                     None,
-                    req.extensions.get::<RemoteAddr>().map(|a| a.0),
+                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
                 ),
                 is_owner: owner,
                 object: "",
@@ -381,7 +379,7 @@ impl Operation for InfoServiceAccount {
                     &cred,
                     None,
                     None,
-                    req.extensions.get::<RemoteAddr>().map(|a| a.0),
+                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
                 ),
                 is_owner: owner,
                 object: "",
@@ -515,7 +513,7 @@ impl Operation for ListServiceAccount {
                         &cred,
                         None,
                         None,
-                        req.extensions.get::<RemoteAddr>().map(|a| a.0),
+                        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
                     ),
                     is_owner: owner,
                     object: "",
@@ -619,7 +617,7 @@ impl Operation for DeleteServiceAccount {
                     &cred,
                     None,
                     None,
-                    req.extensions.get::<RemoteAddr>().map(|a| a.0),
+                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
                 ),
                 is_owner: owner,
                 object: "",

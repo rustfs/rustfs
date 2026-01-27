@@ -21,6 +21,7 @@ use futures::stream::FuturesUnordered;
 use hashbrown::{HashMap, HashSet};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, EnableState, audit::AUDIT_ROUTE_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
+use rustfs_targets::arn::TargetID;
 use rustfs_targets::{Target, TargetError, target::ChannelTargetType};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -138,12 +139,11 @@ impl AuditRegistry {
                 format!("{ENV_PREFIX}{AUDIT_ROUTE_PREFIX}{target_type}{DEFAULT_DELIMITER}{ENABLE_KEY}{DEFAULT_DELIMITER}")
                     .to_uppercase();
             for (key, value) in &all_env {
-                if EnableState::from_str(value).ok().map(|s| s.is_enabled()).unwrap_or(false) {
-                    if let Some(id) = key.strip_prefix(&enable_prefix) {
-                        if !id.is_empty() {
-                            instance_ids_from_env.insert(id.to_lowercase());
-                        }
-                    }
+                if EnableState::from_str(value).ok().map(|s| s.is_enabled()).unwrap_or(false)
+                    && let Some(id) = key.strip_prefix(&enable_prefix)
+                    && !id.is_empty()
+                {
+                    instance_ids_from_env.insert(id.to_lowercase());
                 }
             }
 
@@ -292,10 +292,10 @@ impl AuditRegistry {
             for section in sections {
                 let mut section_map: std::collections::HashMap<String, KVS> = std::collections::HashMap::new();
                 // Add default item
-                if let Some(default_kvs) = section_defaults.get(&section) {
-                    if !default_kvs.is_empty() {
-                        section_map.insert(DEFAULT_DELIMITER.to_string(), default_kvs.clone());
-                    }
+                if let Some(default_kvs) = section_defaults.get(&section)
+                    && !default_kvs.is_empty()
+                {
+                    section_map.insert(DEFAULT_DELIMITER.to_string(), default_kvs.clone());
                 }
 
                 // Add successful instance item
@@ -391,6 +391,82 @@ impl AuditRegistry {
             return Err(AuditError::Target(errors.into_iter().next().unwrap()));
         }
 
+        Ok(())
+    }
+
+    /// Creates a unique key for a target based on its type and ID
+    ///
+    /// # Arguments
+    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
+    /// * `target_id` - The identifier for the target instance.
+    ///
+    /// # Returns
+    /// * `String` - The unique key for the target.
+    pub fn create_key(&self, target_type: &str, target_id: &str) -> String {
+        let key = TargetID::new(target_id.to_string(), target_type.to_string());
+        info!(target_type = %target_type, "Create key for {}", key);
+        key.to_string()
+    }
+
+    /// Enables a target (placeholder, assumes target exists)
+    ///
+    /// # Arguments
+    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
+    /// * `target_id` - The identifier for the target instance.
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure.
+    pub fn enable_target(&self, target_type: &str, target_id: &str) -> AuditResult<()> {
+        let key = self.create_key(target_type, target_id);
+        if self.get_target(&key).is_some() {
+            info!("Target {}-{} enabled", target_type, target_id);
+            Ok(())
+        } else {
+            Err(AuditError::Configuration(
+                format!("Target not found: {}-{}", target_type, target_id),
+                None,
+            ))
+        }
+    }
+
+    /// Disables a target (placeholder, assumes target exists)
+    ///
+    /// # Arguments
+    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
+    /// * `target_id` - The identifier for the target instance.
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure.
+    pub fn disable_target(&self, target_type: &str, target_id: &str) -> AuditResult<()> {
+        let key = self.create_key(target_type, target_id);
+        if self.get_target(&key).is_some() {
+            info!("Target {}-{} disabled", target_type, target_id);
+            Ok(())
+        } else {
+            Err(AuditError::Configuration(
+                format!("Target not found: {}-{}", target_type, target_id),
+                None,
+            ))
+        }
+    }
+
+    /// Upserts a target into the registry
+    ///
+    /// # Arguments
+    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
+    /// * `target_id` - The identifier for the target instance.
+    /// * `target` - The target instance to be upserted.
+    ///
+    /// # Returns
+    /// * `AuditResult<()>` - Result indicating success or failure.
+    pub fn upsert_target(
+        &mut self,
+        target_type: &str,
+        target_id: &str,
+        target: Box<dyn Target<AuditEntry> + Send + Sync>,
+    ) -> AuditResult<()> {
+        let key = self.create_key(target_type, target_id);
+        self.targets.insert(key, target);
         Ok(())
     }
 }

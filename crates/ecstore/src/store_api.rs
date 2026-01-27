@@ -28,14 +28,16 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{
     FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision, ReplicationState,
-    ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
+    ReplicationStatusType, RestoreStatusOps as _, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
+    version_purge_statuses_map,
 };
+use rustfs_lock::FastLockGuard;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
-use rustfs_utils::http::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
+use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_RESTORE, AMZ_STORAGE_CLASS};
 use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -144,10 +146,10 @@ impl GetObjectReader {
     ) -> Result<(Self, usize, i64)> {
         let mut rs = rs;
 
-        if let Some(part_number) = opts.part_number {
-            if rs.is_none() {
-                rs = HTTPRangeSpec::from_object_info(oi, part_number);
-            }
+        if let Some(part_number) = opts.part_number
+            && rs.is_none()
+        {
+            rs = HTTPRangeSpec::from_object_info(oi, part_number);
         }
 
         // TODO:Encrypted
@@ -462,32 +464,30 @@ impl ObjectOptions {
     pub fn precondition_check(&self, obj_info: &ObjectInfo) -> Result<()> {
         let has_valid_mod_time = obj_info.mod_time.is_some_and(|t| t != OffsetDateTime::UNIX_EPOCH);
 
-        if let Some(part_number) = self.part_number {
-            if part_number > 1 && !obj_info.parts.is_empty() {
-                let part_found = obj_info.parts.iter().any(|pi| pi.number == part_number);
-                if !part_found {
-                    return Err(Error::InvalidPartNumber(part_number));
-                }
+        if let Some(part_number) = self.part_number
+            && part_number > 1
+            && !obj_info.parts.is_empty()
+        {
+            let part_found = obj_info.parts.iter().any(|pi| pi.number == part_number);
+            if !part_found {
+                return Err(Error::InvalidPartNumber(part_number));
             }
         }
 
         if let Some(pre) = &self.http_preconditions {
-            if let Some(if_none_match) = &pre.if_none_match {
-                if let Some(etag) = &obj_info.etag {
-                    if is_etag_equal(etag, if_none_match) {
-                        return Err(Error::NotModified);
-                    }
-                }
+            if let Some(if_none_match) = &pre.if_none_match
+                && let Some(etag) = &obj_info.etag
+                && is_etag_equal(etag, if_none_match)
+            {
+                return Err(Error::NotModified);
             }
 
-            if has_valid_mod_time {
-                if let Some(if_modified_since) = &pre.if_modified_since {
-                    if let Some(mod_time) = &obj_info.mod_time {
-                        if !is_modified_since(mod_time, if_modified_since) {
-                            return Err(Error::NotModified);
-                        }
-                    }
-                }
+            if has_valid_mod_time
+                && let Some(if_modified_since) = &pre.if_modified_since
+                && let Some(mod_time) = &obj_info.mod_time
+                && !is_modified_since(mod_time, if_modified_since)
+            {
+                return Err(Error::NotModified);
             }
 
             if let Some(if_match) = &pre.if_match {
@@ -499,14 +499,13 @@ impl ObjectOptions {
                     return Err(Error::PreconditionFailed);
                 }
             }
-            if has_valid_mod_time && pre.if_match.is_none() {
-                if let Some(if_unmodified_since) = &pre.if_unmodified_since {
-                    if let Some(mod_time) = &obj_info.mod_time {
-                        if is_modified_since(mod_time, if_unmodified_since) {
-                            return Err(Error::PreconditionFailed);
-                        }
-                    }
-                }
+            if has_valid_mod_time
+                && pre.if_match.is_none()
+                && let Some(if_unmodified_since) = &pre.if_unmodified_since
+                && let Some(mod_time) = &obj_info.mod_time
+                && is_modified_since(mod_time, if_unmodified_since)
+            {
+                return Err(Error::PreconditionFailed);
             }
         }
 
@@ -698,12 +697,12 @@ impl ObjectInfo {
         }
 
         if self.is_compressed() {
-            if let Some(size_str) = self.user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size")) {
-                if !size_str.is_empty() {
-                    // Todo: deal with error
-                    let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
-                    return Ok(size);
-                }
+            if let Some(size_str) = self.user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"))
+                && !size_str.is_empty()
+            {
+                // Todo: deal with error
+                let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
+                return Ok(size);
             }
             let mut actual_size = 0;
             self.parts.iter().for_each(|part| {
@@ -744,8 +743,39 @@ impl ObjectInfo {
 
         let inlined = fi.inline_data();
 
-        // TODO:expires
-        // TODO:ReplicationState
+        // Parse expires from metadata (HTTP date format RFC 7231 or ISO 8601)
+        let expires = fi.metadata.get("expires").and_then(|s| {
+            // Try parsing as ISO 8601 first
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
+                .or_else(|_| {
+                    // Try RFC 2822 format
+                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc2822)
+                })
+                .or_else(|_| {
+                    // Try RFC 3339 format
+                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                })
+                .ok()
+        });
+
+        let replication_status_internal = fi
+            .replication_state_internal
+            .as_ref()
+            .and_then(|v| v.replication_status_internal.clone());
+        let version_purge_status_internal = fi
+            .replication_state_internal
+            .as_ref()
+            .and_then(|v| v.version_purge_status_internal.clone());
+
+        let mut replication_status = fi.replication_status();
+        if replication_status.is_empty()
+            && let Some(status) = fi.metadata.get(AMZ_BUCKET_REPLICATION_STATUS).cloned()
+            && status == ReplicationStatusType::Replica.as_str()
+        {
+            replication_status = ReplicationStatusType::Replica;
+        }
+
+        let version_purge_status = fi.version_purge_status();
 
         let transitioned_object = TransitionedObject {
             name: fi.transitioned_objname.clone(),
@@ -766,10 +796,24 @@ impl ObjectInfo {
         };
 
         // Extract storage class from metadata, default to STANDARD if not found
-        let storage_class = metadata
-            .get(AMZ_STORAGE_CLASS)
-            .cloned()
-            .or_else(|| Some(storageclass::STANDARD.to_string()));
+        let storage_class = if !fi.transition_tier.is_empty() {
+            Some(fi.transition_tier.clone())
+        } else {
+            fi.metadata
+                .get(AMZ_STORAGE_CLASS)
+                .cloned()
+                .or_else(|| Some(storageclass::STANDARD.to_string()))
+        };
+
+        let mut restore_ongoing = false;
+        let mut restore_expires = None;
+        if let Some(restore_status) = fi.metadata.get(AMZ_RESTORE).cloned() {
+            //
+            if let Ok(restore_status) = parse_restore_obj_status(&restore_status) {
+                restore_ongoing = restore_status.on_going();
+                restore_expires = restore_status.expiry();
+            }
+        }
 
         // Convert parts from rustfs_filemeta::ObjectPartInfo to store_api::ObjectPartInfo
         let parts = fi
@@ -787,6 +831,8 @@ impl ObjectInfo {
             })
             .collect();
 
+        // TODO: part checksums
+
         ObjectInfo {
             bucket: bucket.to_string(),
             name,
@@ -802,6 +848,7 @@ impl ObjectInfo {
             user_tags,
             content_type,
             content_encoding,
+            expires,
             num_versions: fi.num_versions,
             successor_mod_time: fi.successor_mod_time,
             etag,
@@ -810,6 +857,12 @@ impl ObjectInfo {
             transitioned_object,
             checksum: fi.checksum.clone(),
             storage_class,
+            restore_ongoing,
+            restore_expires,
+            replication_status_internal,
+            replication_status,
+            version_purge_status_internal,
+            version_purge_status,
             ..Default::default()
         }
     }
@@ -881,32 +934,31 @@ impl ObjectInfo {
                 continue;
             }
 
-            if entry.is_dir() {
-                if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = {
-                        let remaining = if entry.name.starts_with(prefix) {
-                            &entry.name[prefix.len()..]
-                        } else {
-                            entry.name.as_str()
-                        };
-                        remaining.find(delimiter.as_str())
-                    } {
-                        let idx = prefix.len() + idx + delimiter.len();
-                        if let Some(curr_prefix) = entry.name.get(0..idx) {
-                            if curr_prefix == prev_prefix {
-                                continue;
-                            }
-
-                            prev_prefix = curr_prefix;
-
-                            objects.push(ObjectInfo {
-                                is_dir: true,
-                                bucket: bucket.to_owned(),
-                                name: curr_prefix.to_owned(),
-                                ..Default::default()
-                            });
-                        }
+            if entry.is_dir()
+                && let Some(delimiter) = &delimiter
+                && let Some(idx) = {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    remaining.find(delimiter.as_str())
+                }
+            {
+                let idx = prefix.len() + idx + delimiter.len();
+                if let Some(curr_prefix) = entry.name.get(0..idx) {
+                    if curr_prefix == prev_prefix {
+                        continue;
                     }
+
+                    prev_prefix = curr_prefix;
+
+                    objects.push(ObjectInfo {
+                        is_dir: true,
+                        bucket: bucket.to_owned(),
+                        name: curr_prefix.to_owned(),
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -966,32 +1018,31 @@ impl ObjectInfo {
                 continue;
             }
 
-            if entry.is_dir() {
-                if let Some(delimiter) = &delimiter {
-                    if let Some(idx) = {
-                        let remaining = if entry.name.starts_with(prefix) {
-                            &entry.name[prefix.len()..]
-                        } else {
-                            entry.name.as_str()
-                        };
-                        remaining.find(delimiter.as_str())
-                    } {
-                        let idx = prefix.len() + idx + delimiter.len();
-                        if let Some(curr_prefix) = entry.name.get(0..idx) {
-                            if curr_prefix == prev_prefix {
-                                continue;
-                            }
-
-                            prev_prefix = curr_prefix;
-
-                            objects.push(ObjectInfo {
-                                is_dir: true,
-                                bucket: bucket.to_owned(),
-                                name: curr_prefix.to_owned(),
-                                ..Default::default()
-                            });
-                        }
+            if entry.is_dir()
+                && let Some(delimiter) = &delimiter
+                && let Some(idx) = {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    remaining.find(delimiter.as_str())
+                }
+            {
+                let idx = prefix.len() + idx + delimiter.len();
+                if let Some(curr_prefix) = entry.name.get(0..idx) {
+                    if curr_prefix == prev_prefix {
+                        continue;
                     }
+
+                    prev_prefix = curr_prefix;
+
+                    objects.push(ObjectInfo {
+                        is_dir: true,
+                        bucket: bucket.to_owned(),
+                        name: curr_prefix.to_owned(),
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -1026,10 +1077,10 @@ impl ObjectInfo {
     }
 
     pub fn decrypt_checksums(&self, part: usize, _headers: &HeaderMap) -> Result<(HashMap<String, String>, bool)> {
-        if part > 0 {
-            if let Some(checksums) = self.parts.iter().find(|p| p.number == part).and_then(|p| p.checksums.clone()) {
-                return Ok((checksums, true));
-            }
+        if part > 0
+            && let Some(checksums) = self.parts.iter().find(|p| p.number == part).and_then(|p| p.checksums.clone())
+        {
+            return Ok((checksums, true));
         }
 
         // TODO: decrypt checksums
@@ -1299,6 +1350,7 @@ pub trait ObjectIO: Send + Sync + Debug + 'static {
 #[allow(clippy::too_many_arguments)]
 pub trait StorageAPI: ObjectIO + Debug {
     // NewNSLock TODO:
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard>;
     // Shutdown TODO:
     // NSScanner TODO:
 

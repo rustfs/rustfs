@@ -11,7 +11,7 @@ image:
   # This sets the pull policy for images.
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "latest"
+  tag: ""
 
 # This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
 imagePullSecrets: []
@@ -30,6 +30,11 @@ fullnameOverride: ""
 mode:
   standalone:
     enabled: false
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 0
+        maxUnavailable: 1
   distributed:
     enabled: true
 
@@ -48,11 +53,13 @@ config:
     address: ":9000"
     console_enable: "true"
     console_address: ":9001"
-    log_level: "debug"
-    rust_log: "debug"
+    log_level: "info"
     region: "us-east-1"
     obs_log_directory: "/logs"
-    obs_environment: "develop"
+    obs_environment: "development"
+    # Optionally enable support for virtual-hosted-style requests.
+    # See more information: https://docs.rustfs.com/integration/virtual.html
+    domains: "" # e.g. "example.com"
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
@@ -110,6 +117,7 @@ ingress:
     traefik.ingress.kubernetes.io/service.sticky.cookie.secure: "true"
   nginxAnnotations:
     nginx.ingress.kubernetes.io/affinity: cookie
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
     nginx.ingress.kubernetes.io/session-cookie-expires: "3600"
     nginx.ingress.kubernetes.io/session-cookie-hash: sha1
     nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
@@ -129,17 +137,26 @@ ingress:
     crt: tls.crt
     key: tls.key
 
-resources:
+gatewayApi:
+  enabled: false
+  gatewayClass: traefik
+  hostname: example.rustfs.com
+  secretName: secret-tls
+  existingGateway:
+    name: ""
+    namespace: ""
+
+resources: {}
   # We usually recommend not to specify default resources and to leave this as a conscious
   # choice for the user. This also increases chances charts run on environments with little
   # resources, such as Minikube. If you do want to specify resources, uncomment the following
   # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-  limits:
-    cpu: 200m
-    memory: 512Mi
-  requests:
-    cpu: 100m
-    memory: 128Mi
+  # limits:
+  #   cpu: 200m
+  #   memory: 512Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
 
 # This is to setup the liveness and readiness probes more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
 livenessProbe:

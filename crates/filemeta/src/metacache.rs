@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Error, FileInfo, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, merge_file_meta_versions};
+use crate::{
+    Error, FileInfo, FileInfoOpts, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, get_file_info,
+    merge_file_meta_versions,
+};
 use rmp::Marker;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -141,8 +144,7 @@ impl MetaCacheEntry {
             });
         }
 
-        if self.cached.is_some() {
-            let fm = self.cached.as_ref().unwrap();
+        if let Some(fm) = &self.cached {
             if fm.versions.is_empty() {
                 return Ok(FileInfo {
                     volume: bucket.to_owned(),
@@ -154,14 +156,20 @@ impl MetaCacheEntry {
                 });
             }
 
-            let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
+            let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false, true)?;
             return Ok(fi);
         }
 
-        let mut fm = FileMeta::new();
-        fm.unmarshal_msg(&self.metadata)?;
-        let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
-        Ok(fi)
+        get_file_info(
+            &self.metadata,
+            bucket,
+            self.name.as_str(),
+            "",
+            FileInfoOpts {
+                data: false,
+                include_free_versions: false,
+            },
+        )
     }
 
     pub fn file_info_versions(&self, bucket: &str) -> Result<FileInfoVersions> {
@@ -442,10 +450,10 @@ impl MetaCacheEntriesSorted {
     }
 
     pub fn forward_past(&mut self, marker: Option<String>) {
-        if let Some(val) = marker {
-            if let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val) {
-                self.o.0 = self.o.0.split_off(idx);
-            }
+        if let Some(val) = marker
+            && let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val)
+        {
+            self.o.0 = self.o.0.split_off(idx);
         }
     }
 }
@@ -788,22 +796,23 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
-        if now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() {
-            if let Some(v) = v {
-                return Ok(v);
-            }
+        if now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs()
+            && let Some(v) = v
+        {
+            return Ok(v);
         }
 
-        if self.opts.no_wait && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2 {
-            if let Some(value) = v {
-                if self.updating.try_lock().is_ok() {
-                    let this = Arc::clone(&self);
-                    spawn(async move {
-                        let _ = this.update().await;
-                    });
-                }
-                return Ok(value);
+        if self.opts.no_wait
+            && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2
+            && let Some(value) = v
+        {
+            if self.updating.try_lock().is_ok() {
+                let this = Arc::clone(&self);
+                spawn(async move {
+                    let _ = this.update().await;
+                });
             }
+            return Ok(value);
         }
 
         let _ = self.updating.lock().await;
@@ -811,10 +820,9 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
         if let (Ok(duration), Some(value)) = (
             SystemTime::now().duration_since(UNIX_EPOCH + Duration::from_secs(self.last_update_ms.load(AtomicOrdering::SeqCst))),
             v,
-        ) {
-            if duration < self.ttl {
-                return Ok(value);
-            }
+        ) && duration < self.ttl
+        {
+            return Ok(value);
         }
 
         match self.update().await {

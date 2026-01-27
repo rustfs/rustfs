@@ -29,7 +29,7 @@ use handlers::{
     event::{ListNotificationTargets, ListTargetsArns, NotificationTarget, RemoveNotificationTarget},
     group, kms, kms_dynamic, kms_keys, policies, pools,
     profile::{TriggerProfileCPU, TriggerProfileMemory},
-    rebalance,
+    quota, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
 };
@@ -203,6 +203,32 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
     )?;
 
     r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota/{bucket}").as_str(),
+        AdminOperation(&quota::SetBucketQuotaHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota/{bucket}").as_str(),
+        AdminOperation(&quota::GetBucketQuotaHandler {}),
+    )?;
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota/{bucket}").as_str(),
+        AdminOperation(&quota::ClearBucketQuotaHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota-stats/{bucket}").as_str(),
+        AdminOperation(&quota::GetBucketQuotaStatsHandler {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota-check/{bucket}").as_str(),
+        AdminOperation(&quota::CheckBucketQuotaHandler {}),
+    )?;
+
+    r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/export-bucket-metadata").as_str(),
         AdminOperation(&bucket_meta::ExportBucketMetadata {}),
@@ -239,14 +265,12 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
     )?;
 
     // Performance profiling endpoints (available on all platforms, with platform-specific responses)
-    #[cfg(not(target_os = "windows"))]
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/debug/pprof/profile").as_str(),
         AdminOperation(&handlers::ProfileHandler {}),
     )?;
 
-    #[cfg(not(target_os = "windows"))]
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/debug/pprof/status").as_str(),

@@ -180,10 +180,10 @@ impl Config {
                     let mut default = HashMap::new();
                     default.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
                     self.0.insert(k.clone(), default);
-                } else if !self.0[k].contains_key(DEFAULT_DELIMITER) {
-                    if let Some(m) = self.0.get_mut(k) {
-                        m.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
-                    }
+                } else if !self.0[k].contains_key(DEFAULT_DELIMITER)
+                    && let Some(m) = self.0.get_mut(k)
+                {
+                    m.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
                 }
             }
         }

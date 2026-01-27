@@ -345,10 +345,10 @@ impl TargetList {
     pub async fn clear_targets_only(&mut self) {
         let target_ids_to_clear: Vec<TargetID> = self.targets.keys().cloned().collect();
         for id in target_ids_to_clear {
-            if let Some(target_arc) = self.targets.remove(&id) {
-                if let Err(e) = target_arc.close().await {
-                    error!("Failed to close target {} during clear: {}", id, e);
-                }
+            if let Some(target_arc) = self.targets.remove(&id)
+                && let Err(e) = target_arc.close().await
+            {
+                error!("Failed to close target {} during clear: {}", id, e);
             }
         }
         self.targets.clear();
@@ -368,6 +368,11 @@ impl TargetList {
     /// Returns all target IDs
     pub fn keys(&self) -> Vec<TargetID> {
         self.targets.keys().cloned().collect()
+    }
+
+    /// Returns all targets in the list
+    pub fn values(&self) -> Vec<Arc<dyn Target<Event> + Send + Sync>> {
+        self.targets.values().cloned().collect()
     }
 
     /// Returns the number of targets

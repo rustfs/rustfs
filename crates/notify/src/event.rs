@@ -49,7 +49,7 @@ pub struct Object {
     pub size: Option<i64>,
     /// The entity tag (ETag) of the object
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub etag: Option<String>,
+    pub e_tag: Option<String>,
     /// The content type of the object
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
@@ -162,7 +162,7 @@ impl Event {
                 object: Object {
                     key: key.to_string(),
                     size: Some(1024),
-                    etag: Some("etag123".to_string()),
+                    e_tag: Some("etag123".to_string()),
                     content_type: Some("application/octet-stream".to_string()),
                     user_metadata: Some(user_metadata),
                     version_id: Some("1".to_string()),
@@ -183,7 +183,7 @@ impl Event {
 
     pub fn new(args: EventArgs) -> Self {
         let event_time = Utc::now().naive_local();
-        let unique_id = match args.object.mod_time {
+        let sequencer = match args.object.mod_time {
             Some(t) => format!("{:X}", t.unix_timestamp_nanos()),
             None => format!("{:X}", event_time.and_utc().timestamp_nanos_opt().unwrap_or(0)),
         };
@@ -213,7 +213,7 @@ impl Event {
             object: Object {
                 key: key_name,
                 version_id,
-                sequencer: unique_id,
+                sequencer,
                 ..Default::default()
             },
         };
@@ -225,7 +225,7 @@ impl Event {
 
         if !is_removed_event {
             s3_metadata.object.size = Some(args.object.size);
-            s3_metadata.object.etag = args.object.etag.clone();
+            s3_metadata.object.e_tag = args.object.etag.clone();
             s3_metadata.object.content_type = args.object.content_type.clone();
             // Filter out internal reserved metadata
             let mut user_metadata = HashMap::new();
@@ -249,7 +249,11 @@ impl Event {
             s3: s3_metadata,
             source: Source {
                 host: args.host,
-                port: "".to_string(),
+                port: if args.port == 0 {
+                    "".to_string()
+                } else {
+                    args.port.to_string()
+                },
                 user_agent: args.user_agent,
             },
         }
@@ -271,6 +275,7 @@ pub struct EventArgs {
     pub resp_elements: HashMap<String, String>,
     pub version_id: String,
     pub host: String,
+    pub port: u16,
     pub user_agent: String,
 }
 
@@ -307,6 +312,7 @@ pub struct EventArgsBuilder {
     resp_elements: HashMap<String, String>,
     version_id: String,
     host: String,
+    port: u16,
     user_agent: String,
 }
 
@@ -375,6 +381,12 @@ impl EventArgsBuilder {
         self
     }
 
+    /// Sets the port.
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
     /// Sets the user agent.
     pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = user_agent.into();
@@ -393,6 +405,7 @@ impl EventArgsBuilder {
             resp_elements: self.resp_elements,
             version_id: self.version_id,
             host: self.host,
+            port: self.port,
             user_agent: self.user_agent,
         }
     }

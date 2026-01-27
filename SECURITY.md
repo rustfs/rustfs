@@ -1,19 +1,40 @@
 # Security Policy
 
+## Security Philosophy
+
+At RustFS, we take security seriously. We believe that **transparency leads to better security**. The more open our code is, the more eyes are on it, and the faster we can identify and resolve potential issues.
+
+We highly value the contributions of the security community and welcome anyone to audit our code. Your efforts help us make RustFS safer for everyone.
+
 ## Supported Versions
 
-Security updates are provided for the latest released version of this project.
+To help us focus our security efforts, please refer to the table below to see which versions of RustFS are currently supported with security updates.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.x.x   | :white_check_mark: |
+| Latest  | :white_check_mark: |
+| < 1.0   | :x:                |
 
 ## Reporting a Vulnerability
 
-Please report security vulnerabilities **privately** via GitHub Security Advisories:
+If you discover a security vulnerability in RustFS, we appreciate your help in disclosing it to us responsibly.
 
-https://github.com/rustfs/rustfs/security/advisories/new
+**Please do not open a public GitHub issue for security vulnerabilities.** Publicly disclosing a vulnerability can put the entire community at risk before a fix is available.
 
-Do **not** open a public issue for security-sensitive bugs.
+### How to Report
 
-You can expect an initial response within a reasonable timeframe. Further updates will be provided as the report is triaged.
+1. https://github.com/rustfs/rustfs/security/advisories/new
+2. Please email us directly at: **security@rustfs.com**
+
+In your email, please include:
+1.  **Description**: A detailed description of the vulnerability.
+2.  **Steps to Reproduce**: Steps or a script to reproduce the issue.
+3.  **Impact**: The potential impact of the vulnerability.
+
+### Our Response Process
+
+1.  **Acknowledgment**: We will acknowledge your email within 48 hours.
+2.  **Assessment**: We will investigate the issue and determine its severity.
+3.  **Fix & Disclosure**: We will work on a patch. Once the patch is released, we will publicly announce the vulnerability and acknowledge your contribution (unless you prefer to remain anonymous).
+
+Thank you for helping keep RustFS and its users safe!

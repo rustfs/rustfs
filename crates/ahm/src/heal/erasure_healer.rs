@@ -348,7 +348,7 @@ impl ErasureSetHealer {
                 }
 
                 // save checkpoint periodically
-                if global_obj_idx % 100 == 0 {
+                if global_obj_idx.is_multiple_of(100) {
                     checkpoint_manager
                         .update_position(bucket_index, *current_object_index)
                         .await?;

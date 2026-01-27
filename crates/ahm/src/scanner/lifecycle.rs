@@ -23,7 +23,7 @@ use rustfs_ecstore::bucket::{
         lifecycle::Lifecycle,
     },
     metadata_sys::get_object_lock_config,
-    object_lock::objectlock_sys::{BucketObjectLockSys, enforce_retention_for_deletion},
+    object_lock::objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion},
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
@@ -127,8 +127,8 @@ impl ScannerItem {
         let mut to_del = Vec::<ObjectToDelete>::with_capacity(overflow_versions.len());
         for fi in overflow_versions.iter() {
             let obj = ObjectInfo::from_file_info(fi, &self.bucket, &self.object_name, versioned);
-            if lock_enabled && enforce_retention_for_deletion(&obj) {
-                //if enforce_retention_for_deletion(&obj) {
+            // Lifecycle operations should never bypass governance retention
+            if lock_enabled && check_object_lock_for_deletion(&self.bucket, &obj, false).await.is_some() {
                 /*if self.debug {
                     if obj.version_id.is_some() {
                         info!("lifecycle: {} v({}) is locked, not deleting\n", obj.name, obj.version_id.expect("err"));

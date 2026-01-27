@@ -13,15 +13,11 @@
 // limitations under the License.
 
 pub mod local;
-pub mod remote;
+// pub mod remote;
 
+use crate::{LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
-
-use crate::{
-    error::Result,
-    types::{LockId, LockInfo, LockRequest, LockResponse, LockStats},
-};
 
 /// Lock client trait
 #[async_trait]
@@ -35,8 +31,8 @@ pub trait LockClient: Send + Sync + std::fmt::Debug {
     /// Acquire lock (generic method)
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
         match request.lock_type {
-            crate::types::LockType::Exclusive => self.acquire_exclusive(request).await,
-            crate::types::LockType::Shared => self.acquire_shared(request).await,
+            LockType::Exclusive => self.acquire_exclusive(request).await,
+            LockType::Shared => self.acquire_shared(request).await,
         }
     }
 
@@ -74,50 +70,41 @@ impl ClientFactory {
         Arc::new(local::LocalClient::new())
     }
 
-    /// Create remote client
-    pub fn create_remote(endpoint: String) -> Arc<dyn LockClient> {
-        Arc::new(remote::RemoteClient::new(endpoint))
-    }
+    // /// Create remote client
+    // pub fn create_remote(endpoint: String) -> Arc<dyn LockClient> {
+    //     Arc::new(remote::RemoteClient::new(endpoint))
+    // }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LockType;
-
-    #[tokio::test]
-    async fn test_client_factory() {
-        let local_client = ClientFactory::create_local();
-        assert!(local_client.is_local().await);
-
-        let remote_client = ClientFactory::create_remote("http://localhost:8080".to_string());
-        assert!(!remote_client.is_local().await);
-    }
+    use crate::LockType;
 
     #[tokio::test]
     async fn test_local_client_basic_operations() {
         let client = ClientFactory::create_local();
 
-        let request = crate::types::LockRequest::new("test-resource", LockType::Exclusive, "test-owner");
+        let request = LockRequest::new("test-resource", LockType::Exclusive, "test-owner");
 
         // Test lock acquisition
         let response = client.acquire_exclusive(&request).await;
         assert!(response.is_ok());
 
-        if let Ok(response) = response {
-            if response.success {
-                let lock_info = response.lock_info.unwrap();
+        if let Ok(response) = response
+            && response.success
+        {
+            let lock_info = response.lock_info.unwrap();
 
-                // Test status check
-                let status = client.check_status(&lock_info.id).await;
-                assert!(status.is_ok());
-                assert!(status.unwrap().is_some());
+            // Test status check
+            let status = client.check_status(&lock_info.id).await;
+            assert!(status.is_ok());
+            assert!(status.unwrap().is_some());
 
-                // Test lock release
-                let released = client.release(&lock_info.id).await;
-                assert!(released.is_ok());
-                assert!(released.unwrap());
-            }
+            // Test lock release
+            let released = client.release(&lock_info.id).await;
+            assert!(released.is_ok());
+            assert!(released.unwrap());
         }
     }
 }

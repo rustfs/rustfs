@@ -97,7 +97,7 @@ impl Operation for AddTier {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetTierAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -233,7 +233,7 @@ impl Operation for EditTier {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetTierAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -316,7 +316,7 @@ impl Operation for ListTiers {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListTierAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -360,7 +360,7 @@ impl Operation for RemoveTier {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetTierAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -431,7 +431,7 @@ impl Operation for VerifyTier {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListTierAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -462,7 +462,7 @@ impl Operation for GetTierInfo {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListTierAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -522,7 +522,7 @@ impl Operation for ClearTier {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetTierAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 

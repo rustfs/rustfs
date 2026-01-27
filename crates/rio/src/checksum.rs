@@ -387,7 +387,7 @@ impl Checksum {
 
             // Ensure we don't divide by 0
             let raw_len = self.checksum_type.raw_byte_len();
-            if raw_len == 0 || parts.len() % raw_len != 0 {
+            if raw_len == 0 || !parts.len().is_multiple_of(raw_len) {
                 checksums = 0;
             } else if !parts.is_empty() {
                 checksums = (parts.len() / raw_len) as i32;
@@ -506,16 +506,16 @@ pub fn get_content_checksum(headers: &HeaderMap) -> Result<Option<Checksum>, std
         for header in trailing_headers {
             let mut duplicates = false;
             for &checksum_type in crate::checksum::BASE_CHECKSUM_TYPES {
-                if let Some(key) = checksum_type.key() {
-                    if header.eq_ignore_ascii_case(key) {
-                        duplicates = result.is_some();
-                        result = Some(Checksum {
-                            checksum_type: ChecksumType(checksum_type.0 | ChecksumType::TRAILING.0),
-                            encoded: String::new(),
-                            raw: Vec::new(),
-                            want_parts: 0,
-                        });
-                    }
+                if let Some(key) = checksum_type.key()
+                    && header.eq_ignore_ascii_case(key)
+                {
+                    duplicates = result.is_some();
+                    result = Some(Checksum {
+                        checksum_type: ChecksumType(checksum_type.0 | ChecksumType::TRAILING.0),
+                        encoded: String::new(),
+                        raw: Vec::new(),
+                        want_parts: 0,
+                    });
                 }
             }
             if duplicates {
@@ -567,13 +567,13 @@ fn get_content_checksum_direct(headers: &HeaderMap) -> (ChecksumType, String) {
             checksum_type = ChecksumType(checksum_type.0 | ChecksumType::FULL_OBJECT.0);
         }
 
-        if checksum_type.is_set() {
-            if let Some(key) = checksum_type.key() {
-                if let Some(value) = headers.get(key).and_then(|v| v.to_str().ok()) {
-                    return (checksum_type, value.to_string());
-                } else {
-                    return (ChecksumType::NONE, String::new());
-                }
+        if checksum_type.is_set()
+            && let Some(key) = checksum_type.key()
+        {
+            if let Some(value) = headers.get(key).and_then(|v| v.to_str().ok()) {
+                return (checksum_type, value.to_string());
+            } else {
+                return (ChecksumType::NONE, String::new());
             }
         }
         return (checksum_type, String::new());
@@ -581,22 +581,22 @@ fn get_content_checksum_direct(headers: &HeaderMap) -> (ChecksumType, String) {
 
     // Check individual checksum headers
     for &ct in crate::checksum::BASE_CHECKSUM_TYPES {
-        if let Some(key) = ct.key() {
-            if let Some(value) = headers.get(key).and_then(|v| v.to_str().ok()) {
-                // If already set, invalid
-                if checksum_type != ChecksumType::NONE {
+        if let Some(key) = ct.key()
+            && let Some(value) = headers.get(key).and_then(|v| v.to_str().ok())
+        {
+            // If already set, invalid
+            if checksum_type != ChecksumType::NONE {
+                return (ChecksumType::INVALID, String::new());
+            }
+            checksum_type = ct;
+
+            if headers.get("x-amz-checksum-type").and_then(|v| v.to_str().ok()) == Some("FULL_OBJECT") {
+                if !checksum_type.can_merge() {
                     return (ChecksumType::INVALID, String::new());
                 }
-                checksum_type = ct;
-
-                if headers.get("x-amz-checksum-type").and_then(|v| v.to_str().ok()) == Some("FULL_OBJECT") {
-                    if !checksum_type.can_merge() {
-                        return (ChecksumType::INVALID, String::new());
-                    }
-                    checksum_type = ChecksumType(checksum_type.0 | ChecksumType::FULL_OBJECT.0);
-                }
-                return (checksum_type, value.to_string());
+                checksum_type = ChecksumType(checksum_type.0 | ChecksumType::FULL_OBJECT.0);
             }
+            return (checksum_type, value.to_string());
         }
     }
 
@@ -965,10 +965,10 @@ fn gf2_matrix_times(mat: &[u64], mut vec: u64) -> u64 {
     let mut mat_iter = mat.iter();
 
     while vec != 0 {
-        if vec & 1 != 0 {
-            if let Some(&m) = mat_iter.next() {
-                sum ^= m;
-            }
+        if vec & 1 != 0
+            && let Some(&m) = mat_iter.next()
+        {
+            sum ^= m;
         }
         vec >>= 1;
         mat_iter.next();

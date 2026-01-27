@@ -63,16 +63,23 @@ pub struct Policy {
 
 impl Policy {
     pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
+        // First, check all Deny statements - if any Deny matches, deny the request
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
             if !statement.is_allowed(args).await {
                 return false;
             }
         }
 
-        if args.deny_only || args.is_owner {
+        // Owner has all permissions
+        if args.is_owner {
             return true;
         }
 
+        if args.deny_only {
+            return false;
+        }
+
+        // Check Allow statements
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Allow)) {
             if statement.is_allowed(args).await {
                 return true;
@@ -177,9 +184,11 @@ pub struct BucketPolicyArgs<'a> {
     pub object: &'a str,
 }
 
+/// Bucket Policy with AWS S3-compatible JSON serialization.
+/// Empty optional fields are omitted from output to match AWS format.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct BucketPolicy {
-    #[serde(default, rename = "ID")]
+    #[serde(default, rename = "ID", skip_serializing_if = "ID::is_empty")]
     pub id: ID,
     #[serde(rename = "Version")]
     pub version: String,
@@ -527,6 +536,168 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_parse_policy_with_single_string_action_and_resource() -> Result<()> {
+        // Test policy with single string Action and Resource (AWS IAM allows both formats)
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::test/analytics/customers/*"
+    }
+  ]
+}
+"#;
+
+        let p = Policy::parse_config(data.as_bytes())?;
+        assert!(!p.statements.is_empty());
+        assert!(!p.statements[0].actions.is_empty());
+        assert!(!p.statements[0].resources.is_empty());
+
+        // Test with array format (should still work)
+        let data_array = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::test/analytics/customers/*"]
+    }
+  ]
+}
+"#;
+
+        let p2 = Policy::parse_config(data_array.as_bytes())?;
+        assert!(!p2.statements.is_empty());
+        assert!(!p2.statements[0].actions.is_empty());
+        assert!(!p2.statements[0].resources.is_empty());
+
+        // Verify that both formats produce equivalent results
+        assert_eq!(
+            p.statements.len(),
+            p2.statements.len(),
+            "Both policies should have the same number of statements"
+        );
+        assert_eq!(
+            p.statements[0].actions, p2.statements[0].actions,
+            "ActionSet from string format should equal ActionSet from array format"
+        );
+        assert_eq!(
+            p.statements[0].resources, p2.statements[0].resources,
+            "ResourceSet from string format should equal ResourceSet from array format"
+        );
+        assert_eq!(
+            p.statements[0].effect, p2.statements[0].effect,
+            "Effect should be the same in both formats"
+        );
+
+        // Verify specific content
+        assert_eq!(p.statements[0].actions.len(), 1, "ActionSet should contain exactly one action");
+        assert_eq!(p.statements[0].resources.len(), 1, "ResourceSet should contain exactly one resource");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deny_only_security_fix() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::bucket1/*"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        // Test with deny_only=true but no matching Allow statement
+        let args_deny_only = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket2",
+            conditions: &conditions,
+            is_owner: false,
+            object: "test.txt",
+            claims: &claims,
+            deny_only: true, // Should NOT automatically allow
+        };
+
+        // Should return false because deny_only=true, regardless of whether there's a matching Allow statement
+        assert!(
+            !policy.is_allowed(&args_deny_only).await,
+            "deny_only should return false when deny_only=true, regardless of Allow statements"
+        );
+
+        // Test with deny_only=true and matching Allow statement
+        let args_deny_only_allowed = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::GetObjectAction),
+            bucket: "bucket1",
+            conditions: &conditions,
+            is_owner: false,
+            object: "test.txt",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        // Should return false because deny_only=true prevents checking Allow statements (unless is_owner=true)
+        assert!(
+            !policy.is_allowed(&args_deny_only_allowed).await,
+            "deny_only should return false even with matching Allow statement"
+        );
+
+        // Test with deny_only=false (normal case)
+        let args_normal = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::GetObjectAction),
+            bucket: "bucket1",
+            conditions: &conditions,
+            is_owner: false,
+            object: "test.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Should return true because there's an Allow statement
+        assert!(
+            policy.is_allowed(&args_normal).await,
+            "normal policy evaluation should allow with matching Allow statement"
+        );
+
+        let args_owner_deny_only = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket2",
+            conditions: &conditions,
+            is_owner: true, // Owner has all permissions
+            object: "test.txt",
+            claims: &claims,
+            deny_only: true, // Even with deny_only=true, owner should be allowed
+        };
+
+        assert!(
+            policy.is_allowed(&args_owner_deny_only).await,
+            "owner should retain all permissions even when deny_only=true"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_aws_username_policy_variable() -> Result<()> {
         let data = r#"
 {
@@ -801,5 +972,191 @@ mod test {
         assert!(pollster::block_on(policy.is_allowed(&args1)) || pollster::block_on(policy.is_allowed(&args2)));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_statement_with_only_notresource_is_valid() {
+        // Test: A statement with only NotResource (and no Resource) is valid
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "NotResource": ["arn:aws:s3:::mybucket/private/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_ok(), "Statement with only NotResource should be valid");
+    }
+
+    #[test]
+    fn test_statement_with_both_resource_and_notresource_is_invalid() {
+        // Test: A statement with both Resource and NotResource returns BothResourceAndNotResource error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::mybucket/public/*"],
+      "NotResource": ["arn:aws:s3:::mybucket/private/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with both Resource and NotResource should be invalid");
+
+        // Verify the specific error type
+        if let Err(e) = result {
+            let error_msg = format!("{}", e);
+            assert!(
+                error_msg.contains("Resource")
+                    && error_msg.contains("NotResource")
+                    && error_msg.contains("cannot both be specified"),
+                "Error should be BothResourceAndNotResource, got: {}",
+                error_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_statement_with_neither_resource_nor_notresource_is_invalid() {
+        // Test: A statement with neither Resource nor NotResource returns NonResource error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with neither Resource nor NotResource should be invalid");
+
+        // Verify the specific error type
+        if let Err(e) = result {
+            let error_msg = format!("{}", e);
+            assert!(
+                error_msg.contains("Resource") && error_msg.contains("empty"),
+                "Error should be NonResource, got: {}",
+                error_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_bucket_policy_serialize_omits_empty_fields() {
+        use crate::policy::action::{Action, ActionSet, S3Action};
+        use crate::policy::resource::{Resource, ResourceSet};
+        use crate::policy::{Effect, Functions, Principal};
+
+        // Create a BucketPolicy with empty optional fields
+        // Use JSON deserialization to create Principal (since aws field is private)
+        let principal: Principal = serde_json::from_str(r#"{"AWS": "*"}"#).expect("Should parse principal");
+
+        let mut policy = BucketPolicy {
+            id: ID::default(), // Empty ID
+            version: "2012-10-17".to_string(),
+            statements: vec![BPStatement {
+                sid: ID::default(), // Empty Sid
+                effect: Effect::Allow,
+                principal,
+                actions: ActionSet::default(),
+                not_actions: ActionSet::default(), // Empty NotAction
+                resources: ResourceSet::default(),
+                not_resources: ResourceSet::default(), // Empty NotResource
+                conditions: Functions::default(),      // Empty Condition
+            }],
+        };
+
+        // Set actions and resources (required fields)
+        policy.statements[0]
+            .actions
+            .0
+            .insert(Action::S3Action(S3Action::ListBucketAction));
+        policy.statements[0]
+            .resources
+            .0
+            .insert(Resource::try_from("arn:aws:s3:::test/*").unwrap());
+
+        let json = serde_json::to_string(&policy).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+
+        // Verify empty fields are omitted
+        assert!(!parsed.as_object().unwrap().contains_key("ID"), "Empty ID should be omitted");
+
+        let statement = &parsed["Statement"][0];
+        assert!(!statement.as_object().unwrap().contains_key("Sid"), "Empty Sid should be omitted");
+        assert!(
+            !statement.as_object().unwrap().contains_key("NotAction"),
+            "Empty NotAction should be omitted"
+        );
+        assert!(
+            !statement.as_object().unwrap().contains_key("NotResource"),
+            "Empty NotResource should be omitted"
+        );
+        assert!(
+            !statement.as_object().unwrap().contains_key("Condition"),
+            "Empty Condition should be omitted"
+        );
+
+        // Verify required fields are present
+        assert_eq!(parsed["Version"], "2012-10-17");
+        assert_eq!(statement["Effect"], "Allow");
+        assert_eq!(statement["Principal"]["AWS"], "*");
+    }
+
+    #[test]
+    fn test_bucket_policy_serialize_single_action_as_array() {
+        use crate::policy::action::{Action, ActionSet, S3Action};
+        use crate::policy::resource::{Resource, ResourceSet};
+        use crate::policy::{Effect, Principal};
+
+        // Use JSON deserialization to create Principal (since aws field is private)
+        let principal: Principal = serde_json::from_str(r#"{"AWS": "*"}"#).expect("Should parse principal");
+
+        let mut policy = BucketPolicy {
+            version: "2012-10-17".to_string(),
+            statements: vec![BPStatement {
+                effect: Effect::Allow,
+                principal,
+                actions: ActionSet::default(),
+                resources: ResourceSet::default(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Single action
+        policy.statements[0]
+            .actions
+            .0
+            .insert(Action::S3Action(S3Action::ListBucketAction));
+        policy.statements[0]
+            .resources
+            .0
+            .insert(Resource::try_from("arn:aws:s3:::test/*").unwrap());
+
+        let json = serde_json::to_string(&policy).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        let action = &parsed["Statement"][0]["Action"];
+
+        // Single action should be serialized as array for S3 specification compliance
+        assert!(action.is_array(), "Single action should serialize as array");
+        let arr = action.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str().unwrap(), "s3:ListBucket");
     }
 }

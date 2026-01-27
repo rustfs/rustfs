@@ -126,16 +126,30 @@ impl S3Auth for IAMAuth {
         }
 
         if let Ok(iam_store) = rustfs_iam::get() {
-            if let Some(id) = iam_store.get_user(access_key).await {
-                return Ok(SecretKey::from(id.credentials.secret_key.clone()));
-            } else {
-                tracing::warn!("get_user failed: no such user, access_key: {access_key}");
+            // Use check_key instead of get_user to ensure user is loaded from disk if not in cache
+            // This is important for newly created users that may not be in cache yet.
+            // check_key will automatically attempt to load the user from disk if not found in cache.
+            match iam_store.check_key(access_key).await {
+                Ok((Some(id), _valid)) => {
+                    // Return secret key for signature verification regardless of user status.
+                    // Authorization will be checked separately in the authorization phase.
+                    return Ok(SecretKey::from(id.credentials.secret_key.clone()));
+                }
+                Ok((None, _)) => {
+                    tracing::warn!("get_secret_key failed: no such user, access_key: {access_key}");
+                }
+                Err(e) => {
+                    tracing::warn!("get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}");
+                }
             }
         } else {
             tracing::warn!("get_secret_key failed: iam not initialized, access_key: {access_key}");
         }
 
-        Err(s3_error!(UnauthorizedAccess, "Your account is not signed up2, access_key: {access_key}"))
+        Err(s3_error!(
+            InvalidAccessKeyId,
+            "The Access Key Id you provided does not exist in our records."
+        ))
     }
 }
 
@@ -164,10 +178,10 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed1 {e}")))?;
 
         if !ok {
-            if let Some(u) = u {
-                if u.credentials.status == "off" {
-                    return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
-                }
+            if let Some(u) = u
+                && u.credentials.status == "off"
+            {
+                return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
             }
 
             return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
@@ -189,10 +203,10 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
         constant_time_eq(&sys_cred.access_key, &cred.access_key) || constant_time_eq(&cred.parent_user, &sys_cred.access_key);
 
     // permitRootAccess
-    if let Some(claims) = &cred.claims {
-        if claims.contains_key(SESSION_POLICY_NAME) {
-            owner = false
-        }
+    if let Some(claims) = &cred.claims
+        && claims.contains_key(SESSION_POLICY_NAME)
+    {
+        owner = false
     }
 
     Ok((cred, owner))
@@ -347,10 +361,10 @@ pub fn get_condition_values(
         args.insert("authType".to_owned(), vec![auth_type]);
     }
 
-    if let Some(lc) = region {
-        if !lc.is_empty() {
-            args.insert("LocationConstraint".to_owned(), vec![lc.to_string()]);
-        }
+    if let Some(lc) = region
+        && !lc.is_empty()
+    {
+        args.insert("LocationConstraint".to_owned(), vec![lc.to_string()]);
     }
 
     let mut clone_header = header.clone();
@@ -400,23 +414,23 @@ pub fn get_condition_values(
             }
         }
 
-        if let Some(grps_val) = claims.get("groups") {
-            if let Some(grps_is) = grps_val.as_array() {
-                let grps = grps_is
-                    .iter()
-                    .filter_map(|g| g.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<String>>();
-                if !grps.is_empty() {
-                    args.insert("groups".to_string(), grps);
-                }
+        if let Some(grps_val) = claims.get("groups")
+            && let Some(grps_is) = grps_val.as_array()
+        {
+            let grps = grps_is
+                .iter()
+                .filter_map(|g| g.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>();
+            if !grps.is_empty() {
+                args.insert("groups".to_string(), grps);
             }
         }
     }
 
-    if let Some(groups) = &cred.groups {
-        if !args.contains_key("groups") {
-            args.insert("groups".to_string(), groups.clone());
-        }
+    if let Some(groups) = &cred.groups
+        && !args.contains_key("groups")
+    {
+        args.insert("groups".to_string(), groups.clone());
     }
 
     args
@@ -491,10 +505,10 @@ fn determine_auth_type_and_version(header: &HeaderMap) -> (String, String) {
 /// # Returns
 /// * `bool` - True if request has JWT, false otherwise
 fn is_request_jwt(header: &HeaderMap) -> bool {
-    if let Some(auth) = header.get("authorization") {
-        if let Ok(auth_str) = auth.to_str() {
-            return auth_str.starts_with(JWT_ALGORITHM);
-        }
+    if let Some(auth) = header.get("authorization")
+        && let Ok(auth_str) = auth.to_str()
+    {
+        return auth_str.starts_with(JWT_ALGORITHM);
     }
     false
 }
@@ -507,10 +521,10 @@ fn is_request_jwt(header: &HeaderMap) -> bool {
 /// # Returns
 /// * `bool` - True if request has AWS Signature Version '4', false otherwise
 fn is_request_signature_v4(header: &HeaderMap) -> bool {
-    if let Some(auth) = header.get("authorization") {
-        if let Ok(auth_str) = auth.to_str() {
-            return auth_str.starts_with(SIGN_V4_ALGORITHM);
-        }
+    if let Some(auth) = header.get("authorization")
+        && let Ok(auth_str) = auth.to_str()
+    {
+        return auth_str.starts_with(SIGN_V4_ALGORITHM);
     }
     false
 }
@@ -523,10 +537,10 @@ fn is_request_signature_v4(header: &HeaderMap) -> bool {
 /// # Returns
 /// * `bool` - True if request has AWS Signature Version '2', false otherwise
 fn is_request_signature_v2(header: &HeaderMap) -> bool {
-    if let Some(auth) = header.get("authorization") {
-        if let Ok(auth_str) = auth.to_str() {
-            return !auth_str.starts_with(SIGN_V4_ALGORITHM) && auth_str.starts_with(SIGN_V2_ALGORITHM);
-        }
+    if let Some(auth) = header.get("authorization")
+        && let Ok(auth_str) = auth.to_str()
+    {
+        return !auth_str.starts_with(SIGN_V4_ALGORITHM) && auth_str.starts_with(SIGN_V2_ALGORITHM);
     }
     false
 }
@@ -567,40 +581,40 @@ fn is_request_presigned_signature_v2(header: &HeaderMap) -> bool {
 /// # Returns
 /// * `bool` - True if request has AWS Post policy Signature Version '4', false otherwise
 fn is_request_post_policy_signature_v4(header: &HeaderMap) -> bool {
-    if let Some(content_type) = header.get("content-type") {
-        if let Ok(ct) = content_type.to_str() {
-            return ct.contains("multipart/form-data");
-        }
+    if let Some(content_type) = header.get("content-type")
+        && let Ok(ct) = content_type.to_str()
+    {
+        return ct.contains("multipart/form-data");
     }
     false
 }
 
 /// Verify if the request has AWS Streaming Signature Version '4'
 fn is_request_sign_streaming_v4(header: &HeaderMap) -> bool {
-    if let Some(content_sha256) = header.get("x-amz-content-sha256") {
-        if let Ok(sha256_str) = content_sha256.to_str() {
-            return sha256_str == STREAMING_CONTENT_SHA256;
-        }
+    if let Some(content_sha256) = header.get("x-amz-content-sha256")
+        && let Ok(sha256_str) = content_sha256.to_str()
+    {
+        return sha256_str == STREAMING_CONTENT_SHA256;
     }
     false
 }
 
 // Verify if the request has AWS Streaming Signature Version '4' with trailer
 fn is_request_sign_streaming_trailer_v4(header: &HeaderMap) -> bool {
-    if let Some(content_sha256) = header.get("x-amz-content-sha256") {
-        if let Ok(sha256_str) = content_sha256.to_str() {
-            return sha256_str == STREAMING_CONTENT_SHA256_TRAILER;
-        }
+    if let Some(content_sha256) = header.get("x-amz-content-sha256")
+        && let Ok(sha256_str) = content_sha256.to_str()
+    {
+        return sha256_str == STREAMING_CONTENT_SHA256_TRAILER;
     }
     false
 }
 
 // Verify if the request has AWS Streaming Signature Version '4' with unsigned content and trailer
 fn is_request_unsigned_trailer_v4(header: &HeaderMap) -> bool {
-    if let Some(content_sha256) = header.get("x-amz-content-sha256") {
-        if let Ok(sha256_str) = content_sha256.to_str() {
-            return sha256_str == UNSIGNED_PAYLOAD_TRAILER;
-        }
+    if let Some(content_sha256) = header.get("x-amz-content-sha256")
+        && let Ok(sha256_str) = content_sha256.to_str()
+    {
+        return sha256_str == UNSIGNED_PAYLOAD_TRAILER;
     }
     false
 }
@@ -623,10 +637,10 @@ pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> 
 
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
-        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
-            if key.to_lowercase() == param_name {
-                return Some(value);
-            }
+        if let (Some(key), Some(value)) = (parts.next(), parts.next())
+            && key.to_lowercase() == param_name
+        {
+            return Some(value);
         }
     }
     None

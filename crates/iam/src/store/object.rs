@@ -130,8 +130,14 @@ impl ObjectStore {
     }
 
     fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
-        let de = rustfs_crypto::decrypt_data(get_global_action_cred().unwrap_or_default().secret_key.as_bytes(), data)?;
-        Ok(de)
+        let cred = get_global_action_cred().unwrap_or_default();
+        match rustfs_crypto::decrypt_data(cred.secret_key.as_bytes(), data) {
+            Ok(decrypted) => Ok(decrypted),
+            Err(_) => {
+                warn!("Failed to decrypt IAM config data, treating as unencrypted");
+                Ok(data.to_vec())
+            }
+        }
     }
 
     fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
@@ -633,10 +639,10 @@ impl Store for ObjectStore {
 
             if let Some(item) = v.item {
                 let name = rustfs_utils::path::dir(&item);
-                if let Err(err) = self.load_group(&name, m).await {
-                    if !is_err_no_such_group(&err) {
-                        return Err(err);
-                    }
+                if let Err(err) = self.load_group(&name, m).await
+                    && !is_err_no_such_group(&err)
+                {
+                    return Err(err);
                 }
             }
         }
@@ -936,10 +942,10 @@ impl Store for ObjectStore {
                 let name = item.trim_end_matches(".json");
 
                 info!("load group policy: {}", name);
-                if let Err(err) = self.load_mapped_policy(name, UserType::Reg, true, &mut items_cache).await {
-                    if !is_err_no_such_policy(&err) {
-                        return Err(Error::other(format!("load group policy failed: {err}")));
-                    }
+                if let Err(err) = self.load_mapped_policy(name, UserType::Reg, true, &mut items_cache).await
+                    && !is_err_no_such_policy(&err)
+                {
+                    return Err(Error::other(format!("load group policy failed: {err}")));
                 };
             }
 
@@ -955,10 +961,10 @@ impl Store for ObjectStore {
             for item in item_name_list.iter() {
                 let name = rustfs_utils::path::dir(item);
                 info!("load svc user: {}", name);
-                if let Err(err) = self.load_user(&name, UserType::Svc, &mut items_cache).await {
-                    if !is_err_no_such_user(&err) {
-                        return Err(Error::other(format!("load svc user failed: {err}")));
-                    }
+                if let Err(err) = self.load_user(&name, UserType::Svc, &mut items_cache).await
+                    && !is_err_no_such_user(&err)
+                {
+                    return Err(Error::other(format!("load svc user failed: {err}")));
                 };
             }
 
@@ -969,10 +975,9 @@ impl Store for ObjectStore {
                     if let Err(err) = self
                         .load_mapped_policy(&parent, UserType::Sts, false, &mut sts_policies_cache)
                         .await
+                        && !is_err_no_such_policy(&err)
                     {
-                        if !is_err_no_such_policy(&err) {
-                            return Err(Error::other(format!("load_mapped_policy failed: {err}")));
-                        }
+                        return Err(Error::other(format!("load_mapped_policy failed: {err}")));
                     }
                 }
             }

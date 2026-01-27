@@ -75,10 +75,10 @@ fn increment_version(version: &str) -> Result<String, Box<dyn std::error::Error>
     let (major, minor, patch, pre_release) = parse_version(version)?;
 
     // If there's a pre-release identifier, increment the pre-release version number
-    if let Some(pre) = pre_release {
-        if let Some(new_pre) = increment_pre_release(&pre) {
-            return Ok(format!("{major}.{minor}.{patch}-{new_pre}"));
-        }
+    if let Some(pre) = pre_release
+        && let Some(new_pre) = increment_pre_release(&pre)
+    {
+        return Ok(format!("{major}.{minor}.{patch}-{new_pre}"));
     }
 
     // Otherwise increment patch version number
@@ -107,10 +107,10 @@ pub fn parse_version(version: &str) -> VersionParseResult {
 fn increment_pre_release(pre_release: &str) -> Option<String> {
     // Handle pre-release versions like "alpha.19"
     let parts: Vec<&str> = pre_release.split('.').collect();
-    if parts.len() == 2 {
-        if let Ok(num) = parts[1].parse::<u32>() {
-            return Some(format!("{}.{}", parts[0], num + 1));
-        }
+    if parts.len() == 2
+        && let Ok(num) = parts[1].parse::<u32>()
+    {
+        return Some(format!("{}.{}", parts[0], num + 1));
     }
 
     // Handle pre-release versions like "alpha19"

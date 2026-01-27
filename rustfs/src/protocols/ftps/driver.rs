@@ -34,16 +34,20 @@ use s3s::dto::{GetObjectInput, PutObjectInput};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncRead;
+use tokio_util::io::StreamReader;
 use tracing::{debug, error, info, trace};
 
 /// FTPS storage driver implementation
-#[derive(Debug)]
-pub struct FtpsDriver {}
+#[derive(Debug, Clone)]
+pub struct FtpsDriver {
+    fs: crate::storage::ecfs::FS,
+}
 
 impl FtpsDriver {
     /// Create a new FTPS driver
     pub fn new() -> Self {
-        Self {}
+        let fs = crate::storage::ecfs::FS {};
+        Self { fs }
     }
 
     /// Validate FTP feature support
@@ -68,9 +72,7 @@ impl FtpsDriver {
     /// Create ProtocolS3Client for the given user
     fn create_s3_client_for_user(&self, user: &super::server::FtpsUser) -> Result<ProtocolS3Client> {
         let session_context = &user.session_context;
-        let fs = crate::storage::ecfs::FS {};
-
-        let s3_client = ProtocolS3Client::new(fs, session_context.access_key().to_string());
+        let s3_client = ProtocolS3Client::new(self.fs.clone(), session_context.access_key().to_string());
         Ok(s3_client)
     }
 
@@ -455,31 +457,28 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
         let mut builder = GetObjectInput::builder();
         builder.set_bucket(bucket);
         builder.set_key(object_key);
-        let mut input = builder
+
+        if start_pos > 0
+            && let Ok(range) = s3s::dto::Range::parse(&format!("bytes={}-", start_pos))
+        {
+            builder.set_range(Some(range));
+        }
+
+        let input = builder
             .build()
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Failed to build GetObjectInput"))?;
-
-        if start_pos > 0 {
-            input.range = Some(
-                s3s::dto::Range::parse(&format!("bytes={}-", start_pos))
-                    .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Invalid range format"))?,
-            );
-        }
 
         match s3_client.get_object(input).await {
             Ok(output) => {
                 if let Some(body) = output.body {
-                    // Map the s3s/Box<dyn StdError> error to std::io::Error
                     let stream = body.map_err(std::io::Error::other);
-                    // Wrap the stream in StreamReader to make it a tokio::io::AsyncRead
-                    let reader = tokio_util::io::StreamReader::new(stream);
+                    let reader = StreamReader::new(stream);
                     Ok(Box::new(reader))
                 } else {
                     Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Empty object body"))
                 }
             }
             Err(e) => {
-                error!("Failed to get object: {}", e);
                 let protocol_error = map_s3_error_to_ftps(&e);
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, protocol_error))
             }
@@ -735,14 +734,14 @@ impl StorageBackend<super::server::FtpsUser> for FtpsDriver {
 
             match s3_client.list_objects_v2(list_input).await {
                 Ok(output) => {
-                    if let Some(objects) = output.contents {
-                        if !objects.is_empty() {
-                            debug!("FTPS RMD - bucket '{}' is not empty, cannot delete", bucket);
-                            return Err(Error::new(
-                                ErrorKind::PermanentFileNotAvailable,
-                                format!("Bucket '{}' is not empty", bucket),
-                            ));
-                        }
+                    if let Some(objects) = output.contents
+                        && !objects.is_empty()
+                    {
+                        debug!("FTPS RMD - bucket '{}' is not empty, cannot delete", bucket);
+                        return Err(Error::new(
+                            ErrorKind::PermanentFileNotAvailable,
+                            format!("Bucket '{}' is not empty", bucket),
+                        ));
                     }
                 }
                 Err(e) => {

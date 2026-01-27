@@ -159,8 +159,8 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: s3s-e2e
-          git: https://github.com/Nugine/s3s.git
-          rev: b7714bfaa17ddfa9b23ea01774a1e7bbdbfc2ca3
+          git: https://github.com/s3s-project/s3s.git
+          rev: 4a04a670cf41274d9be9ab65dc36f4aa3f92fbad
 
       - name: Build debug binary
         run: |
@@ -175,7 +175,7 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: e2e-test-logs-${{ github.run_number }}
           path: /tmp/rustfs.log

@@ -96,10 +96,10 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        if let Some(sys_cred) = get_global_action_cred() {
-            if constant_time_eq(&sys_cred.access_key, ak) {
-                return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
-            }
+        if let Some(sys_cred) = get_global_action_cred()
+            && constant_time_eq(&sys_cred.access_key, ak)
+        {
+            return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
         }
 
         let Ok(iam_store) = rustfs_iam::get() else {
@@ -118,14 +118,16 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is not utf8"));
         }
 
-        let deny_only = ak == cred.access_key;
+        // Security fix: Always require explicit Allow permission for CreateUser
+        // Do not use deny_only to bypass permission checks, even when creating for self
+        // This ensures consistent security semantics and prevents privilege escalation
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
-            deny_only,
+            false, // Always require explicit Allow permission
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -178,7 +180,7 @@ impl Operation for SetUserStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -223,7 +225,7 @@ impl Operation for ListUsers {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListUsersAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -282,7 +284,7 @@ impl Operation for RemoveUser {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -375,14 +377,16 @@ impl Operation for GetUserInfo {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let deny_only = ak == cred.access_key;
+        // Security fix: Always require explicit Allow permission for GetUser
+        // Users should have explicit GetUser permission to view account information
+        // This ensures consistent security semantics across all admin operations
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
-            deny_only,
+            false, // Always require explicit Allow permission
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -438,7 +442,7 @@ impl Operation for ExportIam {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ExportIAMAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -651,8 +655,8 @@ impl Operation for ImportIam {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            vec![Action::AdminAction(AdminAction::ImportIAMAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -777,10 +781,10 @@ impl Operation for ImportIam {
                 let groups: HashMap<String, GroupInfo> = serde_json::from_slice(&file_content)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                 for (group_name, group_info) in groups {
-                    if let Err(e) = iam_store.get_group_description(&group_name).await {
-                        if matches!(e, rustfs_iam::error::Error::NoSuchGroup(_)) || has_space_be(&group_name) {
-                            return Err(s3_error!(InvalidArgument, "group not found or has space be"));
-                        }
+                    if let Err(e) = iam_store.get_group_description(&group_name).await
+                        && (matches!(e, rustfs_iam::error::Error::NoSuchGroup(_)) || has_space_be(&group_name))
+                    {
+                        return Err(s3_error!(InvalidArgument, "group not found or has space be"));
                     }
 
                     if let Err(e) = iam_store.add_users_to_group(&group_name, group_info.members.clone()).await {

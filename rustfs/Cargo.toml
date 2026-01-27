@@ -61,6 +61,7 @@ rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
+rustfs-scanner = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
@@ -98,6 +99,7 @@ rustls-pemfile = { workspace = true }
 
 # Time and Date
 chrono = { workspace = true }
+jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 
 # Utilities and Tools
@@ -115,8 +117,6 @@ md5.workspace = true
 mime_guess = { workspace = true }
 moka = { workspace = true }
 pin-project-lite.workspace = true
-# rand = "0.8" is pinned due to dependency conflicts with workspace version
-rand = "0.8"
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
@@ -127,6 +127,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
+libc = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
@@ -136,9 +137,6 @@ libunftp = { workspace = true }
 russh = { workspace = true }
 russh-sftp = { workspace = true }
 ssh-key = { workspace = true }
-
-[target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-sysctl = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true

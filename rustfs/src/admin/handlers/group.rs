@@ -58,7 +58,7 @@ impl Operation for ListGroups {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListGroupsAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -97,7 +97,7 @@ impl Operation for GetGroup {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::GetGroupAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -145,7 +145,7 @@ impl Operation for SetGroupStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableGroupAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -213,7 +213,7 @@ impl Operation for UpdateGroupMembers {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::AddUserToGroupAdminAction)],
-            req.extensions.get::<RemoteAddr>().map(|a| a.0),
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -277,10 +277,11 @@ impl Operation for UpdateGroupMembers {
         } else {
             warn!("add group members");
 
-            if let Err(err) = iam_store.get_group_description(&args.group).await {
-                if is_err_no_such_group(&err) && has_space_be(&args.group) {
-                    return Err(s3_error!(InvalidArgument, "not such group"));
-                }
+            if let Err(err) = iam_store.get_group_description(&args.group).await
+                && is_err_no_such_group(&err)
+                && has_space_be(&args.group)
+            {
+                return Err(s3_error!(InvalidArgument, "not such group"));
             }
 
             iam_store.add_users_to_group(&args.group, args.members).await.map_err(|e| {

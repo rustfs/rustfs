@@ -69,7 +69,8 @@ impl SftpServer {
             russh::keys::load_secret_key(path, None)?
         } else {
             warn!("No host key provided, generating random key (not recommended for production).");
-            let mut rng = rand::rngs::OsRng;
+            use russh::keys::signature::rand_core::OsRng;
+            let mut rng = OsRng;
             PrivateKey::random(&mut rng, Algorithm::Ed25519)?
         };
 
@@ -696,10 +697,10 @@ fn compare_keys(stored_key: &str, client_key_base64: &str) -> bool {
         return true;
     }
 
-    if let Ok(stored_bytes) = BASE64.decode(stored_key_data) {
-        if let Ok(client_bytes) = BASE64.decode(client_key_base64) {
-            return stored_bytes == client_bytes;
-        }
+    if let Ok(stored_bytes) = BASE64.decode(stored_key_data)
+        && let Ok(client_bytes) = BASE64.decode(client_key_base64)
+    {
+        return stored_bytes == client_bytes;
     }
 
     false

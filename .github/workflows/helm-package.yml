@@ -44,7 +44,6 @@ jobs:
           set -x
           old_version=$(grep "^appVersion:" helm/rustfs/Chart.yaml | awk '{print $2}')
           sed -i "s/$old_version/$new_version/g" helm/rustfs/Chart.yaml
-          sed  -i "/^image:/,/^[^ ]/ s/tag:.*/tag: "$new_version"/" helm/rustfs/values.yaml
 
       - name: Set up Helm
         uses: azure/setup-helm@v4.3.0
@@ -56,7 +55,7 @@ jobs:
           helm package ./helm/rustfs --destination helm/rustfs/ --version "0.0.$package_version"
 
       - name: Upload helm package as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: helm-package
           path: helm/rustfs/*.tgz
@@ -74,7 +73,7 @@ jobs:
           token: ${{ secrets.RUSTFS_HELM_PACKAGE }}
 
       - name: Download helm package
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: helm-package
           path: ./

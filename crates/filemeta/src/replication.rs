@@ -270,14 +270,12 @@ impl ReplicationState {
                         return repl_status;
                     }
 
-                    if repl_status == ReplicationStatusType::Completed {
-                        if let (Some(replica_timestamp), Some(replication_timestamp)) =
+                    if repl_status == ReplicationStatusType::Completed
+                        && let (Some(replica_timestamp), Some(replication_timestamp)) =
                             (self.replica_timestamp, self.replication_timestamp)
-                        {
-                            if replica_timestamp > replication_timestamp {
-                                return self.replica_status.clone();
-                            }
-                        }
+                        && replica_timestamp > replication_timestamp
+                    {
+                        return self.replica_status.clone();
                     }
 
                     return repl_status;
@@ -710,7 +708,7 @@ pub fn parse_replicate_decision(_bucket: &str, s: &str) -> std::io::Result<Repli
     // }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicateObjectInfo {
     pub name: String,
     pub size: i64,

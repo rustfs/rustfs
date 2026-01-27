@@ -1,3 +1,17 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::error::Error;
 use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use serde::{Deserialize, Serialize};
@@ -49,13 +63,13 @@ impl ExponentialMovingAverage {
     pub fn update_exponential_moving_average(&self, now: SystemTime) {
         if let Ok(mut last_update_guard) = self.last_update.try_lock() {
             let last_update = *last_update_guard;
-            if let Ok(duration) = now.duration_since(last_update) {
-                if duration.as_secs() > 0 {
-                    let decay = (-duration.as_secs_f64() / 60.0).exp(); // 1 minute decay
-                    let current_value = f64::from_bits(self.value.load(AtomicOrdering::Relaxed));
-                    self.value.store((current_value * decay).to_bits(), AtomicOrdering::Relaxed);
-                    *last_update_guard = now;
-                }
+            if let Ok(duration) = now.duration_since(last_update)
+                && duration.as_secs() > 0
+            {
+                let decay = (-duration.as_secs_f64() / 60.0).exp(); // 1 minute decay
+                let current_value = f64::from_bits(self.value.load(AtomicOrdering::Relaxed));
+                self.value.store((current_value * decay).to_bits(), AtomicOrdering::Relaxed);
+                *last_update_guard = now;
             }
         }
     }
@@ -757,10 +771,10 @@ impl ReplicationStats {
 
     /// Check if bucket replication statistics have usage
     pub fn has_replication_usage(&self, bucket: &str) -> bool {
-        if let Ok(cache) = self.cache.try_read() {
-            if let Some(stats) = cache.get(bucket) {
-                return stats.has_replication_usage();
-            }
+        if let Ok(cache) = self.cache.try_read()
+            && let Some(stats) = cache.get(bucket)
+        {
+            return stats.has_replication_usage();
         }
         false
     }

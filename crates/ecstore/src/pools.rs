@@ -244,10 +244,12 @@ impl PoolMeta {
     }
     pub fn decommission(&mut self, idx: usize, pi: PoolSpaceInfo) -> Result<()> {
         if let Some(pool) = self.pools.get_mut(idx) {
-            if let Some(ref info) = pool.decommission {
-                if !info.complete && !info.failed && !info.canceled {
-                    return Err(StorageError::DecommissionAlreadyRunning);
-                }
+            if let Some(ref info) = pool.decommission
+                && !info.complete
+                && !info.failed
+                && !info.canceled
+            {
+                return Err(StorageError::DecommissionAlreadyRunning);
             }
 
             let now = OffsetDateTime::now_utc();
@@ -273,12 +275,12 @@ impl PoolMeta {
     pub fn pending_buckets(&self, idx: usize) -> Vec<DecomBucketInfo> {
         let mut list = Vec::new();
 
-        if let Some(pool) = self.pools.get(idx) {
-            if let Some(ref info) = pool.decommission {
-                for bk in info.queued_buckets.iter() {
-                    let (name, prefix) = path2_bucket_object(bk);
-                    list.push(DecomBucketInfo { name, prefix });
-                }
+        if let Some(pool) = self.pools.get(idx)
+            && let Some(ref info) = pool.decommission
+        {
+            for bk in info.queued_buckets.iter() {
+                let (name, prefix) = path2_bucket_object(bk);
+                list.push(DecomBucketInfo { name, prefix });
             }
         }
 
@@ -306,15 +308,15 @@ impl PoolMeta {
     }
 
     pub fn count_item(&mut self, idx: usize, size: usize, failed: bool) {
-        if let Some(pool) = self.pools.get_mut(idx) {
-            if let Some(info) = pool.decommission.as_mut() {
-                if failed {
-                    info.items_decommission_failed += 1;
-                    info.bytes_failed += size;
-                } else {
-                    info.items_decommissioned += 1;
-                    info.bytes_done += size;
-                }
+        if let Some(pool) = self.pools.get_mut(idx)
+            && let Some(info) = pool.decommission.as_mut()
+        {
+            if failed {
+                info.items_decommission_failed += 1;
+                info.bytes_failed += size;
+            } else {
+                info.items_decommissioned += 1;
+                info.bytes_done += size;
             }
         }
     }
@@ -324,11 +326,11 @@ impl PoolMeta {
             return;
         }
 
-        if let Some(pool) = self.pools.get_mut(idx) {
-            if let Some(info) = pool.decommission.as_mut() {
-                info.object = object;
-                info.bucket = bucket;
-            }
+        if let Some(pool) = self.pools.get_mut(idx)
+            && let Some(info) = pool.decommission.as_mut()
+        {
+            info.object = object;
+            info.bucket = bucket;
         }
     }
 
@@ -407,10 +409,10 @@ impl PoolMeta {
 
         if specified_pools.len() == remembered_pools.len() {
             for (k, pi) in remembered_pools.iter() {
-                if let Some(pos) = specified_pools.get(k) {
-                    if *pos != pi.position {
-                        update = true; // Pool order changed, allow the update.
-                    }
+                if let Some(pos) = specified_pools.get(k)
+                    && *pos != pi.position
+                {
+                    update = true; // Pool order changed, allow the update.
                 }
             }
         }
@@ -440,11 +442,11 @@ impl PoolMeta {
     }
 }
 
-fn path2_bucket_object(name: &str) -> (String, String) {
+pub fn path2_bucket_object(name: &str) -> (String, String) {
     path2_bucket_object_with_base_path("", name)
 }
 
-fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
+pub fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
     // Trim the base path and leading slash
     let trimmed_path = path
         .strip_prefix(base_path)
@@ -452,7 +454,9 @@ fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, S
         .strip_prefix(SLASH_SEPARATOR)
         .unwrap_or(path);
     // Find the position of the first '/'
-    let pos = trimmed_path.find(SLASH_SEPARATOR).unwrap_or(trimmed_path.len());
+    let Some(pos) = trimmed_path.find(SLASH_SEPARATOR) else {
+        return (trimmed_path.to_string(), "".to_string());
+    };
     // Split into bucket and prefix
     let bucket = &trimmed_path[0..pos];
     let prefix = &trimmed_path[pos + 1..]; // +1 to skip the '/' character if it exists
@@ -640,10 +644,12 @@ impl ECStore {
     pub async fn is_decommission_running(&self) -> bool {
         let pool_meta = self.pool_meta.read().await;
         for pool in pool_meta.pools.iter() {
-            if let Some(ref info) = pool.decommission {
-                if !info.complete && !info.failed && !info.canceled {
-                    return true;
-                }
+            if let Some(ref info) = pool.decommission
+                && !info.complete
+                && !info.failed
+                && !info.canceled
+            {
+                return true;
             }
         }
 
@@ -850,8 +856,8 @@ impl ECStore {
             decommissioned += 1;
         }
 
-        if decommissioned == fivs.versions.len() {
-            if let Err(err) = set
+        if decommissioned == fivs.versions.len()
+            && let Err(err) = set
                 .delete_object(
                     bucket.as_str(),
                     &encode_dir_object(&entry.name),
@@ -863,9 +869,8 @@ impl ECStore {
                     },
                 )
                 .await
-            {
-                error!("decommission_pool: delete_object err {:?}", &err);
-            }
+        {
+            error!("decommission_pool: delete_object err {:?}", &err);
         }
 
         {
@@ -879,10 +884,8 @@ impl ECStore {
                 .unwrap_or_default();
 
             drop(pool_meta);
-            if ok {
-                if let Some(notification_sys) = get_global_notification_sys() {
-                    notification_sys.reload_pool_meta().await;
-                }
+            if ok && let Some(notification_sys) = get_global_notification_sys() {
+                notification_sys.reload_pool_meta().await;
             }
         }
 
@@ -1080,10 +1083,10 @@ impl ECStore {
 
                 {
                     let mut pool_meta = self.pool_meta.write().await;
-                    if pool_meta.bucket_done(idx, bucket.to_string()) {
-                        if let Err(err) = pool_meta.save(self.pools.clone()).await {
-                            error!("decom pool_meta.save err {:?}", err);
-                        }
+                    if pool_meta.bucket_done(idx, bucket.to_string())
+                        && let Err(err) = pool_meta.save(self.pools.clone()).await
+                    {
+                        error!("decom pool_meta.save err {:?}", err);
                     }
                 }
                 continue;
@@ -1100,10 +1103,10 @@ impl ECStore {
 
             {
                 let mut pool_meta = self.pool_meta.write().await;
-                if pool_meta.bucket_done(idx, bucket.to_string()) {
-                    if let Err(err) = pool_meta.save(self.pools.clone()).await {
-                        error!("decom pool_meta.save err {:?}", err);
-                    }
+                if pool_meta.bucket_done(idx, bucket.to_string())
+                    && let Err(err) = pool_meta.save(self.pools.clone()).await
+                {
+                    error!("decom pool_meta.save err {:?}", err);
                 }
 
                 warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
@@ -1138,11 +1141,10 @@ impl ECStore {
             if let Err(err) = self
                 .make_bucket(bk.to_string_lossy().to_string().as_str(), &MakeBucketOptions::default())
                 .await
+                && !is_err_bucket_exists(&err)
             {
-                if !is_err_bucket_exists(&err) {
-                    error!("decommission: make bucket failed: {err}");
-                    return Err(err);
-                }
+                error!("decommission: make bucket failed: {err}");
+                return Err(err);
             }
         }
 
@@ -1384,28 +1386,109 @@ impl SetDisks {
     }
 }
 
+fn is_disk_online_state(state: &str) -> bool {
+    // The disk state strings are produced from rustfs_utils::os::get_drive_stats or DiskError::to_string().
+    // Conventionally, online is "ok"/"online" (may evolve). Be conservative:
+    // - Treat empty as unknown -> include it (to avoid dropping capacity).
+    // - Exclude explicit offline-ish states.
+    let s = state.trim().to_lowercase();
+    if s.is_empty() {
+        return true;
+    }
+    if s.contains("offline") {
+        return false;
+    }
+    if s.contains("not found") || s.contains("disk not found") {
+        return false;
+    }
+    true
+}
+
+fn fallback_total_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
+    disks
+        .iter()
+        .filter(|d| is_disk_online_state(&d.state))
+        .map(|d| d.total_space as usize)
+        .sum()
+}
+
+fn fallback_free_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
+    disks
+        .iter()
+        .filter(|d| is_disk_online_state(&d.state))
+        .map(|d| d.available_space as usize)
+        .sum()
+}
+
 pub fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
-    let mut capacity = 0;
+    // If backend info is missing or inconsistent, do a safe fallback to avoid reporting nonsense.
+    if info.backend.standard_sc_data.is_empty() {
+        return fallback_total_capacity(disks);
+    }
+
+    let mut capacity = 0usize;
+    let mut matched_any = false;
+
     for disk in disks.iter() {
-        if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
+        if disk.pool_index < 0 {
             continue;
         }
-        if (disk.disk_index as usize) < info.backend.standard_sc_data[disk.pool_index as usize] {
+        let pool_idx = disk.pool_index as usize;
+        if info.backend.standard_sc_data.len() <= pool_idx {
+            continue;
+        }
+
+        let usable_disks_per_set = info.backend.standard_sc_data[pool_idx];
+        if usable_disks_per_set == 0 {
+            continue;
+        }
+
+        if (disk.disk_index as usize) < usable_disks_per_set {
+            matched_any = true;
             capacity += disk.total_space as usize;
         }
     }
-    capacity
+
+    if matched_any {
+        capacity
+    } else {
+        // Even if standard_sc_data exists, it might not match disk indexes due to upstream bugs.
+        // Fallback to summing all online disks to prevent under-reporting.
+        fallback_total_capacity(disks)
+    }
 }
 
 pub fn get_total_usable_capacity_free(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
-    let mut capacity = 0;
+    if info.backend.standard_sc_data.is_empty() {
+        return fallback_free_capacity(disks);
+    }
+
+    let mut capacity = 0usize;
+    let mut matched_any = false;
+
     for disk in disks.iter() {
-        if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
+        if disk.pool_index < 0 {
             continue;
         }
-        if (disk.disk_index as usize) < info.backend.standard_sc_data[disk.pool_index as usize] {
+        let pool_idx = disk.pool_index as usize;
+        if info.backend.standard_sc_data.len() <= pool_idx {
+            continue;
+        }
+
+        let usable_disks_per_set = info.backend.standard_sc_data[pool_idx];
+        if usable_disks_per_set == 0 {
+            continue;
+        }
+
+        if (disk.disk_index as usize) < usable_disks_per_set {
+            matched_any = true;
             capacity += disk.available_space as usize;
         }
     }
-    capacity
+
+    if matched_any {
+        capacity
+    } else {
+        fallback_free_capacity(disks)
+    }
 }

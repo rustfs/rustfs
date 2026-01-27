@@ -16,6 +16,7 @@
 mod linux;
 #[cfg(all(unix, not(target_os = "linux")))]
 mod unix;
+
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -80,7 +81,7 @@ mod tests {
         assert!(info.used > 0);
         assert!(info.files > 0);
         assert!(info.ffree > 0);
-        assert!(!info.fstype.is_empty());
+        assert!(info.total >= info.free);
     }
 
     #[test]

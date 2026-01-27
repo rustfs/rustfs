@@ -169,12 +169,31 @@ impl ErasureInfo {
 
     /// Check if this ErasureInfo equals another ErasureInfo
     pub fn equals(&self, other: &ErasureInfo) -> bool {
-        self.algorithm == other.algorithm
-            && self.data_blocks == other.data_blocks
-            && self.parity_blocks == other.parity_blocks
-            && self.block_size == other.block_size
-            && self.index == other.index
-            && self.distribution == other.distribution
+        if self.algorithm != other.algorithm {
+            return false;
+        }
+
+        if self.data_blocks != other.data_blocks {
+            return false;
+        }
+
+        if self.parity_blocks != other.parity_blocks {
+            return false;
+        }
+
+        if self.block_size != other.block_size {
+            return false;
+        }
+
+        if self.distribution.len() != other.distribution.len() {
+            return false;
+        }
+        for (i, v) in self.distribution.iter().enumerate() {
+            if v != &other.distribution[i] {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -438,21 +457,28 @@ impl FileInfo {
     pub fn equals(&self, other: &FileInfo) -> bool {
         // Check if both are compressed or both are not compressed
         if self.is_compressed() != other.is_compressed() {
+            tracing::warn!("equals: is_compressed is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check transition info
         if !self.transition_info_equals(other) {
+            tracing::warn!("equals: transition_info_equals is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check mod time
         if self.mod_time != other.mod_time {
+            tracing::warn!("equals: mod_time is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check erasure info
-        self.erasure.equals(&other.erasure)
+        if !self.erasure.equals(&other.erasure) {
+            tracing::warn!("equals: erasure is not equal, object_name={}", self.name);
+            return false;
+        }
+        true
     }
 
     /// Check if transition related information are equal
@@ -504,6 +530,10 @@ impl FileInfo {
         } else {
             ReplicationStatusType::Empty
         }
+    }
+
+    pub fn shard_file_size(&self, total_length: i64) -> i64 {
+        self.erasure.shard_file_size(total_length)
     }
 }
 
@@ -590,7 +620,7 @@ impl RestoreStatusOps for RestoreStatus {
     }
 }
 
-fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
+pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
     let tokens: Vec<&str> = restore_hdr.splitn(2, ",").collect();
     let progress_tokens: Vec<&str> = tokens[0].splitn(2, "=").collect();
     if progress_tokens.len() != 2 {
@@ -635,10 +665,10 @@ fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
 }
 
 pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
-    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str()) {
-        if let Ok(restore_status) = parse_restore_obj_status(restore_hdr) {
-            return restore_status.on_disk();
-        }
+    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str())
+        && let Ok(restore_status) = parse_restore_obj_status(restore_hdr)
+    {
+        return restore_status.on_disk();
     }
     false
 }

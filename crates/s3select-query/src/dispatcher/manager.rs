@@ -175,10 +175,10 @@ impl SimpleQueryDispatcher {
                             .clone()
                             .map(|e| e.as_bytes().first().copied().unwrap_or_default()),
                     );
-                if let Some(delimiter) = csv.field_delimiter.as_ref() {
-                    if delimiter.len() == 1 {
-                        file_format = file_format.with_delimiter(delimiter.as_bytes()[0]);
-                    }
+                if let Some(delimiter) = csv.field_delimiter.as_ref()
+                    && delimiter.len() == 1
+                {
+                    file_format = file_format.with_delimiter(delimiter.as_bytes()[0]);
                 }
                 // TODO waiting for processing @junxiang Mu
                 // if csv.file_header_info.is_some() {}

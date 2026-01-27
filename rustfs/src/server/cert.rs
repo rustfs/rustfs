@@ -26,7 +26,7 @@ pub enum RustFSError {
 impl std::fmt::Display for RustFSError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RustFSError::Cert(msg) => write!(f, "Certificate error: {}", msg),
+            RustFSError::Cert(msg) => write!(f, "Certificate error: {msg}"),
         }
     }
 }
@@ -78,7 +78,7 @@ fn parse_pem_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, RustFSErr
 async fn read_file(path: &PathBuf, desc: &str) -> Result<Vec<u8>, RustFSError> {
     tokio::fs::read(path)
         .await
-        .map_err(|e| RustFSError::Cert(format!("read {} {:?}: {e}", desc, path)))
+        .map_err(|e| RustFSError::Cert(format!("read {desc} {path:?}: {e}")))
 }
 
 /// Initialize TLS material for both server and outbound client connections.
@@ -260,12 +260,12 @@ async fn walk_dir(path: PathBuf, cert_name: &str, cert_data: &mut Vec<u8>) {
                     // Only check direct subdirectories, no deeper recursion
                     if let Ok(mut sub_rd) = tokio::fs::read_dir(&entry.path()).await {
                         while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
-                            if let Ok(sub_ft) = sub_entry.file_type().await {
-                                if sub_ft.is_file() {
-                                    load_if_matches(&sub_entry, cert_name, cert_data).await;
-                                }
-                                // Ignore subdirectories and symlinks in subdirs to limit to one level
+                            if let Ok(sub_ft) = sub_entry.file_type().await
+                                && sub_ft.is_file()
+                            {
+                                load_if_matches(&sub_entry, cert_name, cert_data).await;
                             }
+                            // Ignore subdirectories and symlinks in subdirs to limit to one level
                         }
                     }
                 } else if ft.is_symlink() {
@@ -277,12 +277,12 @@ async fn walk_dir(path: PathBuf, cert_name: &str, cert_data: &mut Vec<u8>) {
                             // Treat as directory but only check its direct contents
                             if let Ok(mut sub_rd) = tokio::fs::read_dir(&entry.path()).await {
                                 while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
-                                    if let Ok(sub_ft) = sub_entry.file_type().await {
-                                        if sub_ft.is_file() {
-                                            load_if_matches(&sub_entry, cert_name, cert_data).await;
-                                        }
-                                        // Ignore deeper levels
+                                    if let Ok(sub_ft) = sub_entry.file_type().await
+                                        && sub_ft.is_file()
+                                    {
+                                        load_if_matches(&sub_entry, cert_name, cert_data).await;
                                     }
+                                    // Ignore deeper levels
                                 }
                             }
                         }

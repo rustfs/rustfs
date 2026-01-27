@@ -36,10 +36,7 @@ use crate::server::{
 };
 use clap::Parser;
 use license::init_license;
-use rustfs_ahm::{
-    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
-    scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
-};
+use rustfs_ahm::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::{
@@ -59,6 +56,7 @@ use rustfs_ecstore::{
 };
 use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
+use rustfs_scanner::init_data_scanner;
 use rustfs_utils::net::parse_and_resolve_address;
 use std::io::{Error, Result};
 use std::sync::Arc;
@@ -73,11 +71,16 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn main() -> Result<()> {
+fn main() {
     let runtime = server::get_tokio_runtime_builder()
         .build()
         .expect("Failed to build Tokio runtime");
-    runtime.block_on(async_main())
+    let result = runtime.block_on(async_main());
+    if let Err(ref e) = result {
+        eprintln!("{} Server encountered an error and is shutting down: {}", jiff::Zoned::now(), e);
+        error!("Server encountered an error and is shutting down: {}", e);
+        std::process::exit(1);
+    }
 }
 async fn async_main() -> Result<()> {
     // Parse the obtained parameters
@@ -165,8 +168,8 @@ async fn run(opt: config::Opt) -> Result<()> {
             info!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
         }
         Err(e) => {
-            let msg = format!("init_global_action_credentials failed: {e:?}");
-            error!("{msg}");
+            let msg = format!("init global action credentials failed: {e:?}");
+            error!(target: "rustfs::main::run","{msg}");
             return Err(Error::other(msg));
         }
     };
@@ -272,14 +275,10 @@ async fn run(opt: config::Opt) -> Result<()> {
     let (ftp_sftp_shutdown_tx, _) = tokio::sync::broadcast::channel(1);
 
     // Initialize FTP system if enabled
-    init_ftp_system(&opt, ftp_sftp_shutdown_tx.clone())
-        .await
-        .map_err(Error::other)?;
+    init_ftp_system(ftp_sftp_shutdown_tx.clone()).await.map_err(Error::other)?;
 
     // Initialize SFTP system if enabled
-    init_sftp_system(&opt, ftp_sftp_shutdown_tx.clone())
-        .await
-        .map_err(Error::other)?;
+    init_sftp_system(ftp_sftp_shutdown_tx.clone()).await.map_err(Error::other)?;
 
     // Initialize buffer profiling system
     init_buffer_profile_system(&opt);
@@ -338,23 +337,29 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Initialize heal manager and scanner based on environment variables
     if enable_heal || enable_scanner {
-        if enable_heal {
-            // Initialize heal manager with channel processor
-            let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-            let heal_manager = init_heal_manager(heal_storage, None).await?;
+        let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
 
-            if enable_scanner {
-                info!(target: "rustfs::main::run","Starting scanner with heal manager...");
-                let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
-                scanner.start().await?;
-            } else {
-                info!(target: "rustfs::main::run","Scanner disabled, but heal manager is initialized and available");
-            }
-        } else if enable_scanner {
-            info!("Starting scanner without heal manager...");
-            let scanner = Scanner::new(Some(ScannerConfig::default()), None);
-            scanner.start().await?;
-        }
+        init_heal_manager(heal_storage, None).await?;
+
+        init_data_scanner(ctx.clone(), store.clone()).await;
+
+        // if enable_heal {
+        //     // Initialize heal manager with channel processor
+        //     let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
+        //     let heal_manager = init_heal_manager(heal_storage, None).await?;
+
+        //     if enable_scanner {
+        //         info!(target: "rustfs::main::run","Starting scanner with heal manager...");
+        //         let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
+        //         scanner.start().await?;
+        //     } else {
+        //         info!(target: "rustfs::main::run","Scanner disabled, but heal manager is initialized and available");
+        //     }
+        // } else if enable_scanner {
+        //     info!("Starting scanner without heal manager...");
+        //     let scanner = Scanner::new(Some(ScannerConfig::default()), None);
+        //     scanner.start().await?;
+        // }
     } else {
         info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }
@@ -365,13 +370,17 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_update_check();
 
     println!(
-        "RustFS server started successfully at {}, current time: {}",
+        "RustFS server version: {} started successfully at {}, current time: {}",
+        version::get_version(),
         &server_address,
-        chrono::offset::Utc::now().to_string()
+        jiff::Zoned::now()
     );
     info!(target: "rustfs::main::run","server started successfully at {}", &server_address);
     // 4. Mark as Full Ready now that critical components are warm
     readiness.mark_stage(SystemStage::FullReady);
+
+    // Set the global RustFS initialization time to now
+    rustfs_common::set_global_init_time_now().await;
 
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;

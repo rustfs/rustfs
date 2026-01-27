@@ -14,8 +14,6 @@
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, pin_mut};
-#[cfg(test)]
-use std::sync::MutexGuard;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
@@ -83,7 +81,7 @@ fn reset_dns_resolver_inner() {
 
 #[cfg(test)]
 pub struct MockResolverGuard {
-    _lock: MutexGuard<'static, ()>,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
@@ -174,16 +172,15 @@ pub async fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => {
             // Check cache first
-            if CUSTOM_DNS_RESOLVER.read().unwrap().is_none() {
-                if let Ok(mut cache) = DNS_CACHE.lock() {
-                    if let Some(entry) = cache.get(domain) {
-                        if !entry.is_expired(DNS_CACHE_TTL) {
-                            return Ok(entry.ips.clone());
-                        }
-                        // Remove expired entry
-                        cache.remove(domain);
-                    }
+            if CUSTOM_DNS_RESOLVER.read().unwrap().is_none()
+                && let Ok(mut cache) = DNS_CACHE.lock()
+                && let Some(entry) = cache.get(domain)
+            {
+                if !entry.is_expired(DNS_CACHE_TTL) {
+                    return Ok(entry.ips.clone());
                 }
+                // Remove expired entry
+                cache.remove(domain);
             }
 
             info!("Cache miss for domain {domain}, querying system resolver.");
