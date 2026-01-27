@@ -85,5 +85,9 @@ pub use notify::*;
 #[cfg(feature = "obj")]
 pub mod obj;
 
+#[cfg(feature = "path")]
+mod dunce;
+#[cfg(feature = "path")]
+pub use dunce::*;
 mod envs;
 pub use envs::*;

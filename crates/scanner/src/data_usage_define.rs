@@ -32,12 +32,12 @@ use rustfs_ecstore::{
     error::{Error, Result as StorageResult, StorageError},
     store_api::{ObjectInfo, ObjectOptions},
 };
-use rustfs_utils::path::{SLASH_SEPARATOR_STR, path_join_buf};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{error, warn};
 
 // Data usage constants
-pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR_STR;
+pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 
@@ -47,16 +47,16 @@ pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 
 // Data usage paths (computed at runtime)
 pub static DATA_USAGE_BUCKET: LazyLock<String> =
-    LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR_STR}{BUCKET_META_PREFIX}"));
+    LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{BUCKET_META_PREFIX}"));
 
 pub static DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
-    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR_STR}{DATA_USAGE_OBJ_NAME}"));
+    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBJ_NAME}"));
 
 pub static DATA_USAGE_BLOOM_NAME_PATH: LazyLock<String> =
-    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR_STR}{DATA_USAGE_BLOOM_NAME}"));
+    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_BLOOM_NAME}"));
 
 pub static BACKGROUND_HEAL_INFO_PATH: LazyLock<String> =
-    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR_STR}.background-heal.json"));
+    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}.background-heal.json"));
 
 #[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TierStats {
