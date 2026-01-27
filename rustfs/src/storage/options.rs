@@ -33,30 +33,11 @@ use rustfs_utils::http::RUSTFS_FORCE_DELETE;
 use rustfs_utils::path::is_dir_object;
 use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
 use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
-use s3s::{S3Request, S3Result, s3_error};
+use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::error;
 use uuid::Uuid;
-
-// NOTE:
-// Code-search results may be incomplete (GitHub search returns top matches).
-// To view more matches in GitHub UI:
-// https://github.com/rustfs/rustfs/search?q=extract_metadata_from_mime_with_object_name&type=code
-
-// ===== Query-meta constraints (SigV4 presigned PutObject only) =====
-//
-// Requirements implemented here:
-// - Only enabled when AuthType::Presigned (SigV4) AND operation is PutObject (HTTP PUT)
-// - Only accept key prefix (case-insensitive): x-amz-meta-
-// - Enforce size limits: total <= 2KB, per entry <= 1KB (key bytes + value bytes)
-// - Forbid empty key (both whole key and suffix after prefix); consistent with existing header parsing
-// - Value must be valid UTF-8 and "printable" (no ASCII control chars except HT)
-//
-// Design:
-// - Keep existing extract_metadata_from_mime_with_object_name for headers
-// - Add extra_kv merging function to accept validated kv from query
-// - Provide helper to extract extra_kv from presigned PutObject query-string
 
 /// S3-like metadata limits (conservative defaults).
 const QUERY_META_MAX_TOTAL_BYTES: usize = 2 * 1024;
