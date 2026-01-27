@@ -26,8 +26,8 @@ use crate::storage::{
     access::{ReqInfo, authorize_request, has_bypass_governance_header},
     options::{
         copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_extra_from_presigned_putobject_query,
-        extract_metadata_from_mime_with_object_name, extract_metadata_from_mime_with_object_name_and_extra_kv,
-        get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
+        extract_metadata_from_mime_with_object_name_and_extra_kv, get_complete_multipart_upload_opts, get_opts,
+        parse_copy_source_range, put_opts,
     },
 };
 use crate::storage::{

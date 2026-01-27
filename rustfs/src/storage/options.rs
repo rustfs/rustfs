@@ -44,6 +44,7 @@ const QUERY_META_MAX_TOTAL_BYTES: usize = 2 * 1024;
 const QUERY_META_MAX_ENTRY_BYTES: usize = 1024;
 
 /// Extracts metadata from headers and returns it as a HashMap.
+#[allow(dead_code)]
 pub fn get_default_get_opts(_headers: &HeaderMap<HeaderValue>, metadata: HashMap<String, String>) -> Result<ObjectOptions> {
     get_default_opts(_headers, metadata, false)
 }
@@ -317,8 +318,9 @@ fn is_printable_utf8(s: &str) -> bool {
     })
 }
 
+/// Calculate entry size in bytes for key-value pair.
 fn entry_size_bytes(key: &str, value: &str) -> usize {
-    key.as_bytes().len() + value.as_bytes().len()
+    key.len() + value.len()
 }
 
 /// Extract `x-amz-meta-*` from query-string with strict constraints.
@@ -372,7 +374,8 @@ fn extract_query_meta_from_uri(uri: &Uri) -> S3Result<Vec<(String, String)>> {
         }
 
         // enforce per-entry and total limits (bytes)
-        let entry_bytes = entry_size_bytes(&k, value);
+        // enforce per-entry and total limits (bytes); use suffix (stored key) for size calculation
+        let entry_bytes = entry_size_bytes(suffix, value);
         if entry_bytes > QUERY_META_MAX_ENTRY_BYTES {
             return Err(s3_error!(
                 InvalidArgument,
@@ -398,7 +401,7 @@ fn extract_query_meta_from_uri(uri: &Uri) -> S3Result<Vec<(String, String)>> {
 /// Extract query-meta ONLY for SigV4 presigned PutObject.
 ///
 /// Returns user-metadata as Vec<(key_without_prefix, value)> ready to be merged into `metadata`.
-pub fn extract_metadata_extra_from_presigned_putobject_query<T>(
+pub fn extract_metadata_extra_from_presigned_putobject_query(
     req_uri: &Uri,
     req_method: &Method,
     auth_type: AuthType,
