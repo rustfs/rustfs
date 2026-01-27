@@ -367,11 +367,11 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
 
     let mut filtered_metadata = HashMap::new();
     for (k, v) in metadata {
+        let lower_key = k.to_ascii_lowercase();
         // Skip internal/reserved metadata
-        if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
+        if lower_key.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
             continue;
         }
-
         // Skip empty object lock values
         if v.is_empty() && (k == &X_AMZ_OBJECT_LOCK_MODE.to_string() || k == &X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string()) {
             continue;
@@ -381,8 +381,6 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
         if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
             continue;
         }
-
-        let lower_key = k.to_ascii_lowercase();
 
         // Skip standard HTTP headers (they are returned as separate headers, not metadata)
         if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {

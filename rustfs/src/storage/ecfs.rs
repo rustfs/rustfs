@@ -4385,7 +4385,7 @@ impl S3 for FS {
 
         if let Err(err) = cfg.is_valid() {
             warn!("put_bucket_policy err input {:?}, {:?}", &policy, err);
-            return Err(s3_error!(InvalidPolicyDocument));
+            return Err(s3_error!(MalformedPolicy));
         }
 
         let data = serde_json::to_vec(&cfg).map_err(|e| s3_error!(InternalError, "parse policy failed {:?}", e))?;
@@ -5206,15 +5206,12 @@ impl S3 for FS {
                 return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
             }
 
+            // allow to set the value of a tag to an empty string, but cannot set it to a null value.
+            // Reference：https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/UserGuide/Using_Tags.html#tag-restrictions
             let value = tag.value.as_ref().ok_or_else(|| {
                 error!("Null tag value");
                 s3_error!(InvalidTag, "Tag value cannot be null")
             })?;
-
-            if value.is_empty() {
-                error!("Empty tag value");
-                return Err(s3_error!(InvalidTag, "Tag value cannot be empty"));
-            }
 
             if value.len() > 256 {
                 error!("Tag value too long: {} bytes", value.len());
