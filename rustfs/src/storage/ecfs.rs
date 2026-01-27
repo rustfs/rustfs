@@ -699,6 +699,7 @@ impl S3 for FS {
         let mpu_key = key.clone();
         let mpu_version = obj_info.version_id.map(|v| v.to_string());
         let mpu_version_clone = mpu_version.clone();
+        let mpu_version_for_event = mpu_version.clone();
         tokio::spawn(async move {
             manager
                 .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
@@ -792,7 +793,7 @@ impl S3 for FS {
 
         // Set object info for event notification
         helper = helper.object(obj_info.clone());
-        if let Some(version_id) = &mpu_version {
+        if let Some(version_id) = &mpu_version_for_event {
             helper = helper.version_id(version_id.clone());
         }
 
