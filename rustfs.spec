@@ -2,7 +2,7 @@
 %global _empty_manifest_terminate_build 0
 Name:           rustfs
 Version:        1.0.0
-Release:        alpha.69
+Release:        alpha.81
 Summary:       High-performance distributed object storage for MinIO alternative
 
 License:        Apache-2.0
@@ -57,6 +57,9 @@ install %_builddir/%{name}-%{version}-%{release}/target/%_arch/%_arch-unknown-li
 %_bindir/rustfs
 
 %changelog
+* Thu Jan 28 2026 houseme <housemecn@gmail.com>
+- Initial RPM package for RustFS 1.0.0-alpha.81
+
 * Thu Nov 20 2025 Wenlong Zhang <zhangwenlong@loongson.cn>
 - Initial RPM package for RustFS 1.0.0-alpha.69
 
