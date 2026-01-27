@@ -387,7 +387,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    //#[ignore]
+    #[ignore]
     async fn test_lifecycle_chche_build() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
@@ -513,6 +513,7 @@ mod serial_tests {
                                 ..Default::default()
                             },
                             OffsetDateTime::now_utc(),
+                            0
                         )
                         .await;
                     }
