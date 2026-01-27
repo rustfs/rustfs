@@ -336,15 +336,15 @@ fn extract_query_meta_from_uri(uri: &Uri) -> S3Result<Vec<(String, String)>> {
         return Ok(Vec::new());
     };
 
-    // Parse as raw bytes to validate UTF-8 ourselves.
-    // serde_urlencoded performs percent-decoding and '+' => ' ' conversion.
-    let pairs: Vec<(String, Vec<u8>)> =
+    // Parse as Vec<(String, String)> to let serde_urlencoded handle percent-decoding.
+    // Note: serde_urlencoded replaces invalid UTF-8 sequences with the replacement character (U+FFFD).
+    let pairs: Vec<(String, String)> =
         serde_urlencoded::from_bytes(query.as_bytes()).map_err(|e| s3_error!(InvalidArgument, "invalid query string: {e}"))?;
 
     let mut out: Vec<(String, String)> = Vec::new();
     let mut total_bytes: usize = 0;
 
-    for (k, vbytes) in pairs {
+    for (k, value) in pairs {
         if k.is_empty() {
             // RustFS headers parsing already skips empty keys; keep same behavior.
             continue;
@@ -362,20 +362,19 @@ fn extract_query_meta_from_uri(uri: &Uri) -> S3Result<Vec<(String, String)>> {
             continue;
         }
 
-        // value must be valid utf-8
-        let value = std::str::from_utf8(&vbytes).map_err(|e| {
-            error!("extract_query_meta_from_uri: invalid UTF-8 in query-meta value for key '{}': {}", k, e);
-            s3_error!(InvalidArgument, "query-meta value must be valid UTF-8")
-        })?;
+        // Check for replacement character to detect invalid UTF-8 in the original query string
+        if value.contains('\u{FFFD}') {
+            return Err(s3_error!(InvalidArgument, "query-meta value must be valid UTF-8"));
+        }
 
         // value must be printable utf-8
-        if !is_printable_utf8(value) {
+        if !is_printable_utf8(&value) {
             return Err(s3_error!(InvalidArgument, "query-meta value must be printable UTF-8"));
         }
 
         // enforce per-entry and total limits (bytes)
         // enforce per-entry and total limits (bytes); use suffix (stored key) for size calculation
-        let entry_bytes = entry_size_bytes(suffix, value);
+        let entry_bytes = entry_size_bytes(suffix, &value);
         if entry_bytes > QUERY_META_MAX_ENTRY_BYTES {
             return Err(s3_error!(
                 InvalidArgument,
@@ -392,7 +391,7 @@ fn extract_query_meta_from_uri(uri: &Uri) -> S3Result<Vec<(String, String)>> {
         }
 
         // Store WITHOUT the x-amz-meta- prefix (to match existing header behavior)
-        out.push((suffix.to_string(), value.to_string()));
+        out.push((suffix.to_string(), value));
     }
 
     Ok(out)
@@ -1316,7 +1315,7 @@ mod tests {
         // %FF is invalid UTF-8 when percent-decoded into bytes.
         let uri: Uri = "/b/k?x-amz-meta-a=%FF".parse().unwrap();
         let err = extract_query_meta_from_uri(&uri).unwrap_err();
-        assert!(err.to_string().to_ascii_lowercase().contains("utf-8"));
+        assert!(err.message().unwrap().to_ascii_lowercase().contains("utf-8"));
     }
 
     #[test]
@@ -1324,7 +1323,7 @@ mod tests {
         // newline is not allowed
         let uri: Uri = "/b/k?x-amz-meta-a=hello%0Aworld".parse().unwrap();
         let err = extract_query_meta_from_uri(&uri).unwrap_err();
-        assert!(err.to_string().to_ascii_lowercase().contains("printable"));
+        assert!(err.message().unwrap().to_ascii_lowercase().contains("printable"));
     }
 
     #[test]
@@ -1332,7 +1331,7 @@ mod tests {
         let big = "a".repeat(QUERY_META_MAX_ENTRY_BYTES + 1);
         let uri: Uri = format!("/b/k?x-amz-meta-a={big}").parse().unwrap();
         let err = extract_query_meta_from_uri(&uri).unwrap_err();
-        assert!(err.to_string().to_ascii_lowercase().contains("entry too large"));
+        assert!(err.message().unwrap().to_ascii_lowercase().contains("entry too large"));
     }
 
     #[test]
@@ -1347,6 +1346,6 @@ mod tests {
         }
         let uri: Uri = format!("/b/k?{qs}").parse().unwrap();
         let err = extract_query_meta_from_uri(&uri).unwrap_err();
-        assert!(err.to_string().to_ascii_lowercase().contains("total too large"));
+        assert!(err.message().unwrap().to_ascii_lowercase().contains("total too large"));
     }
 }
