@@ -48,7 +48,6 @@ async-trait.workspace = true
 bytes.workspace = true
 byteorder = { workspace = true }
 chrono.workspace = true
-dunce.workspace = true
 glob = { workspace = true }
 thiserror.workspace = true
 flatbuffers.workspace = true
