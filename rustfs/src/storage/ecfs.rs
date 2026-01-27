@@ -25,7 +25,8 @@ use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
     access::{ReqInfo, authorize_request, has_bypass_governance_header},
     options::{
-        copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
+        copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_extra_from_presigned_putobject_query,
+        extract_metadata_from_mime_with_object_name, extract_metadata_from_mime_with_object_name_and_extra_kv,
         get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
     },
 };
@@ -4662,6 +4663,13 @@ impl S3 for FS {
         }
 
         extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, true, Some(&key));
+
+        // query-meta is only enabled for SigV4 presigned PutObject
+        let auth_type = crate::auth::get_request_auth_type(&req.headers);
+        let extra_kv = extract_metadata_extra_from_presigned_putobject_query(&req.uri, &req.methd, auth_type)
+            .map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
+
+        extract_metadata_from_mime_with_object_name_and_extra_kv(&req.headers, &mut metadata, true, Some(&key), extra_kv);
 
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_string());

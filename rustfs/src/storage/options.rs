@@ -12,37 +12,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use http::{HeaderMap, HeaderValue};
+use crate::auth::{
+    AuthType, UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER, get_request_auth_type, is_request_presigned_signature_v4,
+};
+use http::{HeaderMap, HeaderValue, Method, Uri};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::error::Result;
-use rustfs_ecstore::error::StorageError;
-use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
-use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
-use rustfs_utils::http::RUSTFS_FORCE_DELETE;
-use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
-use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
-
-use crate::auth::UNSIGNED_PAYLOAD;
-use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
+use rustfs_ecstore::error::{Result, StorageError};
 use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions};
 use rustfs_policy::service_type::ServiceType;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
+use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
+use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_REQUEST;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
 use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_VERSION_ID;
+use rustfs_utils::http::RUSTFS_FORCE_DELETE;
 use rustfs_utils::path::is_dir_object;
-use s3s::{S3Result, s3_error};
+use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
+use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
+use s3s::{S3Request, S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::auth::AuthType;
-use crate::auth::get_request_auth_type;
-use crate::auth::is_request_presigned_signature_v4;
+// NOTE:
+// Code-search results may be incomplete (GitHub search returns top matches).
+// To view more matches in GitHub UI:
+// https://github.com/rustfs/rustfs/search?q=extract_metadata_from_mime_with_object_name&type=code
+
+// ===== Query-meta constraints (SigV4 presigned PutObject only) =====
+//
+// Requirements implemented here:
+// - Only enabled when AuthType::Presigned (SigV4) AND operation is PutObject (HTTP PUT)
+// - Only accept key prefix (case-insensitive): x-amz-meta-
+// - Enforce size limits: total <= 2KB, per entry <= 1KB (key bytes + value bytes)
+// - Forbid empty key (both whole key and suffix after prefix); consistent with existing header parsing
+// - Value must be valid UTF-8 and "printable" (no ASCII control chars except HT)
+//
+// Design:
+// - Keep existing extract_metadata_from_mime_with_object_name for headers
+// - Add extra_kv merging function to accept validated kv from query
+// - Provide helper to extract extra_kv from presigned PutObject query-string
+
+/// S3-like metadata limits (conservative defaults).
+const QUERY_META_MAX_TOTAL_BYTES: usize = 2 * 1024;
+const QUERY_META_MAX_ENTRY_BYTES: usize = 1024;
+
+/// Extracts metadata from headers and returns it as a HashMap.
+pub fn get_default_get_opts(_headers: &HeaderMap<HeaderValue>, metadata: HashMap<String, String>) -> Result<ObjectOptions> {
+    get_default_opts(_headers, metadata, false)
+}
 
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
@@ -301,6 +324,135 @@ pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &m
     extract_metadata_from_mime_with_object_name(headers, metadata, false, None);
 }
 
+fn is_printable_utf8(s: &str) -> bool {
+    s.chars().all(|ch| {
+        if ch.is_ascii() {
+            let b = ch as u8;
+            // allow HT(0x09), allow space and visible (0x20..=0x7E)
+            b == b'\t' || (0x20..=0x7E).contains(&b)
+        } else {
+            true
+        }
+    })
+}
+
+fn entry_size_bytes(key: &str, value: &str) -> usize {
+    key.as_bytes().len() + value.as_bytes().len()
+}
+
+/// Extract `x-amz-meta-*` from query-string with strict constraints.
+///
+/// Returns Vec of (key_without_prefix, value) ready to be merged into metadata map.
+///
+/// - Keys must start with `x-amz-meta-` ignoring ASCII case.
+/// - Suffix after prefix must be non-empty.
+/// - Values must be valid UTF-8 and printable.
+/// - Enforces per-entry and total size limits.
+fn extract_query_meta_from_uri(uri: &Uri) -> S3Result<Vec<(String, String)>> {
+    let Some(query) = uri.query() else {
+        return Ok(Vec::new());
+    };
+
+    // Parse as raw bytes to validate UTF-8 ourselves.
+    // serde_urlencoded performs percent-decoding and '+' => ' ' conversion.
+    let pairs: Vec<(String, Vec<u8>)> =
+        serde_urlencoded::from_bytes(query.as_bytes()).map_err(|e| s3_error!(InvalidArgument, "invalid query string: {e}"))?;
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut total_bytes: usize = 0;
+
+    for (k, vbytes) in pairs {
+        if k.is_empty() {
+            // RustFS headers parsing already skips empty keys; keep same behavior.
+            continue;
+        }
+
+        // Only accept prefix x-amz-meta- (case-insensitive)
+        const PREFIX: &str = "x-amz-meta-";
+        if k.len() < PREFIX.len() || !k[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+            continue;
+        }
+
+        // Suffix after prefix: must be non-empty
+        let suffix = k.get(PREFIX.len()..).unwrap_or("");
+        if suffix.is_empty() {
+            continue;
+        }
+
+        // value must be valid utf-8
+        let value = std::str::from_utf8(&vbytes).map_err(|e| {
+            error!("extract_query_meta_from_uri: invalid UTF-8 in query-meta value for key '{}': {}", k, e);
+            s3_error!(InvalidArgument, "query-meta value must be valid UTF-8")
+        })?;
+
+        // value must be printable utf-8
+        if !is_printable_utf8(value) {
+            return Err(s3_error!(InvalidArgument, "query-meta value must be printable UTF-8"));
+        }
+
+        // enforce per-entry and total limits (bytes)
+        let entry_bytes = entry_size_bytes(&k, value);
+        if entry_bytes > QUERY_META_MAX_ENTRY_BYTES {
+            return Err(s3_error!(
+                InvalidArgument,
+                "query-meta entry too large (max {QUERY_META_MAX_ENTRY_BYTES} bytes)"
+            ));
+        }
+
+        total_bytes = total_bytes.saturating_add(entry_bytes);
+        if total_bytes > QUERY_META_MAX_TOTAL_BYTES {
+            return Err(s3_error!(
+                InvalidArgument,
+                "query-meta total too large (max {QUERY_META_MAX_TOTAL_BYTES} bytes)"
+            ));
+        }
+
+        // Store WITHOUT the x-amz-meta- prefix (to match existing header behavior)
+        out.push((suffix.to_string(), value.to_string()));
+    }
+
+    Ok(out)
+}
+
+/// Extract query-meta ONLY for SigV4 presigned PutObject.
+///
+/// Returns user-metadata as Vec<(key_without_prefix, value)> ready to be merged into `metadata`.
+pub fn extract_metadata_extra_from_presigned_putobject_query<T>(
+    req_uri: &Uri,
+    req_method: &Method,
+    auth_type: AuthType,
+) -> S3Result<Vec<(String, String)>> {
+    // Only enable for Presigned (SigV4)
+    if auth_type != AuthType::Presigned {
+        return Ok(Vec::new());
+    }
+
+    // Only enable for PutObject
+    if req_method != Method::PUT {
+        return Ok(Vec::new());
+    }
+
+    extract_query_meta_from_uri(req_uri)
+}
+
+/// On top of the original header metadata extraction, additional kv from query is merged.
+pub fn extract_metadata_from_mime_with_object_name_and_extra_kv(
+    headers: &HeaderMap<HeaderValue>,
+    metadata: &mut HashMap<String, String>,
+    skip_content_type: bool,
+    object_name: Option<&str>,
+    extra_kv: impl IntoIterator<Item = (String, String)>,
+) {
+    extract_metadata_from_mime_with_object_name(headers, metadata, skip_content_type, object_name);
+
+    for (k, v) in extra_kv {
+        if k.is_empty() {
+            continue;
+        }
+        metadata.insert(k, v);
+    }
+}
+
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
 pub fn extract_metadata_from_mime_with_object_name(
     headers: &HeaderMap<HeaderValue>,
@@ -450,7 +602,7 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
 });
 
 /// Parse copy source range string in format "bytes=start-end"
-pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
+pub fn parse_copy_source_range(range_str: &str) -> std::result::Result<HTTPRangeSpec, s3s::S3Error> {
     if !range_str.starts_with("bytes=") {
         return Err(s3_error!(InvalidArgument, "Invalid range format"));
     }
@@ -1161,5 +1313,56 @@ mod tests {
         assert!(parse_copy_source_range("bytes=").is_err());
         assert!(parse_copy_source_range("bytes=abc-def").is_err());
         assert!(parse_copy_source_range("bytes=100-50").is_err()); // start > end
+    }
+
+    #[test]
+    fn test_extract_query_meta_filters_prefix_case_insensitive_and_strips_prefix() {
+        let uri: Uri = "/bucket/key?X-Amz-Meta-Foo=bar&x-amz-meta-baz=qux&not-meta=1"
+            .parse()
+            .unwrap();
+
+        let meta = extract_query_meta_from_uri(&uri).unwrap();
+        assert_eq!(meta.len(), 2);
+        assert!(meta.contains(&(String::from("Foo"), String::from("bar"))));
+        assert!(meta.contains(&(String::from("baz"), String::from("qux"))));
+    }
+
+    #[test]
+    fn test_extract_query_meta_rejects_non_utf8_value() {
+        // %FF is invalid UTF-8 when percent-decoded into bytes.
+        let uri: Uri = "/b/k?x-amz-meta-a=%FF".parse().unwrap();
+        let err = extract_query_meta_from_uri(&uri).unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("utf-8"));
+    }
+
+    #[test]
+    fn test_extract_query_meta_rejects_non_printable() {
+        // newline is not allowed
+        let uri: Uri = "/b/k?x-amz-meta-a=hello%0Aworld".parse().unwrap();
+        let err = extract_query_meta_from_uri(&uri).unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("printable"));
+    }
+
+    #[test]
+    fn test_extract_query_meta_enforces_entry_limit() {
+        let big = "a".repeat(QUERY_META_MAX_ENTRY_BYTES + 1);
+        let uri: Uri = format!("/b/k?x-amz-meta-a={big}").parse().unwrap();
+        let err = extract_query_meta_from_uri(&uri).unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("entry too large"));
+    }
+
+    #[test]
+    fn test_extract_query_meta_enforces_total_limit() {
+        // Make many small entries to exceed total.
+        let mut qs = String::new();
+        for i in 0..200 {
+            if !qs.is_empty() {
+                qs.push('&');
+            }
+            qs.push_str(&format!("x-amz-meta-k{i}=v{i}"));
+        }
+        let uri: Uri = format!("/b/k?{qs}").parse().unwrap();
+        let err = extract_query_meta_from_uri(&uri).unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("total too large"));
     }
 }
