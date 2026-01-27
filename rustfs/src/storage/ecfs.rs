@@ -111,7 +111,8 @@ use rustfs_targets::{
     arn::{ARN, TargetIDError},
 };
 use rustfs_utils::{
-    CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
+    CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_port,
+    get_request_user_agent,
     http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
@@ -532,7 +533,8 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
         let input = req.input;
         let CompleteMultipartUploadInput {
             multipart_upload,
@@ -699,6 +701,7 @@ impl S3 for FS {
         let mpu_key = key.clone();
         let mpu_version = obj_info.version_id.map(|v| v.to_string());
         let mpu_version_clone = mpu_version.clone();
+        let mpu_version_for_event = mpu_version.clone();
         tokio::spawn(async move {
             manager
                 .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
@@ -738,11 +741,12 @@ impl S3 for FS {
             }
         }
 
+        let region = rustfs_ecstore::global::get_global_region().unwrap_or_else(|| "us-east-1".to_string());
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some("us-east-1".to_string()),
+            location: Some(region.clone()),
             server_side_encryption: server_side_encryption.clone(), // TDD: Return encryption info
             ssekms_key_id: ssekms_key_id.clone(),                   // TDD: Return KMS key ID if present
             checksum_crc32: checksum_crc32.clone(),
@@ -763,7 +767,7 @@ impl S3 for FS {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some("us-east-1".to_string()),
+            location: Some(region.clone()),
             server_side_encryption, // TDD: Return encryption info
             ssekms_key_id,          // TDD: Return KMS key ID if present
             checksum_crc32,
@@ -776,20 +780,26 @@ impl S3 for FS {
         };
 
         let mt2 = HashMap::new();
-        let repoptions =
+        let replicate_options =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
 
-        let dsc = must_replicate(&bucket, &key, repoptions).await;
+        let dsc = must_replicate(&bucket, &key, replicate_options).await;
 
         if dsc.replicate_any() {
             warn!("need multipart replication");
-            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
+            schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
         }
         info!(
             "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
             output.server_side_encryption, output.ssekms_key_id
         );
-        helper.object(obj_info);
+
+        // Set object info for event notification
+        helper = helper.object(obj_info);
+        if let Some(version_id) = &mpu_version_for_event {
+            helper = helper.version_id(version_id.clone());
+        }
+
         let helper_result = Ok(S3Response::new(helper_output));
         let _ = helper.complete(&helper_result);
         Ok(S3Response::new(output))
