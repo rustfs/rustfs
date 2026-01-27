@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use s3s::dto::Tag;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use url::form_urlencoded;
 
@@ -31,7 +32,13 @@ pub fn decode_tags(tags: &str) -> Vec<Tag> {
             value: Some(v.to_string()),
         });
     }
-    list.sort_by(|a, b| a.key.cmp(&b.key));
+    // use pattern matching instead of unwrap(), no panic even if the key becomes None later
+    list.sort_by(|a, b| match (a.key.as_ref(), b.key.as_ref()) {
+        (Some(a_k), Some(b_k)) => a_k.cmp(b_k),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => Ordering::Equal,
+    });
     list
 }
 
