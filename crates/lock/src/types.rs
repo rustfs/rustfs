@@ -117,18 +117,14 @@ impl LockId {
         }
     }
 
-    /// Generate deterministic lock ID for a resource (same resource = same ID)
+    /// Generate unique lock ID for a resource
+    /// Each call generates a different ID, even for the same resource
     pub fn new_deterministic(resource: &ObjectKey) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        resource.hash(&mut hasher);
-        let hash = hasher.finish();
-
+        // Use UUID v4 (random) to ensure uniqueness
+        // Each call generates a new unique ID regardless of the resource
         Self {
             resource: resource.clone(),
-            uuid: format!("{hash:016x}"),
+            uuid: Uuid::new_v4().to_string(),
         }
     }
 

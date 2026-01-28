@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::fast_lock::guard::FastLockGuard;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smartstring::SmartString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -21,11 +21,93 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 /// Object key for version-aware locking
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectKey {
     pub bucket: Arc<str>,
     pub object: Arc<str>,
     pub version: Option<Arc<str>>, // None means latest version
+}
+
+impl Serialize for ObjectKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ObjectKey", 3)?;
+        state.serialize_field("bucket", self.bucket.as_ref())?;
+        state.serialize_field("object", self.object.as_ref())?;
+        state.serialize_field("version", &self.version.as_ref().map(|v| v.as_ref()))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Field {
+            Bucket,
+            Object,
+            Version,
+        }
+
+        struct ObjectKeyVisitor;
+
+        impl<'de> Visitor<'de> for ObjectKeyVisitor {
+            type Value = ObjectKey;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("struct ObjectKey")
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<ObjectKey, V::Error>
+            where
+                V: MapAccess<'de>,
+            {
+                let mut bucket = None;
+                let mut object = None;
+                let mut version = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Bucket => {
+                            if bucket.is_some() {
+                                return Err(de::Error::duplicate_field("bucket"));
+                            }
+                            let s: String = map.next_value()?;
+                            bucket = Some(Arc::from(s));
+                        }
+                        Field::Object => {
+                            if object.is_some() {
+                                return Err(de::Error::duplicate_field("object"));
+                            }
+                            let s: String = map.next_value()?;
+                            object = Some(Arc::from(s));
+                        }
+                        Field::Version => {
+                            if version.is_some() {
+                                return Err(de::Error::duplicate_field("version"));
+                            }
+                            let opt: Option<String> = map.next_value()?;
+                            version = opt.map(Arc::from);
+                        }
+                    }
+                }
+                let bucket = bucket.ok_or_else(|| de::Error::missing_field("bucket"))?;
+                let object = object.ok_or_else(|| de::Error::missing_field("object"))?;
+                Ok(ObjectKey { bucket, object, version })
+            }
+        }
+
+        const FIELDS: &[&str] = &["bucket", "object", "version"];
+        deserializer.deserialize_struct("ObjectKey", FIELDS, ObjectKeyVisitor)
+    }
 }
 
 impl ObjectKey {

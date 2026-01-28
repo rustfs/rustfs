@@ -123,7 +123,13 @@ impl NamespaceLock {
             if let Some(client) = &self.clients[0] {
                 let resp = client.acquire_lock(request).await?;
                 if resp.success {
-                    return Ok(Some(LockGuard::new(LockId::new_deterministic(&request.resource), vec![client.clone()])));
+                    // Use lock_id from LockResponse's LockInfo
+                    let lock_id = resp
+                        .lock_info
+                        .as_ref()
+                        .map(|info| info.id.clone())
+                        .unwrap_or_else(|| LockId::new_deterministic(&request.resource));
+                    return Ok(Some(LockGuard::new(lock_id, vec![client.clone()])));
                 }
                 return Ok(None);
             } else {
@@ -133,11 +139,17 @@ impl NamespaceLock {
 
         let (resp, idxs) = self.acquire_lock_quorum(request).await?;
         if resp.success {
+            // Use lock_id from LockResponse's LockInfo
+            let lock_id = resp
+                .lock_info
+                .as_ref()
+                .map(|info| info.id.clone())
+                .unwrap_or_else(|| LockId::new_deterministic(&request.resource));
             let subset: Vec<_> = idxs
                 .into_iter()
                 .filter_map(|i| self.clients.get(i).and_then(|c| c.clone()))
                 .collect();
-            Ok(Some(LockGuard::new(LockId::new_deterministic(&request.resource), subset)))
+            Ok(Some(LockGuard::new(lock_id, subset)))
         } else {
             Ok(None)
         }
@@ -190,6 +202,7 @@ impl NamespaceLock {
         let results = futures::future::join_all(futs).await;
         let mut successful_clients = Vec::new();
         let mut failed_clients = Vec::new();
+        let mut first_successful_response: Option<LockResponse> = None;
 
         for (idx, res) in results {
             if let Some(resp) = res {
@@ -197,6 +210,10 @@ impl NamespaceLock {
                     Ok(resp) => {
                         if resp.success {
                             successful_clients.push(idx);
+                            // Store the first successful response to get the lock_id
+                            if first_successful_response.is_none() {
+                                first_successful_response = Some(resp.clone());
+                            }
                         } else {
                             failed_clients.push(idx);
                         }
@@ -209,9 +226,15 @@ impl NamespaceLock {
         }
 
         if successful_clients.len() >= self.quorum {
+            // Use lock_id from the first successful response, or fallback to generating one
+            let lock_id = first_successful_response
+                .as_ref()
+                .and_then(|resp| resp.lock_info.as_ref().map(|info| info.id.clone()))
+                .unwrap_or_else(|| LockId::new_deterministic(&request.resource));
+
             let resp = LockResponse::success(
                 LockInfo {
-                    id: LockId::new_deterministic(&request.resource),
+                    id: lock_id,
                     resource: request.resource.clone(),
                     lock_type: request.lock_type,
                     status: LockStatus::Acquired,

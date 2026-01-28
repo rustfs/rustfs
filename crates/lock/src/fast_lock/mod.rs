@@ -35,6 +35,9 @@ pub mod shard;
 pub mod state;
 pub mod types;
 
+#[cfg(test)]
+mod tests;
+
 // Re-export main types
 pub use disabled_manager::DisabledLockManager;
 pub use guard::FastLockGuard;
