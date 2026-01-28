@@ -426,118 +426,119 @@ mod serial_tests {
         };
 
         if let Some(lmdb_env) = GLOBAL_LMDB_ENV.get()
-            && let Some(lmdb) = GLOBAL_LMDB_DB.get() {
-                let mut wtxn = lmdb_env.write_txn().unwrap();
+            && let Some(lmdb) = GLOBAL_LMDB_DB.get()
+        {
+            let mut wtxn = lmdb_env.write_txn().unwrap();
 
-                /*if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await {
-                    if let Ok(object_info) = ecstore
-                        .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
-                        .await
-                    {
-                        let event = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::eval_action_from_lifecycle(
-                            &lc_config,
-                            None,
-                            None,
-                            &object_info,
-                        )
-                        .await;
-
-                        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
-                            ecstore.clone(),
-                            &object_info,
-                            &event,
-                            &rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
-                        )
-                        .await;
-
-                        expired = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
-                    }
-                }*/
-
-                for record in records {
-                    if !record.usage.has_live_object {
-                        continue;
-                    }
-
-                    let object_info = convert_record_to_object_info(record);
-                    println!("object_info2: {object_info:?}");
-                    let mod_time = object_info.mod_time.unwrap_or(OffsetDateTime::now_utc());
-                    let expiry_time = rustfs_ecstore::bucket::lifecycle::lifecycle::expected_expiry_time(mod_time, 1);
-
-                    let version_id = if let Some(version_id) = object_info.version_id {
-                        version_id.to_string()
-                    } else {
-                        "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz".to_string()
-                    };
-
-                    lmdb.put(
-                        &mut wtxn,
-                        &expiry_time.unix_timestamp(),
-                        &LifecycleContent {
-                            ver_no: 0,
-                            ver_id: version_id,
-                            mod_time,
-                            type_: LifecycleType::TransitionNoncurrent,
-                            object_name: object_info.name,
-                        },
+            /*if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await {
+                if let Ok(object_info) = ecstore
+                    .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
+                    .await
+                {
+                    let event = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::eval_action_from_lifecycle(
+                        &lc_config,
+                        None,
+                        None,
+                        &object_info,
                     )
-                    .unwrap();
+                    .await;
+
+                    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+                        ecstore.clone(),
+                        &object_info,
+                        &event,
+                        &rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+                    )
+                    .await;
+
+                    expired = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
+                }
+            }*/
+
+            for record in records {
+                if !record.usage.has_live_object {
+                    continue;
                 }
 
-                wtxn.commit().unwrap();
+                let object_info = convert_record_to_object_info(record);
+                println!("object_info2: {object_info:?}");
+                let mod_time = object_info.mod_time.unwrap_or(OffsetDateTime::now_utc());
+                let expiry_time = rustfs_ecstore::bucket::lifecycle::lifecycle::expected_expiry_time(mod_time, 1);
 
-                let mut wtxn = lmdb_env.write_txn().unwrap();
-                let iter = lmdb.iter_mut(&mut wtxn).unwrap();
-                //let _ = unsafe { iter.del_current().unwrap() };
-                for row in iter {
-                    if let Ok(ref elm) = row {
-                        let LifecycleContent {
-                            ver_no,
-                            ver_id,
-                            mod_time,
-                            type_,
-                            object_name,
-                        } = &elm.1;
-                        println!("cache row:{ver_no} {ver_id} {mod_time} {type_:?} {object_name}");
-                        let _lifecycle_config = match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
-                            Ok(bucket_meta) => {
-                                if let Some(lifecycle_config) = bucket_meta.lifecycle_config.clone() {
-                                    lifecycle_config
-                                } else {
-                                    panic!("❌ lifecycle_config metadata retrieved error");
-                                }
-                            }
-                            Err(e) => {
-                                panic!("❌ Error retrieving bucket metadata: {e:?}");
-                            }
-                        };
-                        //eval_inner(&oi.to_lifecycle_opts(), OffsetDateTime::now_utc()).await;
-                        /*eval_inner(
-                            lifecycle_config,
-                            &lifecycle::ObjectOpts {
-                                name: oi.name.clone(),
-                                user_tags: oi.user_tags.clone(),
-                                version_id: oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
-                                mod_time: oi.mod_time,
-                                size: oi.size as usize,
-                                is_latest: oi.is_latest,
-                                num_versions: oi.num_versions,
-                                delete_marker: oi.delete_marker,
-                                successor_mod_time: oi.successor_mod_time,
-                                restore_ongoing: oi.restore_ongoing,
-                                restore_expires: oi.restore_expires,
-                                transition_status: oi.transitioned_object.status.clone(),
-                                ..Default::default()
-                            },
-                            OffsetDateTime::now_utc(),
-                        )
-                        .await;*/
-                    }
-                    println!("row:{row:?}");
-                }
-                //drop(iter);
-                wtxn.commit().unwrap();
+                let version_id = if let Some(version_id) = object_info.version_id {
+                    version_id.to_string()
+                } else {
+                    "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz".to_string()
+                };
+
+                lmdb.put(
+                    &mut wtxn,
+                    &expiry_time.unix_timestamp(),
+                    &LifecycleContent {
+                        ver_no: 0,
+                        ver_id: version_id,
+                        mod_time,
+                        type_: LifecycleType::TransitionNoncurrent,
+                        object_name: object_info.name,
+                    },
+                )
+                .unwrap();
             }
+
+            wtxn.commit().unwrap();
+
+            let mut wtxn = lmdb_env.write_txn().unwrap();
+            let iter = lmdb.iter_mut(&mut wtxn).unwrap();
+            //let _ = unsafe { iter.del_current().unwrap() };
+            for row in iter {
+                if let Ok(ref elm) = row {
+                    let LifecycleContent {
+                        ver_no,
+                        ver_id,
+                        mod_time,
+                        type_,
+                        object_name,
+                    } = &elm.1;
+                    println!("cache row:{ver_no} {ver_id} {mod_time} {type_:?} {object_name}");
+                    let _lifecycle_config = match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
+                        Ok(bucket_meta) => {
+                            if let Some(lifecycle_config) = bucket_meta.lifecycle_config.clone() {
+                                lifecycle_config
+                            } else {
+                                panic!("❌ lifecycle_config metadata retrieved error");
+                            }
+                        }
+                        Err(e) => {
+                            panic!("❌ Error retrieving bucket metadata: {e:?}");
+                        }
+                    };
+                    //eval_inner(&oi.to_lifecycle_opts(), OffsetDateTime::now_utc()).await;
+                    /*eval_inner(
+                        lifecycle_config,
+                        &lifecycle::ObjectOpts {
+                            name: oi.name.clone(),
+                            user_tags: oi.user_tags.clone(),
+                            version_id: oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
+                            mod_time: oi.mod_time,
+                            size: oi.size as usize,
+                            is_latest: oi.is_latest,
+                            num_versions: oi.num_versions,
+                            delete_marker: oi.delete_marker,
+                            successor_mod_time: oi.successor_mod_time,
+                            restore_ongoing: oi.restore_ongoing,
+                            restore_expires: oi.restore_expires,
+                            transition_status: oi.transitioned_object.status.clone(),
+                            ..Default::default()
+                        },
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await;*/
+                }
+                println!("row:{row:?}");
+            }
+            //drop(iter);
+            wtxn.commit().unwrap();
+        }
 
         println!("Lifecycle cache test completed");
     }
@@ -556,119 +557,131 @@ async fn eval_inner(lifecycle_config: &BucketLifecycleConfiguration, obj: &lifec
     }
 
     if let Some(restore_expires) = obj.restore_expires
-        && !restore_expires.unix_timestamp() == 0 && now.unix_timestamp() > restore_expires.unix_timestamp() {
-            let mut action = IlmAction::DeleteRestoredAction;
-            if !obj.is_latest {
-                action = IlmAction::DeleteRestoredVersionAction;
-            }
-
-            events.push(Event {
-                action,
-                due: Some(now),
-                rule_id: "".into(),
-                noncurrent_days: 0,
-                newer_noncurrent_versions: 0,
-                storage_class: "".into(),
-            });
+        && !restore_expires.unix_timestamp() == 0
+        && now.unix_timestamp() > restore_expires.unix_timestamp()
+    {
+        let mut action = IlmAction::DeleteRestoredAction;
+        if !obj.is_latest {
+            action = IlmAction::DeleteRestoredVersionAction;
         }
+
+        events.push(Event {
+            action,
+            due: Some(now),
+            rule_id: "".into(),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: "".into(),
+        });
+    }
 
     if let Some(ref lc_rules) = lifecycle_config.filter_rules(obj).await {
         for rule in lc_rules.iter() {
             if obj.expired_object_deletemarker()
-                && let Some(expiration) = rule.expiration.as_ref() {
-                    if let Some(_expired_object_delete_marker) = expiration.expired_object_delete_marker {
+                && let Some(expiration) = rule.expiration.as_ref()
+            {
+                if let Some(_expired_object_delete_marker) = expiration.expired_object_delete_marker {
+                    events.push(Event {
+                        action: IlmAction::DeleteVersionAction,
+                        rule_id: rule.id.clone().expect("err!"),
+                        due: Some(now),
+                        noncurrent_days: 0,
+                        newer_noncurrent_versions: 0,
+                        storage_class: "".into(),
+                    });
+                    break;
+                }
+
+                if let Some(days) = expiration.days {
+                    let expected_expiry = expected_expiry_time(obj.mod_time.unwrap(), days /*, date*/);
+                    if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
                         events.push(Event {
                             action: IlmAction::DeleteVersionAction,
                             rule_id: rule.id.clone().expect("err!"),
-                            due: Some(now),
+                            due: Some(expected_expiry),
                             noncurrent_days: 0,
                             newer_noncurrent_versions: 0,
                             storage_class: "".into(),
                         });
                         break;
                     }
-
-                    if let Some(days) = expiration.days {
-                        let expected_expiry = expected_expiry_time(obj.mod_time.unwrap(), days /*, date*/);
-                        if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
-                            events.push(Event {
-                                action: IlmAction::DeleteVersionAction,
-                                rule_id: rule.id.clone().expect("err!"),
-                                due: Some(expected_expiry),
-                                noncurrent_days: 0,
-                                newer_noncurrent_versions: 0,
-                                storage_class: "".into(),
-                            });
-                            break;
-                        }
-                    }
                 }
+            }
 
             if obj.is_latest
                 && let Some(ref expiration) = rule.expiration
-                    && let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker
-                        && obj.delete_marker && expired_object_delete_marker {
-                            let due = expiration.next_due(obj);
-                            if let Some(due) = due
-                                && now.unix_timestamp() >= due.unix_timestamp() {
-                                    events.push(Event {
-                                        action: IlmAction::DelMarkerDeleteAllVersionsAction,
-                                        rule_id: rule.id.clone().expect("err!"),
-                                        due: Some(due),
-                                        noncurrent_days: 0,
-                                        newer_noncurrent_versions: 0,
-                                        storage_class: "".into(),
-                                    });
-                                }
-                            continue;
-                        }
+                && let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker
+                && obj.delete_marker
+                && expired_object_delete_marker
+            {
+                let due = expiration.next_due(obj);
+                if let Some(due) = due
+                    && now.unix_timestamp() >= due.unix_timestamp()
+                {
+                    events.push(Event {
+                        action: IlmAction::DelMarkerDeleteAllVersionsAction,
+                        rule_id: rule.id.clone().expect("err!"),
+                        due: Some(due),
+                        noncurrent_days: 0,
+                        newer_noncurrent_versions: 0,
+                        storage_class: "".into(),
+                    });
+                }
+                continue;
+            }
 
             if !obj.is_latest
                 && let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration
-                    && let Some(newer_noncurrent_versions) = noncurrent_version_expiration.newer_noncurrent_versions
-                        && newer_noncurrent_versions > 0 {
-                            continue;
-                        }
+                && let Some(newer_noncurrent_versions) = noncurrent_version_expiration.newer_noncurrent_versions
+                && newer_noncurrent_versions > 0
+            {
+                continue;
+            }
 
             if !obj.is_latest
                 && let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration
-                    && let Some(noncurrent_days) = noncurrent_version_expiration.noncurrent_days
-                        && noncurrent_days != 0
-                            && let Some(successor_mod_time) = obj.successor_mod_time {
-                                let expected_expiry = expected_expiry_time(successor_mod_time, noncurrent_days);
-                                if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
-                                    events.push(Event {
-                                        action: IlmAction::DeleteVersionAction,
-                                        rule_id: rule.id.clone().expect("err!"),
-                                        due: Some(expected_expiry),
-                                        noncurrent_days: 0,
-                                        newer_noncurrent_versions: 0,
-                                        storage_class: "".into(),
-                                    });
-                                }
-                            }
+                && let Some(noncurrent_days) = noncurrent_version_expiration.noncurrent_days
+                && noncurrent_days != 0
+                && let Some(successor_mod_time) = obj.successor_mod_time
+            {
+                let expected_expiry = expected_expiry_time(successor_mod_time, noncurrent_days);
+                if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
+                    events.push(Event {
+                        action: IlmAction::DeleteVersionAction,
+                        rule_id: rule.id.clone().expect("err!"),
+                        due: Some(expected_expiry),
+                        noncurrent_days: 0,
+                        newer_noncurrent_versions: 0,
+                        storage_class: "".into(),
+                    });
+                }
+            }
 
             if !obj.is_latest
                 && let Some(ref noncurrent_version_transitions) = rule.noncurrent_version_transitions
-                    && let Some(ref storage_class) = noncurrent_version_transitions[0].storage_class
-                        && storage_class.as_str() != "" && !obj.delete_marker && obj.transition_status != TRANSITION_COMPLETE {
-                            let due = rule.noncurrent_version_transitions.as_ref().unwrap()[0].next_due(obj);
-                            if let Some(due0) = due
-                                && (now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp()) {
-                                    events.push(Event {
-                                        action: IlmAction::TransitionVersionAction,
-                                        rule_id: rule.id.clone().expect("err!"),
-                                        due,
-                                        storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
-                                            .storage_class
-                                            .clone()
-                                            .unwrap()
-                                            .as_str()
-                                            .to_string(),
-                                        ..Default::default()
-                                    });
-                                }
-                        }
+                && let Some(ref storage_class) = noncurrent_version_transitions[0].storage_class
+                && storage_class.as_str() != ""
+                && !obj.delete_marker
+                && obj.transition_status != TRANSITION_COMPLETE
+            {
+                let due = rule.noncurrent_version_transitions.as_ref().unwrap()[0].next_due(obj);
+                if let Some(due0) = due
+                    && (now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp())
+                {
+                    events.push(Event {
+                        action: IlmAction::TransitionVersionAction,
+                        rule_id: rule.id.clone().expect("err!"),
+                        due,
+                        storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
+                            .storage_class
+                            .clone()
+                            .unwrap()
+                            .as_str()
+                            .to_string(),
+                        ..Default::default()
+                    });
+                }
+            }
 
             info!(
                 "eval_inner: checking expiration condition - is_latest={}, delete_marker={}, version_id={:?}, condition_met={}",
@@ -727,20 +740,22 @@ async fn eval_inner(lifecycle_config: &BucketLifecycleConfiguration, obj: &lifec
                 }
 
                 if obj.transition_status != TRANSITION_COMPLETE
-                    && let Some(ref transitions) = rule.transitions {
-                        let due = transitions[0].next_due(obj);
-                        if let Some(due0) = due
-                            && (now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp()) {
-                                events.push(Event {
-                                    action: IlmAction::TransitionAction,
-                                    rule_id: rule.id.clone().expect("err!"),
-                                    due,
-                                    storage_class: transitions[0].storage_class.clone().expect("err!").as_str().to_string(),
-                                    noncurrent_days: 0,
-                                    newer_noncurrent_versions: 0,
-                                });
-                            }
+                    && let Some(ref transitions) = rule.transitions
+                {
+                    let due = transitions[0].next_due(obj);
+                    if let Some(due0) = due
+                        && (now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp())
+                    {
+                        events.push(Event {
+                            action: IlmAction::TransitionAction,
+                            rule_id: rule.id.clone().expect("err!"),
+                            due,
+                            storage_class: transitions[0].storage_class.clone().expect("err!").as_str().to_string(),
+                            noncurrent_days: 0,
+                            newer_noncurrent_versions: 0,
+                        });
                     }
+                }
             }
         }
     }

@@ -431,25 +431,25 @@ mod serial_tests {
                 && let Ok(object_info) = ecstore
                     .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
                     .await
-                {
-                    let event = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::eval_action_from_lifecycle(
-                        &lc_config,
-                        None,
-                        None,
-                        &object_info,
-                    )
-                    .await;
+            {
+                let event = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::eval_action_from_lifecycle(
+                    &lc_config,
+                    None,
+                    None,
+                    &object_info,
+                )
+                .await;
 
-                    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
-                        ecstore.clone(),
-                        &object_info,
-                        &event,
-                        &rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
-                    )
-                    .await;
+                rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+                    ecstore.clone(),
+                    &object_info,
+                    &event,
+                    &rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+                )
+                .await;
 
-                    expired = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
-                }
+                expired = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
+            }
 
             if !expired {
                 println!("❌ Object was not deleted by lifecycle processing");
@@ -565,29 +565,29 @@ mod serial_tests {
                 && let Ok(obj_info) = ecstore
                     .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
                     .await
-                {
-                    let event = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::eval_action_from_lifecycle(
-                        &lc_config, None, None, &obj_info,
-                    )
-                    .await;
+            {
+                let event = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::eval_action_from_lifecycle(
+                    &lc_config, None, None, &obj_info,
+                )
+                .await;
 
-                    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
-                        ecstore.clone(),
-                        &obj_info,
-                        &event,
-                        &rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
-                    )
-                    .await;
+                rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+                    ecstore.clone(),
+                    &obj_info,
+                    &event,
+                    &rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+                )
+                .await;
 
-                    deleted = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
+                deleted = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
 
-                    if !deleted {
-                        println!(
-                            "Object info: name={}, size={}, mod_time={:?}",
-                            obj_info.name, obj_info.size, obj_info.mod_time
-                        );
-                    }
+                if !deleted {
+                    println!(
+                        "Object info: name={}, size={}, mod_time={:?}",
+                        obj_info.name, obj_info.size, obj_info.mod_time
+                    );
                 }
+            }
 
             if !deleted {
                 println!("❌ Object was not deleted by lifecycle processing");
