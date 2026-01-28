@@ -141,15 +141,6 @@ impl ObjectKey {
         self.hash(&mut hasher);
         hasher.finish() as usize & shard_mask
     }
-
-    pub fn to_string(&self) -> String {
-        format!(
-            "{}/{}@{}",
-            self.bucket,
-            self.object,
-            self.version.as_ref().map(|v| v.as_ref()).unwrap_or("latest")
-        )
-    }
 }
 
 /// Optimized object key using smart strings for better performance
