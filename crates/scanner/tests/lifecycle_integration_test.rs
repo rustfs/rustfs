@@ -125,6 +125,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 }
 
 /// Test helper: Create a test bucket
+#[allow(dead_code)]
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
@@ -161,6 +162,7 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
 }
 
 /// Test helper: Set bucket lifecycle configuration
+#[allow(dead_code)]
 async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create a simple lifecycle configuration XML with 0 days expiry for immediate testing
     let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -183,6 +185,7 @@ async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::erro
 }
 
 /// Test helper: Set bucket lifecycle configuration
+#[allow(dead_code)]
 async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create a simple lifecycle configuration XML with 0 days expiry for immediate testing
     let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -331,6 +334,7 @@ async fn object_is_transitioned(ecstore: &Arc<ECStore>, bucket: &str, object: &s
     }
 }
 
+#[allow(dead_code)]
 async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -400,7 +404,7 @@ mod serial_tests {
 
         // Start scanner
         let heal_storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));
-        init_heal_manager(heal_storage, None).await;
+        let _ = init_heal_manager(heal_storage, None).await;
         init_data_scanner(ctx.clone(), ecstore.clone()).await;
         println!("✅ Scanner started");
 
