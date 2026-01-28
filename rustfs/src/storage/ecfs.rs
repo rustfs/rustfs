@@ -3578,6 +3578,9 @@ impl S3 for FS {
             0
         };
 
+        warn!("head object filter object metadata before {:?}", &metadata_map);
+        let filter_object_metadata_map = filter_object_metadata(&metadata_map);
+        warn!("head object filter object metadata after {:?}", &filter_object_metadata_map);
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -3588,7 +3591,7 @@ impl S3 for FS {
             expires,
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: filter_object_metadata(&metadata_map),
+            metadata: filter_object_metadata_map,
             version_id: info.version_id.map(|v| v.to_string()),
             server_side_encryption,
             sse_customer_algorithm,
@@ -4690,7 +4693,7 @@ impl S3 for FS {
         if let Some(kms_key_id) = &effective_kms_key_id {
             metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
         }
-
+        warn!("put object put_opts before metadata: {:?}", &metadata);
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
             .await
             .map_err(ApiError::from)?;
@@ -4825,6 +4828,8 @@ impl S3 for FS {
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
             opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
         }
+
+        warn!("put object store options: {:?}", &opts);
 
         let obj_info = store
             .put_object(&bucket, &key, &mut reader, &opts)
