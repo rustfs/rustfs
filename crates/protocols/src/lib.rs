@@ -12,4 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod s3;
+#![deny(unsafe_code)]
+
+pub mod common;
+pub mod constants;
+
+#[cfg(feature = "ftps")]
+pub mod ftps;
+
+#[cfg(feature = "sftp")]
+pub mod sftp;
+
+pub use common::session::Protocol;
+pub use common::{AuthorizationError, ProtocolPrincipal, S3Action, SessionContext, authorize_operation};
+
+#[cfg(feature = "ftps")]
+pub use ftps::{config::FtpsConfig, server::FtpsServer};
+
+#[cfg(feature = "sftp")]
+pub use sftp::{config::SftpConfig, server::SftpServer};

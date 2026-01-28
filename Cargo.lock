@@ -7664,7 +7664,6 @@ dependencies = [
  "jiff",
  "libc",
  "libsystemd",
- "libunftp",
  "matchit 0.9.1",
  "md5 0.8.0",
  "metrics",
@@ -7675,8 +7674,6 @@ dependencies = [
  "pprof",
  "reqwest",
  "rmp-serde",
- "russh",
- "russh-sftp",
  "rust-embed",
  "rustfs-ahm",
  "rustfs-appauth",
@@ -7693,6 +7690,7 @@ dependencies = [
  "rustfs-notify",
  "rustfs-obs",
  "rustfs-policy",
+ "rustfs-protocols",
  "rustfs-protos",
  "rustfs-rio",
  "rustfs-s3select-api",
@@ -7710,7 +7708,6 @@ dependencies = [
  "serial_test",
  "shadow-rs",
  "socket2",
- "ssh-key",
  "subtle",
  "sysinfo",
  "thiserror 2.0.18",
@@ -8154,6 +8151,35 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-protocols"
+version = "0.0.5"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "futures",
+ "futures-util",
+ "libunftp",
+ "russh",
+ "russh-sftp",
+ "rustfs-credentials",
+ "rustfs-iam",
+ "rustfs-policy",
+ "rustfs-utils",
+ "rustls",
+ "s3s",
+ "serde_json",
+ "ssh-key",
+ "suppaftp",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -9430,9 +9456,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "suppaftp"
-version = "7.1.0"
+version = "8.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69a15b325bbe0a1f85de3dbf988a3a14e9cd321537dffcbf6641381dd6d7586f"
+checksum = "939df458aae4df73ba0de3063941ec9ff85bfff67d4dac7e482c20637a52ac8a"
 dependencies = [
  "async-trait",
  "chrono",

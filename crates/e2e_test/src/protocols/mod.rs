@@ -15,5 +15,6 @@
 //! Protocol tests for FTPS and SFTP
 
 pub mod ftps_core;
+pub mod sftp_core;
 pub mod test_env;
 pub mod test_runner;

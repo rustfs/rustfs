@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::protocols::session::context::{Protocol as SessionProtocol, SessionContext};
-use crate::protocols::session::principal::ProtocolPrincipal;
-use crate::protocols::sftp::handler::SftpHandler;
+use crate::common::client::s3::StorageBackend;
+use crate::common::session::ProtocolPrincipal;
+use crate::common::session::{Protocol as SessionProtocol, SessionContext};
+use crate::constants::{network, sftp};
+use crate::sftp::config::{SftpConfig, SftpInitError};
+use crate::sftp::handler::SftpHandler;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use russh::ChannelId;
-use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey, PublicKeyBase64};
+use russh::keys::{Algorithm, HashAlg, PublicKey, PublicKeyBase64};
 use russh::server::{Auth, Handler, Server as RusshServer, Session};
 use ssh_key::Certificate;
 use ssh_key::certificate::CertType;
@@ -31,52 +34,60 @@ use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-const DEFAULT_ADDR: &str = "0.0.0.0:0";
-const AUTH_SUFFIX_SVC: &str = "=svc";
-const AUTH_SUFFIX_LDAP: &str = "=ldap";
-const SSH_KEY_TYPE_RSA: &str = "ssh-rsa";
-const SSH_KEY_TYPE_ED25519: &str = "ssh-ed25519";
-const SSH_KEY_TYPE_ECDSA: &str = "ecdsa-";
-const SFTP_SUBSYSTEM: &str = "sftp";
-const CRITICAL_OPTION_SOURCE_ADDRESS: &str = "source-address";
-const AUTH_FAILURE_DELAY_MS: u64 = 300;
-const SFTP_BUFFER_SIZE: usize = 65536;
-const SFTP_READ_BUF_SIZE: usize = 32 * 1024;
-
+/// Server error type for SFTP operations
 type ServerError = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Debug, Clone)]
-pub struct SftpConfig {
-    pub bind_addr: SocketAddr,
-    pub require_key_auth: bool,
-    pub cert_file: Option<String>,
-    pub key_file: Option<String>,
-    pub authorized_keys_file: Option<String>,
-}
-
 #[derive(Clone)]
-pub struct SftpServer {
+pub struct SftpServer<S> {
     config: SftpConfig,
-    key_pair: Arc<PrivateKey>,
+    key_pairs: Arc<Vec<russh::keys::PrivateKey>>,
     trusted_certificates: Arc<Vec<ssh_key::PublicKey>>,
     authorized_keys: Arc<Vec<String>>,
+    storage: S,
 }
 
-impl SftpServer {
-    pub fn new(config: SftpConfig) -> Result<Self, ServerError> {
-        let key_pair = if let Some(key_file) = &config.key_file {
-            let path = Path::new(key_file);
-            russh::keys::load_secret_key(path, None)?
-        } else {
-            warn!("No host key provided, generating random key (not recommended for production).");
-            use russh::keys::signature::rand_core::OsRng;
-            let mut rng = OsRng;
-            PrivateKey::random(&mut rng, Algorithm::Ed25519)?
-        };
+impl<S: StorageBackend + Clone + Send + Sync + 'static> SftpServer<S> {
+    pub fn new(config: SftpConfig, storage: S) -> Result<Self, SftpInitError> {
+        // Load host keys - support both single file and directory with multiple keys
+        let mut key_pairs: Vec<russh::keys::PrivateKey> = Vec::new();
 
-        let trusted_certificates = if let Some(cert_file) = &config.cert_file {
-            info!("Loading trusted CA certificates from: {}", cert_file);
-            load_trusted_certificates(cert_file)?
+        if let Some(key_dir) = &config.key_dir {
+            // Load all keys from directory
+            info!("Loading host keys from directory: {}", key_dir);
+            let dir_entries = std::fs::read_dir(key_dir)
+                .map_err(|e| SftpInitError::InvalidConfig(format!("Failed to read key directory: {}", e)))?;
+
+            for entry in dir_entries {
+                let entry = entry.map_err(|e| SftpInitError::InvalidConfig(format!("Failed to read directory entry: {}", e)))?;
+                let path = entry.path();
+                if path.is_file() {
+                    match russh::keys::load_secret_key(&path, None) {
+                        Ok(key) => {
+                            info!("Loaded host key: {:?}", path.file_name());
+                            key_pairs.push(key);
+                        }
+                        Err(e) => {
+                            debug!("Skipping non-key file {:?}: {}", path.file_name(), e);
+                        }
+                    }
+                }
+            }
+
+            if key_pairs.is_empty() {
+                return Err(SftpInitError::InvalidConfig("No valid host keys found in directory".to_string()));
+            }
+        }
+
+        if key_pairs.is_empty() {
+            return Err(SftpInitError::InvalidConfig("No valid host keys found in directory".to_string()));
+        }
+
+        info!("Loaded {} host key(s) for SFTP", key_pairs.len());
+
+        let trusted_certificates = if let Some(ca_file) = &config.cert_file {
+            info!("Loading trusted CA certificates from: {}", ca_file);
+            load_trusted_certificates(ca_file)
+                .map_err(|e| SftpInitError::InvalidConfig(format!("Failed to load certificates: {}", e)))?
         } else {
             if config.require_key_auth {
                 warn!("Key auth required but no CA certs provided.");
@@ -99,9 +110,10 @@ impl SftpServer {
 
         Ok(Self {
             config,
-            key_pair: Arc::new(key_pair),
+            key_pairs: Arc::new(key_pairs),
             trusted_certificates: Arc::new(trusted_certificates),
             authorized_keys: Arc::new(authorized_keys),
+            storage,
         })
     }
 
@@ -120,7 +132,7 @@ impl SftpServer {
                             let config = config.clone();
                             let server_instance = server_stub.clone();
                             tokio::spawn(async move {
-                                let handler = SftpConnectionHandler::new(addr, server_instance.trusted_certificates.clone(), server_instance.authorized_keys.clone());
+                                let handler = SftpConnectionHandler::new(addr, server_instance.trusted_certificates.clone(), server_instance.authorized_keys.clone(), server_instance.storage.clone());
                                 if let Err(e) = russh::server::run_stream(config, stream, handler).await {
                                     debug!("SFTP session closed from {}: {}", addr, e);
                                 }
@@ -140,7 +152,11 @@ impl SftpServer {
 
     fn make_ssh_config(&self) -> russh::server::Config {
         let mut config = russh::server::Config::default();
-        config.keys.push(self.key_pair.as_ref().clone());
+
+        // Add all host keys to support multiple algorithms/key types
+        for key_pair in self.key_pairs.iter() {
+            config.keys.push(key_pair.clone());
+        }
 
         config.preferred.key = Cow::Borrowed(&[
             Algorithm::Ed25519,
@@ -161,30 +177,41 @@ impl SftpServer {
     }
 }
 
-impl RusshServer for SftpServer {
-    type Handler = SftpConnectionHandler;
+impl<S: StorageBackend + Clone + Send + Sync + 'static> RusshServer for SftpServer<S> {
+    type Handler = SftpConnectionHandler<S>;
 
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
-        let addr = peer_addr.unwrap_or_else(|| DEFAULT_ADDR.parse().unwrap());
-        SftpConnectionHandler::new(addr, self.trusted_certificates.clone(), self.authorized_keys.clone())
+        let addr = peer_addr.unwrap_or_else(|| network::DEFAULT_ADDR.parse().unwrap());
+        SftpConnectionHandler::new(
+            addr,
+            self.trusted_certificates.clone(),
+            self.authorized_keys.clone(),
+            self.storage.clone(),
+        )
     }
 }
 
-struct ConnectionState {
+struct ConnectionState<S> {
     client_ip: SocketAddr,
     identity: Option<rustfs_policy::auth::UserIdentity>,
     trusted_certificates: Arc<Vec<ssh_key::PublicKey>>,
     authorized_keys: Arc<Vec<String>>,
     sftp_channels: HashMap<ChannelId, mpsc::UnboundedSender<Vec<u8>>>,
+    storage: S,
 }
 
 #[derive(Clone)]
-pub struct SftpConnectionHandler {
-    state: Arc<Mutex<ConnectionState>>,
+pub struct SftpConnectionHandler<S> {
+    state: Arc<Mutex<ConnectionState<S>>>,
 }
 
-impl SftpConnectionHandler {
-    fn new(client_ip: SocketAddr, trusted_certificates: Arc<Vec<ssh_key::PublicKey>>, authorized_keys: Arc<Vec<String>>) -> Self {
+impl<S: StorageBackend + Clone + Send + Sync + 'static> SftpConnectionHandler<S> {
+    fn new(
+        client_ip: SocketAddr,
+        trusted_certificates: Arc<Vec<ssh_key::PublicKey>>,
+        authorized_keys: Arc<Vec<String>>,
+        storage: S,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(ConnectionState {
                 client_ip,
@@ -192,12 +219,13 @@ impl SftpConnectionHandler {
                 trusted_certificates,
                 authorized_keys,
                 sftp_channels: HashMap::new(),
+                storage,
             })),
         }
     }
 }
 
-impl Handler for SftpConnectionHandler {
+impl<S: StorageBackend + Clone + Send + Sync + 'static> Handler for SftpConnectionHandler<S> {
     type Error = ServerError;
 
     fn auth_password(&mut self, user: &str, password: &str) -> impl Future<Output = Result<Auth, Self::Error>> + Send {
@@ -236,7 +264,7 @@ impl Handler for SftpConnectionHandler {
 
             if !is_valid {
                 warn!("Invalid AccessKey: {}", username);
-                tokio::time::sleep(std::time::Duration::from_millis(AUTH_FAILURE_DELAY_MS)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(network::AUTH_FAILURE_DELAY_MS)).await;
                 return Ok(Auth::Reject {
                     proceed_with_methods: None,
                     partial_success: false,
@@ -246,7 +274,7 @@ impl Handler for SftpConnectionHandler {
             if let Some(identity) = user_identity {
                 if identity.credentials.secret_key != s3_creds.secret_key {
                     warn!("Invalid SecretKey for user: {}", username);
-                    tokio::time::sleep(std::time::Duration::from_millis(AUTH_FAILURE_DELAY_MS)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(network::AUTH_FAILURE_DELAY_MS)).await;
                     return Ok(Auth::Reject {
                         proceed_with_methods: None,
                         partial_success: false,
@@ -478,7 +506,7 @@ impl Handler for SftpConnectionHandler {
         let session_handle = session.handle();
 
         async move {
-            if name == SFTP_SUBSYSTEM {
+            if name == sftp::SFTP_SUBSYSTEM {
                 let (identity, client_ip) = {
                     let guard = state.lock().unwrap();
                     if let Some(id) = &guard.identity {
@@ -494,7 +522,7 @@ impl Handler for SftpConnectionHandler {
                 let context =
                     SessionContext::new(ProtocolPrincipal::new(Arc::new(identity)), SessionProtocol::Sftp, client_ip.ip());
 
-                let (client_pipe, server_pipe) = tokio::io::duplex(SFTP_BUFFER_SIZE);
+                let (client_pipe, server_pipe) = tokio::io::duplex(sftp::SFTP_BUFFER_SIZE);
                 let (mut client_read, mut client_write) = tokio::io::split(client_pipe);
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -513,7 +541,11 @@ impl Handler for SftpConnectionHandler {
                     }
                 });
 
-                let sftp_handler = SftpHandler::new(context);
+                let storage = {
+                    let guard = state.lock().unwrap();
+                    guard.storage.clone()
+                };
+                let sftp_handler = SftpHandler::new(context, storage);
                 tokio::spawn(async move {
                     russh_sftp::server::run(server_pipe, sftp_handler).await;
                     debug!("SFTP handler finished");
@@ -522,7 +554,7 @@ impl Handler for SftpConnectionHandler {
                 let session_handle = session_handle.clone();
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
-                    let mut buf = vec![0u8; SFTP_READ_BUF_SIZE];
+                    let mut buf = vec![0u8; sftp::DEFAULT_CHUNK_SIZE];
                     loop {
                         match client_read.read(&mut buf).await {
                             Ok(0) => break,
@@ -584,7 +616,10 @@ fn load_authorized_keys(auth_keys_path: &str) -> Result<Vec<String>, ServerError
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if line.starts_with(SSH_KEY_TYPE_RSA) || line.starts_with(SSH_KEY_TYPE_ED25519) || line.starts_with(SSH_KEY_TYPE_ECDSA) {
+        if line.starts_with(sftp::SSH_KEY_TYPE_RSA)
+            || line.starts_with(sftp::SSH_KEY_TYPE_ED25519)
+            || line.starts_with(sftp::SSH_KEY_TYPE_ECDSA)
+        {
             keys.push(line.to_string());
         } else {
             warn!(
@@ -601,7 +636,7 @@ fn load_authorized_keys(auth_keys_path: &str) -> Result<Vec<String>, ServerError
 fn parse_auth_username(username: &str) -> (&str, Option<&str>) {
     if let Some(idx) = username.rfind('=') {
         let suffix = &username[idx..];
-        if suffix == AUTH_SUFFIX_SVC || suffix == AUTH_SUFFIX_LDAP {
+        if suffix == network::AUTH_SUFFIX_SVC || suffix == network::AUTH_SUFFIX_LDAP {
             return (&username[..idx], Some(suffix));
         }
     }
@@ -674,7 +709,7 @@ fn validate_ssh_certificate(
     }
 
     for (name, _value) in cert.critical_options().iter() {
-        if name.as_str() == CRITICAL_OPTION_SOURCE_ADDRESS {
+        if name.as_str() == sftp::CRITICAL_OPTION_SOURCE_ADDRESS {
         } else {
             warn!("Rejecting certificate due to unsupported critical option: {}", name);
             return Ok(false);

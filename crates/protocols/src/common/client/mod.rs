@@ -12,10 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Gateway module for protocol implementations
+pub mod s3;
 
-pub mod action;
-pub mod adapter;
-pub mod authorize;
-pub mod error;
-pub mod restrictions;
+pub use s3::StorageBackend as S3StorageBackend;
