@@ -3429,6 +3429,7 @@ impl S3 for FS {
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
             Err(err) => {
+                error!("HEAD object get_object_info error: bucket={}, key={}, err={}", &bucket, &key, err);
                 // If the error indicates the object or its version was not found, return 404 (NoSuchKey)
                 if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                     if is_dir_object(&key) {
@@ -3448,14 +3449,14 @@ impl S3 for FS {
                 return Err(ApiError::from(err).into());
             }
         };
-
+        warn!("HEAD object got info: bucket={}, key={}", &bucket, &key);
         if info.delete_marker {
             if opts.version_id.is_none() {
                 return Err(S3Error::new(S3ErrorCode::NoSuchKey));
             }
             return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
         }
-
+        warn!("HEAD object info check passed: bucket={}, key={}", &bucket, &key);
         if let Some(match_etag) = if_none_match
             && let Some(strong_etag) = match_etag.into_etag()
             && info
@@ -3463,19 +3464,21 @@ impl S3 for FS {
                 .as_ref()
                 .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
         {
+            warn!("HEAD object if-none-match matched: bucket={}, key={}", &bucket, &key);
             return Err(S3Error::new(S3ErrorCode::NotModified));
         }
-
+        warn!("HEAD object if-none-match check passed: bucket={}, key={}", &bucket, &key);
         if let Some(modified_since) = if_modified_since {
             // obj_time < givenTime + 1s
             if info.mod_time.is_some_and(|mod_time| {
                 let give_time: OffsetDateTime = modified_since.into();
                 mod_time < give_time.add(time::Duration::seconds(1))
             }) {
+                warn!("HEAD object if-modified-since matched: bucket={}, key={}", &bucket, &key);
                 return Err(S3Error::new(S3ErrorCode::NotModified));
             }
         }
-
+        warn!("HEAD object if-modified-since check passed: bucket={}, key={}", &bucket, &key);
         if let Some(match_etag) = if_match {
             if let Some(strong_etag) = match_etag.into_etag()
                 && info
@@ -3483,6 +3486,7 @@ impl S3 for FS {
                     .as_ref()
                     .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
             {
+                warn!("HEAD object if-match did not match: bucket={}, key={}", &bucket, &key);
                 return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
             }
         } else if let Some(unmodified_since) = if_unmodified_since
@@ -3491,9 +3495,10 @@ impl S3 for FS {
                 mod_time > give_time.add(time::Duration::seconds(1))
             })
         {
+            warn!("HEAD object if-unmodified-since did not match: bucket={}, key={}", &bucket, &key);
             return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
         }
-
+        warn!("HEAD object precondition checks passed: bucket={}, key={}", &bucket, &key);
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -3534,7 +3539,7 @@ impl S3 for FS {
             .or_else(|| metadata_map.get("x-amz-storage-class").cloned())
             .filter(|s| !s.is_empty())
             .map(StorageClass::from);
-
+        warn!("HEAD object preparing response: bucket={}, key={}", &bucket, &key);
         let mut checksum_crc32 = None;
         let mut checksum_crc32c = None;
         let mut checksum_sha1 = None;
@@ -3568,7 +3573,7 @@ impl S3 for FS {
                 }
             }
         }
-
+        warn!("HEAD object constructing output: bucket={}, key={}", &bucket, &key);
         // Extract standard HTTP headers from user_defined metadata
         // Note: These headers are stored with lowercase keys by extract_metadata_from_mime
         let cache_control = metadata_map.get("cache-control").cloned();
@@ -3584,7 +3589,7 @@ impl S3 for FS {
         } else {
             0
         };
-
+        warn!("HEAD object tag count: bucket={}, key={}, tag_count={}", &bucket, &key, tag_count);
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -3657,7 +3662,7 @@ impl S3 for FS {
         {
             response.headers.insert(header_name, header_value);
         }
-
+        warn!("HEAD object completed response construction: bucket={}, key={}", &bucket, &key);
         let result = Ok(response);
         let _ = helper.complete(&result);
         warn!("HEAD object completed: bucket={}, key={}", &bucket, &key);
