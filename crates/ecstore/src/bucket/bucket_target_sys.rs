@@ -629,10 +629,17 @@ impl BucketTargetSys {
             .provider_name("bucket_target_sys")
             .build();
 
+        // Strip the protocol so it can be added back based on `target.secure`
+        let stripped = target
+            .endpoint
+            .strip_prefix("https://")
+            .or_else(|| target.endpoint.strip_prefix("http://"))
+            .unwrap_or(&target.endpoint);
+
         let endpoint = if target.secure {
-            format!("https://{}", target.endpoint)
+            format!("https://{}", stripped)
         } else {
-            format!("http://{}", target.endpoint)
+            format!("http://{}", stripped)
         };
 
         let config = S3Config::builder()
