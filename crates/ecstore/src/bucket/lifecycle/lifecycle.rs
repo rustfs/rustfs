@@ -506,7 +506,12 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                         action: IlmAction::TransitionAction,
                                         rule_id: rule.id.clone().unwrap_or_default(),
                                         due,
-                                        storage_class: transitions[0].storage_class.clone().unwrap_or(TransitionStorageClass::from_static("")).as_str().to_string(),
+                                        storage_class: transitions[0]
+                                            .storage_class
+                                            .clone()
+                                            .unwrap_or(TransitionStorageClass::from_static(""))
+                                            .as_str()
+                                            .to_string(),
                                         noncurrent_days: 0,
                                         newer_noncurrent_versions: 0,
                                     });
@@ -522,7 +527,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
             events.sort_by(|a, b| {
                 if now.unix_timestamp() > a.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp()
                     && now.unix_timestamp() > b.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp()
-                    || a.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp() == b.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp()
+                    || a.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp()
+                        == b.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp()
                 {
                     match a.action {
                         IlmAction::DeleteAllVersionsAction
@@ -545,7 +551,9 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     return Ordering::Less;
                 }
 
-                if a.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp() < b.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp() {
+                if a.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp()
+                    < b.due.unwrap_or_else(|| OffsetDateTime::UNIX_EPOCH).unix_timestamp()
+                {
                     return Ordering::Less;
                 }
                 return Ordering::Greater;
