@@ -262,14 +262,3 @@ pub fn get_global_fast_lock_manager() -> Arc<FastObjectLockManager> {
         panic!("Cannot get FastObjectLockManager when locks are disabled. Use get_global_lock_manager() instead.");
     })
 }
-
-// ============================================================================
-// Convenience Functions
-// ============================================================================
-
-/// Create a new namespace lock
-pub fn create_namespace_lock(namespace: String, _distributed: bool) -> NamespaceLock {
-    // The distributed behavior is now determined by the type of clients added to the NamespaceLock
-    // This function just creates an empty NamespaceLock
-    NamespaceLock::new(namespace)
-}

@@ -18,8 +18,8 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 struct UnlockJob {
-    lock_id: LockId,
-    clients: Vec<Arc<dyn LockClient>>, // cloned Arcs; cheap and shares state
+    /// Entries to release: each (LockId, client) pair will be released independently.
+    entries: Vec<(LockId, Arc<dyn LockClient>)>,
 }
 
 #[derive(Debug)]
@@ -35,18 +35,18 @@ static UNLOCK_RUNTIME: LazyLock<UnlockRuntime> = LazyLock::new(|| {
     // Spawn background worker when first used; assumes a Tokio runtime is available
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            // Best-effort release across clients; try all, success if any succeeds
+            // Best-effort release across all (LockId, client) entries.
             let mut any_ok = false;
-            let lock_id = job.lock_id.clone();
-            for client in job.clients.into_iter() {
+            for (lock_id, client) in job.entries.into_iter() {
                 if client.release(&lock_id).await.unwrap_or(false) {
                     any_ok = true;
                 }
             }
+
             if !any_ok {
-                tracing::warn!("LockGuard background release failed for {}", lock_id);
+                tracing::warn!("LockGuard background release failed for one or more entries");
             } else {
-                tracing::debug!("LockGuard background released {}", lock_id);
+                tracing::debug!("LockGuard background released one or more entries");
             }
         }
     });
@@ -57,17 +57,26 @@ static UNLOCK_RUNTIME: LazyLock<UnlockRuntime> = LazyLock::new(|| {
 /// A RAII guard that releases the lock asynchronously when dropped.
 #[derive(Debug)]
 pub struct LockGuard {
+    /// The public-facing lock id. For multi-client scenarios this is typically
+    /// an aggregate id; for single-client it is the only id.
     lock_id: LockId,
-    clients: Vec<Arc<dyn LockClient>>,
+    /// All underlying (LockId, client) entries that should be released when the
+    /// guard is dropped.
+    entries: Vec<(LockId, Arc<dyn LockClient>)>,
     /// If true, Drop will not try to release (used if user manually released).
     disarmed: bool,
 }
 
 impl LockGuard {
-    pub(crate) fn new(lock_id: LockId, clients: Vec<Arc<dyn LockClient>>) -> Self {
+    /// Create a new guard.
+    ///
+    /// - `lock_id` is the id returned to the caller (`lock_id()`).
+    /// - `entries` is the full list of underlying (LockId, client) pairs
+    ///   that should be released when this guard is dropped.
+    pub(crate) fn new(lock_id: LockId, entries: Vec<(LockId, Arc<dyn LockClient>)>) -> Self {
         Self {
             lock_id,
-            clients,
+            entries,
             disarmed: false,
         }
     }
@@ -91,22 +100,23 @@ impl Drop for LockGuard {
         }
 
         let job = UnlockJob {
-            lock_id: self.lock_id.clone(),
-            clients: self.clients.clone(),
+            entries: self.entries.clone(),
         };
 
         // Try a non-blocking send to avoid panics in Drop
         if let Err(err) = UNLOCK_RUNTIME.tx.try_send(job) {
             // Channel full or closed; best-effort fallback: spawn a detached task
-            let lock_id = self.lock_id.clone();
-            let clients = self.clients.clone();
-            tracing::warn!("LockGuard channel send failed ({}), spawning fallback unlock task for {}", err, lock_id);
+            let entries = self.entries.clone();
+            tracing::warn!(
+                "LockGuard channel send failed ({}), spawning fallback unlock task for {} entries",
+                err,
+                entries.len()
+            );
 
             // If runtime is not available, this will panic; but in RustFS we are inside Tokio contexts.
             let handle = tokio::spawn(async move {
-                let futures_iter = clients.into_iter().map(|client| {
-                    let id = lock_id.clone();
-                    async move { client.release(&id).await.unwrap_or(false) }
+                let futures_iter = entries.into_iter().map(|(lock_id, client)| {
+                    async move { client.release(&lock_id).await.unwrap_or(false) }
                 });
                 let _ = futures::future::join_all(futures_iter).await;
             });
