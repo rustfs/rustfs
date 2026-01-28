@@ -3441,8 +3441,10 @@ impl S3 for FS {
                             }
                         };
                         let msg = head_prefix_not_found_message(&bucket, &key, has_children);
+                        warn!("HEAD object no such key (is dir): bucket={}, key={},message:={}", &bucket, &key, &msg);
                         return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
                     }
+                    warn!("HEAD object no such key: bucket={}, key={}", &bucket, &key);
                     return Err(S3Error::new(S3ErrorCode::NoSuchKey));
                 }
                 // Other errors, such as insufficient permissions, still return the original error
