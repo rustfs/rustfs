@@ -3395,7 +3395,7 @@ impl S3 for FS {
 
         // Validate object key
         validate_object_key(&key, "HEAD")?;
-
+        warn!("HEAD object: bucket={}, key={}", &bucket, &key);
         // Parse part number from Option<i32> to Option<usize> with validation
         let part_number: Option<usize> = parse_part_number_i32_to_usize(part_number, "HEAD")?;
 
@@ -3424,7 +3424,7 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-
+        warn!("HEAD object get_object_info: bucket={}, key={}", &bucket, &key);
         // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
@@ -3660,7 +3660,7 @@ impl S3 for FS {
 
         let result = Ok(response);
         let _ = helper.complete(&result);
-
+        warn!("HEAD object completed: bucket={}, key={}", &bucket, &key);
         result
     }
 
