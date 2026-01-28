@@ -124,6 +124,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 }
 
 /// Test helper: Create a test bucket
+#[allow(dead_code)]
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
@@ -426,8 +427,8 @@ mod serial_tests {
                 .await;
             println!("Pending expiry tasks: {pending}");
 
-            if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await {
-                if let Ok(object_info) = ecstore
+            if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await
+                && let Ok(object_info) = ecstore
                     .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
                     .await
                 {
@@ -449,7 +450,6 @@ mod serial_tests {
 
                     expired = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await;
                 }
-            }
 
             if !expired {
                 println!("❌ Object was not deleted by lifecycle processing");
@@ -561,8 +561,8 @@ mod serial_tests {
                 .await;
             println!("Pending expiry tasks: {pending}");
 
-            if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await {
-                if let Ok(obj_info) = ecstore
+            if let Ok((lc_config, _)) = rustfs_ecstore::bucket::metadata_sys::get_lifecycle_config(bucket_name.as_str()).await
+                && let Ok(obj_info) = ecstore
                     .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
                     .await
                 {
@@ -588,7 +588,6 @@ mod serial_tests {
                         );
                     }
                 }
-            }
 
             if !deleted {
                 println!("❌ Object was not deleted by lifecycle processing");
