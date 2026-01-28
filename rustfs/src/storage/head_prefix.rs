@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use rustfs_ecstore::store::ECStore;
+use rustfs_ecstore::store_api::StorageAPI;
 use std::sync::Arc;
 
 /// Determines if the key "looks like a prefix" (ends with `/`).
 /// Note: No special handling for empty strings here; the caller must ensure the key has passed `validate_object_key`.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn is_prefix_key(key: &str) -> bool {
     key.ends_with('/')
@@ -46,23 +48,30 @@ and no objects exist under this prefix in bucket `{}`",
 /// Lightweight probe: Checks if any objects exist under the prefix (max_keys=1).
 ///
 /// Purpose: Only used to optimize the error message, without changing error codes or external semantics.
-pub(crate) async fn probe_prefix_has_children(store: Arc<ECStore>, bucket: &str, prefix: &str) -> Result<bool, String> {
+pub(crate) async fn probe_prefix_has_children(
+    store: Arc<ECStore>,
+    bucket: &str,
+    prefix: &str,
+    include_deleted: bool,
+) -> Result<bool, String> {
     // Even if the underlying implementation has overhead for list, this is only one extra request, and it only happens when NotFound occurs and the key ends with `/`.
     // No delimiter is introduced here to avoid "virtual directory" hierarchy affecting the judgment: as long as there are any objects under the prefix.
     let res = store
-        .list_objects(
-            bucket, prefix, None,  // marker
+        .list_objects_v2(
+            bucket,
+            prefix,
+            None,  // continuation_token
             None,  // delimiter
             1,     // max_keys
             false, // fetch_owner
-            false, // include_versions
             None,  // start_after
+            include_deleted,
         )
         .await
         .map_err(|e| format!("{e}"))?;
 
     let has_objects = !res.objects.is_empty();
-    let has_common_prefixes = !res.common_prefixes.is_empty();
+    let has_common_prefixes = !res.prefixes.is_empty();
 
     Ok(has_objects || has_common_prefixes)
 }

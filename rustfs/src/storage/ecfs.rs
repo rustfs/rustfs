@@ -19,7 +19,7 @@ use crate::server::RemoteAddr;
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
-use crate::storage::head_prefix::{head_prefix_not_found_message, is_prefix_key, probe_prefix_has_children};
+use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
@@ -3396,16 +3396,8 @@ impl S3 for FS {
         // Validate object key
         validate_object_key(&key, "HEAD")?;
 
-        // let part_number = part_number.map(|v| v as usize);
         // Parse part number from Option<i32> to Option<usize> with validation
         let part_number: Option<usize> = parse_part_number_i32_to_usize(part_number, "HEAD")?;
-
-        if let Some(part_num) = part_number
-            && part_num == 0
-        {
-            error!("head object invalid part_number {}", part_num);
-            return Err(s3_error!(InvalidArgument, "part_number invalid"));
-        }
 
         let rs = range.map(|v| match v {
             Range::Int { first, last } => HTTPRangeSpec {
@@ -3439,8 +3431,14 @@ impl S3 for FS {
             Err(err) => {
                 // If the error indicates the object or its version was not found, return 404 (NoSuchKey)
                 if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
-                    if is_dir_object(&key) || is_prefix_key(&key) {
-                        let has_children = probe_prefix_has_children(store, &bucket, &key).await.unwrap_or(false);
+                    if is_dir_object(&key) {
+                        let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
+                            Ok(has_children) => has_children,
+                            Err(e) => {
+                                error!("Failed to probe children for prefix (bucket: {}, key: {}): {}", bucket, key, e);
+                                false
+                            }
+                        };
                         let msg = head_prefix_not_found_message(&bucket, &key, has_children);
                         return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
                     }

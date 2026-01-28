@@ -1111,7 +1111,7 @@ pub(crate) async fn wrap_response_with_cors<T>(
 /// * `part_number` - The optional part number as i32
 /// * `op` - The operation name for logging purposes
 ///
-///# Returns
+/// # Returns
 /// * `Ok(Some(usize))` if part number is valid
 /// * `Ok(None)` if part number is None
 /// * `Err(S3Error)` if part number is invalid (0 or overflow)
