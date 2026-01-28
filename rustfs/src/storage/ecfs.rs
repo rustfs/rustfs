@@ -2453,7 +2453,7 @@ impl S3 for FS {
             range,
             ..
         } = req.input.clone();
-
+        warn!("get object input start key: {:?}", &key);
         // Validate object key
         validate_object_key(&key, "GET")?;
 
@@ -3058,7 +3058,12 @@ impl S3 for FS {
         } else {
             None
         };
-
+        warn!("get object output metadata end key: {:?},metadata:{:?}", &key, &info.user_defined);
+        let filter_object_metadata_map = filter_object_metadata(&info.user_defined);
+        warn!(
+            "get object output metadata filtered key: {:?},metadata:{:?}",
+            &key, &filter_object_metadata_map
+        );
         let output = GetObjectOutput {
             body,
             content_length: Some(response_content_length),
@@ -3068,7 +3073,7 @@ impl S3 for FS {
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: filter_object_metadata(&info.user_defined),
+            metadata: filter_object_metadata_map,
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
@@ -3396,6 +3401,8 @@ impl S3 for FS {
         // Validate object key
         validate_object_key(&key, "HEAD")?;
 
+        warn!("head object start key: {:?}", &key);
+
         let part_number = part_number.map(|v| v as usize);
 
         if let Some(part_num) = part_number
@@ -3578,9 +3585,12 @@ impl S3 for FS {
             0
         };
 
-        warn!("head object filter object metadata before {:?}", &metadata_map);
+        warn!("head object filter object key: {:?} metadata before {:?}", &key, &metadata_map);
         let filter_object_metadata_map = filter_object_metadata(&metadata_map);
-        warn!("head object filter object metadata after {:?}", &filter_object_metadata_map);
+        warn!(
+            "head object filter object key:{:?} metadata after {:?}",
+            &key, &filter_object_metadata_map
+        );
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -4521,7 +4531,7 @@ impl S3 for FS {
 
         // Validate object key
         validate_object_key(&key, "PUT")?;
-
+        warn!("put_object start req key {:?}", &key);
         // check quota for put operation
         if let Some(size) = content_length
             && let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get()
@@ -4693,7 +4703,7 @@ impl S3 for FS {
         if let Some(kms_key_id) = &effective_kms_key_id {
             metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
         }
-        warn!("put object put_opts before metadata: {:?}", &metadata);
+        warn!("put object put_opts before key:{:?} metadata: {:?}", &key, &metadata);
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
             .await
             .map_err(ApiError::from)?;
@@ -4829,7 +4839,7 @@ impl S3 for FS {
             opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
         }
 
-        warn!("put object store options: {:?}", &opts);
+        warn!("put object key:{:?} store options: {:?},metadata:{:?}", &key, &opts, &opts.user_defined);
 
         let obj_info = store
             .put_object(&bucket, &key, &mut reader, &opts)

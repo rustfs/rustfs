@@ -15,6 +15,7 @@
 use crate::{AppConfig, GlobalError, OtelGuard, SystemObserver, telemetry::init_telemetry};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
+use tracing::log::warn;
 use tracing::{error, info};
 
 /// Global guard for OpenTelemetry tracing
@@ -51,7 +52,7 @@ pub fn observability_metric_enabled() -> bool {
 pub async fn init_obs(endpoint: Option<String>) -> Result<OtelGuard, GlobalError> {
     // Load the configuration file
     let config = AppConfig::new_with_endpoint(endpoint);
-
+    warn!("Observability configuration: {:?}", config.observability);
     let otel_guard = init_telemetry(&config.observability)?;
     // Server will be created per connection - this ensures isolation
     tokio::spawn(async move {
