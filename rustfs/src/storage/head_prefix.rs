@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::StorageAPI;
 use std::sync::Arc;
 
 /// Determines if the key "looks like a prefix" (ends with `/`).
@@ -32,15 +32,13 @@ pub(crate) fn is_prefix_key(key: &str) -> bool {
 pub(crate) fn head_prefix_not_found_message(bucket: &str, key: &str, has_children: bool) -> String {
     if has_children {
         format!(
-            "NoSuchKey: key `{}` looks like a prefix (ends with `/`), prefix has children objects, \
-but directory marker object does not exist in bucket `{}`",
-            key, bucket
+            "NoSuchKey: key `{key}` looks like a prefix (ends with `/`), prefix has children objects, \
+but directory marker object does not exist in bucket `{bucket}`"
         )
     } else {
         format!(
-            "NoSuchKey: key `{}` looks like a prefix (ends with `/`), but no directory marker object \
-and no objects exist under this prefix in bucket `{}`",
-            key, bucket
+            "NoSuchKey: key `{key}` looks like a prefix (ends with `/`), but no directory marker object \
+and no objects exist under this prefix in bucket `{bucket}`"
         )
     }
 }
