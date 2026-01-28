@@ -585,7 +585,7 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
 });
 
 /// Parse copy source range string in format "bytes=start-end"
-pub fn parse_copy_source_range(range_str: &str) -> std::result::Result<HTTPRangeSpec, s3s::S3Error> {
+pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
     if !range_str.starts_with("bytes=") {
         return Err(s3_error!(InvalidArgument, "Invalid range format"));
     }
