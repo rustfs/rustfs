@@ -1204,7 +1204,8 @@ impl FileMeta {
                     && v.header.user_data_dir()
             })
             .filter_map(|v| FileMetaVersion::decode_data_dir_from_meta(&v.meta).ok())
-            .filter(|&dir| dir == data_dir)
+            .filter(|&dir| dir.is_none() || dir != data_dir)
+            //.filter(|&dir| dir != data_dir)
             .count()
     }
 
