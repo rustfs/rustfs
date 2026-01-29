@@ -119,7 +119,12 @@ pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
-const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
+/// Defaults to 30 seconds if not set or invalid
+fn get_lock_acquire_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+}
 
 #[derive(Clone, Debug)]
 pub struct SetDisks {
@@ -2655,7 +2660,7 @@ impl SetDisks {
 
         let write_lock_guard = if !opts.no_lock {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
                 StorageError::other(format!(
                     "Failed to acquire write lock: {}",
                     self.format_lock_error_from_error(bucket, object, "write", &e)
@@ -3310,7 +3315,7 @@ impl SetDisks {
         let _write_lock_guard = self
             .new_ns_lock(bucket, object)
             .await?
-            .get_write_lock(LOCK_ACQUIRE_TIMEOUT)
+            .get_write_lock(get_lock_acquire_timeout())
             .await
             .map_err(|e| {
                 let message = format!(
@@ -3616,7 +3621,7 @@ impl ObjectIO for SetDisks {
             Some(
                 self.new_ns_lock(bucket, object)
                     .await?
-                    .get_read_lock(LOCK_ACQUIRE_TIMEOUT)
+                    .get_read_lock(get_lock_acquire_timeout())
                     .await
                     .map_err(|e| {
                         Error::other(format!(
@@ -3712,7 +3717,7 @@ impl ObjectIO for SetDisks {
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                object_lock_guard = Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
                     StorageError::other(format!(
                         "Failed to acquire write lock: {}",
                         self.format_lock_error_from_error(bucket, object, "write", &e)
@@ -3926,7 +3931,7 @@ impl ObjectIO for SetDisks {
 
         if !opts.no_lock && object_lock_guard.is_none() {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
-            object_lock_guard = Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+            object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
                 StorageError::other(format!(
                     "Failed to acquire write lock: {}",
                     self.format_lock_error_from_error(bucket, object, "write", &e)
@@ -3976,6 +3981,7 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         let set_lock = if is_dist_erasure().await {
+            warn!("new_ns_lock: is_dist_erasure");
             let mut write_quorum = self.set_drive_count - self.default_parity_count;
             if write_quorum == self.default_parity_count {
                 write_quorum += 1;
@@ -3986,6 +3992,7 @@ impl StorageAPI for SetDisks {
                 write_quorum,
             )
         } else {
+            warn!("new_ns_lock: is_local_erasure");
             NamespaceLock::Local(LocalLock::new(
                 format!("set-{}-{}", self.pool_index, self.set_index),
                 Arc::new(rustfs_lock::GlobalLockManager::new()),
@@ -4062,7 +4069,7 @@ impl StorageAPI for SetDisks {
         let _lock_guard = self
             .new_ns_lock(src_bucket, src_object)
             .await?
-            .get_write_lock(LOCK_ACQUIRE_TIMEOUT)
+            .get_write_lock(get_lock_acquire_timeout())
             .await
             .map_err(|e| {
                 Error::other(format!(
@@ -4242,7 +4249,7 @@ impl StorageAPI for SetDisks {
                     continue;
                 }
             };
-            let _lock_guard = match ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await {
+            let _lock_guard = match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
                 Ok(lock_guard) => lock_guard,
                 Err(e) => {
                     failed_map.insert((req.key.bucket.as_ref().to_string(), req.key.object.as_ref().to_string()), e.to_string());
@@ -4426,7 +4433,7 @@ impl StorageAPI for SetDisks {
             Some(
                 self.new_ns_lock(bucket, object)
                     .await?
-                    .get_write_lock(LOCK_ACQUIRE_TIMEOUT)
+                    .get_write_lock(get_lock_acquire_timeout())
                     .await
                     .map_err(|e| {
                         Error::other(format!(
@@ -4612,7 +4619,7 @@ impl StorageAPI for SetDisks {
             Some(
                 self.new_ns_lock(bucket, object)
                     .await?
-                    .get_read_lock(LOCK_ACQUIRE_TIMEOUT)
+                    .get_read_lock(get_lock_acquire_timeout())
                     .await
                     .map_err(|e| {
                         Error::other(format!(
@@ -4668,7 +4675,7 @@ impl StorageAPI for SetDisks {
             Some(
                 self.new_ns_lock(bucket, object)
                     .await?
-                    .get_write_lock(LOCK_ACQUIRE_TIMEOUT)
+                    .get_write_lock(get_lock_acquire_timeout())
                     .await
                     .map_err(|e| {
                         Error::other(format!(
@@ -5510,7 +5517,7 @@ impl StorageAPI for SetDisks {
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             let object_lock_guard = if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+                Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
                     StorageError::other(format!(
                         "Failed to acquire write lock: {}",
                         self.format_lock_error_from_error(bucket, object, "write", &e)
@@ -5686,7 +5693,7 @@ impl StorageAPI for SetDisks {
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                object_lock_guard = Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
                     StorageError::other(format!(
                         "Failed to acquire write lock: {}",
                         self.format_lock_error_from_error(bucket, object, "write", &e)
@@ -6030,7 +6037,7 @@ impl StorageAPI for SetDisks {
 
         if !opts.no_lock && object_lock_guard.is_none() {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
-            object_lock_guard = Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+            object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
                 StorageError::other(format!(
                     "Failed to acquire write lock: {}",
                     self.format_lock_error_from_error(bucket, object, "write", &e)
@@ -6126,7 +6133,7 @@ impl StorageAPI for SetDisks {
     ) -> Result<(HealResultItem, Option<Error>)> {
         let _write_lock_guard = if !opts.no_lock {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await.map_err(|e| {
+            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
                 StorageError::other(format!(
                     "Failed to acquire write lock: {}",
                     self.format_lock_error_from_error(bucket, object, "write", &e)

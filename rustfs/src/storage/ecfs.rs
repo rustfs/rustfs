@@ -1911,9 +1911,9 @@ impl S3 for FS {
 
     /// Delete a bucket
     #[instrument(level = "debug", skip(self, req))]
-    async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+    async fn delete_bucket(&self, mut req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let helper = OperationHelper::new(&req, EventName::BucketRemoved, "s3:DeleteBucket");
-        let input = req.input;
+        let input = req.input.clone();
         // TODO: DeleteBucketInput doesn't have force parameter?
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));

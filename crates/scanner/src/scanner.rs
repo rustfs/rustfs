@@ -125,10 +125,16 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
     }
 }
 
+/// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
+/// Defaults to 30 seconds if not set or invalid
+fn get_lock_acquire_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+}
+
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
     // Acquire leader lock (write lock) to ensure only one scanner runs
     let _guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
-        Ok(ns_lock) => match ns_lock.get_write_lock(Duration::from_secs(30)).await {
+        Ok(ns_lock) => match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
             Ok(guard) => {
                 debug!("run_data_scanner: acquired leader write lock");
                 guard
