@@ -107,6 +107,11 @@ impl DistributedLockGuard {
         self.disarmed = true;
     }
 
+    /// Check if the guard has been disarmed (lock already released)
+    pub fn is_disarmed(&self) -> bool {
+        self.disarmed
+    }
+
     /// Manually release the lock early.
     /// This sends a release job to the background worker and then disarms the guard
     /// to prevent double-release on drop.

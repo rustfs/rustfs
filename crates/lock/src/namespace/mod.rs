@@ -24,6 +24,9 @@ use crate::{
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+mod tests;
+
 /// Unified guard for namespace locks
 /// Supports both DistributedLockGuard (for Distributed locks) and FastLockGuard (for Local locks)
 #[derive(Debug)]
@@ -93,10 +96,9 @@ impl NamespaceLockGuard {
     /// Check if the lock has been released
     pub fn is_released(&self) -> bool {
         match self {
-            Self::Standard(_guard) => {
-                // DistributedLockGuard doesn't expose is_released, so we check if it's disarmed
-                // This is a limitation, but we can't change DistributedLockGuard's API
-                false // We can't know without modifying DistributedLockGuard
+            Self::Standard(guard) => {
+                // Check if the guard has been disarmed, which indicates the lock was released
+                guard.is_disarmed()
             }
             Self::Fast(guard) => guard.is_released(),
         }
@@ -216,10 +218,11 @@ impl NamespaceLock {
     /// Acquire write lock (exclusive lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_write_lock(&self, resource: ObjectKey, owner: &str, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
-        let ttl = Duration::from_secs(30); // Default TTL
+        let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
+        let resource_str = format!("{}", resource);
         match self.lock_guard(resource, owner, timeout, ttl).await {
             Ok(Some(guard)) => Ok(guard),
-            Ok(None) => Err(crate::error::LockError::internal("Lock acquisition returned None")),
+            Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
             Err(e) => Err(e),
         }
     }
@@ -227,10 +230,11 @@ impl NamespaceLock {
     /// Acquire read lock (shared lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_read_lock(&self, resource: ObjectKey, owner: &str, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
-        let ttl = Duration::from_secs(30); // Default TTL
+        let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
+        let resource_str = format!("{}", resource);
         match self.rlock_guard(resource, owner, timeout, ttl).await {
             Ok(Some(guard)) => Ok(guard),
-            Ok(None) => Err(crate::error::LockError::internal("Lock acquisition returned None")),
+            Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
             Err(e) => Err(e),
         }
     }
@@ -247,14 +251,16 @@ impl NamespaceLock {
 
         match self {
             Self::Distributed(lock) => {
-                // Check client status
+                // Check client status - parallelize async calls for better performance
                 let clients = lock.clients();
-                let mut connected_clients = 0;
-                for client in clients.iter().flatten() {
-                    if client.is_online().await {
-                        connected_clients += 1;
-                    }
-                }
+                let client_checks: Vec<_> = clients
+                    .iter()
+                    .flatten()
+                    .map(|client| client.is_online())
+                    .collect();
+                
+                let results = futures::future::join_all(client_checks).await;
+                let connected_clients = results.iter().filter(|&&online| online).count();
 
                 let quorum = if clients.len() > 1 {
                     (clients.len() / 2) + 1
@@ -287,11 +293,25 @@ impl NamespaceLock {
 
         match self {
             Self::Distributed(lock) => {
-                // Try to get stats from clients
-                for client in lock.clients().iter().flatten() {
-                    if let Ok(client_stats) = client.get_stats().await {
-                        stats.successful_acquires += client_stats.successful_acquires;
-                        stats.failed_acquires += client_stats.failed_acquires;
+                // Parallelize stats collection for better performance
+                let stats_futures: Vec<_> = lock
+                    .clients()
+                    .iter()
+                    .flatten()
+                    .map(|client| client.get_stats())
+                    .collect();
+                
+                let results = futures::future::join_all(stats_futures).await;
+                
+                for result in results {
+                    match result {
+                        Ok(client_stats) => {
+                            stats.successful_acquires += client_stats.successful_acquires;
+                            stats.failed_acquires += client_stats.failed_acquires;
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to get stats from client: {}", e);
+                        }
                     }
                 }
             }
