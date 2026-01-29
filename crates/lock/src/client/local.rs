@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -21,23 +22,55 @@ use crate::{
     LockResponse, LockStats, LockStatus, LockType, Result,
 };
 
-/// Local lock client using FastLock
-#[derive(Debug, Clone)]
+/// Default shard count for guard storage (must be power of 2)
+const DEFAULT_GUARD_SHARD_COUNT: usize = 64;
+
+/// Local lock client using FastLock with sharded guard storage for better concurrency
+#[derive(Debug)]
 pub struct LocalClient {
-    guard_storage: Arc<RwLock<HashMap<LockId, FastLockGuard>>>,
+    /// Sharded guard storage to reduce lock contention
+    guard_storage: Vec<Arc<RwLock<HashMap<LockId, FastLockGuard>>>>,
+    /// Mask for fast shard index calculation (shard_count - 1)
+    shard_mask: usize,
 }
 
 impl LocalClient {
-    /// Create new local client
+    /// Create new local client with default shard count
     pub fn new() -> Self {
+        Self::with_shard_count(DEFAULT_GUARD_SHARD_COUNT)
+    }
+
+    /// Create new local client with custom shard count
+    /// Shard count must be a power of 2 for efficient masking
+    pub fn with_shard_count(shard_count: usize) -> Self {
+        assert!(shard_count.is_power_of_two(), "Shard count must be power of 2");
+        
+        let guard_storage: Vec<Arc<RwLock<HashMap<LockId, FastLockGuard>>>> = (0..shard_count)
+            .map(|_| Arc::new(RwLock::new(HashMap::new())))
+            .collect();
+
         Self {
-            guard_storage: Arc::new(RwLock::new(HashMap::new())),
+            guard_storage,
+            shard_mask: shard_count - 1,
         }
     }
 
     /// Get the global lock manager
     pub fn get_lock_manager(&self) -> Arc<GlobalLockManager> {
         crate::get_global_lock_manager()
+    }
+
+    /// Get the shard index for a given lock ID
+    fn get_shard_index(&self, lock_id: &LockId) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        lock_id.hash(&mut hasher);
+        (hasher.finish() as usize) & self.shard_mask
+    }
+
+    /// Get the shard for a given lock ID
+    fn get_shard(&self, lock_id: &LockId) -> &Arc<RwLock<HashMap<LockId, FastLockGuard>>> {
+        let index = self.get_shard_index(lock_id);
+        &self.guard_storage[index]
     }
 }
 
@@ -64,7 +97,8 @@ impl LockClient for LocalClient {
                 let lock_id = LockId::new_deterministic(&request.resource);
 
                 {
-                    let mut guards = self.guard_storage.write().await;
+                    let shard = self.get_shard(&lock_id);
+                    let mut guards = shard.write().await;
                     guards.insert(lock_id.clone(), guard);
                 }
 
@@ -100,7 +134,8 @@ impl LockClient for LocalClient {
     }
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
-        let mut guards = self.guard_storage.write().await;
+        let shard = self.get_shard(lock_id);
+        let mut guards = shard.write().await;
         if let Some(guard) = guards.remove(lock_id) {
             // Guard automatically releases the lock when dropped
             drop(guard);
@@ -121,7 +156,8 @@ impl LockClient for LocalClient {
     }
 
     async fn check_status(&self, lock_id: &LockId) -> Result<Option<LockInfo>> {
-        let guards = self.guard_storage.read().await;
+        let shard = self.get_shard(lock_id);
+        let guards = shard.read().await;
         if let Some(guard) = guards.get(lock_id) {
             // We have an active guard for this lock
             let lock_type = match guard.mode() {
