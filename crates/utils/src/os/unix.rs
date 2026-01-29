@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{DiskInfo, IOStats};
-use rustix::fs::{statvfs, StatVfs};
+use rustix::fs::{StatVfs, statvfs};
 use std::io::Error;
 use std::path::Path;
 
