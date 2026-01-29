@@ -306,6 +306,12 @@ impl DistributedLock {
                             // Save the individual lock_id returned by each client
                             individual_locks.push((lock_info.id.clone(), self.clients[idx].clone()));
                         }
+                    } else {
+                        tracing::warn!(
+                            "Failed to acquire lock on client from response: {}, error: {}",
+                            idx,
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
                     }
                 }
                 Err(e) => {
