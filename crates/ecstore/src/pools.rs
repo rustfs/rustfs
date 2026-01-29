@@ -1455,8 +1455,7 @@ pub fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_ma
                 matched_any = true;
                 capacity += disk.total_space as usize;
             } else {
-                // Log duplicate disks (only in debug mode)
-                // #[cfg(debug_assertions)]
+                // Log duplicate disks: this likely indicates a configuration issue and should always be visible.
                 warn!(
                     "Duplicate disk detected in capacity calculation: {} at {}",
                     disk.endpoint, disk.drive_path

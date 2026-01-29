@@ -1026,13 +1026,13 @@ impl ECStore {
         let mut duplicate_count = 0;
 
         for disk in disks {
-            // 生成复合唯一键
+            // Generate a compound unique key
             let key = format!(
                 "{}|{}|p{}s{}d{}",
                 disk.endpoint, disk.drive_path, disk.pool_index, disk.set_index, disk.disk_index
             );
 
-            // 使用 entry API 避免重复插入
+            // Use the entry API to avoid duplicate inserts
             use std::collections::hash_map::Entry;
             match unique_disks.entry(key) {
                 Entry::Vacant(e) => {
@@ -1333,7 +1333,9 @@ impl StorageAPI for ECStore {
             disks.extend_from_slice(&res.disks);
         }
 
-        // 🔧 Deduplication protection
+        // 🔧 Defensive deduplication: when aggregating disks from all pools, drop duplicate
+        //  entries that may be reported multiple times by backends; this extra layer is kept
+        //  even if the upstream reporting is later fixed.
         let original_count = disks.len();
         disks = Self::deduplicate_disks(disks);
 
