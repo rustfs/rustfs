@@ -19,7 +19,7 @@ use crate::server::RemoteAddr;
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
-use crate::storage::entity;
+use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
@@ -36,6 +36,7 @@ use crate::storage::{
     process_topic_configurations, strip_managed_encryption_metadata, validate_bucket_object_lock_enabled,
     validate_list_object_unordered_with_delimiter, validate_object_key, wrap_response_with_cors,
 };
+use crate::storage::{entity, parse_part_number_i32_to_usize};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -3394,14 +3395,9 @@ impl S3 for FS {
 
         // Validate object key
         validate_object_key(&key, "HEAD")?;
-
-        let part_number = part_number.map(|v| v as usize);
-
-        if let Some(part_num) = part_number
-            && part_num == 0
-        {
-            return Err(s3_error!(InvalidArgument, "part_number invalid"));
-        }
+        warn!("HEAD object: bucket={}, key={}", &bucket, &key);
+        // Parse part number from Option<i32> to Option<usize> with validation
+        let part_number: Option<usize> = parse_part_number_i32_to_usize(part_number, "HEAD")?;
 
         let rs = range.map(|v| match v {
             Range::Int { first, last } => HTTPRangeSpec {
@@ -3417,6 +3413,7 @@ impl S3 for FS {
         });
 
         if rs.is_some() && part_number.is_some() {
+            error!("head object invalid range and part_number");
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
         }
 
@@ -3427,27 +3424,41 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-
+        warn!("HEAD object get_object_info: bucket={}, key={}", &bucket, &key);
         // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
             Err(err) => {
+                error!("HEAD object get_object_info error: bucket={}, key={}, err={}", &bucket, &key, err);
                 // If the error indicates the object or its version was not found, return 404 (NoSuchKey)
                 if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    if is_dir_object(&key) {
+                        let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
+                            Ok(has_children) => has_children,
+                            Err(e) => {
+                                error!("Failed to probe children for prefix (bucket: {}, key: {}): {}", bucket, key, e);
+                                false
+                            }
+                        };
+                        let msg = head_prefix_not_found_message(&bucket, &key, has_children);
+                        warn!("HEAD object no such key (is dir): bucket={}, key={},message:={}", &bucket, &key, &msg);
+                        return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
+                    }
+                    warn!("HEAD object no such key: bucket={}, key={}", &bucket, &key);
                     return Err(S3Error::new(S3ErrorCode::NoSuchKey));
                 }
                 // Other errors, such as insufficient permissions, still return the original error
                 return Err(ApiError::from(err).into());
             }
         };
-
+        warn!("HEAD object got info: bucket={}, key={}", &bucket, &key);
         if info.delete_marker {
             if opts.version_id.is_none() {
                 return Err(S3Error::new(S3ErrorCode::NoSuchKey));
             }
             return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
         }
-
+        warn!("HEAD object info check passed: bucket={}, key={}", &bucket, &key);
         if let Some(match_etag) = if_none_match
             && let Some(strong_etag) = match_etag.into_etag()
             && info
@@ -3455,19 +3466,21 @@ impl S3 for FS {
                 .as_ref()
                 .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
         {
+            warn!("HEAD object if-none-match matched: bucket={}, key={}", &bucket, &key);
             return Err(S3Error::new(S3ErrorCode::NotModified));
         }
-
+        warn!("HEAD object if-none-match check passed: bucket={}, key={}", &bucket, &key);
         if let Some(modified_since) = if_modified_since {
             // obj_time < givenTime + 1s
             if info.mod_time.is_some_and(|mod_time| {
                 let give_time: OffsetDateTime = modified_since.into();
                 mod_time < give_time.add(time::Duration::seconds(1))
             }) {
+                warn!("HEAD object if-modified-since matched: bucket={}, key={}", &bucket, &key);
                 return Err(S3Error::new(S3ErrorCode::NotModified));
             }
         }
-
+        warn!("HEAD object if-modified-since check passed: bucket={}, key={}", &bucket, &key);
         if let Some(match_etag) = if_match {
             if let Some(strong_etag) = match_etag.into_etag()
                 && info
@@ -3475,6 +3488,7 @@ impl S3 for FS {
                     .as_ref()
                     .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
             {
+                warn!("HEAD object if-match did not match: bucket={}, key={}", &bucket, &key);
                 return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
             }
         } else if let Some(unmodified_since) = if_unmodified_since
@@ -3483,9 +3497,10 @@ impl S3 for FS {
                 mod_time > give_time.add(time::Duration::seconds(1))
             })
         {
+            warn!("HEAD object if-unmodified-since did not match: bucket={}, key={}", &bucket, &key);
             return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
         }
-
+        warn!("HEAD object precondition checks passed: bucket={}, key={}", &bucket, &key);
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -3526,7 +3541,7 @@ impl S3 for FS {
             .or_else(|| metadata_map.get("x-amz-storage-class").cloned())
             .filter(|s| !s.is_empty())
             .map(StorageClass::from);
-
+        warn!("HEAD object preparing response: bucket={}, key={}", &bucket, &key);
         let mut checksum_crc32 = None;
         let mut checksum_crc32c = None;
         let mut checksum_sha1 = None;
@@ -3560,7 +3575,7 @@ impl S3 for FS {
                 }
             }
         }
-
+        warn!("HEAD object constructing output: bucket={}, key={}", &bucket, &key);
         // Extract standard HTTP headers from user_defined metadata
         // Note: These headers are stored with lowercase keys by extract_metadata_from_mime
         let cache_control = metadata_map.get("cache-control").cloned();
@@ -3576,7 +3591,7 @@ impl S3 for FS {
         } else {
             0
         };
-
+        warn!("HEAD object tag count: bucket={}, key={}, tag_count={}", &bucket, &key, tag_count);
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -3649,10 +3664,10 @@ impl S3 for FS {
         {
             response.headers.insert(header_name, header_value);
         }
-
+        warn!("HEAD object completed response construction: bucket={}, key={}", &bucket, &key);
         let result = Ok(response);
         let _ = helper.complete(&result);
-
+        warn!("HEAD object completed: bucket={}, key={}", &bucket, &key);
         result
     }
 
