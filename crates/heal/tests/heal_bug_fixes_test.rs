@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ahm::heal::{
+use rustfs_heal::heal::{
     event::{HealEvent, Severity},
     task::{HealPriority, HealType},
     utils,
@@ -73,7 +73,7 @@ fn test_heal_event_object_corruption() {
         bucket: "test-bucket".to_string(),
         object: "test-object".to_string(),
         version_id: None,
-        corruption_type: rustfs_ahm::heal::event::CorruptionType::DataCorruption,
+        corruption_type: rustfs_heal::heal::event::CorruptionType::DataCorruption,
         severity: Severity::High,
     };
 
@@ -119,7 +119,7 @@ fn test_format_set_disk_id_from_i32_valid() {
 
 #[test]
 fn test_resume_state_timestamp_handling() {
-    use rustfs_ahm::heal::resume::ResumeState;
+    use rustfs_heal::heal::resume::ResumeState;
 
     // Test that ResumeState creation doesn't panic even if system time is before epoch
     // This is a theoretical test - in practice, system time should never be before epoch
@@ -139,7 +139,7 @@ fn test_resume_state_timestamp_handling() {
 
 #[test]
 fn test_resume_checkpoint_timestamp_handling() {
-    use rustfs_ahm::heal::resume::ResumeCheckpoint;
+    use rustfs_heal::heal::resume::ResumeCheckpoint;
 
     // Test that ResumeCheckpoint creation doesn't panic
     let checkpoint = ResumeCheckpoint::new("test-task".to_string());
@@ -162,8 +162,8 @@ fn test_path_to_str_helper() {
 
 #[test]
 fn test_heal_task_status_atomic_update() {
-    use rustfs_ahm::heal::storage::HealStorageAPI;
-    use rustfs_ahm::heal::task::{HealOptions, HealRequest, HealTask, HealTaskStatus};
+    use rustfs_heal::heal::storage::HealStorageAPI;
+    use rustfs_heal::heal::task::{HealOptions, HealRequest, HealTask, HealTaskStatus};
     use std::sync::Arc;
 
     // Mock storage for testing
@@ -174,49 +174,49 @@ fn test_heal_task_status_atomic_update() {
             &self,
             _bucket: &str,
             _object: &str,
-        ) -> rustfs_ahm::Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+        ) -> rustfs_heal::Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
             Ok(None)
         }
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> rustfs_ahm::Result<Option<Vec<u8>>> {
+        async fn get_object_data(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<Vec<u8>>> {
             Ok(None)
         }
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> rustfs_ahm::Result<()> {
+        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> rustfs_heal::Result<()> {
             Ok(())
         }
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> rustfs_ahm::Result<()> {
+        async fn delete_object(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<()> {
             Ok(())
         }
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> rustfs_ahm::Result<bool> {
+        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
             Ok(true)
         }
-        async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_ahm::Result<Vec<u8>> {
+        async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
             Ok(vec![])
         }
         async fn get_disk_status(
             &self,
             _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint,
-        ) -> rustfs_ahm::Result<rustfs_ahm::heal::storage::DiskStatus> {
-            Ok(rustfs_ahm::heal::storage::DiskStatus::Ok)
+        ) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
+            Ok(rustfs_heal::heal::storage::DiskStatus::Ok)
         }
-        async fn format_disk(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> rustfs_ahm::Result<()> {
+        async fn format_disk(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> rustfs_heal::Result<()> {
             Ok(())
         }
-        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_ahm::Result<Option<rustfs_ecstore::store_api::BucketInfo>> {
+        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<rustfs_ecstore::store_api::BucketInfo>> {
             Ok(None)
         }
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_ahm::Result<()> {
+        async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_heal::Result<()> {
             Ok(())
         }
-        async fn list_buckets(&self) -> rustfs_ahm::Result<Vec<rustfs_ecstore::store_api::BucketInfo>> {
+        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<rustfs_ecstore::store_api::BucketInfo>> {
             Ok(vec![])
         }
-        async fn object_exists(&self, _bucket: &str, _object: &str) -> rustfs_ahm::Result<bool> {
+        async fn object_exists(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
             Ok(false)
         }
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> rustfs_ahm::Result<Option<u64>> {
+        async fn get_object_size(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<u64>> {
             Ok(None)
         }
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> rustfs_ahm::Result<Option<String>> {
+        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<String>> {
             Ok(None)
         }
         async fn heal_object(
@@ -225,23 +225,23 @@ fn test_heal_task_status_atomic_update() {
             _object: &str,
             _version_id: Option<&str>,
             _opts: &rustfs_common::heal_channel::HealOpts,
-        ) -> rustfs_ahm::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_ahm::Error>)> {
+        ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
         async fn heal_bucket(
             &self,
             _bucket: &str,
             _opts: &rustfs_common::heal_channel::HealOpts,
-        ) -> rustfs_ahm::Result<rustfs_madmin::heal_commands::HealResultItem> {
+        ) -> rustfs_heal::Result<rustfs_madmin::heal_commands::HealResultItem> {
             Ok(rustfs_madmin::heal_commands::HealResultItem::default())
         }
         async fn heal_format(
             &self,
             _dry_run: bool,
-        ) -> rustfs_ahm::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_ahm::Error>)> {
+        ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_ahm::Result<Vec<String>> {
+        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_heal::Result<Vec<String>> {
             Ok(vec![])
         }
         async fn list_objects_for_heal_page(
@@ -249,11 +249,11 @@ fn test_heal_task_status_atomic_update() {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
-        ) -> rustfs_ahm::Result<(Vec<String>, Option<String>, bool)> {
+        ) -> rustfs_heal::Result<(Vec<String>, Option<String>, bool)> {
             Ok((vec![], None, false))
         }
-        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_ahm::Result<rustfs_ecstore::disk::DiskStore> {
-            Err(rustfs_ahm::Error::other("Not implemented in mock"))
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<rustfs_ecstore::disk::DiskStore> {
+            Err(rustfs_heal::Error::other("Not implemented in mock"))
         }
     }
 

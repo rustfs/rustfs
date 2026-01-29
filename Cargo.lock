@@ -7634,7 +7634,6 @@ dependencies = [
  "russh",
  "russh-sftp",
  "rust-embed",
- "rustfs-ahm",
  "rustfs-appauth",
  "rustfs-audit",
  "rustfs-common",
@@ -7642,6 +7641,7 @@ dependencies = [
  "rustfs-credentials",
  "rustfs-ecstore",
  "rustfs-filemeta",
+ "rustfs-heal",
  "rustfs-iam",
  "rustfs-kms",
  "rustfs-lock",
@@ -7685,38 +7685,6 @@ dependencies = [
  "urlencoding",
  "uuid",
  "zip",
-]
-
-[[package]]
-name = "rustfs-ahm"
-version = "0.0.5"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "futures",
- "heed",
- "rand 0.10.0-rc.6",
- "reqwest",
- "rustfs-common",
- "rustfs-config",
- "rustfs-ecstore",
- "rustfs-filemeta",
- "rustfs-madmin",
- "rustfs-utils",
- "s3s",
- "serde",
- "serde_json",
- "serial_test",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "walkdir",
 ]
 
 [[package]]
@@ -7924,6 +7892,38 @@ dependencies = [
  "tracing",
  "uuid",
  "xxhash-rust",
+]
+
+[[package]]
+name = "rustfs-heal"
+version = "0.0.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "heed",
+ "rand 0.10.0-rc.6",
+ "reqwest",
+ "rustfs-common",
+ "rustfs-config",
+ "rustfs-ecstore",
+ "rustfs-filemeta",
+ "rustfs-madmin",
+ "rustfs-utils",
+ "s3s",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]
