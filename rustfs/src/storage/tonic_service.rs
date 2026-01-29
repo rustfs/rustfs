@@ -3207,7 +3207,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tokio::test]
     async fn test_r_un_lock_invalid_args() {
         let service = create_test_node_service();
 
