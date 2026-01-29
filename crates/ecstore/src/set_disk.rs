@@ -255,12 +255,15 @@ impl SetDisks {
     ) -> String {
         match err {
             rustfs_lock::error::LockError::Timeout { .. } => {
-                format!("{mode} lock acquisition timed out on {bucket}/{object} (owner={})", self.locker_owner)
+                format!(
+                    "ns_loc: {mode} lock acquisition timed out on {bucket}/{object} (owner={})",
+                    self.locker_owner
+                )
             }
             rustfs_lock::error::LockError::AlreadyLocked { owner, .. } => {
-                format!("{mode} lock conflicted on {bucket}/{object}: held by {owner}")
+                format!("ns_loc: {mode} lock conflicted on {bucket}/{object}: held by {owner}")
             }
-            _ => format!("{mode} lock acquisition failed on {bucket}/{object}: {}", err),
+            _ => format!("ns_loc: {mode} lock acquisition failed on {bucket}/{object}: {}", err),
         }
     }
     async fn get_disks_internal(&self) -> Vec<Option<DiskStore>> {
@@ -3981,18 +3984,15 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         let set_lock = if is_dist_erasure().await {
-            warn!("new_ns_lock: is_dist_erasure");
-            let mut write_quorum = self.set_drive_count - self.default_parity_count;
-            if write_quorum == self.default_parity_count {
-                write_quorum += 1;
-            }
+            // Calculate quorum based on lockers count (majority)
+            let lockers_count = self.lockers.len();
+            let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
             NamespaceLock::with_clients_and_quorum(
                 format!("set-{}-{}", self.pool_index, self.set_index),
                 self.lockers.clone(),
                 write_quorum,
             )
         } else {
-            warn!("new_ns_lock: is_local_erasure");
             NamespaceLock::Local(LocalLock::new(
                 format!("set-{}-{}", self.pool_index, self.set_index),
                 Arc::new(rustfs_lock::GlobalLockManager::new()),
