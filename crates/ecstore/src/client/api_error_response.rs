@@ -101,6 +101,16 @@ pub fn http_resp_to_error_response(
     object_name: &str,
 ) -> ErrorResponse {
     let err_body = String::from_utf8(b).unwrap();
+    if h.is_empty() || resp_status.is_client_error() || resp_status.is_server_error() {
+        return ErrorResponse {
+            status_code: resp_status,
+            code: S3ErrorCode::ResponseInterrupted,
+            message: "Invalid HTTP response.".to_string(),
+            bucket_name: bucket_name.to_string(),
+            key: object_name.to_string(),
+            ..Default::default()
+        };
+    }
     let err_resp_ = quick_xml::de::from_str::<ErrorResponse>(&err_body);
     let mut err_resp = ErrorResponse::default();
     if err_resp_.is_err() {

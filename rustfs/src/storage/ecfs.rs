@@ -5303,9 +5303,9 @@ impl S3 for FS {
         }
 
         // Validate restore request
-        rreq.validate(store.clone()).map_err(|_| {
-            S3Error::with_message(S3ErrorCode::Custom("ErrValidRestoreObject".into()), "restore object validation failed")
-        })?;
+        if let Err(e) = rreq.validate(store.clone()) {
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrValidRestoreObject".into()), format!("Restore object validation failed: {}", e)));
+        }
 
         // Check if restore is already in progress
         if obj_info.restore_ongoing && (rreq.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT")) {
