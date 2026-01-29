@@ -25,10 +25,7 @@ use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
-use rustfs_config::{
-    DEFAULT_CPU_FREQ, DEFAULT_ENABLE_PROFILING, ENV_CPU_FREQ, ENV_ENABLE_PROFILING, MAX_ADMIN_REQUEST_BODY_SIZE,
-    MAX_HEAL_REQUEST_SIZE,
-};
+use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_HEAL_REQUEST_SIZE};
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
@@ -56,7 +53,6 @@ use rustfs_policy::policy::action::AdminAction;
 use rustfs_policy::policy::action::S3Action;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_utils::path::path_join;
-use rustfs_utils::{get_env_bool, get_env_usize};
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
