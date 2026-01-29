@@ -81,7 +81,9 @@ mod tests {
         assert!(info.used > 0);
         assert!(info.files > 0);
         assert!(info.ffree > 0);
-        assert!(!info.fstype.is_empty());
+        // Only Linux get_info sets fstype (via statfs); macOS/other Unix use statvfs which does not.
+        #[cfg(target_os = "linux")]
+        assert!(!info.fstype.is_empty(), "fstype should not be empty on Linux");
     }
 
     #[test]
