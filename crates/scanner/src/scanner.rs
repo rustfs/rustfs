@@ -129,9 +129,12 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     // Acquire leader lock (write lock) to ensure only one scanner runs
     let _guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
         Ok(ns_lock) => match ns_lock.get_write_lock(Duration::from_secs(30)).await {
-            Ok(guard) => guard,
+            Ok(guard) => {
+                debug!("run_data_scanner: acquired leader write lock");
+                guard
+            }
             Err(e) => {
-                error!("run_data_scanner: other node is running, failed to acquire leader write lock: {:?}", e);
+                debug!("run_data_scanner: other node is running, failed to acquire leader write lock: {:?}", e);
                 return Ok(());
             }
         },
@@ -229,6 +232,9 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     }
 
     global_metrics().set_cycle(None).await;
+
+    debug!("Data scanner done");
+
     Ok(())
 }
 

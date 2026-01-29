@@ -55,6 +55,7 @@ lazy_static! {
     pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
     pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
     pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
+    pub static ref GLOBAL_LOCK_CLIENT: OnceLock<Arc<dyn rustfs_lock::client::LockClient>> = OnceLock::new();
 }
 
 /// Global cancellation token for background services (data scanner and auto heal)
@@ -274,4 +275,26 @@ pub fn shutdown_background_services() {
     if let Some(cancel_token) = GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN.get() {
         cancel_token.cancel();
     }
+}
+
+/// Set the global lock client (first LocalClient created)
+///
+/// # Arguments
+/// * `client` - The LockClient instance to set globally
+///
+/// # Returns
+/// * `Ok(())` if successful
+/// * `Err(Arc<dyn LockClient>)` if setting fails (client already set)
+///
+pub fn set_global_lock_client(client: Arc<dyn rustfs_lock::client::LockClient>) -> Result<(), Arc<dyn rustfs_lock::client::LockClient>> {
+    GLOBAL_LOCK_CLIENT.set(client)
+}
+
+/// Get the global lock client
+///
+/// # Returns
+/// * `Option<Arc<dyn LockClient>>` - The global lock client, if set
+///
+pub fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
+    GLOBAL_LOCK_CLIENT.get().cloned()
 }

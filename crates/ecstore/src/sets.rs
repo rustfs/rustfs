@@ -44,8 +44,8 @@ use rustfs_common::{
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
-use rustfs_lock::client::{LockClient, local::LocalClient};
 use rustfs_lock::NamespaceLockWrapper;
+use rustfs_lock::client::{LockClient, local::LocalClient};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use std::{collections::HashMap, sync::Arc};
@@ -91,9 +91,23 @@ pub fn create_unique_clients(endpoints: &[Endpoint]) -> HashMap<String, Arc<dyn 
     }
 
     let mut clients = HashMap::new();
+    let mut first_local_client_set = false;
+
     for (key, endpoint) in unique_endpoints {
         if endpoint.is_local {
-            clients.insert(key, Arc::new(LocalClient::new()) as Arc<dyn LockClient>);
+            let local_client = Arc::new(LocalClient::new()) as Arc<dyn LockClient>;
+
+            // Store the first LocalClient globally for use by other modules
+            if !first_local_client_set {
+                if let Err(e) = crate::global::set_global_lock_client(local_client.clone()) {
+                    // If already set, ignore the error (another thread may have set it)
+                    warn!("set_global_lock_client error: {:?}", e);
+                } else {
+                    first_local_client_set = true;
+                }
+            }
+
+            clients.insert(key, local_client);
         } else {
             clients.insert(key, Arc::new(RemoteClient::new(endpoint.url.to_string())) as Arc<dyn LockClient>);
         }
@@ -117,11 +131,6 @@ impl Sets {
         let lock_clients = create_unique_clients(endpoints.endpoints.as_ref());
 
         let mut disk_set = Vec::with_capacity(set_count);
-
-        // Create fast lock manager for high performance
-        let fast_lock_manager = Arc::new(rustfs_lock::FastObjectLockManager::new());
-
-        // let mut set_lockers = Vec::with_capacity(set_count);
 
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
@@ -182,20 +191,7 @@ impl Sets {
                 }
             }
 
-            // let mut write_quorum = set_drive_count - parity_count;
-            // if write_quorum == parity_count {
-            //     write_quorum += 1;
-            // }
-            // let set_lock = rustfs_lock::NamespaceLock::with_clients_and_quorum(
-            //     format!("set-{pool_idx}-{i}"),
-            //     set_lock_clients,
-            //     write_quorum,
-            // );
-
-            // set_lockers.push(set_lock);
-
             let set_disks = SetDisks::new(
-                fast_lock_manager.clone(),
                 GLOBAL_LOCAL_NODE_NAME.read().await.to_string(),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,

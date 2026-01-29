@@ -111,6 +111,8 @@ use rustfs_targets::{
     EventName,
     arn::{ARN, TargetID, TargetIDError},
 };
+use rustfs_utils::http::RUSTFS_FORCE_DELETE;
+use rustfs_utils::string::parse_bool;
 use rustfs_utils::{
     CompressionAlgorithm, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
     http::{
@@ -1917,11 +1919,29 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        // get value from header, support mc style
+        let force_str = req
+            .headers
+            .get(RUSTFS_FORCE_DELETE)
+            .map(|v| v.to_str().unwrap_or_default())
+            .unwrap_or(
+                req.headers
+                    .get("x-minio-force-delete")
+                    .map(|v| v.to_str().unwrap_or_default())
+                    .unwrap_or_default(),
+            );
+
+        let force = parse_bool(force_str).unwrap_or_default();
+
+        if force {
+            authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteAction)).await?;
+        }
+
         store
             .delete_bucket(
                 &input.bucket,
                 &DeleteBucketOptions {
-                    force: false,
+                    force,
                     ..Default::default()
                 },
             )

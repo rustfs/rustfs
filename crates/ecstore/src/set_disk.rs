@@ -75,6 +75,7 @@ use rustfs_filemeta::{
 };
 use rustfs_lock::LockClient;
 use rustfs_lock::fast_lock::types::LockResult;
+use rustfs_lock::local_lock::LocalLock;
 use rustfs_lock::{FastLockGuard, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
@@ -122,7 +123,6 @@ const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct SetDisks {
-    pub fast_lock_manager: Arc<rustfs_lock::FastObjectLockManager>,
     pub locker_owner: String,
     pub disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
     pub set_endpoints: Vec<Endpoint>,
@@ -154,7 +154,6 @@ impl DiskHealthEntry {
 impl SetDisks {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        fast_lock_manager: Arc<rustfs_lock::FastObjectLockManager>,
         locker_owner: String,
         disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
         set_drive_count: usize,
@@ -166,7 +165,6 @@ impl SetDisks {
         lockers: Vec<Option<Arc<dyn LockClient>>>,
     ) -> Arc<Self> {
         Arc::new(SetDisks {
-            fast_lock_manager,
             locker_owner,
             disks,
             set_drive_count,
@@ -243,7 +241,13 @@ impl SetDisks {
         }
     }
 
-    fn format_lock_error_from_error(&self, bucket: &str, object: &str, mode: &str, err: &rustfs_lock::error::LockError) -> String {
+    fn format_lock_error_from_error(
+        &self,
+        bucket: &str,
+        object: &str,
+        mode: &str,
+        err: &rustfs_lock::error::LockError,
+    ) -> String {
         match err {
             rustfs_lock::error::LockError::Timeout { .. } => {
                 format!("{mode} lock acquisition timed out on {bucket}/{object} (owner={})", self.locker_owner)
@@ -3309,7 +3313,10 @@ impl SetDisks {
             .get_write_lock(LOCK_ACQUIRE_TIMEOUT)
             .await
             .map_err(|e| {
-                let message = format!("Failed to acquire write lock: {}", self.format_lock_error_from_error(bucket, object, "write", &e));
+                let message = format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error_from_error(bucket, object, "write", &e)
+                );
                 DiskError::other(message)
             })?;
 
@@ -3968,15 +3975,22 @@ impl ObjectIO for SetDisks {
 impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        let mut write_quorum = self.set_drive_count - self.default_parity_count;
-        if write_quorum == self.default_parity_count {
-            write_quorum += 1;
-        }
-        let set_lock = NamespaceLock::with_clients_and_quorum(
-            format!("set-{}-{}", self.pool_index, self.set_index),
-            self.lockers.clone(),
-            write_quorum,
-        );
+        let set_lock = if is_dist_erasure().await {
+            let mut write_quorum = self.set_drive_count - self.default_parity_count;
+            if write_quorum == self.default_parity_count {
+                write_quorum += 1;
+            }
+            NamespaceLock::with_clients_and_quorum(
+                format!("set-{}-{}", self.pool_index, self.set_index),
+                self.lockers.clone(),
+                write_quorum,
+            )
+        } else {
+            NamespaceLock::Local(LocalLock::new(
+                format!("set-{}-{}", self.pool_index, self.set_index),
+                Arc::new(rustfs_lock::GlobalLockManager::new()),
+            ))
+        };
 
         let resource = ObjectKey {
             bucket: Arc::from(bucket),
@@ -4150,12 +4164,6 @@ impl StorageAPI for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        // // Guard lock for single object delete-version
-        // let _lock_guard = self
-        //     .fast_lock_manager
-        //     .acquire_write_lock("", object, self.locker_owner.as_str())
-        //     .await
-        //     .map_err(|_| Error::other("can not get lock. please retry".to_string()))?;
         let disks = self.get_disks(0, 0).await?;
         let write_quorum = disks.len() / 2 + 1;
 
@@ -4221,29 +4229,36 @@ impl StorageAPI for SetDisks {
             }
         }
 
-        let batch_result = self.fast_lock_manager.acquire_locks_batch(batch).await;
-        let locked_objects: HashSet<String> = batch_result
-            .successful_locks
-            .iter()
-            .map(|key| key.object.as_ref().to_string())
-            .collect();
-        let _lock_guards = batch_result.guards;
+        let mut failed_map = HashMap::new();
+        let mut batch_guards = Vec::with_capacity(batch.requests.len());
 
-        let failed_map: HashMap<(String, String), LockResult> = batch_result
-            .failed_locks
-            .into_iter()
-            .map(|(key, err)| ((key.bucket.as_ref().to_string(), key.object.as_ref().to_string()), err))
-            .collect();
+        let mut locked_objects = HashSet::new();
+
+        for req in batch.requests.iter() {
+            let ns_lock = match self.new_ns_lock(req.key.bucket.as_ref(), req.key.object.as_ref()).await {
+                Ok(ns_lock) => ns_lock,
+                Err(e) => {
+                    failed_map.insert((req.key.bucket.as_ref().to_string(), req.key.object.as_ref().to_string()), e.to_string());
+                    continue;
+                }
+            };
+            let _lock_guard = match ns_lock.get_write_lock(LOCK_ACQUIRE_TIMEOUT).await {
+                Ok(lock_guard) => lock_guard,
+                Err(e) => {
+                    failed_map.insert((req.key.bucket.as_ref().to_string(), req.key.object.as_ref().to_string()), e.to_string());
+                    continue;
+                }
+            };
+            batch_guards.push(_lock_guard);
+            locked_objects.insert(req.key.object.as_ref().to_string());
+        }
 
         // Mark failures for objects that could not be locked
         for (i, dobj) in objects.iter().enumerate() {
             if let Some(err) = failed_map.get(&(bucket.to_string(), dobj.object_name.clone())) {
-                let message = self.format_lock_error(bucket, dobj.object_name.as_str(), "write", err);
-                del_errs[i] = Some(Error::other(message));
+                del_errs[i] = Some(Error::other(err.to_string()));
             }
         }
-
-        // let mut del_fvers = Vec::with_capacity(objects.len());
 
         let ver_cfg = BucketVersioningSys::get(bucket).await.unwrap_or_default();
 

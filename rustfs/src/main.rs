@@ -178,6 +178,12 @@ async fn run(opt: config::Opt) -> Result<()> {
         .await
         .map_err(Error::other)?;
 
+    set_global_endpoints(endpoint_pools.as_ref().clone());
+    update_erasure_type(setup_type).await;
+
+    // Initialize the local disk
+    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
+
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
             target: "rustfs::main::run",
@@ -230,12 +236,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     } else {
         None
     };
-
-    set_global_endpoints(endpoint_pools.as_ref().clone());
-    update_erasure_type(setup_type).await;
-
-    // Initialize the local disk
-    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
 
     let ctx = CancellationToken::new();
 

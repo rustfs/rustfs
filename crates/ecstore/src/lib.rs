@@ -52,6 +52,7 @@ pub mod tier;
 pub use global::new_object_layer_fn;
 pub use global::set_global_endpoints;
 pub use global::update_erasure_type;
+pub use global::{get_global_lock_client, set_global_lock_client};
 
 pub use global::GLOBAL_Endpoints;
 pub use store_api::StorageAPI;

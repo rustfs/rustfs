@@ -24,6 +24,7 @@ use rustfs_ecstore::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts,
         error::DiskError,
     },
+    get_global_lock_client,
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
     new_object_layer_fn,
     rpc::{LocalPeerS3Client, PeerS3Client},
@@ -74,16 +75,11 @@ type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 #[derive(Debug)]
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
-    lock_manager: Arc<rustfs_lock::LocalClient>,
 }
 
 pub fn make_server() -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    let lock_manager = Arc::new(rustfs_lock::LocalClient::new());
-    NodeService {
-        local_peer,
-        lock_manager,
-    }
+    NodeService { local_peer }
 }
 
 impl NodeService {
@@ -93,6 +89,12 @@ impl NodeService {
 
     async fn all_disk(&self) -> Vec<String> {
         all_local_disk_path().await
+    }
+
+    /// Get the global lock client, returning an error if not initialized
+    fn get_lock_client(&self) -> Result<Arc<dyn LockClient>, Status> {
+        get_global_lock_client()
+            .ok_or_else(|| Status::internal("Lock client not initialized. Please ensure storage is initialized first."))
     }
 }
 
@@ -1462,7 +1464,8 @@ impl Node for NodeService {
             }
         };
 
-        match self.lock_manager.acquire_lock(&args).await {
+        let lock_client = self.get_lock_client()?;
+        match lock_client.acquire_lock(&args).await {
             Ok(result) => Ok(Response::new(GenerallyLockResponse {
                 success: result.success,
                 error_info: None,
@@ -1489,7 +1492,8 @@ impl Node for NodeService {
             }
         };
 
-        match self.lock_manager.release(&args.lock_id).await {
+        let lock_client = self.get_lock_client()?;
+        match lock_client.release(&args.lock_id).await {
             Ok(_) => Ok(Response::new(GenerallyLockResponse {
                 success: true,
                 error_info: None,
@@ -1516,7 +1520,8 @@ impl Node for NodeService {
             }
         };
 
-        match self.lock_manager.acquire_lock(&args).await {
+        let lock_client = self.get_lock_client()?;
+        match lock_client.acquire_lock(&args).await {
             Ok(result) => Ok(Response::new(GenerallyLockResponse {
                 success: result.success,
                 error_info: None,
@@ -1543,7 +1548,8 @@ impl Node for NodeService {
             }
         };
 
-        match self.lock_manager.release(&args.lock_id).await {
+        let lock_client = self.get_lock_client()?;
+        match lock_client.release(&args.lock_id).await {
             Ok(_) => Ok(Response::new(GenerallyLockResponse {
                 success: true,
                 error_info: None,
@@ -1570,7 +1576,8 @@ impl Node for NodeService {
             }
         };
 
-        match self.lock_manager.release(&args.lock_id).await {
+        let lock_client = self.get_lock_client()?;
+        match lock_client.release(&args.lock_id).await {
             Ok(_) => Ok(Response::new(GenerallyLockResponse {
                 success: true,
                 error_info: None,
