@@ -1010,6 +1010,46 @@ impl ECStore {
         // *self.pool_meta.write().unwrap() = meta;
         Ok(())
     }
+
+    /// Disk information deduplication function
+    ///
+    /// Use multiple field combinations to ensure uniqueness:
+    /// - endpoint (node address)
+    /// - drive_path (mount path)
+    /// - pool_index (pool index)
+    /// - set_index (Collection Index)
+    /// - disk_index (disk index)
+    pub(crate) fn deduplicate_disks(disks: Vec<rustfs_madmin::Disk>) -> Vec<rustfs_madmin::Disk> {
+        use std::collections::HashMap;
+
+        let mut unique_disks: HashMap<String, rustfs_madmin::Disk> = HashMap::new();
+        let mut duplicate_count = 0;
+
+        for disk in disks {
+            // Generate a compound unique key
+            let key = format!(
+                "{}|{}|p{}s{}d{}",
+                disk.endpoint, disk.drive_path, disk.pool_index, disk.set_index, disk.disk_index
+            );
+
+            // Use the entry API to avoid duplicate inserts
+            use std::collections::hash_map::Entry;
+            match unique_disks.entry(key) {
+                Entry::Vacant(e) => {
+                    e.insert(disk);
+                }
+                Entry::Occupied(_) => {
+                    duplicate_count += 1;
+                }
+            }
+        }
+
+        if duplicate_count > 0 {
+            debug!("Deduplicated {} duplicate disk entries", duplicate_count);
+        }
+
+        unique_disks.into_values().collect()
+    }
 }
 
 pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
@@ -1259,7 +1299,23 @@ impl StorageAPI for ECStore {
             return rustfs_madmin::StorageInfo::default();
         };
 
-        notification_sy.storage_info(self).await
+        let mut info = notification_sy.storage_info(self).await;
+
+        // 🔧 Defensive deduplication: This protection mechanism is retained even if the upstream is fixed
+        let original_count = info.disks.len();
+        info.disks = Self::deduplicate_disks(info.disks);
+        let final_count = info.disks.len();
+
+        if original_count != final_count {
+            warn!(
+                "Storage info deduplication: removed {} duplicate disk entries ({} -> {})",
+                original_count - final_count,
+                original_count,
+                final_count
+            );
+        }
+
+        info
     }
     #[instrument(skip(self))]
     async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
@@ -1275,6 +1331,16 @@ impl StorageAPI for ECStore {
 
         for res in results.into_iter() {
             disks.extend_from_slice(&res.disks);
+        }
+
+        // 🔧 Defensive deduplication: when aggregating disks from all pools, drop duplicate
+        //  entries that may be reported multiple times by backends; this extra layer is kept
+        //  even if the upstream reporting is later fixed.
+        let original_count = disks.len();
+        disks = Self::deduplicate_disks(disks);
+
+        if original_count != disks.len() {
+            warn!("Local storage info deduplication: {} -> {}", original_count, disks.len());
         }
 
         let backend = self.backend_info().await;

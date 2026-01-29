@@ -12,29 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nix::sys::stat::{self, stat};
-use nix::sys::statfs::{self, FsType, statfs};
+use super::{DiskInfo, IOStats};
+use rustix::fs::statfs;
 use std::fs::File;
 use std::io::{self, BufRead, Error, ErrorKind};
 use std::path::Path;
 
-use super::{DiskInfo, IOStats};
-
 /// Returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let path_display = p.as_ref().display();
-    let stat_fs = statfs(p.as_ref())?;
+    // Use statfs on Linux to get access to f_type (filesystem magic number)
+    let stat = statfs(p.as_ref())?;
 
-    let bsize = stat_fs.block_size() as u64;
-    let bfree = stat_fs.blocks_free() as u64;
-    let bavail = stat_fs.blocks_available() as u64;
-    let blocks = stat_fs.blocks() as u64;
+    // Linux statfs:
+    // f_bsize: Optimal transfer block size
+    // f_blocks: Total data blocks in file system
+    // f_frsize: Fragment size (since Linux 2.6) - unit for blocks
+    //
+    // If f_frsize is > 0, it is the unit for f_blocks, f_bfree, f_bavail.
+    // Otherwise f_bsize is used.
+    let bsize = if stat.f_frsize > 0 {
+        stat.f_frsize as u64
+    } else {
+        stat.f_bsize as u64
+    };
+
+    let bfree = stat.f_bfree as u64;
+    let bavail = stat.f_bavail as u64;
+    let blocks = stat.f_blocks as u64;
 
     let reserved = match bfree.checked_sub(bavail) {
         Some(reserved) => reserved,
         None => {
             return Err(Error::other(format!(
-                "detected f_bavail space ({bavail}) > f_bfree space ({bfree}), fs corruption at ({path_display}). please run 'fsck'"
+                "detected f_bavail space ({bavail}) > f_bfree space ({bfree}), fs corruption at ({path_display}). please run 'fsck'",
             )));
         }
     };
@@ -43,7 +54,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         Some(total) => total * bsize,
         None => {
             return Err(Error::other(format!(
-                "detected reserved space ({reserved}) > blocks space ({blocks}), fs corruption at ({path_display}). please run 'fsck'"
+                "detected reserved space ({reserved}) > blocks space ({blocks}), fs corruption at ({path_display}). please run 'fsck'",
             )));
         }
     };
@@ -58,17 +69,17 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         }
     };
 
-    let st = stat(p.as_ref())?;
+    let st = rustix::fs::stat(p.as_ref())?;
 
     Ok(DiskInfo {
         total,
         free,
         used,
-        files: stat_fs.files(),
-        ffree: stat_fs.files_free(),
-        fstype: get_fs_type(stat_fs.filesystem_type()).to_string(),
-        major: stat::major(st.st_dev),
-        minor: stat::minor(st.st_dev),
+        files: stat.f_files as u64,
+        ffree: stat.f_ffree as u64,
+        fstype: get_fs_type(stat.f_type as u64).to_string(),
+        major: rustix::fs::major(st.st_dev) as u64,
+        minor: rustix::fs::minor(st.st_dev) as u64,
         ..Default::default()
     })
 }
@@ -85,23 +96,26 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
 /// "2fc12fc1" => "zfs",
 /// "ff534d42" => "cifs",
 /// "53464846" => "wslfs",
-fn get_fs_type(fs_type: FsType) -> &'static str {
+fn get_fs_type(fs_type: u64) -> &'static str {
+    // Magic numbers for various filesystems
     match fs_type {
-        statfs::TMPFS_MAGIC => "TMPFS",
-        statfs::MSDOS_SUPER_MAGIC => "MSDOS",
-        // statfs::XFS_SUPER_MAGIC => "XFS",
-        statfs::NFS_SUPER_MAGIC => "NFS",
-        statfs::EXT4_SUPER_MAGIC => "EXT4",
-        statfs::ECRYPTFS_SUPER_MAGIC => "ecryptfs",
-        statfs::OVERLAYFS_SUPER_MAGIC => "overlayfs",
-        statfs::REISERFS_SUPER_MAGIC => "REISERFS",
+        0x01021994 => "TMPFS",
+        0x4d44 => "MSDOS",
+        0x6969 => "NFS",
+        0xEF53 => "EXT4",
+        0xf15f => "ecryptfs",
+        0x794c7630 => "overlayfs",
+        0x52654973 => "REISERFS",
+        // Additional common ones can be added here:
+        // 0x58465342 => "XFS",
+        // 0x9123683E => "BTRFS",
         _ => "UNKNOWN",
     }
 }
 
 pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
-    let stat1 = stat(disk1)?;
-    let stat2 = stat(disk2)?;
+    let stat1 = rustix::fs::stat(disk1)?;
+    let stat2 = rustix::fs::stat(disk2)?;
 
     Ok(stat1.st_dev == stat2.st_dev)
 }
@@ -165,19 +179,4 @@ fn read_stat(file_name: &str) -> std::io::Result<Vec<u64>> {
     }
 
     Ok(stats)
-}
-
-#[cfg(test)]
-mod test {
-    use super::get_drive_stats;
-    use tracing::debug;
-
-    #[ignore] // FIXME: failed in github actions
-    #[test]
-    fn test_stats() {
-        let major = 7;
-        let minor = 11;
-        let s = get_drive_stats(major, minor).unwrap();
-        debug!("Drive stats for major: {}, minor: {} - {:?}", major, minor, s);
-    }
 }
