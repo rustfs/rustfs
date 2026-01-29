@@ -561,7 +561,7 @@ impl Operation for DataUsageInfoHandler {
         let raw_free = get_total_usable_capacity_free(&sinfo.disks, &sinfo);
 
         // 🔧 Add a plausibility check (extra layer of protection)
-        const MAX_REASONABLE_CAPACITY: u64 = 10_000 * 1024 * 1024 * 1024 * 1024; // 10 PiB
+        const MAX_REASONABLE_CAPACITY: u64 = 100_000 * 1024 * 1024 * 1024 * 1024; // 100 PiB
         const MIN_REASONABLE_CAPACITY: u64 = 1024 * 1024 * 1024; // 1 GiB
 
         let total_u64 = raw_total as u64;
