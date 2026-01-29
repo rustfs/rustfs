@@ -32,6 +32,8 @@ pub struct LocalClient {
     guard_storage: Vec<Arc<RwLock<HashMap<LockId, FastLockGuard>>>>,
     /// Mask for fast shard index calculation (shard_count - 1)
     shard_mask: usize,
+    /// Optional lock manager (if None, uses global singleton)
+    manager: Option<Arc<GlobalLockManager>>,
 }
 
 impl LocalClient {
@@ -44,20 +46,32 @@ impl LocalClient {
     /// Shard count must be a power of 2 for efficient masking
     pub fn with_shard_count(shard_count: usize) -> Self {
         assert!(shard_count.is_power_of_two(), "Shard count must be power of 2");
-        
-        let guard_storage: Vec<Arc<RwLock<HashMap<LockId, FastLockGuard>>>> = (0..shard_count)
-            .map(|_| Arc::new(RwLock::new(HashMap::new())))
-            .collect();
+
+        let guard_storage: Vec<Arc<RwLock<HashMap<LockId, FastLockGuard>>>> =
+            (0..shard_count).map(|_| Arc::new(RwLock::new(HashMap::new()))).collect();
 
         Self {
             guard_storage,
             shard_mask: shard_count - 1,
+            manager: None,
         }
     }
 
-    /// Get the global lock manager
+    /// Create new local client with a specific lock manager
+    /// This allows simulating multi-node environments where each node has its own lock backend
+    pub fn with_manager(manager: Arc<GlobalLockManager>) -> Self {
+        Self {
+            guard_storage: (0..DEFAULT_GUARD_SHARD_COUNT)
+                .map(|_| Arc::new(RwLock::new(HashMap::new())))
+                .collect(),
+            shard_mask: DEFAULT_GUARD_SHARD_COUNT - 1,
+            manager: Some(manager),
+        }
+    }
+
+    /// Get the lock manager (injected manager if available, otherwise global singleton)
     pub fn get_lock_manager(&self) -> Arc<GlobalLockManager> {
-        crate::get_global_lock_manager()
+        self.manager.clone().unwrap_or_else(crate::get_global_lock_manager)
     }
 
     /// Get the shard index for a given lock ID

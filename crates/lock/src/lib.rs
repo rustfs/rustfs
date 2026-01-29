@@ -17,9 +17,9 @@
 // ============================================================================
 
 // Application Layer Modules
-pub mod namespace;
-pub mod local_lock;
 pub mod distributed_lock;
+pub mod local_lock;
+pub mod namespace;
 
 // Abstraction Layer Modules
 pub mod client;
@@ -39,6 +39,7 @@ pub mod types;
 pub use crate::{
     // Client interfaces
     client::{LockClient, local::LocalClient},
+    distributed_lock::DistributedLockGuard,
     // Error types
     error::{LockError, Result},
     // Fast Lock System exports
@@ -46,7 +47,6 @@ pub use crate::{
         BatchLockRequest, BatchLockResult, DisabledLockManager, FastLockGuard, FastObjectLockManager, LockManager, LockMode,
         LockResult, ObjectKey, ObjectLockInfo, ObjectLockRequest, metrics::AggregatedMetrics,
     },
-    distributed_lock::DistributedLockGuard,
     // Main components
     namespace::{NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper},
     // Core types
