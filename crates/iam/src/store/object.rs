@@ -32,7 +32,7 @@ use rustfs_ecstore::{
     store_api::{ObjectInfo, ObjectOptions},
 };
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
-use rustfs_utils::path::{SLASH_SEPARATOR_STR, path_join_buf};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::LazyLock;
 use std::{collections::HashMap, sync::Arc};
@@ -130,8 +130,14 @@ impl ObjectStore {
     }
 
     fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
-        let de = rustfs_crypto::decrypt_data(get_global_action_cred().unwrap_or_default().secret_key.as_bytes(), data)?;
-        Ok(de)
+        let cred = get_global_action_cred().unwrap_or_default();
+        match rustfs_crypto::decrypt_data(cred.secret_key.as_bytes(), data) {
+            Ok(decrypted) => Ok(decrypted),
+            Err(_) => {
+                warn!("Failed to decrypt IAM config data, treating as unencrypted");
+                Ok(data.to_vec())
+            }
+        }
     }
 
     fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
@@ -182,7 +188,7 @@ impl ObjectStore {
                     } else {
                         info.name
                     };
-                    let name = object_name.trim_start_matches(&prefix).trim_end_matches(SLASH_SEPARATOR_STR);
+                    let name = object_name.trim_start_matches(&prefix).trim_end_matches(SLASH_SEPARATOR);
                     let _ = sender
                         .send(StringOrErr {
                             item: Some(name.to_owned()),

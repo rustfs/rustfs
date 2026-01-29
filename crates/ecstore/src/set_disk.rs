@@ -85,7 +85,7 @@ use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX, 
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
-    path::{SLASH_SEPARATOR_STR, encode_dir_object, has_suffix, path_join_buf},
+    path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
 use rustfs_workers::workers::Workers;
 use s3s::header::X_AMZ_RESTORE;
@@ -2984,7 +2984,7 @@ impl SetDisks {
                                     if this_part_errs[index] != CHECK_PART_SUCCESS {
                                         info!(
                                             "reading part {}: index={}, part_errs={:?}, skipping",
-                                            part.number, index, this_part_errs[part_index]
+                                            part.number, index, this_part_errs[index]
                                         );
                                         readers.push(None);
                                         continue;
@@ -5284,7 +5284,7 @@ impl StorageAPI for SetDisks {
                 &upload_id_path,
                 fi.data_dir.map(|v| v.to_string()).unwrap_or_default().as_str(),
             ]),
-            SLASH_SEPARATOR_STR
+            SLASH_SEPARATOR
         );
 
         let mut part_numbers = match Self::list_parts(&online_disks, &part_path, read_quorum).await {
@@ -5422,7 +5422,7 @@ impl StorageAPI for SetDisks {
         let mut populated_upload_ids = HashSet::new();
 
         for upload_id in upload_ids.iter() {
-            let upload_id = upload_id.trim_end_matches(SLASH_SEPARATOR_STR).to_string();
+            let upload_id = upload_id.trim_end_matches(SLASH_SEPARATOR).to_string();
             if populated_upload_ids.contains(&upload_id) {
                 continue;
             }
@@ -5741,8 +5741,6 @@ impl StorageAPI for SetDisks {
                     rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct)
                 )));
             }
-
-            checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct);
         }
 
         for (i, part) in object_parts.iter().enumerate() {
@@ -5784,17 +5782,20 @@ impl StorageAPI for SetDisks {
             ..Default::default()
         };
 
+        // Build a lookup map for O(1) part resolution instead of O(n) find() in the loop
+        // This optimizes from O(n^2) to O(n) when processing many parts
+        use std::collections::HashMap;
+        let part_lookup: HashMap<usize, &rustfs_filemeta::ObjectPartInfo> =
+            curr_fi.parts.iter().map(|part| (part.number, part)).collect();
+
         for (i, p) in uploaded_parts.iter().enumerate() {
-            let has_part = curr_fi.parts.iter().find(|v| v.number == p.part_num);
-            if has_part.is_none() {
+            let Some(ext_part) = part_lookup.get(&p.part_num) else {
                 error!(
-                    "complete_multipart_upload has_part.is_none() {:?}, part_id={}, bucket={}, object={}",
-                    has_part, p.part_num, bucket, object
+                    "complete_multipart_upload part not found: part_id={}, bucket={}, object={}",
+                    p.part_num, bucket, object
                 );
                 return Err(Error::InvalidPart(p.part_num, "".to_owned(), p.etag.clone().unwrap_or_default()));
-            }
-
-            let ext_part = &curr_fi.parts[i];
+            };
             info!(target:"rustfs_ecstore::set_disk", part_number = p.part_num, part_size = ext_part.size, part_actual_size = ext_part.actual_size, "Completing multipart part");
 
             // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
@@ -6133,7 +6134,7 @@ impl StorageAPI for SetDisks {
             None
         };
 
-        if has_suffix(object, SLASH_SEPARATOR_STR) {
+        if has_suffix(object, SLASH_SEPARATOR) {
             let (result, err) = self.heal_object_dir_locked(bucket, object, opts.dry_run, opts.remove).await?;
             return Ok((result, err.map(|e| e.into())));
         }
@@ -6680,6 +6681,16 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
     ret
 }
 async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rustfs_madmin::StorageInfo {
+    // let mut disks = get_disks_info(disks, eps).await;
+    // disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
+    //
+    // rustfs_madmin::StorageInfo {
+    //     disks,
+    //     backend: rustfs_madmin::BackendInfo {
+    //         backend_type: rustfs_madmin::BackendByte::Erasure,
+    //         ..Default::default()
+    //     },
+    // }
     let mut disks = get_disks_info(disks, eps).await;
     disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
 

@@ -14,7 +14,7 @@
 
 //! Core type definitions for KMS operations
 
-use chrono::{DateTime, Utc};
+use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -37,7 +37,7 @@ pub struct DataKey {
     /// Associated metadata
     pub metadata: HashMap<String, String>,
     /// Key creation timestamp
-    pub created_at: DateTime<Utc>,
+    pub created_at: Zoned,
 }
 
 impl DataKey {
@@ -61,7 +61,7 @@ impl DataKey {
             ciphertext,
             key_spec,
             metadata: HashMap::new(),
-            created_at: Utc::now(),
+            created_at: Zoned::now(),
         }
     }
 
@@ -112,9 +112,9 @@ pub struct MasterKey {
     /// Associated metadata
     pub metadata: HashMap<String, String>,
     /// Key creation timestamp
-    pub created_at: DateTime<Utc>,
+    pub created_at: Zoned,
     /// Key last rotation timestamp
-    pub rotated_at: Option<DateTime<Utc>>,
+    pub rotated_at: Option<Zoned>,
     /// Key creator/owner
     pub created_by: Option<String>,
 }
@@ -139,7 +139,7 @@ impl MasterKey {
             status: KeyStatus::Active,
             description: None,
             metadata: HashMap::new(),
-            created_at: Utc::now(),
+            created_at: Zoned::now(),
             rotated_at: None,
             created_by,
         }
@@ -170,7 +170,7 @@ impl MasterKey {
             status: KeyStatus::Active,
             description,
             metadata: HashMap::new(),
-            created_at: Utc::now(),
+            created_at: Zoned::now(),
             rotated_at: None,
             created_by,
         }
@@ -219,9 +219,9 @@ pub struct KeyInfo {
     /// Key tags
     pub tags: HashMap<String, String>,
     /// Key creation timestamp
-    pub created_at: DateTime<Utc>,
+    pub created_at: Zoned,
     /// Key last rotation timestamp
-    pub rotated_at: Option<DateTime<Utc>>,
+    pub rotated_at: Option<Zoned>,
     /// Key creator
     pub created_by: Option<String>,
 }
@@ -612,7 +612,7 @@ pub struct EncryptionMetadata {
     /// Encryption context
     pub encryption_context: HashMap<String, String>,
     /// Timestamp when encrypted
-    pub encrypted_at: DateTime<Utc>,
+    pub encrypted_at: Zoned,
     /// Size of original data
     pub original_size: u64,
     /// Encrypted data key
@@ -697,9 +697,9 @@ pub struct KeyMetadata {
     /// Key description
     pub description: Option<String>,
     /// Key creation timestamp
-    pub creation_date: DateTime<Utc>,
+    pub creation_date: Zoned,
     /// Key deletion timestamp
-    pub deletion_date: Option<DateTime<Utc>>,
+    pub deletion_date: Option<Zoned>,
     /// Key origin
     pub origin: String,
     /// Key manager

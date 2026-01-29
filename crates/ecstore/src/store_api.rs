@@ -1349,10 +1349,7 @@ pub trait ObjectIO: Send + Sync + Debug + 'static {
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait StorageAPI: ObjectIO + Debug {
-    // NewNSLock TODO:
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper>;
-    // Shutdown TODO:
-    // NSScanner TODO:
 
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo;
     async fn storage_info(&self) -> rustfs_madmin::StorageInfo;

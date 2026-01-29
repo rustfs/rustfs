@@ -47,6 +47,10 @@ pub mod store_utils;
 pub mod client;
 pub mod event;
 pub mod event_notification;
+#[cfg(test)]
+mod pools_test;
+#[cfg(test)]
+mod store_test;
 pub mod tier;
 
 pub use global::new_object_layer_fn;
