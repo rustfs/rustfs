@@ -28,7 +28,7 @@ use rustfs_common::data_usage::{
 };
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
 };
@@ -223,6 +223,7 @@ pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskU
     let mut aggregated = DataUsageInfo::default();
     let mut latest_update: Option<SystemTime> = None;
     let mut statuses: Vec<DiskUsageStatus> = Vec::new();
+    let mut processed_disks: HashSet<String> = HashSet::new();
 
     for (pool_idx, pool) in store.pools.iter().enumerate() {
         for set_disks in pool.disk_set.iter() {
@@ -246,6 +247,13 @@ pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskU
                 };
 
                 let root = disk.path();
+                let disk_key = format!("{}|{}", disk.endpoint(), root.display());
+
+                // Skip if we've already processed this physical disk
+                if !processed_disks.insert(disk_key.clone()) {
+                    continue;
+                }
+
                 let mut status = DiskUsageStatus {
                     disk_id: disk_id.clone(),
                     pool_index: Some(pool_idx),

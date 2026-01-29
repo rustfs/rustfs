@@ -97,9 +97,6 @@ rustls = { workspace = true }
 subtle = { workspace = true }
 rustls-pemfile = { workspace = true }
 aes-gcm = { workspace = true }
-
-# Time and Date
-chrono = { workspace = true }
 jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 
