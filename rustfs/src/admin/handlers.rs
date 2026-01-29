@@ -517,30 +517,10 @@ impl Operation for DataUsageInfoHandler {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let (disk_statuses, mut info) = match aggregate_local_snapshots(store.clone()).await {
-            Ok((statuses, usage)) => (statuses, usage),
-            Err(err) => {
-                warn!("aggregate_local_snapshots failed: {:?}", err);
-                (
-                    Vec::new(),
-                    load_data_usage_from_backend(store.clone()).await.map_err(|e| {
-                        error!("load_data_usage_from_backend failed {:?}", e);
-                        s3_error!(InternalError, "load_data_usage_from_backend failed")
-                    })?,
-                )
-            }
-        };
-
-        let snapshots_available = disk_statuses.iter().any(|status| status.snapshot_exists);
-        if !snapshots_available {
-            if let Ok(fallback) = load_data_usage_from_backend(store.clone()).await {
-                let mut fallback_info = fallback;
-                fallback_info.disk_usage_status = disk_statuses.clone();
-                info = fallback_info;
-            }
-        } else {
-            info.disk_usage_status = disk_statuses.clone();
-        }
+        let mut info = load_data_usage_from_backend(store.clone()).await.map_err(|e| {
+            error!("load_data_usage_from_backend failed {:?}", e);
+            s3_error!(InternalError, "load_data_usage_from_backend failed")
+        })?;
 
         let last_update_age = info.last_update.and_then(|ts| ts.elapsed().ok());
         let data_missing = info.objects_total_count == 0 && info.buckets_count == 0;
@@ -575,8 +555,6 @@ impl Operation for DataUsageInfoHandler {
                 }
             });
         }
-
-        info.disk_usage_status = disk_statuses;
 
         let sinfo = store.storage_info().await;
 
