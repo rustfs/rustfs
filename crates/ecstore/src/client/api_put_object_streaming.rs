@@ -479,9 +479,13 @@ impl TransitionClient {
 
         let resp = self.execute_method(http::Method::PUT, &mut req_metadata).await?;
 
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
         if resp.status() != StatusCode::OK {
             return Err(std::io::Error::other(http_resp_to_error_response(
-                &resp,
+                resp_status,
+                &h,
                 vec![],
                 bucket_name,
                 object_name,

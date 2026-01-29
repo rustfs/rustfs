@@ -99,7 +99,17 @@
             "name": "Debug executable target/debug/rustfs",
             "type":  "lldb",
             "request": "launch",
-            "program": "${workspaceFolder}/target/debug/rustfs",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin",
+                    "rustfs",
+                    "-j",
+                    "1",
+                    "--profile",
+                    "dev"
+                ]
+            },
             "args": [],
             "cwd": "${workspaceFolder}",
             //"stopAtEntry": false,
@@ -107,7 +117,7 @@
             "env": {
                 "RUSTFS_ACCESS_KEY": "rustfsadmin",
                 "RUSTFS_SECRET_KEY": "rustfsadmin",
-                "RUSTFS_VOLUMES": "./target/volume/test{1...4}",
+                //"RUSTFS_VOLUMES": "./target/volume/test{1...4}",
                 "RUSTFS_ADDRESS": ":9000",
                 "RUSTFS_CONSOLE_ENABLE": "true",
                 // "RUSTFS_OBS_TRACE_ENDPOINT": "http://127.0.0.1:4318/v1/traces", // jeager otlp http endpoint
@@ -116,10 +126,30 @@
                 // "RUSTFS_COMPRESS_ENABLE": "true",
                 "RUSTFS_CONSOLE_ADDRESS": "127.0.0.1:9001",
                 "RUSTFS_OBS_LOG_DIRECTORY": "./target/logs",
+                "RUST_LOG":"rustfs=debug,ecstore=debug,s3s=debug,iam=debug",
             },
             "sourceLanguages": [
                 "rust"
             ],
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug test_lifecycle_transition_basic",
+            "cargo": {
+                "args": [
+                    "test",
+                    "-p",
+                    "rustfs-scanner",
+                    "--test",
+                    "lifecycle_integration_test",
+                    "serial_tests::test_lifecycle_transition_basic",
+                    "-j",
+                    "1"
+                ]
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
         },
         {
             "name": "Debug executable target/debug/test",

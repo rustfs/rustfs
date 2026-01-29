@@ -18,7 +18,6 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use std::collections::HashMap;
 use time::OffsetDateTime;
@@ -28,9 +27,12 @@ use crate::client::{
     api_get_object_acl::AccessControlPolicy,
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
 };
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
+use hyper::body::Incoming;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
-use s3s::Body;
 use s3s::header::{X_AMZ_MAX_PARTS, X_AMZ_OBJECT_ATTRIBUTES, X_AMZ_PART_NUMBER_MARKER, X_AMZ_VERSION_ID};
 
 pub struct ObjectAttributesOptions {
@@ -130,19 +132,12 @@ struct ObjectAttributePart {
 }
 
 impl ObjectAttributes {
-    pub async fn parse_response(&mut self, resp: &mut http::Response<Body>) -> Result<(), std::io::Error> {
-        let h = resp.headers();
+    pub async fn parse_response(&mut self, h: &HeaderMap, body_vec: Vec<u8>) -> Result<(), std::io::Error> {
         let mod_time = OffsetDateTime::parse(h.get("Last-Modified").unwrap().to_str().unwrap(), ISO8601_DATEFORMAT).unwrap(); //RFC7231Time
         self.last_modified = mod_time;
         self.version_id = h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap().to_string();
 
-        let b = resp
-            .body_mut()
-            .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
-            .await
-            .unwrap()
-            .to_vec();
-        let mut response = match quick_xml::de::from_str::<ObjectAttributesResponse>(&String::from_utf8(b).unwrap()) {
+        let mut response = match quick_xml::de::from_str::<ObjectAttributesResponse>(&String::from_utf8(body_vec).unwrap()) {
             Ok(result) => result,
             Err(err) => {
                 return Err(std::io::Error::other(err.to_string()));
@@ -213,7 +208,8 @@ impl TransitionClient {
             )
             .await?;
 
-        let h = resp.headers();
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
         let has_etag = h.get("ETag").unwrap().to_str().unwrap();
         if !has_etag.is_empty() {
             return Err(std::io::Error::other(
@@ -221,14 +217,17 @@ impl TransitionClient {
             ));
         }
 
-        if resp.status() != http::StatusCode::OK {
-            let b = resp
-                .body_mut()
-                .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
-                .await
-                .unwrap()
-                .to_vec();
-            let err_body = String::from_utf8(b).unwrap();
+        let mut body_vec = Vec::new();
+        let mut body = resp.into_body();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            if let Some(data) = frame.data_ref() {
+                body_vec.extend_from_slice(data);
+            }
+        }
+
+        if resp_status != http::StatusCode::OK {
+            let err_body = String::from_utf8(body_vec).unwrap();
             let mut er = match quick_xml::de::from_str::<AccessControlPolicy>(&err_body) {
                 Ok(result) => result,
                 Err(err) => {
@@ -240,7 +239,7 @@ impl TransitionClient {
         }
 
         let mut oa = ObjectAttributes::new();
-        oa.parse_response(&mut resp).await?;
+        oa.parse_response(&h, body_vec).await?;
 
         Ok(oa)
     }

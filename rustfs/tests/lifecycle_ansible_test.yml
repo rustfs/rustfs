@@ -1,0 +1,15 @@
+---
+- hosts: webservers
+  remote_user: leafcolor
+  vars:
+    ansible_ssh_pass: "123456"
+  tasks:
+    - name: Configure S3 bucket lifecycle
+      community.aws.s3_lifecycle:
+        endpoint_url: "http://www.example.com:9000"
+        access_key: "rustfsadmin"
+        secret_key: "rustfsadmin"
+        name: "mblock"
+        rule_id: "rule1"
+        state: present
+        expiration_days: "1"

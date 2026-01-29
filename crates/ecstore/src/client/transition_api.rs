@@ -20,6 +20,7 @@
 
 use crate::client::bucket_cache::BucketLocationCache;
 use crate::client::{
+    api_error_response::ErrorResponse,
     api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
     api_get_options::GetObjectOptions,
     api_put_object::PutObjectOptions,
@@ -32,13 +33,16 @@ use crate::client::{
     credentials::{CredContext, Credentials, SignatureType, Static},
 };
 use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
-use bytes::Bytes;
 use futures::{Future, StreamExt};
 use http::{HeaderMap, HeaderName};
 use http::{
     HeaderValue, Response, StatusCode,
     request::{Builder, Request},
 };
+use http_body::Body;
+use http_body_util::BodyExt;
+use hyper::body::Bytes;
+use hyper::body::Incoming;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use md5::Digest;
@@ -54,8 +58,8 @@ use rustfs_utils::{
     },
 };
 use s3s::S3ErrorCode;
+use s3s::dto::Owner;
 use s3s::dto::ReplicationStatus;
-use s3s::{Body, dto::Owner};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::Cursor;
@@ -95,7 +99,7 @@ pub struct TransitionClient {
     pub creds_provider: Arc<Mutex<Credentials<Static>>>,
     pub override_signer_type: SignatureType,
     pub secure: bool,
-    pub http_client: Client<HttpsConnector<HttpConnector>, Body>,
+    pub http_client: Client<HttpsConnector<HttpConnector>, s3s::Body>,
     pub bucket_loc_cache: Arc<Mutex<BucketLocationCache>>,
     pub is_trace_enabled: Arc<Mutex<bool>>,
     pub trace_errors_only: Arc<Mutex<bool>>,
@@ -271,7 +275,7 @@ impl TransitionClient {
         todo!();
     }
 
-    fn dump_http(&self, req: &http::Request<Body>, resp: &http::Response<Body>) -> Result<(), std::io::Error> {
+    fn dump_http(&self, req: &http::Request<s3s::Body>, resp: &http::Response<Incoming>) -> Result<(), std::io::Error> {
         let mut resp_trace: Vec<u8>;
 
         //info!("{}{}", self.trace_output, "---------BEGIN-HTTP---------");
@@ -280,7 +284,7 @@ impl TransitionClient {
         Ok(())
     }
 
-    pub async fn doit(&self, req: http::Request<Body>) -> Result<http::Response<Body>, std::io::Error> {
+    pub async fn doit(&self, req: http::Request<s3s::Body>) -> Result<http::Response<Incoming>, std::io::Error> {
         let req_method;
         let req_uri;
         let req_headers;
@@ -295,9 +299,7 @@ impl TransitionClient {
             debug!("endpoint_url: {}", self.endpoint_url.as_str().to_string());
             resp = http_client.request(req);
         }
-        let resp = resp
-            .await /*.map_err(Into::into)*/
-            .map(|res| res.map(Body::from));
+        let resp = resp.await;
         debug!("http_client url: {} {}", req_method, req_uri);
         debug!("http_client headers: {:?}", req_headers);
         if let Err(err) = resp {
@@ -305,7 +307,7 @@ impl TransitionClient {
             return Err(std::io::Error::other(err));
         }
 
-        let mut resp = resp.unwrap();
+        let resp = resp.unwrap();
         debug!("http_resp: {:?}", resp);
 
         //let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
@@ -314,23 +316,27 @@ impl TransitionClient {
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
         if resp.status() != StatusCode::OK {
             //self.dump_http(&cloned_req, &resp)?;
-            let b = resp
-                .body_mut()
-                .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
-                .await
-                .unwrap()
-                .to_vec();
-            warn!("err_body: {}", String::from_utf8(b).unwrap());
+            let mut body_vec = Vec::new();
+            let mut body = resp.into_body();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                if let Some(data) = frame.data_ref() {
+                    body_vec.extend_from_slice(data);
+                }
+            }
+            let body_str = String::from_utf8_lossy(&body_vec);
+            warn!("err_body: {}", body_str);
+            Err(std::io::Error::other(format!("http_client call error: {}", body_str)))
+        } else {
+            Ok(resp)
         }
-
-        Ok(resp)
     }
 
     pub async fn execute_method(
         &self,
         method: http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<http::Response<Body>, std::io::Error> {
+    ) -> Result<http::Response<Incoming>, std::io::Error> {
         if self.is_offline() {
             let mut s = self.endpoint_url.to_string();
             s.push_str(" is offline.");
@@ -340,7 +346,7 @@ impl TransitionClient {
         let retryable: bool;
         //let mut body_seeker: BufferReader;
         let mut req_retry = self.max_retries;
-        let mut resp: http::Response<Body>;
+        let mut resp: http::Response<Incoming>;
 
         //if metadata.content_body != nil {
         //body_seeker = BufferReader::new(metadata.content_body.read_all().await?);
@@ -362,13 +368,19 @@ impl TransitionClient {
                 }
             }
 
-            let b = resp
-                .body_mut()
-                .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
-                .await
-                .unwrap()
-                .to_vec();
-            let mut err_response = http_resp_to_error_response(&resp, b.clone(), &metadata.bucket_name, &metadata.object_name);
+            let resp_status = resp.status();
+            let h = resp.headers().clone();
+
+            let mut body_vec = Vec::new();
+            let mut body = resp.into_body();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                if let Some(data) = frame.data_ref() {
+                    body_vec.extend_from_slice(data);
+                }
+            }
+            let mut err_response =
+                http_resp_to_error_response(resp_status, &h, body_vec.clone(), &metadata.bucket_name, &metadata.object_name);
             err_response.message = format!("remote tier error: {}", err_response.message);
 
             if self.region == "" {
@@ -404,7 +416,7 @@ impl TransitionClient {
                 continue;
             }
 
-            if is_http_status_retryable(&resp.status()) {
+            if is_http_status_retryable(&resp_status) {
                 continue;
             }
 
@@ -418,7 +430,7 @@ impl TransitionClient {
         &self,
         method: &http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<http::Request<Body>, std::io::Error> {
+    ) -> Result<http::Request<s3s::Body>, std::io::Error> {
         let mut location = metadata.bucket_location.clone();
         if location == "" && metadata.bucket_name != "" {
             location = self.get_bucket_location(&metadata.bucket_name).await?;
@@ -438,7 +450,7 @@ impl TransitionClient {
         let Ok(mut req) = Request::builder()
             .method(method)
             .uri(target_url.to_string())
-            .body(Body::empty())
+            .body(s3s::Body::empty())
         else {
             return Err(std::io::Error::other("create request error"));
         };
@@ -550,10 +562,10 @@ impl TransitionClient {
         if metadata.content_length > 0 {
             match &mut metadata.content_body {
                 ReaderImpl::Body(content_body) => {
-                    *req.body_mut() = Body::from(content_body.clone());
+                    *req.body_mut() = s3s::Body::from(content_body.clone());
                 }
                 ReaderImpl::ObjectBody(content_body) => {
-                    *req.body_mut() = Body::from(content_body.read_all().await?);
+                    *req.body_mut() = s3s::Body::from(content_body.read_all().await?);
                 }
             }
         }
@@ -561,7 +573,7 @@ impl TransitionClient {
         Ok(req)
     }
 
-    pub fn set_user_agent(&self, req: &mut Request<Body>) {
+    pub fn set_user_agent(&self, req: &mut Request<s3s::Body>) {
         let headers = req.headers_mut();
         headers.insert("User-Agent", C_USER_AGENT.parse().expect("err"));
     }
@@ -999,25 +1011,217 @@ impl Default for UploadInfo {
     }
 }
 
+/// Convert HTTP headers to ObjectInfo struct
+/// This function parses various S3 response headers to construct an ObjectInfo struct
+/// containing metadata about an S3 object.
 pub fn to_object_info(bucket_name: &str, object_name: &str, h: &HeaderMap) -> Result<ObjectInfo, std::io::Error> {
-    todo!()
+    // Helper function to get header value as string
+    let get_header = |name: &str| -> String { h.get(name).and_then(|val| val.to_str().ok()).unwrap_or("").to_string() };
+
+    // Get and process the ETag
+    let etag = {
+        let etag_raw = get_header("ETag");
+        // Remove surrounding quotes if present (trimming ETag)
+        let trimmed = etag_raw.trim_start_matches('"').trim_end_matches('"');
+        Some(trimmed.to_string())
+    };
+
+    // Parse content length if it exists
+    let size = {
+        let content_length_str = get_header("Content-Length");
+        if !content_length_str.is_empty() {
+            content_length_str
+                .parse::<i64>()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Content-Length is not an integer"))?
+        } else {
+            -1
+        }
+    };
+
+    // Parse Last-Modified time
+    let mod_time = {
+        let last_modified_str = get_header("Last-Modified");
+        if !last_modified_str.is_empty() {
+            // Parse HTTP date format (RFC 7231)
+            // Using time crate to parse HTTP dates
+            let parsed_time = OffsetDateTime::parse(&last_modified_str, &time::format_description::well_known::Rfc2822)
+                .or_else(|_| OffsetDateTime::parse(&last_modified_str, &time::format_description::well_known::Rfc3339))
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Last-Modified time format is invalid"))?;
+            Some(parsed_time)
+        } else {
+            Some(OffsetDateTime::now_utc())
+        }
+    };
+
+    // Get content type
+    let content_type = {
+        let content_type_raw = get_header("Content-Type");
+        let content_type_trimmed = content_type_raw.trim();
+        if content_type_trimmed.is_empty() {
+            Some("application/octet-stream".to_string())
+        } else {
+            Some(content_type_trimmed.to_string())
+        }
+    };
+
+    // Parse Expires time
+    let expiration = {
+        let expiry_str = get_header("Expires");
+        if !expiry_str.is_empty() {
+            OffsetDateTime::parse(&expiry_str, &time::format_description::well_known::Rfc2822)
+                .or_else(|_| OffsetDateTime::parse(&expiry_str, &time::format_description::well_known::Rfc3339))
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "'Expires' is not in supported format"))?
+        } else {
+            OffsetDateTime::now_utc()
+        }
+    };
+
+    // Extract user metadata (headers prefixed with "X-Amz-Meta-")
+    let user_metadata = {
+        let mut meta = HashMap::new();
+        for (name, value) in h.iter() {
+            let header_name = name.as_str().to_lowercase();
+            if header_name.starts_with("x-amz-meta-") {
+                let key = header_name.strip_prefix("x-amz-meta-").unwrap().to_string();
+                if let Ok(value_str) = value.to_str() {
+                    meta.insert(key, value_str.to_string());
+                }
+            }
+        }
+        meta
+    };
+
+    let user_tag = {
+        let user_tag_str = get_header("X-Amz-Tagging");
+        user_tag_str
+    };
+
+    // Extract user tags count
+    let user_tag_count = {
+        let count_str = get_header("x-amz-tagging-count");
+        if !count_str.is_empty() {
+            count_str
+                .parse::<usize>()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "x-amz-tagging-count is not an integer"))?
+        } else {
+            0
+        }
+    };
+
+    // Handle restore info
+    let restore = {
+        let restore_hdr = get_header("x-amz-restore");
+        if !restore_hdr.is_empty() {
+            // Simplified restore header parsing - in real implementation, this would parse the specific format
+            // "ongoing-request=\"true\"" or "ongoing-request=\"false\", expiry-date=\"..."
+            let ongoing_restore = restore_hdr.contains("ongoing-request=\"true\"");
+            RestoreInfo {
+                ongoing_restore,
+                expiry_time: if ongoing_restore {
+                    OffsetDateTime::now_utc()
+                } else {
+                    // Try to extract expiry date from the header
+                    // This is simplified - real parsing would be more complex
+                    OffsetDateTime::now_utc()
+                },
+            }
+        } else {
+            RestoreInfo::default()
+        }
+    };
+
+    // Extract version ID
+    let version_id = {
+        let version_id_str = get_header("x-amz-version-id");
+        if !version_id_str.is_empty() {
+            Some(Uuid::parse_str(&version_id_str).unwrap_or_else(|_| Uuid::nil()))
+        } else {
+            None
+        }
+    };
+
+    // Check if it's a delete marker
+    let is_delete_marker = get_header("x-amz-delete-marker") == "true";
+
+    // Get replication status
+    let replication_status = {
+        let status_str = get_header("x-amz-replication-status");
+        ReplicationStatus::from_static(match status_str.as_str() {
+            "COMPLETE" => ReplicationStatus::COMPLETE,
+            "PENDING" => ReplicationStatus::PENDING,
+            "FAILED" => ReplicationStatus::FAILED,
+            "REPLICA" => ReplicationStatus::REPLICA,
+            _ => ReplicationStatus::PENDING,
+        })
+    };
+
+    // Extract expiration rule ID and time (simplified)
+    let (expiration_time, expiration_rule_id) = {
+        // In a real implementation, this would parse the x-amz-expiration header
+        // which typically has format: "expiry-date="Fri, 11 Dec 2020 00:00:00 GMT", rule-id="myrule""
+        let exp_header = get_header("x-amz-expiration");
+        if !exp_header.is_empty() {
+            // Simplified parsing - real implementation would be more thorough
+            (OffsetDateTime::now_utc(), exp_header) // Placeholder
+        } else {
+            (OffsetDateTime::now_utc(), "".to_string())
+        }
+    };
+
+    // Extract checksums
+    let checksum_crc32 = get_header("x-amz-checksum-crc32");
+    let checksum_crc32c = get_header("x-amz-checksum-crc32c");
+    let checksum_sha1 = get_header("x-amz-checksum-sha1");
+    let checksum_sha256 = get_header("x-amz-checksum-sha256");
+    let checksum_crc64nvme = get_header("x-amz-checksum-crc64nvme");
+    let checksum_mode = get_header("x-amz-checksum-mode");
+
+    // Build and return the ObjectInfo struct
+    Ok(ObjectInfo {
+        etag,
+        name: object_name.to_string(),
+        mod_time,
+        size,
+        content_type,
+        metadata: h.clone(),
+        user_metadata,
+        user_tags: "".to_string(), // Tags would need separate parsing
+        user_tag_count,
+        owner: Owner::default(),
+        storage_class: get_header("x-amz-storage-class"),
+        is_latest: true, // Would be determined by versioning settings
+        is_delete_marker,
+        version_id,
+        replication_status,
+        replication_ready: false, // Would be computed based on status
+        expiration: expiration_time,
+        expiration_rule_id,
+        num_versions: 1, // Would be determined by versioning
+        restore,
+        checksum_crc32,
+        checksum_crc32c,
+        checksum_sha1,
+        checksum_sha256,
+        checksum_crc64nvme,
+        checksum_mode,
+    })
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 //#[derive(Clone)]
 pub struct SendRequest {
-    inner: hyper::client::conn::http1::SendRequest<Body>,
+    inner: hyper::client::conn::http1::SendRequest<s3s::Body>,
 }
 
-impl From<hyper::client::conn::http1::SendRequest<Body>> for SendRequest {
-    fn from(inner: hyper::client::conn::http1::SendRequest<Body>) -> Self {
+impl From<hyper::client::conn::http1::SendRequest<s3s::Body>> for SendRequest {
+    fn from(inner: hyper::client::conn::http1::SendRequest<s3s::Body>) -> Self {
         Self { inner }
     }
 }
 
-impl tower::Service<Request<Body>> for SendRequest {
-    type Response = Response<Body>;
+impl tower::Service<Request<s3s::Body>> for SendRequest {
+    type Response = Response<Incoming>;
     type Error = std::io::Error;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -1025,13 +1229,13 @@ impl tower::Service<Request<Body>> for SendRequest {
         self.inner.poll_ready(cx).map_err(std::io::Error::other)
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&mut self, req: Request<s3s::Body>) -> Self::Future {
         //let req = hyper::Request::builder().uri("/").body(http_body_util::Empty::<Bytes>::new()).unwrap();
         //let req = hyper::Request::builder().uri("/").body(Body::empty()).unwrap();
 
         let fut = self.inner.send_request(req);
 
-        Box::pin(async move { fut.await.map_err(std::io::Error::other).map(|res| res.map(Body::from)) })
+        Box::pin(async move { fut.await.map_err(std::io::Error::other) })
     }
 }
 

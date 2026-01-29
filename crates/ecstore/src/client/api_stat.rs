@@ -18,8 +18,10 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
 use std::{collections::HashMap, str::FromStr};
 use tokio::io::BufReader;
@@ -66,10 +68,20 @@ impl TransitionClient {
                 return Ok(false);
             }
 
-            let b = resp.body().bytes().expect("err").to_vec();
-            let resperr = http_resp_to_error_response(&resp, b, bucket_name, "");
+            let resp_status = resp.status();
+            let h = resp.headers().clone();
 
-            warn!("bucket exists, resp: {:?}, resperr: {:?}", resp, resperr);
+            let mut body_vec = Vec::new();
+            let mut body = resp.into_body();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                if let Some(data) = frame.data_ref() {
+                    body_vec.extend_from_slice(data);
+                }
+            }
+            let resperr = http_resp_to_error_response(resp_status, &h, body_vec, bucket_name, "");
+
+            warn!("bucket exists, resperr: {:?}", resperr);
             /*if to_error_response(resperr).code == "NoSuchBucket" {
                 return Ok(false);
             }
@@ -108,10 +120,20 @@ impl TransitionClient {
 
         match resp {
             Ok(resp) => {
-                let b = resp.body().bytes().expect("get bucket versioning err").to_vec();
-                let resperr = http_resp_to_error_response(&resp, b, bucket_name, "");
+                let resp_status = resp.status();
+                let h = resp.headers().clone();
 
-                warn!("get bucket versioning, resp: {:?}, resperr: {:?}", resp, resperr);
+                let mut body_vec = Vec::new();
+                let mut body = resp.into_body();
+                while let Some(frame) = body.frame().await {
+                    let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    if let Some(data) = frame.data_ref() {
+                        body_vec.extend_from_slice(data);
+                    }
+                }
+                let resperr = http_resp_to_error_response(resp_status, &h, body_vec, bucket_name, "");
+
+                warn!("get bucket versioning, resperr: {:?}", resperr);
 
                 Ok(VersioningConfiguration::default())
             }
