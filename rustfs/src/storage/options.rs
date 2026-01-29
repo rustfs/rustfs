@@ -743,6 +743,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_ops_with_null_version_id() {
+        let headers = create_test_headers();
+        let result = get_opts("test-bucket", "test-object", Some("null".to_string()), None, &headers).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+        let result = get_opts("test-bucket", "test-object", Some("NULL".to_string()), None, &headers).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+    }
+
+    #[tokio::test]
     async fn test_get_opts_basic() {
         let headers = create_test_headers();
 
