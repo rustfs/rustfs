@@ -126,7 +126,8 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
 }
 
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
-/// Defaults to 30 seconds if not set or invalid
+/// Defaults to 5 seconds if not set or invalid
+/// For distributed environments with multiple nodes, a longer timeout may be needed
 fn get_lock_acquire_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
 }

@@ -15,9 +15,9 @@
 use crate::{
     ObjectKey,
     client::LockClient,
+    distributed_lock::{DistributedLock, DistributedLockGuard},
     error::Result,
     fast_lock::FastLockGuard,
-    distributed_lock::{DistributedLock, DistributedLockGuard},
     local_lock::LocalLock,
     types::{LockId, LockRequest},
 };
@@ -217,19 +217,34 @@ impl NamespaceLock {
 
     /// Acquire write lock (exclusive lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
-    pub async fn get_write_lock(&self, resource: ObjectKey, owner: &str, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+    pub async fn get_write_lock(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+    ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
         let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
         let resource_str = format!("{}", resource);
         match self.lock_guard(resource, owner, timeout, ttl).await {
             Ok(Some(guard)) => Ok(guard),
-            Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
+            Ok(None) => {
+                // None can mean timeout or other failure - check if it's a quorum error
+                // For distributed locks, quorum errors are already converted to LockError::QuorumNotReached
+                // So if we get None here, it's likely a timeout
+                Err(crate::error::LockError::timeout(resource_str, timeout))
+            }
             Err(e) => Err(e),
         }
     }
 
     /// Acquire read lock (shared lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
-    pub async fn get_read_lock(&self, resource: ObjectKey, owner: &str, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+    pub async fn get_read_lock(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+    ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
         let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
         let resource_str = format!("{}", resource);
         match self.rlock_guard(resource, owner, timeout, ttl).await {
@@ -253,20 +268,12 @@ impl NamespaceLock {
             Self::Distributed(lock) => {
                 // Check client status - parallelize async calls for better performance
                 let clients = lock.clients();
-                let client_checks: Vec<_> = clients
-                    .iter()
-                    .flatten()
-                    .map(|client| client.is_online())
-                    .collect();
-                
+                let client_checks: Vec<_> = clients.iter().flatten().map(|client| client.is_online()).collect();
+
                 let results = futures::future::join_all(client_checks).await;
                 let connected_clients = results.iter().filter(|&&online| online).count();
 
-                let quorum = if clients.len() > 1 {
-                    (clients.len() / 2) + 1
-                } else {
-                    1
-                };
+                let quorum = if clients.len() > 1 { (clients.len() / 2) + 1 } else { 1 };
 
                 health.status = if connected_clients >= quorum {
                     crate::types::HealthStatus::Healthy
@@ -294,15 +301,10 @@ impl NamespaceLock {
         match self {
             Self::Distributed(lock) => {
                 // Parallelize stats collection for better performance
-                let stats_futures: Vec<_> = lock
-                    .clients()
-                    .iter()
-                    .flatten()
-                    .map(|client| client.get_stats())
-                    .collect();
-                
+                let stats_futures: Vec<_> = lock.clients().iter().flatten().map(|client| client.get_stats()).collect();
+
                 let results = futures::future::join_all(stats_futures).await;
-                
+
                 for result in results {
                     match result {
                         Ok(client_stats) => {

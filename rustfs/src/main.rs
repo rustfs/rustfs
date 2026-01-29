@@ -183,6 +183,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Initialize the local disk
     init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
+    init_lock_clients(endpoint_pools.clone()).await.map_err(Error::other)?;
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(

@@ -21,6 +21,7 @@ use crate::{
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tracing::warn;
 use uuid::Uuid;
 
 /// Generate a new aggregate lock ID for multiple client locks
@@ -227,7 +228,27 @@ impl DistributedLock {
 
             Ok(Some(DistributedLockGuard::new(aggregate_lock_id, individual_locks)))
         } else {
-            Ok(None)
+            // Check if it's a timeout or quorum failure
+            if let Some(error_msg) = &resp.error {
+                warn!("acquire_lock_quorum error: {}", error_msg);
+                if error_msg.contains("quorum") {
+                    // This is a quorum failure - return appropriate error
+                    // Extract achieved count from error message or use individual_locks.len()
+                    let achieved = individual_locks.len();
+                    Err(LockError::QuorumNotReached {
+                        required: self.quorum,
+                        achieved,
+                    })
+                } else if error_msg.contains("timeout") || resp.wait_time >= request.acquire_timeout {
+                    // This is a timeout - return None so caller can convert to timeout error
+                    Ok(None)
+                } else {
+                    // Other failure - return None for backward compatibility
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
         }
     }
 

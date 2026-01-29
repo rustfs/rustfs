@@ -13,10 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::disk::endpoint::Endpoint;
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
-use crate::rpc::RemoteClient;
 use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::{
     disk::{
@@ -27,7 +25,7 @@ use crate::{
     },
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
-    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
+    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
@@ -45,7 +43,7 @@ use rustfs_common::{
 };
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
-use rustfs_lock::client::{LockClient, local::LocalClient};
+use rustfs_lock::client::LockClient;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use std::{collections::HashMap, sync::Arc};
@@ -82,40 +80,6 @@ impl Drop for Sets {
     }
 }
 
-/// create unique lock clients for the endpoints
-pub fn create_unique_clients(endpoints: &[Endpoint]) -> HashMap<String, Arc<dyn LockClient>> {
-    let mut unique_endpoints: HashMap<String, &Endpoint> = HashMap::new();
-
-    for endpoint in endpoints {
-        unique_endpoints.insert(endpoint.host_port(), endpoint);
-    }
-
-    let mut clients = HashMap::new();
-    let mut first_local_client_set = false;
-
-    for (key, endpoint) in unique_endpoints {
-        if endpoint.is_local {
-            let local_client = Arc::new(LocalClient::new()) as Arc<dyn LockClient>;
-
-            // Store the first LocalClient globally for use by other modules
-            if !first_local_client_set {
-                if let Err(e) = crate::global::set_global_lock_client(local_client.clone()) {
-                    // If already set, ignore the error (another thread may have set it)
-                    warn!("set_global_lock_client error: {:?}", e);
-                } else {
-                    first_local_client_set = true;
-                }
-            }
-
-            clients.insert(key, local_client);
-        } else {
-            clients.insert(key, Arc::new(RemoteClient::new(endpoint.url.to_string())) as Arc<dyn LockClient>);
-        }
-    }
-
-    clients
-}
-
 impl Sets {
     #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, parity_count))]
     pub async fn new(
@@ -128,9 +92,10 @@ impl Sets {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
-        let lock_clients = create_unique_clients(endpoints.endpoints.as_ref());
-
         let mut disk_set = Vec::with_capacity(set_count);
+
+        // Get lock clients from global storage
+        let lock_clients = get_global_lock_clients();
 
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
@@ -142,8 +107,12 @@ impl Sets {
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
 
-                if let Some(lock_client) = lock_clients.get(&endpoint.host_port()) {
-                    set_lock_clients.push(Some(lock_client.clone()));
+                if let Some(lock_clients_map) = lock_clients {
+                    if let Some(lock_client) = lock_clients_map.get(&endpoint.host_port()) {
+                        set_lock_clients.push(Some(lock_client.clone()));
+                    } else {
+                        set_lock_clients.push(None);
+                    }
                 } else {
                     set_lock_clients.push(None);
                 }
