@@ -580,7 +580,7 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
             None => String::default(),
         };
         let now = OffsetDateTime::now_utc();
-        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set". Consistent with minio
+        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set".
         eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
         eval_metadata.insert(
             format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
