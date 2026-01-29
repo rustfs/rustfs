@@ -110,9 +110,10 @@ impl Sets {
                 if let Some(lock_clients_map) = lock_clients {
                     let host_port = endpoint.host_port();
                     if let Some(lock_client) = lock_clients_map.get(&host_port)
-                        && !set_lock_clients.contains_key(&host_port) {
-                            set_lock_clients.insert(host_port, lock_client.clone());
-                        }
+                        && !set_lock_clients.contains_key(&host_port)
+                    {
+                        set_lock_clients.insert(host_port, lock_client.clone());
+                    }
                 }
 
                 set_endpoints.push(endpoint);
