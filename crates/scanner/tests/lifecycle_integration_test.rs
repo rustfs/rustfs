@@ -262,7 +262,7 @@ async fn create_test_tier(server: u32) {
                 access_key: "minioadmin".to_string(),
                 secret_key: "minioadmin".to_string(),
                 bucket: "hello".to_string(),
-                endpoint: "http://39.105.198.204:9000".to_string(),
+                endpoint: "http://127.0.0.1:9000".to_string(),
                 prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
                 region: "".to_string(),
                 ..Default::default()
