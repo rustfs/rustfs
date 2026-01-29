@@ -18,6 +18,6 @@ spec:
       tls:
         mode: Terminate
         certificateRefs:
-          - name: {{ .Values.gatewayApi.secretName }}
+          - name: {{ .Values.ingress.tls.secretName }}
             kind: Secret
 {{- end }}
