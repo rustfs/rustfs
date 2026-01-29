@@ -34,9 +34,7 @@ use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::data_usage::{
-    aggregate_local_snapshots, compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend,
-};
+use rustfs_ecstore::data_usage::{compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend};
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
