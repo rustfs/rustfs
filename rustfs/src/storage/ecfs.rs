@@ -5376,9 +5376,7 @@ impl S3 for FS {
                     },
                 )
                 .await
-                .map_err(|_| {
-                    S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed.")
-                })?;
+                .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed."))?;
 
             if already_restored {
                 let output = RestoreObjectOutput {
