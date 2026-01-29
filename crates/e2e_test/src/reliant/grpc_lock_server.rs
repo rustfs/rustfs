@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Used by test_distributed_lock_4_nodes_grpc in lock.rs
+#![allow(dead_code)]
+
 use bytes::Bytes;
 use futures::Stream;
 use rustfs_lock::{LockClient, LockRequest};

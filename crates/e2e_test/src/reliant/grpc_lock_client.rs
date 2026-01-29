@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Used by test_distributed_lock_4_nodes_grpc in lock.rs
+#![allow(dead_code)]
+
 use async_trait::async_trait;
 use rustfs_ecstore::rpc::node_service_time_out_client_no_auth;
 use rustfs_lock::{

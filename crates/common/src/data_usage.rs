@@ -436,12 +436,9 @@ impl DataUsageEntry {
         self.obj_sizes.add(summary.total_size as u64);
         self.obj_versions.add(summary.versions as u64);
 
-        let replication_stats = if self.replication_stats.is_none() {
-            self.replication_stats = Some(ReplicationAllStats::default());
-            self.replication_stats.as_mut().unwrap()
-        } else {
-            self.replication_stats.as_mut().unwrap()
-        };
+        let replication_stats = self
+            .replication_stats
+            .get_or_insert_with(ReplicationAllStats::default);
         replication_stats.replica_size += summary.replica_size as u64;
         replication_stats.replica_count += summary.replica_count as u64;
 
@@ -449,7 +446,7 @@ impl DataUsageEntry {
             let tgt_stat = replication_stats
                 .targets
                 .entry(arn.to_string())
-                .or_insert(ReplicationStats::default());
+                .or_default();
             tgt_stat.pending_size += st.pending_size as u64;
             tgt_stat.failed_size += st.failed_size as u64;
             tgt_stat.replicated_size += st.replicated_size as u64;
