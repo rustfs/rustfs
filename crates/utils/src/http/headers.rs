@@ -148,6 +148,8 @@ pub const AMZ_META_NAME: &str = "X-Amz-Meta-Name";
 
 pub const AMZ_META_UNENCRYPTED_CONTENT_LENGTH: &str = "X-Amz-Meta-X-Amz-Unencrypted-Content-Length";
 pub const AMZ_META_UNENCRYPTED_CONTENT_MD5: &str = "X-Amz-Meta-X-Amz-Unencrypted-Content-Md5";
+pub const RUSTFS_ENCRYPTION: &str = "X-Rustfs-Encryption-";
+pub const RUSTFS_ENCRYPTION_LOWER: &str = "x-rustfs-encryption-";
 
 pub const RESERVED_METADATA_PREFIX: &str = "X-RustFS-Internal-";
 pub const RESERVED_METADATA_PREFIX_LOWER: &str = "x-rustfs-internal-";
