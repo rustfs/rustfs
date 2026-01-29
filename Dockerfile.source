@@ -85,7 +85,7 @@ COPY . .
 
 # Generate static files
 
-RUN ./rustfs/scripts/static.sh
+RUN ./scripts/static.sh
 
 # Cargo build configuration for lean release artifacts
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \

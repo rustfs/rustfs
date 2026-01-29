@@ -19,7 +19,7 @@ use crate::server::RemoteAddr;
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
-use crate::storage::entity;
+use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
@@ -36,6 +36,7 @@ use crate::storage::{
     process_topic_configurations, strip_managed_encryption_metadata, validate_bucket_object_lock_enabled,
     validate_list_object_unordered_with_delimiter, validate_object_key, wrap_response_with_cors,
 };
+use crate::storage::{entity, parse_part_number_i32_to_usize};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -3394,14 +3395,8 @@ impl S3 for FS {
 
         // Validate object key
         validate_object_key(&key, "HEAD")?;
-
-        let part_number = part_number.map(|v| v as usize);
-
-        if let Some(part_num) = part_number
-            && part_num == 0
-        {
-            return Err(s3_error!(InvalidArgument, "part_number invalid"));
-        }
+        // Parse part number from Option<i32> to Option<usize> with validation
+        let part_number: Option<usize> = parse_part_number_i32_to_usize(part_number, "HEAD")?;
 
         let rs = range.map(|v| match v {
             Range::Int { first, last } => HTTPRangeSpec {
@@ -3427,27 +3422,35 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-
         // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
             Err(err) => {
                 // If the error indicates the object or its version was not found, return 404 (NoSuchKey)
                 if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    if is_dir_object(&key) {
+                        let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
+                            Ok(has_children) => has_children,
+                            Err(e) => {
+                                error!("Failed to probe children for prefix (bucket: {}, key: {}): {}", bucket, key, e);
+                                false
+                            }
+                        };
+                        let msg = head_prefix_not_found_message(&bucket, &key, has_children);
+                        return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
+                    }
                     return Err(S3Error::new(S3ErrorCode::NoSuchKey));
                 }
                 // Other errors, such as insufficient permissions, still return the original error
                 return Err(ApiError::from(err).into());
             }
         };
-
         if info.delete_marker {
             if opts.version_id.is_none() {
                 return Err(S3Error::new(S3ErrorCode::NoSuchKey));
             }
             return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
         }
-
         if let Some(match_etag) = if_none_match
             && let Some(strong_etag) = match_etag.into_etag()
             && info
@@ -3457,7 +3460,6 @@ impl S3 for FS {
         {
             return Err(S3Error::new(S3ErrorCode::NotModified));
         }
-
         if let Some(modified_since) = if_modified_since {
             // obj_time < givenTime + 1s
             if info.mod_time.is_some_and(|mod_time| {
@@ -3467,7 +3469,6 @@ impl S3 for FS {
                 return Err(S3Error::new(S3ErrorCode::NotModified));
             }
         }
-
         if let Some(match_etag) = if_match {
             if let Some(strong_etag) = match_etag.into_etag()
                 && info
@@ -3485,7 +3486,6 @@ impl S3 for FS {
         {
             return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
         }
-
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -3526,7 +3526,6 @@ impl S3 for FS {
             .or_else(|| metadata_map.get("x-amz-storage-class").cloned())
             .filter(|s| !s.is_empty())
             .map(StorageClass::from);
-
         let mut checksum_crc32 = None;
         let mut checksum_crc32c = None;
         let mut checksum_sha1 = None;
@@ -3543,7 +3542,6 @@ impl S3 for FS {
                 .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
                 .map_err(ApiError::from)?;
 
-            debug!("get object metadata checksums: {:?}", checksums);
             for (key, checksum) in checksums {
                 if key == AMZ_CHECKSUM_TYPE {
                     checksum_type = Some(ChecksumType::from(checksum));
@@ -3560,7 +3558,6 @@ impl S3 for FS {
                 }
             }
         }
-
         // Extract standard HTTP headers from user_defined metadata
         // Note: These headers are stored with lowercase keys by extract_metadata_from_mime
         let cache_control = metadata_map.get("cache-control").cloned();
@@ -3576,7 +3573,6 @@ impl S3 for FS {
         } else {
             0
         };
-
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -3649,10 +3645,8 @@ impl S3 for FS {
         {
             response.headers.insert(header_name, header_value);
         }
-
         let result = Ok(response);
         let _ = helper.complete(&result);
-
         result
     }
 
@@ -5694,7 +5688,8 @@ impl S3 for FS {
         if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &fi.user_defined).await? {
             let part_nonce = derive_part_nonce(base_nonce, part_id);
             let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
+            reader = HashReader::new(Box::new(encrypt_reader), HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                .map_err(ApiError::from)?;
         }
 
         let mut reader = PutObjReader::new(reader);
