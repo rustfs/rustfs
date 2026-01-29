@@ -240,7 +240,7 @@ impl HashReader {
                     let er = EtagReader::new(inner, md5hex.clone());
                     inner = Box::new(er);
                 }
-            } else if !diskable_md5 {
+            } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
                 let er = EtagReader::new(inner, md5hex.clone());
                 inner = Box::new(er);
             }
