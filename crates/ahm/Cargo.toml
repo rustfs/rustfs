@@ -4,12 +4,12 @@ version.workspace = true
 edition.workspace = true
 authors = ["RustFS Team"]
 license.workspace = true
-description = "RustFS AHM (Automatic Health Management) Scanner"
+description = "RustFS AHM (Automatic Health Management)"
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/rustfs-ahm/latest/rustfs_ahm/"
-keywords = ["RustFS", "AHM", "health-management", "scanner", "Minio"]
+keywords = ["RustFS", "AHM", "health-management", "Minio"]
 categories = ["web-programming", "development-tools", "filesystem"]
 
 [dependencies]

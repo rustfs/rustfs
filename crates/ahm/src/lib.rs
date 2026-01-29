@@ -14,16 +14,14 @@
 
 mod error;
 pub mod heal;
-pub mod scanner;
 
 pub use error::{Error, Result};
 pub use heal::{HealManager, HealOptions, HealPriority, HealRequest, HealType, channel::HealChannelProcessor};
-pub use scanner::Scanner;
 use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-// Global cancellation token for AHM services (scanner and other background tasks)
+// Global cancellation token for AHM services (e.g. other background tasks)
 static GLOBAL_AHM_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
 
 /// Initialize the global AHM services cancellation token
