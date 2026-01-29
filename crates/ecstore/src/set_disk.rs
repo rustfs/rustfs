@@ -137,7 +137,7 @@ pub struct SetDisks {
     pub pool_index: usize,
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
-    pub lockers: Vec<Option<Arc<dyn LockClient>>>,
+    pub lockers: Vec<Arc<dyn LockClient>>,
 }
 
 #[derive(Clone, Debug)]
@@ -167,7 +167,7 @@ impl SetDisks {
         pool_index: usize,
         set_endpoints: Vec<Endpoint>,
         format: FormatV3,
-        lockers: Vec<Option<Arc<dyn LockClient>>>,
+        lockers: Vec<Arc<dyn LockClient>>,
     ) -> Arc<Self> {
         Arc::new(SetDisks {
             locker_owner,

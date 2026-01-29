@@ -171,7 +171,7 @@ impl Drop for DistributedLockGuard {
 #[derive(Debug)]
 pub struct DistributedLock {
     /// Lock clients for this namespace
-    clients: Vec<Option<Arc<dyn LockClient>>>,
+    clients: Vec<Arc<dyn LockClient>>,
     /// Namespace identifier
     namespace: String,
     /// Quorum size for operations (majority for distributed)
@@ -180,7 +180,7 @@ pub struct DistributedLock {
 
 impl DistributedLock {
     /// Create new distributed lock
-    pub fn new(namespace: String, clients: Vec<Option<Arc<dyn LockClient>>>, quorum: usize) -> Self {
+    pub fn new(namespace: String, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
         let q = if clients.len() <= 1 {
             1
         } else {
@@ -205,7 +205,7 @@ impl DistributedLock {
     }
 
     /// Get clients (for health check and stats)
-    pub(crate) fn clients(&self) -> &[Option<Arc<dyn LockClient>>] {
+    pub(crate) fn clients(&self) -> &[Arc<dyn LockClient>] {
         &self.clients
     }
 
@@ -288,36 +288,28 @@ impl DistributedLock {
             .clients
             .iter()
             .enumerate()
-            .map(|(idx, client_opt)| async move {
-                if let Some(client) = client_opt {
-                    (idx, Some(client.acquire_lock(request).await))
-                } else {
-                    (idx, None)
-                }
-            })
+            .map(|(idx, client)| async move { (idx, client.acquire_lock(request).await) })
             .collect();
 
         let results = futures::future::join_all(futs).await;
         // Store all individual lock_ids and their corresponding clients
         let mut individual_locks: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
 
-        for (idx, res) in results {
-            if let Some(resp) = res {
-                match resp {
-                    Ok(resp) => {
-                        if resp.success {
-                            // Collect individual lock_id and client for each successful acquisition
-                            if let Some(client) = self.clients.get(idx).and_then(|c| c.clone())
-                                && let Some(lock_info) = &resp.lock_info
-                            {
-                                // Save the individual lock_id returned by each client
-                                individual_locks.push((lock_info.id.clone(), client));
-                            }
+        for (idx, result) in results {
+            match result {
+                Ok(resp) => {
+                    if resp.success {
+                        // Collect individual lock_id and client for each successful acquisition
+                        if let Some(lock_info) = &resp.lock_info
+                            && idx < self.clients.len()
+                        {
+                            // Save the individual lock_id returned by each client
+                            individual_locks.push((lock_info.id.clone(), self.clients[idx].clone()));
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to acquire lock on client {}: {}", idx, e);
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to acquire lock on client {}: {}", idx, e);
                 }
             }
         }

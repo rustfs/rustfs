@@ -100,7 +100,7 @@ impl Sets {
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
-            let mut set_lock_clients: Vec<Option<Arc<dyn LockClient>>> = Vec::with_capacity(set_drive_count);
+            let mut set_lock_clients: HashMap<String, Arc<dyn LockClient>> = HashMap::new();
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
                 let mut disk = disks[idx].clone();
@@ -108,13 +108,12 @@ impl Sets {
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
 
                 if let Some(lock_clients_map) = lock_clients {
-                    if let Some(lock_client) = lock_clients_map.get(&endpoint.host_port()) {
-                        set_lock_clients.push(Some(lock_client.clone()));
-                    } else {
-                        set_lock_clients.push(None);
+                    let host_port = endpoint.host_port();
+                    if let Some(lock_client) = lock_clients_map.get(&host_port) {
+                        if !set_lock_clients.contains_key(&host_port) {
+                            set_lock_clients.insert(host_port, lock_client.clone());
+                        }
                     }
-                } else {
-                    set_lock_clients.push(None);
                 }
 
                 set_endpoints.push(endpoint);
@@ -160,6 +159,7 @@ impl Sets {
                 }
             }
 
+            let lockers = set_lock_clients.values().cloned().collect::<Vec<Arc<dyn LockClient>>>();
             let set_disks = SetDisks::new(
                 GLOBAL_LOCAL_NODE_NAME.read().await.to_string(),
                 Arc::new(RwLock::new(set_drive)),
@@ -169,7 +169,7 @@ impl Sets {
                 pool_idx,
                 set_endpoints,
                 fm.clone(),
-                set_lock_clients,
+                lockers,
             )
             .await;
 

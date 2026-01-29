@@ -119,13 +119,13 @@ impl NamespaceLock {
     /// Create new namespace lock with single client (local use case)
     /// Uses DistributedLock with quorum=1 for single client
     pub fn new(namespace: String, client: Arc<dyn LockClient>) -> Self {
-        Self::Distributed(DistributedLock::new(namespace, vec![Some(client)], 1))
+        Self::Distributed(DistributedLock::new(namespace, vec![client], 1))
     }
 
     /// Create namespace lock with client (compatibility)
     /// Uses DistributedLock with quorum=1 for single client
     pub fn with_client(client: Arc<dyn LockClient>) -> Self {
-        Self::Distributed(DistributedLock::new("default".to_string(), vec![Some(client)], 1))
+        Self::Distributed(DistributedLock::new("default".to_string(), vec![client], 1))
     }
 
     /// Create namespace lock with GlobalLockManager (high-performance local locking)
@@ -135,7 +135,7 @@ impl NamespaceLock {
 
     /// Create namespace lock with clients
     /// Uses DistributedLock with appropriate quorum
-    pub fn with_clients(namespace: String, clients: Vec<Option<Arc<dyn LockClient>>>) -> Self {
+    pub fn with_clients(namespace: String, clients: Vec<Arc<dyn LockClient>>) -> Self {
         // Multiple clients: use DistributedLock with majority quorum
         let quorum = if clients.len() > 1 { (clients.len() / 2) + 1 } else { 1 };
         Self::Distributed(DistributedLock::new(namespace, clients, quorum))
@@ -143,7 +143,7 @@ impl NamespaceLock {
 
     /// Create namespace lock with clients and an explicit quorum size.
     /// Quorum will be clamped into [1, clients.len()].
-    pub fn with_clients_and_quorum(namespace: String, clients: Vec<Option<Arc<dyn LockClient>>>, quorum: usize) -> Self {
+    pub fn with_clients_and_quorum(namespace: String, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
         Self::Distributed(DistributedLock::new(namespace, clients, quorum))
     }
 
@@ -268,7 +268,7 @@ impl NamespaceLock {
             Self::Distributed(lock) => {
                 // Check client status - parallelize async calls for better performance
                 let clients = lock.clients();
-                let client_checks: Vec<_> = clients.iter().flatten().map(|client| client.is_online()).collect();
+                let client_checks: Vec<_> = clients.iter().map(|client| client.is_online()).collect();
 
                 let results = futures::future::join_all(client_checks).await;
                 let connected_clients = results.iter().filter(|&&online| online).count();
@@ -301,7 +301,7 @@ impl NamespaceLock {
         match self {
             Self::Distributed(lock) => {
                 // Parallelize stats collection for better performance
-                let stats_futures: Vec<_> = lock.clients().iter().flatten().map(|client| client.get_stats()).collect();
+                let stats_futures: Vec<_> = lock.clients().iter().map(|client| client.get_stats()).collect();
 
                 let results = futures::future::join_all(stats_futures).await;
 

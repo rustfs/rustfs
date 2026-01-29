@@ -814,7 +814,6 @@ service NodeService {
 
   rpc Lock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc UnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
-  rpc RLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc RUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc ForceUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc Refresh(GenerallyLockRequest) returns (GenerallyLockResponse) {};

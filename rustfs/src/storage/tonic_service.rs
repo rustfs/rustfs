@@ -1518,41 +1518,6 @@ impl Node for NodeService {
         }
     }
 
-    async fn r_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
-        let request = request.into_inner();
-        let args: LockRequest = match serde_json::from_str(&request.args) {
-            Ok(args) => args,
-            Err(err) => {
-                return Ok(Response::new(GenerallyLockResponse {
-                    success: false,
-                    error_info: Some(format!("can not decode args, err: {err}")),
-                    lock_info: None,
-                }));
-            }
-        };
-
-        let lock_client = self.get_lock_client()?;
-        match lock_client.acquire_lock(&args).await {
-            Ok(result) => {
-                // Serialize lock_info if available
-                let lock_info_json = result.lock_info.as_ref().and_then(|info| serde_json::to_string(info).ok());
-                Ok(Response::new(GenerallyLockResponse {
-                    success: result.success,
-                    error_info: None,
-                    lock_info: lock_info_json,
-                }))
-            }
-            Err(err) => Ok(Response::new(GenerallyLockResponse {
-                success: false,
-                error_info: Some(format!(
-                    "can not rlock, resource: {0}, owner: {1}, err: {2}",
-                    args.resource, args.owner, err
-                )),
-                lock_info: None,
-            })),
-        }
-    }
-
     async fn r_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
         let args: LockRequest = match serde_json::from_str(&request.args) {
@@ -3242,21 +3207,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_r_lock_invalid_args() {
-        let service = create_test_node_service();
-
-        let request = Request::new(GenerallyLockRequest {
-            args: "invalid json".to_string(),
-        });
-
-        let response = service.r_lock(request).await;
-        assert!(response.is_ok());
-
-        let rlock_response = response.unwrap().into_inner();
-        assert!(!rlock_response.success);
-        assert!(rlock_response.error_info.is_some());
-    }
-
     #[tokio::test]
     async fn test_r_un_lock_invalid_args() {
         let service = create_test_node_service();
