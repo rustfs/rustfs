@@ -48,7 +48,7 @@ pub use crate::{
     },
     distributed_lock::DistributedLockGuard,
     // Main components
-    namespace::{NamespaceLock, NamespaceLockGuard},
+    namespace::{NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper},
     // Core types
     types::{
         HealthInfo, HealthStatus, LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockStatus,

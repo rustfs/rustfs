@@ -34,6 +34,34 @@ pub enum NamespaceLockGuard {
     Fast(FastLockGuard),
 }
 
+/// Wrapper for NamespaceLock that provides convenient lock acquisition methods
+/// This wrapper holds the lock instance and resource information for easy lock acquisition
+#[derive(Debug)]
+pub struct NamespaceLockWrapper {
+    lock: NamespaceLock,
+    resource: ObjectKey,
+    owner: String,
+}
+
+impl NamespaceLockWrapper {
+    /// Create a new wrapper with the lock, resource, and owner
+    pub fn new(lock: NamespaceLock, resource: ObjectKey, owner: String) -> Self {
+        Self { lock, resource, owner }
+    }
+
+    /// Acquire write lock (exclusive lock) with timeout
+    /// Returns the guard if acquisition succeeds, or an error if it fails
+    pub async fn get_write_lock(&self, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        self.lock.get_write_lock(self.resource.clone(), &self.owner, timeout).await
+    }
+
+    /// Acquire read lock (shared lock) with timeout
+    /// Returns the guard if acquisition succeeds, or an error if it fails
+    pub async fn get_read_lock(&self, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        self.lock.get_read_lock(self.resource.clone(), &self.owner, timeout).await
+    }
+}
+
 impl NamespaceLockGuard {
     /// Get the lock ID if available (only for Standard guards)
     pub fn lock_id(&self) -> Option<&LockId> {
@@ -182,6 +210,28 @@ impl NamespaceLock {
                 .rlock_guard(resource, owner, timeout, ttl)
                 .await
                 .map(|opt| opt.map(NamespaceLockGuard::Fast)),
+        }
+    }
+
+    /// Acquire write lock (exclusive lock) with timeout
+    /// Returns the guard if acquisition succeeds, or an error if it fails
+    pub async fn get_write_lock(&self, resource: ObjectKey, owner: &str, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        let ttl = Duration::from_secs(30); // Default TTL
+        match self.lock_guard(resource, owner, timeout, ttl).await {
+            Ok(Some(guard)) => Ok(guard),
+            Ok(None) => Err(crate::error::LockError::internal("Lock acquisition returned None")),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Acquire read lock (shared lock) with timeout
+    /// Returns the guard if acquisition succeeds, or an error if it fails
+    pub async fn get_read_lock(&self, resource: ObjectKey, owner: &str, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        let ttl = Duration::from_secs(30); // Default TTL
+        match self.rlock_guard(resource, owner, timeout, ttl).await {
+            Ok(Some(guard)) => Ok(guard),
+            Ok(None) => Err(crate::error::LockError::internal("Lock acquisition returned None")),
+            Err(e) => Err(e),
         }
     }
 

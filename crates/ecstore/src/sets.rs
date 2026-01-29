@@ -45,7 +45,7 @@ use rustfs_common::{
 };
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::client::{LockClient, local::LocalClient};
-use rustfs_lock::fast_lock::manager::NamespaceLockGuard;
+use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use std::{collections::HashMap, sync::Arc};
@@ -394,7 +394,7 @@ impl ObjectIO for Sets {
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
     #[tracing::instrument(skip(self))]
-    async fn new_ns_lock<'a>(&'a self, bucket: &str, object: &str) -> Result<NamespaceLockGuard<'a>> {
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.disk_set[0].new_ns_lock(bucket, object).await
     }
     #[tracing::instrument(skip(self))]
