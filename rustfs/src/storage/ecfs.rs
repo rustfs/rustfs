@@ -1934,7 +1934,7 @@ impl S3 for FS {
         let force = parse_bool(force_str).unwrap_or_default();
 
         if force {
-            authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteAction)).await?;
+            authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
 
         store
