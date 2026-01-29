@@ -578,13 +578,81 @@ impl Operation for DataUsageInfoHandler {
 
         info.disk_usage_status = disk_statuses;
 
-        // Set capacity information
         let sinfo = store.storage_info().await;
-        info.total_capacity = get_total_usable_capacity(&sinfo.disks, &sinfo) as u64;
-        info.total_free_capacity = get_total_usable_capacity_free(&sinfo.disks, &sinfo) as u64;
-        if info.total_capacity > info.total_free_capacity {
-            info.total_used_capacity = info.total_capacity - info.total_free_capacity;
+
+        // 🔧 Use the fixed capacity calculation function (built-in deduplication)
+        let raw_total = get_total_usable_capacity(&sinfo.disks, &sinfo);
+        let raw_free = get_total_usable_capacity_free(&sinfo.disks, &sinfo);
+
+        // 🔧 Add a plausibility check (extra layer of protection)
+        const MAX_REASONABLE_CAPACITY: u64 = 1_000 * 1024 * 1024 * 1024 * 1024; // 1 PiB
+        const MIN_REASONABLE_CAPACITY: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB
+
+        let total_u64 = raw_total as u64;
+        let free_u64 = raw_free as u64;
+
+        // Detect outliers
+        if total_u64 > MAX_REASONABLE_CAPACITY {
+            error!(
+                "Abnormal total capacity detected: {} bytes ({:.2} TiB), capping to physical capacity",
+                total_u64,
+                total_u64 as f64 / (1024.0_f64.powi(4))
+            );
+
+            // Use the number of disks and the average capacity to estimate reasonable values
+            let disk_count = sinfo.disks.len();
+            if disk_count > 0 {
+                // Calculate the actual number of disks after deduplication (via endpoint + drive_path)
+                use std::collections::HashSet;
+                let unique_disks: HashSet<String> = sinfo
+                    .disks
+                    .iter()
+                    .map(|d| format!("{}|{}", d.endpoint, d.drive_path))
+                    .collect();
+
+                let actual_disk_count = unique_disks.len();
+
+                // Use the capacity of the first disk as a reference
+                if let Some(first_disk) = sinfo.disks.first() {
+                    info.total_capacity = first_disk.total_space * actual_disk_count as u64;
+                    info.total_free_capacity = first_disk.available_space * actual_disk_count as u64;
+
+                    info!(
+                        "Applied capacity correction: {} unique disks, capacity per disk: {} bytes",
+                        actual_disk_count, first_disk.total_space
+                    );
+                } else {
+                    info.total_capacity = 0;
+                    info.total_free_capacity = 0;
+                }
+            } else {
+                info.total_capacity = 0;
+                info.total_free_capacity = 0;
+            }
+        } else if total_u64 < MIN_REASONABLE_CAPACITY && total_u64 > 0 {
+            warn!(
+                "Unusually small total capacity: {} bytes ({:.2} GiB)",
+                total_u64,
+                total_u64 as f64 / (1024.0_f64.powi(3))
+            );
+            info.total_capacity = total_u64;
+            info.total_free_capacity = free_u64;
+        } else {
+            // Normal
+            info.total_capacity = total_u64;
+            info.total_free_capacity = free_u64;
         }
+
+        // Calculate the used capacity
+        info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
+
+        // Record the final statistical results
+        debug!(
+            "Capacity statistics: total={:.2} TiB, free={:.2} TiB, used={:.2} TiB",
+            info.total_capacity as f64 / (1024.0_f64.powi(4)),
+            info.total_free_capacity as f64 / (1024.0_f64.powi(4)),
+            info.total_used_capacity as f64 / (1024.0_f64.powi(4))
+        );
 
         let data = serde_json::to_vec(&info)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse DataUsageInfo failed"))?;
