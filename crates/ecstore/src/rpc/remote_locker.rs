@@ -20,53 +20,33 @@ use rustfs_lock::{
 };
 use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_protos::proto_gen::node_service::{GenerallyLockRequest, PingRequest};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Remote lock client implementation
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RemoteClient {
     addr: String,
-    // Track active locks with their original owner information
-    active_locks: Arc<RwLock<HashMap<LockId, String>>>, // lock_id -> owner
-}
-
-impl Clone for RemoteClient {
-    fn clone(&self) -> Self {
-        Self {
-            addr: self.addr.clone(),
-            active_locks: self.active_locks.clone(),
-        }
-    }
 }
 
 impl RemoteClient {
     pub fn new(endpoint: String) -> Self {
-        Self {
-            addr: endpoint,
-            active_locks: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self { addr: endpoint }
     }
 
     pub fn from_url(url: url::Url) -> Self {
-        Self {
-            addr: url.to_string(),
-            active_locks: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self { addr: url.to_string() }
     }
 
-    /// Create a minimal LockRequest for unlock operations
-    fn create_unlock_request(&self, lock_id: &LockId, owner: &str) -> LockRequest {
+    /// Create a minimal LockRequest for unlock operations using only lock_id
+    fn create_unlock_request(lock_id: &LockId) -> LockRequest {
         LockRequest {
             lock_id: lock_id.clone(),
             resource: lock_id.resource.clone(),
             lock_type: LockType::Exclusive, // Type doesn't matter for unlock
-            owner: owner.to_string(),
+            owner: String::new(),           // Owner not needed, server uses lock_id
             acquire_timeout: std::time::Duration::from_secs(30),
             ttl: std::time::Duration::from_secs(300),
             metadata: LockMetadata::default(),
@@ -105,11 +85,30 @@ impl LockClient for RemoteClient {
 
         // Check if the lock acquisition was successful
         if resp.success {
-            // Save the lock information for later release
-            let mut locks = self.active_locks.write().await;
-            locks.insert(request.lock_id.clone(), request.owner.clone());
-
-            Ok(LockResponse::success(
+            // Try to deserialize lock_info from response
+            let lock_info = if let Some(lock_info_json) = resp.lock_info {
+                match serde_json::from_str::<LockInfo>(&lock_info_json) {
+                    Ok(info) => info,
+                    Err(e) => {
+                        // If deserialization fails, fall back to constructing from request
+                        warn!("Failed to deserialize lock_info from response: {}, using request data", e);
+                        LockInfo {
+                            id: request.lock_id.clone(),
+                            resource: request.resource.clone(),
+                            lock_type: request.lock_type,
+                            status: LockStatus::Acquired,
+                            owner: request.owner.clone(),
+                            acquired_at: std::time::SystemTime::now(),
+                            expires_at: std::time::SystemTime::now() + request.ttl,
+                            last_refreshed: std::time::SystemTime::now(),
+                            metadata: request.metadata.clone(),
+                            priority: request.priority,
+                            wait_start_time: None,
+                        }
+                    }
+                }
+            } else {
+                // If lock_info is not provided, construct from request
                 LockInfo {
                     id: request.lock_id.clone(),
                     resource: request.resource.clone(),
@@ -122,9 +121,10 @@ impl LockClient for RemoteClient {
                     metadata: request.metadata.clone(),
                     priority: request.priority,
                     wait_start_time: None,
-                },
-                std::time::Duration::ZERO,
-            ))
+                }
+            };
+
+            Ok(LockResponse::success(lock_info, std::time::Duration::ZERO))
         } else {
             // Lock acquisition failed
             Ok(LockResponse::failure(
@@ -137,14 +137,7 @@ impl LockClient for RemoteClient {
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
         info!("remote release for {}", lock_id);
 
-        // Get the original owner for this lock
-        let owner = {
-            let locks = self.active_locks.read().await;
-            locks.get(lock_id).cloned().unwrap_or_else(|| "remote".to_string())
-        };
-
-        let unlock_request = self.create_unlock_request(lock_id, &owner);
-
+        let unlock_request = Self::create_unlock_request(lock_id);
         let request_string = serde_json::to_string(&unlock_request)
             .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?;
         let mut client = self.get_client().await?;
@@ -176,18 +169,12 @@ impl LockClient for RemoteClient {
             resp.success
         };
 
-        // Remove the lock from our tracking if successful
-        if success {
-            let mut locks = self.active_locks.write().await;
-            locks.remove(lock_id);
-        }
-
         Ok(success)
     }
 
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
         info!("remote refresh for {}", lock_id);
-        let refresh_request = self.create_unlock_request(lock_id, "remote");
+        let refresh_request = Self::create_unlock_request(lock_id);
         let mut client = self.get_client().await?;
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&refresh_request)
@@ -206,7 +193,7 @@ impl LockClient for RemoteClient {
 
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
         info!("remote force_release for {}", lock_id);
-        let force_request = self.create_unlock_request(lock_id, "remote");
+        let force_request = Self::create_unlock_request(lock_id);
         let mut client = self.get_client().await?;
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&force_request)
@@ -228,7 +215,7 @@ impl LockClient for RemoteClient {
 
         // Since there's no direct status query in the gRPC service,
         // we attempt a non-blocking lock acquisition to check if the resource is available
-        let status_request = self.create_unlock_request(lock_id, "remote");
+        let status_request = Self::create_unlock_request(lock_id);
         let mut client = self.get_client().await?;
 
         // Try to acquire a very short-lived lock to test availability

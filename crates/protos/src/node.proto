@@ -445,6 +445,7 @@ message GenerallyLockRequest {
 message GenerallyLockResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional string lock_info = 3; // JSON serialized LockInfo
 }
 
 message Mss {

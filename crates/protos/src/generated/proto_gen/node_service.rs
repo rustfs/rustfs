@@ -638,6 +638,9 @@ pub struct GenerallyLockResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    /// JSON serialized LockInfo
+    #[prost(string, optional, tag = "3")]
+    pub lock_info: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Mss {

@@ -1460,22 +1460,29 @@ impl Node for NodeService {
                 return Ok(Response::new(GenerallyLockResponse {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
                 }));
             }
         };
 
         let lock_client = self.get_lock_client()?;
         match lock_client.acquire_lock(&args).await {
-            Ok(result) => Ok(Response::new(GenerallyLockResponse {
-                success: result.success,
-                error_info: None,
-            })),
+            Ok(result) => {
+                // Serialize lock_info if available
+                let lock_info_json = result.lock_info.as_ref().and_then(|info| serde_json::to_string(info).ok());
+                Ok(Response::new(GenerallyLockResponse {
+                    success: result.success,
+                    error_info: None,
+                    lock_info: lock_info_json,
+                }))
+            }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!(
                     "can not lock, resource: {0}, owner: {1}, err: {2}",
                     args.resource, args.owner, err
                 )),
+                lock_info: None,
             })),
         }
     }
@@ -1488,6 +1495,7 @@ impl Node for NodeService {
                 return Ok(Response::new(GenerallyLockResponse {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
                 }));
             }
         };
@@ -1497,6 +1505,7 @@ impl Node for NodeService {
             Ok(_) => Ok(Response::new(GenerallyLockResponse {
                 success: true,
                 error_info: None,
+                lock_info: None,
             })),
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
@@ -1504,6 +1513,7 @@ impl Node for NodeService {
                     "can not unlock, resource: {0}, owner: {1}, err: {2}",
                     args.resource, args.owner, err
                 )),
+                lock_info: None,
             })),
         }
     }
@@ -1516,22 +1526,29 @@ impl Node for NodeService {
                 return Ok(Response::new(GenerallyLockResponse {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
                 }));
             }
         };
 
         let lock_client = self.get_lock_client()?;
         match lock_client.acquire_lock(&args).await {
-            Ok(result) => Ok(Response::new(GenerallyLockResponse {
-                success: result.success,
-                error_info: None,
-            })),
+            Ok(result) => {
+                // Serialize lock_info if available
+                let lock_info_json = result.lock_info.as_ref().and_then(|info| serde_json::to_string(info).ok());
+                Ok(Response::new(GenerallyLockResponse {
+                    success: result.success,
+                    error_info: None,
+                    lock_info: lock_info_json,
+                }))
+            }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!(
                     "can not rlock, resource: {0}, owner: {1}, err: {2}",
                     args.resource, args.owner, err
                 )),
+                lock_info: None,
             })),
         }
     }
@@ -1544,6 +1561,7 @@ impl Node for NodeService {
                 return Ok(Response::new(GenerallyLockResponse {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
                 }));
             }
         };
@@ -1553,6 +1571,7 @@ impl Node for NodeService {
             Ok(_) => Ok(Response::new(GenerallyLockResponse {
                 success: true,
                 error_info: None,
+                lock_info: None,
             })),
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
@@ -1560,6 +1579,7 @@ impl Node for NodeService {
                     "can not runlock, resource: {0}, owner: {1}, err: {2}",
                     args.resource, args.owner, err
                 )),
+                lock_info: None,
             })),
         }
     }
@@ -1572,6 +1592,7 @@ impl Node for NodeService {
                 return Ok(Response::new(GenerallyLockResponse {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
                 }));
             }
         };
@@ -1581,6 +1602,7 @@ impl Node for NodeService {
             Ok(_) => Ok(Response::new(GenerallyLockResponse {
                 success: true,
                 error_info: None,
+                lock_info: None,
             })),
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
@@ -1588,6 +1610,7 @@ impl Node for NodeService {
                     "can not force_unlock, resource: {0}, owner: {1}, err: {2}",
                     args.resource, args.owner, err
                 )),
+                lock_info: None,
             })),
         }
     }
@@ -1600,6 +1623,7 @@ impl Node for NodeService {
                 return Ok(Response::new(GenerallyLockResponse {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
                 }));
             }
         };
@@ -1607,6 +1631,7 @@ impl Node for NodeService {
         Ok(Response::new(GenerallyLockResponse {
             success: true,
             error_info: None,
+            lock_info: None,
         }))
     }
 
