@@ -18,6 +18,8 @@
 
 // Application Layer Modules
 pub mod namespace;
+pub mod local_lock;
+pub mod distributed_lock;
 
 // Abstraction Layer Modules
 pub mod client;
@@ -27,7 +29,6 @@ pub mod fast_lock;
 
 // Core Modules
 pub mod error;
-pub mod guard;
 pub mod types;
 
 // ============================================================================
@@ -45,9 +46,9 @@ pub use crate::{
         BatchLockRequest, BatchLockResult, DisabledLockManager, FastLockGuard, FastObjectLockManager, LockManager, LockMode,
         LockResult, ObjectKey, ObjectLockInfo, ObjectLockRequest, metrics::AggregatedMetrics,
     },
-    guard::LockGuard,
+    distributed_lock::DistributedLockGuard,
     // Main components
-    namespace::NamespaceLock,
+    namespace::{NamespaceLock, NamespaceLockGuard},
     // Core types
     types::{
         HealthInfo, HealthStatus, LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockStatus,
@@ -81,6 +82,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 /// Enum wrapper for different lock manager implementations
+#[derive(Debug)]
 pub enum GlobalLockManager {
     Enabled(Arc<FastObjectLockManager>),
     Disabled(DisabledLockManager),
