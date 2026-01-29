@@ -431,13 +431,15 @@ impl BucketTargetSys {
             let versioning = target_client
                 .get_bucket_versioning(&target.target_bucket)
                 .await
-                .map_err(|_e| BucketTargetError::BucketReplicationSourceNotVersioned {
-                    bucket: bucket.to_string(),
+                .map_err(|e| BucketTargetError::RemoteTargetConnectionErr {
+                    bucket: target.target_bucket.clone(),
+                    access_key: target.credentials.as_ref().map(|c| c.access_key.clone()).unwrap_or_default(),
+                    error: e.to_string(),
                 })?;
 
             if versioning.is_none() {
-                return Err(BucketTargetError::BucketReplicationSourceNotVersioned {
-                    bucket: bucket.to_string(),
+                return Err(BucketTargetError::BucketRemoteTargetNotVersioned {
+                    bucket: target.target_bucket.to_string(),
                 });
             }
         }
