@@ -125,12 +125,28 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
     }
 }
 
+/// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
+/// Defaults to 5 seconds if not set or invalid
+/// For distributed environments with multiple nodes, a longer timeout may be needed
+fn get_lock_acquire_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+}
+
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
-    // TODO: leader lock
+    // Acquire leader lock (write lock) to ensure only one scanner runs
     let _guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
-        Ok(guard) => guard,
+        Ok(ns_lock) => match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+            Ok(guard) => {
+                debug!("run_data_scanner: acquired leader write lock");
+                guard
+            }
+            Err(e) => {
+                debug!("run_data_scanner: other node is running, failed to acquire leader write lock: {:?}", e);
+                return Ok(());
+            }
+        },
         Err(e) => {
-            error!("run_data_scanner: other node is running, failed to acquire leader lock: {e}");
+            error!("run_data_scanner: failed to create namespace lock: {e}");
             return Ok(());
         }
     };
@@ -223,6 +239,9 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     }
 
     global_metrics().set_cycle(None).await;
+
+    debug!("Data scanner done");
+
     Ok(())
 }
 

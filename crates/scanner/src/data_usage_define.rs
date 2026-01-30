@@ -521,7 +521,7 @@ impl DataUsageEntry {
         self.obj_sizes.add(summary.total_size as u64);
         self.obj_versions.add(summary.versions as u64);
 
-        let replication_stats = self.replication_stats.get_or_insert(ReplicationAllStats::default());
+        let replication_stats = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
         replication_stats.replica_size += summary.replica_size as u64;
         replication_stats.replica_count += summary.replica_count as u64;
 
