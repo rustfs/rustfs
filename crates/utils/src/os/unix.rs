@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{DiskInfo, IOStats};
+use crate::os::{DiskInfo, IOStats};
 use rustix::fs::{StatVfs, statvfs};
 use std::io::Error;
 use std::path::Path;
