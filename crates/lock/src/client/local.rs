@@ -119,7 +119,7 @@ impl LockClient for LocalClient {
                 let lock_info = LockInfo {
                     id: lock_id,
                     resource: request.resource.clone(),
-                    lock_type: LockType::Exclusive,
+                    lock_type: request.lock_type,
                     status: crate::types::LockStatus::Acquired,
                     owner: request.owner.clone(),
                     acquired_at: std::time::SystemTime::now(),
