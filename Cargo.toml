@@ -113,16 +113,16 @@ hyper-util = { version = "0.1.19", features = ["tokio", "server-auto", "server-g
 http = "1.4.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
-reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-no-provider", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
+reqwest = { version = "0.13.1", default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
 socket2 = { version = "0.6.2", features = ["all"] }
 tokio = { version = "1.49.0", features = ["fs", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
 tokio-stream = { version = "0.1.18" }
 tokio-test = "0.4.5"
 tokio-util = { version = "0.7.18", features = ["io", "compat"] }
-tonic = { version = "0.14.2", features = ["gzip"] }
-tonic-prost = { version = "0.14.2" }
-tonic-prost-build = { version = "0.14.2" }
+tonic = { version = "0.14.3", features = ["gzip"] }
+tonic-prost = { version = "0.14.3" }
+tonic-prost-build = { version = "0.14.3" }
 tower = { version = "0.5.3", features = ["timeout"] }
 tower-http = { version = "0.6.8", features = ["cors"] }
 
@@ -149,7 +149,7 @@ blake3 = { version = "1.8.3", features = ["rayon", "mmap"] }
 chacha20poly1305 = { version = "0.11.0-rc.2" }
 crc-fast = "1.9.0"
 hmac = { version = "0.13.0-rc.3" }
-jsonwebtoken = { version = "10.2.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 pbkdf2 = "0.13.0-rc.8"
 rsa = { version = "0.10.0-rc.12" }
 rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
@@ -174,13 +174,13 @@ atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.12" }
 aws-credential-types = { version = "1.2.11" }
-aws-sdk-s3 = { version = "1.120.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
-aws-smithy-types = { version = "1.3.6" }
+aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-smithy-types = { version = "1.4.0" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"
 cfg-if = "1.0.4"
-clap = { version = "4.5.54", features = ["derive", "env"] }
+clap = { version = "4.5.55", features = ["derive", "env"] }
 const-str = { version = "1.0.0", features = ["std", "proc"] }
 convert_case = "0.10.0"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -192,8 +192,8 @@ faster-hex = "0.10.0"
 flate2 = "1.1.8"
 flexi_logger = { version = "0.31.8", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
 glob = "0.3.3"
-google-cloud-storage = "1.6.0"
-google-cloud-auth = "1.4.0"
+google-cloud-storage = "1.7.0"
+google-cloud-auth = "1.5.0"
 hashbrown = { version = "0.16.1", features = ["serde", "rayon"] }
 heed = { version = "0.22.0" }
 hex-simd = "0.8.0"
@@ -210,7 +210,6 @@ md5 = "0.8.0"
 mime_guess = "2.0.5"
 moka = { version = "0.12.13", features = ["future"] }
 netif = "0.1.6"
-nix = { version = "0.31.1", features = ["fs"] }
 nu-ansi-term = "0.50.3"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.11.0"
@@ -225,12 +224,13 @@ rayon = "1.11.0"
 reed-solomon-simd = { version = "3.1.0" }
 regex = { version = "1.12.2" }
 rumqttc = { version = "0.25.1" }
+rustix = { version = "1.1.3", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
 s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", branch = "main" }
 serial_test = "3.3.1"
-shadow-rs = { version = "1.6.0", default-features = false }
-siphasher = "1.0.1"
+shadow-rs = { version = "1.7.0", default-features = false }
+siphasher = "1.0.2"
 smallvec = { version = "1.15.1", features = ["serde"] }
 smartstring = "1.0.1"
 snafu = "0.8.9"

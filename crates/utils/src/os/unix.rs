@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{DiskInfo, IOStats};
-use nix::sys::{stat::stat, statvfs::statvfs};
+use rustix::fs::{StatVfs, statvfs};
 use std::io::Error;
 use std::path::Path;
 
@@ -22,10 +22,22 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let path_display = p.as_ref().display();
     let stat = statvfs(p.as_ref())?;
 
-    let bsize = stat.block_size();
-    let bfree = stat.blocks_free() as u64;
-    let bavail = stat.blocks_available() as u64;
-    let blocks = stat.blocks() as u64;
+    // According to POSIX statvfs definition:
+    // f_bsize: File system block size.
+    // f_frsize: Fundamental file system block size.
+    // f_blocks: Total number of blocks on file system in units of f_frsize.
+    //
+    // We should use f_frsize to calculate the size in bytes.
+    // If f_frsize is 0 (which shouldn't happen on compliant systems), fallback to f_bsize.
+    let bsize = if stat.f_frsize > 0 {
+        stat.f_frsize as u64
+    } else {
+        stat.f_bsize as u64
+    };
+
+    let bfree = stat.f_bfree as u64;
+    let bavail = stat.f_bavail as u64;
+    let blocks = stat.f_blocks as u64;
 
     let reserved = match bfree.checked_sub(bavail) {
         Some(reserved) => reserved,
@@ -55,24 +67,33 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         }
     };
 
+    let st = rustix::fs::stat(p.as_ref())?;
+
     Ok(DiskInfo {
         total,
         free,
         used,
-        files: stat.files() as u64,
-        ffree: stat.files_free() as u64,
-        // Statvfs does not provide a way to return the filesystem as name.
+        files: stat.f_files,
+        ffree: stat.f_ffree,
+        fstype: get_fs_type(&stat).to_string(),
+        major: rustix::fs::major(st.st_dev) as u64,
+        minor: rustix::fs::minor(st.st_dev) as u64,
         ..Default::default()
     })
 }
 
+fn get_fs_type(_stat: &StatVfs) -> &'static str {
+    "UNKNOWN"
+}
+
 pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
-    let stat1 = stat(disk1)?;
-    let stat2 = stat(disk2)?;
+    let stat1 = rustix::fs::stat(disk1)?;
+    let stat2 = rustix::fs::stat(disk2)?;
 
     Ok(stat1.st_dev == stat2.st_dev)
 }
 
+#[cfg(not(target_os = "linux"))]
 pub fn get_drive_stats(_major: u32, _minor: u32) -> std::io::Result<IOStats> {
     Ok(IOStats::default())
 }

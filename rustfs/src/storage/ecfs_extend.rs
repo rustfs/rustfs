@@ -580,7 +580,7 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
             None => String::default(),
         };
         let now = OffsetDateTime::now_utc();
-        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set". Consistent with minio
+        // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set".
         eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
         eval_metadata.insert(
             format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
@@ -1101,4 +1101,28 @@ pub(crate) async fn wrap_response_with_cors<T>(
     }
 
     response
+}
+
+/// Parse part number from Option<i32> to Option<usize> with validation
+/// This function checks that the part number is greater than 0 and
+/// converts it to usize, returning an error if invalid
+///
+/// # Arguments
+/// * `part_number` - The optional part number as i32
+/// * `op` - The operation name for logging purposes
+///
+/// # Returns
+/// * `Ok(Some(usize))` if part number is valid
+/// * `Ok(None)` if part number is None
+/// * `Err(S3Error)` if part number is invalid (0 or overflow)
+#[inline]
+pub(crate) fn parse_part_number_i32_to_usize(part_number: Option<i32>, op: &'static str) -> S3Result<Option<usize>> {
+    match part_number {
+        None => Ok(None),
+        Some(n) if n <= 0 => Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("{op}: invalid partNumber {n}, must be a positive integer"),
+        )),
+        Some(n) => Ok(Some(n as usize)),
+    }
 }
