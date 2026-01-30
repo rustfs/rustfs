@@ -446,6 +446,13 @@ async fn handle_shutdown(
         Err(e) => error!("Failed to stop audit system: {}", e),
     }
 
+    // Stop profiling tasks
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Stopping profiling tasks..."
+    );
+    profiling::shutdown_profiling();
+
     info!(
         target: "rustfs::main::handle_shutdown",
         "Server is stopping..."

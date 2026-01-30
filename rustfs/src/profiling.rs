@@ -25,9 +25,14 @@ mod generic_impl {
     use rustfs_utils::{get_env_bool, get_env_str, get_env_u64};
     use std::fs::create_dir_all;
     use std::path::PathBuf;
+    use std::sync::OnceLock;
     use std::time::Duration;
     use tokio::time::sleep;
+    use tokio_util::sync::CancellationToken;
     use tracing::{debug, error, info, warn};
+
+    // Global cancellation token for periodic profiling tasks
+    static PROFILING_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
 
     fn get_platform_info() -> (String, String, String) {
         (
@@ -61,26 +66,44 @@ mod generic_impl {
         allocator::set_enabled(true);
         info!("profiling: Memory profiling enabled (mimalloc + tracing)");
 
+        // Initialize cancellation token
+        let token = PROFILING_CANCEL_TOKEN.get_or_init(CancellationToken::new).clone();
+
         // Memory periodic dump
         let mem_periodic = get_env_bool(ENV_MEM_PERIODIC, DEFAULT_MEM_PERIODIC);
         let mem_interval = Duration::from_secs(get_env_u64(ENV_MEM_INTERVAL_SECS, DEFAULT_MEM_INTERVAL_SECS));
         if mem_periodic {
-            start_memory_periodic(mem_interval).await;
+            start_memory_periodic(mem_interval, token).await;
         }
     }
 
-    async fn start_memory_periodic(interval: Duration) {
+    async fn start_memory_periodic(interval: Duration, token: CancellationToken) {
         info!(?interval, "start periodic memory pprof dump");
         tokio::spawn(async move {
             loop {
-                sleep(interval).await;
-                let out = output_dir().join(format!("mem_profile_periodic_{}.pb", ts()));
-                match allocator::dump_profile(&out) {
-                    Ok(_) => info!("periodic memory profile dumped to {}", out.display()),
-                    Err(e) => error!("periodic mem dump failed: {}", e),
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        info!("periodic memory profiling task cancelled");
+                        break;
+                    }
+                    _ = sleep(interval) => {
+                        let out = output_dir().join(format!("mem_profile_periodic_{}.pb", ts()));
+                        match allocator::dump_profile(&out) {
+                            Ok(_) => info!("periodic memory profile dumped to {}", out.display()),
+                            Err(e) => error!("periodic mem dump failed: {}", e),
+                        }
+                    }
                 }
             }
         });
+    }
+
+    /// Stop all background profiling tasks
+    pub fn shutdown_profiling() {
+        if let Some(token) = PROFILING_CANCEL_TOKEN.get() {
+            token.cancel();
+        }
+        allocator::set_enabled(false);
     }
 
     pub async fn dump_cpu_pprof_for(_duration: Duration) -> Result<PathBuf, String> {
@@ -101,7 +124,7 @@ mod generic_impl {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-pub use generic_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env};
+pub use generic_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 mod linux_impl {
@@ -120,9 +143,11 @@ mod linux_impl {
     use std::time::Duration;
     use tokio::sync::Mutex;
     use tokio::time::sleep;
+    use tokio_util::sync::CancellationToken;
     use tracing::{debug, error, info, warn};
 
     static CPU_CONT_GUARD: OnceLock<Arc<Mutex<Option<pprof::ProfilerGuard<'static>>>>> = OnceLock::new();
+    static PROFILING_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
 
     /// CPU profiling mode
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,11 +301,22 @@ mod linux_impl {
     }
 
     // Internal: start periodic CPU sampling loop
-    async fn start_cpu_periodic(freq_hz: i32, interval: Duration, duration: Duration) {
+    async fn start_cpu_periodic(freq_hz: i32, interval: Duration, duration: Duration, token: CancellationToken) {
         info!(freq = freq_hz, ?interval, ?duration, "start periodic CPU profiling");
         tokio::spawn(async move {
             loop {
-                sleep(interval).await;
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        info!("periodic CPU profiling task cancelled");
+                        break;
+                    }
+                    _ = sleep(interval) => {}
+                }
+
+                if token.is_cancelled() {
+                    break;
+                }
+
                 let guard = match pprof::ProfilerGuard::new(freq_hz) {
                     Ok(g) => g,
                     Err(e) => {
@@ -288,7 +324,15 @@ mod linux_impl {
                         continue;
                     }
                 };
-                sleep(duration).await;
+
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        info!("periodic CPU profiling task cancelled during capture");
+                        break;
+                    }
+                    _ = sleep(duration) => {}
+                }
+
                 match guard.report().build() {
                     Ok(report) => {
                         let out = output_dir().join(format!("cpu_profile_{}.pb", ts()));
@@ -305,11 +349,17 @@ mod linux_impl {
     }
 
     // Internal: start periodic memory dump when jemalloc profiling is active
-    async fn start_memory_periodic(interval: Duration) {
+    async fn start_memory_periodic(interval: Duration, token: CancellationToken) {
         info!(?interval, "start periodic memory pprof dump");
         tokio::spawn(async move {
             loop {
-                sleep(interval).await;
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        info!("periodic memory profiling task cancelled");
+                        break;
+                    }
+                    _ = sleep(interval) => {}
+                }
 
                 let Some(lock) = PROF_CTL.as_ref() else {
                     debug!("skip memory dump: PROF_CTL not available");
@@ -354,6 +404,9 @@ mod linux_impl {
         // Jemalloc state check once (no dump)
         check_jemalloc_profiling().await;
 
+        // Initialize cancellation token
+        let token = PROFILING_CANCEL_TOKEN.get_or_init(CancellationToken::new).clone();
+
         // CPU
         let cpu_mode = read_cpu_mode();
         let cpu_freq = get_env_usize(ENV_CPU_FREQ, DEFAULT_CPU_FREQ) as i32;
@@ -363,17 +416,24 @@ mod linux_impl {
         match cpu_mode {
             CpuMode::Off => debug!("profiling: CPU mode off"),
             CpuMode::Continuous => start_cpu_continuous(cpu_freq).await,
-            CpuMode::Periodic => start_cpu_periodic(cpu_freq, cpu_interval, cpu_duration).await,
+            CpuMode::Periodic => start_cpu_periodic(cpu_freq, cpu_interval, cpu_duration, token.clone()).await,
         }
 
         // Memory
         let mem_periodic = get_env_bool(ENV_MEM_PERIODIC, DEFAULT_MEM_PERIODIC);
         let mem_interval = Duration::from_secs(get_env_u64(ENV_MEM_INTERVAL_SECS, DEFAULT_MEM_INTERVAL_SECS));
         if mem_periodic {
-            start_memory_periodic(mem_interval).await;
+            start_memory_periodic(mem_interval, token).await;
+        }
+    }
+
+    /// Stop all background profiling tasks
+    pub fn shutdown_profiling() {
+        if let Some(token) = PROFILING_CANCEL_TOKEN.get() {
+            token.cancel();
         }
     }
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-pub use linux_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env};
+pub use linux_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};

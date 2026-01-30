@@ -157,7 +157,7 @@ fn cleanup_cache() {
     for entry in STACK_CACHE.iter() {
         let (key, weak) = entry;
         if weak.upgrade().is_none() {
-            dead_keys.push(*key);
+            dead_keys.push(key);
         }
     }
 
@@ -177,7 +177,7 @@ fn dump_profile_inner(path: &Path) -> Result<(), String> {
     profile.string_table.push("count".to_string()); // 2
     profile.string_table.push("alloc_space".to_string()); // 3
     profile.string_table.push("bytes".to_string()); // 4
-    profile.string_table.push("space".to_string()); // 5
+    // "space" was unused, removed.
 
     let sample_type_count = pb::ValueType {
         ty: 1,   // "alloc_objects"
@@ -198,7 +198,6 @@ fn dump_profile_inner(path: &Path) -> Result<(), String> {
     string_map.insert("count".to_string(), 2);
     string_map.insert("alloc_space".to_string(), 3);
     string_map.insert("bytes".to_string(), 4);
-    string_map.insert("space".to_string(), 5);
 
     let mut get_string_id = |s: String| -> i64 {
         if let Some(&id) = string_map.get(&s) {
@@ -373,7 +372,9 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for TracingAllocator<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::alloc::System;
+    use std::sync::Arc;
     use std::thread;
     use tempfile::NamedTempFile;
 
@@ -381,6 +382,7 @@ mod tests {
     static TEST_ALLOCATOR: TracingAllocator<System> = TracingAllocator::new(System);
 
     #[test]
+    #[serial]
     fn test_basic_allocation_tracking() {
         // Enable profiling and force sampling (rate = 1 means sample everything)
         set_enabled(true);
@@ -405,6 +407,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_reentrancy_guard() {
         set_enabled(true);
         set_sample_rate(1);
@@ -427,6 +430,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_sampling_logic() {
         set_enabled(true);
         // Set a high rate so small allocations are unlikely to be sampled
@@ -454,6 +458,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_profile_dump() {
         set_enabled(true);
         set_sample_rate(1);
@@ -477,6 +482,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_concurrent_allocations() {
         set_enabled(true);
         set_sample_rate(1);
