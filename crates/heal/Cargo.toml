@@ -30,30 +30,23 @@ categories = ["web-programming", "development-tools", "filesystem"]
 rustfs-config = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-common = { workspace = true }
-rustfs-filemeta = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-utils = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-time = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-s3s = { workspace = true }
-chrono = { workspace = true }
-rand = { workspace = true }
-reqwest = { workspace = true }
 tempfile = { workspace = true }
-walkdir = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
-heed = { workspace = true }
+walkdir = { workspace = true }

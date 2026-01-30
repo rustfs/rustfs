@@ -36,7 +36,6 @@ serde_json.workspace = true
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-url.workspace = true
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes.workspace = true
