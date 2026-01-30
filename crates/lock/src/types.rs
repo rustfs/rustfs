@@ -119,7 +119,7 @@ impl LockId {
 
     /// Generate unique lock ID for a resource
     /// Each call generates a different ID, even for the same resource
-    pub fn new_deterministic(resource: &ObjectKey) -> Self {
+    pub fn new_unique(resource: &ObjectKey) -> Self {
         // Use UUID v4 (random) to ensure uniqueness
         // Each call generates a new unique ID regardless of the resource
         Self {
@@ -231,7 +231,7 @@ impl LockRequest {
     /// Create new lock request
     pub fn new(resource: ObjectKey, lock_type: LockType, owner: impl Into<String>) -> Self {
         Self {
-            lock_id: LockId::new_deterministic(&resource),
+            lock_id: LockId::new_unique(&resource),
             resource,
             lock_type,
             owner: owner.into(),

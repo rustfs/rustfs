@@ -224,7 +224,7 @@ impl DistributedLock {
                 .lock_info
                 .as_ref()
                 .map(|info| info.id.clone())
-                .unwrap_or_else(|| LockId::new_deterministic(&request.resource));
+                .unwrap_or_else(|| LockId::new_unique(&request.resource));
 
             Ok(Some(DistributedLockGuard::new(aggregate_lock_id, individual_locks)))
         } else {
