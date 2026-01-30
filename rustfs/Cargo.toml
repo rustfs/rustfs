@@ -126,6 +126,7 @@ urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
 libc = { workspace = true }
+pprof = { workspace = true }
 rand = { workspace = true }
 
 # Observability and Metrics
@@ -142,16 +143,19 @@ libsystemd.workspace = true
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
+starshard = { workspace = true }
+backtrace = { workspace = true }
+rand = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 jemalloc_pprof = { workspace = true }
-pprof = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
+tempfile = { workspace = true }
 
 [build-dependencies]
 http.workspace = true
