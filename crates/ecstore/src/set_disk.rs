@@ -5730,16 +5730,11 @@ impl StorageAPI for SetDisks {
                 return Err(Error::other("checksum type not found"));
             };
 
-            if let Some(want) = &opts.want_checksum
-                && !want
-                    .checksum_type
-                    .is(rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct))
+            checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct);
+            if let Some(want) = opts.want_checksum.as_ref()
+                && !want.checksum_type.is(checksum_type)
             {
-                return Err(Error::other(format!(
-                    "checksum type mismatch, got {:?}, want {:?}",
-                    want,
-                    rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct)
-                )));
+                return Err(Error::other(format!("checksum type mismatch, got {:?}, want {:?}", want, checksum_type)));
             }
         }
 
