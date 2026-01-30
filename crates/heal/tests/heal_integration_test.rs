@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ahm::heal::{
-    manager::{HealConfig, HealManager},
-    storage::{ECStoreHealStorage, HealStorageAPI},
-    task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
-};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
     store_api::{ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
+};
+use rustfs_heal::heal::{
+    manager::{HealConfig, HealManager},
+    storage::{ECStoreHealStorage, HealStorageAPI},
+    task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
 };
 use serial_test::serial;
 use std::{
@@ -58,7 +58,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
     }
 
     // create temp dir as 4 disks with unique base dir
-    let test_base_dir = format!("/tmp/rustfs_ahm_heal_test_{}", uuid::Uuid::new_v4());
+    let test_base_dir = format!("/tmp/rustfs_heal_heal_test_{}", uuid::Uuid::new_v4());
     let temp_dir = std::path::PathBuf::from(&test_base_dir);
     if temp_dir.exists() {
         fs::remove_dir_all(&temp_dir).await.ok();
