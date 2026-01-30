@@ -108,7 +108,7 @@ impl LockClient for LocalClient {
 
         match lock_manager.acquire_lock(lock_request).await {
             Ok(guard) => {
-                let lock_id = LockId::new_deterministic(&request.resource);
+                let lock_id = LockId::new_unique(&request.resource);
 
                 {
                     let shard = self.get_shard(&lock_id);
