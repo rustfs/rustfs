@@ -51,7 +51,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
-rust-version = "1.90"
+rust-version = "1.93.0"
 version = "0.0.5"
 homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
@@ -176,6 +176,7 @@ aws-config = { version = "1.8.12" }
 aws-credential-types = { version = "1.2.11" }
 aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-types = { version = "1.4.0" }
+backtrace = "0.3.76"
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"

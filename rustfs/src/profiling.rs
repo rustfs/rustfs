@@ -12,45 +12,95 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod allocator;
+
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-pub async fn init_from_env() {
-    let (target_os, target_env, target_arch) = get_platform_info();
-    tracing::info!(
-        target: "rustfs::main::run",
-        target_os = %target_os,
-        target_env = %target_env,
-        target_arch = %target_arch,
-        "profiling: disabled on this platform. target_os={}, target_env={}, target_arch={}",
-        target_os, target_env, target_arch
-    );
+mod generic_impl {
+    use super::allocator;
+    use rustfs_config::{
+        DEFAULT_ENABLE_PROFILING, DEFAULT_MEM_INTERVAL_SECS, DEFAULT_MEM_PERIODIC, DEFAULT_OUTPUT_DIR, ENV_ENABLE_PROFILING,
+        ENV_MEM_INTERVAL_SECS, ENV_MEM_PERIODIC, ENV_OUTPUT_DIR,
+    };
+    use rustfs_utils::{get_env_bool, get_env_str, get_env_u64};
+    use std::fs::create_dir_all;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::time::sleep;
+    use tracing::{debug, error, info, warn};
+
+    fn get_platform_info() -> (String, String, String) {
+        (
+            std::env::consts::OS.to_string(),
+            option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown").to_string(),
+            std::env::consts::ARCH.to_string(),
+        )
+    }
+
+    fn output_dir() -> PathBuf {
+        let dir = get_env_str(ENV_OUTPUT_DIR, DEFAULT_OUTPUT_DIR);
+        let p = PathBuf::from(dir);
+        if let Err(e) = create_dir_all(&p) {
+            warn!("profiling: create output dir {} failed: {}, fallback to current dir", p.display(), e);
+            return PathBuf::from(".");
+        }
+        p
+    }
+
+    fn ts() -> String {
+        jiff::Zoned::now().strftime("%Y%m%dT%H%M%S").to_string()
+    }
+
+    pub async fn init_from_env() {
+        let enabled = get_env_bool(ENV_ENABLE_PROFILING, DEFAULT_ENABLE_PROFILING);
+        if !enabled {
+            debug!("profiling: disabled by env");
+            return;
+        }
+
+        allocator::set_enabled(true);
+        info!("profiling: Memory profiling enabled (mimalloc + tracing)");
+
+        // Memory periodic dump
+        let mem_periodic = get_env_bool(ENV_MEM_PERIODIC, DEFAULT_MEM_PERIODIC);
+        let mem_interval = Duration::from_secs(get_env_u64(ENV_MEM_INTERVAL_SECS, DEFAULT_MEM_INTERVAL_SECS));
+        if mem_periodic {
+            start_memory_periodic(mem_interval).await;
+        }
+    }
+
+    async fn start_memory_periodic(interval: Duration) {
+        info!(?interval, "start periodic memory pprof dump");
+        tokio::spawn(async move {
+            loop {
+                sleep(interval).await;
+                let out = output_dir().join(format!("mem_profile_periodic_{}.pb", ts()));
+                match allocator::dump_profile(&out) {
+                    Ok(_) => info!("periodic memory profile dumped to {}", out.display()),
+                    Err(e) => error!("periodic mem dump failed: {}", e),
+                }
+            }
+        });
+    }
+
+    pub async fn dump_cpu_pprof_for(_duration: Duration) -> Result<PathBuf, String> {
+        let (target_os, target_env, target_arch) = get_platform_info();
+        let msg = format!(
+            "CPU profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}"
+        );
+        Err(msg)
+    }
+
+    pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
+        let out = output_dir().join(format!("mem_profile_{}.pb", ts()));
+        allocator::dump_profile(&out).map(|_| {
+            info!("Memory profile exported: {}", out.display());
+            out
+        })
+    }
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-fn get_platform_info() -> (String, String, String) {
-    (
-        std::env::consts::OS.to_string(),
-        option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown").to_string(),
-        std::env::consts::ARCH.to_string(),
-    )
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-pub async fn dump_cpu_pprof_for(_duration: std::time::Duration) -> Result<std::path::PathBuf, String> {
-    let (target_os, target_env, target_arch) = get_platform_info();
-    let msg = format!(
-        "CPU profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}"
-    );
-    Err(msg)
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-pub async fn dump_memory_pprof_now() -> Result<std::path::PathBuf, String> {
-    let (target_os, target_env, target_arch) = get_platform_info();
-    let msg = format!(
-        "Memory profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}"
-    );
-    Err(msg)
-}
+pub use generic_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env};
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 mod linux_impl {
