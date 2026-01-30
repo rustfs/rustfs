@@ -1518,37 +1518,6 @@ impl Node for NodeService {
         }
     }
 
-    async fn r_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
-        let request = request.into_inner();
-        let args: LockRequest = match serde_json::from_str(&request.args) {
-            Ok(args) => args,
-            Err(err) => {
-                return Ok(Response::new(GenerallyLockResponse {
-                    success: false,
-                    error_info: Some(format!("can not decode args, err: {err}")),
-                    lock_info: None,
-                }));
-            }
-        };
-
-        let lock_client = self.get_lock_client()?;
-        match lock_client.release(&args.lock_id).await {
-            Ok(_) => Ok(Response::new(GenerallyLockResponse {
-                success: true,
-                error_info: None,
-                lock_info: None,
-            })),
-            Err(err) => Ok(Response::new(GenerallyLockResponse {
-                success: false,
-                error_info: Some(format!(
-                    "can not runlock, resource: {0}, owner: {1}, err: {2}",
-                    args.resource, args.owner, err
-                )),
-                lock_info: None,
-            })),
-        }
-    }
-
     async fn force_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
         let args: LockRequest = match serde_json::from_str(&request.args) {
@@ -3204,22 +3173,6 @@ mod tests {
         let unlock_response = response.unwrap().into_inner();
         assert!(!unlock_response.success);
         assert!(unlock_response.error_info.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_r_un_lock_invalid_args() {
-        let service = create_test_node_service();
-
-        let request = Request::new(GenerallyLockRequest {
-            args: "invalid json".to_string(),
-        });
-
-        let response = service.r_un_lock(request).await;
-        assert!(response.is_ok());
-
-        let runlock_response = response.unwrap().into_inner();
-        assert!(!runlock_response.success);
-        assert!(runlock_response.error_info.is_some());
     }
 
     #[tokio::test]

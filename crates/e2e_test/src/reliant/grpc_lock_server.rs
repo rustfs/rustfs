@@ -130,11 +130,6 @@ impl NodeService for MinimalLockNodeService {
         }
     }
 
-    async fn r_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
-        // Same as un_lock for shared locks
-        self.un_lock(request).await
-    }
-
     async fn force_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
         let args: LockRequest = match serde_json::from_str(&request.args) {

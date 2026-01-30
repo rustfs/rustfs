@@ -145,34 +145,19 @@ impl LockClient for GrpcLockClient {
             .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?;
         let mut client = self.get_client().await?;
 
-        // Try UnLock first (for exclusive locks)
         let req = Request::new(GenerallyLockRequest {
             args: request_string.clone(),
         });
-        let resp = client.un_lock(req).await;
+        let resp = client
+            .un_lock(req)
+            .await
+            .map_err(|e| LockError::internal(e.to_string()))?
+            .into_inner();
 
-        let success = if resp.is_err() {
-            // If that fails, try RUnLock (for shared locks)
-            let req = Request::new(GenerallyLockRequest { args: request_string });
-            let resp = client
-                .r_un_lock(req)
-                .await
-                .map_err(|e| LockError::internal(e.to_string()))?
-                .into_inner();
-            if let Some(error_info) = resp.error_info {
-                return Err(LockError::internal(error_info));
-            }
-            resp.success
-        } else {
-            let resp = resp.map_err(|e| LockError::internal(e.to_string()))?.into_inner();
-
-            if let Some(error_info) = resp.error_info {
-                return Err(LockError::internal(error_info));
-            }
-            resp.success
-        };
-
-        Ok(success)
+        if let Some(error_info) = resp.error_info {
+            return Err(LockError::internal(error_info));
+        }
+        Ok(resp.success)
     }
 
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
