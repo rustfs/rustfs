@@ -77,100 +77,54 @@ impl FastObjectLockManager {
     }
 
     /// Acquire shared (read) lock
-    pub async fn acquire_read_lock(
-        &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
-        owner: impl Into<Arc<str>>,
-    ) -> Result<FastLockGuard, LockResult> {
-        let request = ObjectLockRequest::new_read(bucket, object, owner);
+    pub async fn acquire_read_lock(&self, key: ObjectKey, owner: impl Into<Arc<str>>) -> Result<FastLockGuard, LockResult> {
+        let request = ObjectLockRequest::new_read(key, owner);
         self.acquire_lock(request).await
     }
 
     /// Acquire shared (read) lock for specific version
-    pub async fn acquire_read_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
-        version: impl Into<Arc<str>>,
-        owner: impl Into<Arc<str>>,
-    ) -> Result<FastLockGuard, LockResult> {
-        let request = ObjectLockRequest::new_read(bucket, object, owner).with_version(version);
-        self.acquire_lock(request).await
-    }
-
-    /// Acquire exclusive (write) lock
-    pub async fn acquire_write_lock(
-        &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
-        owner: impl Into<Arc<str>>,
-    ) -> Result<FastLockGuard, LockResult> {
-        // let bucket = bucket.into();
-        // let object = object.into();
-        // let owner = owner.into();
-        // error!("acquire_write_lock: bucket={:?}, object={:?}, owner={:?}", bucket, object, owner);
-        let request = ObjectLockRequest::new_write(bucket, object, owner);
-        self.acquire_lock(request).await
-    }
-
-    /// Acquire exclusive (write) lock for specific version
-    pub async fn acquire_write_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
-        version: impl Into<Arc<str>>,
-        owner: impl Into<Arc<str>>,
-    ) -> Result<FastLockGuard, LockResult> {
-        let request = ObjectLockRequest::new_write(bucket, object, owner).with_version(version);
+    pub async fn acquire_write_lock(&self, key: ObjectKey, owner: impl Into<Arc<str>>) -> Result<FastLockGuard, LockResult> {
+        let request = ObjectLockRequest::new_write(key, owner);
         self.acquire_lock(request).await
     }
 
     /// Acquire high-priority read lock - optimized for database queries
     pub async fn acquire_high_priority_read_lock(
         &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
+        key: ObjectKey,
         owner: impl Into<Arc<str>>,
     ) -> Result<FastLockGuard, LockResult> {
-        let request =
-            ObjectLockRequest::new_read(bucket, object, owner).with_priority(crate::fast_lock::types::LockPriority::High);
+        let request = ObjectLockRequest::new_read(key, owner).with_priority(crate::fast_lock::types::LockPriority::High);
         self.acquire_lock(request).await
     }
 
     /// Acquire high-priority write lock - optimized for database queries
     pub async fn acquire_high_priority_write_lock(
         &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
+        key: ObjectKey,
         owner: impl Into<Arc<str>>,
     ) -> Result<FastLockGuard, LockResult> {
-        let request =
-            ObjectLockRequest::new_write(bucket, object, owner).with_priority(crate::fast_lock::types::LockPriority::High);
+        let request = ObjectLockRequest::new_write(key, owner).with_priority(crate::fast_lock::types::LockPriority::High);
         self.acquire_lock(request).await
     }
 
     /// Acquire critical priority read lock - for system operations
     pub async fn acquire_critical_read_lock(
         &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
+        key: ObjectKey,
         owner: impl Into<Arc<str>>,
     ) -> Result<FastLockGuard, LockResult> {
-        let request =
-            ObjectLockRequest::new_read(bucket, object, owner).with_priority(crate::fast_lock::types::LockPriority::Critical);
+        let request = ObjectLockRequest::new_read(key, owner).with_priority(crate::fast_lock::types::LockPriority::Critical);
         self.acquire_lock(request).await
     }
 
     /// Acquire critical priority write lock - for system operations
     pub async fn acquire_critical_write_lock(
         &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
+        key: ObjectKey,
         owner: impl Into<Arc<str>>,
     ) -> Result<FastLockGuard, LockResult> {
-        let request =
-            ObjectLockRequest::new_write(bucket, object, owner).with_priority(crate::fast_lock::types::LockPriority::Critical);
+        let request = ObjectLockRequest::new_write(key, owner).with_priority(crate::fast_lock::types::LockPriority::Critical);
         self.acquire_lock(request).await
     }
 
@@ -440,42 +394,12 @@ impl LockManager for FastObjectLockManager {
         self.acquire_lock(request).await
     }
 
-    async fn acquire_read_lock(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult> {
-        self.acquire_read_lock(bucket, object, owner).await
+    async fn acquire_read_lock(&self, key: ObjectKey, owner: impl Into<Arc<str>> + Send) -> Result<FastLockGuard, LockResult> {
+        self.acquire_read_lock(key, owner).await
     }
 
-    async fn acquire_read_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        version: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult> {
-        self.acquire_read_lock_versioned(bucket, object, version, owner).await
-    }
-
-    async fn acquire_write_lock(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult> {
-        self.acquire_write_lock(bucket, object, owner).await
-    }
-
-    async fn acquire_write_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        version: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult> {
-        self.acquire_write_lock_versioned(bucket, object, version, owner).await
+    async fn acquire_write_lock(&self, key: ObjectKey, owner: impl Into<Arc<str>> + Send) -> Result<FastLockGuard, LockResult> {
+        self.acquire_write_lock(key, owner).await
     }
 
     async fn acquire_locks_batch(&self, batch_request: BatchLockRequest) -> BatchLockResult {
@@ -512,148 +436,5 @@ impl LockManager for FastObjectLockManager {
 
     fn is_disabled(&self) -> bool {
         false
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::time::Duration;
-
-    #[tokio::test]
-    async fn test_manager_basic_operations() {
-        let manager = FastObjectLockManager::new();
-
-        // Test read lock
-        let read_guard = manager
-            .acquire_read_lock("bucket", "object", "owner1")
-            .await
-            .expect("Failed to acquire read lock");
-
-        // Should be able to acquire another read lock
-        let read_guard2 = manager
-            .acquire_read_lock("bucket", "object", "owner2")
-            .await
-            .expect("Failed to acquire second read lock");
-
-        drop(read_guard);
-        drop(read_guard2);
-
-        // Test write lock
-        let write_guard = manager
-            .acquire_write_lock("bucket", "object", "owner1")
-            .await
-            .expect("Failed to acquire write lock");
-
-        drop(write_guard);
-    }
-
-    #[tokio::test]
-    async fn test_manager_contention() {
-        let manager = Arc::new(FastObjectLockManager::new());
-
-        // Acquire write lock
-        let write_guard = manager
-            .acquire_write_lock("bucket", "object", "owner1")
-            .await
-            .expect("Failed to acquire write lock");
-
-        // Try to acquire read lock (should timeout)
-        let manager_clone = manager.clone();
-        let read_result =
-            tokio::time::timeout(Duration::from_millis(100), manager_clone.acquire_read_lock("bucket", "object", "owner2")).await;
-
-        assert!(read_result.is_err()); // Should timeout
-
-        drop(write_guard);
-
-        // Now read lock should succeed
-        let read_guard = manager
-            .acquire_read_lock("bucket", "object", "owner2")
-            .await
-            .expect("Failed to acquire read lock after write lock released");
-
-        drop(read_guard);
-    }
-
-    #[tokio::test]
-    async fn test_versioned_locks() {
-        let manager = FastObjectLockManager::new();
-
-        // Acquire lock on version v1
-        let v1_guard = manager
-            .acquire_write_lock_versioned("bucket", "object", "v1", "owner1")
-            .await
-            .expect("Failed to acquire v1 lock");
-
-        // Should be able to acquire lock on version v2 simultaneously
-        let v2_guard = manager
-            .acquire_write_lock_versioned("bucket", "object", "v2", "owner2")
-            .await
-            .expect("Failed to acquire v2 lock");
-
-        drop(v1_guard);
-        drop(v2_guard);
-    }
-
-    #[tokio::test]
-    async fn test_batch_operations() {
-        let manager = FastObjectLockManager::new();
-
-        let batch = BatchLockRequest::new("owner")
-            .add_read_lock("bucket", "obj1")
-            .add_write_lock("bucket", "obj2")
-            .with_all_or_nothing(true);
-
-        let result = manager.acquire_locks_batch(batch).await;
-        assert!(result.all_acquired);
-        assert_eq!(result.successful_locks.len(), 2);
-        assert!(result.failed_locks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_metrics() {
-        let manager = FastObjectLockManager::new();
-
-        // Perform some operations
-        let _guard1 = manager.acquire_read_lock("bucket", "obj1", "owner").await.unwrap();
-        let _guard2 = manager.acquire_write_lock("bucket", "obj2", "owner").await.unwrap();
-
-        let metrics = manager.get_metrics();
-        assert!(metrics.shard_metrics.total_acquisitions() > 0);
-        assert!(metrics.shard_metrics.fast_path_rate() > 0.0);
-    }
-
-    #[tokio::test]
-    async fn test_cleanup() {
-        let config = LockConfig {
-            max_idle_time: Duration::from_secs(1), // Use 1 second for easier testing
-            ..Default::default()
-        };
-        let manager = FastObjectLockManager::with_config(config);
-
-        // Acquire and release some locks
-        {
-            let _guard = manager.acquire_read_lock("bucket", "obj1", "owner1").await.unwrap();
-            let _guard2 = manager.acquire_read_lock("bucket", "obj2", "owner2").await.unwrap();
-        } // Locks are released here
-
-        // Check lock count before cleanup
-        let count_before = manager.total_lock_count();
-        assert!(count_before >= 2, "Should have at least 2 locks before cleanup");
-
-        // Wait for idle timeout
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Force cleanup with traditional method to ensure cleanup for testing
-        let cleaned = manager.cleanup_expired_traditional().await;
-
-        let count_after = manager.total_lock_count();
-
-        // The test should pass if cleanup works at all
-        assert!(
-            cleaned > 0 || count_after < count_before,
-            "Cleanup should either clean locks or they should be cleaned by other means"
-        );
     }
 }

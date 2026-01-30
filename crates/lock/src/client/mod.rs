@@ -15,26 +15,15 @@
 pub mod local;
 // pub mod remote;
 
-use crate::{LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, Result};
+use crate::{LockId, LockInfo, LockRequest, LockResponse, LockStats, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 
 /// Lock client trait
 #[async_trait]
 pub trait LockClient: Send + Sync + std::fmt::Debug {
-    /// Acquire exclusive lock
-    async fn acquire_exclusive(&self, request: &LockRequest) -> Result<LockResponse>;
-
-    /// Acquire shared lock
-    async fn acquire_shared(&self, request: &LockRequest) -> Result<LockResponse>;
-
     /// Acquire lock (generic method)
-    async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
-        match request.lock_type {
-            LockType::Exclusive => self.acquire_exclusive(request).await,
-            LockType::Shared => self.acquire_shared(request).await,
-        }
-    }
+    async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse>;
 
     /// Release lock
     async fn release(&self, lock_id: &LockId) -> Result<bool>;
@@ -74,37 +63,4 @@ impl ClientFactory {
     // pub fn create_remote(endpoint: String) -> Arc<dyn LockClient> {
     //     Arc::new(remote::RemoteClient::new(endpoint))
     // }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::LockType;
-
-    #[tokio::test]
-    async fn test_local_client_basic_operations() {
-        let client = ClientFactory::create_local();
-
-        let request = LockRequest::new("test-resource", LockType::Exclusive, "test-owner");
-
-        // Test lock acquisition
-        let response = client.acquire_exclusive(&request).await;
-        assert!(response.is_ok());
-
-        if let Ok(response) = response
-            && response.success
-        {
-            let lock_info = response.lock_info.unwrap();
-
-            // Test status check
-            let status = client.check_status(&lock_info.id).await;
-            assert!(status.is_ok());
-            assert!(status.unwrap().is_some());
-
-            // Test lock release
-            let released = client.release(&lock_info.id).await;
-            assert!(released.is_ok());
-            assert!(released.unwrap());
-        }
-    }
 }

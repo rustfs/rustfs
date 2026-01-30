@@ -45,6 +45,7 @@ use crate::global::{
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
+use crate::rpc::RemoteClient;
 use crate::store_api::{
     ListMultipartsInfo, ListObjectVersionsInfo, ListPartsInfo, MultipartInfo, ObjectIO, ObjectInfoOrErr, WalkOptions,
 };
@@ -69,7 +70,7 @@ use rand::Rng as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
-use rustfs_lock::FastLockGuard;
+use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
@@ -1125,6 +1126,45 @@ pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()>
     Ok(())
 }
 
+/// create unique lock clients for the endpoints and store them globally
+pub fn init_lock_clients(endpoint_pools: EndpointServerPools) {
+    let mut unique_endpoints: HashMap<String, &Endpoint> = HashMap::new();
+
+    for pool_eps in endpoint_pools.as_ref().iter() {
+        for ep in pool_eps.endpoints.as_ref().iter() {
+            unique_endpoints.insert(ep.host_port(), ep);
+        }
+    }
+
+    let mut clients = HashMap::new();
+    let mut first_local_client_set = false;
+
+    for (key, endpoint) in unique_endpoints {
+        if endpoint.is_local {
+            let local_client = Arc::new(LocalClient::new()) as Arc<dyn LockClient>;
+
+            // Store the first LocalClient globally for use by other modules
+            if !first_local_client_set {
+                if let Err(e) = crate::global::set_global_lock_client(local_client.clone()) {
+                    // If already set, ignore the error (another thread may have set it)
+                    warn!("set_global_lock_client error: {:?}", e);
+                } else {
+                    first_local_client_set = true;
+                }
+            }
+
+            clients.insert(key, local_client);
+        } else {
+            clients.insert(key, Arc::new(RemoteClient::new(endpoint.url.to_string())) as Arc<dyn LockClient>);
+        }
+    }
+
+    // Store the lock clients map globally
+    if crate::global::set_global_lock_clients(clients).is_err() {
+        error!("init_lock_clients: error setting lock clients");
+    }
+}
+
 #[derive(Debug, Default)]
 struct PoolErr {
     index: Option<usize>,
@@ -1245,7 +1285,7 @@ lazy_static! {
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
     #[instrument(skip(self))]
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.pools[0].new_ns_lock(bucket, object).await
     }
     #[instrument(skip(self))]
@@ -2352,20 +2392,10 @@ impl StorageAPI for ECStore {
 
         let mut futures = Vec::with_capacity(self.pools.len());
         for pool in self.pools.iter() {
-            //TODO: IsSuspended
+            if self.is_suspended(pool.pool_idx).await {
+                continue;
+            }
             futures.push(pool.heal_object(bucket, &object, version_id, opts));
-            // futures.push(async move {
-            // match pool.heal_object(bucket, &object, version_id, opts).await {
-            //     Ok((mut result, err)) => {
-            //         result.object = utils::path::decode_dir_object(&result.object);
-            //         results.write().await.insert(idx, result);
-            //         errs.write().await[idx] = err;
-            //     }
-            //     Err(err) => {
-            //         errs.write().await[idx] = Some(err);
-            //     }
-            // }
-            // });
         }
         let results = join_all(futures).await;
 

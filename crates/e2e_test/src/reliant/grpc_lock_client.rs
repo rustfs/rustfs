@@ -12,32 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+// Used by test_distributed_lock_4_nodes_grpc in lock.rs
+#![allow(dead_code)]
+
 use async_trait::async_trait;
+use rustfs_ecstore::rpc::node_service_time_out_client_no_auth;
 use rustfs_lock::{
-    LockClient, LockError, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
-    types::{LockId, LockMetadata, LockPriority},
+    LockClient, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
+    types::{LockMetadata, LockPriority},
 };
-use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_protos::proto_gen::node_service::{GenerallyLockRequest, PingRequest};
 use tonic::Request;
-use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 use tracing::{info, warn};
 
-/// Remote lock client implementation
+/// gRPC lock client without authentication for testing
+/// Similar to RemoteClient but uses no_auth client
 #[derive(Debug, Clone)]
-pub struct RemoteClient {
+pub struct GrpcLockClient {
     addr: String,
 }
 
-impl RemoteClient {
+impl GrpcLockClient {
     pub fn new(endpoint: String) -> Self {
         Self { addr: endpoint }
     }
 
-    pub fn from_url(url: url::Url) -> Self {
-        Self { addr: url.to_string() }
+    async fn get_client(
+        &self,
+    ) -> Result<
+        rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient<
+            tonic::service::interceptor::InterceptedService<tonic::transport::Channel, rustfs_ecstore::rpc::TonicInterceptor>,
+        >,
+    > {
+        node_service_time_out_client_no_auth(&self.addr)
+            .await
+            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))
     }
 
     /// Create a minimal LockRequest for unlock operations using only lock_id
@@ -54,18 +63,12 @@ impl RemoteClient {
             deadlock_detection: false,
         }
     }
-
-    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
-        node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
-            .await
-            .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))
-    }
 }
 
 #[async_trait]
-impl LockClient for RemoteClient {
+impl LockClient for GrpcLockClient {
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
-        info!("remote acquire_exclusive for {}", request.resource);
+        info!("grpc acquire_lock for {}", request.resource);
         let mut client = self.get_client().await?;
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&request)
@@ -135,18 +138,22 @@ impl LockClient for RemoteClient {
     }
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
-        info!("remote release for {}", lock_id);
+        info!("grpc release for {}", lock_id);
 
         let unlock_request = Self::create_unlock_request(lock_id);
         let request_string = serde_json::to_string(&unlock_request)
             .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?;
         let mut client = self.get_client().await?;
-        let req = Request::new(GenerallyLockRequest { args: request_string });
+
+        let req = Request::new(GenerallyLockRequest {
+            args: request_string.clone(),
+        });
         let resp = client
             .un_lock(req)
             .await
             .map_err(|e| LockError::internal(e.to_string()))?
             .into_inner();
+
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
         }
@@ -154,7 +161,7 @@ impl LockClient for RemoteClient {
     }
 
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
-        info!("remote refresh for {}", lock_id);
+        info!("grpc refresh for {}", lock_id);
         let refresh_request = Self::create_unlock_request(lock_id);
         let mut client = self.get_client().await?;
         let req = Request::new(GenerallyLockRequest {
@@ -173,7 +180,7 @@ impl LockClient for RemoteClient {
     }
 
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
-        info!("remote force_release for {}", lock_id);
+        info!("grpc force_release for {}", lock_id);
         let force_request = Self::create_unlock_request(lock_id);
         let mut client = self.get_client().await?;
         let req = Request::new(GenerallyLockRequest {
@@ -192,7 +199,7 @@ impl LockClient for RemoteClient {
     }
 
     async fn check_status(&self, lock_id: &LockId) -> Result<Option<LockInfo>> {
-        info!("remote check_status for {}", lock_id);
+        info!("grpc check_status for {}", lock_id);
 
         // Since there's no direct status query in the gRPC service,
         // we attempt a non-blocking lock acquisition to check if the resource is available
@@ -260,7 +267,7 @@ impl LockClient for RemoteClient {
     }
 
     async fn get_stats(&self) -> Result<LockStats> {
-        info!("remote get_stats from {}", self.addr);
+        info!("grpc get_stats from {}", self.addr);
 
         // Since there's no direct statistics endpoint in the gRPC service,
         // we return basic stats indicating this is a remote client
@@ -269,12 +276,6 @@ impl LockClient for RemoteClient {
             ..Default::default()
         };
 
-        // We could potentially enhance this by:
-        // 1. Keeping local counters of operations performed
-        // 2. Adding a stats gRPC method to the service
-        // 3. Querying server health endpoints
-
-        // For now, return minimal stats indicating remote connectivity
         Ok(stats)
     }
 
@@ -287,7 +288,7 @@ impl LockClient for RemoteClient {
         let mut client = match self.get_client().await {
             Ok(client) => client,
             Err(_) => {
-                info!("remote client {} connection failed", self.addr);
+                info!("grpc client {} connection failed", self.addr);
                 return false;
             }
         };
@@ -299,11 +300,11 @@ impl LockClient for RemoteClient {
 
         match client.ping(ping_req).await {
             Ok(_) => {
-                info!("remote client {} is online", self.addr);
+                info!("grpc client {} is online", self.addr);
                 true
             }
             Err(_) => {
-                info!("remote client {} ping failed", self.addr);
+                info!("grpc client {} ping failed", self.addr);
                 false
             }
         }

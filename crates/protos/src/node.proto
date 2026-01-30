@@ -445,6 +445,7 @@ message GenerallyLockRequest {
 message GenerallyLockResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional string lock_info = 3; // JSON serialized LockInfo
 }
 
 message Mss {
@@ -813,8 +814,6 @@ service NodeService {
 
   rpc Lock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc UnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
-  rpc RLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
-  rpc RUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc ForceUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc Refresh(GenerallyLockRequest) returns (GenerallyLockResponse) {};
 

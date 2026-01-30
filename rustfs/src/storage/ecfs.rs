@@ -111,6 +111,8 @@ use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},
 };
+use rustfs_utils::http::RUSTFS_FORCE_DELETE;
+use rustfs_utils::string::parse_bool;
 use rustfs_utils::{
     CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
     get_request_user_agent,
@@ -1357,19 +1359,37 @@ impl S3 for FS {
 
     /// Delete a bucket
     #[instrument(level = "debug", skip(self, req))]
-    async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+    async fn delete_bucket(&self, mut req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let helper = OperationHelper::new(&req, EventName::BucketRemoved, "s3:DeleteBucket");
-        let input = req.input;
+        let input = req.input.clone();
         // TODO: DeleteBucketInput doesn't have force parameter?
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        // get value from header, support mc style
+        let force_str = req
+            .headers
+            .get(RUSTFS_FORCE_DELETE)
+            .map(|v| v.to_str().unwrap_or_default())
+            .unwrap_or(
+                req.headers
+                    .get("x-minio-force-delete")
+                    .map(|v| v.to_str().unwrap_or_default())
+                    .unwrap_or_default(),
+            );
+
+        let force = parse_bool(force_str).unwrap_or_default();
+
+        if force {
+            authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
+        }
+
         store
             .delete_bucket(
                 &input.bucket,
                 &DeleteBucketOptions {
-                    force: false,
+                    force,
                     ..Default::default()
                 },
             )
@@ -4504,8 +4524,6 @@ impl S3 for FS {
             sse_customer_key_md5,
             ssekms_key_id,
             content_md5,
-            if_match,
-            if_none_match,
             ..
         } = input;
 
@@ -4536,46 +4554,6 @@ impl S3 for FS {
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
-                }
-            }
-        }
-
-        if if_match.is_some() || if_none_match.is_some() {
-            let Some(store) = new_object_layer_fn() else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-            };
-
-            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-                Ok(info) => {
-                    if !info.delete_marker {
-                        if let Some(ifmatch) = if_match
-                            && let Some(strong_etag) = ifmatch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                        if let Some(ifnonematch) = if_none_match
-                            && let Some(strong_etag) = ifnonematch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                    }
-                }
-                Err(err) => {
-                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                        return Err(ApiError::from(err).into());
-                    }
-
-                    if if_match.is_some() && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
-                        return Err(ApiError::from(err).into());
-                    }
                 }
             }
         }

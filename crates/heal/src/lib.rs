@@ -14,38 +14,36 @@
 
 mod error;
 pub mod heal;
-pub mod scanner;
 
 pub use error::{Error, Result};
 pub use heal::{HealManager, HealOptions, HealPriority, HealRequest, HealType, channel::HealChannelProcessor};
-pub use scanner::Scanner;
 use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-// Global cancellation token for AHM services (scanner and other background tasks)
+// Global cancellation token for heal and related services
 static GLOBAL_AHM_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
 
-/// Initialize the global AHM services cancellation token
+/// Initialize the global heal services cancellation token
 pub fn init_ahm_services_cancel_token(cancel_token: CancellationToken) -> Result<()> {
     GLOBAL_AHM_SERVICES_CANCEL_TOKEN
         .set(cancel_token)
-        .map_err(|_| Error::Config("AHM services cancel token already initialized".to_string()))
+        .map_err(|_| Error::Config("Heal services cancel token already initialized".to_string()))
 }
 
-/// Get the global AHM services cancellation token
+/// Get the global heal services cancellation token
 pub fn get_ahm_services_cancel_token() -> Option<&'static CancellationToken> {
     GLOBAL_AHM_SERVICES_CANCEL_TOKEN.get()
 }
 
-/// Create and initialize the global AHM services cancellation token
+/// Create and initialize the global heal services cancellation token
 pub fn create_ahm_services_cancel_token() -> CancellationToken {
     let cancel_token = CancellationToken::new();
-    init_ahm_services_cancel_token(cancel_token.clone()).expect("AHM services cancel token already initialized");
+    init_ahm_services_cancel_token(cancel_token.clone()).expect("Heal services cancel token already initialized");
     cancel_token
 }
 
-/// Shutdown all AHM services gracefully
+/// Shutdown all heal services gracefully
 pub fn shutdown_ahm_services() {
     if let Some(cancel_token) = GLOBAL_AHM_SERVICES_CANCEL_TOKEN.get() {
         cancel_token.cancel();
