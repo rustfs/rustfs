@@ -42,9 +42,9 @@ use crate::server::{
 };
 use clap::Parser;
 use license::init_license;
-use rustfs_ahm::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
+use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
     StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
@@ -59,6 +59,9 @@ use rustfs_ecstore::{
     store::init_local_disks,
     store_api::BucketOptions,
     update_erasure_type,
+};
+use rustfs_heal::{
+    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
 use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
@@ -189,6 +192,14 @@ async fn run(opt: config::Opt) -> Result<()> {
         .await
         .map_err(Error::other)?;
 
+    set_global_endpoints(endpoint_pools.as_ref().clone());
+    update_erasure_type(setup_type).await;
+
+    // Initialize the local disk
+    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
+    // Initialize the lock clients
+    init_lock_clients(endpoint_pools.clone());
+
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
             target: "rustfs::main::run",
@@ -241,12 +252,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     } else {
         None
     };
-
-    set_global_endpoints(endpoint_pools.as_ref().clone());
-    update_erasure_type(setup_type).await;
-
-    // Initialize the local disk
-    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
 
     let ctx = CancellationToken::new();
 

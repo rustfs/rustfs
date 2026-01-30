@@ -2813,6 +2813,11 @@ mod test {
         let disk_info = disk.disk_info(&disk_info_opts).await.unwrap();
 
         // Basic checks on disk info
+        // Note: On macOS and some other Unix systems, fs_type may be empty
+        // because statvfs does not provide filesystem type information.
+        // This is a platform limitation, not a bug.
+        #[cfg(not(target_os = "macos"))]
+        assert!(!disk_info.fs_type.is_empty(), "fs_type should not be empty on this platform");
         assert!(disk_info.total > 0);
         assert!(disk_info.free <= disk_info.total);
         assert!(!disk_info.mount_path.is_empty());
