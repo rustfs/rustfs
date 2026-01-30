@@ -34,7 +34,7 @@ use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::data_usage::{compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend};
+use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
@@ -519,40 +519,6 @@ impl Operation for DataUsageInfoHandler {
             error!("load_data_usage_from_backend failed {:?}", e);
             s3_error!(InternalError, "load_data_usage_from_backend failed")
         })?;
-
-        let last_update_age = info.last_update.and_then(|ts| ts.elapsed().ok());
-        let data_missing = info.objects_total_count == 0 && info.buckets_count == 0;
-        let stale = last_update_age
-            .map(|elapsed| elapsed > std::time::Duration::from_secs(300))
-            .unwrap_or(true);
-
-        if data_missing {
-            info!("No data usage statistics found, attempting real-time collection");
-
-            if let Err(e) = collect_realtime_data_usage(&mut info, store.clone()).await {
-                warn!("Failed to collect real-time data usage: {}", e);
-            } else if let Err(e) = store_data_usage_in_backend(info.clone(), store.clone()).await {
-                warn!("Failed to persist refreshed data usage: {}", e);
-            }
-        } else if stale {
-            info!(
-                "Data usage statistics are stale (last update {:?} ago), refreshing asynchronously",
-                last_update_age
-            );
-
-            let mut info_for_refresh = info.clone();
-            let store_for_refresh = store.clone();
-            spawn(async move {
-                if let Err(e) = collect_realtime_data_usage(&mut info_for_refresh, store_for_refresh.clone()).await {
-                    warn!("Background data usage refresh failed: {}", e);
-                    return;
-                }
-
-                if let Err(e) = store_data_usage_in_backend(info_for_refresh, store_for_refresh).await {
-                    warn!("Background data usage persistence failed: {}", e);
-                }
-            });
-        }
 
         let sinfo = store.storage_info().await;
 
@@ -1308,62 +1274,6 @@ impl Operation for RemoveRemoteTargetHandler {
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
-}
-
-/// Real-time data collection function
-async fn collect_realtime_data_usage(
-    info: &mut rustfs_common::data_usage::DataUsageInfo,
-    store: Arc<rustfs_ecstore::store::ECStore>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Get bucket list and collect basic statistics
-    let buckets = store.list_bucket(&BucketOptions::default()).await?;
-
-    info.buckets_count = buckets.len() as u64;
-    info.last_update = Some(std::time::SystemTime::now());
-    info.buckets_usage.clear();
-    info.bucket_sizes.clear();
-    info.disk_usage_status.clear();
-    info.objects_total_count = 0;
-    info.objects_total_size = 0;
-    info.versions_total_count = 0;
-    info.delete_markers_total_count = 0;
-
-    let mut total_objects = 0u64;
-    let mut total_versions = 0u64;
-    let mut total_size = 0u64;
-    let mut total_delete_markers = 0u64;
-
-    // For each bucket, try to get object count
-    for bucket_info in buckets {
-        let bucket_name = &bucket_info.name;
-
-        // Skip system buckets
-        if bucket_name.starts_with('.') {
-            continue;
-        }
-
-        match compute_bucket_usage(store.clone(), bucket_name).await {
-            Ok(bucket_usage) => {
-                total_objects = total_objects.saturating_add(bucket_usage.objects_count);
-                total_versions = total_versions.saturating_add(bucket_usage.versions_count);
-                total_size = total_size.saturating_add(bucket_usage.size);
-                total_delete_markers = total_delete_markers.saturating_add(bucket_usage.delete_markers_count);
-
-                info.buckets_usage.insert(bucket_name.clone(), bucket_usage.clone());
-                info.bucket_sizes.insert(bucket_name.clone(), bucket_usage.size);
-            }
-            Err(e) => {
-                warn!("Failed to compute bucket usage for {}: {}", bucket_name, e);
-            }
-        }
-    }
-
-    info.objects_total_count = total_objects;
-    info.objects_total_size = total_size;
-    info.versions_total_count = total_versions;
-    info.delete_markers_total_count = total_delete_markers;
-
-    Ok(())
 }
 
 pub struct ProfileHandler {}
