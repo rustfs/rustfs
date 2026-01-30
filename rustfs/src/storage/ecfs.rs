@@ -3697,6 +3697,8 @@ impl S3 for FS {
                     let req_info = req_clone.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
                     req_info.bucket = Some(info.name.clone());
 
+                    warn!("list_bucket_infos bucket: {:?}", &info.name);
+
                     if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
                         .await
                         .is_ok()
