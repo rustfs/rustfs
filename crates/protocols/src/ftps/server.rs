@@ -98,6 +98,11 @@ where
             server_builder = server_builder.passive_host(external_ip.as_str());
         }
 
+        // Configure both active and passive mode support
+        use libunftp::options::ActivePassiveMode;
+        server_builder = server_builder.active_passive_mode(ActivePassiveMode::ActiveAndPassive);
+        info!("FTPS server configured for both active and passive mode support");
+
         // Configure FTPS / TLS
         if self.config.tls_enabled {
             if let Some(cert_dir) = &self.config.cert_dir {

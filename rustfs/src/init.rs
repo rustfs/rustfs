@@ -317,6 +317,81 @@ pub(crate) fn init_buffer_profile_system(opt: &config::Opt) {
     }
 }
 
+/// Initialize the FTP system
+///
+/// This function initializes the FTP server (non-encrypted) if enabled in the configuration.
+#[cfg(feature = "ftps")]
+#[instrument(skip_all)]
+pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+    {
+        use crate::protocols::ProtocolStorageClient;
+        use rustfs_config::{DEFAULT_FTP_ADDRESS, ENV_FTP_ADDRESS, ENV_FTP_ENABLE, ENV_FTP_EXTERNAL_IP, ENV_FTP_PASSIVE_PORTS};
+        use rustfs_protocols::constants::defaults::DEFAULT_FTPS_PASSIVE_PORTS;
+        use rustfs_protocols::{FtpsConfig, FtpsServer};
+        // Check if FTP is enabled
+        let ftp_enable = rustfs_utils::get_env_bool(ENV_FTP_ENABLE, false);
+        if !ftp_enable {
+            debug!("FTP system is disabled");
+            return Ok(None);
+        }
+
+        // Parse FTP address - force IPv4 for libunftp compatibility
+        let ftp_address_str = rustfs_utils::get_env_str(ENV_FTP_ADDRESS, DEFAULT_FTP_ADDRESS);
+        let addr = rustfs_utils::net::parse_and_resolve_address(&ftp_address_str)
+            .map_err(|e| format!("Invalid FTP address '{ftp_address_str}': {e}"))?;
+        // Force IPv4 binding to avoid libunftp IPv6 compatibility issues
+        let addr = if addr.is_ipv6() {
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), addr.port())
+        } else {
+            addr
+        };
+
+        // Get FTP configuration from environment variables
+        let passive_ports =
+            rustfs_utils::get_env_opt_str(ENV_FTP_PASSIVE_PORTS).or_else(|| Some(DEFAULT_FTPS_PASSIVE_PORTS.to_string())); // Default passive ports range
+        let external_ip = rustfs_utils::get_env_opt_str(ENV_FTP_EXTERNAL_IP);
+
+        // Create FTP configuration (TLS disabled, FTPS not required)
+        let config = FtpsConfig {
+            bind_addr: addr,
+            passive_ports,
+            external_ip,
+            ftps_required: false,
+            tls_enabled: false,
+            cert_dir: None,
+            ca_file: None,
+        };
+
+        // Validate FTP configuration
+        config.validate().await?;
+
+        // Create FTP server with protocol storage client
+        let fs = crate::storage::ecfs::FS::new();
+        let storage_client = ProtocolStorageClient::new(fs);
+        let server: FtpsServer<crate::protocols::ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+
+        // Log server configuration
+        info!(
+            "FTP server configured on {} with passive ports {:?}",
+            server.config().bind_addr,
+            server.config().passive_ports
+        );
+
+        // Start FTP server in background task with proper shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        tokio::spawn(async move {
+            if let Err(e) = server.start(shutdown_rx).await {
+                error!("FTP server error: {}", e);
+            }
+            info!("FTP server shutdown completed");
+        });
+
+        info!("FTP system initialized successfully");
+        Ok(Some(shutdown_tx))
+    }
+}
+
 /// Initialize the FTPS system
 ///
 /// This function initializes the FTPS server if enabled in the configuration.
@@ -331,8 +406,8 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
             DEFAULT_FTPS_ADDRESS, ENV_FTPS_ADDRESS, ENV_FTPS_CA_FILE, ENV_FTPS_CERTS_DIR, ENV_FTPS_ENABLE, ENV_FTPS_EXTERNAL_IP,
             ENV_FTPS_PASSIVE_PORTS, ENV_FTPS_TLS_ENABLED,
         };
+        use rustfs_protocols::constants::defaults::DEFAULT_FTPS_PASSIVE_PORTS;
         use rustfs_protocols::{FtpsConfig, FtpsServer};
-        use std::net::SocketAddr;
         // Check if FTPS is enabled
         let ftps_enable = rustfs_utils::get_env_bool(ENV_FTPS_ENABLE, false);
         if !ftps_enable {
@@ -340,17 +415,23 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
             return Ok(None);
         }
 
-        // Parse FTPS address
+        // Parse FTPS address - force IPv4 for libunftp compatibility
         let ftps_address_str = rustfs_utils::get_env_str(ENV_FTPS_ADDRESS, DEFAULT_FTPS_ADDRESS);
-        let addr: SocketAddr = ftps_address_str
-            .parse()
+        let addr = rustfs_utils::net::parse_and_resolve_address(&ftps_address_str)
             .map_err(|e| format!("Invalid FTPS address '{ftps_address_str}': {e}"))?;
+        // Force IPv4 binding to avoid libunftp IPv6 compatibility issues
+        let addr = if addr.is_ipv6() {
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), addr.port())
+        } else {
+            addr
+        };
 
         // Get FTPS configuration from environment variables
         let tls_enabled = rustfs_utils::get_env_bool(ENV_FTPS_TLS_ENABLED, true);
         let cert_dir = rustfs_utils::get_env_opt_str(ENV_FTPS_CERTS_DIR);
         let ca_file = rustfs_utils::get_env_opt_str(ENV_FTPS_CA_FILE);
-        let passive_ports = rustfs_utils::get_env_opt_str(ENV_FTPS_PASSIVE_PORTS);
+        let passive_ports =
+            rustfs_utils::get_env_opt_str(ENV_FTPS_PASSIVE_PORTS).or_else(|| Some(DEFAULT_FTPS_PASSIVE_PORTS.to_string())); // Default passive ports range
         let external_ip = rustfs_utils::get_env_opt_str(ENV_FTPS_EXTERNAL_IP);
 
         // Create FTPS configuration
@@ -405,10 +486,10 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
-            ENV_SFTP_ADDRESS, ENV_SFTP_AUTHORIZED_KEYS, ENV_SFTP_CA_FILE, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR,
+            DEFAULT_SFTP_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_AUTHORIZED_KEYS, ENV_SFTP_CA_FILE, ENV_SFTP_ENABLE,
+            ENV_SFTP_HOST_KEY_DIR,
         };
         use rustfs_protocols::{SftpConfig, SftpServer};
-        use std::net::SocketAddr;
         // Check if SFTP is enabled
         let sftp_enable = rustfs_utils::get_env_bool(ENV_SFTP_ENABLE, false);
         if !sftp_enable {
@@ -417,9 +498,8 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
         }
 
         // Parse SFTP address
-        let sftp_address_str = rustfs_utils::get_env_str(ENV_SFTP_ADDRESS, "0.0.0.0:8022");
-        let addr: SocketAddr = sftp_address_str
-            .parse()
+        let sftp_address_str = rustfs_utils::get_env_str(ENV_SFTP_ADDRESS, DEFAULT_SFTP_ADDRESS);
+        let addr = rustfs_utils::net::parse_and_resolve_address(&sftp_address_str)
             .map_err(|e| format!("Invalid SFTP address '{sftp_address_str}': {e}"))?;
 
         // Get SFTP configuration from environment variables

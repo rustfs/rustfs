@@ -31,10 +31,10 @@ use crate::init::{
     add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
 };
 
-#[cfg(feature = "ftps")]
-use crate::init::init_ftps_system;
 #[cfg(feature = "sftp")]
 use crate::init::init_sftp_system;
+#[cfg(feature = "ftps")]
+use crate::init::{init_ftp_system, init_ftps_system};
 
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
@@ -277,6 +277,26 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
 
+    // Initialize FTP system if enabled
+    #[cfg(feature = "ftps")]
+    let ftp_shutdown_tx = match init_ftp_system().await {
+        Ok(Some(tx)) => {
+            info!("FTP system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("FTP system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize FTP system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "ftps"))]
+    let ftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+
     // Initialize FTPS system if enabled
     #[cfg(feature = "ftps")]
     let ftps_shutdown_tx = match init_ftps_system().await {
@@ -429,6 +449,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                 &state_manager,
                 s3_shutdown_tx,
                 console_shutdown_tx,
+                ftp_shutdown_tx,
                 ftps_shutdown_tx,
                 sftp_shutdown_tx,
                 ctx.clone(),
@@ -441,6 +462,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                 &state_manager,
                 s3_shutdown_tx,
                 console_shutdown_tx,
+                ftp_shutdown_tx,
                 ftps_shutdown_tx,
                 sftp_shutdown_tx,
                 ctx.clone(),
@@ -458,6 +480,7 @@ async fn handle_shutdown(
     state_manager: &ServiceStateManager,
     s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    ftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     sftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ctx: CancellationToken,
@@ -495,7 +518,15 @@ async fn handle_shutdown(
         );
     }
 
-    // Shutdown FTPS and SFTP servers
+    // Shutdown FTP, FTPS and SFTP servers
+    if let Some(ftp_shutdown_tx) = ftp_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down FTP server..."
+        );
+        let _ = ftp_shutdown_tx.send(());
+    }
+
     if let Some(ftps_shutdown_tx) = ftps_shutdown_tx {
         info!(
             target: "rustfs::main::handle_shutdown",
