@@ -41,7 +41,7 @@ use rustfs_rio::{HashReader, WarpReader};
 use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use rustfs_workers::workers::Workers;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
@@ -49,7 +49,7 @@ use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub const POOL_META_NAME: &str = "pool.bin";
 pub const POOL_META_FORMAT: u16 = 1;
@@ -1404,30 +1404,26 @@ fn is_disk_online_state(state: &str) -> bool {
     true
 }
 
+#[deprecated(since = "0.1.0", note = "Use fallback_total_capacity_dedup instead")]
+#[allow(dead_code)]
 fn fallback_total_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
-    disks
-        .iter()
-        .filter(|d| is_disk_online_state(&d.state))
-        .map(|d| d.total_space as usize)
-        .sum()
+    fallback_total_capacity_dedup(disks)
 }
 
+#[deprecated(since = "0.1.0", note = "Use fallback_free_capacity_dedup instead")]
+#[allow(dead_code)]
 fn fallback_free_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
-    disks
-        .iter()
-        .filter(|d| is_disk_online_state(&d.state))
-        .map(|d| d.available_space as usize)
-        .sum()
+    fallback_free_capacity_dedup(disks)
 }
 
 pub fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
     // If backend info is missing or inconsistent, do a safe fallback to avoid reporting nonsense.
     if info.backend.standard_sc_data.is_empty() {
-        return fallback_total_capacity(disks);
+        return fallback_total_capacity_dedup(disks);
     }
-
     let mut capacity = 0usize;
     let mut matched_any = false;
+    let mut counted_disks: HashSet<String> = HashSet::new();
 
     for disk in disks.iter() {
         if disk.pool_index < 0 {
@@ -1444,8 +1440,27 @@ pub fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_ma
         }
 
         if (disk.disk_index as usize) < usable_disks_per_set {
-            matched_any = true;
-            capacity += disk.total_space as usize;
+            // 🔧 Generate a unique identity using a combination of fields
+            let disk_key = format!(
+                "{}|{}|p{}s{}d{}",
+                disk.endpoint,   // Node address
+                disk.drive_path, // mount path
+                disk.pool_index, // Pool index
+                disk.set_index,  // Collection index
+                disk.disk_index  // Disk index
+            );
+            debug!("get_total_usable_capacity disk_key: {}", disk_key);
+            // 🔧 Only disks that have not been counted are counted towards capacity
+            if counted_disks.insert(disk_key) {
+                matched_any = true;
+                capacity += disk.total_space as usize;
+            } else {
+                // Log duplicate disks: this likely indicates a configuration issue and should always be visible.
+                warn!(
+                    "Duplicate disk detected in capacity calculation: {} at {}",
+                    disk.endpoint, disk.drive_path
+                );
+            }
         }
     }
 
@@ -1454,17 +1469,18 @@ pub fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_ma
     } else {
         // Even if standard_sc_data exists, it might not match disk indexes due to upstream bugs.
         // Fallback to summing all online disks to prevent under-reporting.
-        fallback_total_capacity(disks)
+        fallback_total_capacity_dedup(disks)
     }
 }
 
 pub fn get_total_usable_capacity_free(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
     if info.backend.standard_sc_data.is_empty() {
-        return fallback_free_capacity(disks);
+        return fallback_free_capacity_dedup(disks);
     }
 
     let mut capacity = 0usize;
     let mut matched_any = false;
+    let mut counted_disks: HashSet<String> = HashSet::new();
 
     for disk in disks.iter() {
         if disk.pool_index < 0 {
@@ -1481,14 +1497,68 @@ pub fn get_total_usable_capacity_free(disks: &[rustfs_madmin::Disk], info: &rust
         }
 
         if (disk.disk_index as usize) < usable_disks_per_set {
-            matched_any = true;
-            capacity += disk.available_space as usize;
+            let disk_key = format!(
+                "{}|{}|p{}s{}d{}",
+                disk.endpoint, disk.drive_path, disk.pool_index, disk.set_index, disk.disk_index
+            );
+
+            if counted_disks.insert(disk_key) {
+                matched_any = true;
+                capacity += disk.available_space as usize;
+            }
         }
     }
 
     if matched_any {
         capacity
     } else {
-        fallback_free_capacity(disks)
+        fallback_free_capacity_dedup(disks)
     }
+}
+
+/// Total fallback capacity calculation with deweight
+///
+/// Replace original function: fallback_total_capacity()
+pub(crate) fn fallback_total_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usize {
+    let mut counted_disks: HashSet<String> = HashSet::new();
+    let mut total = 0usize;
+
+    for disk in disks.iter() {
+        // Only online disks are counted
+        if !is_disk_online_state(&disk.state) {
+            continue;
+        }
+
+        // Use endpoint + drive_path as a unique identifier
+        let disk_key = format!("{}|{}", disk.endpoint, disk.drive_path);
+
+        // Capacity is counted only when the disk is encountered for the first time
+        if counted_disks.insert(disk_key) {
+            total += disk.total_space as usize;
+        }
+    }
+
+    total
+}
+
+/// Remove the heavy fallback idle capacity calculation
+///
+/// Replace original function: fallback_free_capacity()
+pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usize {
+    let mut counted_disks: HashSet<String> = HashSet::new();
+    let mut total = 0usize;
+
+    for disk in disks.iter() {
+        if !is_disk_online_state(&disk.state) {
+            continue;
+        }
+
+        let disk_key = format!("{}|{}", disk.endpoint, disk.drive_path);
+
+        if counted_disks.insert(disk_key) {
+            total += disk.available_space as usize;
+        }
+    }
+
+    total
 }
