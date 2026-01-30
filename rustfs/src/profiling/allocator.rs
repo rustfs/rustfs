@@ -374,7 +374,6 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::alloc::System;
-    use std::sync::Arc;
     use std::thread;
     use tempfile::NamedTempFile;
 
