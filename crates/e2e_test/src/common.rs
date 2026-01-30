@@ -374,3 +374,153 @@ pub async fn awscurl_delete(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     execute_awscurl(url, "DELETE", None, access_key, secret_key).await
 }
+
+pub struct ClusterNode {
+    pub address: String,
+    pub url: String,
+    pub data_dir: String,
+    pub process: Option<Child>,
+}
+
+pub struct RustFSTestClusterEnvironment {
+    pub nodes: Vec<ClusterNode>,
+    pub temp_dir: String,
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+impl RustFSTestClusterEnvironment {
+    pub async fn new(node_count: usize) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let temp_dir = format!("/tmp/rustfs_cluster_test_{}", Uuid::new_v4());
+        fs::create_dir_all(&temp_dir).await?;
+
+        let mut nodes = Vec::with_capacity(node_count);
+        for i in 0..node_count {
+            let port = RustFSTestEnvironment::find_available_port().await?;
+            let address = format!("127.0.0.1:{}", port);
+            let url = format!("http://{}", address);
+            let data_dir = format!("{}/node{}", temp_dir, i);
+            fs::create_dir_all(&data_dir).await?;
+
+            nodes.push(ClusterNode {
+                address,
+                url,
+                data_dir,
+                process: None,
+            });
+        }
+
+        Ok(Self {
+            nodes,
+            temp_dir,
+            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            secret_key: DEFAULT_SECRET_KEY.to_string(),
+        })
+    }
+
+    fn build_volumes_arg(&self) -> String {
+        self.nodes
+            .iter()
+            .map(|n| format!("http://{}{}", n.address, n.data_dir))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        let volumes_arg = self.build_volumes_arg();
+
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            info!("Starting cluster node {} on {}", i, node.address);
+
+            let process = Command::new(&binary_path)
+                .env("RUSTFS_VOLUMES", &volumes_arg)
+                .env("RUSTFS_ADDRESS", &node.address)
+                .env("RUSTFS_ACCESS_KEY", &self.access_key)
+                .env("RUSTFS_SECRET_KEY", &self.secret_key)
+                .env("RUSTFS_CONSOLE_ENABLE", "false")
+                .current_dir(&node.data_dir)
+                .spawn()?;
+
+            node.process = Some(process);
+        }
+
+        for (i, node) in self.nodes.iter().enumerate() {
+            self.wait_for_node_ready(&node.address, i).await?;
+        }
+
+        self.wait_for_service_ready().await?;
+
+        Ok(())
+    }
+
+    async fn wait_for_node_ready(&self, address: &str, idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for attempt in 0..60 {
+            if TcpStream::connect(address).await.is_ok() {
+                info!("Node {} ({}) TCP ready after {} attempts", idx, address, attempt + 1);
+                return Ok(());
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        Err(format!("Node {} failed to become ready", idx).into())
+    }
+
+    async fn wait_for_service_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.create_s3_client(0);
+
+        for attempt in 0..120 {
+            match client.list_buckets().send().await {
+                Ok(_) => {
+                    info!("Cluster service ready after {} attempts", attempt + 1);
+                    return Ok(());
+                }
+                Err(_) => {
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+        Err("Cluster service failed to become ready".into())
+    }
+
+    pub fn create_s3_client(&self, node_idx: usize) -> Client {
+        let credentials = Credentials::new(&self.access_key, &self.secret_key, None, None, "cluster-test");
+        let config = Config::builder()
+            .credentials_provider(credentials)
+            .region(Region::new("us-east-1"))
+            .endpoint_url(&self.nodes[node_idx].url)
+            .force_path_style(true)
+            .behavior_version_latest()
+            .build();
+        Client::from_conf(config)
+    }
+
+    pub fn create_all_clients(&self) -> Vec<Client> {
+        (0..self.nodes.len()).map(|i| self.create_s3_client(i)).collect()
+    }
+
+    pub async fn create_test_bucket(&self, bucket_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.create_s3_client(0);
+        client.create_bucket().bucket(bucket_name).send().await?;
+        info!("Created test bucket: {}", bucket_name);
+        Ok(())
+    }
+
+    pub fn stop(&mut self) {
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            if let Some(mut process) = node.process.take() {
+                info!("Stopping cluster node {}", i);
+                let _ = process.kill();
+                let _ = process.wait();
+            }
+        }
+    }
+}
+
+impl Drop for RustFSTestClusterEnvironment {
+    fn drop(&mut self) {
+        self.stop();
+        if let Err(e) = std::fs::remove_dir_all(&self.temp_dir) {
+            warn!("Failed to clean up cluster temp directory {}: {}", self.temp_dir, e);
+        }
+    }
+}
