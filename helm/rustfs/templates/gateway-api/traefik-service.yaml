@@ -1,4 +1,4 @@
-{{- if eq .Values.gatewayApi.gatewayClass "traefik" -}}
+{{- if eq .Values.gatewayApi.gatewayClass "traefik" }}
 apiVersion: traefik.io/v1alpha1
 kind: TraefikService
 metadata:
@@ -15,4 +15,6 @@ spec:
           cookie:
             name: rustfs
             httpOnly: true
+            secure: true
+            sameSite: none
 {{- end }}
