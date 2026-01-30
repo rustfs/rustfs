@@ -177,7 +177,6 @@ fn dump_profile_inner(path: &Path) -> Result<(), String> {
     profile.string_table.push("count".to_string()); // 2
     profile.string_table.push("alloc_space".to_string()); // 3
     profile.string_table.push("bytes".to_string()); // 4
-    // "space" was unused, removed.
 
     let sample_type_count = pb::ValueType {
         ty: 1,   // "alloc_objects"
@@ -219,11 +218,10 @@ fn dump_profile_inner(path: &Path) -> Result<(), String> {
     // Map: Arc pointer -> (Count, Bytes, Arc<Vec<usize>>)
     let mut aggregated_samples: HashMap<*const Vec<usize>, (i64, i64, Arc<Vec<usize>>)> = HashMap::new();
 
-    // Iterate over all live allocations
+    // Step 1: Collect data from LIVE_ALLOCATIONS while holding the lock (implicitly via iter)
+    // We do NOT perform symbol resolution here to avoid deadlocks.
     for entry in LIVE_ALLOCATIONS.iter() {
         let (_ptr, (size, stack_arc)) = entry;
-        // stack_arc is likely &Arc<Vec<usize>> because ShardedHashMap iterator yields references to values.
-        // We need to clone the Arc to keep it alive and get a raw pointer for the key.
         let stack_arc_clone = stack_arc.clone();
         let key = Arc::as_ptr(&stack_arc_clone);
 
@@ -231,8 +229,9 @@ fn dump_profile_inner(path: &Path) -> Result<(), String> {
         agg.0 += 1;
         agg.1 += size as i64;
     }
+    // LIVE_ALLOCATIONS lock is released here as the iterator is dropped.
 
-    // Build Profile
+    // Step 2: Process samples and resolve symbols (outside of LIVE_ALLOCATIONS lock)
     for (_key, (count, bytes, frames)) in aggregated_samples {
         let mut sample = pb::Sample::default();
         sample.value = vec![count, bytes];
@@ -243,6 +242,7 @@ fn dump_profile_inner(path: &Path) -> Result<(), String> {
                 id
             } else {
                 // Resolve symbol
+                // This might take time and locks, but we are safe now.
                 let mut func_name = "unknown".to_string();
                 let mut file_name = "unknown".to_string();
                 let mut line_no = 0;
@@ -460,10 +460,13 @@ mod tests {
     #[serial]
     fn test_profile_dump() {
         set_enabled(true);
-        set_sample_rate(1);
+        // Use a larger sample rate to avoid capturing too much noise from the test runner
+        // and ensure we only capture our large allocation.
+        set_sample_rate(1024 * 1024);
 
         unsafe {
-            let layout = Layout::from_size_align(512, 8).unwrap();
+            // Allocate a large enough chunk to likely be sampled (2MB > 1MB rate)
+            let layout = Layout::from_size_align(2 * 1024 * 1024, 8).unwrap();
             let ptr = TEST_ALLOCATOR.alloc(layout);
 
             let file = NamedTempFile::new().unwrap();
