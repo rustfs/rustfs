@@ -1,0 +1,19 @@
+{{- if eq .Values.gatewayApi.gatewayClass "traefik" }}
+apiVersion: traefik.io/v1alpha1
+kind: TraefikService
+metadata:
+  name: {{ include "rustfs.fullname" . }}-sticky-svc
+spec:
+  weighted:
+    services:
+      - name: {{ include "rustfs.fullname" . }}-svc
+        namespace: {{ .Release.Namespace }}
+        port: {{ .Values.service.console.port }}
+        weight: 1
+        sticky:
+          cookie:
+            name: rustfs
+            httpOnly: true
+            secure: true
+            sameSite: none
+{{- end }}
