@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 pub mod allocator;
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
