@@ -141,7 +141,6 @@ gatewayApi:
   enabled: false
   gatewayClass: traefik
   hostname: example.rustfs.com
-  secretName: secret-tls
   existingGateway:
     name: ""
     namespace: ""
