@@ -39,7 +39,7 @@ workspace = true
 
 [dependencies]
 # RustFS Internal Crates
-rustfs-ahm = { workspace = true }
+rustfs-heal = { workspace = true }
 rustfs-appauth = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }

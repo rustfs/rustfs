@@ -617,7 +617,7 @@ impl FileMeta {
     // delete_version deletes version, returns data_dir
     #[tracing::instrument(skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
-        let vid = fi.version_id.or(Some(Uuid::nil()));
+        let vid = Some(fi.version_id.unwrap_or(Uuid::nil()));
 
         let mut ventry = FileMetaVersion::default();
         if fi.deleted {
@@ -1725,13 +1725,9 @@ impl From<FileMetaVersion> for FileMetaVersionHeader {
             f
         };
 
-        let (ec_n, ec_m) = if value.version_type == VersionType::Object {
-            value
-                .object
-                .as_ref()
-                .map_or((0, 0), |o| (o.erasure_n as u8, o.erasure_m as u8))
-        } else {
-            (0, 0)
+        let (ec_n, ec_m) = match (value.version_type == VersionType::Object, value.object.as_ref()) {
+            (true, Some(obj)) => (obj.erasure_n as u8, obj.erasure_m as u8),
+            _ => (0, 0),
         };
 
         Self {

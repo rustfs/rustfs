@@ -472,8 +472,8 @@ impl HealManager {
             let config = config.read().await;
             config.heal_interval
         };
-        if duration < Duration::from_secs(1) {
-            duration = Duration::from_secs(1);
+        if duration < Duration::from_secs(10) {
+            duration = Duration::from_secs(10);
         }
         info!("start_auto_disk_scanner: Starting auto disk scanner with interval: {:?}", duration);
 
