@@ -369,3 +369,140 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for TracingAllocator<A> {
         new_ptr
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::alloc::System;
+    use std::thread;
+    use tempfile::NamedTempFile;
+
+    // Use System allocator for testing
+    static TEST_ALLOCATOR: TracingAllocator<System> = TracingAllocator::new(System);
+
+    #[test]
+    fn test_basic_allocation_tracking() {
+        // Enable profiling and force sampling (rate = 1 means sample everything)
+        set_enabled(true);
+        set_sample_rate(1);
+
+        unsafe {
+            let layout = Layout::from_size_align(1024, 8).unwrap();
+            let ptr = TEST_ALLOCATOR.alloc(layout);
+            assert!(!ptr.is_null());
+
+            // Verify allocation is recorded
+            assert!(LIVE_ALLOCATIONS.get(&(ptr as usize)).is_some());
+
+            TEST_ALLOCATOR.dealloc(ptr, layout);
+
+            // Verify allocation is removed
+            assert!(LIVE_ALLOCATIONS.get(&(ptr as usize)).is_none());
+        }
+
+        // Reset
+        set_enabled(false);
+    }
+
+    #[test]
+    fn test_reentrancy_guard() {
+        set_enabled(true);
+        set_sample_rate(1);
+
+        // Manually set guard to simulate reentrancy
+        REENTRANCY_GUARD.set(true);
+
+        unsafe {
+            let layout = Layout::from_size_align(128, 8).unwrap();
+            let ptr = TEST_ALLOCATOR.alloc(layout);
+
+            // Should NOT be recorded because guard was true
+            assert!(LIVE_ALLOCATIONS.get(&(ptr as usize)).is_none());
+
+            TEST_ALLOCATOR.dealloc(ptr, layout);
+        }
+
+        REENTRANCY_GUARD.set(false);
+        set_enabled(false);
+    }
+
+    #[test]
+    fn test_sampling_logic() {
+        set_enabled(true);
+        // Set a high rate so small allocations are unlikely to be sampled
+        set_sample_rate(1_000_000);
+
+        let mut sampled_count = 0;
+        let iterations = 100;
+
+        unsafe {
+            let layout = Layout::from_size_align(8, 8).unwrap();
+            for _ in 0..iterations {
+                let ptr = TEST_ALLOCATOR.alloc(layout);
+                if LIVE_ALLOCATIONS.get(&(ptr as usize)).is_some() {
+                    sampled_count += 1;
+                }
+                TEST_ALLOCATOR.dealloc(ptr, layout);
+            }
+        }
+
+        // With high sample rate and small size, sampled count should be low (likely 0)
+        // This is probabilistic, but 0 is very likely.
+        assert!(sampled_count < iterations);
+
+        set_enabled(false);
+    }
+
+    #[test]
+    fn test_profile_dump() {
+        set_enabled(true);
+        set_sample_rate(1);
+
+        unsafe {
+            let layout = Layout::from_size_align(512, 8).unwrap();
+            let ptr = TEST_ALLOCATOR.alloc(layout);
+
+            let file = NamedTempFile::new().unwrap();
+            let path = file.path();
+
+            let result = dump_profile(path);
+            assert!(result.is_ok());
+
+            let metadata = std::fs::metadata(path).unwrap();
+            assert!(metadata.len() > 0);
+
+            TEST_ALLOCATOR.dealloc(ptr, layout);
+        }
+        set_enabled(false);
+    }
+
+    #[test]
+    fn test_concurrent_allocations() {
+        set_enabled(true);
+        set_sample_rate(1);
+
+        let threads: Vec<_> = (0..10)
+            .map(|_| {
+                thread::spawn(|| {
+                    unsafe {
+                        let layout = Layout::from_size_align(64, 8).unwrap();
+                        for _ in 0..100 {
+                            let ptr = TEST_ALLOCATOR.alloc(layout);
+                            // Just ensure no panic/crash
+                            TEST_ALLOCATOR.dealloc(ptr, layout);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // After all threads join and dealloc, map should be empty (ignoring other potential allocations in test runner)
+        // Note: In a real test runner, other tests might be running, so we can't assert empty.
+        // But we verified no crashes.
+        set_enabled(false);
+    }
+}

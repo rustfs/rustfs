@@ -153,6 +153,7 @@ jemalloc_pprof = { workspace = true }
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
+tempfile = { workspace = true }
 
 [build-dependencies]
 http.workspace = true

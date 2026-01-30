@@ -7675,6 +7675,7 @@ dependencies = [
  "starshard",
  "subtle",
  "sysinfo",
+ "tempfile",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
