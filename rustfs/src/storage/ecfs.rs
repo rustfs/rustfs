@@ -24,11 +24,11 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
     access::{ReqInfo, authorize_request, has_bypass_governance_header},
+    ecfs_extend::RFC1123,
     options::{
         copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
         get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
     },
-    ecfs_extend::RFC1123,
 };
 use crate::storage::{
     check_preconditions, create_managed_encryption_material, decrypt_managed_encryption_key, decrypt_multipart_managed_stream,
@@ -94,8 +94,8 @@ use rustfs_ecstore::{
     },
 };
 use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
-use rustfs_filemeta::{RestoreStatusOps, parse_restore_obj_status};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
+use rustfs_filemeta::{RestoreStatusOps, parse_restore_obj_status};
 use rustfs_kms::DataKey;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_policy::policy::{
@@ -3667,9 +3667,7 @@ impl S3 for FS {
             response.headers.insert(header_name, header_value);
         }
 
-        if let Some(amz_restore) = metadata_map
-            .get(X_AMZ_RESTORE.as_str())
-        {
+        if let Some(amz_restore) = metadata_map.get(X_AMZ_RESTORE.as_str()) {
             let Ok(restore_status) = parse_restore_obj_status(&amz_restore) else {
                 return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "parse amz_restore failed."));
             };
@@ -3677,22 +3675,26 @@ impl S3 for FS {
                 response.headers.insert(X_AMZ_RESTORE, header_value);
             }
         }
-        if let Some(amz_restore_request_date) = metadata_map
-            .get(AMZ_RESTORE_REQUEST_DATE)
+        if let Some(amz_restore_request_date) = metadata_map.get(AMZ_RESTORE_REQUEST_DATE)
             && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_RESTORE_REQUEST_DATE.as_bytes())
         {
             let Ok(amz_restore_request_date) = OffsetDateTime::parse(amz_restore_request_date, &Rfc3339) else {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "parse amz_restore_request_date failed."));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ErrMeta".into()),
+                    "parse amz_restore_request_date failed.",
+                ));
             };
             let Ok(amz_restore_request_date) = amz_restore_request_date.format(&RFC1123) else {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "format amz_restore_request_date failed."));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ErrMeta".into()),
+                    "format amz_restore_request_date failed.",
+                ));
             };
             if let Ok(header_value) = HeaderValue::from_str(&amz_restore_request_date) {
                 response.headers.insert(header_name, header_value);
             }
         }
-        if let Some(amz_restore_expiry_days) = metadata_map
-            .get(AMZ_RESTORE_EXPIRY_DAYS)
+        if let Some(amz_restore_expiry_days) = metadata_map.get(AMZ_RESTORE_EXPIRY_DAYS)
             && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_RESTORE_EXPIRY_DAYS.as_bytes())
             && let Ok(header_value) = HeaderValue::from_str(amz_restore_expiry_days)
         {
