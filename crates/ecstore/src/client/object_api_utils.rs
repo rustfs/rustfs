@@ -118,38 +118,51 @@ pub fn new_getobjectreader<'a>(
     let mut is_encrypted = false;
     let is_compressed = false; //oi.is_compressed_ok();
 
-    let mut rs_ = None;
+    let rs_;
     if rs.is_none() && opts.part_number.is_some() && opts.part_number.unwrap() > 0 {
         rs_ = part_number_to_rangespec(oi.clone(), opts.part_number.unwrap());
+    } else {
+        rs_ = rs.clone();
     }
 
     let mut get_fn: ObjReaderFn;
 
-    let (off, length) = match rs_.unwrap().get_offset_length(oi.size) {
-        Ok(x) => x,
-        Err(err) => {
-            return Err(ErrorResponse {
-                code: S3ErrorCode::InvalidRange,
-                message: err.to_string(),
-                key: None,
-                bucket_name: None,
-                region: None,
-                request_id: None,
-                host_id: "".to_string(),
-            });
-        }
-    };
-    get_fn = Arc::new(move |input_reader: BufReader<Cursor<Vec<u8>>>, _: HeaderMap| {
-        //Box::pin({
-        let r = GetObjectReader {
-            object_info: oi.clone(),
-            stream: Box::new(input_reader),
+    if let Some(rs_) = rs_ {
+        let (off, length) = match rs_.get_offset_length(oi.size) {
+            Ok(x) => x,
+            Err(err) => {
+                return Err(ErrorResponse {
+                    code: S3ErrorCode::InvalidRange,
+                    message: err.to_string(),
+                    key: None,
+                    bucket_name: None,
+                    region: None,
+                    request_id: None,
+                    host_id: "".to_string(),
+                });
+            }
         };
-        r
-        //})
-    });
+        get_fn = Arc::new(move |input_reader: BufReader<Cursor<Vec<u8>>>, _: HeaderMap| {
+            //Box::pin({
+            let r = GetObjectReader {
+                object_info: oi.clone(),
+                stream: Box::new(input_reader),
+            };
+            r
+            //})
+        });
 
-    Ok((get_fn, off as i64, length as i64))
+        return Ok((get_fn, off as i64, length as i64));
+    }
+    Err(ErrorResponse {
+        code: S3ErrorCode::InvalidRange,
+        message: "Invalid range".to_string(),
+        key: Some(oi.name.clone()),
+        bucket_name: Some(oi.bucket.clone()),
+        region: Some("".to_string()),
+        request_id: None,
+        host_id: "".to_string(),
+    })
 }
 
 /// Convert a raw stored ETag into the strongly-typed `s3s::dto::ETag`.

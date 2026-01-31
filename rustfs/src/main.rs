@@ -78,7 +78,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
+    profiling::allocator::TracingAllocator::new(mimalloc::MiMalloc);
 
 fn main() {
     let runtime = server::get_tokio_runtime_builder()
@@ -404,24 +405,6 @@ async fn run(opt: config::Opt) -> Result<()> {
         init_heal_manager(heal_storage, None).await?;
 
         init_data_scanner(ctx.clone(), store.clone()).await;
-
-        // if enable_heal {
-        //     // Initialize heal manager with channel processor
-        //     let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-        //     let heal_manager = init_heal_manager(heal_storage, None).await?;
-
-        //     if enable_scanner {
-        //         info!(target: "rustfs::main::run","Starting scanner with heal manager...");
-        //         let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
-        //         scanner.start().await?;
-        //     } else {
-        //         info!(target: "rustfs::main::run","Scanner disabled, but heal manager is initialized and available");
-        //     }
-        // } else if enable_scanner {
-        //     info!("Starting scanner without heal manager...");
-        //     let scanner = Scanner::new(Some(ScannerConfig::default()), None);
-        //     scanner.start().await?;
-        // }
     } else {
         info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }
@@ -564,6 +547,13 @@ async fn handle_shutdown(
         Ok(_) => info!("Audit system stopped successfully."),
         Err(e) => error!("Failed to stop audit system: {}", e),
     }
+
+    // Stop profiling tasks
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Stopping profiling tasks..."
+    );
+    profiling::shutdown_profiling();
 
     info!(
         target: "rustfs::main::handle_shutdown",

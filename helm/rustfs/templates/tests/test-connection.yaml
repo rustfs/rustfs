@@ -9,8 +9,8 @@ metadata:
 spec:
   containers:
     - name: wget
-      image: "{{ .Values.initStep.image.repository }}:{{ .Values.initStep.image.tag }}"
-      imagePullPolicy: {{ .Values.initStep.image.pullPolicy }}
+      image: "{{ .Values.image.initImage.repository }}:{{ .Values.image.initImage.tag }}"
+      imagePullPolicy: {{ .Values.image.initImage.pullPolicy }}
       command: ['wget']
       args: ['-O', '/dev/null', '{{ include "rustfs.fullname" . }}-svc:{{ .Values.service.endpoint.port }}/health']
   restartPolicy: Never

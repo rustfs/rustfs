@@ -3672,7 +3672,11 @@ impl ObjectIO for SetDisks {
         }
 
         if object_info.is_remote() {
-            let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, opts).await?;
+            let mut opts = opts.clone();
+            if object_info.parts.len() == 1 {
+                opts.part_number = Some(1);
+            }
+            let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, &opts).await?;
             return Ok(gr);
         }
 
@@ -4794,10 +4798,18 @@ impl StorageAPI for SetDisks {
         // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
         let transition_etag = rustfs_utils::path::trim_etag(&opts.transition.etag);
         let stored_etag = rustfs_utils::path::trim_etag(&get_raw_etag(&fi.metadata));
-        if opts.mod_time.expect("err").unix_timestamp() != fi.mod_time.as_ref().expect("err").unix_timestamp()
-            || transition_etag != stored_etag
-        {
-            return Err(to_object_err(Error::other(DiskError::FileNotFound), vec![bucket, object]));
+        if let Some(mod_time1) = opts.mod_time {
+            if let Some(mod_time2) = fi.mod_time.as_ref() {
+                if mod_time1.unix_timestamp() != mod_time2.unix_timestamp()
+                /*|| transition_etag != stored_etag*/
+                {
+                    return Err(to_object_err(Error::other(DiskError::FileNotFound), vec![bucket, object]));
+                }
+            } else {
+                return Err(Error::other("mod_time 2 error.".to_string()));
+            }
+        } else {
+            return Err(Error::other("mod_time 1 error.".to_string()));
         }
         if fi.transition_status == TRANSITION_COMPLETE {
             return Ok(());
@@ -4927,8 +4939,10 @@ impl StorageAPI for SetDisks {
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
         let ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
         if oi.parts.len() == 1 {
+            let mut opts = opts.clone();
+            opts.part_number = Some(1);
             let rs: Option<HTTPRangeSpec> = None;
-            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, opts).await;
+            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &opts).await;
             if let Err(err) = gr {
                 return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
             }
