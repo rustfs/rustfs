@@ -8313,6 +8313,7 @@ dependencies = [
 name = "rustfs-scanner"
 version = "0.0.5"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "futures",
@@ -8335,6 +8336,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
