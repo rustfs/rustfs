@@ -3668,7 +3668,7 @@ impl S3 for FS {
         }
 
         if let Some(amz_restore) = metadata_map.get(X_AMZ_RESTORE.as_str()) {
-            let Ok(restore_status) = parse_restore_obj_status(&amz_restore) else {
+            let Ok(restore_status) = parse_restore_obj_status(amz_restore) else {
                 return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "parse amz_restore failed."));
             };
             if let Ok(header_value) = HeaderValue::from_str(restore_status.to_string2().as_str()) {
