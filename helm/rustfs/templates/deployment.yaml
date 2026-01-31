@@ -82,11 +82,11 @@ spec:
               mountPath: /mnt/rustfs
       containers:
         - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
           command: ["/usr/bin/rustfs"]
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.image.rustfs.pullPolicy }}
           securityContext:
-          {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           ports:
             - name: endpoint
               containerPort: {{ .Values.service.endpoint.port }}

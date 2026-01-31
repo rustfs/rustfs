@@ -16,7 +16,7 @@ image:
   initImage: # This sets the init container image repository and tag.
     repository: busybox
     pullPolicy: IfNotPresent
-    tag: "latest"
+    tag: "stable"
 
 # This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
 imagePullSecrets: []
