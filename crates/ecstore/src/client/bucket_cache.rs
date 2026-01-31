@@ -25,10 +25,13 @@ use crate::client::{
     transition_api::{CreateBucketConfiguration, LocationConstraint, TransitionClient},
 };
 use http::Request;
+use http_body_util::BodyExt;
 use hyper::StatusCode;
+use hyper::body::Body;
+use hyper::body::Bytes;
+use hyper::body::Incoming;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
-use s3s::Body;
 use s3s::S3ErrorCode;
 use std::collections::HashMap;
 
@@ -86,7 +89,7 @@ impl TransitionClient {
         Ok(location)
     }
 
-    fn get_bucket_location_request(&self, bucket_name: &str) -> Result<http::Request<Body>, std::io::Error> {
+    fn get_bucket_location_request(&self, bucket_name: &str) -> Result<http::Request<s3s::Body>, std::io::Error> {
         let mut url_values = HashMap::new();
         url_values.insert("location".to_string(), "".to_string());
 
@@ -120,7 +123,11 @@ impl TransitionClient {
             url_str = target_url.to_string();
         }
 
-        let Ok(mut req) = Request::builder().method(http::Method::GET).uri(url_str).body(Body::empty()) else {
+        let Ok(mut req) = Request::builder()
+            .method(http::Method::GET)
+            .uri(url_str)
+            .body(s3s::Body::empty())
+        else {
             return Err(std::io::Error::other("create request error"));
         };
 
@@ -172,13 +179,16 @@ impl TransitionClient {
 }
 
 async fn process_bucket_location_response(
-    mut resp: http::Response<Body>,
+    mut resp: http::Response<Incoming>,
     bucket_name: &str,
     tier_type: &str,
 ) -> Result<String, std::io::Error> {
     //if resp != nil {
     if resp.status() != StatusCode::OK {
-        let err_resp = http_resp_to_error_response(&resp, vec![], bucket_name, "");
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
+        let err_resp = http_resp_to_error_response(resp_status, &h, vec![], bucket_name, "");
         match err_resp.code {
                 S3ErrorCode::NotImplemented => {
                     match err_resp.server.as_str() {
@@ -208,18 +218,22 @@ async fn process_bucket_location_response(
     }
     //}
 
-    let b = resp
-        .body_mut()
-        .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
-        .await
-        .unwrap()
-        .to_vec();
+    let mut body_vec = Vec::new();
+    let mut body = resp.into_body();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        if let Some(data) = frame.data_ref() {
+            body_vec.extend_from_slice(data);
+        }
+    }
     let mut location = "".to_string();
     if tier_type == "huaweicloud" {
-        let d = quick_xml::de::from_str::<CreateBucketConfiguration>(&String::from_utf8(b).unwrap()).unwrap();
+        let d = quick_xml::de::from_str::<CreateBucketConfiguration>(&String::from_utf8(body_vec).unwrap()).unwrap();
         location = d.location_constraint;
     } else {
-        if let Ok(LocationConstraint { field }) = quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(b).unwrap()) {
+        if let Ok(LocationConstraint { field }) =
+            quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(body_vec).unwrap())
+        {
             location = field;
         }
     }

@@ -59,20 +59,18 @@ spec:
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
       {{- end }}
-      {{- if .Values.podSecurityContext }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- end }}
       {{- if .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       {{- end }}
       initContainers:
         - name: init-step
-          image: "{{ .Values.initStep.image.repository }}:{{ .Values.initStep.image.tag }}"
-          imagePullPolicy: {{ .Values.initStep.image.pullPolicy }}
+          image: "{{ .Values.image.initImage.repository }}:{{ .Values.image.initImage.tag }}"
+          imagePullPolicy: {{ .Values.image.initImage.pullPolicy }}
           securityContext:
-            {{- toYaml .Values.initStep.containerSecurityContext | nindent 12 }}
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           env:
             - name: REPLICA_COUNT
               value: {{ .Values.replicaCount | quote }}
@@ -87,8 +85,8 @@ spec:
               elif [ "$REPLICA_COUNT" -eq 16 ]; then
                 mkdir -p /data
               fi
-              mkdir -p {{ $logDir }}
-              chown 10001:10001 /data {{ $logDir }}
+              mkdir -p /mnt/rustfs/logs
+              chmod 755 /mnt/rustfs/logs
           volumeMounts:
             {{- if eq (int .Values.replicaCount) 4 }}
             {{- range $i := until (int .Values.replicaCount) }}
@@ -100,16 +98,14 @@ spec:
               mountPath: /data
             {{- end }}
             - name: logs
-              mountPath: {{ $logDir }}
+              mountPath: /mnt/rustfs
       containers:
         - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
           command: ["/usr/bin/rustfs"]
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if .Values.containerSecurityContext }}
+          imagePullPolicy: {{ .Values.image.rustfs.pullPolicy }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          {{- end }}
           ports:
             - name: endpoint
               containerPort: {{ .Values.service.endpoint.port }}
@@ -127,10 +123,9 @@ spec:
           readinessProbe:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
           volumeMounts:
-            - name: tmp
-              mountPath: /tmp
             - name: logs
               mountPath: {{ $logDir }}
+              subPath: logs
             {{- if eq (int .Values.replicaCount) 4 }}
             {{- range $i := until (int .Values.replicaCount) }}
             - name: data-rustfs-{{ $i }}
@@ -140,9 +135,6 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
-      volumes:
-        - name: tmp
-          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: logs

@@ -18,8 +18,10 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
 use rustfs_utils::HashAlgorithm;
 use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
@@ -344,8 +346,15 @@ impl TransitionClient {
                 )
                 .await?;
 
-            let body_bytes: Vec<u8> = resp.body().bytes().expect("err").to_vec();
-            process_remove_multi_objects_response(ReaderImpl::Body(Bytes::from(body_bytes)), result_tx.clone());
+            let mut body_vec = Vec::new();
+            let mut body = resp.into_body();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                if let Some(data) = frame.data_ref() {
+                    body_vec.extend_from_slice(data);
+                }
+            }
+            process_remove_multi_objects_response(ReaderImpl::Body(Bytes::from(body_vec)), result_tx.clone());
         }
         Ok(())
     }
@@ -390,6 +399,10 @@ impl TransitionClient {
                 },
             )
             .await?;
+
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
         //if resp.is_some() {
         if resp.status() != StatusCode::NO_CONTENT {
             let error_response: ErrorResponse;
@@ -426,7 +439,8 @@ impl TransitionClient {
                 }
                 _ => {
                     return Err(std::io::Error::other(http_resp_to_error_response(
-                        &resp,
+                        resp_status,
+                        &h,
                         vec![],
                         bucket_name,
                         object_name,
