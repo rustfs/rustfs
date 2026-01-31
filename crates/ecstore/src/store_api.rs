@@ -808,7 +808,6 @@ impl ObjectInfo {
         let mut restore_ongoing = false;
         let mut restore_expires = None;
         if let Some(restore_status) = fi.metadata.get(AMZ_RESTORE).cloned() {
-            //
             if let Ok(restore_status) = parse_restore_obj_status(&restore_status) {
                 restore_ongoing = restore_status.on_going();
                 restore_expires = restore_status.expiry();

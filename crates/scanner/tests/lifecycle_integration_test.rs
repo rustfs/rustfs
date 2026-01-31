@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ahm::{heal::storage::ECStoreHealStorage, init_heal_manager};
 use rustfs_ecstore::{
     bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
     bucket::metadata_sys,
@@ -403,8 +402,6 @@ mod serial_tests {
         let ctx = CancellationToken::new();
 
         // Start scanner
-        let heal_storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));
-        let _ = init_heal_manager(heal_storage, None).await;
         init_data_scanner(ctx.clone(), ecstore.clone()).await;
         println!("✅ Scanner started");
 
