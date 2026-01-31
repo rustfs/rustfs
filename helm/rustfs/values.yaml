@@ -7,11 +7,16 @@ replicaCount: 4
 
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
 image:
-  repository: rustfs/rustfs
-  # This sets the pull policy for images.
-  pullPolicy: IfNotPresent
-  # Overrides the image tag whose default is the chart appVersion.
-  tag: ""
+  rustfs: # This sets the rustfs image repository and tag.
+    repository: rustfs/rustfs
+    # This sets the pull policy for images.
+    pullPolicy: IfNotPresent
+    # Overrides the image tag whose default is the chart appVersion.
+    tag: ""
+  initImage: # This sets the init container image repository and tag.
+    repository: busybox
+    pullPolicy: IfNotPresent
+    tag: "stable"
 
 # This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
 imagePullSecrets: []
@@ -94,6 +99,7 @@ containerSecurityContext:
     drop:
       - ALL
   readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
   runAsNonRoot: true
 
 service:
@@ -192,16 +198,6 @@ storageclass:
   name: local-path
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
-
-# Init container parameters.
-initStep:
-  image:
-    repository: busybox
-    pullPolicy: IfNotPresent
-    tag: "latest"
-  containerSecurityContext:
-    runAsUser: 0
-    runAsGroup: 0
 
 pdb:
   create: false
