@@ -21,6 +21,7 @@ pub mod allocator;
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use std::path::PathBuf;
+    use std::time::Duration;
     use tracing::info;
 
     pub async fn init_from_env() {
