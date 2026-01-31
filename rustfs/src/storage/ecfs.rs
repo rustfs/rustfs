@@ -28,6 +28,7 @@ use crate::storage::{
         copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
         get_complete_multipart_upload_opts, get_opts, parse_copy_source_range, put_opts,
     },
+    ecfs_extend::RFC1123,
 };
 use crate::storage::{
     check_preconditions, create_managed_encryption_material, decrypt_managed_encryption_key, decrypt_multipart_managed_stream,
@@ -93,7 +94,7 @@ use rustfs_ecstore::{
     },
 };
 use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
-use rustfs_filemeta::RestoreStatusOps;
+use rustfs_filemeta::{RestoreStatusOps, parse_restore_obj_status};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
 use rustfs_kms::DataKey;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
@@ -3665,8 +3666,42 @@ impl S3 for FS {
         {
             response.headers.insert(header_name, header_value);
         }
+
+        if let Some(amz_restore) = metadata_map
+            .get(X_AMZ_RESTORE.as_str())
+        {
+            let Ok(restore_status) = parse_restore_obj_status(&amz_restore) else {
+                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "parse amz_restore failed."));
+            };
+            if let Ok(header_value) = HeaderValue::from_str(restore_status.to_string2().as_str()) {
+                response.headers.insert(X_AMZ_RESTORE, header_value);
+            }
+        }
+        if let Some(amz_restore_request_date) = metadata_map
+            .get(AMZ_RESTORE_REQUEST_DATE)
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_RESTORE_REQUEST_DATE.as_bytes())
+        {
+            let Ok(amz_restore_request_date) = OffsetDateTime::parse(amz_restore_request_date, &Rfc3339) else {
+                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "parse amz_restore_request_date failed."));
+            };
+            let Ok(amz_restore_request_date) = amz_restore_request_date.format(&RFC1123) else {
+                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "format amz_restore_request_date failed."));
+            };
+            if let Ok(header_value) = HeaderValue::from_str(&amz_restore_request_date) {
+                response.headers.insert(header_name, header_value);
+            }
+        }
+        if let Some(amz_restore_expiry_days) = metadata_map
+            .get(AMZ_RESTORE_EXPIRY_DAYS)
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_RESTORE_EXPIRY_DAYS.as_bytes())
+            && let Ok(header_value) = HeaderValue::from_str(amz_restore_expiry_days)
+        {
+            response.headers.insert(header_name, header_value);
+        }
+
         let result = Ok(response);
         let _ = helper.complete(&result);
+
         result
     }
 
@@ -5256,7 +5291,7 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let version_id_str = version_id.unwrap_or_default();
+        let version_id_str = version_id.clone().unwrap_or_default();
         let opts = post_restore_opts(&version_id_str, &bucket, &object)
             .await
             .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?;
@@ -5376,7 +5411,7 @@ impl S3 for FS {
         let bucket_clone = bucket.clone();
         let object_clone = object.clone();
         let rreq_clone = rreq.clone();
-        let obj_info_clone = obj_info_.clone();
+        let version_id_clone = version_id.clone();
 
         tokio::spawn(async move {
             let opts = ObjectOptions {
@@ -5385,7 +5420,7 @@ impl S3 for FS {
                     restore_expiry,
                     ..Default::default()
                 },
-                version_id: obj_info_clone.version_id.map(|e| e.to_string()),
+                version_id: version_id_clone,
                 ..Default::default()
             };
 
