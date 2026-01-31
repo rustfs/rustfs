@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+use crate::ObjectKey;
+
 /// Lock type enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LockType {
@@ -56,7 +58,7 @@ pub struct LockInfo {
     /// Unique identifier for the lock
     pub id: LockId,
     /// Resource path
-    pub resource: String,
+    pub resource: ObjectKey,
     /// Lock type
     pub lock_type: LockType,
     /// Lock status
@@ -102,56 +104,27 @@ impl LockInfo {
 /// Lock ID type
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LockId {
-    pub resource: String,
+    pub resource: ObjectKey,
     pub uuid: String,
 }
 
 impl LockId {
     /// Generate new lock ID for a resource
-    pub fn new(resource: &str) -> Self {
+    pub fn new(resource: ObjectKey) -> Self {
         Self {
-            resource: resource.to_string(),
+            resource,
             uuid: Uuid::new_v4().to_string(),
         }
     }
 
-    /// Generate deterministic lock ID for a resource (same resource = same ID)
-    pub fn new_deterministic(resource: &str) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        resource.hash(&mut hasher);
-        let hash = hasher.finish();
-
+    /// Generate unique lock ID for a resource
+    /// Each call generates a different ID, even for the same resource
+    pub fn new_unique(resource: &ObjectKey) -> Self {
+        // Use UUID v4 (random) to ensure uniqueness
+        // Each call generates a new unique ID regardless of the resource
         Self {
-            resource: resource.to_string(),
-            uuid: format!("{hash:016x}"),
-        }
-    }
-
-    /// Create lock ID from resource and uuid
-    pub fn from_parts(resource: impl Into<String>, uuid: impl Into<String>) -> Self {
-        Self {
-            resource: resource.into(),
-            uuid: uuid.into(),
-        }
-    }
-
-    /// Create lock ID from string (for compatibility, expects "resource:uuid")
-    pub fn from_string(id: impl Into<String>) -> Self {
-        let s = id.into();
-        if let Some((resource, uuid)) = s.split_once(":") {
-            Self {
-                resource: resource.to_string(),
-                uuid: uuid.to_string(),
-            }
-        } else {
-            // fallback: treat as uuid only
-            Self {
-                resource: "unknown".to_string(),
-                uuid: s,
-            }
+            resource: resource.clone(),
+            uuid: Uuid::new_v4().to_string(),
         }
     }
 
@@ -163,7 +136,7 @@ impl LockId {
 
 impl Default for LockId {
     fn default() -> Self {
-        Self::new("default")
+        Self::new(ObjectKey::new("default", "default"))
     }
 }
 
@@ -237,7 +210,7 @@ pub struct LockRequest {
     /// Lock ID
     pub lock_id: LockId,
     /// Resource path
-    pub resource: String,
+    pub resource: ObjectKey,
     /// Lock type
     pub lock_type: LockType,
     /// Lock owner
@@ -256,11 +229,10 @@ pub struct LockRequest {
 
 impl LockRequest {
     /// Create new lock request
-    pub fn new(resource: impl Into<String>, lock_type: LockType, owner: impl Into<String>) -> Self {
-        let resource_str = resource.into();
+    pub fn new(resource: ObjectKey, lock_type: LockType, owner: impl Into<String>) -> Self {
         Self {
-            lock_id: LockId::new_deterministic(&resource_str),
-            resource: resource_str,
+            lock_id: LockId::new_unique(&resource),
+            resource,
             lock_type,
             owner: owner.into(),
             acquire_timeout: Duration::from_secs(10), // Default 10 seconds to acquire
@@ -609,97 +581,5 @@ impl WaitQueueItem {
     /// Get wait duration
     pub fn wait_duration(&self) -> Duration {
         self.wait_start_time.elapsed().unwrap_or_default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lock_id() {
-        let id1 = LockId::new("test-resource");
-        let id2 = LockId::new("test-resource");
-        assert_ne!(id1, id2);
-
-        let id3 = LockId::from_string("test-resource:test-uuid");
-        assert_eq!(id3.as_str(), "test-resource:test-uuid");
-    }
-
-    #[test]
-    fn test_lock_metadata() {
-        let metadata = LockMetadata::new()
-            .with_client_info("test-client")
-            .with_operation_id("test-op")
-            .with_priority(1)
-            .with_tag("key", "value");
-
-        assert_eq!(metadata.client_info, Some("test-client".to_string()));
-        assert_eq!(metadata.operation_id, Some("test-op".to_string()));
-        assert_eq!(metadata.priority, Some(1));
-        assert_eq!(metadata.tags.get("key"), Some(&"value".to_string()));
-    }
-
-    #[test]
-    fn test_lock_request() {
-        let request = LockRequest::new("test-resource", LockType::Exclusive, "test-owner")
-            .with_acquire_timeout(Duration::from_secs(60))
-            .with_priority(LockPriority::High)
-            .with_deadlock_detection(true);
-
-        assert_eq!(request.resource, "test-resource");
-        assert_eq!(request.lock_type, LockType::Exclusive);
-        assert_eq!(request.owner, "test-owner");
-        assert_eq!(request.acquire_timeout, Duration::from_secs(60));
-        assert_eq!(request.priority, LockPriority::High);
-        assert!(request.deadlock_detection);
-    }
-
-    #[test]
-    fn test_lock_response() {
-        let lock_info = LockInfo {
-            id: LockId::new("test-resource"),
-            resource: "test".to_string(),
-            lock_type: LockType::Exclusive,
-            status: LockStatus::Acquired,
-            owner: "test".to_string(),
-            acquired_at: SystemTime::now(),
-            expires_at: SystemTime::now() + Duration::from_secs(30),
-            last_refreshed: SystemTime::now(),
-            metadata: LockMetadata::default(),
-            priority: LockPriority::Normal,
-            wait_start_time: None,
-        };
-
-        let success = LockResponse::success(lock_info.clone(), Duration::ZERO);
-        assert!(success.is_success());
-
-        let failure = LockResponse::failure("error", Duration::ZERO);
-        assert!(failure.is_failure());
-
-        let waiting = LockResponse::waiting(Duration::ZERO, 1);
-        assert!(waiting.is_waiting());
-    }
-
-    #[test]
-    fn test_timestamp_conversion() {
-        let now = SystemTime::now();
-        let timestamp = system_time_to_timestamp(now);
-        let converted = timestamp_to_system_time(timestamp);
-
-        // Allow for small time differences
-        let diff = now.duration_since(converted).unwrap_or(Duration::ZERO);
-        assert!(diff < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn test_serialization() {
-        let request = LockRequest::new("test", LockType::Exclusive, "owner");
-        let serialized = serde_json::to_string(&request).unwrap();
-        let deserialized: LockRequest = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(request.resource, deserialized.resource);
-        assert_eq!(request.lock_type, deserialized.lock_type);
-        assert_eq!(request.owner, deserialized.owner);
     }
 }

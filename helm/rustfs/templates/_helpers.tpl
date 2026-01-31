@@ -111,3 +111,18 @@ Render RUSTFS_VOLUMES
 {{- end }}
 {{- end }}
 
+{{/*
+Render RUSTFS_SERVER_DOMAINS
+*/}}
+
+{{- define "rustfs.serverDomains" -}}
+{{- $domains := list .Values.config.rustfs.domains -}}
+{{- $fullname := include "rustfs.fullname" . -}}
+{{- $replicaCount := int .Values.replicaCount -}}
+{{- $servicePort := .Values.service.endpoint.port | default 9000 -}}
+{{- range $i := until $replicaCount -}}
+  {{- $podDomain := printf "%s-%d.%s-headless:%d" $fullname $i $fullname (int $servicePort) -}}
+  {{- $domains = append $domains $podDomain -}}
+{{- end -}}
+{{- join "," $domains -}}
+{{- end -}}

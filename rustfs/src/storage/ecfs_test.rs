@@ -35,7 +35,6 @@ mod tests {
     };
     use s3s::{S3Error, S3ErrorCode, s3_error};
     use time::OffsetDateTime;
-    use time::format_description::well_known::Rfc2822;
 
     #[test]
     fn test_fs_creation() {
@@ -558,6 +557,9 @@ mod tests {
 
     #[test]
     fn test_check_preconditions() {
+        use time::{format_description::FormatItem, macros::format_description};
+        const RFC1123: &[FormatItem<'_>] =
+            format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
         let valid_mod_time = OffsetDateTime::from_unix_timestamp(1700000000).unwrap();
         let valid_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
         let wrong_etag = "\"wrong-etag-123456\"";
@@ -605,7 +607,7 @@ mod tests {
         let mut headers5 = HeaderMap::new();
         headers5.insert(
             "if-modified-since",
-            HeaderValue::from_str(&valid_mod_time.format(&Rfc2822).unwrap()).unwrap(),
+            HeaderValue::from_str(&valid_mod_time.format(&RFC1123).unwrap()).unwrap(),
         );
         let info5 = info3.clone();
         let result5 = check_preconditions(&headers5, &info5);
@@ -618,7 +620,7 @@ mod tests {
         let mut headers6 = HeaderMap::new();
         headers6.insert(
             "if-modified-since",
-            HeaderValue::from_str(&earlier_time.format(&Rfc2822).unwrap()).unwrap(),
+            HeaderValue::from_str(&earlier_time.format(&RFC1123).unwrap()).unwrap(),
         );
         let info6 = info3.clone();
         assert!(check_preconditions(&headers6, &info6).is_ok());
@@ -641,7 +643,7 @@ mod tests {
         let mut headers9 = HeaderMap::new();
         headers9.insert(
             "if-unmodified-since",
-            HeaderValue::from_str(&earlier_time.format(&Rfc2822).unwrap()).unwrap(),
+            HeaderValue::from_str(&earlier_time.format(&RFC1123).unwrap()).unwrap(),
         );
         let info9 = info3.clone();
         let result9 = check_preconditions(&headers9, &info9);
@@ -652,7 +654,7 @@ mod tests {
         let mut headers10 = HeaderMap::new();
         headers10.insert(
             "if-unmodified-since",
-            HeaderValue::from_str(&valid_mod_time.format(&Rfc2822).unwrap()).unwrap(),
+            HeaderValue::from_str(&valid_mod_time.format(&RFC1123).unwrap()).unwrap(),
         );
         let info10 = info3.clone();
         assert!(check_preconditions(&headers10, &info10).is_ok());
@@ -684,7 +686,7 @@ mod tests {
         headers13.insert("if-none-match", HeaderValue::from_str(valid_etag).unwrap());
         headers13.insert(
             "if-modified-since",
-            HeaderValue::from_str(&earlier_time.format(&Rfc2822).unwrap()).unwrap(),
+            HeaderValue::from_str(&earlier_time.format(&RFC1123).unwrap()).unwrap(),
         );
         let info13 = info3.clone();
         let result13 = check_preconditions(&headers13, &info13);
@@ -696,7 +698,7 @@ mod tests {
         headers14.insert("if-none-match", HeaderValue::from_str("\"wrong-etag\"").unwrap());
         headers14.insert(
             "if-modified-since",
-            HeaderValue::from_str(&valid_mod_time.format(&Rfc2822).unwrap()).unwrap(),
+            HeaderValue::from_str(&valid_mod_time.format(&RFC1123).unwrap()).unwrap(),
         );
         let info14 = info3.clone();
         assert!(check_preconditions(&headers14, &info14).is_ok());

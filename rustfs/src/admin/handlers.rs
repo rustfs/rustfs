@@ -34,9 +34,7 @@ use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::data_usage::{
-    aggregate_local_snapshots, compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend,
-};
+use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
@@ -517,74 +515,86 @@ impl Operation for DataUsageInfoHandler {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let (disk_statuses, mut info) = match aggregate_local_snapshots(store.clone()).await {
-            Ok((statuses, usage)) => (statuses, usage),
-            Err(err) => {
-                warn!("aggregate_local_snapshots failed: {:?}", err);
-                (
-                    Vec::new(),
-                    load_data_usage_from_backend(store.clone()).await.map_err(|e| {
-                        error!("load_data_usage_from_backend failed {:?}", e);
-                        s3_error!(InternalError, "load_data_usage_from_backend failed")
-                    })?,
-                )
-            }
-        };
+        let mut info = load_data_usage_from_backend(store.clone()).await.map_err(|e| {
+            error!("load_data_usage_from_backend failed {:?}", e);
+            s3_error!(InternalError, "load_data_usage_from_backend failed")
+        })?;
 
-        let snapshots_available = disk_statuses.iter().any(|status| status.snapshot_exists);
-        if !snapshots_available {
-            if let Ok(fallback) = load_data_usage_from_backend(store.clone()).await {
-                let mut fallback_info = fallback;
-                fallback_info.disk_usage_status = disk_statuses.clone();
-                info = fallback_info;
-            }
-        } else {
-            info.disk_usage_status = disk_statuses.clone();
-        }
+        let sinfo = store.storage_info().await;
 
-        let last_update_age = info.last_update.and_then(|ts| ts.elapsed().ok());
-        let data_missing = info.objects_total_count == 0 && info.buckets_count == 0;
-        let stale = last_update_age
-            .map(|elapsed| elapsed > std::time::Duration::from_secs(300))
-            .unwrap_or(true);
+        // 🔧 Use the fixed capacity calculation function (built-in deduplication)
+        let raw_total = get_total_usable_capacity(&sinfo.disks, &sinfo);
+        let raw_free = get_total_usable_capacity_free(&sinfo.disks, &sinfo);
 
-        if data_missing {
-            info!("No data usage statistics found, attempting real-time collection");
+        // 🔧 Add a plausibility check (extra layer of protection)
+        const MAX_REASONABLE_CAPACITY: u64 = 100_000 * 1024 * 1024 * 1024 * 1024; // 100 PiB
+        const MIN_REASONABLE_CAPACITY: u64 = 1024 * 1024 * 1024; // 1 GiB
 
-            if let Err(e) = collect_realtime_data_usage(&mut info, store.clone()).await {
-                warn!("Failed to collect real-time data usage: {}", e);
-            } else if let Err(e) = store_data_usage_in_backend(info.clone(), store.clone()).await {
-                warn!("Failed to persist refreshed data usage: {}", e);
-            }
-        } else if stale {
-            info!(
-                "Data usage statistics are stale (last update {:?} ago), refreshing asynchronously",
-                last_update_age
+        let total_u64 = raw_total as u64;
+        let free_u64 = raw_free as u64;
+
+        // Detect outliers
+        if total_u64 > MAX_REASONABLE_CAPACITY {
+            error!(
+                "Abnormal total capacity detected: {} bytes ({:.2} TiB), capping to physical capacity",
+                total_u64,
+                total_u64 as f64 / (1024.0_f64.powi(4))
             );
 
-            let mut info_for_refresh = info.clone();
-            let store_for_refresh = store.clone();
-            spawn(async move {
-                if let Err(e) = collect_realtime_data_usage(&mut info_for_refresh, store_for_refresh.clone()).await {
-                    warn!("Background data usage refresh failed: {}", e);
-                    return;
-                }
+            // Use the number of disks and the average capacity to estimate reasonable values
+            let disk_count = sinfo.disks.len();
+            if disk_count > 0 {
+                // Calculate the actual number of disks after deduplication (via endpoint + drive_path)
+                use std::collections::HashSet;
+                let unique_disks: HashSet<String> = sinfo
+                    .disks
+                    .iter()
+                    .map(|d| format!("{}|{}", d.endpoint, d.drive_path))
+                    .collect();
 
-                if let Err(e) = store_data_usage_in_backend(info_for_refresh, store_for_refresh).await {
-                    warn!("Background data usage persistence failed: {}", e);
+                let actual_disk_count = unique_disks.len();
+
+                // Use the capacity of the first disk as a reference
+                if let Some(first_disk) = sinfo.disks.first() {
+                    info.total_capacity = first_disk.total_space * actual_disk_count as u64;
+                    info.total_free_capacity = first_disk.available_space * actual_disk_count as u64;
+
+                    info!(
+                        "Applied capacity correction: {} unique disks, capacity per disk: {} bytes",
+                        actual_disk_count, first_disk.total_space
+                    );
+                } else {
+                    info.total_capacity = 0;
+                    info.total_free_capacity = 0;
                 }
-            });
+            } else {
+                info.total_capacity = 0;
+                info.total_free_capacity = 0;
+            }
+        } else if total_u64 < MIN_REASONABLE_CAPACITY && total_u64 > 0 {
+            warn!(
+                "Unusually small total capacity: {} bytes ({:.2} GiB)",
+                total_u64,
+                total_u64 as f64 / (1024.0_f64.powi(3))
+            );
+            info.total_capacity = total_u64;
+            info.total_free_capacity = free_u64;
+        } else {
+            // Normal
+            info.total_capacity = total_u64;
+            info.total_free_capacity = free_u64;
         }
 
-        info.disk_usage_status = disk_statuses;
+        // Calculate the used capacity
+        info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
 
-        // Set capacity information
-        let sinfo = store.storage_info().await;
-        info.total_capacity = get_total_usable_capacity(&sinfo.disks, &sinfo) as u64;
-        info.total_free_capacity = get_total_usable_capacity_free(&sinfo.disks, &sinfo) as u64;
-        if info.total_capacity > info.total_free_capacity {
-            info.total_used_capacity = info.total_capacity - info.total_free_capacity;
-        }
+        // Record the final statistical results
+        debug!(
+            "Capacity statistics: total={:.2} TiB, free={:.2} TiB, used={:.2} TiB",
+            info.total_capacity as f64 / (1024.0_f64.powi(4)),
+            info.total_free_capacity as f64 / (1024.0_f64.powi(4)),
+            info.total_used_capacity as f64 / (1024.0_f64.powi(4))
+        );
 
         let data = serde_json::to_vec(&info)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse DataUsageInfo failed"))?;
@@ -1264,62 +1274,6 @@ impl Operation for RemoveRemoteTargetHandler {
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
-}
-
-/// Real-time data collection function
-async fn collect_realtime_data_usage(
-    info: &mut rustfs_common::data_usage::DataUsageInfo,
-    store: Arc<rustfs_ecstore::store::ECStore>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Get bucket list and collect basic statistics
-    let buckets = store.list_bucket(&BucketOptions::default()).await?;
-
-    info.buckets_count = buckets.len() as u64;
-    info.last_update = Some(std::time::SystemTime::now());
-    info.buckets_usage.clear();
-    info.bucket_sizes.clear();
-    info.disk_usage_status.clear();
-    info.objects_total_count = 0;
-    info.objects_total_size = 0;
-    info.versions_total_count = 0;
-    info.delete_markers_total_count = 0;
-
-    let mut total_objects = 0u64;
-    let mut total_versions = 0u64;
-    let mut total_size = 0u64;
-    let mut total_delete_markers = 0u64;
-
-    // For each bucket, try to get object count
-    for bucket_info in buckets {
-        let bucket_name = &bucket_info.name;
-
-        // Skip system buckets
-        if bucket_name.starts_with('.') {
-            continue;
-        }
-
-        match compute_bucket_usage(store.clone(), bucket_name).await {
-            Ok(bucket_usage) => {
-                total_objects = total_objects.saturating_add(bucket_usage.objects_count);
-                total_versions = total_versions.saturating_add(bucket_usage.versions_count);
-                total_size = total_size.saturating_add(bucket_usage.size);
-                total_delete_markers = total_delete_markers.saturating_add(bucket_usage.delete_markers_count);
-
-                info.buckets_usage.insert(bucket_name.clone(), bucket_usage.clone());
-                info.bucket_sizes.insert(bucket_name.clone(), bucket_usage.size);
-            }
-            Err(e) => {
-                warn!("Failed to compute bucket usage for {}: {}", bucket_name, e);
-            }
-        }
-    }
-
-    info.objects_total_count = total_objects;
-    info.objects_total_size = total_size;
-    info.versions_total_count = total_versions;
-    info.delete_markers_total_count = total_delete_markers;
-
-    Ok(())
 }
 
 pub struct ProfileHandler {}
