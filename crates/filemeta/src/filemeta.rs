@@ -14,8 +14,8 @@
 
 use crate::{
     ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, ObjectPartInfo, RawFileInfo, ReplicationState,
-    ReplicationStatusType, Result, TIER_FV_ID, TIER_FV_MARKER, VersionPurgeStatusType, replication_statuses_map,
-    version_purge_statuses_map, is_restored_object_on_disk,
+    ReplicationStatusType, Result, TIER_FV_ID, TIER_FV_MARKER, VersionPurgeStatusType, is_restored_object_on_disk,
+    replication_statuses_map, version_purge_statuses_map,
 };
 use byteorder::ByteOrder;
 use bytes::Bytes;
