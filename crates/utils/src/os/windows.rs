@@ -38,7 +38,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
             Some(&mut total_number_of_bytes),
             Some(&mut total_number_of_free_bytes),
         )
-        .map_err(|e| Error::from_raw_os_error(e.code().0 as i32))?;
+        .map_err(|e| Error::from_raw_os_error(e.code().0))?;
     }
 
     let total = total_number_of_bytes;
@@ -67,7 +67,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
             Some(&mut number_of_free_clusters),
             Some(&mut total_number_of_clusters),
         )
-        .map_err(|e| Error::from_raw_os_error(e.code().0 as i32))?;
+        .map_err(|e| Error::from_raw_os_error(e.code().0))?;
     }
 
     Ok(DiskInfo {
@@ -103,7 +103,7 @@ fn get_windows_fs_type(p: &[u16]) -> std::io::Result<String> {
             Some(&mut file_system_flags),
             Some(&mut file_system_name_buffer),
         )
-        .map_err(|e| Error::from_raw_os_error(e.code().0 as i32))?;
+        .map_err(|e| Error::from_raw_os_error(e.code().0))?;
     }
 
     Ok(utf16_to_string(&file_system_name_buffer))
@@ -119,7 +119,7 @@ fn get_volume_name(v: &[u16]) -> std::io::Result<Vec<u16>> {
     // Note: GetVolumePathNameW documentation says "The buffer should be large enough to hold the path". MAX_PATH is generally safe for volume roots.
     unsafe {
         GetVolumePathNameW(windows::core::PCWSTR::from_raw(v.as_ptr()), &mut volume_name_buffer)
-            .map_err(|e| Error::from_raw_os_error(e.code().0 as i32))?;
+            .map_err(|e| Error::from_raw_os_error(e.code().0))?;
     }
 
     let len = volume_name_buffer
