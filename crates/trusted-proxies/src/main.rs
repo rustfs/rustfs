@@ -33,7 +33,7 @@ use api::handlers;
 use config::{AppConfig, ConfigLoader, MonitoringConfig};
 use error::AppError;
 use middleware::TrustedProxyLayer;
-use proxy::metrics::default_proxy_metrics;
+use proxy::default_proxy_metrics;
 use state::AppState;
 
 #[tokio::main]

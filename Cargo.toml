@@ -177,7 +177,7 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.8.12" }
 aws-credential-types = { version = "1.2.11" }
 aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
-aws-smithy-types = { version = "1.4.1" }
+aws-smithy-types = { version = "1.4.2" }
 backtrace = "0.3.76"
 base64 = "0.22.1"
 base64-simd = "0.8.0"
@@ -204,7 +204,7 @@ ipnetwork = { version = "0.21.1", features = ["serde"] }
 lazy_static = "1.5.0"
 libc = "0.2.180"
 libsystemd = "0.7.2"
-local-ip-address = "0.6.9"
+local-ip-address = "0.6.10"
 lz4 = "1.28.1"
 matchit = "0.9.1"
 md-5 = "0.11.0-rc.3"
@@ -237,7 +237,7 @@ smallvec = { version = "1.15.1", features = ["serde"] }
 smartstring = "1.0.1"
 snafu = "0.8.9"
 snap = "1.1.1"
-starshard = { version = "0.6.0", features = ["rayon", "async", "serde"] }
+starshard = { version = "1.1.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.27.2", features = ["derive"] }
 sysinfo = "0.38.0"
 temp-env = "0.3.6"
