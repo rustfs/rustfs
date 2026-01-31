@@ -22,6 +22,7 @@ use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{format_description::FormatItem, macros::format_description};
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
@@ -36,6 +37,9 @@ pub const TIER_FV_MARKER: &str = "tier-free-marker";
 pub const TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
 
 const ERR_RESTORE_HDR_MALFORMED: &str = "x-amz-restore header malformed";
+
+const RFC1123: &[FormatItem<'_>] =
+    format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
@@ -580,6 +584,7 @@ pub trait RestoreStatusOps {
     fn on_going(&self) -> bool;
     fn on_disk(&self) -> bool;
     fn to_string(&self) -> String;
+    fn to_string2(&self) -> String;
 }
 
 impl RestoreStatusOps for RestoreStatus {
@@ -618,6 +623,18 @@ impl RestoreStatusOps for RestoreStatus {
                 .unwrap()
         )
     }
+
+    fn to_string2(&self) -> String {
+        if self.on_going() {
+            return "ongoing-request=\"true\"".to_string();
+        }
+        format!(
+            "ongoing-request=\"false\", expiry-date=\"{}\"",
+            OffsetDateTime::from(self.restore_expiry_date.clone().unwrap())
+                .format(&RFC1123)
+                .unwrap()
+        )
+    }
 }
 
 pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
@@ -650,10 +667,8 @@ pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
             if expiry_tokens[0].trim() != "expiry-date" {
                 return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
             }
-            let expiry = OffsetDateTime::parse(expiry_tokens[1].trim_matches('"'), &Rfc3339).unwrap();
-            /*if err != nil {
-                return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
-            }*/
+            let expiry = OffsetDateTime::parse(expiry_tokens[1].trim_matches('"'), &Rfc3339)
+                .map_err(|_| Error::other(ERR_RESTORE_HDR_MALFORMED))?;
             return Ok(RestoreStatus {
                 is_restore_in_progress: Some(false),
                 restore_expiry_date: Some(Timestamp::from(expiry)),

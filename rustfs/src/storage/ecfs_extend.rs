@@ -52,7 +52,7 @@ use time::{format_description::FormatItem, macros::format_description};
 use tokio::io::AsyncRead;
 use tracing::{debug, warn};
 
-const RFC1123: &[FormatItem<'_>] =
+pub const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
 /// =======================

@@ -14,8 +14,8 @@
 
 use crate::{
     ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, ObjectPartInfo, RawFileInfo, ReplicationState,
-    ReplicationStatusType, Result, TIER_FV_ID, TIER_FV_MARKER, VersionPurgeStatusType, replication_statuses_map,
-    version_purge_statuses_map,
+    ReplicationStatusType, Result, TIER_FV_ID, TIER_FV_MARKER, VersionPurgeStatusType, is_restored_object_on_disk,
+    replication_statuses_map, version_purge_statuses_map,
 };
 use byteorder::ByteOrder;
 use bytes::Bytes;
@@ -462,7 +462,7 @@ impl FileMeta {
         self.versions
             .iter()
             .filter(|v| {
-                v.header.version_type == VersionType::Object && v.header.version_id != Some(vid) && v.header.user_data_dir()
+                v.header.version_type == VersionType::Object && v.header.version_id != Some(vid) && v.header.uses_data_dir()
             })
             .map(|v| FileMetaVersion::decode_data_dir_from_meta(&v.meta).unwrap_or_default())
             .filter(|v| v == data_dir)
@@ -1201,10 +1201,11 @@ impl FileMeta {
             .filter(|v| {
                 v.header.version_type == VersionType::Object
                     && v.header.version_id != Some(version_id)
-                    && v.header.user_data_dir()
+                    && v.header.uses_data_dir()
             })
             .filter_map(|v| FileMetaVersion::decode_data_dir_from_meta(&v.meta).ok())
-            .filter(|&dir| dir == data_dir)
+            .filter(|&dir| dir.is_none() || dir != data_dir)
+            //.filter(|&dir| dir != data_dir)
             .count()
     }
 
@@ -1588,7 +1589,7 @@ impl FileMetaVersionHeader {
         false
     }
 
-    pub fn user_data_dir(&self) -> bool {
+    pub fn uses_data_dir(&self) -> bool {
         self.flags & Flags::UsesDataDir as u8 != 0
     }
 
@@ -1961,7 +1962,15 @@ impl MetaObject {
     }
 
     pub fn uses_data_dir(&self) -> bool {
-        !self.inlinedata()
+        if let Some(status) = self
+            .meta_sys
+            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"))
+            && *status == TRANSITION_COMPLETE.as_bytes().to_vec()
+        {
+            return false;
+        }
+
+        is_restored_object_on_disk(&self.meta_user)
     }
 
     pub fn inlinedata(&self) -> bool {
