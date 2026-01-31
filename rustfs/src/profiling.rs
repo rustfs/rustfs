@@ -24,7 +24,7 @@ mod windows_impl {
     use tracing::info;
 
     pub async fn init_from_env() {
-        info!("Initializing system tracing allocator");
+        info!("Profiling initialization skipped on Windows platform (not supported)");
     }
 
     /// Stop all background profiling tasks
