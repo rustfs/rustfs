@@ -170,7 +170,7 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 
 #export RUSTFS_REGION="us-east-1"
 
-export RUSTFS_ENABLE_SCANNER=false
+export RUSTFS_ENABLE_SCANNER=true
 
 export RUSTFS_ENABLE_HEAL=false
 
@@ -178,7 +178,7 @@ export RUSTFS_ENABLE_HEAL=false
 export RUSTFS_OBJECT_CACHE_ENABLE=true
 
 # Profiling configuration
-export RUSTFS_ENABLE_PROFILING=false
+export RUSTFS_ENABLE_PROFILING=true
 
 # Heal configuration queue size
 export RUSTFS_HEAL_QUEUE_SIZE=10000
@@ -201,6 +201,8 @@ export RUSTFS_LOCK_ACQUIRE_TIMEOUT=30
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
+
+export RUSTFS_PROF_MEM_PERIODIC=true
 
 # Enable jemalloc for memory profiling
 # MALLOC_CONF parameters:

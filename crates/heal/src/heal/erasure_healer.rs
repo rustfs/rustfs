@@ -245,7 +245,7 @@ impl ErasureSetHealer {
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
-        info!(target: "rustfs:ahm:heal_bucket_with_resume" ,"Starting heal for bucket from object index {}", current_object_index);
+        info!(target: "rustfs:heal:heal_bucket_with_resume" ,"Starting heal for bucket from object index {}", current_object_index);
 
         // 1. get bucket info
         let _bucket_info = match self.storage.get_bucket_info(bucket).await? {
@@ -301,7 +301,7 @@ impl ErasureSetHealer {
 
                 if !object_exists {
                     info!(
-                        target: "rustfs:ahm:heal_bucket_with_resume" ,"Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
+                        target: "rustfs:heal:heal_bucket_with_resume" ,"Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
                         bucket, object
                     );
                     checkpoint_manager.add_processed_object(object.clone()).await?;

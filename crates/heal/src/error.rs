@@ -14,9 +14,9 @@
 
 use thiserror::Error;
 
-/// Custom error type for AHM operations
+/// Custom error type for heal operations
 /// This enum defines various error variants that can occur during
-/// the execution of AHM-related tasks, such as I/O errors, storage errors,
+/// the execution of heal-related tasks, such as I/O errors, storage errors,
 /// configuration errors, and specific errors related to healing operations.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -41,13 +41,6 @@ pub enum Error {
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
 
-    // Scanner
-    #[error("Scanner error: {0}")]
-    Scanner(String),
-
-    #[error("Metrics error: {0}")]
-    Metrics(String),
-
     #[error("Serialization error: {0}")]
     Serialization(String),
 
@@ -60,7 +53,6 @@ pub enum Error {
     #[error("Invalid checkpoint: {0}")]
     InvalidCheckpoint(String),
 
-    // Heal
     #[error("Heal task not found: {task_id}")]
     TaskNotFound { task_id: String },
 
@@ -89,9 +81,7 @@ pub enum Error {
     ProgressTrackingFailed { message: String },
 }
 
-/// A specialized Result type for AHM operations
-///This type is a convenient alias for results returned by functions in the AHM crate,
-/// using the custom Error type defined above.
+/// A specialized Result type for heal operations
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {

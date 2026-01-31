@@ -41,7 +41,7 @@ members = [
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
-    "crates/ahm", # Asynchronous Hash Map for concurrent data structures
+    "crates/heal", # Erasure set and object healing
     "crates/mcp", # MCP server for S3 operations
     "crates/kms", # Key Management Service
 ]
@@ -51,7 +51,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
-rust-version = "1.90"
+rust-version = "1.93.0"
 version = "0.0.5"
 homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
@@ -67,7 +67,7 @@ all = "warn"
 [workspace.dependencies]
 # RustFS Internal Crates
 rustfs = { path = "./rustfs", version = "0.0.5" }
-rustfs-ahm = { path = "crates/ahm", version = "0.0.5" }
+rustfs-heal = { path = "crates/heal", version = "0.0.5" }
 rustfs-appauth = { path = "crates/appauth", version = "0.0.5" }
 rustfs-audit = { path = "crates/audit", version = "0.0.5" }
 rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
@@ -175,12 +175,13 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.8.12" }
 aws-credential-types = { version = "1.2.11" }
 aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
-aws-smithy-types = { version = "1.4.0" }
+aws-smithy-types = { version = "1.4.1" }
+backtrace = "0.3.76"
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"
 cfg-if = "1.0.4"
-clap = { version = "4.5.55", features = ["derive", "env"] }
+clap = { version = "4.5.56", features = ["derive", "env"] }
 const-str = { version = "1.0.0", features = ["std", "proc"] }
 convert_case = "0.10.0"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -195,7 +196,6 @@ glob = "0.3.3"
 google-cloud-storage = "1.7.0"
 google-cloud-auth = "1.5.0"
 hashbrown = { version = "0.16.1", features = ["serde", "rayon"] }
-heed = { version = "0.22.0" }
 hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
 ipnetwork = { version = "0.21.1", features = ["serde"] }
@@ -210,7 +210,6 @@ md5 = "0.8.0"
 mime_guess = "2.0.5"
 moka = { version = "0.12.13", features = ["future"] }
 netif = "0.1.6"
-nix = { version = "0.31.1", features = ["fs"] }
 nu-ansi-term = "0.50.3"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.11.0"
@@ -225,9 +224,10 @@ rayon = "1.11.0"
 reed-solomon-simd = { version = "3.1.0" }
 regex = { version = "1.12.2" }
 rumqttc = { version = "0.25.1" }
+rustix = { version = "1.1.3", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", branch = "main" }
+s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", rev = "3cdb3fe22fe8a1b7fc3f71ead4beacac2683ba7f" }
 serial_test = "3.3.1"
 shadow-rs = { version = "1.7.0", default-features = false }
 siphasher = "1.0.2"

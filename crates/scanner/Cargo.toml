@@ -38,8 +38,6 @@ tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true, features = ["v4", "serde"] }
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 time = { workspace = true }
@@ -50,14 +48,9 @@ rustfs-filemeta = { workspace = true }
 rustfs-madmin = { workspace = true }
 tokio-util = { workspace = true }
 rustfs-ecstore  = { workspace = true }
-rustfs-ahm  = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
 s3s = { workspace = true }
 
 [dev-dependencies]
-tokio-test = { workspace = true }
-tracing-subscriber = { workspace = true }
-tempfile = { workspace = true }
-serial_test = { workspace = true }
-heed = { workspace = true }
+heed = { version = "0.22.0" }
