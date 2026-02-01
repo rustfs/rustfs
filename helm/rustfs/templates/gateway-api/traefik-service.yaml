@@ -1,4 +1,4 @@
-{{- if eq .Values.gatewayApi.gatewayClass "traefik" }}
+{{- if and .Values.gatewayApi.enabled (eq .Values.gatewayApi.gatewayClass "traefik") }}
 apiVersion: traefik.io/v1alpha1
 kind: TraefikService
 metadata:
