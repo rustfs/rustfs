@@ -239,7 +239,7 @@ fn dump_profile_inner(path: &Path) -> Result<(), String> {
     for (_key, (count, bytes, frames)) in aggregated_samples {
         let mut sample = pb::Sample {
             value: vec![count, bytes],
-            ..Default::default() // 其他字段继承 Default::default() 的值
+            ..Default::default()
         };
 
         // Process frames
