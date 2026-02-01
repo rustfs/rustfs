@@ -177,7 +177,7 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.8.12" }
 aws-credential-types = { version = "1.2.11" }
 aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
-aws-smithy-types = { version = "1.4.2" }
+aws-smithy-types = { version = "1.4.3" }
 backtrace = "0.3.76"
 base64 = "0.22.1"
 base64-simd = "0.8.0"
@@ -185,7 +185,7 @@ brotli = "8.0.2"
 cfg-if = "1.0.4"
 clap = { version = "4.5.56", features = ["derive", "env"] }
 const-str = { version = "1.0.0", features = ["std", "proc"] }
-convert_case = "0.10.0"
+convert_case = "0.11.0"
 criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "52.1.0"

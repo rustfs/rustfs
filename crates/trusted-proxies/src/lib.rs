@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod api;
 pub mod cloud;
 pub mod config;
 pub mod error;
+pub mod global;
 pub mod logging;
 pub mod middleware;
 pub mod proxy;
@@ -25,6 +25,8 @@ pub mod utils;
 // Re-export core types for convenience
 pub use cloud::*;
 pub use config::*;
+pub use global::{init, layer};
 pub use middleware::{ClientInfo, TrustedProxyLayer, TrustedProxyMiddleware};
 pub use proxy::*;
+#[cfg(test)]
 pub use state::AppState;

@@ -14,7 +14,8 @@
 
 //! Shared application state.
 
-use crate::{AppConfig, ProxyMetrics};
+use crate::proxy::ProxyMetrics;
+use crate::AppConfig;
 use std::sync::Arc;
 
 /// Global application state shared across handlers and middleware.
