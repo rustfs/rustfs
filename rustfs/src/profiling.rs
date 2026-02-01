@@ -12,10 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
 pub mod allocator;
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tracing::info;
+
+    pub async fn init_from_env() {
+        info!("Profiling initialization skipped on Windows platform (not supported)");
+    }
+
+    /// Stop all background profiling tasks
+    pub fn shutdown_profiling() {
+        info!("profiling: shutdown called on Windows platform (no-op)");
+    }
+
+    pub async fn dump_cpu_pprof_for(_duration: Duration) -> Result<PathBuf, String> {
+        Err("CPU profiling is not supported on Windows platform".to_string())
+    }
+
+    pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
+        Err("Memory profiling is not supported on Windows platform".to_string())
+    }
+}
+#[cfg(target_os = "windows")]
+pub use windows_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};
+
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
 mod generic_impl {
     use super::allocator;
     use rustfs_config::{
@@ -123,7 +155,10 @@ mod generic_impl {
     }
 }
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
 pub use generic_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]

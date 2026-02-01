@@ -30,6 +30,8 @@ use crate::client::{
     transition_api::{Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
+use crate::error::ErrorResponse;
+use crate::error::error_resp_to_object_err;
 use crate::tier::{
     tier_config::TierS3,
     warm_backend::{WarmBackend, WarmBackendGetOpts},

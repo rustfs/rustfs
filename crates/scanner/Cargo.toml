@@ -53,3 +53,6 @@ rand = { workspace = true }
 s3s = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
+serial_test = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }

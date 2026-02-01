@@ -70,10 +70,17 @@ use tracing::{debug, error, info, instrument, warn};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
 #[global_allocator]
 static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
     profiling::allocator::TracingAllocator::new(mimalloc::MiMalloc);
+
+#[cfg(target_os = "windows")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
     let runtime = server::get_tokio_runtime_builder()
