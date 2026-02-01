@@ -7598,6 +7598,7 @@ dependencies = [
 name = "rustfs"
 version = "0.0.5"
 dependencies = [
+ "aes-gcm 0.11.0-rc.2",
  "astral-tokio-tar",
  "async-trait",
  "atoi",

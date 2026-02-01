@@ -78,7 +78,6 @@ use aes_gcm::{
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use chrono::Utc;
 use rand::RngCore;
 use rustfs_ecstore::error::StorageError;
 use rustfs_filemeta::ObjectPartInfo;
@@ -815,7 +814,7 @@ async fn apply_managed_encryption_material(
         iv: data_key.nonce.to_vec(),
         tag: None,
         encryption_context: context.encryption_context.clone(),
-        encrypted_at: Utc::now(),
+        encrypted_at: jiff::Zoned::now(),
         original_size: if content_size >= 0 { content_size as u64 } else { 0 },
         encrypted_data_key,
     };

@@ -194,13 +194,6 @@ impl InMemoryAsyncReader {
     }
 }
 
-/// Managed encryption material for KMS-based encryption
-pub(crate) struct ManagedEncryptionMaterial {
-    pub(crate) data_key: rustfs_kms::service::DataKey,
-    pub(crate) headers: HashMap<String, String>,
-    pub(crate) kms_key_id: String,
-}
-
 impl AsyncRead for InMemoryAsyncReader {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
