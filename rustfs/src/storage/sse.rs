@@ -942,13 +942,6 @@ async fn apply_managed_encryption_material(
         encryption_metadata.original_size.to_string(),
     );
 
-    // Handle part-specific nonce if needed
-    let nonce = if let Some(part_num) = part_number {
-        derive_part_nonce(data_key.nonce, part_num)
-    } else {
-        data_key.nonce
-    };
-
     Ok(EncryptionMaterial {
         sse_type: encryption_type,
         server_side_encryption,
@@ -956,7 +949,7 @@ async fn apply_managed_encryption_material(
         algorithm,
 
         key_bytes: data_key.plaintext_key,
-        nonce,
+        nonce: data_key.nonce,
         metadata,
     })
 }
@@ -1420,103 +1413,41 @@ pub fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
     nonce
 }
 
-/// Decrypt multipart upload stream with managed encryption
-///
-/// Decrypts a stream of encrypted parts by:
-/// 1. Reading all parts into memory
-/// 2. Deriving per-part nonces from base nonce
-/// 3. Decrypting each part separately
-/// 4. Concatenating decrypted data
 pub(crate) async fn decrypt_multipart_managed_stream(
     mut encrypted_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     parts: &[ObjectPartInfo],
     key_bytes: [u8; 32],
     base_nonce: [u8; 12],
 ) -> Result<(Box<dyn Reader>, i64), StorageError> {
-    // Read all encrypted data into memory first
-    // This ensures we have all parts data before starting decryption
-    let mut encrypted_data = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut encrypted_stream, &mut encrypted_data)
-        .await
-        .map_err(|e| StorageError::other(format!("failed to read encrypted stream: {}", e)))?;
-
-    // Calculate total encrypted size expected
-    let total_encrypted_size: usize = parts.iter().map(|part| part.size).sum();
     let total_plain_capacity: usize = parts.iter().map(|part| part.actual_size.max(0) as usize).sum();
-    
-    debug!(
-        "decrypt_multipart_managed_stream: {} parts, total_encrypted_size={}, encrypted_data_len={}, total_plain_capacity={}",
-        parts.len(),
-        total_encrypted_size,
-        encrypted_data.len(),
-        total_plain_capacity
-    );
 
-    // Verify we have enough encrypted data
-    if encrypted_data.len() < total_encrypted_size {
-        return Err(StorageError::other(format!(
-            "encrypted stream size mismatch: expected {} bytes but got {} bytes. This indicates the stream does not contain all parts data.",
-            total_encrypted_size, encrypted_data.len()
-        )));
-    }
+    let mut plaintext = Vec::with_capacity(total_plain_capacity);
 
-    let mut decrypted_parts = Vec::new();
-    let mut offset = 0;
-
-    for (idx, part_info) in parts.iter().enumerate() {
-        if part_info.size == 0 {
-            debug!("Skipping part {} with size 0", part_info.number);
+    for part in parts {
+        if part.size == 0 {
             continue;
         }
 
-        debug!(
-            "Decrypting part {} (index {}): encrypted_size={}, actual_size={}",
-            part_info.number, idx, part_info.size, part_info.actual_size
-        );
-
-        // Use part.size (encrypted size) to split encrypted data
-        // part.actual_size is the decrypted size, which we'll verify after decryption
-        if offset + part_info.size > encrypted_data.len() {
-            return Err(StorageError::other(format!(
-                "encrypted data size mismatch for part {}: offset {} + encrypted_size {} exceeds total encrypted data length {}",
-                part_info.number, offset, part_info.size, encrypted_data.len()
-            )));
-        }
-
-        let part_encrypted_data = &encrypted_data[offset..offset + part_info.size];
-        let part_nonce = derive_part_nonce(base_nonce, part_info.number);
-
-        // Decrypt this part
-        let cursor = std::io::Cursor::new(part_encrypted_data.to_vec());
-        let decrypt_reader = DecryptReader::new(WarpReader::new(cursor), key_bytes, part_nonce);
-        let mut decrypt_reader = Box::pin(decrypt_reader);
-
-        let mut decrypted_part = Vec::with_capacity(part_info.actual_size.max(0) as usize);
-        tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut decrypted_part)
+        let mut encrypted_part = vec![0u8; part.size];
+        tokio::io::AsyncReadExt::read_exact(&mut encrypted_stream, &mut encrypted_part)
             .await
-            .map_err(|e| StorageError::other(format!("failed to decrypt multipart segment {}: {}", part_info.number, e)))?;
+            .map_err(|e| StorageError::other(format!("failed to read encrypted multipart segment {}: {}", part.number, e)))?;
 
-        debug!(
-            "Decrypted part {}: {} bytes (expected actual_size: {})",
-            part_info.number, decrypted_part.len(), part_info.actual_size
-        );
+        let part_nonce = derive_part_nonce(base_nonce, part.number);
+        let cursor = std::io::Cursor::new(encrypted_part);
+        let mut decrypt_reader = DecryptReader::new(WarpReader::new(cursor), key_bytes, part_nonce);
 
-        decrypted_parts.push(decrypted_part);
-        offset += part_info.size;
+        tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut plaintext)
+            .await
+            .map_err(|e| StorageError::other(format!("failed to decrypt multipart segment {}: {}", part.number, e)))?;
     }
 
-    // Concatenate all decrypted parts
-    let all_decrypted = decrypted_parts.concat();
-    let total_size = all_decrypted.len() as i64;
+    let total_plain_size = plaintext.len() as i64;
+    let reader = Box::new(WarpReader::new(InMemoryAsyncReader::new(plaintext))) as Box<dyn Reader>;
 
-    debug!(
-        "decrypt_multipart_managed_stream completed: total_plain_size={}, expected_total={}",
-        total_size, total_plain_capacity
-    );
-
-    let reader: Box<dyn Reader> = Box::new(WarpReader::new(InMemoryAsyncReader::new(all_decrypted)));
-    Ok((reader, total_size))
+    Ok((reader, total_plain_size))
 }
+
 
 // ============================================================================
 // SSE-C Functions
