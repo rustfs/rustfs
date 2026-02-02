@@ -564,7 +564,11 @@ fn process_connection(
             }
         };
         let hybrid_service = ServiceBuilder::new()
+            // Insert RemoteAddr for existing code that depends on it
             .layer(AddExtensionLayer::new(remote_addr))
+            // Insert raw SocketAddr for TrustedProxyMiddleware
+            // The TrustedProxyLayer needs to access the peer address to validate proxy chains
+            .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
             // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
             // This should be placed before TraceLayer so that logs reflect the real client IP
             .option_layer(if rustfs_trusted_proxies::is_enabled() {
