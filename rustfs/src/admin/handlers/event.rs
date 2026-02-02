@@ -261,7 +261,7 @@ impl Operation for ListNotificationTargets {
                 };
                 NotificationEndpoint {
                     account_id: target.id().id.clone(),
-                    service: target.name().to_string(),
+                    service: target.id().name.to_string(),
                     status: status.to_string(),
                 }
             });
