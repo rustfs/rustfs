@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use axum::body::Body;
-use axum::{Router, routing::get};
-use rustfs_trusted_proxies::config::{TrustedProxy, TrustedProxyConfig, ValidationMode};
-use rustfs_trusted_proxies::middleware::TrustedProxyLayer;
+use axum::{routing::get, Router};
+use rustfs_trusted_proxies::{TrustedProxy, TrustedProxyConfig, TrustedProxyLayer, ValidationMode};
 use tower::ServiceExt;
 
 #[tokio::test]

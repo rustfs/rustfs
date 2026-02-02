@@ -78,17 +78,17 @@ impl AppError {
 }
 
 /// Type alias for API error responses (Status Code, Error Message).
-pub type ApiError = (axum::http::StatusCode, String);
+pub type ApiError = (http::StatusCode, String);
 
 impl From<AppError> for ApiError {
     fn from(err: AppError) -> Self {
         match err {
-            AppError::Config(_) => (axum::http::StatusCode::BAD_REQUEST, err.to_string()),
-            AppError::Proxy(_) => (axum::http::StatusCode::BAD_REQUEST, err.to_string()),
-            AppError::Cloud(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
-            AppError::Internal(_) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            AppError::Io(_) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            AppError::Http(_) => (axum::http::StatusCode::BAD_GATEWAY, err.to_string()),
+            AppError::Config(_) => (http::StatusCode::BAD_REQUEST, err.to_string()),
+            AppError::Proxy(_) => (http::StatusCode::BAD_REQUEST, err.to_string()),
+            AppError::Cloud(_) => (http::StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+            AppError::Internal(_) => (http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            AppError::Io(_) => (http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            AppError::Http(_) => (http::StatusCode::BAD_GATEWAY, err.to_string()),
         }
     }
 }

@@ -22,6 +22,7 @@ The module is configured primarily through environment variables:
 
 | Variable                                      | Default             | Description                                             |
 |-----------------------------------------------|---------------------|---------------------------------------------------------|
+| `RUSTFS_TRUSTED_PROXY_ENABLED`                | `true`              | Enable the trusted proxy middleware                     |
 | `RUSTFS_TRUSTED_PROXY_VALIDATION_MODE`        | `hop_by_hop`        | Validation strategy (`strict`, `lenient`, `hop_by_hop`) |
 | `RUSTFS_TRUSTED_PROXY_NETWORKS`               | `127.0.0.1,::1,...` | Comma-separated list of trusted CIDR ranges             |
 | `RUSTFS_TRUSTED_PROXY_MAX_HOPS`               | `10`                | Maximum allowed proxy hops                              |
@@ -31,30 +32,44 @@ The module is configured primarily through environment variables:
 
 ## Usage
 
-### As a Middleware
+### Initialization
 
-Integrate the trusted proxy validation into your Axum application:
+Initialize the global trusted proxy system at the start of your application (e.g., in `main.rs`):
 
 ```rust
-use rustfs_trusted_proxies::{TrustedProxyLayer, TrustedProxyConfig};
+// Initialize trusted proxies system
+rustfs_trusted_proxies::init();
+```
 
-let config = TrustedProxyConfig::default ();
-let layer = TrustedProxyLayer::enabled(config, None);
+### As a Middleware
+
+Integrate the trusted proxy validation into your Axum application or HTTP service stack:
+
+```rust
+use rustfs_trusted_proxies;
 
 let app = Router::new()
-.route("/", get(handler))
-.layer(layer);
+    .route("/", get(handler))
+    // Add the trusted proxy layer if enabled
+    .option_layer(if rustfs_trusted_proxies::is_enabled() {
+        Some(rustfs_trusted_proxies::layer().clone())
+    } else {
+        None
+    });
 ```
 
 ### Accessing Client Info
 
-Retrieve the verified client information in your handlers:
+Retrieve the verified client information in your handlers or other middleware:
 
 ```rust
 use rustfs_trusted_proxies::ClientInfo;
 
-async fn handler(Extension(client_info): Extension<ClientInfo>) -> impl IntoResponse {
-    println!("Real Client IP: {}", client_info.real_ip);
+async fn handler(req: Request) -> impl IntoResponse {
+    if let Some(client_info) = req.extensions().get::<ClientInfo>() {
+        println!("Real Client IP: {}", client_info.real_ip);
+        println!("Is Trusted: {}", client_info.is_from_trusted_proxy);
+    }
 }
 ```
 

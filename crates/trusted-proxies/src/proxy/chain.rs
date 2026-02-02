@@ -14,9 +14,7 @@
 
 //! Proxy chain analysis and validation logic.
 
-use crate::config::{TrustedProxyConfig, ValidationMode};
-use crate::error::ProxyError;
-use crate::utils::is_valid_ip_address;
+use crate::{is_valid_ip_address, ProxyError, TrustedProxyConfig, ValidationMode};
 use axum::http::HeaderMap;
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -129,11 +127,11 @@ impl ProxyChainAnalyzer {
             return (IpAddr::from([0, 0, 0, 0]), Vec::new(), 0);
         }
 
-        if let Some(last_proxy) = chain.last() {
-            if self.is_ip_trusted(last_proxy) {
-                let client_ip = chain.first().copied().unwrap_or(*last_proxy);
-                return (client_ip, chain.to_vec(), chain.len());
-            }
+        if let Some(last_proxy) = chain.last()
+            && self.is_ip_trusted(last_proxy)
+        {
+            let client_ip = chain.first().copied().unwrap_or(*last_proxy);
+            return (client_ip, chain.to_vec(), chain.len());
         }
 
         let client_ip = chain.first().copied().unwrap_or(IpAddr::from([0, 0, 0, 0]));

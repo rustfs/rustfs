@@ -16,14 +16,17 @@
 
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::time::Duration;
 
-use crate::error::ConfigError;
+use crate::ConfigError;
 
 /// Proxy validation mode defining how the proxy chain is verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ValidationMode {
     /// Lenient mode: Accepts the entire chain as long as the last proxy is trusted.
     Lenient,
@@ -31,12 +34,14 @@ pub enum ValidationMode {
     Strict,
     /// Hop-by-hop mode: Finds the first untrusted proxy from right to left.
     /// This is the recommended mode for most production environments.
+    #[default]
     HopByHop,
 }
 
-impl ValidationMode {
-    /// Parses the validation mode from a string.
-    pub fn from_str(s: &str) -> Result<Self, ConfigError> {
+impl FromStr for ValidationMode {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "lenient" => Ok(Self::Lenient),
             "strict" => Ok(Self::Strict),
@@ -47,7 +52,9 @@ impl ValidationMode {
             ))),
         }
     }
+}
 
+impl ValidationMode {
     /// Returns the string representation of the validation mode.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -55,12 +62,6 @@ impl ValidationMode {
             Self::Strict => "strict",
             Self::HopByHop => "hop_by_hop",
         }
-    }
-}
-
-impl Default for ValidationMode {
-    fn default() -> Self {
-        Self::HopByHop
     }
 }
 
@@ -73,20 +74,21 @@ pub enum TrustedProxy {
     Cidr(IpNetwork),
 }
 
+impl fmt::Display for TrustedProxy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Single(ip) => write!(f, "{}", ip),
+            Self::Cidr(network) => write!(f, "{}", network),
+        }
+    }
+}
+
 impl TrustedProxy {
     /// Checks if the given IP address matches this proxy configuration.
     pub fn contains(&self, ip: &IpAddr) -> bool {
         match self {
             Self::Single(proxy_ip) => ip == proxy_ip,
             Self::Cidr(network) => network.contains(*ip),
-        }
-    }
-
-    /// Returns the string representation of the proxy entry.
-    pub fn to_string(&self) -> String {
-        match self {
-            Self::Single(ip) => ip.to_string(),
-            Self::Cidr(network) => network.to_string(),
         }
     }
 }

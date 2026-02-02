@@ -14,12 +14,24 @@
 
 //! Configuration loader for environment variables and files.
 
-use std::net::{IpAddr, SocketAddr};
-
-use crate::config::env::*;
-use crate::config::{AppConfig, CacheConfig, CloudConfig, MonitoringConfig, TrustedProxy, TrustedProxyConfig, ValidationMode};
-use crate::error::ConfigError;
-use rustfs_utils::*;
+use crate::{
+    parse_ip_list_from_env, parse_string_list_from_env, AppConfig, CacheConfig, CloudConfig, ConfigError,
+    MonitoringConfig, TrustedProxy, TrustedProxyConfig, ValidationMode,
+    DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_CLEANUP_INTERVAL, DEFAULT_CACHE_TTL_SECONDS, DEFAULT_CLOUDFLARE_IPS_ENABLED,
+    DEFAULT_CLOUD_METADATA_ENABLED, DEFAULT_CLOUD_METADATA_TIMEOUT, DEFAULT_CLOUD_PROVIDER_FORCE,
+    DEFAULT_EXTRA_TRUSTED_PROXIES, DEFAULT_LOG_LEVEL, DEFAULT_METRICS_ENABLED, DEFAULT_PRIVATE_NETWORKS,
+    DEFAULT_PROXY_CHAIN_CONTINUITY_CHECK, DEFAULT_PROXY_ENABLE_RFC7239, DEFAULT_PROXY_LOG_FAILED_VALIDATIONS, DEFAULT_PROXY_MAX_HOPS, DEFAULT_PROXY_VALIDATION_MODE,
+    DEFAULT_STRUCTURED_LOGGING, DEFAULT_TRACING_ENABLED, DEFAULT_TRUSTED_PROXIES, DEFAULT_TRUSTED_PROXY_IPS,
+    ENV_CACHE_CAPACITY, ENV_CACHE_CLEANUP_INTERVAL, ENV_CACHE_TTL_SECONDS, ENV_CLOUDFLARE_IPS_ENABLED, ENV_CLOUD_METADATA_ENABLED,
+    ENV_CLOUD_METADATA_TIMEOUT, ENV_CLOUD_PROVIDER_FORCE, ENV_EXTRA_TRUSTED_PROXIES, ENV_LOG_LEVEL,
+    ENV_METRICS_ENABLED, ENV_PRIVATE_NETWORKS, ENV_PROXY_CHAIN_CONTINUITY_CHECK, ENV_PROXY_ENABLE_RFC7239, ENV_PROXY_LOG_FAILED_VALIDATIONS,
+    ENV_PROXY_MAX_HOPS, ENV_PROXY_VALIDATION_MODE, ENV_STRUCTURED_LOGGING, ENV_TRACING_ENABLED, ENV_TRUSTED_PROXIES, ENV_TRUSTED_PROXY_IPS,
+};
+use ipnetwork::IpNetwork;
+use rustfs_utils::{get_env_bool, get_env_str, get_env_u64, get_env_usize, parse_and_resolve_address};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
+use tracing::info;
 
 /// Loader for application configuration.
 #[derive(Debug, Clone)]
@@ -63,7 +75,7 @@ impl ConfigLoader {
         }
 
         // Parse individual trusted proxy IPs.
-        let ip_strings = parse_string_list_from_env("TRUSTED_PROXY_IPS", "");
+        let ip_strings = parse_string_list_from_env(ENV_TRUSTED_PROXY_IPS, DEFAULT_TRUSTED_PROXY_IPS);
         for ip_str in ip_strings {
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
                 proxies.push(TrustedProxy::Single(ip));
@@ -131,19 +143,16 @@ impl ConfigLoader {
 
     /// Loads the server binding address from environment variables.
     fn load_server_addr() -> SocketAddr {
-        let host = get_env_str("SERVER_HOST", "0.0.0.0");
-        let port = get_env_usize("SERVER_PORT", 3000) as u16;
-
-        format!("{}:{}", host, port)
-            .parse()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 3000)))
+        let address = get_env_str("RUSTFS_ADDRESS", rustfs_config::DEFAULT_ADDRESS);
+        parse_and_resolve_address(&address)
+            .unwrap_or_else(|_| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), rustfs_config::DEFAULT_PORT))
     }
 
     /// Loads configuration from environment, falling back to defaults on failure.
     pub fn from_env_or_default() -> AppConfig {
         match Self::from_env() {
             Ok(config) => {
-                tracing::info!("Configuration loaded successfully from environment variables");
+                info!("Configuration loaded successfully from environment variables");
                 config
             }
             Err(e) => {
@@ -157,18 +166,21 @@ impl ConfigLoader {
     pub fn default_config() -> AppConfig {
         let proxy_config = TrustedProxyConfig::new(
             vec![
-                TrustedProxy::Single("127.0.0.1".parse().unwrap()),
-                TrustedProxy::Single("::1".parse().unwrap()),
+                TrustedProxy::Single(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                TrustedProxy::Single(IpAddr::V6(Ipv6Addr::LOCALHOST)),
             ],
             ValidationMode::HopByHop,
             true,
             10,
             true,
             vec![
-                "10.0.0.0/8".parse().unwrap(),
-                "172.16.0.0/12".parse().unwrap(),
-                "192.168.0.0/16".parse().unwrap(),
-            ],
+                IpNetwork::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
+                IpNetwork::new(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
+                IpNetwork::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16),
+            ]
+            .into_iter()
+            .filter_map(|n| n.ok())
+            .collect(),
         );
 
         AppConfig::new(
@@ -176,22 +188,22 @@ impl ConfigLoader {
             CacheConfig::default(),
             MonitoringConfig::default(),
             CloudConfig::default(),
-            "0.0.0.0:3000".parse().unwrap(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), rustfs_config::DEFAULT_PORT),
         )
     }
 
     /// Prints a summary of the configuration to the log.
     pub fn print_summary(config: &AppConfig) {
-        tracing::info!("=== Application Configuration ===");
-        tracing::info!("Server: {}", config.server_addr);
-        tracing::info!("Trusted Proxies: {}", config.proxy.proxies.len());
-        tracing::info!("Validation Mode: {:?}", config.proxy.validation_mode);
-        tracing::info!("Cache Capacity: {}", config.cache.capacity);
-        tracing::info!("Metrics Enabled: {}", config.monitoring.metrics_enabled);
-        tracing::info!("Cloud Metadata: {}", config.cloud.metadata_enabled);
+        info!("=== Application Configuration ===");
+        info!("Server: {}", config.server_addr);
+        info!("Trusted Proxies: {}", config.proxy.proxies.len());
+        info!("Validation Mode: {:?}", config.proxy.validation_mode);
+        info!("Cache Capacity: {}", config.cache.capacity);
+        info!("Metrics Enabled: {}", config.monitoring.metrics_enabled);
+        info!("Cloud Metadata: {}", config.cloud.metadata_enabled);
 
         if config.monitoring.log_failed_validations {
-            tracing::info!("Failed validations will be logged");
+            info!("Failed validations will be logged");
         }
 
         if !config.proxy.proxies.is_empty() {

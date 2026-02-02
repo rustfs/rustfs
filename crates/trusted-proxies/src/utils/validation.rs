@@ -15,10 +15,14 @@
 //! Validation utility functions for various data types.
 
 use http::HeaderMap;
-use lazy_static::lazy_static;
 use regex::Regex;
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::OnceLock;
+
+static EMAIL_REGEX: OnceLock<Regex> = OnceLock::new();
+static URL_REGEX: OnceLock<Regex> = OnceLock::new();
+static SAFE_REGEX: OnceLock<Regex> = OnceLock::new();
 
 /// Collection of validation utility functions.
 pub struct ValidationUtils;
@@ -26,22 +30,22 @@ pub struct ValidationUtils;
 impl ValidationUtils {
     /// Validates an email address format.
     pub fn is_valid_email(email: &str) -> bool {
-        lazy_static! {
-            static ref EMAIL_REGEX: Regex =
-                Regex::new(r"^([a-z0-9_+]([a-z0-9_+.]*[a-z0-9_+])?)@([a-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,6})").unwrap();
-        }
-
-        EMAIL_REGEX.is_match(email)
+        EMAIL_REGEX
+            .get_or_init(|| {
+                Regex::new(r"^([a-z0-9_+]([a-z0-9_+.]*[a-z0-9_+])?)@([a-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,6})")
+                    .expect("Invalid email regex")
+            })
+            .is_match(email)
     }
 
     /// Validates a URL format.
     pub fn is_valid_url(url: &str) -> bool {
-        lazy_static! {
-            static ref URL_REGEX: Regex =
-                Regex::new(r"^(https?://)?([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,6}(/.*)?$").unwrap();
-        }
-
-        URL_REGEX.is_match(url)
+        URL_REGEX
+            .get_or_init(|| {
+                Regex::new(r"^(https?://)?([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,6}(/.*)?$")
+                    .expect("Invalid URL regex")
+            })
+            .is_match(url)
     }
 
     /// Validates the format of an X-Forwarded-For header value.
@@ -92,11 +96,10 @@ impl ValidationUtils {
     /// Checks if an IP address is within any of the specified CIDR ranges.
     pub fn validate_ip_in_range(ip: &IpAddr, cidr_ranges: &[String]) -> bool {
         for cidr in cidr_ranges {
-            if let Ok(network) = ipnetwork::IpNetwork::from_str(cidr) {
-                if network.contains(*ip) {
+            if let Ok(network) = ipnetwork::IpNetwork::from_str(cidr)
+                && network.contains(*ip) {
                     return true;
                 }
-            }
         }
 
         false
@@ -169,10 +172,11 @@ impl ValidationUtils {
 
     /// Checks if a string contains only safe characters for use in URLs or headers.
     pub fn is_safe_string(s: &str) -> bool {
-        lazy_static! {
-            static ref SAFE_REGEX: Regex = Regex::new(r"^[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=]+$").unwrap();
-        }
-        SAFE_REGEX.is_match(s)
+        SAFE_REGEX
+            .get_or_init(|| {
+                Regex::new(r"^[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=]+$").expect("Invalid safe string regex")
+            })
+            .is_match(s)
     }
 
     /// Validates rate limiting parameters.
@@ -190,10 +194,16 @@ impl ValidationUtils {
         let mut result = data.to_string();
 
         for pattern in sensitive_patterns {
-            let regex = Regex::new(&format!(r#"(?i){}[:=]\s*([^&\s]+)"#, pattern)).unwrap();
-            result = regex
-                .replace_all(&result, |caps: &regex::Captures| format!("{}:[REDACTED]", &caps[1]))
-                .to_string();
+            match Regex::new(&format!(r#"(?i){}[:=]\s*([^&\s]+)"#, pattern)) {
+                Ok(regex) => {
+                    result = regex
+                        .replace_all(&result, |caps: &regex::Captures| format!("{}:[REDACTED]", &caps[1]))
+                        .to_string();
+                }
+                Err(e) => {
+                    tracing::warn!("Invalid sensitive pattern '{}': {}", pattern, e);
+                }
+            }
         }
 
         result

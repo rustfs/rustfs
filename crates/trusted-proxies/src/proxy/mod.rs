@@ -26,7 +26,3 @@ pub use cache::*;
 pub use chain::*;
 pub use metrics::*;
 pub use validator::*;
-
-// Re-export commonly used types
-pub use crate::config::{TrustedProxyConfig, ValidationMode};
-pub use crate::error::ProxyError;

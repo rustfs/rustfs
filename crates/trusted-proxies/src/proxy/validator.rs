@@ -19,10 +19,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 use tracing::{debug, warn};
 
-use crate::config::{TrustedProxyConfig, ValidationMode};
-use crate::error::ProxyError;
-use crate::proxy::chain::ProxyChainAnalyzer;
-use crate::proxy::metrics::ProxyMetrics;
+use crate::{ProxyChainAnalyzer, ProxyError, ProxyMetrics, TrustedProxyConfig, ValidationMode};
 
 /// Information about the client extracted from the request and proxy headers.
 #[derive(Debug, Clone)]
@@ -245,10 +242,10 @@ impl ProxyValidator {
                 match key.as_str() {
                     "for" => {
                         // Extract IP address, ignoring port if present.
-                        if let Some(ip_part) = value.split(':').next() {
-                            if let Ok(ip) = ip_part.parse::<IpAddr>() {
-                                proxy_chain.push(ip);
-                            }
+                        if let Some(ip_part) = value.split(':').next()
+                            && let Ok(ip) = ip_part.parse::<IpAddr>()
+                        {
+                            proxy_chain.push(ip);
                         }
                     }
                     "host" => {

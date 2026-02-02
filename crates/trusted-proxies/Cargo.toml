@@ -27,23 +27,20 @@ categories = ["network-programming", "security", "web-programming"]
 [dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true }
-jiff = { workspace = true }
 http = { workspace = true }
 ipnetwork = { workspace = true }
 metrics = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 reqwest = { workspace = true }
-rustfs-utils = { workspace = true }
+rustfs-config = { workspace = true }
+rustfs-utils = { workspace = true, features = ["net"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 tower = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["json"] }
-uuid = { workspace = true, features = ["v4"] }
 regex = { workspace = true }
-lazy_static = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

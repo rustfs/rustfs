@@ -13,9 +13,7 @@
 // limitations under the License.
 
 use axum::http::HeaderMap;
-use rustfs_trusted_proxies::config::{TrustedProxy, TrustedProxyConfig, ValidationMode};
-use rustfs_trusted_proxies::proxy::chain::ProxyChainAnalyzer;
-use rustfs_trusted_proxies::proxy::validator::{ClientInfo, ProxyValidator};
+use rustfs_trusted_proxies::{ClientInfo, ProxyChainAnalyzer, ProxyValidator, TrustedProxy, TrustedProxyConfig, ValidationMode};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 

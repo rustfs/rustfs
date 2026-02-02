@@ -14,8 +14,7 @@
 
 //! Metrics and monitoring for proxy validation performance and results.
 
-use crate::config::ValidationMode;
-use crate::error::ProxyError;
+use crate::{ProxyError, ValidationMode};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use std::time::Duration;
 use tracing::info;

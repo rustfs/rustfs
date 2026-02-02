@@ -12,21 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod cloud;
-pub mod config;
-pub mod error;
-pub mod global;
-pub mod logging;
-pub mod middleware;
-pub mod proxy;
-pub mod state;
-pub mod utils;
+mod cloud;
+mod config;
+mod error;
+mod global;
+mod middleware;
+mod proxy;
+mod utils;
 
 // Re-export core types for convenience
 pub use cloud::*;
 pub use config::*;
-pub use global::{init, layer};
-pub use middleware::{ClientInfo, TrustedProxyLayer, TrustedProxyMiddleware};
+pub use error::*;
+pub use global::{config as global_config, init, is_enabled, layer, metrics};
+pub use middleware::{TrustedProxyLayer, TrustedProxyMiddleware};
 pub use proxy::*;
-#[cfg(test)]
-pub use state::AppState;
+pub use utils::*;

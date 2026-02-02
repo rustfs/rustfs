@@ -37,7 +37,7 @@ use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
-use rustfs_trusted_proxies::{ClientInfo, TrustedProxiesLayer};
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3Service, service::S3ServiceBuilder};
@@ -563,9 +563,14 @@ fn process_connection(
                 None
             }
         };
-        let trusted_proxies = rustfs_trusted_proxies::get_trusted_proxies_config().await;
         let hybrid_service = ServiceBuilder::new()
-            .layer(TrustedProxiesLayer::new(trusted_proxies.clone()))
+            // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
+            // This should be placed before TraceLayer so that logs reflect the real client IP
+            .option_layer(if rustfs_trusted_proxies::is_enabled() {
+                Some(rustfs_trusted_proxies::layer().clone())
+            } else {
+                None
+            })
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
             .layer(AddExtensionLayer::new(remote_addr))
@@ -580,10 +585,13 @@ fn process_connection(
                             .get(http::header::HeaderName::from_static("x-request-id"))
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("unknown");
+
+                        // Extract real client IP from trusted proxy middleware if available
                         let client_info = request.extensions().get::<ClientInfo>();
                         let real_ip = client_info
                             .map(|info| info.real_ip.to_string())
                             .unwrap_or_else(|| "unknown".to_string());
+
                         let span = tracing::info_span!("http-request",
                             trace_id = %trace_id,
                             status_code = tracing::field::Empty,

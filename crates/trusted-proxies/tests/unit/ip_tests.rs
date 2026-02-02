@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_trusted_proxies::utils::IpUtils;
+use rustfs_trusted_proxies::IpUtils;
 use std::net::IpAddr;
 use std::str::FromStr;
 

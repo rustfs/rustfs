@@ -23,6 +23,4 @@ mod ranges;
 
 pub use detector::*;
 pub use ranges::*;
-
-// Re-export metadata module types
 pub use metadata::*;

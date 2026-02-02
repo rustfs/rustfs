@@ -15,10 +15,11 @@
 //! Cloud provider detection and metadata fetching.
 
 use async_trait::async_trait;
+use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::error::AppError;
+use crate::AppError;
 
 /// Supported cloud providers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -37,40 +38,55 @@ pub enum CloudProvider {
     Unknown(String),
 }
 
+impl FromStr for CloudProvider {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
+            "aws" | "amazon" => Self::Aws,
+            "azure" | "microsoft" => Self::Azure,
+            "gcp" | "google" => Self::Gcp,
+            "digitalocean" | "do" => Self::DigitalOcean,
+            "cloudflare" | "cf" => Self::Cloudflare,
+            _ => Self::Unknown(s.to_string()),
+        })
+    }
+}
+
 impl CloudProvider {
     /// Detects the cloud provider based on environment variables.
     pub fn detect_from_env() -> Option<Self> {
         // Check for AWS environment variables.
-        if std::env::var("AWS_EXECUTION_ENV").is_ok()
-            || std::env::var("AWS_REGION").is_ok()
-            || std::env::var("EC2_INSTANCE_ID").is_ok()
+        if std::env::var("RUSTFS_AWS_EXECUTION_ENV").is_ok()
+            || std::env::var("RUSTFS_AWS_REGION").is_ok()
+            || std::env::var("RUSTFS_EC2_INSTANCE_ID").is_ok()
         {
             return Some(Self::Aws);
         }
 
         // Check for Azure environment variables.
-        if std::env::var("WEBSITE_SITE_NAME").is_ok()
-            || std::env::var("WEBSITE_INSTANCE_ID").is_ok()
-            || std::env::var("APPSETTING_WEBSITE_SITE_NAME").is_ok()
+        if std::env::var("RUSTFS_WEBSITE_SITE_NAME").is_ok()
+            || std::env::var("RUSTFS_WEBSITE_INSTANCE_ID").is_ok()
+            || std::env::var("RUSTFS_APPSETTING_WEBSITE_SITE_NAME").is_ok()
         {
             return Some(Self::Azure);
         }
 
         // Check for GCP environment variables.
-        if std::env::var("GCP_PROJECT").is_ok()
-            || std::env::var("GOOGLE_CLOUD_PROJECT").is_ok()
-            || std::env::var("GAE_INSTANCE").is_ok()
+        if std::env::var("RUSTFS_GCP_PROJECT").is_ok()
+            || std::env::var("RUSTFS_GOOGLE_CLOUD_PROJECT").is_ok()
+            || std::env::var("RUSTFS_GAE_INSTANCE").is_ok()
         {
             return Some(Self::Gcp);
         }
 
         // Check for DigitalOcean environment variables.
-        if std::env::var("DIGITALOCEAN_REGION").is_ok() {
+        if std::env::var("RUSTFS_DIGITALOCEAN_REGION").is_ok() {
             return Some(Self::DigitalOcean);
         }
 
         // Check for Cloudflare environment variables.
-        if std::env::var("CF_PAGES").is_ok() || std::env::var("CF_WORKERS").is_ok() {
+        if std::env::var("RUSTFS_CF_PAGES").is_ok() || std::env::var("RUSTFS_CF_WORKERS").is_ok() {
             return Some(Self::Cloudflare);
         }
 
@@ -86,18 +102,6 @@ impl CloudProvider {
             Self::DigitalOcean => "digitalocean",
             Self::Cloudflare => "cloudflare",
             Self::Unknown(name) => name,
-        }
-    }
-
-    /// Parses a cloud provider from a string.
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "aws" | "amazon" => Self::Aws,
-            "azure" | "microsoft" => Self::Azure,
-            "gcp" | "google" => Self::Gcp,
-            "digitalocean" | "do" => Self::DigitalOcean,
-            "cloudflare" | "cf" => Self::Cloudflare,
-            _ => Self::Unknown(s.to_string()),
         }
     }
 }
@@ -146,7 +150,7 @@ pub struct CloudDetector {
 impl CloudDetector {
     /// Creates a new `CloudDetector`.
     pub fn new(enabled: bool, timeout: Duration, forced_provider: Option<String>) -> Self {
-        let forced_provider = forced_provider.map(|s| CloudProvider::from_str(&s));
+        let forced_provider = forced_provider.and_then(|s| CloudProvider::from_str(&s).ok());
 
         Self {
             enabled,
@@ -180,27 +184,27 @@ impl CloudDetector {
         match provider {
             Some(CloudProvider::Aws) => {
                 info!("Detected AWS environment, fetching metadata");
-                let fetcher = crate::cloud::metadata::AwsMetadataFetcher::new(self.timeout);
+                let fetcher = crate::AwsMetadataFetcher::new(self.timeout);
                 fetcher.fetch_trusted_proxy_ranges().await
             }
             Some(CloudProvider::Azure) => {
                 info!("Detected Azure environment, fetching metadata");
-                let fetcher = crate::cloud::metadata::AzureMetadataFetcher::new(self.timeout);
+                let fetcher = crate::AzureMetadataFetcher::new(self.timeout);
                 fetcher.fetch_trusted_proxy_ranges().await
             }
             Some(CloudProvider::Gcp) => {
                 info!("Detected GCP environment, fetching metadata");
-                let fetcher = crate::cloud::metadata::GcpMetadataFetcher::new(self.timeout);
+                let fetcher = crate::GcpMetadataFetcher::new(self.timeout);
                 fetcher.fetch_trusted_proxy_ranges().await
             }
             Some(CloudProvider::Cloudflare) => {
                 info!("Detected Cloudflare environment");
-                let ranges = crate::cloud::ranges::CloudflareIpRanges::fetch().await?;
+                let ranges = crate::CloudflareIpRanges::fetch().await?;
                 Ok(ranges)
             }
             Some(CloudProvider::DigitalOcean) => {
                 info!("Detected DigitalOcean environment");
-                let ranges = crate::cloud::ranges::DigitalOceanIpRanges::fetch().await?;
+                let ranges = crate::DigitalOceanIpRanges::fetch().await?;
                 Ok(ranges)
             }
             Some(CloudProvider::Unknown(name)) => {
@@ -221,9 +225,9 @@ impl CloudDetector {
         }
 
         let providers: Vec<Box<dyn CloudMetadataFetcher>> = vec![
-            Box::new(crate::cloud::metadata::AwsMetadataFetcher::new(self.timeout)),
-            Box::new(crate::cloud::metadata::AzureMetadataFetcher::new(self.timeout)),
-            Box::new(crate::cloud::metadata::GcpMetadataFetcher::new(self.timeout)),
+            Box::new(crate::AwsMetadataFetcher::new(self.timeout)),
+            Box::new(crate::AzureMetadataFetcher::new(self.timeout)),
+            Box::new(crate::GcpMetadataFetcher::new(self.timeout)),
         ];
 
         for provider in providers {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_trusted_proxies::utils::ValidationUtils;
+use rustfs_trusted_proxies::ValidationUtils;
 use std::net::IpAddr;
 
 #[test]

@@ -20,8 +20,8 @@ use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, info};
 
-use crate::cloud::detector::CloudMetadataFetcher;
-use crate::error::AppError;
+use crate::AppError;
+use crate::CloudMetadataFetcher;
 
 /// Fetcher for AWS-specific metadata.
 #[derive(Debug, Clone)]
@@ -93,10 +93,7 @@ impl CloudMetadataFetcher for AwsMetadataFetcher {
             "192.168.0.0/16", // Small VPCs
         ];
 
-        let networks: Result<Vec<_>, _> = default_ranges
-            .into_iter()
-            .map(|s| ipnetwork::IpNetwork::from_str(s))
-            .collect();
+        let networks: Result<Vec<_>, _> = default_ranges.into_iter().map(ipnetwork::IpNetwork::from_str).collect();
 
         match networks {
             Ok(networks) => {
@@ -133,10 +130,10 @@ impl CloudMetadataFetcher for AwsMetadataFetcher {
 
                     for prefix in ip_ranges.prefixes {
                         // Include EC2 and CloudFront ranges as potential trusted proxies.
-                        if prefix.service == "EC2" || prefix.service == "CLOUDFRONT" {
-                            if let Ok(network) = ipnetwork::IpNetwork::from_str(&prefix.ip_prefix) {
-                                networks.push(network);
-                            }
+                        if (prefix.service == "EC2" || prefix.service == "CLOUDFRONT")
+                            && let Ok(network) = ipnetwork::IpNetwork::from_str(&prefix.ip_prefix)
+                        {
+                            networks.push(network);
                         }
                     }
 

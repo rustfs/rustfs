@@ -14,11 +14,16 @@
 
 //! Environment variable configuration constants and helpers for the trusted proxy system.
 
-use crate::error::ConfigError;
+use crate::ConfigError;
 use ipnetwork::IpNetwork;
 use std::str::FromStr;
 
 // ==================== Base Proxy Configuration ====================
+/// Environment variable to enable the trusted proxy middleware.
+pub const ENV_TRUSTED_PROXY_ENABLED: &str = "RUSTFS_TRUSTED_PROXY_ENABLED";
+/// Trusted proxy middleware is enabled by default.
+pub const DEFAULT_TRUSTED_PROXY_ENABLED: bool = true;
+
 /// Environment variable for the proxy validation mode.
 pub const ENV_PROXY_VALIDATION_MODE: &str = "RUSTFS_TRUSTED_PROXY_VALIDATION_MODE";
 /// Default validation mode is "hop_by_hop".
@@ -54,6 +59,11 @@ pub const DEFAULT_TRUSTED_PROXIES: &str = "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/1
 pub const ENV_EXTRA_TRUSTED_PROXIES: &str = "RUSTFS_TRUSTED_PROXY_EXTRA_NETWORKS";
 /// No extra trusted networks by default.
 pub const DEFAULT_EXTRA_TRUSTED_PROXIES: &str = "";
+
+/// Environment variable for individual trusted proxy IPs.
+pub const ENV_TRUSTED_PROXY_IPS: &str = "RUSTFS_TRUSTED_PROXY_IPS";
+/// No individual trusted IPs by default.
+pub const DEFAULT_TRUSTED_PROXY_IPS: &str = "";
 
 /// Environment variable for private network ranges used in internal validation.
 pub const ENV_PRIVATE_NETWORKS: &str = "RUSTFS_TRUSTED_PROXY_PRIVATE_NETWORKS";
@@ -157,46 +167,23 @@ pub fn parse_string_list_from_env(key: &str, default: &str) -> Vec<String> {
         .collect()
 }
 
-/// Retrieves a boolean value from an environment variable.
-pub fn get_bool_from_env(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .map(|v| match v.to_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => true,
-            "false" | "0" | "no" | "off" => false,
-            _ => default,
-        })
-        .unwrap_or(default)
-}
-
-/// Retrieves a `usize` value from an environment variable.
-pub fn get_usize_from_env(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
-
-/// Retrieves a `u64` value from an environment variable.
-pub fn get_u64_from_env(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
-
-/// Retrieves a string value from an environment variable.
-pub fn get_string_from_env(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
 /// Checks if an environment variable is set.
 pub fn is_env_set(key: &str) -> bool {
     std::env::var(key).is_ok()
 }
 
 /// Returns a list of all proxy-related environment variables and their current values.
+#[allow(dead_code)]
 pub fn get_all_proxy_env_vars() -> Vec<(String, String)> {
     let vars = [
+        ENV_TRUSTED_PROXY_ENABLED,
         ENV_PROXY_VALIDATION_MODE,
         ENV_PROXY_ENABLE_RFC7239,
         ENV_PROXY_MAX_HOPS,
         ENV_PROXY_CHAIN_CONTINUITY_CHECK,
         ENV_TRUSTED_PROXIES,
         ENV_EXTRA_TRUSTED_PROXIES,
+        ENV_TRUSTED_PROXY_IPS,
         ENV_CLOUD_METADATA_ENABLED,
         ENV_CLOUD_METADATA_TIMEOUT,
         ENV_CLOUDFLARE_IPS_ENABLED,

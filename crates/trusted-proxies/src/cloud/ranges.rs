@@ -56,7 +56,7 @@ impl CloudflareIpRanges {
             "2c0f:f248::/32",
         ];
 
-        let networks: Result<Vec<_>, _> = ranges.into_iter().map(|s| IpNetwork::from_str(s)).collect();
+        let networks: Result<Vec<_>, _> = ranges.into_iter().map(IpNetwork::from_str).collect();
 
         match networks {
             Ok(networks) => {
@@ -147,7 +147,7 @@ impl DigitalOceanIpRanges {
             "161.35.0.0/16",
         ];
 
-        let networks: Result<Vec<_>, _> = ranges.into_iter().map(|s| IpNetwork::from_str(s)).collect();
+        let networks: Result<Vec<_>, _> = ranges.into_iter().map(IpNetwork::from_str).collect();
 
         match networks {
             Ok(networks) => {
@@ -193,11 +193,10 @@ impl GoogleCloudIpRanges {
                     let mut networks = Vec::new();
 
                     for prefix in ip_ranges.prefixes {
-                        if let Some(ipv4_prefix) = prefix.ipv4_prefix {
-                            if let Ok(network) = IpNetwork::from_str(&ipv4_prefix) {
+                        if let Some(ipv4_prefix) = prefix.ipv4_prefix
+                            && let Ok(network) = IpNetwork::from_str(&ipv4_prefix) {
                                 networks.push(network);
                             }
-                        }
                     }
 
                     info!("Successfully fetched {} Google Cloud IP ranges from API", networks.len());

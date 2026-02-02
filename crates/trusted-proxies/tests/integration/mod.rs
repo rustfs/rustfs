@@ -13,9 +13,6 @@
 // limitations under the License.
 
 //! Integration tests for the trusted proxy system.
-
-#[cfg(test)]
-mod api_tests;
 #[cfg(test)]
 mod cloud_tests;
 #[cfg(test)]

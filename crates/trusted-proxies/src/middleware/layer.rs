@@ -17,13 +17,13 @@
 use std::sync::Arc;
 use tower::Layer;
 
-use crate::config::TrustedProxyConfig;
-use crate::middleware::TrustedProxyMiddleware;
-use crate::proxy::ProxyMetrics;
-use crate::proxy::ProxyValidator;
+use crate::TrustedProxyConfig;
+use crate::TrustedProxyMiddleware;
+use crate::ProxyMetrics;
+use crate::ProxyValidator;
 
 /// Tower Layer for the trusted proxy middleware.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TrustedProxyLayer {
     /// The validator used to verify proxy chains.
     pub(crate) validator: Arc<ProxyValidator>,

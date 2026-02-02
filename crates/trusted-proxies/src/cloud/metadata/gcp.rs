@@ -21,8 +21,8 @@ use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::cloud::detector::CloudMetadataFetcher;
-use crate::error::AppError;
+use crate::AppError;
+use crate::CloudMetadataFetcher;
 
 /// Fetcher for GCP-specific metadata.
 #[derive(Debug, Clone)]
@@ -202,10 +202,10 @@ impl GcpMetadataFetcher {
                     let mut networks = Vec::new();
 
                     for prefix in ip_ranges.prefixes {
-                        if let Some(ipv4_prefix) = prefix.ipv4_prefix {
-                            if let Ok(network) = ipnetwork::IpNetwork::from_str(&ipv4_prefix) {
-                                networks.push(network);
-                            }
+                        if let Some(ipv4_prefix) = prefix.ipv4_prefix
+                            && let Ok(network) = ipnetwork::IpNetwork::from_str(&ipv4_prefix)
+                        {
+                            networks.push(network);
                         }
                     }
 
@@ -276,7 +276,7 @@ impl GcpMetadataFetcher {
             "2c0f:fb50::/32",
         ];
 
-        let networks: Result<Vec<_>, _> = ranges.into_iter().map(|s| ipnetwork::IpNetwork::from_str(s)).collect();
+        let networks: Result<Vec<_>, _> = ranges.into_iter().map(ipnetwork::IpNetwork::from_str).collect();
 
         match networks {
             Ok(networks) => {
@@ -296,7 +296,7 @@ impl GcpMetadataFetcher {
             "100.64.0.0/10",  // GCP reserved range
         ];
 
-        let networks: Result<Vec<_>, _> = ranges.into_iter().map(|s| ipnetwork::IpNetwork::from_str(s)).collect();
+        let networks: Result<Vec<_>, _> = ranges.into_iter().map(ipnetwork::IpNetwork::from_str).collect();
 
         match networks {
             Ok(networks) => {

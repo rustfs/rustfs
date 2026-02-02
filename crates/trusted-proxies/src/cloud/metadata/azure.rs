@@ -21,8 +21,8 @@ use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::cloud::detector::CloudMetadataFetcher;
-use crate::error::AppError;
+use crate::AppError;
+use crate::CloudMetadataFetcher;
 
 /// Fetcher for Azure-specific metadata.
 #[derive(Debug, Clone)]
@@ -71,8 +71,9 @@ impl AzureMetadataFetcher {
     /// Fetches Azure public IP ranges from the official Microsoft download source.
     async fn fetch_azure_ip_ranges(&self) -> Result<Vec<ipnetwork::IpNetwork>, AppError> {
         // Official Azure IP ranges download URL (periodically updated).
+        // See: https://www.microsoft.com/en-us/download/details.aspx?id=56519
         let url =
-            "https://download.microsoft.com/download/7/1/D/71D86715-5596-4529-9B13-DA13A5DE5B63/ServiceTags_Public_20231211.json";
+            "https://download.microsoft.com/download/7/1/D/71D86715-5596-4529-9B13-DA13A5DE5B63/ServiceTags_Public_20260126.json";
 
         #[derive(Debug, Deserialize)]
         struct AzureServiceTags {
@@ -212,7 +213,7 @@ impl AzureMetadataFetcher {
             "2603:1100::/40",
         ];
 
-        let networks: Result<Vec<_>, _> = ranges.into_iter().map(|s| ipnetwork::IpNetwork::from_str(s)).collect();
+        let networks: Result<Vec<_>, _> = ranges.into_iter().map(ipnetwork::IpNetwork::from_str).collect();
 
         match networks {
             Ok(networks) => {
@@ -294,7 +295,7 @@ impl AzureMetadataFetcher {
             "192.0.0.0/24",   // Azure reserved
         ];
 
-        let networks: Result<Vec<_>, _> = ranges.into_iter().map(|s| ipnetwork::IpNetwork::from_str(s)).collect();
+        let networks: Result<Vec<_>, _> = ranges.into_iter().map(ipnetwork::IpNetwork::from_str).collect();
 
         match networks {
             Ok(networks) => {

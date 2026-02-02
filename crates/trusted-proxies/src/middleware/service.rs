@@ -14,16 +14,12 @@
 
 //! Tower service implementation for the trusted proxy middleware.
 
+use crate::{ClientInfo, ProxyValidator, TrustedProxyLayer};
+use http::Request;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-
-use axum::extract::Request;
-use axum::response::Response;
 use tower::Service;
 use tracing::{Span, debug, instrument};
-
-use crate::middleware::layer::TrustedProxyLayer;
-use crate::proxy::{ClientInfo, ProxyValidator};
 
 /// Tower Service for the trusted proxy middleware.
 #[derive(Clone)]
@@ -52,9 +48,9 @@ impl<S> TrustedProxyMiddleware<S> {
     }
 }
 
-impl<S> Service<Request> for TrustedProxyMiddleware<S>
+impl<S, ReqBody> Service<Request<ReqBody>> for TrustedProxyMiddleware<S>
 where
-    S: Service<Request, Response = Response> + Clone + Send + 'static,
+    S: Service<Request<ReqBody>> + Clone + Send + 'static,
     S::Future: Send,
 {
     type Response = S::Response;
@@ -75,7 +71,7 @@ where
             enabled = self.enabled,
         )
     )]
-    fn call(&mut self, mut req: Request) -> Self::Future {
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         let span = Span::current();
 
         // If the middleware is disabled, pass the request through immediately.

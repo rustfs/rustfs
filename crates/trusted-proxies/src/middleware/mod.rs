@@ -19,6 +19,3 @@ mod service;
 
 pub use layer::*;
 pub use service::*;
-
-// Re-export commonly used types
-pub use crate::proxy::ClientInfo;

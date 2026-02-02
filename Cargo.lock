@@ -8305,12 +8305,11 @@ dependencies = [
  "axum",
  "http 1.4.0",
  "ipnetwork",
- "jiff",
- "lazy_static",
  "metrics",
  "moka",
  "regex",
  "reqwest 0.13.1",
+ "rustfs-config",
  "rustfs-utils",
  "serde",
  "serde_json",
@@ -8318,8 +8317,6 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
