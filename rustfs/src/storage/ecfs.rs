@@ -1040,7 +1040,7 @@ impl S3 for FS {
         {
             let key_bytes = BASE64_STANDARD.decode(sse_key.as_str()).map_err(|e| {
                 error!("Failed to decode SSE-C key: {}", e);
-                ApiError::from(StorageError::other("Invalid SSE-C key"))
+                S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid SSE-C key".to_string())
             })?;
 
             if key_bytes.len() != 32 {
@@ -1049,7 +1049,7 @@ impl S3 for FS {
 
             let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != sse_md5.as_str() {
-                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+                return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "SSE-C key MD5 mismatch".to_string()));
             }
 
             // Store original size before encryption
@@ -2747,9 +2747,10 @@ impl S3 for FS {
                         debug!("SSE-C MD5 comparison: provided='{}', stored='{}'", sse_key_md5_provided, stored_md5);
                         if sse_key_md5_provided != stored_md5 {
                             error!("SSE-C key MD5 mismatch: provided='{}', stored='{}'", sse_key_md5_provided, stored_md5);
-                            return Err(
-                                ApiError::from(StorageError::other("SSE-C key does not match object encryption key")).into()
-                            );
+                            return Err(S3Error::with_message(
+                                S3ErrorCode::InvalidRequest,
+                                "SSE-C key does not match object encryption key".to_string(),
+                            ));
                         }
                     } else {
                         return Err(ApiError::from(StorageError::other(
@@ -2767,9 +2768,10 @@ impl S3 for FS {
                         debug!("SSE-C MD5 comparison: provided='{}', stored='{}'", sse_key_md5_provided, stored_md5);
                         if sse_key_md5_provided != stored_md5 {
                             error!("SSE-C key MD5 mismatch: provided='{}', stored='{}'", sse_key_md5_provided, stored_md5);
-                            return Err(
-                                ApiError::from(StorageError::other("SSE-C key does not match object encryption key")).into()
-                            );
+                            return Err(S3Error::with_message(
+                                S3ErrorCode::InvalidRequest,
+                                "SSE-C key does not match object encryption key".to_string(),
+                            ));
                         }
                     } else {
                         return Err(ApiError::from(StorageError::other(
@@ -2781,11 +2783,14 @@ impl S3 for FS {
                     // Decode the base64 key
                     let key_bytes = BASE64_STANDARD
                         .decode(sse_key)
-                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
+                        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid SSE-C key: {e}")))?;
 
                     // Verify key length (should be 32 bytes for AES-256)
                     if key_bytes.len() != 32 {
-                        return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            "SSE-C key must be 32 bytes".to_string(),
+                        ));
                     }
 
                     // Convert Vec<u8> to [u8; 32]
@@ -2795,7 +2800,7 @@ impl S3 for FS {
                     // Verify MD5 hash of the key matches what the client claims
                     let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
                     if computed_md5 != *sse_key_md5_provided {
-                        return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+                        return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "SSE-C key MD5 mismatch".to_string()));
                     }
 
                     // Generate the same deterministic nonce from object key
@@ -2811,9 +2816,10 @@ impl S3 for FS {
                     final_stream = Box::new(decrypt_reader);
                 }
             } else {
-                return Err(
-                    ApiError::from(StorageError::other("Object encrypted with SSE-C but no customer key provided")).into(),
-                );
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "The SSE-C key must be provided for this object".to_string(),
+                ));
             }
         }
 
@@ -3540,6 +3546,46 @@ impl S3 for FS {
             .map(|v| SSECustomerAlgorithm::from(v.clone()));
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
+
+        // SSE-C validation: If object was encrypted with SSE-C, customer must provide matching key
+        // This matches AWS S3 behavior: HEAD request on SSE-C encrypted object without key returns 400
+        if let Some(stored_algorithm) = &sse_customer_algorithm {
+            let provided_key = req.input.sse_customer_key.as_ref();
+            let provided_md5 = req.input.sse_customer_key_md5.as_ref();
+
+            // Check if customer provided SSE-C key headers
+            if provided_key.is_none() || provided_md5.is_none() {
+                // Object is encrypted with SSE-C but customer didn't provide key
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "The SSE-C key must be provided for this object".to_string(),
+                ));
+            }
+
+            // Verify that the provided key MD5 matches the stored MD5
+            if let Some(stored_md5) = &sse_customer_key_md5 {
+                if provided_md5.unwrap() != stored_md5 {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidRequest,
+                        "The SSE-C key does not match the key used to encrypt the object".to_string(),
+                    ));
+                }
+            } else {
+                // This shouldn't happen if PUT was implemented correctly, but handle it defensively
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Object encrypted with SSE-C but stored key MD5 not found".to_string(),
+                ));
+            }
+
+            // Verify the algorithm matches (should be AES256)
+            if stored_algorithm.as_str() != "AES256" {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    format!("Unsupported SSE-C algorithm: {}", stored_algorithm.as_str()),
+                ));
+            }
+        }
         // Prefer explicit storage_class from object info; fall back to persisted metadata header.
         let storage_class = info
             .storage_class
@@ -4324,12 +4370,11 @@ impl S3 for FS {
 
         let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
 
+        // Validate lifecycle configuration
         let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
-        if let Ok(rcfg) = rcfg
-            && let Err(err) = input_cfg.validate(&rcfg.0).await
-        {
-            //return Err(S3Error::with_message(S3ErrorCode::Custom("BucketLockValidateFailed".into()), err.to_string()));
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
+        let object_lock_config = rcfg.map(|(config, _timestamp)| config).unwrap_or_default();
+        if let Err(err) = input_cfg.validate(&object_lock_config).await {
+            return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, err.to_string()));
         }
 
         if let Err(err) = validate_transition_tier(&input_cfg).await {
@@ -4754,7 +4799,7 @@ impl S3 for FS {
             // Decode the base64 key
             let key_bytes = BASE64_STANDARD
                 .decode(sse_key)
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Invalid SSE-C key: {e}")))?;
 
             // Verify key length (should be 32 bytes for AES-256)
             if key_bytes.len() != 32 {
@@ -4768,7 +4813,7 @@ impl S3 for FS {
             // Verify MD5 hash of the key matches what the client claims
             let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != *sse_key_md5_provided {
-                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+                return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "SSE-C key MD5 mismatch".to_string()));
             }
 
             // Store original size for later retrieval during decryption
@@ -5652,7 +5697,7 @@ impl S3 for FS {
             // Verify MD5 hash of the key matches what the client claims
             let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
             if computed_md5 != *sse_key_md5_provided {
-                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
+                return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "SSE-C key MD5 mismatch".to_string()));
             }
 
             // Generate a deterministic nonce from object key for consistency

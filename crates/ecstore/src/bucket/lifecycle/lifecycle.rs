@@ -114,9 +114,28 @@ impl RuleValidate for LifecycleRule {
 
     fn validate(&self) -> Result<(), std::io::Error> {
         /*self.validate_id()?;
-        self.validate_status()?;
-        self.validate_expiration()?;
-        self.validate_noncurrent_expiration()?;
+        self.validate_status()?;*/
+
+        // Validate date range for LifecycleExpiration
+        if let Some(expiration) = &self.expiration {
+            if let Some(date) = &expiration.date {
+                let date_time: OffsetDateTime = date.clone().into();
+                let now = time::OffsetDateTime::now_utc();
+                // Date should not be before year 2000 (to catch boto3 parsing bugs like 1970 dates)
+                // AWS allows past dates for lifecycle rules, but dates before 2000 are likely errors
+                let min_date = time::OffsetDateTime::from_unix_timestamp(946684800).unwrap(); // 2000-01-01 00:00:00 UTC
+                if date_time < min_date {
+                    return Err(std::io::Error::other("Expiration date cannot be before year 2000"));
+                }
+                // Date should not be more than 10 years in the future
+                let max_date = now + time::Duration::days(365 * 10);
+                if date_time > max_date {
+                    return Err(std::io::Error::other("Expiration date cannot be more than 10 years in the future"));
+                }
+            }
+        }
+
+        /*self.validate_noncurrent_expiration()?;
         self.validate_prefix_and_filter()?;
         self.validate_transition()?;
         self.validate_noncurrent_transition()?;
