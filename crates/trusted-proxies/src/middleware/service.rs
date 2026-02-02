@@ -69,6 +69,12 @@ where
             http.uri = %req.uri(),
             http.version = ?req.version(),
             enabled = self.enabled,
+            peer.addr = tracing::field::Empty,
+            client.ip = tracing::field::Empty,
+            client.trusted = tracing::field::Empty,
+            client.hops = tracing::field::Empty,
+            error = tracing::field::Empty,
+            error.message = tracing::field::Empty,
         )
     )]
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
