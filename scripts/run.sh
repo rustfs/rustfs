@@ -188,7 +188,7 @@ export RUSTFS_OBJECT_CACHE_ENABLE=true
 # Profiling configuration
 export RUSTFS_ENABLE_PROFILING=false
 # Memory profiling periodic dump
-export RUSTFS_PROF_MEM_PERIODIC=true
+export RUSTFS_PROF_MEM_PERIODIC=false
 
 # Heal configuration queue size
 export RUSTFS_HEAL_QUEUE_SIZE=10000

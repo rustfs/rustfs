@@ -22,9 +22,12 @@ use std::str::FromStr;
 pub struct IpUtils;
 
 impl IpUtils {
-    /// Checks if an IP address is valid for general use (not unspecified, multicast, or reserved).
+    /// Checks if an IP address is valid for general use.
+    ///
+    /// "Valid" here means the address is syntactically valid and not an unspecified or multicast
+    /// address. Classification (private/link-local/documentation/reserved) is handled separately.
     pub fn is_valid_ip_address(ip: &IpAddr) -> bool {
-        !ip.is_unspecified() && !ip.is_multicast() && !Self::is_reserved_ip(ip)
+        !ip.is_unspecified() && !ip.is_multicast()
     }
 
     /// Checks if an IP address belongs to a reserved range.
@@ -218,9 +221,10 @@ impl IpUtils {
     }
 }
 
-/// Helper function to check if an IP address is valid.
+/// Checks if an IP address is valid for general use.
+///
+/// "Valid" here means the address is syntactically valid and not an unspecified or multicast
+/// address. Classification (private/link-local/documentation/reserved) is handled separately.
 pub fn is_valid_ip_address(ip: &IpAddr) -> bool {
-    // Allow private IPs as valid, but disallow unspecified, multicast, and other reserved ranges
-    // that are not private, loopback, or documentation.
     !ip.is_unspecified() && !ip.is_multicast()
 }
