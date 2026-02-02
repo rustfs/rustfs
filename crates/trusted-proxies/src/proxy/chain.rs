@@ -211,16 +211,16 @@ impl ProxyChainAnalyzer {
     /// Validates that IP addresses are not unspecified, multicast, or otherwise invalid.
     fn validate_ip_addresses(&self, chain: &[IpAddr]) -> Result<(), ProxyError> {
         for ip in chain {
-            if !is_valid_ip_address(ip) {
-                return Err(ProxyError::IpParseError(format!("Invalid IP address in chain: {}", ip)));
-            }
-
             if ip.is_unspecified() {
                 return Err(ProxyError::invalid_xff("IP address cannot be unspecified (0.0.0.0 or ::)"));
             }
 
             if ip.is_multicast() {
                 return Err(ProxyError::invalid_xff("IP address cannot be multicast"));
+            }
+
+            if !is_valid_ip_address(ip) {
+                return Err(ProxyError::IpParseError(format!("Invalid IP address in chain: {}", ip)));
             }
         }
 

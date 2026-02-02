@@ -57,7 +57,7 @@ fn test_config_loader_env_vars() {
             std::env::remove_var("RUSTFS_TRUSTED_PROXY_VALIDATION_MODE");
         }
         unsafe {
-            std::env::remove_var("TRUSTED_PROXY_MAX_HOPS");
+            std::env::remove_var("RUSTFS_TRUSTED_PROXY_MAX_HOPS");
         }
         unsafe {
             std::env::remove_var("SERVER_PORT");
