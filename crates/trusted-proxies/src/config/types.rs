@@ -14,14 +14,17 @@
 
 //! Configuration type definitions for the trusted proxy system.
 
+use crate::ConfigError;
 use ipnetwork::IpNetwork;
+use rustfs_config::{
+    DEFAULT_TRUSTED_PROXIES_LOG_LEVEL, DEFAULT_TRUSTED_PROXY_CLOUD_METADATA_ENABLED,
+    DEFAULT_TRUSTED_PROXY_CLOUD_METADATA_TIMEOUT, DEFAULT_TRUSTED_PROXY_CLOUDFLARE_IPS_ENABLED,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
-
-use crate::ConfigError;
 
 /// Proxy validation mode defining how the proxy chain is verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,7 +212,7 @@ impl Default for MonitoringConfig {
     fn default() -> Self {
         Self {
             metrics_enabled: true,
-            log_level: "info".to_string(),
+            log_level: DEFAULT_TRUSTED_PROXIES_LOG_LEVEL.to_string(),
             structured_logging: false,
             tracing_enabled: true,
             log_failed_validations: true,
@@ -233,9 +236,9 @@ pub struct CloudConfig {
 impl Default for CloudConfig {
     fn default() -> Self {
         Self {
-            metadata_enabled: false,
-            metadata_timeout_seconds: 5,
-            cloudflare_ips_enabled: false,
+            metadata_enabled: DEFAULT_TRUSTED_PROXY_CLOUD_METADATA_ENABLED,
+            metadata_timeout_seconds: DEFAULT_TRUSTED_PROXY_CLOUD_METADATA_TIMEOUT,
+            cloudflare_ips_enabled: DEFAULT_TRUSTED_PROXY_CLOUDFLARE_IPS_ENABLED,
             forced_provider: None,
         }
     }

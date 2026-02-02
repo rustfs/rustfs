@@ -15,19 +15,26 @@
 //! Configuration loader for environment variables and files.
 
 use crate::{
-    AppConfig, CacheConfig, CloudConfig, ConfigError, DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_CLEANUP_INTERVAL,
-    DEFAULT_CACHE_TTL_SECONDS, DEFAULT_CLOUD_METADATA_ENABLED, DEFAULT_CLOUD_METADATA_TIMEOUT, DEFAULT_CLOUD_PROVIDER_FORCE,
-    DEFAULT_CLOUDFLARE_IPS_ENABLED, DEFAULT_EXTRA_TRUSTED_PROXIES, DEFAULT_LOG_LEVEL, DEFAULT_METRICS_ENABLED,
-    DEFAULT_PRIVATE_NETWORKS, DEFAULT_PROXY_CHAIN_CONTINUITY_CHECK, DEFAULT_PROXY_ENABLE_RFC7239,
-    DEFAULT_PROXY_LOG_FAILED_VALIDATIONS, DEFAULT_PROXY_MAX_HOPS, DEFAULT_PROXY_VALIDATION_MODE, DEFAULT_STRUCTURED_LOGGING,
-    DEFAULT_TRACING_ENABLED, DEFAULT_TRUSTED_PROXIES, DEFAULT_TRUSTED_PROXY_IPS, ENV_CACHE_CAPACITY, ENV_CACHE_CLEANUP_INTERVAL,
-    ENV_CACHE_TTL_SECONDS, ENV_CLOUD_METADATA_ENABLED, ENV_CLOUD_METADATA_TIMEOUT, ENV_CLOUD_PROVIDER_FORCE,
-    ENV_CLOUDFLARE_IPS_ENABLED, ENV_EXTRA_TRUSTED_PROXIES, ENV_LOG_LEVEL, ENV_METRICS_ENABLED, ENV_PRIVATE_NETWORKS,
-    ENV_PROXY_CHAIN_CONTINUITY_CHECK, ENV_PROXY_ENABLE_RFC7239, ENV_PROXY_LOG_FAILED_VALIDATIONS, ENV_PROXY_MAX_HOPS,
-    ENV_PROXY_VALIDATION_MODE, ENV_STRUCTURED_LOGGING, ENV_TRACING_ENABLED, ENV_TRUSTED_PROXIES, ENV_TRUSTED_PROXY_IPS,
-    MonitoringConfig, TrustedProxy, TrustedProxyConfig, ValidationMode, parse_ip_list_from_env, parse_string_list_from_env,
+    AppConfig, CacheConfig, CloudConfig, ConfigError, MonitoringConfig, TrustedProxy, TrustedProxyConfig, ValidationMode,
+    parse_ip_list_from_env, parse_string_list_from_env,
 };
 use ipnetwork::IpNetwork;
+use rustfs_config::{
+    DEFAULT_TRUSTED_PROXIES_LOG_LEVEL, DEFAULT_TRUSTED_PROXY_CACHE_CAPACITY, DEFAULT_TRUSTED_PROXY_CACHE_CLEANUP_INTERVAL,
+    DEFAULT_TRUSTED_PROXY_CACHE_TTL_SECONDS, DEFAULT_TRUSTED_PROXY_CHAIN_CONTINUITY_CHECK,
+    DEFAULT_TRUSTED_PROXY_CLOUD_METADATA_ENABLED, DEFAULT_TRUSTED_PROXY_CLOUD_METADATA_TIMEOUT,
+    DEFAULT_TRUSTED_PROXY_CLOUD_PROVIDER_FORCE, DEFAULT_TRUSTED_PROXY_CLOUDFLARE_IPS_ENABLED,
+    DEFAULT_TRUSTED_PROXY_ENABLE_RFC7239, DEFAULT_TRUSTED_PROXY_EXTRA_PROXIES, DEFAULT_TRUSTED_PROXY_IPS,
+    DEFAULT_TRUSTED_PROXY_LOG_FAILED_VALIDATIONS, DEFAULT_TRUSTED_PROXY_MAX_HOPS, DEFAULT_TRUSTED_PROXY_METRICS_ENABLED,
+    DEFAULT_TRUSTED_PROXY_PRIVATE_NETWORKS, DEFAULT_TRUSTED_PROXY_PROXIES, DEFAULT_TRUSTED_PROXY_STRUCTURED_LOGGING,
+    DEFAULT_TRUSTED_PROXY_TRACING_ENABLED, DEFAULT_TRUSTED_PROXY_VALIDATION_MODE, ENV_TRUSTED_PROXIES_LOG_LEVEL,
+    ENV_TRUSTED_PROXY_CACHE_CAPACITY, ENV_TRUSTED_PROXY_CACHE_CLEANUP_INTERVAL, ENV_TRUSTED_PROXY_CACHE_TTL_SECONDS,
+    ENV_TRUSTED_PROXY_CHAIN_CONTINUITY_CHECK, ENV_TRUSTED_PROXY_CLOUD_METADATA_ENABLED, ENV_TRUSTED_PROXY_CLOUD_METADATA_TIMEOUT,
+    ENV_TRUSTED_PROXY_CLOUD_PROVIDER_FORCE, ENV_TRUSTED_PROXY_CLOUDFLARE_IPS_ENABLED, ENV_TRUSTED_PROXY_ENABLE_RFC7239,
+    ENV_TRUSTED_PROXY_EXTRA_PROXIES, ENV_TRUSTED_PROXY_IPS, ENV_TRUSTED_PROXY_LOG_FAILED_VALIDATIONS, ENV_TRUSTED_PROXY_MAX_HOPS,
+    ENV_TRUSTED_PROXY_METRICS_ENABLED, ENV_TRUSTED_PROXY_PRIVATE_NETWORKS, ENV_TRUSTED_PROXY_PROXIES,
+    ENV_TRUSTED_PROXY_STRUCTURED_LOGGING, ENV_TRUSTED_PROXY_TRACING_ENABLED, ENV_TRUSTED_PROXY_VALIDATION_MODE,
+};
 use rustfs_utils::{get_env_bool, get_env_str, get_env_u64, get_env_usize, parse_and_resolve_address};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
@@ -63,13 +70,13 @@ impl ConfigLoader {
         let mut proxies = Vec::new();
 
         // Parse base trusted proxies from environment.
-        let base_networks = parse_ip_list_from_env(ENV_TRUSTED_PROXIES, DEFAULT_TRUSTED_PROXIES)?;
+        let base_networks = parse_ip_list_from_env(ENV_TRUSTED_PROXY_PROXIES, DEFAULT_TRUSTED_PROXY_PROXIES)?;
         for network in base_networks {
             proxies.push(TrustedProxy::Cidr(network));
         }
 
         // Parse extra trusted proxies from environment.
-        let extra_networks = parse_ip_list_from_env(ENV_EXTRA_TRUSTED_PROXIES, DEFAULT_EXTRA_TRUSTED_PROXIES)?;
+        let extra_networks = parse_ip_list_from_env(ENV_TRUSTED_PROXY_EXTRA_PROXIES, DEFAULT_TRUSTED_PROXY_EXTRA_PROXIES)?;
         for network in extra_networks {
             proxies.push(TrustedProxy::Cidr(network));
         }
@@ -83,16 +90,18 @@ impl ConfigLoader {
         }
 
         // Determine validation mode.
-        let validation_mode_str = get_env_str(ENV_PROXY_VALIDATION_MODE, DEFAULT_PROXY_VALIDATION_MODE);
+        let validation_mode_str = get_env_str(ENV_TRUSTED_PROXY_VALIDATION_MODE, DEFAULT_TRUSTED_PROXY_VALIDATION_MODE);
         let validation_mode = ValidationMode::from_str(&validation_mode_str)?;
 
         // Load other proxy settings.
-        let enable_rfc7239 = get_env_bool(ENV_PROXY_ENABLE_RFC7239, DEFAULT_PROXY_ENABLE_RFC7239);
-        let max_hops = get_env_usize(ENV_PROXY_MAX_HOPS, DEFAULT_PROXY_MAX_HOPS);
-        let enable_chain_check = get_env_bool(ENV_PROXY_CHAIN_CONTINUITY_CHECK, DEFAULT_PROXY_CHAIN_CONTINUITY_CHECK);
+        let enable_rfc7239 = get_env_bool(ENV_TRUSTED_PROXY_ENABLE_RFC7239, DEFAULT_TRUSTED_PROXY_ENABLE_RFC7239);
+        let max_hops = get_env_usize(ENV_TRUSTED_PROXY_MAX_HOPS, DEFAULT_TRUSTED_PROXY_MAX_HOPS);
+        let enable_chain_check =
+            get_env_bool(ENV_TRUSTED_PROXY_CHAIN_CONTINUITY_CHECK, DEFAULT_TRUSTED_PROXY_CHAIN_CONTINUITY_CHECK);
 
         // Load private network ranges.
-        let private_networks = parse_ip_list_from_env(ENV_PRIVATE_NETWORKS, DEFAULT_PRIVATE_NETWORKS)?;
+        let private_networks =
+            parse_ip_list_from_env(ENV_TRUSTED_PROXY_PRIVATE_NETWORKS, DEFAULT_TRUSTED_PROXY_PRIVATE_NETWORKS)?;
 
         Ok(TrustedProxyConfig::new(
             proxies,
@@ -107,26 +116,32 @@ impl ConfigLoader {
     /// Loads cache configuration from environment variables.
     fn load_cache_config() -> CacheConfig {
         CacheConfig {
-            capacity: get_env_usize(ENV_CACHE_CAPACITY, DEFAULT_CACHE_CAPACITY),
-            ttl_seconds: get_env_u64(ENV_CACHE_TTL_SECONDS, DEFAULT_CACHE_TTL_SECONDS),
-            cleanup_interval_seconds: get_env_u64(ENV_CACHE_CLEANUP_INTERVAL, DEFAULT_CACHE_CLEANUP_INTERVAL),
+            capacity: get_env_usize(ENV_TRUSTED_PROXY_CACHE_CAPACITY, DEFAULT_TRUSTED_PROXY_CACHE_CAPACITY),
+            ttl_seconds: get_env_u64(ENV_TRUSTED_PROXY_CACHE_TTL_SECONDS, DEFAULT_TRUSTED_PROXY_CACHE_TTL_SECONDS),
+            cleanup_interval_seconds: get_env_u64(
+                ENV_TRUSTED_PROXY_CACHE_CLEANUP_INTERVAL,
+                DEFAULT_TRUSTED_PROXY_CACHE_CLEANUP_INTERVAL,
+            ),
         }
     }
 
     /// Loads monitoring configuration from environment variables.
     fn load_monitoring_config() -> MonitoringConfig {
         MonitoringConfig {
-            metrics_enabled: get_env_bool(ENV_METRICS_ENABLED, DEFAULT_METRICS_ENABLED),
-            log_level: get_env_str(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL),
-            structured_logging: get_env_bool(ENV_STRUCTURED_LOGGING, DEFAULT_STRUCTURED_LOGGING),
-            tracing_enabled: get_env_bool(ENV_TRACING_ENABLED, DEFAULT_TRACING_ENABLED),
-            log_failed_validations: get_env_bool(ENV_PROXY_LOG_FAILED_VALIDATIONS, DEFAULT_PROXY_LOG_FAILED_VALIDATIONS),
+            metrics_enabled: get_env_bool(ENV_TRUSTED_PROXY_METRICS_ENABLED, DEFAULT_TRUSTED_PROXY_METRICS_ENABLED),
+            log_level: get_env_str(ENV_TRUSTED_PROXIES_LOG_LEVEL, DEFAULT_TRUSTED_PROXIES_LOG_LEVEL),
+            structured_logging: get_env_bool(ENV_TRUSTED_PROXY_STRUCTURED_LOGGING, DEFAULT_TRUSTED_PROXY_STRUCTURED_LOGGING),
+            tracing_enabled: get_env_bool(ENV_TRUSTED_PROXY_TRACING_ENABLED, DEFAULT_TRUSTED_PROXY_TRACING_ENABLED),
+            log_failed_validations: get_env_bool(
+                ENV_TRUSTED_PROXY_LOG_FAILED_VALIDATIONS,
+                DEFAULT_TRUSTED_PROXY_LOG_FAILED_VALIDATIONS,
+            ),
         }
     }
 
     /// Loads cloud configuration from environment variables.
     fn load_cloud_config() -> CloudConfig {
-        let forced_provider_str = get_env_str(ENV_CLOUD_PROVIDER_FORCE, DEFAULT_CLOUD_PROVIDER_FORCE);
+        let forced_provider_str = get_env_str(ENV_TRUSTED_PROXY_CLOUD_PROVIDER_FORCE, DEFAULT_TRUSTED_PROXY_CLOUD_PROVIDER_FORCE);
         let forced_provider = if forced_provider_str.is_empty() {
             None
         } else {
@@ -134,9 +149,18 @@ impl ConfigLoader {
         };
 
         CloudConfig {
-            metadata_enabled: get_env_bool(ENV_CLOUD_METADATA_ENABLED, DEFAULT_CLOUD_METADATA_ENABLED),
-            metadata_timeout_seconds: get_env_u64(ENV_CLOUD_METADATA_TIMEOUT, DEFAULT_CLOUD_METADATA_TIMEOUT),
-            cloudflare_ips_enabled: get_env_bool(ENV_CLOUDFLARE_IPS_ENABLED, DEFAULT_CLOUDFLARE_IPS_ENABLED),
+            metadata_enabled: get_env_bool(
+                ENV_TRUSTED_PROXY_CLOUD_METADATA_ENABLED,
+                DEFAULT_TRUSTED_PROXY_CLOUD_METADATA_ENABLED,
+            ),
+            metadata_timeout_seconds: get_env_u64(
+                ENV_TRUSTED_PROXY_CLOUD_METADATA_TIMEOUT,
+                DEFAULT_TRUSTED_PROXY_CLOUD_METADATA_TIMEOUT,
+            ),
+            cloudflare_ips_enabled: get_env_bool(
+                ENV_TRUSTED_PROXY_CLOUDFLARE_IPS_ENABLED,
+                DEFAULT_TRUSTED_PROXY_CLOUDFLARE_IPS_ENABLED,
+            ),
             forced_provider,
         }
     }

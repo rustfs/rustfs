@@ -35,10 +35,6 @@ RUN set -eux; \
     ca-certificates \
     curl \
     git \
-    cmake \
-    libclang-dev \
-    golang \
-    perl \
     pkg-config \
     libssl-dev \
     lld \

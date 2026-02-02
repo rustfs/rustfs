@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_config::{DEFAULT_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_PROXIES};
 use rustfs_trusted_proxies::{ConfigLoader, TrustedProxy, TrustedProxyConfig, ValidationMode};
-use rustfs_trusted_proxies::{DEFAULT_TRUSTED_PROXIES, ENV_TRUSTED_PROXIES};
 use std::net::IpAddr;
 
 #[test]
 #[allow(unsafe_code)]
 fn test_config_loader_default() {
     unsafe {
-        std::env::remove_var(ENV_TRUSTED_PROXIES);
+        std::env::remove_var(ENV_TRUSTED_PROXY_PROXIES);
     }
     let config = ConfigLoader::from_env_or_default();
     assert_eq!(config.server_addr.port(), 3000);
@@ -34,7 +34,7 @@ fn test_config_loader_default() {
 #[allow(unsafe_code)]
 fn test_config_loader_env_vars() {
     unsafe {
-        std::env::set_var(ENV_TRUSTED_PROXIES, "192.168.1.0/24,10.0.0.0/8");
+        std::env::set_var(ENV_TRUSTED_PROXY_PROXIES, "192.168.1.0/24,10.0.0.0/8");
     }
     unsafe {
         std::env::set_var("TRUSTED_PROXY_VALIDATION_MODE", "strict");
@@ -54,7 +54,7 @@ fn test_config_loader_env_vars() {
         assert_eq!(config.proxy.max_hops, 5);
 
         unsafe {
-            std::env::remove_var(ENV_TRUSTED_PROXIES);
+            std::env::remove_var(ENV_TRUSTED_PROXY_PROXIES);
         }
         unsafe {
             std::env::remove_var("TRUSTED_PROXY_VALIDATION_MODE");
@@ -133,5 +133,8 @@ fn test_private_network_check() {
 
 #[test]
 fn test_default_values() {
-    assert_eq!(DEFAULT_TRUSTED_PROXIES, "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8");
+    assert_eq!(
+        DEFAULT_TRUSTED_PROXY_PROXIES,
+        "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8"
+    );
 }

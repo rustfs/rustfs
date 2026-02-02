@@ -38,14 +38,6 @@ impl TryFrom<u8> for ID {
 
 impl ID {
     pub(crate) fn get_key(&self, password: &[u8], salt: &[u8]) -> Result<[u8; 32], crate::Error> {
-        // Validate inputs for security
-        // if password.is_empty() {
-        //     return Err(crate::Error::ErrInvalidInput("Password cannot be empty".to_string()));
-        // }
-        // if salt.len() < 16 {
-        //     return Err(crate::Error::ErrInvalidInput("Salt must be at least 16 bytes".to_string()));
-        // }
-
         let mut key = [0u8; 32];
         match self {
             ID::Pbkdf2AESGCM => {

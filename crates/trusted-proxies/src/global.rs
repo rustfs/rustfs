@@ -17,13 +17,10 @@
 //! This module provides a unified interface for initializing and using the
 //! trusted proxy functionality within the RustFS server.
 
+use crate::{AppConfig, ConfigLoader, ProxyMetrics, TrustedProxyLayer, default_proxy_metrics};
+use rustfs_config::{DEFAULT_TRUSTED_PROXY_ENABLED, ENV_TRUSTED_PROXY_ENABLED};
 use std::sync::Arc;
 use std::sync::OnceLock;
-
-use crate::{
-    AppConfig, ConfigLoader, DEFAULT_TRUSTED_PROXY_ENABLED, ENV_TRUSTED_PROXY_ENABLED, ProxyMetrics, TrustedProxyLayer,
-    default_proxy_metrics,
-};
 
 /// Global instance of the application configuration.
 static CONFIG: OnceLock<Arc<AppConfig>> = OnceLock::new();
