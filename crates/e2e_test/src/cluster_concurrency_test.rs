@@ -37,7 +37,7 @@ async fn conditional_put(
         .put_object()
         .bucket(BUCKET)
         .key(key)
-        .body(Bytes::from(data.to_vec()).into())
+        .body(Bytes::copy_from_slice(data).into())
         .if_none_match("*")
         .send()
         .await;
@@ -101,12 +101,19 @@ async fn run_race_iteration(
     }
 
     let mut success_count = 0;
+    let mut had_error = false;
     for handle in handles {
         match handle.await {
             Ok(Ok(true)) => success_count += 1,
             Ok(Ok(false)) => {}
-            Ok(Err(e)) => info!("  Error: {}", e),
-            Err(e) => info!("  Task error: {}", e),
+            Ok(Err(e)) => {
+                had_error = true;
+                info!("  Error: {}", e);
+            }
+            Err(e) => {
+                had_error = true;
+                info!("  Task error: {}", e);
+            }
         }
     }
 
@@ -116,9 +123,12 @@ async fn run_race_iteration(
         info!(">>> RACE CONDITION DETECTED!");
     } else if success_count == 1 {
         info!(">>> Correct behavior: exactly 1 writer succeeded.");
+    } else if had_error {
+        return Err("all conditional PUTs failed (e.g. cluster/bucket not ready)".into());
     } else {
         info!(">>> Unexpected: no writers succeeded.");
     }
+
 
     Ok(success_count)
 }
@@ -134,7 +144,7 @@ async fn test_conditional_put_race_cluster() -> Result<(), Box<dyn std::error::E
 
     cluster.create_test_bucket(BUCKET).await?;
 
-    let clients = cluster.create_all_clients();
+    let clients = cluster.create_all_clients()?;
 
     let iterations = 5;
     let mut races_detected = 0;
@@ -151,7 +161,10 @@ async fn test_conditional_put_race_cluster() -> Result<(), Box<dyn std::error::E
                     correct_count += 1;
                 }
             }
-            Err(e) => warn!("Iteration {} failed: {}", i, e),
+            Err(e) => {
+                races_detected += 1;
+                warn!("Iteration {} failed: {}", i, e)
+            },
         }
 
         cleanup_object(&clients[0], &test_key).await;
@@ -181,7 +194,7 @@ async fn test_conditional_put_basic_cluster() -> Result<(), Box<dyn std::error::
 
     cluster.create_test_bucket(BUCKET).await?;
 
-    let client = cluster.create_s3_client(0);
+    let client = cluster.create_s3_client(0)?;
     let test_key = "basic-conditional-put";
     cleanup_object(&client, test_key).await;
 
@@ -204,6 +217,8 @@ async fn test_conditional_put_basic_cluster() -> Result<(), Box<dyn std::error::
         .send()
         .await;
     assert!(result.is_err(), "Second PUT with If-None-Match:* should fail");
+
+    assert!(matches!(result, Err(SdkError::ServiceError(_))), "Expected ServiceError but got different error type");
 
     if let Err(SdkError::ServiceError(e)) = result {
         let code = e.err().meta().code().unwrap_or("");
