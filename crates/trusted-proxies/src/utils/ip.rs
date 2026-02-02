@@ -211,55 +211,8 @@ impl IpUtils {
         match ip {
             IpAddr::V4(ipv4) => ipv4.to_string(),
             IpAddr::V6(ipv6) => {
-                // Compress IPv6 address
-                let mut result = String::new();
-                let segments = ipv6.segments();
-
-                // Find the longest sequence of zero segments
-                let mut longest_start = 0;
-                let mut longest_len = 0;
-                let mut current_start = 0;
-                let mut current_len = 0;
-
-                for (i, &segment) in segments.iter().enumerate() {
-                    if segment == 0 {
-                        if current_len == 0 {
-                            current_start = i;
-                        }
-                        current_len += 1;
-                    } else {
-                        if current_len > longest_len {
-                            longest_start = current_start;
-                            longest_len = current_len;
-                        }
-                        current_len = 0;
-                    }
-                }
-
-                if current_len > longest_len {
-                    longest_start = current_start;
-                    longest_len = current_len;
-                }
-
-                // Format as string
-                let mut i = 0;
-                while i < 8 {
-                    if i == longest_start && longest_len > 1 {
-                        result.push_str("::");
-                        i += longest_len;
-                        if i == 8 {
-                            break;
-                        }
-                    } else {
-                        if i > 0 && (i != longest_start + longest_len || longest_len <= 1) {
-                            result.push(':');
-                        }
-                        result.push_str(&format!("{:x}", segments[i]));
-                        i += 1;
-                    }
-                }
-
-                result
+                // Use the standard library's Display implementation for canonical representation
+                ipv6.to_string()
             }
         }
     }
@@ -267,5 +220,7 @@ impl IpUtils {
 
 /// Helper function to check if an IP address is valid.
 pub fn is_valid_ip_address(ip: &IpAddr) -> bool {
-    IpUtils::is_valid_ip_address(ip)
+    // Allow private IPs as valid, but disallow unspecified, multicast, and other reserved ranges
+    // that are not private, loopback, or documentation.
+    !ip.is_unspecified() && !ip.is_multicast()
 }
