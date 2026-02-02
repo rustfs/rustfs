@@ -43,12 +43,12 @@ impl IpValidationCache {
 
         // Attempt to get the result from cache.
         if let Some(is_trusted) = self.cache.get(ip).await {
-            metrics::counter!("proxy.cache.hits").increment(1);
+            metrics::counter!("rustfs_trusted_proxy_cache_hits").increment(1);
             return is_trusted;
         }
 
         // Cache miss: perform validation and update cache.
-        metrics::counter!("proxy.cache.misses").increment(1);
+        metrics::counter!("rustfs_trusted_proxy_cache_misses").increment(1);
         let is_trusted = validator(ip);
         self.cache.insert(*ip, is_trusted).await;
 
@@ -58,7 +58,7 @@ impl IpValidationCache {
     /// Clears all entries from the cache.
     pub async fn clear(&self) {
         self.cache.invalidate_all();
-        metrics::gauge!("proxy.cache.size").set(0.0);
+        metrics::gauge!("rustfs_trusted_proxy_cache_size").set(0.0);
     }
 
     /// Returns statistics about the current state of the cache.

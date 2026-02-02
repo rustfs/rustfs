@@ -48,18 +48,36 @@ impl ProxyMetrics {
             return;
         }
 
-        describe_counter!("proxy_validation_attempts_total", "Total number of proxy validation attempts");
-        describe_counter!("proxy_validation_success_total", "Total number of successful proxy validations");
-        describe_counter!("proxy_validation_failure_total", "Total number of failed proxy validations");
         describe_counter!(
-            "proxy_validation_failure_by_type_total",
+            "rustfs_trusted_proxy_validation_attempts_total",
+            "Total number of proxy validation attempts"
+        );
+        describe_counter!(
+            "rustfs_trusted_proxy_validation_success_total",
+            "Total number of successful proxy validations"
+        );
+        describe_counter!(
+            "rustfs_trusted_proxy_validation_failure_total",
+            "Total number of failed proxy validations"
+        );
+        describe_counter!(
+            "rustfs_trusted_proxy_validation_failure_by_type_total",
             "Total number of failed proxy validations categorized by error type"
         );
-        describe_gauge!("proxy_chain_length", "Current length of proxy chains being validated");
-        describe_histogram!("proxy_validation_duration_seconds", "Time taken to validate a proxy chain in seconds");
-        describe_gauge!("proxy_cache_size", "Current number of entries in the proxy validation cache");
-        describe_counter!("proxy_cache_hits_total", "Total number of cache hits for proxy validation");
-        describe_counter!("proxy_cache_misses_total", "Total number of cache misses for proxy validation");
+        describe_gauge!("rustfs_trusted_proxy_chain_length", "Current length of proxy chains being validated");
+        describe_histogram!(
+            "rustfs_trusted_proxy_validation_duration_seconds",
+            "Time taken to validate a proxy chain in seconds"
+        );
+        describe_gauge!(
+            "rustfs_trusted_proxy_cache_size",
+            "Current number of entries in the proxy validation cache"
+        );
+        describe_counter!("rustfs_trusted_proxy_cache_hits_total", "Total number of cache hits for proxy validation");
+        describe_counter!(
+            "rustfs_trusted_proxy_cache_misses_total",
+            "Total number of cache misses for proxy validation"
+        );
     }
 
     /// Increments the total number of validation attempts.
@@ -69,7 +87,7 @@ impl ProxyMetrics {
         }
 
         counter!(
-            "proxy_validation_attempts_total",
+            "rustfs_trusted_proxy_validation_attempts_total",
             "app" => self.app_name.clone()
         )
         .increment(1);
@@ -82,20 +100,20 @@ impl ProxyMetrics {
         }
 
         counter!(
-            "proxy_validation_success_total",
+            "rustfs_trusted_proxy_validation_success_total",
             "app" => self.app_name.clone(),
             "trusted" => from_trusted_proxy.to_string()
         )
         .increment(1);
 
         gauge!(
-            "proxy_chain_length",
+            "rustfs_trusted_proxy_chain_length",
             "app" => self.app_name.clone()
         )
         .set(proxy_hops as f64);
 
         histogram!(
-            "proxy_validation_duration_seconds",
+            "rustfs_trusted_proxy_validation_duration_seconds",
             "app" => self.app_name.clone()
         )
         .record(duration.as_secs_f64());
@@ -121,21 +139,21 @@ impl ProxyMetrics {
         };
 
         counter!(
-            "proxy_validation_failure_total",
+            "rustfs_trusted_proxy_validation_failure_total",
             "app" => self.app_name.clone(),
             "error_type" => error_type
         )
         .increment(1);
 
         counter!(
-            "proxy_validation_failure_by_type_total",
+            "rustfs_trusted_proxy_validation_failure_by_type_total",
             "app" => self.app_name.clone(),
             "error_type" => error_type
         )
         .increment(1);
 
         histogram!(
-            "proxy_validation_duration_seconds",
+            "rustfs_trusted_proxy_validation_duration_seconds",
             "app" => self.app_name.clone(),
             "error_type" => error_type
         )
@@ -149,7 +167,7 @@ impl ProxyMetrics {
         }
 
         gauge!(
-            "proxy_validation_mode",
+            "rustfs_trusted_proxy_validation_mode",
             "app" => self.app_name.clone(),
             "mode" => mode.as_str()
         )
@@ -166,9 +184,9 @@ impl ProxyMetrics {
             return;
         }
 
-        counter!("proxy_cache_hits_total", "app" => self.app_name.clone()).increment(hits);
-        counter!("proxy_cache_misses_total", "app" => self.app_name.clone()).increment(misses);
-        gauge!("proxy_cache_size", "app" => self.app_name.clone()).set(size as f64);
+        counter!("rustfs_trusted_proxy_cache_hits_total", "app" => self.app_name.clone()).increment(hits);
+        counter!("rustfs_trusted_proxy_cache_misses_total", "app" => self.app_name.clone()).increment(misses);
+        gauge!("rustfs_trusted_proxy_cache_size", "app" => self.app_name.clone()).set(size as f64);
     }
 
     /// Prints a summary of enabled metrics to the log.
@@ -180,15 +198,15 @@ impl ProxyMetrics {
 
         info!("Proxy metrics enabled for application: {}", self.app_name);
         info!("Available metrics:");
-        info!("  - proxy_validation_attempts_total");
-        info!("  - proxy_validation_success_total");
-        info!("  - proxy_validation_failure_total");
-        info!("  - proxy_validation_failure_by_type_total");
-        info!("  - proxy_chain_length");
-        info!("  - proxy_validation_duration_seconds");
-        info!("  - proxy_cache_size");
-        info!("  - proxy_cache_hits_total");
-        info!("  - proxy_cache_misses_total");
+        info!("  - rustfs_trusted_proxy_validation_attempts_total");
+        info!("  - rustfs_trusted_proxy_validation_success_total");
+        info!("  - rustfs_trusted_proxy_validation_failure_total");
+        info!("  - rustfs_trusted_proxy_validation_failure_by_type_total");
+        info!("  - rustfs_trusted_proxy_chain_length");
+        info!("  - rustfs_trusted_proxy_validation_duration_seconds");
+        info!("  - rustfs_trusted_proxy_cache_size");
+        info!("  - rustfs_trusted_proxy_cache_hits_total");
+        info!("  - rustfs_trusted_proxy_cache_misses_total");
     }
 }
 
