@@ -23,7 +23,7 @@ use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_ha
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::sse::{
-    DecryptionRequest, EncryptionRequest, SseTypeV2, check_encryption_metadata, prepare_sse_configuration_v2, sse_decryption,
+    DecryptionRequest, EncryptionRequest, check_encryption_metadata, PrepareEncryptionRequest, sse_prepare_encryption, sse_decryption,
     sse_encryption, strip_managed_encryption_metadata,
 };
 use crate::storage::{
@@ -1186,31 +1186,29 @@ impl S3 for FS {
         }
 
         // Prepare SSE configuration for multipart upload
-        // Note: For SSE-C, customer_key is not needed at create_multipart_upload stage
-        // It will be provided with each upload_part call
-        let sse_type = prepare_sse_configuration_v2(
-            &bucket,
-            server_side_encryption.clone(),
-            sse_customer_algorithm.clone(),
-            Some("".to_string()), // if request is SSE_C, customer_key is not available at create_multipart_upload stage
-            sse_customer_key_md5.clone(),
-            ssekms_key_id.clone(),
-        )
-        .await?;
+        // Apply encryption using unified SSE API
+        let encryption_request = PrepareEncryptionRequest {
+            bucket: &bucket,
+            key: &key,
+            server_side_encryption,
+            ssekms_key_id,
+            sse_customer_algorithm: sse_customer_algorithm.clone(),
+            sse_customer_key_md5: sse_customer_key_md5.clone(),
+        };
 
-        // Extract effective encryption configuration from sse_type
-        let (effective_sse, effective_kms_key_id) = match &sse_type {
-            Some(SseTypeV2::SseS3(sse)) => (Some(sse.clone()), None),
-            Some(SseTypeV2::SseKms(sse, kms_key_id)) => (Some(sse.clone()), kms_key_id.clone()),
-            Some(SseTypeV2::SseC(_, _, _)) => (None, None), // SSE-C handled separately
+        let (effective_sse, effective_kms_key_id) = match sse_prepare_encryption(encryption_request).await? {
+            Some(material) => {
+                let server_side_encryption = Some(material.server_side_encryption.clone());
+                let ssekms_key_id = material.kms_key_id.clone();
+
+                // Merge encryption metadata
+                metadata.extend(material.metadata);
+
+                (server_side_encryption, ssekms_key_id)
+            }
             None => (None, None),
         };
 
-        // Add SSE metadata to options if encryption is configured
-        if let Some(sse_config) = sse_type.clone() {
-            let sse_metadata = sse_config.to_metadata();
-            metadata.extend(sse_metadata);
-        }
 
         if is_compressible(&req.headers, &key) {
             metadata.insert(

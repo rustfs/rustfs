@@ -94,6 +94,7 @@ use tokio::io::AsyncRead;
 use tracing::{debug, error};
 
 use crate::error::ApiError;
+use crate::storage::ecfs::InMemoryAsyncReader;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::error::Error;
 use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
@@ -231,9 +232,11 @@ pub async fn prepare_sse_configuration_v2(
     ssekms_key_id: Option<SSEKMSKeyId>,
 ) -> Result<Option<SseTypeV2>, ApiError> {
     if let Some(customer_algorithm) = customer_algorithm
-        && let Some(customer_key) = customer_key
         && let Some(customer_key_md5) = customer_key_md5
     {
+        // if create_multipart_upload request, customer_key is not provided
+        let customer_key = customer_key.unwrap_or_default();
+
         return Ok(Some(SseTypeV2::SseC(customer_algorithm, customer_key, customer_key_md5)));
     }
 
@@ -434,7 +437,7 @@ impl DecryptionMaterial {
     pub async fn wrap_reader(
         self,
         stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
-        encrypted_size: i64,
+        actual_size: i64,
     ) -> Result<(Box<dyn Reader>, i64), StorageError> {
         let (mut final_stream, response_content_length): (Box<dyn Reader>, i64) = if self.is_multipart {
             // Multipart decryption
@@ -444,17 +447,18 @@ impl DecryptionMaterial {
             // Single-part decryption - wrap AsyncRead into Reader first
             let warp_reader = WarpReader::new(stream);
             let decrypt_reader = self.wrap_single_reader(warp_reader);
-            let plain_size = self.original_size.unwrap_or(encrypted_size);
+            let plain_size = self.original_size.unwrap_or(actual_size);
             (decrypt_reader, plain_size)
         };
 
         // Add hard limit reader to prevent over-reading
-        let limit_reader = HardLimitReader::new(Box::new(WarpReader::new(final_stream)), response_content_length);
+        // final_stream is already Box<dyn Reader>, no need to wrap with WarpReader
+        let limit_reader = HardLimitReader::new(final_stream, response_content_length);
         final_stream = Box::new(limit_reader);
 
         debug!(
             "{:?} decryption applied: plaintext_size={}, encrypted_size={}",
-            self.sse_type, response_content_length, encrypted_size
+            self.sse_type, response_content_length, actual_size
         );
 
         Ok((final_stream, response_content_length))
@@ -541,6 +545,75 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
     Ok(None)
 }
 
+/// **Core API**: Apply encryption based on request parameters
+///
+/// sse_prepare_encryption, support SSE-C, SSE-S3, SSE-KMS
+
+
+pub struct PrepareEncryptionRequest<'a> {
+    /// Bucket name
+    pub bucket: &'a str,
+    /// Object key
+    pub key: &'a str,
+    /// Server-side encryption algorithm (SSE-S3 or SSE-KMS)
+    pub server_side_encryption: Option<ServerSideEncryption>,
+    /// KMS key ID (for SSE-KMS)
+    pub ssekms_key_id: Option<SSEKMSKeyId>,
+    /// SSE-C algorithm (customer-provided key)
+    pub sse_customer_algorithm: Option<SSECustomerAlgorithm>,
+    /// SSE-C key MD5 (Base64-encoded)
+    pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+}
+ 
+pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
+    let sse_type = prepare_sse_configuration_v2(
+        request.bucket,
+        request.server_side_encryption,
+        request.sse_customer_algorithm,
+        None,
+        request.sse_customer_key_md5,
+        request.ssekms_key_id,
+    )
+    .await?;
+
+    // apply encryption material
+    let material = match sse_type {
+        Some(SseTypeV2::SseS3(sse)) => 
+            apply_managed_encryption_material(
+                request.bucket, 
+                request.key, 
+                sse, 
+                None, 
+                0, 
+                None, 
+                None, 
+                None
+            ).await?
+            ,
+        Some(SseTypeV2::SseKms(sse, kms_key_id)) => 
+            apply_managed_encryption_material(
+                request.bucket, 
+                request.key, 
+                sse, 
+                kms_key_id, 
+                0, 
+                None, 
+                None, 
+                None
+            ).await?
+            ,
+        Some(SseTypeV2::SseC(algorithm, _, key_md5)) => 
+            apply_ssec_prepare_encryption_material(
+                algorithm, 
+                key_md5, 
+            ).await?
+            ,
+        None => return Ok(None),
+    };
+
+    Ok(Some(material))
+}
+
 /// **Core API**: Apply decryption based on stored metadata
 ///
 /// This function automatically detects the encryption type from metadata:
@@ -620,6 +693,29 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
 // ============================================================================
 // Internal Implementation - SSE-C
 // ============================================================================
+
+
+async fn apply_ssec_prepare_encryption_material(
+    algorithm: SSECustomerAlgorithm,
+    sse_key_md5: SSECustomerKeyMD5,
+) -> Result<EncryptionMaterial, ApiError> {
+    // Build metadata
+    let mut metadata = HashMap::new();
+
+    metadata.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+    metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), algorithm.clone());
+    metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_key_md5);
+
+    Ok(EncryptionMaterial {
+        sse_type: SSEType::SseC,
+        server_side_encryption: ServerSideEncryption::AES256.parse().unwrap(),
+        kms_key_id: None,
+        algorithm: algorithm,
+        key_bytes: [0; 32],
+        nonce: [0; 12],
+        metadata,
+    })
+}
 
 async fn apply_ssec_encryption_material(
     bucket: &str,
@@ -773,7 +869,7 @@ async fn apply_managed_encryption_material(
     let (data_key, encrypted_data_key) = if let Some(part_number) = part_number
         && let Some(part_nonce) = part_nonce
         && let Some(part_key) = part_key
-        && part_number > 1
+        && part_number >= 1 // upload_part mode, dek generate by create_multipart_upload
     {
         let _base_nonce = BASE64_STANDARD
             .decode(part_nonce.as_bytes())
@@ -932,7 +1028,6 @@ async fn apply_managed_decryption_material(
 
     let mut base_nonce = [0u8; 12];
     base_nonce.copy_from_slice(&iv[..12]);
-
     let nonce = if let Some(part_num) = part_number {
         derive_part_nonce(base_nonce, part_num)
     } else {
@@ -1084,7 +1179,7 @@ impl SseDekProvider for KmsSseDekProvider {
 /// # Linux/Unix/macOS
 /// ./scripts/generate-sse-keys.sh
 /// ```
-struct TestSseDekProvider {
+pub(crate) struct TestSseDekProvider {
     master_key: [u8; 32],
 }
 
@@ -1132,7 +1227,7 @@ impl TestSseDekProvider {
     }
 
     // Simple encryption of DEK
-    fn encrypt_dek(dek: [u8; 32], cmk_value: [u8; 32]) -> Result<String, ApiError> {
+    pub(crate) fn encrypt_dek(dek: [u8; 32], cmk_value: [u8; 32]) -> Result<String, ApiError> {
         // Use AES-256-GCM to encrypt DEK
         let key = Key::<Aes256Gcm>::from(cmk_value);
 
@@ -1147,7 +1242,7 @@ impl TestSseDekProvider {
     }
 
     // Simple decryption of DEK
-    fn decrypt_dek(encrypted_dek: &str, cmk_value: [u8; 32]) -> Result<[u8; 32], ApiError> {
+    pub(crate) fn decrypt_dek(encrypted_dek: &str, cmk_value: [u8; 32]) -> Result<[u8; 32], ApiError> {
         let parts: Vec<&str> = encrypted_dek.split(':').collect();
         if parts.len() != 2 {
             return Err(ApiError::from(StorageError::other("Invalid encrypted DEK format")));
@@ -1332,41 +1427,94 @@ pub fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
 /// 2. Deriving per-part nonces from base nonce
 /// 3. Decrypting each part separately
 /// 4. Concatenating decrypted data
-pub async fn decrypt_multipart_managed_stream(
+pub(crate) async fn decrypt_multipart_managed_stream(
     mut encrypted_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     parts: &[ObjectPartInfo],
     key_bytes: [u8; 32],
     base_nonce: [u8; 12],
 ) -> Result<(Box<dyn Reader>, i64), StorageError> {
+    // Read all encrypted data into memory first
+    // This ensures we have all parts data before starting decryption
     let mut encrypted_data = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut encrypted_stream, &mut encrypted_data).await?;
+    tokio::io::AsyncReadExt::read_to_end(&mut encrypted_stream, &mut encrypted_data)
+        .await
+        .map_err(|e| StorageError::other(format!("failed to read encrypted stream: {}", e)))?;
+
+    // Calculate total encrypted size expected
+    let total_encrypted_size: usize = parts.iter().map(|part| part.size).sum();
+    let total_plain_capacity: usize = parts.iter().map(|part| part.actual_size.max(0) as usize).sum();
+    
+    debug!(
+        "decrypt_multipart_managed_stream: {} parts, total_encrypted_size={}, encrypted_data_len={}, total_plain_capacity={}",
+        parts.len(),
+        total_encrypted_size,
+        encrypted_data.len(),
+        total_plain_capacity
+    );
+
+    // Verify we have enough encrypted data
+    if encrypted_data.len() < total_encrypted_size {
+        return Err(StorageError::other(format!(
+            "encrypted stream size mismatch: expected {} bytes but got {} bytes. This indicates the stream does not contain all parts data.",
+            total_encrypted_size, encrypted_data.len()
+        )));
+    }
 
     let mut decrypted_parts = Vec::new();
     let mut offset = 0;
 
-    for part_info in parts {
-        let part_size = part_info.actual_size as usize;
-        if offset + part_size > encrypted_data.len() {
-            return Err(StorageError::other("Encrypted data size mismatch with parts metadata"));
+    for (idx, part_info) in parts.iter().enumerate() {
+        if part_info.size == 0 {
+            debug!("Skipping part {} with size 0", part_info.number);
+            continue;
         }
 
-        let part_data = &encrypted_data[offset..offset + part_size];
+        debug!(
+            "Decrypting part {} (index {}): encrypted_size={}, actual_size={}",
+            part_info.number, idx, part_info.size, part_info.actual_size
+        );
+
+        // Use part.size (encrypted size) to split encrypted data
+        // part.actual_size is the decrypted size, which we'll verify after decryption
+        if offset + part_info.size > encrypted_data.len() {
+            return Err(StorageError::other(format!(
+                "encrypted data size mismatch for part {}: offset {} + encrypted_size {} exceeds total encrypted data length {}",
+                part_info.number, offset, part_info.size, encrypted_data.len()
+            )));
+        }
+
+        let part_encrypted_data = &encrypted_data[offset..offset + part_info.size];
         let part_nonce = derive_part_nonce(base_nonce, part_info.number);
 
-        let mut decrypted_part = Vec::with_capacity(part_size);
-        let cursor = WarpReader::new(std::io::Cursor::new(part_data.to_vec()));
-        let decrypt_reader = DecryptReader::new(cursor, key_bytes, part_nonce);
+        // Decrypt this part
+        let cursor = std::io::Cursor::new(part_encrypted_data.to_vec());
+        let decrypt_reader = DecryptReader::new(WarpReader::new(cursor), key_bytes, part_nonce);
         let mut decrypt_reader = Box::pin(decrypt_reader);
 
-        tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut decrypted_part).await?;
+        let mut decrypted_part = Vec::with_capacity(part_info.actual_size.max(0) as usize);
+        tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut decrypted_part)
+            .await
+            .map_err(|e| StorageError::other(format!("failed to decrypt multipart segment {}: {}", part_info.number, e)))?;
+
+        debug!(
+            "Decrypted part {}: {} bytes (expected actual_size: {})",
+            part_info.number, decrypted_part.len(), part_info.actual_size
+        );
+
         decrypted_parts.push(decrypted_part);
-        offset += part_size;
+        offset += part_info.size;
     }
 
+    // Concatenate all decrypted parts
     let all_decrypted = decrypted_parts.concat();
     let total_size = all_decrypted.len() as i64;
 
-    let reader: Box<dyn Reader> = Box::new(WarpReader::new(std::io::Cursor::new(all_decrypted)));
+    debug!(
+        "decrypt_multipart_managed_stream completed: total_plain_size={}, expected_total={}",
+        total_size, total_plain_capacity
+    );
+
+    let reader: Box<dyn Reader> = Box::new(WarpReader::new(InMemoryAsyncReader::new(all_decrypted)));
     Ok((reader, total_size))
 }
 
