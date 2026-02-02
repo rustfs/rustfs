@@ -50,6 +50,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 // Map: Address (usize) -> (Size (usize), StackTrace (Arc<Vec<usize>>))
 // We store the Arc to keep the stack trace alive as long as the allocation is live.
 static LIVE_ALLOCATIONS: LazyAllocatorShardedMap = LazyLock::new(|| ShardedHashMap::new(64));
+
 // Cache for deduplicating stack traces.
 // Map: StackHash (u64) -> Weak<Vec<usize>>
 // We use Weak references so that unused stack traces can be dropped when all referring allocations are freed.
