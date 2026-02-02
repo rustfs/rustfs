@@ -5366,11 +5366,11 @@ impl S3 for FS {
                     &object,
                     &mut obj_info,
                     &ObjectOptions {
-                        version_id: obj_info_.version_id.map(|e| e.to_string()),
+                        version_id: obj_info_.version_id.map(|v| v.to_string()),
                         ..Default::default()
                     },
                     &ObjectOptions {
-                        version_id: obj_info_.version_id.map(|e| e.to_string()),
+                        version_id: obj_info_.version_id.map(|v| v.to_string()),
                         mod_time: obj_info_.mod_time,
                         ..Default::default()
                     },
