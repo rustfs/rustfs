@@ -20,10 +20,10 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crate::config::{AppConfig, ConfigLoader, DEFAULT_TRUSTED_PROXY_ENABLED, ENV_TRUSTED_PROXY_ENABLED};
-use crate::middleware::TrustedProxyLayer;
-use crate::proxy::default_proxy_metrics;
-use crate::proxy::ProxyMetrics;
+use crate::{
+    AppConfig, ConfigLoader, DEFAULT_TRUSTED_PROXY_ENABLED, ENV_TRUSTED_PROXY_ENABLED, ProxyMetrics, TrustedProxyLayer,
+    default_proxy_metrics,
+};
 
 /// Global instance of the application configuration.
 static CONFIG: OnceLock<Arc<AppConfig>> = OnceLock::new();

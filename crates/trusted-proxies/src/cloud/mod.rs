@@ -22,5 +22,5 @@ pub mod metadata;
 mod ranges;
 
 pub use detector::*;
-pub use ranges::*;
 pub use metadata::*;
+pub use ranges::*;

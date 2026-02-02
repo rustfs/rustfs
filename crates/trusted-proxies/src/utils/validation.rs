@@ -97,9 +97,10 @@ impl ValidationUtils {
     pub fn validate_ip_in_range(ip: &IpAddr, cidr_ranges: &[String]) -> bool {
         for cidr in cidr_ranges {
             if let Ok(network) = ipnetwork::IpNetwork::from_str(cidr)
-                && network.contains(*ip) {
-                    return true;
-                }
+                && network.contains(*ip)
+            {
+                return true;
+            }
         }
 
         false
@@ -173,9 +174,7 @@ impl ValidationUtils {
     /// Checks if a string contains only safe characters for use in URLs or headers.
     pub fn is_safe_string(s: &str) -> bool {
         SAFE_REGEX
-            .get_or_init(|| {
-                Regex::new(r"^[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=]+$").expect("Invalid safe string regex")
-            })
+            .get_or_init(|| Regex::new(r"^[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=]+$").expect("Invalid safe string regex"))
             .is_match(s)
     }
 

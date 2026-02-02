@@ -17,10 +17,10 @@
 use std::sync::Arc;
 use tower::Layer;
 
-use crate::TrustedProxyConfig;
-use crate::TrustedProxyMiddleware;
 use crate::ProxyMetrics;
 use crate::ProxyValidator;
+use crate::TrustedProxyConfig;
+use crate::TrustedProxyMiddleware;
 
 /// Tower Layer for the trusted proxy middleware.
 #[derive(Clone, Debug)]

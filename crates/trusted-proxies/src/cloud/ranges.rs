@@ -194,9 +194,10 @@ impl GoogleCloudIpRanges {
 
                     for prefix in ip_ranges.prefixes {
                         if let Some(ipv4_prefix) = prefix.ipv4_prefix
-                            && let Ok(network) = IpNetwork::from_str(&ipv4_prefix) {
-                                networks.push(network);
-                            }
+                            && let Ok(network) = IpNetwork::from_str(&ipv4_prefix)
+                        {
+                            networks.push(network);
+                        }
                     }
 
                     info!("Successfully fetched {} Google Cloud IP ranges from API", networks.len());

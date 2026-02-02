@@ -14,7 +14,7 @@
 
 //! Proxy chain analysis and validation logic.
 
-use crate::{is_valid_ip_address, ProxyError, TrustedProxyConfig, ValidationMode};
+use crate::{ProxyError, TrustedProxyConfig, ValidationMode, is_valid_ip_address};
 use axum::http::HeaderMap;
 use std::collections::HashSet;
 use std::net::IpAddr;
