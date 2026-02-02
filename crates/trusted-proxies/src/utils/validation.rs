@@ -206,7 +206,7 @@ impl ValidationUtils {
         let mut result = data.to_string();
 
         for pattern in sensitive_patterns {
-            match Regex::new(&format!(r#"(?i){}[:=]\s*([^&\s]+)"#, pattern)) {
+            match Regex::new(&format!(r#"(?i)({})[:=]\s*([^&\s]+)"#, pattern)) {
                 Ok(regex) => {
                     result = regex
                         .replace_all(&result, |caps: &regex::Captures| format!("{}:[REDACTED]", &caps[1]))
