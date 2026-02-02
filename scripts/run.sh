@@ -168,17 +168,27 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 # - Minimum size threshold prevents compression of small files where overhead > benefit
 # - Wildcard patterns supported in MIME types (e.g., text/* matches text/plain, text/html, etc.)
 
+# Trusted Proxy Configuration
+# export RUSTFS_TRUSTED_PROXY_ENABLED=true
+# export RUSTFS_TRUSTED_PROXY_NETWORKS=127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8
+# export RUSTFS_TRUSTED_PROXY_VALIDATION_MODE=hop_by_hop
+# export RUSTFS_TRUSTED_PROXY_ENABLE_RFC7239=true
+# export RUSTFS_TRUSTED_PROXY_MAX_HOPS=10
+# export RUSTFS_TRUSTED_PROXY_METRICS_ENABLED=true
+
 #export RUSTFS_REGION="us-east-1"
 
 export RUSTFS_ENABLE_SCANNER=true
 
-export RUSTFS_ENABLE_HEAL=false
+export RUSTFS_ENABLE_HEAL=true
 
 # Object cache configuration
 export RUSTFS_OBJECT_CACHE_ENABLE=true
 
 # Profiling configuration
-export RUSTFS_ENABLE_PROFILING=true
+export RUSTFS_ENABLE_PROFILING=false
+# Memory profiling periodic dump
+export RUSTFS_PROF_MEM_PERIODIC=false
 
 # Heal configuration queue size
 export RUSTFS_HEAL_QUEUE_SIZE=10000
@@ -201,8 +211,6 @@ export RUSTFS_LOCK_ACQUIRE_TIMEOUT=30
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
-
-export RUSTFS_PROF_MEM_PERIODIC=true
 
 # Enable jemalloc for memory profiling
 # MALLOC_CONF parameters:
