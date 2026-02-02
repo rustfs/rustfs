@@ -564,7 +564,14 @@ fn process_connection(
             }
         };
         let hybrid_service = ServiceBuilder::new()
+            // NOTE: Both extension types are intentionally inserted to maintain compatibility:
+            // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
+            // 2. `std::net::SocketAddr` - Required by TrustedProxyMiddleware for proxy validation
+            // This dual insertion is necessary because the middleware expects the raw SocketAddr type
+            // while our application code uses the RemoteAddr wrapper. Consolidating these would
+            // require either modifying the third-party middleware or refactoring all existing handlers.
             .layer(AddExtensionLayer::new(remote_addr))
+            .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
             // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
             // This should be placed before TraceLayer so that logs reflect the real client IP
             .option_layer(if rustfs_trusted_proxies::is_enabled() {
