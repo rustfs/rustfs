@@ -126,6 +126,9 @@ async fn async_main() -> Result<()> {
     // Initialize performance profiling if enabled
     profiling::init_from_env().await;
 
+    // Initialize trusted proxies system
+    rustfs_trusted_proxies::init();
+
     // Initialize TLS if a certificate path is provided
     if let Some(tls_path) = &opt.tls_path {
         match init_cert(tls_path).await {

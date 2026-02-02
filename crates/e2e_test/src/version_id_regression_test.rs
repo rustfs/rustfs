@@ -395,4 +395,46 @@ mod tests {
 
         info!("✅ PASSED: Veeam backup workflow simulation completed successfully");
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_terraform_put_after_delete() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        // Use a versioned bucket for this test
+        let bucket = "terraform";
+
+        let client = env.create_s3_client();
+        env.create_test_bucket(bucket).await?;
+
+        let key = "terraform.tfstate";
+        let response = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(b"v1".to_vec()))
+            .send()
+            .await;
+        assert!(response.is_ok());
+
+        client.delete_object().bucket(bucket).key(key).send().await?;
+
+        let response = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(b"v1".to_vec()))
+            .send()
+            .await;
+
+        assert!(response.is_ok());
+
+        let get_response = client.get_object().bucket(bucket).key(key).send().await;
+        assert!(get_response.is_ok(), "Object should exist after PUT");
+
+        Ok(())
+    }
 }

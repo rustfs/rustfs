@@ -15,3 +15,15 @@
 max_width = 130
 fn_call_width = 90
 single_line_let_else_max_width = 100
+
+## Enable group import Preserve, StdExternalCrate, One
+#group_imports = "StdExternalCrate"
+#
+## Import granularity control Preserve, Crate, Module, Item, One
+#imports_granularity = "Crate"
+#
+## Sort alphabetically
+#reorder_imports = true
+#
+## The instability feature needs to be enabled
+#unstable_features = true

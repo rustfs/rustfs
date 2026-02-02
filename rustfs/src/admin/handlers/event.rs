@@ -260,8 +260,8 @@ impl Operation for ListNotificationTargets {
                     _ => "offline",
                 };
                 NotificationEndpoint {
-                    account_id: target.id().to_string(),
-                    service: target.name().to_string(),
+                    account_id: target.id().id.clone(),
+                    service: target.id().name.to_string(),
                     status: status.to_string(),
                 }
             });
