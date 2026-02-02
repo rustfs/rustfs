@@ -3583,6 +3583,10 @@ impl SetDisks {
 
         match oi {
             Ok(oi) => {
+                // If top level is a delete marker proceed to upload.
+                if oi.delete_marker {
+                    return None;
+                }
                 if should_prevent_write(&oi, http_preconditions.if_none_match, http_preconditions.if_match) {
                     return Some(StorageError::PreconditionFailed);
                 }
