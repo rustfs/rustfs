@@ -129,7 +129,6 @@ async fn run_race_iteration(
         info!(">>> Unexpected: no writers succeeded.");
     }
 
-
     Ok(success_count)
 }
 
@@ -164,7 +163,7 @@ async fn test_conditional_put_race_cluster() -> Result<(), Box<dyn std::error::E
             Err(e) => {
                 races_detected += 1;
                 warn!("Iteration {} failed: {}", i, e)
-            },
+            }
         }
 
         cleanup_object(&clients[0], &test_key).await;
@@ -218,7 +217,10 @@ async fn test_conditional_put_basic_cluster() -> Result<(), Box<dyn std::error::
         .await;
     assert!(result.is_err(), "Second PUT with If-None-Match:* should fail");
 
-    assert!(matches!(result, Err(SdkError::ServiceError(_))), "Expected ServiceError but got different error type");
+    assert!(
+        matches!(result, Err(SdkError::ServiceError(_))),
+        "Expected ServiceError but got different error type"
+    );
 
     if let Err(SdkError::ServiceError(e)) = result {
         let code = e.err().meta().code().unwrap_or("");

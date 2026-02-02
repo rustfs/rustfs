@@ -419,7 +419,7 @@ impl RustFSTestClusterEnvironment {
     /// * `Err(Box<dyn Error + Send + Sync>)` - An error if any step fails, such as temporary
     ///   directory creation failure or available port lookup failure.
     pub async fn new(node_count: usize) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        if node_count <= 0 {
+        if node_count == 0 {
             return Err("Zero node will be created".into());
         }
         let temp_dir = format!("/tmp/rustfs_cluster_test_{}", Uuid::new_v4());
@@ -576,20 +576,15 @@ impl RustFSTestClusterEnvironment {
     /// * `Ok(Vec<Client>)` - A vector of configured S3 `Client` instances (one per cluster node) on full success.
     /// * `Err(Box<dyn Error + Send + Sync>)` - An error with a descriptive message if any client creation fails,
     ///   including the underlying error from `create_s3_client`.
-
     pub fn create_all_clients(&self) -> Result<Vec<Client>, Box<dyn std::error::Error + Send + Sync>> {
         (0..self.nodes.len()).map(|i| self.create_s3_client(i)).try_fold(
             Vec::with_capacity(self.nodes.len()),
-            |mut clients, result| {
-                match result {
-                    Ok(client) => {
-                        clients.push(client);
-                        Ok(clients)
-                    }
-                    Err(e) => {
-                        Err(format!("Failed to create all S3 client for node: {}", e).into())
-                    }
+            |mut clients, result| match result {
+                Ok(client) => {
+                    clients.push(client);
+                    Ok(clients)
                 }
+                Err(e) => Err(format!("Failed to create all S3 client for node: {}", e).into()),
             },
         )
     }
