@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod app;
-pub(crate) mod body_limits;
-pub(crate) mod compress;
-pub(crate) mod console;
-pub(crate) mod env;
-pub(crate) mod heal;
-pub(crate) mod object;
-pub(crate) mod profiler;
-pub(crate) mod protocols;
-pub(crate) mod proxy;
-pub(crate) mod quota;
-pub(crate) mod runtime;
-pub(crate) mod scanner;
-pub(crate) mod targets;
-pub(crate) mod tls;
+use rustfs_trusted_proxies::AwsMetadataFetcher;
+use rustfs_trusted_proxies::CloudDetector;
+use rustfs_trusted_proxies::CloudMetadataFetcher;
+use std::time::Duration;
+
+#[tokio::test]
+async fn test_cloud_detector_disabled() {
+    let detector = CloudDetector::new(false, Duration::from_secs(1), None);
+    let provider = detector.detect_provider();
+    assert!(provider.is_none());
+}
+
+#[tokio::test]
+async fn test_aws_metadata_fetcher() {
+    let fetcher = AwsMetadataFetcher::new(Duration::from_secs(5));
+    assert_eq!(fetcher.provider_name(), "aws");
+}

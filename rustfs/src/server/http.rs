@@ -37,6 +37,7 @@ use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3Service, service::S3ServiceBuilder};
@@ -216,7 +217,7 @@ pub async fn start_http_server(
         b.set_access(store.clone());
         b.set_route(admin::make_admin_route(opt.console_enable)?);
 
-        // console server does not need to setup virtual-hosted-style requests
+        // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
         if !opt.server_domains.is_empty() && !opt.console_enable {
             MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
 
@@ -525,7 +526,7 @@ struct ConnectionContext {
 
 /// Process a single incoming TCP connection.
 ///
-/// This function is executed in a new Tokio task and it will:
+/// This function is executed in a new Tokio task, and it will:
 /// 1. If TLS is configured, perform TLS handshake.
 /// 2. Build a complete service stack for this connection, including S3, RPC services, and all middleware.
 /// 3. Use Hyper to handle HTTP requests on this connection.
@@ -562,11 +563,24 @@ fn process_connection(
                 None
             }
         };
-
         let hybrid_service = ServiceBuilder::new()
+            // NOTE: Both extension types are intentionally inserted to maintain compatibility:
+            // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
+            // 2. `std::net::SocketAddr` - Required by TrustedProxyMiddleware for proxy validation
+            // This dual insertion is necessary because the middleware expects the raw SocketAddr type
+            // while our application code uses the RemoteAddr wrapper. Consolidating these would
+            // require either modifying the third-party middleware or refactoring all existing handlers.
+            .layer(AddExtensionLayer::new(remote_addr))
+            .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
+            // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
+            // This should be placed before TraceLayer so that logs reflect the real client IP
+            .option_layer(if rustfs_trusted_proxies::is_enabled() {
+                Some(rustfs_trusted_proxies::layer().clone())
+            } else {
+                None
+            })
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
-            .layer(AddExtensionLayer::new(remote_addr))
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
             .layer(ReadinessGateLayer::new(readiness))
@@ -578,10 +592,18 @@ fn process_connection(
                             .get(http::header::HeaderName::from_static("x-request-id"))
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("unknown");
+
+                        // Extract real client IP from trusted proxy middleware if available
+                        let client_info = request.extensions().get::<ClientInfo>();
+                        let real_ip = client_info
+                            .map(|info| info.real_ip.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+
                         let span = tracing::info_span!("http-request",
                             trace_id = %trace_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
+                            real_ip = %real_ip,
                             uri = %request.uri(),
                             version = ?request.version(),
                         );
@@ -773,7 +795,7 @@ fn get_listen_backlog() -> i32 {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
     let mut buf = [0; 1];
-    let mut buf_len = std::mem::size_of_val(&buf);
+    let mut buf_len = size_of_val(&buf);
 
     if unsafe {
         libc::sysctl(
