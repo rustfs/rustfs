@@ -125,7 +125,6 @@ urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
 libc = { workspace = true }
-pprof = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
@@ -141,14 +140,20 @@ libsystemd.workspace = true
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
+
+# Note: If you want to *explicitly* exclude Windows from a target dependency set,
+# you can use a cfg like the following instead:
+[target.'cfg(all(not(target_os = "windows"), not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))'.dependencies]
 starshard = { workspace = true }
 backtrace = { workspace = true }
 rand = { workspace = true }
+pprof = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 jemalloc_pprof = { workspace = true }
+pprof = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
