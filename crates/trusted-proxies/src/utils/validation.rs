@@ -31,10 +31,7 @@ impl ValidationUtils {
     /// Validates an email address format.
     pub fn is_valid_email(email: &str) -> bool {
         EMAIL_REGEX
-            .get_or_init(|| {
-                Regex::new(r"^([a-z0-9_+]([a-z0-9_+.]*[a-z0-9_+])?)@([a-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,6})")
-                    .expect("Invalid email regex")
-            })
+            .get_or_init(|| Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$").expect("Invalid email regex"))
             .is_match(email)
     }
 
@@ -61,14 +58,30 @@ impl ValidationUtils {
                 return false;
             }
 
-            let ip_part = ip_str.split(':').next().unwrap_or(ip_str);
-
-            if IpAddr::from_str(ip_part).is_err() {
-                return false;
+            if let Some(ip_part) = Self::extract_ip_part(ip_str) {
+                if IpAddr::from_str(ip_part).is_err() {
+                    return false;
+                }
+            } else {
+                continue;
             }
         }
 
         true
+    }
+
+    /// Extracts the IP part from a string, handling brackets for IPv6.
+    pub fn extract_ip_part(ip_str: &str) -> Option<&str> {
+        if ip_str.starts_with('[') {
+            if let Some(end) = ip_str.find(']') {
+                Some(&ip_str[1..end])
+            } else {
+                None
+            }
+        } else {
+            // For IPv4 or IPv6 without brackets, take the part before the first colon.
+            Some(ip_str.split(':').next().unwrap_or(ip_str))
+        }
     }
 
     /// Validates the format of an RFC 7239 Forwarded header value.
@@ -109,7 +122,7 @@ impl ValidationUtils {
     /// Validates a header value for security (length and control characters).
     pub fn validate_header_value(value: &str) -> bool {
         for c in value.chars() {
-            if c.is_control() && c != '\t' && c != '\n' && c != '\r' {
+            if c.is_control() && c != '\t' {
                 return false;
             }
         }

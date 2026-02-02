@@ -53,12 +53,13 @@ impl ProxyChainAnalyzer {
 
         for proxy in &config.proxies {
             match proxy {
-                crate::config::TrustedProxy::Single(ip) => {
+                crate::TrustedProxy::Single(ip) => {
                     trusted_ip_cache.insert(*ip);
                 }
-                crate::config::TrustedProxy::Cidr(network) => {
+                crate::TrustedProxy::Cidr(network) => {
                     // For small networks, cache all IPs to speed up lookups.
-                    if network.prefix() >= 24 {
+                    // Only cache IPv4 networks to avoid iterating huge IPv6 ranges.
+                    if network.is_ipv4() && network.prefix() >= 24 {
                         for ip in network.iter() {
                             trusted_ip_cache.insert(ip);
                         }
@@ -88,6 +89,11 @@ impl ProxyChainAnalyzer {
         // Construct the full chain including the direct peer.
         let mut full_chain = proxy_chain.to_vec();
         full_chain.push(current_proxy_ip);
+
+        // Enforce maximum hop limit.
+        if full_chain.len() > self.config.max_hops {
+            return Err(ProxyError::ChainTooLong(full_chain.len(), self.config.max_hops));
+        }
 
         // Analyze the chain based on the configured validation mode.
         let (client_ip, trusted_chain, hops) = match self.config.validation_mode {
@@ -233,14 +239,6 @@ impl ProxyChainAnalyzer {
     /// Collects warnings about potential issues in the proxy chain.
     fn collect_warnings(&self, full_chain: &[IpAddr], trusted_chain: &[IpAddr], headers: &HeaderMap) -> Vec<String> {
         let mut warnings = Vec::new();
-
-        if full_chain.len() > self.config.max_hops {
-            warnings.push(format!(
-                "Proxy chain length ({}) exceeds configured maximum ({})",
-                full_chain.len(),
-                self.config.max_hops
-            ));
-        }
 
         if !trusted_chain.is_empty() && !headers.contains_key("x-forwarded-for") && !headers.contains_key("forwarded") {
             warnings.push("No proxy headers found for request from trusted proxy".to_string());

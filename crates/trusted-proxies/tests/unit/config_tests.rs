@@ -23,7 +23,7 @@ fn test_config_loader_default() {
         std::env::remove_var(ENV_TRUSTED_PROXY_PROXIES);
     }
     let config = ConfigLoader::from_env_or_default();
-    assert_eq!(config.server_addr.port(), 3000);
+    assert_eq!(config.server_addr.port(), 9000);
     assert!(!config.proxy.proxies.is_empty());
     assert_eq!(config.proxy.validation_mode, ValidationMode::HopByHop);
     assert!(config.proxy.enable_rfc7239);
@@ -37,19 +37,16 @@ fn test_config_loader_env_vars() {
         std::env::set_var(ENV_TRUSTED_PROXY_PROXIES, "192.168.1.0/24,10.0.0.0/8");
     }
     unsafe {
-        std::env::set_var("TRUSTED_PROXY_VALIDATION_MODE", "strict");
+        std::env::set_var("RUSTFS_TRUSTED_PROXY_VALIDATION_MODE", "strict");
     }
     unsafe {
-        std::env::set_var("TRUSTED_PROXY_MAX_HOPS", "5");
-    }
-    unsafe {
-        std::env::set_var("SERVER_PORT", "8080");
+        std::env::set_var("RUSTFS_TRUSTED_PROXY_MAX_HOPS", "5");
     }
 
     let config = ConfigLoader::from_env();
 
     if let Ok(config) = config {
-        assert_eq!(config.server_addr.port(), 8080);
+        assert_eq!(config.server_addr.port(), 9000);
         assert_eq!(config.proxy.validation_mode, ValidationMode::Strict);
         assert_eq!(config.proxy.max_hops, 5);
 
@@ -57,7 +54,7 @@ fn test_config_loader_env_vars() {
             std::env::remove_var(ENV_TRUSTED_PROXY_PROXIES);
         }
         unsafe {
-            std::env::remove_var("TRUSTED_PROXY_VALIDATION_MODE");
+            std::env::remove_var("RUSTFS_TRUSTED_PROXY_VALIDATION_MODE");
         }
         unsafe {
             std::env::remove_var("TRUSTED_PROXY_MAX_HOPS");

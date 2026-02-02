@@ -52,3 +52,28 @@ fn test_proxy_chain_analyzer_hop_by_hop() {
     let result = analyzer.analyze_chain(&chain, current_proxy, &headers);
     assert!(result.is_ok());
 }
+
+#[test]
+fn test_proxy_chain_too_long() {
+    let config = create_test_config();
+    let analyzer = ProxyChainAnalyzer::new(config);
+    let chain = vec![
+        IpAddr::from_str("203.0.113.195").unwrap(),
+        IpAddr::from_str("10.0.1.100").unwrap(),
+        IpAddr::from_str("10.0.1.101").unwrap(),
+        IpAddr::from_str("10.0.1.102").unwrap(),
+        IpAddr::from_str("10.0.1.103").unwrap(),
+    ];
+    let current_proxy = IpAddr::from_str("192.168.1.100").unwrap();
+    let headers = HeaderMap::new();
+    // Total chain length is 6 (5 in chain + 1 current proxy), max hops is 5
+    let result = analyzer.analyze_chain(&chain, current_proxy, &headers);
+    assert!(result.is_err());
+    match result {
+        Err(rustfs_trusted_proxies::ProxyError::ChainTooLong(len, max)) => {
+            assert_eq!(len, 6);
+            assert_eq!(max, 5);
+        }
+        _ => panic!("Expected ChainTooLong error"),
+    }
+}

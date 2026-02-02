@@ -217,7 +217,7 @@ pub async fn start_http_server(
         b.set_access(store.clone());
         b.set_route(admin::make_admin_route(opt.console_enable)?);
 
-        // console server does not need to setup virtual-hosted-style requests
+        // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
         if !opt.server_domains.is_empty() && !opt.console_enable {
             MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
 
@@ -526,7 +526,7 @@ struct ConnectionContext {
 
 /// Process a single incoming TCP connection.
 ///
-/// This function is executed in a new Tokio task and it will:
+/// This function is executed in a new Tokio task, and it will:
 /// 1. If TLS is configured, perform TLS handshake.
 /// 2. Build a complete service stack for this connection, including S3, RPC services, and all middleware.
 /// 3. Use Hyper to handle HTTP requests on this connection.
@@ -564,6 +564,7 @@ fn process_connection(
             }
         };
         let hybrid_service = ServiceBuilder::new()
+            .layer(AddExtensionLayer::new(remote_addr))
             // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
             // This should be placed before TraceLayer so that logs reflect the real client IP
             .option_layer(if rustfs_trusted_proxies::is_enabled() {
@@ -573,7 +574,6 @@ fn process_connection(
             })
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
-            .layer(AddExtensionLayer::new(remote_addr))
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
             .layer(ReadinessGateLayer::new(readiness))
@@ -788,7 +788,7 @@ fn get_listen_backlog() -> i32 {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
     let mut buf = [0; 1];
-    let mut buf_len = std::mem::size_of_val(&buf);
+    let mut buf_len = size_of_val(&buf);
 
     if unsafe {
         libc::sysctl(

@@ -197,14 +197,10 @@ impl ConfigLoader {
             true,
             10,
             true,
-            vec![
-                IpNetwork::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
-                IpNetwork::new(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
-                IpNetwork::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16),
-            ]
-            .into_iter()
-            .filter_map(|n| n.ok())
-            .collect(),
+            DEFAULT_TRUSTED_PROXY_PRIVATE_NETWORKS
+                .split(',')
+                .filter_map(|s| s.trim().parse::<IpNetwork>().ok())
+                .collect(),
         );
 
         AppConfig::new(

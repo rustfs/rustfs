@@ -241,10 +241,19 @@ impl ProxyValidator {
 
                 match key.as_str() {
                     "for" => {
-                        // Extract IP address, ignoring port if present.
-                        if let Some(ip_part) = value.split(':').next()
-                            && let Ok(ip) = ip_part.parse::<IpAddr>()
-                        {
+                        // Extract IP address, handling IPv6 addresses in brackets as per RFC 7239.
+                        let ip_str = if value.starts_with('[') {
+                            if let Some(end) = value.find(']') {
+                                &value[1..end]
+                            } else {
+                                continue; // Invalid format, skip
+                            }
+                        } else {
+                            // For IPv4 or IPv6 without brackets, take the part before the first colon.
+                            value.split(':').next().unwrap_or(value)
+                        };
+
+                        if let Ok(ip) = ip_str.parse::<IpAddr>() {
                             proxy_chain.push(ip);
                         }
                     }
@@ -278,9 +287,18 @@ impl ProxyValidator {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .filter_map(|s| {
-                // Strip port if present.
-                let ip_part = s.split(':').next().unwrap_or(s);
-                ip_part.parse::<IpAddr>().ok()
+                // Handle IPv6 addresses in brackets, e.g., [::1]:8080
+                let ip_str = if s.starts_with('[') {
+                    if let Some(end) = s.find(']') {
+                        &s[1..end]
+                    } else {
+                        s // Invalid format, try parsing as is
+                    }
+                } else {
+                    // For IPv4 or IPv6 without brackets, take the part before the first colon.
+                    s.split(':').next().unwrap_or(s)
+                };
+                ip_str.parse::<IpAddr>().ok()
             })
             .collect()
     }
