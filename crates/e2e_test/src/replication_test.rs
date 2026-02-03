@@ -113,7 +113,10 @@ async fn test_replication_delete_marker() {
     }
     */
 
-    // 7. Check for replication status on the delete marker
+    // 7. Check for replication status on the delete marker (Source)
+    // Note: HeadObject on a delete marker returns 405, but might include headers.
+    // The AWS SDK might treat 405 as an error, making it hard to inspect headers easily without detailed error inspection.
+    // For now, we rely on checking the destination bucket (Step 8) as the primary verification.
     let mut attempts = 0;
     loop {
         let head_output = client
@@ -139,19 +142,44 @@ async fn test_replication_delete_marker() {
                 }
             }
             Err(e) => {
-                println!("HeadObject failed: {:?}", e);
+                println!("HeadObject failed (expected 405 for delete marker): {:?}", e);
+                // If it's a service error 405, we can consider ignoring it here and moving to step 8
             }
         }
 
         attempts += 1;
-        if attempts >= 5 {
+        if attempts >= 3 {
             println!(
-                "Warning: Could not verify replication status via HeadObject (likely due to 405). Assuming success if delete occurred."
+                "Warning: Could not verify replication status on source delete marker via HeadObject. Proceeding to check destination."
             );
             break;
         }
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(1000)).await;
     }
+
+    // 8. Verify delete marker replicated to destination bucket
+    println!("Checking destination bucket for replicated delete marker...");
+    let mut dest_replicated = false;
+    for _ in 0..30 {
+        // Wait up to 30 seconds for replication (it's async)
+        let versions = client
+            .list_object_versions()
+            .bucket(&dest_bucket_name)
+            .prefix(key)
+            .send()
+            .await
+            .unwrap();
+
+        let delete_markers = versions.delete_markers();
+        if delete_markers.iter().any(|dm| dm.key() == Some(key)) {
+            println!("Found delete marker in destination bucket!");
+            dest_replicated = true;
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    assert!(dest_replicated, "Delete marker was not replicated to the destination bucket");
 
     // Cleanup: delete created buckets and stop the server.
     let _ = env.delete_test_bucket(&bucket_name).await;
