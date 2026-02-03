@@ -17,6 +17,7 @@ members = [
     "rustfs", # Core file system implementation
     "crates/appauth", # Application authentication and authorization
     "crates/audit", # Audit target management system with multi-target fan-out
+    "crates/checksums", # client checksums
     "crates/common", # Shared utilities and data structures
     "crates/config", # Configuration management
     "crates/credentials", # Credential management system
@@ -24,26 +25,26 @@ members = [
     "crates/ecstore", # Erasure coding storage implementation
     "crates/e2e_test", # End-to-end test suite
     "crates/filemeta", # File metadata management
+    "crates/heal", # Erasure set and object healing
     "crates/iam", # Identity and Access Management
+    "crates/kms", # Key Management Service
     "crates/lock", # Distributed locking implementation
     "crates/madmin", # Management dashboard and admin API interface
+    "crates/mcp", # MCP server for S3 operations
     "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
     "crates/policy", # Policy management
     "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
-    "crates/targets", # Target-specific configurations and utilities
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
     "crates/scanner", # Scanner for data integrity checks and health monitoring
     "crates/signer", # client signer
-    "crates/checksums", # client checksums
+    "crates/targets", # Target-specific configurations and utilities
+    "crates/trusted-proxies", # Trusted proxies management
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
-    "crates/heal", # Erasure set and object healing
-    "crates/mcp", # MCP server for S3 operations
-    "crates/kms", # Key Management Service
 ]
 resolver = "2"
 
@@ -91,6 +92,7 @@ rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
 rustfs-s3select-query = { path = "crates/s3select-query", version = "0.0.5" }
 rustfs-scanner = { path = "crates/scanner", version = "0.0.5" }
 rustfs-signer = { path = "crates/signer", version = "0.0.5" }
+rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "0.0.5" }
 rustfs-targets = { path = "crates/targets", version = "0.0.5" }
 rustfs-utils = { path = "crates/utils", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
@@ -109,7 +111,7 @@ futures-util = "0.3.31"
 pollster = "0.4.0"
 hyper = { version = "1.8.1", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
-hyper-util = { version = "0.1.19", features = ["tokio", "server-auto", "server-graceful", "tracing"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "server-graceful", "tracing"] }
 http = "1.4.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
@@ -140,7 +142,7 @@ rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
-schemars = "1.2.0"
+schemars = "1.2.1"
 
 # Cryptography and Security
 aes-gcm = { version = "0.11.0-rc.2", features = ["rand_core"] }
@@ -175,15 +177,15 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.8.12" }
 aws-credential-types = { version = "1.2.11" }
 aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
-aws-smithy-types = { version = "1.4.1" }
+aws-smithy-types = { version = "1.4.3" }
 backtrace = "0.3.76"
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"
 cfg-if = "1.0.4"
 clap = { version = "4.5.56", features = ["derive", "env"] }
-const-str = { version = "1.0.0", features = ["std", "proc"] }
-convert_case = "0.10.0"
+const-str = { version = "1.1.0", features = ["std", "proc"] }
+convert_case = "0.11.0"
 criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
 datafusion = "52.1.0"
@@ -202,7 +204,7 @@ ipnetwork = { version = "0.21.1", features = ["serde"] }
 lazy_static = "1.5.0"
 libc = "0.2.180"
 libsystemd = "0.7.2"
-local-ip-address = "0.6.9"
+local-ip-address = "0.6.10"
 lz4 = "1.28.1"
 matchit = "0.9.1"
 md-5 = "0.11.0-rc.3"
@@ -227,7 +229,7 @@ rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.3", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", rev = "3cdb3fe22fe8a1b7fc3f71ead4beacac2683ba7f" }
+s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/rustfs/s3s.git", branch = "dependabot/cargo/dep-0202" }
 serial_test = "3.3.1"
 shadow-rs = { version = "1.7.0", default-features = false }
 siphasher = "1.0.2"
@@ -235,7 +237,7 @@ smallvec = { version = "1.15.1", features = ["serde"] }
 smartstring = "1.0.1"
 snafu = "0.8.9"
 snap = "1.1.1"
-starshard = { version = "0.6.0", features = ["rayon", "async", "serde"] }
+starshard = { version = "1.1.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.27.2", features = ["derive"] }
 sysinfo = "0.38.0"
 temp-env = "0.3.6"
