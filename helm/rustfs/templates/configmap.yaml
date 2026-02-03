@@ -5,20 +5,25 @@ metadata:
   labels:
     {{- toYaml .Values.commonLabels | nindent 4 }}
 data:
-  RUSTFS_ADDRESS: {{ .Values.config.rustfs.address | quote }}
-  RUSTFS_CONSOLE_ADDRESS: {{ .Values.config.rustfs.console_address | quote }}
-  RUSTFS_CONSOLE_ENABLE: {{ .Values.config.rustfs.console_enable | quote }}
-  RUSTFS_OBS_LOG_DIRECTORY: {{ .Values.config.rustfs.obs_log_directory | quote }}
-  RUSTFS_OBS_LOGGER_LEVEL: {{ .Values.config.rustfs.log_level | quote }}
-  RUSTFS_OBS_ENVIRONMENT: {{ .Values.config.rustfs.obs_environment | quote }}
-  {{- if .Values.config.rustfs.region }}
-  RUSTFS_REGION: {{ .Values.config.rustfs.region | quote }}
+  {{- with .Values.config }}
+  RUSTFS_ADDRESS: {{ .address | quote }}
+  RUSTFS_CONSOLE_ADDRESS: {{ .console_address | quote }}
+  RUSTFS_CONSOLE_ENABLE: {{ .console_enable | quote }}
+  RUSTFS_OBS_LOG_DIRECTORY: {{ .obs_log_directory | quote }}
+  RUSTFS_OBS_LOGGER_LEVEL: {{ .log_level | quote }}
+  RUSTFS_OBS_ENVIRONMENT: {{ .obs_environment | quote }}
+  RUSTFS_REGION: {{ .region | quote }}
+  {{- if .log_rotation }}
+  RUSTFS_OBS_LOG_ROTATION_SIZE_MB: {{ .log_rotation.size | quote }}
+  RUSTFS_OBS_LOG_ROTATION_TIME: {{ .log_rotation.time | quote }}
+  RUSTFS_OBS_LOG_KEEP_FILES: {{ .log_rotation.files_number | quote }}
+  {{- end }}
+  {{- if .domains }}
+  RUSTFS_SERVER_DOMAINS: {{ include "rustfs.serverDomains" . | quote }}
+  {{- end }}
   {{- end }}
   {{- if .Values.mode.distributed.enabled }}
-  RUSTFS_VOLUMES: {{ .Values.config.rustfs.volumes | default (include "rustfs.volumes" .) }}
+  RUSTFS_VOLUMES: {{ .Values.config.volumes | default (include "rustfs.volumes" .) }}
   {{- else }}
   RUSTFS_VOLUMES: "/data"
-  {{- end }}
-  {{- if .Values.config.rustfs.domains }}
-  RUSTFS_SERVER_DOMAINS: {{ include "rustfs.serverDomains" . | quote }}
   {{- end }}

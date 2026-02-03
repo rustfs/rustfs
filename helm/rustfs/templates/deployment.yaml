@@ -1,4 +1,4 @@
-{{- $logDir := .Values.config.rustfs.obs_log_directory }}
+{{- $logDir := .Values.config.obs_log_directory }}
 
 {{- if .Values.mode.standalone.enabled }}
 apiVersion: apps/v1

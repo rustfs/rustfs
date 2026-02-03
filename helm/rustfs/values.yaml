@@ -50,21 +50,25 @@ secret:
     secret_key: rustfsadmin
 
 config:
-  rustfs:
-    # Examples
-    # volumes: "/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3"
-    # volumes: "http://rustfs-{0...3}.rustfs-headless:9000/data/rustfs{0...3}"
-    volumes: ""
-    address: ":9000"
-    console_enable: "true"
-    console_address: ":9001"
-    log_level: "info"
-    region: "us-east-1"
-    obs_log_directory: "/logs"
-    obs_environment: "development"
-    # Optionally enable support for virtual-hosted-style requests.
-    # See more information: https://docs.rustfs.com/integration/virtual.html
-    domains: "" # e.g. "example.com"
+  # Examples
+  # volumes: "/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3"
+  # volumes: "http://rustfs-{0...3}.rustfs-headless:9000/data/rustfs{0...3}"
+  volumes: ""
+  address: ":9000"
+  console_enable: "true"
+  console_address: ":9001"
+  log_level: "info"
+  region: "us-east-1"
+  obs_log_directory: "/logs"
+  obs_environment: "development"
+  # Optionally enable support for virtual-hosted-style requests.
+  # See more information: https://docs.rustfs.com/integration/virtual.html
+  domains: "" # e.g. "example.com"
+  # Sepcify the log rotation settings, default value for rotation size is 100MB, time is hourly and the numbers of keep files is 30.
+  log_rotation: {}
+    # size: "100"
+    # time: "hour"
+    # files_number: "30"
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
