@@ -4669,7 +4669,17 @@ impl S3 for FS {
 
         let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
-            Err(_) => None,
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    None
+                } else {
+                    warn!("get_object_lock_config err {:?}", err);
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        "Failed to load Object Lock configuration".to_string(),
+                    ));
+                }
+            }
         };
 
         apply_lock_retention(object_lock_configuration, &mut metadata);
