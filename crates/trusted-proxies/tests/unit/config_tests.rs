@@ -12,15 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_config::{DEFAULT_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_PROXIES};
+use rustfs_config::{DEFAULT_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_VALIDATION_MODE};
 use rustfs_trusted_proxies::{ConfigLoader, TrustedProxy, TrustedProxyConfig, ValidationMode};
+use serial_test::serial;
 use std::net::IpAddr;
 
 #[test]
+#[serial]
 #[allow(unsafe_code)]
 fn test_config_loader_default() {
+    // Clean up environment variables that might be set by other tests
     unsafe {
         std::env::remove_var(ENV_TRUSTED_PROXY_PROXIES);
+        std::env::remove_var(ENV_TRUSTED_PROXY_VALIDATION_MODE);
+        std::env::remove_var("RUSTFS_TRUSTED_PROXY_MAX_HOPS");
     }
     let config = ConfigLoader::from_env_or_default();
     assert_eq!(config.server_addr.port(), 9000);
@@ -31,6 +36,7 @@ fn test_config_loader_default() {
 }
 
 #[test]
+#[serial]
 #[allow(unsafe_code)]
 fn test_config_loader_env_vars() {
     unsafe {

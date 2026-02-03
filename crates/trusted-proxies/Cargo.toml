@@ -45,6 +45,7 @@ regex = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tower = { workspace = true, features = ["util"] }
+serial_test = { workspace = true }
 
 [lints]
 workspace = true
