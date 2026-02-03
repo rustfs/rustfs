@@ -454,7 +454,7 @@ mod tests {
         Ok(())
     }
 
-    /// Test 6: PutObject should return "null" version_id when versioning is Suspended
+    /// Test 7: PutObject should return "null" version_id when versioning is Suspended
     #[tokio::test]
     #[serial]
     async fn test_put_object_returns_null_version_id_with_suspended_versioning() {

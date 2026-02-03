@@ -4860,9 +4860,7 @@ impl S3 for FS {
         let put_bucket = bucket.clone();
         let put_key = key.clone();
         let mut put_version = obj_info.version_id.map(|v| v.to_string());
-        if (put_version.is_none() || put_version.as_deref() == Some("00000000-0000-0000-0000-000000000000"))
-            && opts.version_suspended
-        {
+        if opts.version_suspended && obj_info.version_id.map_or(true, |v| v.is_nil()) {
             put_version = Some("null".to_string());
         }
 
