@@ -1587,7 +1587,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        match store.get_object_info(&bucket, &key, &get_opts).await {
+        let existing_obj_info = match store.get_object_info(&bucket, &key, &get_opts).await {
             Ok(obj_info) => {
                 // Check for bypass governance retention header (permission already verified in access.rs)
                 let bypass_governance = has_bypass_governance_header(&req.headers);
@@ -1595,17 +1595,41 @@ impl S3 for FS {
                 if let Some(block_reason) = check_object_lock_for_deletion(&bucket, &obj_info, bypass_governance).await {
                     return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
                 }
+                Some(obj_info)
             }
             Err(err) => {
                 // If object not found, allow deletion to proceed (will return 204 No Content)
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
                 }
+                None
+            }
+        };
+
+        if !replica {
+            let dobj = ObjectToDelete {
+                object_name: key.clone(),
+                version_id: if let Some(ref info) = existing_obj_info {
+                     info.version_id
+                } else {
+                     None
+                },
+                ..Default::default()
+            };
+            let zero_info = ObjectInfo::default();
+            let info = existing_obj_info.as_ref().unwrap_or(&zero_info);
+
+            let decision = check_replicate_delete(&bucket, &dobj, info, &opts, None).await;
+            if decision.replicate_any() {
+                let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
+                opts.user_defined.insert(k, jiff::Zoned::now().to_string());
+                let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
+                opts.user_defined.insert(k, decision.pending_status().unwrap_or_default());
             }
         }
 
         let obj_info = {
-            match store.delete_object(&bucket, &key, opts).await {
+            match store.delete_object(&bucket, &key, opts.clone()).await {
                 Ok(obj) => obj,
                 Err(err) => {
                     if is_err_bucket_not_found(&err) {
@@ -1642,6 +1666,7 @@ impl S3 for FS {
         }
 
         if obj_info.replication_status == ReplicationStatusType::Replica
+            || obj_info.replication_status == ReplicationStatusType::Pending
             || obj_info.version_purge_status == VersionPurgeStatusType::Pending
         {
             schedule_replication_delete(DeletedObjectReplicationInfo {
@@ -1678,10 +1703,18 @@ impl S3 for FS {
 
         helper = helper.event_name(event_name);
         helper = helper
-            .object(obj_info)
+            .object(obj_info.clone())
             .version_id(version_id.map(|v| v.to_string()).unwrap_or_default());
 
-        let result = Ok(S3Response::new(output));
+        let mut res = S3Response::new(output);
+        if obj_info.replication_status != ReplicationStatusType::Empty {
+            res.headers.insert(
+                AMZ_BUCKET_REPLICATION_STATUS,
+                obj_info.replication_status.to_string().parse().unwrap(),
+            );
+        }
+
+        let result = Ok(res);
         let _ = helper.complete(&result);
         result
     }

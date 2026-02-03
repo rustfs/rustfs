@@ -29,6 +29,9 @@ mod data_usage_test;
 #[cfg(test)]
 mod kms;
 
+#[cfg(test)]
+mod replication_test;
+
 // Quota tests
 #[cfg(test)]
 mod quota_test;
