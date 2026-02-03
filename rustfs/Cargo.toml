@@ -59,6 +59,7 @@ rustfs-rio.workspace = true
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-trusted-proxies = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
 rustfs-scanner = { workspace = true }
@@ -141,8 +142,7 @@ libsystemd.workspace = true
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
 
-# Note: If you want to *explicitly* exclude Windows from a target dependency set,
-# you can use a cfg like the following instead:
+# Only enable pprof-based profiling on non-Windows targets.
 [target.'cfg(all(not(target_os = "windows"), not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))'.dependencies]
 starshard = { workspace = true }
 backtrace = { workspace = true }
