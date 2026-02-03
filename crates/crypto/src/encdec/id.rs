@@ -40,11 +40,18 @@ impl ID {
     pub(crate) fn get_key(&self, password: &[u8], salt: &[u8]) -> Result<[u8; 32], crate::Error> {
         let mut key = [0u8; 32];
         match self {
-            ID::Pbkdf2AESGCM => pbkdf2_hmac::<Sha256>(password, salt, 8192, &mut key),
-            _ => {
-                let params = Params::new(64 * 1024, 1, 4, Some(32))?;
-                let argon_2id = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-                argon_2id.hash_password_into(password, salt, &mut key)?;
+            ID::Pbkdf2AESGCM => {
+                pbkdf2_hmac::<Sha256>(password, salt, 8192, &mut key);
+            }
+            ID::Argon2idAESGCM | ID::Argon2idChaCHa20Poly1305 => {
+                const ARGON2_MEMORY: u32 = 64 * 1024;
+                const ARGON2_ITERATIONS: u32 = 1;
+                const ARGON2_PARALLELISM: u32 = 4;
+                const ARGON2_OUTPUT_LEN: usize = 32;
+
+                let params = Params::new(ARGON2_MEMORY, ARGON2_ITERATIONS, ARGON2_PARALLELISM, Some(ARGON2_OUTPUT_LEN))?;
+                let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+                argon2.hash_password_into(password, salt, &mut key)?;
             }
         }
 

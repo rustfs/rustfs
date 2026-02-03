@@ -28,6 +28,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 
+type AllocatorShardedMap = ShardedHashMap<usize, (usize, Arc<Vec<usize>>)>;
+type LazyAllocatorShardedMap = LazyLock<AllocatorShardedMap>;
+
+type AllocatorSampleHashMap = HashMap<*const Vec<usize>, (i64, i64, Arc<Vec<usize>>)>;
 /// A wrapper around a GlobalAlloc that samples allocations and records stack traces.
 pub struct TracingAllocator<A: GlobalAlloc> {
     inner: A,
@@ -45,7 +49,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 // Global storage for profile data
 // Map: Address (usize) -> (Size (usize), StackTrace (Arc<Vec<usize>>))
 // We store the Arc to keep the stack trace alive as long as the allocation is live.
-static LIVE_ALLOCATIONS: LazyLock<ShardedHashMap<usize, (usize, Arc<Vec<usize>>)>> = LazyLock::new(|| ShardedHashMap::new(64));
+static LIVE_ALLOCATIONS: LazyAllocatorShardedMap = LazyLock::new(|| ShardedHashMap::new(64));
 
 // Cache for deduplicating stack traces.
 // Map: StackHash (u64) -> Weak<Vec<usize>>
@@ -216,7 +220,7 @@ fn dump_profile_inner(path: &Path) -> Result<(), String> {
     // Collect samples
     // Aggregate by Stack Trace Pointer (deduplication via Arc pointer)
     // Map: Arc pointer -> (Count, Bytes, Arc<Vec<usize>>)
-    let mut aggregated_samples: HashMap<*const Vec<usize>, (i64, i64, Arc<Vec<usize>>)> = HashMap::new();
+    let mut aggregated_samples: AllocatorSampleHashMap = HashMap::new();
 
     // Step 1: Collect data from LIVE_ALLOCATIONS while holding the lock (implicitly via iter)
     // We do NOT perform symbol resolution here to avoid deadlocks.
@@ -233,8 +237,10 @@ fn dump_profile_inner(path: &Path) -> Result<(), String> {
 
     // Step 2: Process samples and resolve symbols (outside of LIVE_ALLOCATIONS lock)
     for (_key, (count, bytes, frames)) in aggregated_samples {
-        let mut sample = pb::Sample::default();
-        sample.value = vec![count, bytes];
+        let mut sample = pb::Sample {
+            value: vec![count, bytes],
+            ..Default::default()
+        };
 
         // Process frames
         for &addr in frames.iter() {
