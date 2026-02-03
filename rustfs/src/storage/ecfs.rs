@@ -23,8 +23,8 @@ use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_ha
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::sse::{
-    DecryptionRequest, EncryptionRequest, check_encryption_metadata, PrepareEncryptionRequest, sse_prepare_encryption, sse_decryption,
-    sse_encryption, strip_managed_encryption_metadata,
+    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
+    sse_prepare_encryption, strip_managed_encryption_metadata,
 };
 use crate::storage::{
     access::{ReqInfo, authorize_request, has_bypass_governance_header},
@@ -35,10 +35,10 @@ use crate::storage::{
     },
 };
 use crate::storage::{
-    check_preconditions, get_buffer_size_opt_in, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
-    parse_object_lock_retention, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter, validate_object_key,
-    wrap_response_with_cors, apply_lock_retention,
+    apply_lock_retention, check_preconditions, get_buffer_size_opt_in, get_validated_store, has_replication_rules,
+    parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations, process_queue_configurations,
+    process_topic_configurations, validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
+    validate_object_key, wrap_response_with_cors,
 };
 use crate::storage::{entity, parse_part_number_i32_to_usize};
 // base64 imports moved to sse module
@@ -1208,7 +1208,6 @@ impl S3 for FS {
             }
             None => (None, None),
         };
-
 
         if is_compressible(&req.headers, &key) {
             metadata.insert(

@@ -14,11 +14,11 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::sse::SseDekProvider;
+    use crate::storage::sse::TestSseDekProvider;
     use rustfs_rio::{DecryptReader, EncryptReader, WarpReader};
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
-    use crate::storage::sse::TestSseDekProvider;
-    use crate::storage::sse::SseDekProvider;
 
     /// Test EncryptReader encryption and DecryptReader decryption integration without KMS
     /// This test verifies the complete encryption/decryption flow:
@@ -90,10 +90,7 @@ mod tests {
         println!("Decrypted length: {} bytes", decrypted_data.len());
 
         // Step 6: Verify decrypted data matches original plaintext
-        assert_eq!(
-            decrypted_data, plaintext,
-            "Decrypted data should match original plaintext"
-        );
+        assert_eq!(decrypted_data, plaintext, "Decrypted data should match original plaintext");
 
         println!("✅ EncryptReader/DecryptReader integration test passed!");
     }
@@ -141,15 +138,8 @@ mod tests {
             .expect("Failed to decrypt large data");
 
         // Verify
-        assert_eq!(
-            decrypted_data.len(),
-            plaintext.len(),
-            "Decrypted size should match original"
-        );
-        assert_eq!(
-            decrypted_data, plaintext,
-            "Decrypted data should match original plaintext"
-        );
+        assert_eq!(decrypted_data.len(), plaintext.len(), "Decrypted size should match original");
+        assert_eq!(decrypted_data, plaintext, "Decrypted data should match original plaintext");
 
         println!("✅ Large data encryption/decryption test passed!");
     }
@@ -176,10 +166,7 @@ mod tests {
             .expect("Failed to generate DEK 2");
 
         // Verify nonces are different
-        assert_ne!(
-            data_key1.nonce, data_key2.nonce,
-            "Different keys should have different nonces"
-        );
+        assert_ne!(data_key1.nonce, data_key2.nonce, "Different keys should have different nonces");
 
         // Same plaintext
         let plaintext = b"Same plaintext";
@@ -256,10 +243,7 @@ mod tests {
         decrypt_reader.read_to_end(&mut decrypted_data).await.unwrap();
 
         // Step 5: Verify
-        assert_eq!(
-            decrypted_data, plaintext,
-            "Data decrypted with recovered key should match original"
-        );
+        assert_eq!(decrypted_data, plaintext, "Data decrypted with recovered key should match original");
 
         println!("✅ Full cycle (generate -> encrypt DEK -> decrypt DEK -> decrypt data) test passed!");
     }

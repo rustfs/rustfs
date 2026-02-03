@@ -564,7 +564,7 @@ pub struct PrepareEncryptionRequest<'a> {
     /// SSE-C key MD5 (Base64-encoded)
     pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
 }
- 
+
 pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
     let sse_type = prepare_sse_configuration_v2(
         request.bucket,
@@ -578,36 +578,13 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
 
     // apply encryption material
     let material = match sse_type {
-        Some(SseTypeV2::SseS3(sse)) => 
-            apply_managed_encryption_material(
-                request.bucket, 
-                request.key, 
-                sse, 
-                None, 
-                0, 
-                None, 
-                None, 
-                None
-            ).await?
-            ,
-        Some(SseTypeV2::SseKms(sse, kms_key_id)) => 
-            apply_managed_encryption_material(
-                request.bucket, 
-                request.key, 
-                sse, 
-                kms_key_id, 
-                0, 
-                None, 
-                None, 
-                None
-            ).await?
-            ,
-        Some(SseTypeV2::SseC(algorithm, _, key_md5)) => 
-            apply_ssec_prepare_encryption_material(
-                algorithm, 
-                key_md5, 
-            ).await?
-            ,
+        Some(SseTypeV2::SseS3(sse)) => {
+            apply_managed_encryption_material(request.bucket, request.key, sse, None, 0, None, None, None).await?
+        }
+        Some(SseTypeV2::SseKms(sse, kms_key_id)) => {
+            apply_managed_encryption_material(request.bucket, request.key, sse, kms_key_id, 0, None, None, None).await?
+        }
+        Some(SseTypeV2::SseC(algorithm, _, key_md5)) => apply_ssec_prepare_encryption_material(algorithm, key_md5).await?,
         None => return Ok(None),
     };
 
@@ -693,7 +670,6 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
 // ============================================================================
 // Internal Implementation - SSE-C
 // ============================================================================
-
 
 async fn apply_ssec_prepare_encryption_material(
     algorithm: SSECustomerAlgorithm,
@@ -869,7 +845,8 @@ async fn apply_managed_encryption_material(
     let (data_key, encrypted_data_key) = if let Some(part_number) = part_number
         && let Some(part_nonce) = part_nonce
         && let Some(part_key) = part_key
-        && part_number >= 1 // upload_part mode, dek generate by create_multipart_upload
+        && part_number >= 1
+    // upload_part mode, dek generate by create_multipart_upload
     {
         let _base_nonce = BASE64_STANDARD
             .decode(part_nonce.as_bytes())
@@ -1447,7 +1424,6 @@ pub(crate) async fn decrypt_multipart_managed_stream(
 
     Ok((reader, total_plain_size))
 }
-
 
 // ============================================================================
 // SSE-C Functions

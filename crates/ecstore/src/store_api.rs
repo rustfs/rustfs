@@ -720,7 +720,9 @@ impl ObjectInfo {
         if let Some(size_str) = self.user_defined.get("x-rustfs-encryption-original-size")
             && !size_str.is_empty()
         {
-            let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(format!("Failed to parse encryption original size: {e}")))?;
+            let size = size_str
+                .parse::<i64>()
+                .map_err(|e| std::io::Error::other(format!("Failed to parse encryption original size: {e}")))?;
             return Ok(size);
         }
 
