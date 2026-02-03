@@ -34,32 +34,32 @@ use crate::client::{
 };
 use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
 use futures::{Future, StreamExt};
-use http::{HeaderMap, HeaderName};
 use http::{
-    HeaderValue, Response, StatusCode,
-    request::{Builder, Request},
+    request::{Builder, Request}, HeaderValue, Response,
+    StatusCode,
 };
+use http::{HeaderMap, HeaderName};
 use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use hyper::body::Incoming;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
-use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector, rt::TokioExecutor};
+use hyper_util::{client::legacy::connect::HttpConnector, client::legacy::Client, rt::TokioExecutor};
 use md5::Digest;
 use md5::Md5;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
     net::get_endpoint_url,
     retry::{
-        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
+        is_http_status_retryable, is_s3code_retryable, RetryTimer, DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY,
     },
 };
-use s3s::S3ErrorCode;
 use s3s::dto::Owner;
 use s3s::dto::ReplicationStatus;
+use s3s::S3ErrorCode;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::Cursor;
@@ -74,7 +74,7 @@ use time::Duration;
 use time::OffsetDateTime;
 use tokio::io::BufReader;
 use tracing::{debug, error, warn};
-use url::{Url, form_urlencoded};
+use url::{form_urlencoded, Url};
 use uuid::Uuid;
 
 const C_USER_AGENT: &str = "RustFS (linux; x86)";

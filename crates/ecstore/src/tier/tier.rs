@@ -21,10 +21,10 @@
 use bytes::Bytes;
 use http::status::StatusCode;
 use lazy_static::lazy_static;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{hash_map::Entry, HashMap},
     io::Cursor,
     sync::Arc,
     time::Duration,
@@ -44,14 +44,14 @@ use crate::tier::{
     warm_backend::{check_warm_backend, new_warm_backend},
 };
 use crate::{
-    StorageAPI,
-    config::com::{CONFIG_PREFIX, read_config},
+    config::com::{read_config, CONFIG_PREFIX},
     disk::RUSTFS_META_BUCKET,
     store::ECStore,
     store_api::{ObjectOptions, PutObjReader},
+    StorageAPI,
 };
 use rustfs_rio::HashReader;
-use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
+use rustfs_utils::path::{path_join, SLASH_SEPARATOR};
 use s3s::S3ErrorCode;
 
 use super::{

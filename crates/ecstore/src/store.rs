@@ -28,19 +28,19 @@ use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
-use crate::config::GLOBAL_STORAGE_CLASS;
 use crate::config::storageclass;
+use crate::config::GLOBAL_STORAGE_CLASS;
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
-use crate::error::{Error, Result};
 use crate::error::{
-    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
-    is_err_read_quorum, is_err_version_not_found, to_object_err,
+    is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found, is_err_read_quorum,
+    is_err_version_not_found, to_object_err, StorageError,
 };
+use crate::error::{Error, Result};
 use crate::global::{
-    DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, get_global_deployment_id, get_global_endpoints,
-    is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer,
+    get_global_deployment_id, get_global_endpoints, is_dist_erasure, is_erasure_sd, set_global_deployment_id,
+    set_object_layer, GLOBAL_TierConfigMgr, DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES,
+    DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -52,7 +52,7 @@ use crate::store_api::{
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
-    disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
+    disk::{new_disk, DiskOption, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     endpoints::EndpointServerPools,
     rpc::S3PeerSys,
     sets::Sets,
@@ -66,7 +66,7 @@ use crate::{
 use futures::future::join_all;
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use rand::Rng as _;
+use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;

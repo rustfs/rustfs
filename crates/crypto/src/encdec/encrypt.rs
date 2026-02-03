@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
 #[cfg(any(test, feature = "crypto"))]
 pub fn encrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Error> {
     use crate::encdec::id::ID;
@@ -58,7 +59,7 @@ fn encrypt<T: aes_gcm::aead::Aead>(
     use crate::error::Error;
     use aes_gcm::AeadCore;
     use aes_gcm::aead::array::Array;
-    use rand::RngCore;
+    use rand::Rng;
 
     let mut nonce: Array<u8, <T as AeadCore>::NonceSize> = Array::default();
     rand::rng().fill_bytes(&mut nonce);

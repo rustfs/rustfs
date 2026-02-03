@@ -19,16 +19,16 @@ use crate::{
     store_api::StorageAPI,
 };
 pub use local_snapshot::{
-    DATA_USAGE_DIR, DATA_USAGE_STATE_DIR, LOCAL_USAGE_SNAPSHOT_VERSION, LocalUsageSnapshot, LocalUsageSnapshotMeta,
     data_usage_dir, data_usage_state_dir, ensure_data_usage_layout, read_snapshot as read_local_snapshot, snapshot_file_name,
-    snapshot_object_path, snapshot_path, write_snapshot as write_local_snapshot,
+    snapshot_object_path, snapshot_path, write_snapshot as write_local_snapshot, LocalUsageSnapshot, LocalUsageSnapshotMeta,
+    DATA_USAGE_DIR, DATA_USAGE_STATE_DIR, LOCAL_USAGE_SNAPSHOT_VERSION,
 };
 use rustfs_common::data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{hash_map::Entry, HashMap, HashSet},
     sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
 };
@@ -620,7 +620,7 @@ pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str
     use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
     use crate::store_api::{ObjectIO, ObjectOptions};
     use http::HeaderMap;
-    use rand::Rng;
+    use rand::RngExt;
     use std::path::Path;
     use std::time::Duration;
     use tokio::time::sleep;
