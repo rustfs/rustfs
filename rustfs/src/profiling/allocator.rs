@@ -47,6 +47,7 @@ static SAMPLE_RATE: AtomicUsize = AtomicUsize::new(512 * 1024); // Default: samp
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 // Global storage for profile data
+
 // Map: Address (usize) -> (Size (usize), StackTrace (Arc<Vec<usize>>))
 // We store the Arc to keep the stack trace alive as long as the allocation is live.
 static LIVE_ALLOCATIONS: LazyAllocatorShardedMap = LazyLock::new(|| ShardedHashMap::new(64));

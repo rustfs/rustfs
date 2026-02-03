@@ -1611,9 +1611,9 @@ impl S3 for FS {
             let dobj = ObjectToDelete {
                 object_name: key.clone(),
                 version_id: if let Some(ref info) = existing_obj_info {
-                     info.version_id
+                    info.version_id
                 } else {
-                     None
+                    None
                 },
                 ..Default::default()
             };
@@ -1709,10 +1709,8 @@ impl S3 for FS {
 
         let mut res = S3Response::new(output);
         if obj_info.replication_status != ReplicationStatusType::Empty {
-            res.headers.insert(
-                AMZ_BUCKET_REPLICATION_STATUS,
-                obj_info.replication_status.to_string().parse().unwrap(),
-            );
+            res.headers
+                .insert(AMZ_BUCKET_REPLICATION_STATUS, obj_info.replication_status.to_string().parse().unwrap());
         }
 
         let result = Ok(res);
