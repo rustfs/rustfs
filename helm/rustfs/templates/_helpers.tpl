@@ -116,7 +116,7 @@ Render RUSTFS_SERVER_DOMAINS
 */}}
 
 {{- define "rustfs.serverDomains" -}}
-{{- $domains := list .Values.config.rustfs.domains -}}
+{{- $domains := list .Values.config.domains -}}
 {{- $fullname := include "rustfs.fullname" . -}}
 {{- $replicaCount := int .Values.replicaCount -}}
 {{- $servicePort := .Values.service.endpoint.port | default 9000 -}}

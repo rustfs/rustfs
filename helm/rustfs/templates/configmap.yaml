@@ -12,14 +12,22 @@ data:
   RUSTFS_OBS_LOG_DIRECTORY: {{ .obs_log_directory | quote }}
   RUSTFS_OBS_LOGGER_LEVEL: {{ .log_level | quote }}
   RUSTFS_OBS_ENVIRONMENT: {{ .obs_environment | quote }}
+  {{- if .region }}
   RUSTFS_REGION: {{ .region | quote }}
-  {{- if .log_rotation }}
-  RUSTFS_OBS_LOG_ROTATION_SIZE_MB: {{ .log_rotation.size | quote }}
-  RUSTFS_OBS_LOG_ROTATION_TIME: {{ .log_rotation.time | quote }}
-  RUSTFS_OBS_LOG_KEEP_FILES: {{ .log_rotation.files_number | quote }}
+  {{- end }}
+  {{- with .log_rotation }}
+    {{- if .size }}
+  RUSTFS_OBS_LOG_ROTATION_SIZE_MB: {{ .size | quote }}
+    {{- end }}
+    {{- if .time }}
+  RUSTFS_OBS_LOG_ROTATION_TIME: {{ .time | quote }}
+    {{- end }}
+    {{- if .keep_files }}
+  RUSTFS_OBS_LOG_KEEP_FILES: {{ .keep_files | quote }}
+    {{- end }}
   {{- end }}
   {{- if .domains }}
-  RUSTFS_SERVER_DOMAINS: {{ include "rustfs.serverDomains" . | quote }}
+  RUSTFS_SERVER_DOMAINS: {{ include "rustfs.serverDomains" $ | quote }}
   {{- end }}
   {{- end }}
   {{- if .Values.mode.distributed.enabled }}

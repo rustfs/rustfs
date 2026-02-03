@@ -65,10 +65,10 @@ config:
   # See more information: https://docs.rustfs.com/integration/virtual.html
   domains: "" # e.g. "example.com"
   # Specify the log rotation settings, default value for rotation size is 100MB, time is hourly and the numbers of keep files is 30.
-  log_rotation: {}
+  log_rotation:
     # size: "100"
     # time: "hour"
-    # files_number: "30"
+    # keep_files: "30"
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
