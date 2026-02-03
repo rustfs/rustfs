@@ -4932,7 +4932,7 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        // fix response for POST Policy (multipart/form-data) ，wait s3s crate update,fix issue #1564 ,see s3s #467
+        // Fix response for POST Policy (multipart/form-data), waiting for s3s crate update, fix issue #1564, see s3s #467
         // If it is a POST Policy(multipart/form-data) path, the PutObjectInput carries the success_action_* field
         // Here, the response is uniformly rewritten, with the default being 204, redirect prioritizing 303, and status supporting 200/201/204
         if input.success_action_status.is_some() || input.success_action_redirect.is_some() {
