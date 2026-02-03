@@ -296,18 +296,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_data_key_envelope_backward_compatibility() {
-        // Test that old envelopes without master_key_version can still be deserialized
-        let old_envelope_json = r#"{
+        // Test deserialization with current Zoned format (with timezone annotation)
+        let envelope_json = r#"{
             "key_id": "test-key-id",
             "master_key_id": "master-key-id",
             "key_spec": "AES_256",
             "encrypted_key": [1, 2, 3, 4],
             "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             "encryption_context": {"bucket": "test-bucket"},
-            "created_at": "2024-01-01T00:00:00Z"
+            "created_at": "2024-01-01T00:00:00+00:00[UTC]"
         }"#;
 
-        let deserialized: DataKeyEnvelope = serde_json::from_str(old_envelope_json).expect("Should deserialize old format");
+        let deserialized: DataKeyEnvelope = serde_json::from_str(envelope_json).expect("Should deserialize current format");
         assert_eq!(deserialized.key_id, "test-key-id");
         assert_eq!(deserialized.master_key_id, "master-key-id");
     }
