@@ -23,6 +23,7 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
+use rustfs_ecstore::bucket::object_lock::objectlock_sys;
 use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::store_api::{BucketOptions, ObjectInfo, ObjectToDelete};
@@ -34,8 +35,9 @@ use rustfs_utils::http::{
     RESERVED_METADATA_PREFIX_LOWER,
 };
 use s3s::dto::{
-    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockEnabled, ObjectLockLegalHold,
-    ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
+    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
+    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration,
+    ServerSideEncryption, TopicConfiguration,
 };
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 use serde_urlencoded::from_bytes;
@@ -49,6 +51,45 @@ use tracing::{debug, warn};
 
 pub const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
+
+/// Apply bucket default Object Lock retention to object metadata if no explicit retention is set.
+///
+/// This function implements S3-compatible behavior where objects uploaded to a bucket with
+/// default retention configuration automatically inherit the bucket's default retention policy.
+/// The retention is only applied if:
+/// 1. The bucket has Object Lock enabled
+/// 2. The bucket has a default retention rule configured
+/// 3. The object metadata does not already contain explicit retention headers
+///
+/// # Arguments
+/// * `object_lock_config` - Optional bucket Object Lock configuration. If None, no retention is applied.
+/// * `metadata` - Mutable reference to object metadata HashMap. Retention headers are inserted here.
+pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
+    if metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER) || metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER) {
+        return;
+    }
+
+    let Some(config) = object_lock_config else { return };
+
+    if config.object_lock_enabled.as_ref().map(|e| e.as_str()) != Some(ObjectLockEnabled::ENABLED) {
+        return;
+    }
+
+    let Some(default_retention) = config.rule.and_then(|r| r.default_retention) else { return };
+    let Some(mode) = default_retention.mode else { return };
+
+    let now = OffsetDateTime::now_utc();
+    let retain_until = match (default_retention.days, default_retention.years) {
+        (Some(days), _) => now.saturating_add(time::Duration::days(days as i64)),
+        (None, Some(years)) => objectlock_sys::add_years(now, years),
+        _ => return,
+    };
+
+    if let Ok(date_str) = retain_until.format(&Rfc3339) {
+        metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode.as_str().to_string());
+        metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), date_str);
+    }
+}
 
 /// =======================
 /// Presigned POST helpers

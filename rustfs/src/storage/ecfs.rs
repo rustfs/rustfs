@@ -4458,6 +4458,23 @@ impl S3 for FS {
 
         let mut metadata = metadata.unwrap_or_default();
 
+        let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
+            Ok((cfg, _created)) => Some(cfg),
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    None
+                } else {
+                    warn!("get_object_lock_config err {:?}", err);
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        "Failed to load Object Lock configuration".to_string(),
+                    ));
+                }
+            }
+        };
+
+        apply_lock_retention(object_lock_configuration, &mut metadata);
+
         if let Some(content_type) = content_type {
             metadata.insert("content-type".to_string(), content_type.to_string());
         }
