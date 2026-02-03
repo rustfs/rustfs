@@ -26,9 +26,9 @@ pub use local_snapshot::{
 use rustfs_common::data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
-use rustfs_utils::path::SLASH_SEPARATOR_STR;
+use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
 };
@@ -37,7 +37,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 // Data usage storage constants
-pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR_STR;
+pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
@@ -61,17 +61,17 @@ fn cache_updating() -> &'static CacheUpdating {
 lazy_static::lazy_static! {
     pub static ref DATA_USAGE_BUCKET: String = format!("{}{}{}",
         crate::disk::RUSTFS_META_BUCKET,
-        SLASH_SEPARATOR_STR,
+        SLASH_SEPARATOR,
         crate::disk::BUCKET_META_PREFIX
     );
     pub static ref DATA_USAGE_OBJ_NAME_PATH: String = format!("{}{}{}",
         crate::disk::BUCKET_META_PREFIX,
-        SLASH_SEPARATOR_STR,
+        SLASH_SEPARATOR,
         DATA_USAGE_OBJ_NAME
     );
     pub static ref DATA_USAGE_BLOOM_NAME_PATH: String = format!("{}{}{}",
         crate::disk::BUCKET_META_PREFIX,
-        SLASH_SEPARATOR_STR,
+        SLASH_SEPARATOR,
         DATA_USAGE_BLOOM_NAME
     );
 }
@@ -223,6 +223,7 @@ pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskU
     let mut aggregated = DataUsageInfo::default();
     let mut latest_update: Option<SystemTime> = None;
     let mut statuses: Vec<DiskUsageStatus> = Vec::new();
+    let mut processed_disks: HashSet<String> = HashSet::new();
 
     for (pool_idx, pool) in store.pools.iter().enumerate() {
         for set_disks in pool.disk_set.iter() {
@@ -246,6 +247,13 @@ pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskU
                 };
 
                 let root = disk.path();
+                let disk_key = format!("{}|{}", disk.endpoint(), root.display());
+
+                // Skip if we've already processed this physical disk
+                if !processed_disks.insert(disk_key.clone()) {
+                    continue;
+                }
+
                 let mut status = DiskUsageStatus {
                     disk_id: disk_id.clone(),
                     pool_index: Some(pool_idx),

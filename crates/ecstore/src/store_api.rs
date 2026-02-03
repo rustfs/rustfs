@@ -31,7 +31,7 @@ use rustfs_filemeta::{
     ReplicationStatusType, RestoreStatusOps as _, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
     version_purge_statuses_map,
 };
-use rustfs_lock::FastLockGuard;
+use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
@@ -807,12 +807,11 @@ impl ObjectInfo {
 
         let mut restore_ongoing = false;
         let mut restore_expires = None;
-        if let Some(restore_status) = fi.metadata.get(AMZ_RESTORE).cloned() {
-            //
-            if let Ok(restore_status) = parse_restore_obj_status(&restore_status) {
-                restore_ongoing = restore_status.on_going();
-                restore_expires = restore_status.expiry();
-            }
+        if let Some(restore_status) = fi.metadata.get(AMZ_RESTORE).cloned()
+            && let Ok(restore_status) = parse_restore_obj_status(&restore_status)
+        {
+            restore_ongoing = restore_status.on_going();
+            restore_expires = restore_status.expiry();
         }
 
         // Convert parts from rustfs_filemeta::ObjectPartInfo to store_api::ObjectPartInfo
@@ -1349,10 +1348,7 @@ pub trait ObjectIO: Send + Sync + Debug + 'static {
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait StorageAPI: ObjectIO + Debug {
-    // NewNSLock TODO:
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard>;
-    // Shutdown TODO:
-    // NSScanner TODO:
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper>;
 
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo;
     async fn storage_info(&self) -> rustfs_madmin::StorageInfo;

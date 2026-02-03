@@ -25,7 +25,7 @@ use crate::{
     },
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
-    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
+    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
@@ -42,7 +42,8 @@ use rustfs_common::{
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
-use rustfs_lock::FastLockGuard;
+use rustfs_lock::NamespaceLockWrapper;
+use rustfs_lock::client::LockClient;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use std::{collections::HashMap, sync::Arc};
@@ -91,35 +92,30 @@ impl Sets {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
-        let mut unique: Vec<Vec<String>> = (0..set_count).map(|_| vec![]).collect();
-
-        for (idx, endpoint) in endpoints.endpoints.as_ref().iter().enumerate() {
-            let set_idx = idx / set_drive_count;
-            if endpoint.is_local && !unique[set_idx].contains(&"local".to_string()) {
-                unique[set_idx].push("local".to_string());
-            }
-
-            if !endpoint.is_local {
-                let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap());
-                if !unique[set_idx].contains(&host_port) {
-                    unique[set_idx].push(host_port);
-                }
-            }
-        }
-
         let mut disk_set = Vec::with_capacity(set_count);
 
-        // Create fast lock manager for high performance
-        let fast_lock_manager = Arc::new(rustfs_lock::FastObjectLockManager::new());
+        // Get lock clients from global storage
+        let lock_clients = get_global_lock_clients();
 
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
+            let mut set_lock_clients: HashMap<String, Arc<dyn LockClient>> = HashMap::new();
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
                 let mut disk = disks[idx].clone();
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
+
+                if let Some(lock_clients_map) = lock_clients {
+                    let host_port = endpoint.host_port();
+                    if let Some(lock_client) = lock_clients_map.get(&host_port)
+                        && !set_lock_clients.contains_key(&host_port)
+                    {
+                        set_lock_clients.insert(host_port, lock_client.clone());
+                    }
+                }
+
                 set_endpoints.push(endpoint);
 
                 if disk.is_none() {
@@ -163,11 +159,8 @@ impl Sets {
                 }
             }
 
-            // Note: write_quorum was used for the old lock system, no longer needed with FastLock
-            let _write_quorum = set_drive_count - parity_count;
-
+            let lockers = set_lock_clients.values().cloned().collect::<Vec<Arc<dyn LockClient>>>();
             let set_disks = SetDisks::new(
-                fast_lock_manager.clone(),
                 GLOBAL_LOCAL_NODE_NAME.read().await.to_string(),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
@@ -176,6 +169,7 @@ impl Sets {
                 pool_idx,
                 set_endpoints,
                 fm.clone(),
+                lockers,
             )
             .await;
 
@@ -365,7 +359,7 @@ impl ObjectIO for Sets {
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
     #[tracing::instrument(skip(self))]
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<FastLockGuard> {
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.disk_set[0].new_ns_lock(bucket, object).await
     }
     #[tracing::instrument(skip(self))]

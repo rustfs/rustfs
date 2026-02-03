@@ -44,7 +44,7 @@ use rustfs_ecstore::pools::{path2_bucket_object, path2_bucket_object_with_base_p
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicationStatusType};
-use rustfs_utils::path::{SLASH_SEPARATOR_STR, path_join_buf};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use tokio::select;
 use tokio::sync::mpsc;
@@ -110,7 +110,7 @@ impl ScannerItem {
     /// This converts a directory path like "bucket/dir1/dir2/file" to prefix="bucket/dir1/dir2" and object_name="file"
     pub fn transform_meta_dir(&mut self) {
         let prefix = self.prefix.clone(); // Clone to avoid borrow checker issues
-        let split: Vec<&str> = prefix.split(SLASH_SEPARATOR_STR).collect();
+        let split: Vec<&str> = prefix.split(SLASH_SEPARATOR).collect();
 
         if split.len() > 1 {
             let prefix_parts: Vec<&str> = split[..split.len() - 1].to_vec();

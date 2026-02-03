@@ -39,7 +39,7 @@ workspace = true
 
 [dependencies]
 # RustFS Internal Crates
-rustfs-ahm = { workspace = true }
+rustfs-heal = { workspace = true }
 rustfs-appauth = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
@@ -59,6 +59,7 @@ rustfs-rio.workspace = true
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-trusted-proxies = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
 rustfs-scanner = { workspace = true }
@@ -96,9 +97,6 @@ serde_urlencoded = { workspace = true }
 rustls = { workspace = true }
 subtle = { workspace = true }
 rustls-pemfile = { workspace = true }
-
-# Time and Date
-chrono = { workspace = true }
 jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 
@@ -144,6 +142,13 @@ libsystemd.workspace = true
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
 
+# Only enable pprof-based profiling on non-Windows targets.
+[target.'cfg(all(not(target_os = "windows"), not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))'.dependencies]
+starshard = { workspace = true }
+backtrace = { workspace = true }
+rand = { workspace = true }
+pprof = { workspace = true }
+
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
@@ -153,6 +158,7 @@ pprof = { workspace = true }
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
+tempfile = { workspace = true }
 
 [build-dependencies]
 http.workspace = true

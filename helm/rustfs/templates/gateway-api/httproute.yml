@@ -1,4 +1,4 @@
-{{- if .Values.gatewayApi.enabled -}}
+{{- if and .Values.gatewayApi.enabled (eq .Values.gatewayApi.gatewayClass "traefik") }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -21,6 +21,8 @@ spec:
             type: PathPrefix
             value: /
       backendRefs:
-        - name: rustfs-svc
-          port: 9001
+        - name: {{ include "rustfs.fullname" . }}-sticky-svc
+          port: {{ .Values.service.console.port }}
+          kind: TraefikService
+          group: traefik.io
 {{- end }}

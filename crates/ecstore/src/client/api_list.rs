@@ -27,8 +27,10 @@ use crate::client::{
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
 };
 use crate::store_api::BucketInfo;
-use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use std::collections::HashMap;
@@ -97,18 +99,30 @@ impl TransitionClient {
                 },
             )
             .await?;
+
+        let resp_status = resp.status();
+        let h = resp.headers().clone();
+
         if resp.status() != StatusCode::OK {
-            return Err(std::io::Error::other(http_resp_to_error_response(&resp, vec![], bucket_name, "")));
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                resp_status,
+                &h,
+                vec![],
+                bucket_name,
+                "",
+            )));
         }
 
         //let mut list_bucket_result = ListBucketV2Result::default();
-        let b = resp
-            .body_mut()
-            .store_all_limited(MAX_S3_CLIENT_RESPONSE_SIZE)
-            .await
-            .unwrap()
-            .to_vec();
-        let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8(b).unwrap()) {
+        let mut body_vec = Vec::new();
+        let mut body = resp.into_body();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            if let Some(data) = frame.data_ref() {
+                body_vec.extend_from_slice(data);
+            }
+        }
+        let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8(body_vec).unwrap()) {
             Ok(result) => result,
             Err(err) => {
                 return Err(std::io::Error::other(err.to_string()));

@@ -26,8 +26,6 @@
 
 pub mod disabled_manager;
 pub mod guard;
-pub mod integration_example;
-pub mod integration_test;
 pub mod manager;
 pub mod manager_trait;
 pub mod metrics;
@@ -37,6 +35,9 @@ pub mod shard;
 pub mod state;
 pub mod types;
 
+#[cfg(test)]
+mod tests;
+
 // Re-export main types
 pub use disabled_manager::DisabledLockManager;
 pub use guard::FastLockGuard;
@@ -45,19 +46,19 @@ pub use manager_trait::LockManager;
 use std::time::Duration;
 pub use types::*;
 
-/// Default RustFS specific timeouts in seconds
-pub(crate) const DEFAULT_RUSTFS_MAX_ACQUIRE_TIMEOUT: u64 = 120;
+/// Maximum acquire timeout in seconds (for slow storage / high contention; override via env)
+pub(crate) const DEFAULT_RUSTFS_MAX_ACQUIRE_TIMEOUT: u64 = 60;
 
-/// Default RustFS acquire timeout in seconds
-pub(crate) const DEFAULT_RUSTFS_ACQUIRE_TIMEOUT: u64 = 60;
+/// Default acquire timeout in seconds (how long to wait for a lock before giving up)
+pub(crate) const DEFAULT_RUSTFS_ACQUIRE_TIMEOUT: u64 = 10;
 
 /// Default shard count (must be power of 2)
 pub const DEFAULT_SHARD_COUNT: usize = 1024;
 
-/// Default lock timeout
+/// Default lock timeout (lease TTL; lock is released if not refreshed within this duration)
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default acquire timeout - increased for network block storage workloads (e.g., Hetzner Ceph)
+/// Default acquire timeout - common value for local/low-latency; use env to increase for slow storage
 pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(DEFAULT_RUSTFS_ACQUIRE_TIMEOUT);
 
 /// Maximum acquire timeout for high-load scenarios

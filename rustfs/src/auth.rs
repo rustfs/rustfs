@@ -146,7 +146,10 @@ impl S3Auth for IAMAuth {
             tracing::warn!("get_secret_key failed: iam not initialized, access_key: {access_key}");
         }
 
-        Err(s3_error!(UnauthorizedAccess, "Your account is not signed up2, access_key: {access_key}"))
+        Err(s3_error!(
+            InvalidAccessKeyId,
+            "The Access Key Id you provided does not exist in our records."
+        ))
     }
 }
 

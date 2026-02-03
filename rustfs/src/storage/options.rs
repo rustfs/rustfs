@@ -33,6 +33,7 @@ use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_REQUEST;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
 use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_VERSION_ID;
+use rustfs_utils::http::RUSTFS_ENCRYPTION_LOWER;
 use rustfs_utils::path::is_dir_object;
 use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
@@ -126,19 +127,28 @@ pub async fn get_opts(
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid
-        && *id != Uuid::nil().to_string()
-        && let Err(_err) = Uuid::parse_str(id.as_str())
-    {
-        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-    }
+    let nil_uuid_str = Uuid::nil().to_string();
+
+    let vid = match vid {
+        Some(ref id) => {
+            if id.eq_ignore_ascii_case("null") {
+                Some(nil_uuid_str.clone())
+            } else {
+                if id.as_str() != nil_uuid_str.as_str() && Uuid::parse_str(id).is_err() {
+                    return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+                }
+                Some(id.clone())
+            }
+        }
+        None => None,
+    };
 
     let mut opts = get_default_opts(headers, HashMap::new(), false)
         .map_err(|err| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string()))?;
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::nil().to_string())
+            Some(nil_uuid_str)
         } else {
             vid
         }
@@ -367,8 +377,14 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
 
     let mut filtered_metadata = HashMap::new();
     for (k, v) in metadata {
+        let lower_key = k.to_ascii_lowercase();
         // Skip internal/reserved metadata
-        if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
+        if lower_key.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
+            continue;
+        }
+
+        // Skip internal encryption metadata
+        if lower_key.starts_with(RUSTFS_ENCRYPTION_LOWER) {
             continue;
         }
 
@@ -377,12 +393,10 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
             continue;
         }
 
-        // Skip encryption metadata placeholders
+        // Skip UNENCRYPTED metadata placeholders
         if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
             continue;
         }
-
-        let lower_key = k.to_ascii_lowercase();
 
         // Skip standard HTTP headers (they are returned as separate headers, not metadata)
         if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {
@@ -444,6 +458,10 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "x-amz-tagging",
         "expires",
         "x-amz-replication-status",
+        // Object Lock headers - required for S3 Object Lock functionality
+        "x-amz-object-lock-mode",
+        "x-amz-object-lock-retain-until-date",
+        "x-amz-object-lock-legal-hold",
     ]
 });
 
@@ -722,6 +740,19 @@ mod tests {
         assert!(result.is_ok());
         let result = del_opts("test-bucket", "test-object", Some("NULL".to_string()), &headers, metadata.clone()).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_ops_with_null_version_id() {
+        let headers = create_test_headers();
+        let result = get_opts("test-bucket", "test-object", Some("null".to_string()), None, &headers).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+        let result = get_opts("test-bucket", "test-object", Some("NULL".to_string()), None, &headers).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
     }
 
     #[tokio::test]
@@ -1021,10 +1052,13 @@ mod tests {
             "x-amz-tagging",
             "expires",
             "x-amz-replication-status",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-object-lock-legal-hold",
         ];
 
         assert_eq!(*SUPPORTED_HEADERS, expected_headers);
-        assert_eq!(SUPPORTED_HEADERS.len(), 9);
+        assert_eq!(SUPPORTED_HEADERS.len(), 12);
     }
 
     #[test]
