@@ -228,7 +228,6 @@ where
 
                 if ConditionalCorsLayer::is_s3_path(&path)
                     && !bucket.is_empty()
-                    && cors_origins.is_some()
                     && let Some(cors_headers) = apply_cors_headers(&bucket, &method_clone, &request_headers_clone).await
                 {
                     for (key, value) in cors_headers.iter() {
@@ -243,6 +242,15 @@ where
                 cors_layer.apply_cors_headers(&request_headers_clone, response.headers_mut());
 
                 Ok(response)
+            });
+        }
+
+        if method == Method::OPTIONS && ConditionalCorsLayer::is_s3_path(&path) {
+            return Box::pin(async move {
+                Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(ResBody::default())
+                    .unwrap())
             });
         }
 

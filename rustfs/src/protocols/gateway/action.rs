@@ -66,10 +66,10 @@ impl From<S3Action> for PolicyS3Action {
             S3Action::AbortMultipartUpload => PolicyS3Action::AbortMultipartUploadAction,
             S3Action::ListMultipartUploads => PolicyS3Action::ListBucketMultipartUploadsAction,
             S3Action::ListParts => PolicyS3Action::ListMultipartUploadPartsAction,
-            S3Action::GetBucketAcl => PolicyS3Action::GetBucketPolicyAction,
-            S3Action::PutBucketAcl => PolicyS3Action::PutBucketPolicyAction,
-            S3Action::GetObjectAcl => PolicyS3Action::GetObjectAction,
-            S3Action::PutObjectAcl => PolicyS3Action::PutObjectAction,
+            S3Action::GetBucketAcl => PolicyS3Action::GetBucketAclAction,
+            S3Action::PutBucketAcl => PolicyS3Action::PutBucketAclAction,
+            S3Action::GetObjectAcl => PolicyS3Action::GetObjectAclAction,
+            S3Action::PutObjectAcl => PolicyS3Action::PutObjectAclAction,
             S3Action::CopyObject => PolicyS3Action::PutObjectAction,
         }
     }

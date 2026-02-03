@@ -974,6 +974,7 @@ impl LocalDisk {
         opts: &WalkDirOptions,
         out: &mut MetacacheWriter<W>,
         objs_returned: &mut i32,
+        skip_current_dir_object: bool,
     ) -> Result<()>
     where
         W: AsyncWrite + Unpin + Send,
@@ -1078,6 +1079,10 @@ impl LocalDisk {
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
 
+                if skip_current_dir_object {
+                    continue;
+                }
+
                 // if opts.limit > 0
                 //     && let Ok(meta) = FileMeta::load(&metadata)
                 //     && !meta.all_hidden(true)
@@ -1092,7 +1097,7 @@ impl LocalDisk {
                 })
                 .await?;
 
-                return Ok(());
+                continue;
             }
         }
 
@@ -1107,7 +1112,7 @@ impl LocalDisk {
             }
         }
 
-        let mut dir_stack: Vec<String> = Vec::with_capacity(5);
+        let mut dir_stack: Vec<(String, bool)> = Vec::with_capacity(5);
         prefix = "".to_owned();
 
         for entry in entries.iter() {
@@ -1121,7 +1126,7 @@ impl LocalDisk {
 
             let name = path_join_buf(&[current.as_str(), entry.as_str()]);
 
-            while let Some(pop) = dir_stack.last().cloned()
+            while let Some((pop, skip_object)) = dir_stack.last().cloned()
                 && pop < name
             {
                 out.write_obj(&MetaCacheEntry {
@@ -1131,7 +1136,7 @@ impl LocalDisk {
                 .await?;
 
                 if opts.recursive
-                    && let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned)).await
+                    && let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object)).await
                 {
                     error!("scan_dir err {:?}", er);
                 }
@@ -1170,6 +1175,14 @@ impl LocalDisk {
                     // {
                     *objs_returned += 1;
                     // }
+
+                    if opts.recursive {
+                        let mut dir_name = meta.name.clone();
+                        if !dir_name.ends_with(SLASH_SEPARATOR) {
+                            dir_name.push_str(SLASH_SEPARATOR);
+                        }
+                        dir_stack.push((dir_name, true));
+                    }
                 }
                 Err(err) => {
                     if err == Error::FileNotFound || err == Error::IsNotRegular {
@@ -1177,7 +1190,7 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            dir_stack.push(meta.name);
+                            dir_stack.push((meta.name, false));
                         }
                     }
 
@@ -1186,7 +1199,7 @@ impl LocalDisk {
             };
         }
 
-        while let Some(dir) = dir_stack.pop() {
+        while let Some((dir, skip_object)) = dir_stack.pop() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
             }
@@ -1198,7 +1211,7 @@ impl LocalDisk {
             .await?;
 
             if opts.recursive
-                && let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned)).await
+                && let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object)).await
             {
                 warn!("scan_dir err {:?}", &er);
             }
@@ -1949,6 +1962,7 @@ impl DiskAPI for LocalDisk {
             &opts,
             &mut out,
             &mut objs_returned,
+            false,
         )
         .await?;
 
@@ -2642,6 +2656,56 @@ mod test {
         for p in paths.iter() {
             assert!(skip_access_checks(p.to_str().unwrap()));
         }
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_includes_nested_object_dirs() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join("foo/bar/xyzzy")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("quux/thud")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("asdf")).await.unwrap();
+
+        fs::write(bucket_dir.join("foo/bar/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("foo/bar/xyzzy/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("quux/thud/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("asdf/xl.meta"), b"meta").await.unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.unwrap();
+        let names: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name)
+            .collect();
+
+        assert!(names.contains(&"asdf".to_string()));
+        assert!(names.contains(&"foo/bar".to_string()));
+        assert!(names.contains(&"foo/bar/xyzzy".to_string()));
+        assert!(names.contains(&"quux/thud".to_string()));
     }
 
     #[tokio::test]
