@@ -798,6 +798,127 @@ mod tests {
         assert_eq!(result13.unwrap_err().code(), &S3ErrorCode::InvalidArgument);
     }
 
+    #[test]
+    fn test_apply_lock_retention() {
+        use crate::storage::ecfs_extend::apply_lock_retention;
+        use s3s::dto::{DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule};
+        use std::collections::HashMap;
+
+        // [1] Normal case: Apply default retention with COMPLIANCE mode and days
+        let mut metadata = HashMap::new();
+        let config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: Some(30),
+                    years: None,
+                }),
+            }),
+        });
+        apply_lock_retention(config, &mut metadata);
+        assert_eq!(metadata.get("x-amz-object-lock-mode"), Some(&"COMPLIANCE".to_string()));
+        assert!(metadata.contains_key("x-amz-object-lock-retain-until-date"));
+
+        // [2] Normal case: Apply default retention with GOVERNANCE mode and years
+        let mut metadata = HashMap::new();
+        let config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: None,
+                    years: Some(1),
+                }),
+            }),
+        });
+        apply_lock_retention(config, &mut metadata);
+        assert_eq!(metadata.get("x-amz-object-lock-mode"), Some(&"GOVERNANCE".to_string()));
+        assert!(metadata.contains_key("x-amz-object-lock-retain-until-date"));
+
+        // [3] Skip case: No configuration provided
+        let mut metadata = HashMap::new();
+        apply_lock_retention(None, &mut metadata);
+        assert!(!metadata.contains_key("x-amz-object-lock-mode"));
+        assert!(!metadata.contains_key("x-amz-object-lock-retain-until-date"));
+
+        // [4] Skip case: Object Lock not enabled
+        let mut metadata = HashMap::new();
+        let config = Some(ObjectLockConfiguration {
+            object_lock_enabled: None,
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: Some(30),
+                    years: None,
+                }),
+            }),
+        });
+        apply_lock_retention(config, &mut metadata);
+        assert!(!metadata.contains_key("x-amz-object-lock-mode"));
+
+        // [5] Skip case: Explicit retention already set (explicit takes precedence)
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
+        metadata.insert("x-amz-object-lock-retain-until-date".to_string(), "2030-01-01T00:00:00Z".to_string());
+        let config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: Some(30),
+                    years: None,
+                }),
+            }),
+        });
+        apply_lock_retention(config, &mut metadata);
+        // Explicit retention should remain unchanged
+        assert_eq!(metadata.get("x-amz-object-lock-mode"), Some(&"GOVERNANCE".to_string()));
+        assert_eq!(
+            metadata.get("x-amz-object-lock-retain-until-date"),
+            Some(&"2030-01-01T00:00:00Z".to_string())
+        );
+
+        // [6] Skip case: No default retention configured
+        let mut metadata = HashMap::new();
+        let config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule { default_retention: None }),
+        });
+        apply_lock_retention(config, &mut metadata);
+        assert!(!metadata.contains_key("x-amz-object-lock-mode"));
+
+        // [7] Skip case: No retention mode specified
+        let mut metadata = HashMap::new();
+        let config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: None,
+                    days: Some(30),
+                    years: None,
+                }),
+            }),
+        });
+        apply_lock_retention(config, &mut metadata);
+        assert!(!metadata.contains_key("x-amz-object-lock-mode"));
+
+        // [8] Skip case: No retention period specified (neither days nor years)
+        let mut metadata = HashMap::new();
+        let config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: None,
+                    years: None,
+                }),
+            }),
+        });
+        apply_lock_retention(config, &mut metadata);
+        assert!(!metadata.contains_key("x-amz-object-lock-mode"));
+    }
+
     // Note: S3Request structure is complex and requires many fields.
     // For real testing, we would need proper integration test setup.
     // Removing this test as it requires too much S3 infrastructure setup.
