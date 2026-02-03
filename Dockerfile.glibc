@@ -53,7 +53,7 @@ ARG VCS_REF
 
 LABEL name="RustFS" \
       vendor="RustFS Team" \
-      maintainer="RustFS Team <hello@rustfs.com>" \
+      maintainer="RustFS Team <dev@rustfs.com>" \
       version="v${RELEASE#v}" \
       release="${RELEASE}" \
       build-date="${BUILD_DATE}" \
