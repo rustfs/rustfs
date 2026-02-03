@@ -8564,7 +8564,7 @@ checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 [[package]]
 name = "s3s"
 version = "0.13.0-alpha.2"
-source = "git+https://github.com/rustfs/s3s.git?branch=dependabot%2Fcargo%2Fdep-0202#13f968fc89e3bd286d308ca855456b23734d4f74"
+source = "git+https://github.com/rustfs/s3s.git?rev=13f968fc89e3bd286d308ca855456b23734d4f74#13f968fc89e3bd286d308ca855456b23734d4f74"
 dependencies = [
  "arc-swap",
  "arrayvec",
