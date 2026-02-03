@@ -218,6 +218,7 @@ pub enum SseTypeV2 {
 }
 
 impl SseTypeV2 {
+    #[allow(unused)]
     pub fn to_metadata(&self) -> HashMap<String, String> {
         sse_configuration_to_metadata(self)
     }
@@ -255,6 +256,7 @@ pub async fn prepare_sse_configuration_v2(
     Ok(None)
 }
 
+#[allow(unused)]
 pub fn sse_configuration_to_metadata(sse_configuration: &SseTypeV2) -> HashMap<String, String> {
     let mut metadata = HashMap::new();
     match sse_configuration {
@@ -548,8 +550,6 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
 /// **Core API**: Apply encryption based on request parameters
 ///
 /// sse_prepare_encryption, support SSE-C, SSE-S3, SSE-KMS
-
-
 pub struct PrepareEncryptionRequest<'a> {
     /// Bucket name
     pub bucket: &'a str,
@@ -710,7 +710,7 @@ async fn apply_ssec_prepare_encryption_material(
         sse_type: SSEType::SseC,
         server_side_encryption: ServerSideEncryption::AES256.parse().unwrap(),
         kms_key_id: None,
-        algorithm: algorithm,
+        algorithm,
         key_bytes: [0; 32],
         nonce: [0; 12],
         metadata,

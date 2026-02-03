@@ -38,7 +38,7 @@ use crate::storage::{
     check_preconditions, get_buffer_size_opt_in, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
     parse_object_lock_retention, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter, validate_object_key,
-    wrap_response_with_cors,
+    wrap_response_with_cors, apply_lock_retention,
 };
 use crate::storage::{entity, parse_part_number_i32_to_usize};
 // base64 imports moved to sse module
