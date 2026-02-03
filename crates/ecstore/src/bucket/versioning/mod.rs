@@ -36,11 +36,11 @@ impl VersioningApi for VersioningConfiguration {
             return true;
         }
 
-        if let Some(exclude_folders) = self.exclude_folders
-            && exclude_folders
-            && prefix.ends_with('/')
-        {
-            return false;
+        #[allow(clippy::collapsible_if)]
+        if let Some(exclude_folders) = self.exclude_folders {
+            if exclude_folders && prefix.ends_with('/') {
+                return false;
+            }
         }
 
         if let Some(ref excluded_prefixes) = self.excluded_prefixes {
