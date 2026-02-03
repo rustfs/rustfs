@@ -1376,16 +1376,36 @@ impl DiskAPI for LocalDisk {
         //     return Ok(id);
         // }
 
+        // first check if format.json exists and get file metadata
+        let file_meta = match self.check_format_json().await {
+            Ok(meta) => meta,
+            Err(e) => {
+                // file does not exist or cannot be accessed, clear cached format info
+                if matches!(e, DiskError::UnformattedDisk | DiskError::DiskNotFound) {
+                    let mut format_info = self.format_info.write().await;
+                    format_info.id = None;
+                    format_info.file_info = None;
+                    format_info.data = Bytes::new();
+                    format_info.last_check = None;
+                }
+                return Err(e);
+            }
+        };
+
+        // check if we can use cached value
         if format_info.file_info.is_some() && id.is_some() {
             // check last check time
             if let Some(last_check) = format_info.last_check
                 && last_check.unix_timestamp() + 1 < OffsetDateTime::now_utc().unix_timestamp()
             {
-                return Ok(id);
+                // verify the file is still the same 
+                if let Some(ref file_info) = format_info.file_info
+                    && super::fs::same_file(&file_meta, file_info)
+                {
+                    return Ok(id);
+                }
             }
         }
-
-        let file_meta = self.check_format_json().await?;
 
         if let Some(file_info) = &format_info.file_info
             && super::fs::same_file(&file_meta, file_info)
