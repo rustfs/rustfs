@@ -106,7 +106,7 @@ fn test_encrypt_decrypt_binary_data() -> Result<(), crate::Error> {
 #[test]
 fn test_encrypt_decrypt_unicode_data() -> Result<(), crate::Error> {
     let unicode_strings = [
-        "Hello, 世界! 🌍",
+        "Hello, 世界！🌍",
         "Тест на русском языке",
         "العربية اختبار",
         "🚀🔐💻🌟⭐",
