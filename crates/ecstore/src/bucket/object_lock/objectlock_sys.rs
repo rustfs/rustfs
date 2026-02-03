@@ -106,7 +106,7 @@ pub fn check_retention_for_modification(
     None
 }
 
-pub(crate) fn add_years(dt: OffsetDateTime, years: i32) -> OffsetDateTime {
+pub fn add_years(dt: OffsetDateTime, years: i32) -> OffsetDateTime {
     let target_year = dt.year() + years;
     dt.replace_year(target_year)
         .or_else(|_| {
