@@ -64,7 +64,7 @@ config:
   # Optionally enable support for virtual-hosted-style requests.
   # See more information: https://docs.rustfs.com/integration/virtual.html
   domains: "" # e.g. "example.com"
-  # Sepcify the log rotation settings, default value for rotation size is 100MB, time is hourly and the numbers of keep files is 30.
+  # Specify the log rotation settings, default value for rotation size is 100MB, time is hourly and the numbers of keep files is 30.
   log_rotation: {}
     # size: "100"
     # time: "hour"

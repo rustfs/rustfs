@@ -19,15 +19,15 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | affinity.podAntiAffinity.enabled | bool | `true` |  |
 | affinity.podAntiAffinity.topologyKey | string | `"kubernetes.io/hostname"` |  |
 | commonLabels | object | `{}` | Labels to add to all deployed objects. |
-| config.rustfs.address | string | `":9000"` |  |
-| config.rustfs.console_address | string | `":9001"` |  |
-| config.rustfs.console_enable | string | `"true"` |  |
-| config.rustfs.log_level | string | `"debug"` |  |
-| config.rustfs.obs_environment | string | `"develop"` |  |
-| config.rustfs.obs_log_directory | string | `"/logs"` |  |
-| config.rustfs.region | string | `"us-east-1"` |  |
-| config.rustfs.rust_log | string | `"debug"` |  |
-| config.rustfs.volumes | string | `""` |  |
+| config.address | string | `":9000"` |  |
+| config.console_address | string | `":9001"` |  |
+| config.console_enable | string | `"true"` |  |
+| config.log_level | string | `"debug"` |  |
+| config.obs_environment | string | `"develop"` |  |
+| config.obs_log_directory | string | `"/logs"` |  |
+| config.region | string | `"us-east-1"` |  |
+| config.rust_log | string | `"debug"` |  |
+| config.volumes | string | `""` |  |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
