@@ -69,7 +69,7 @@ pub enum BackendConfig {
     /// Local backend configuration
     Local(LocalConfig),
     /// Vault backend configuration
-    Vault(VaultConfig),
+    Vault(Box<VaultConfig>),
 }
 
 impl Default for BackendConfig {
@@ -194,11 +194,11 @@ impl KmsConfig {
     pub fn vault(address: Url, token: String) -> Self {
         Self {
             backend: KmsBackend::Vault,
-            backend_config: BackendConfig::Vault(VaultConfig {
+            backend_config: BackendConfig::Vault(Box::new(VaultConfig {
                 address: address.to_string(),
                 auth_method: VaultAuthMethod::Token { token },
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         }
     }
@@ -207,11 +207,11 @@ impl KmsConfig {
     pub fn vault_approle(address: Url, role_id: String, secret_id: String) -> Self {
         Self {
             backend: KmsBackend::Vault,
-            backend_config: BackendConfig::Vault(VaultConfig {
+            backend_config: BackendConfig::Vault(Box::new(VaultConfig {
                 address: address.to_string(),
                 auth_method: VaultAuthMethod::AppRole { role_id, secret_id },
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         }
     }
@@ -353,7 +353,7 @@ impl KmsConfig {
                 let address = std::env::var("RUSTFS_KMS_VAULT_ADDRESS").unwrap_or_else(|_| "http://localhost:8200".to_string());
                 let token = std::env::var("RUSTFS_KMS_VAULT_TOKEN").unwrap_or_else(|_| "dev-token".to_string());
 
-                config.backend_config = BackendConfig::Vault(VaultConfig {
+                config.backend_config = BackendConfig::Vault(Box::new(VaultConfig {
                     address,
                     auth_method: VaultAuthMethod::Token { token },
                     namespace: std::env::var("RUSTFS_KMS_VAULT_NAMESPACE").ok(),
@@ -362,7 +362,7 @@ impl KmsConfig {
                     key_path_prefix: std::env::var("RUSTFS_KMS_VAULT_KEY_PREFIX")
                         .unwrap_or_else(|_| "rustfs/kms/keys".to_string()),
                     tls: None,
-                });
+                }));
             }
         }
 

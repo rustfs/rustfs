@@ -7613,6 +7613,7 @@ dependencies = [
 name = "rustfs"
 version = "0.0.5"
 dependencies = [
+ "aes-gcm 0.11.0-rc.2",
  "anyhow",
  "astral-tokio-tar",
  "async-trait",
@@ -7978,6 +7979,7 @@ name = "rustfs-kms"
 version = "0.0.5"
 dependencies = [
  "aes-gcm 0.11.0-rc.2",
+ "arc-swap",
  "async-trait",
  "base64",
  "chacha20poly1305",

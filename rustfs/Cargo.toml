@@ -126,6 +126,8 @@ urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
 libc = { workspace = true }
+rand = { workspace = true }
+aes-gcm = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }

@@ -170,6 +170,81 @@
             "sourceLanguages": [
                 "rust"
             ],
-        }
+        },
+        {
+            "name": "Debug executable target/debug/rustfs with sse",
+            "type":  "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/rustfs",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            //"stopAtEntry": false,
+            //"preLaunchTask": "cargo build",
+            "env": {
+                "RUSTFS_ACCESS_KEY": "rustfsadmin",
+                "RUSTFS_SECRET_KEY": "rustfsadmin",
+                "RUSTFS_VOLUMES": "./target/volumes/test{1...4}",
+                "RUSTFS_ADDRESS": ":9000",
+                "RUSTFS_CONSOLE_ENABLE": "true",
+                "RUSTFS_CONSOLE_ADDRESS": "127.0.0.1:9001",
+                "RUSTFS_OBS_LOG_DIRECTORY": "./target/logs",
+                // "RUSTFS_OBS_TRACE_ENDPOINT": "http://127.0.0.1:4318/v1/traces", // jeager otlp http endpoint
+                // "RUSTFS_OBS_METRIC_ENDPOINT": "http://127.0.0.1:4318/v1/metrics", // default otlp http endpoint
+                // "RUSTFS_OBS_LOG_ENDPOINT": "http://127.0.0.1:4318/v1/logs", // default otlp http endpoint
+                // "RUSTFS_COMPRESS_ENABLE": "true",
+
+                // 1. simple sse test key (no kms system)
+                // "__RUSTFS_SSE_SIMPLE_CMK": "2dfNXGHlsEflGVCxb+5DIdGEl1sIvtwX+QfmYasi5QM=",
+
+                // 2. kms local backend test key
+                "RUSTFS_KMS_ENABLE": "true",
+                "RUSTFS_KMS_BACKEND": "local",
+                "RUSTFS_KMS_KEY_DIR": "./target/kms-key-dir",
+                "RUSTFS_KMS_LOCAL_MASTER_KEY": "my-secret-key", // Some Password
+                "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-master-key",
+
+                // 3. kms vault backend test key
+                // "RUSTFS_KMS_ENABLE": "true",
+                // "RUSTFS_KMS_BACKEND": "vault",
+                // "RUSTFS_KMS_VAULT_ADDRESS": "http://127.0.0.1:8200",
+                // "RUSTFS_KMS_VAULT_TOKEN": "Dev Token",
+                // "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-master-key",
+
+            },
+            "sourceLanguages": [
+                "rust"
+            ],
+        },
+        {
+            "name": "E2E test executable target/debug/rustfs",
+            "type":  "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/rustfs",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            //"stopAtEntry": false,
+            //"preLaunchTask": "cargo build",
+            "env": {
+                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug,iam=debug",
+                "RUST_BACKTRACE": "full",
+                "RUSTFS_ACCESS_KEY": "rustfsadmin",
+                "RUSTFS_SECRET_KEY": "rustfsadmin",
+                "RUSTFS_VOLUMES": "./target/e2e-test/test{1...4}",
+                "RUSTFS_REGION": "us-east-1",
+                "RUSTFS_ADDRESS": ":9000",
+                "RUSTFS_CONSOLE_ENABLE": "true",
+                "RUSTFS_CONSOLE_ADDRESS": "127.0.0.1:9001",
+                "RUSTFS_OBS_LOG_DIRECTORY": "./target/logs",
+
+                "RUSTFS_KMS_ENABLE": "true",
+                "RUSTFS_KMS_BACKEND": "local",
+                "RUSTFS_KMS_KEY_DIR": "./target/e2e-key-dir",
+                "RUSTFS_KMS_LOCAL_MASTER_KEY": "my-secret-key", // Some Password
+                "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-master-key",
+            },
+            "sourceLanguages": [
+                "rust"
+            ],
+        },
     ]
 }
