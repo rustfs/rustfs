@@ -209,7 +209,7 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
 
                 rustfs_kms::config::KmsConfig {
                     backend: rustfs_kms::config::KmsBackend::Vault,
-                    backend_config: rustfs_kms::config::BackendConfig::Vault(rustfs_kms::config::VaultConfig {
+                    backend_config: rustfs_kms::config::BackendConfig::Vault(Box::new(rustfs_kms::config::VaultConfig {
                         address: vault_address.clone(),
                         auth_method: rustfs_kms::config::VaultAuthMethod::Token {
                             token: vault_token.clone(),
@@ -219,7 +219,7 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
                         kv_mount: "secret".to_string(),
                         key_path_prefix: "rustfs/kms/keys".to_string(),
                         tls: None,
-                    }),
+                    })),
                     default_key_id: opt.kms_default_key_id.clone(),
                     timeout: std::time::Duration::from_secs(30),
                     retry_attempts: 3,
