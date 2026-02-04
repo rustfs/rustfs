@@ -10,8 +10,10 @@ spec:
       {{- if .Values.gatewayApi.existingGateway.namespace }}
       namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
       {{- end }}
+      sectionName: https
   {{- else }}
     - name: {{ include "rustfs.fullname" . }}-gateway
+      sectionName: https
   {{- end }}
   hostnames:
     - {{ .Values.gatewayApi.hostname }}
@@ -25,4 +27,28 @@ spec:
           port: {{ .Values.service.console.port }}
           kind: TraefikService
           group: traefik.io
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "rustfs.fullname" . }}-redirect
+spec:
+  parentRefs:
+  {{- if .Values.gatewayApi.existingGateway.name }}
+    - name: {{ .Values.gatewayApi.existingGateway.name }}
+      {{- if .Values.gatewayApi.existingGateway.namespace }}
+      namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
+      {{- end }}
+      sectionName: http
+  {{- else }}
+    - name: {{ include "rustfs.fullname" . }}-gateway
+      sectionName: http
+  {{- end }}
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
 {{- end }}
