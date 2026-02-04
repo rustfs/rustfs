@@ -1398,7 +1398,7 @@ impl DiskAPI for LocalDisk {
             if let Some(last_check) = format_info.last_check
                 && last_check.unix_timestamp() + 1 < OffsetDateTime::now_utc().unix_timestamp()
             {
-                // verify the file is still the same 
+                // verify the file is still the same
                 if let Some(ref file_info) = format_info.file_info
                     && super::fs::same_file(&file_meta, file_info)
                 {
@@ -2441,11 +2441,12 @@ impl DiskAPI for LocalDisk {
                     return self.write_metadata("", volume, path, fi).await;
                 }
 
-                return if fi.version_id.is_some() {
-                    Err(DiskError::FileVersionNotFound)
+                let ret_err = if fi.version_id.is_some() {
+                    DiskError::FileVersionNotFound
                 } else {
-                    Err(DiskError::FileNotFound)
+                    DiskError::FileNotFound
                 };
+                return Err(ret_err);
             }
         };
 

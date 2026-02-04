@@ -36,10 +36,7 @@ impl VersioningApi for VersioningConfiguration {
             return true;
         }
 
-        if let Some(exclude_folders) = self.exclude_folders
-            && exclude_folders
-            && prefix.ends_with('/')
-        {
+        if self.exclude_folders.unwrap_or(false) && prefix.ends_with('/') {
             return false;
         }
 
