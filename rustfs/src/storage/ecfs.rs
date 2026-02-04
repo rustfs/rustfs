@@ -4599,7 +4599,10 @@ impl S3 for FS {
         let manager = get_concurrency_manager();
         let put_bucket = bucket.clone();
         let put_key = key.clone();
-        let put_version = obj_info.version_id.map(|v| v.to_string());
+        let mut put_version = obj_info.version_id.map(|v| v.to_string());
+        if opts.version_suspended && obj_info.version_id.is_none_or(|v| v.is_nil()) {
+            put_version = Some("null".to_string());
+        }
 
         helper = helper.object(obj_info.clone());
         if let Some(version_id) = &put_version {

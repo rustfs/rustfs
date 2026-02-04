@@ -67,6 +67,22 @@ mod tests {
         Ok(())
     }
 
+    async fn suspend_versioning(client: &Client, bucket: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let versioning_config = VersioningConfiguration::builder()
+            .status(BucketVersioningStatus::Suspended)
+            .build();
+
+        client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(versioning_config)
+            .send()
+            .await?;
+
+        info!("✅ Versioning suspended for bucket {}", bucket);
+        Ok(())
+    }
+
     /// Test 1: PutObject should return version_id when versioning is enabled
     /// This directly addresses the Veeam issue from #1066
     #[tokio::test]
@@ -436,5 +452,50 @@ mod tests {
         assert!(get_response.is_ok(), "Object should exist after PUT");
 
         Ok(())
+    }
+
+    /// Test 7: PutObject should return "null" version_id when versioning is Suspended
+    #[tokio::test]
+    #[serial]
+    async fn test_put_object_returns_null_version_id_with_suspended_versioning() {
+        init_logging();
+        info!("🧪 TEST: PutObject returns null version_id with versioning suspended");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-suspended-version-id";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        suspend_versioning(&client, bucket)
+            .await
+            .expect("Failed to suspend versioning");
+
+        let key = "test-file-suspended.txt";
+        let content = b"Test content for suspended version ID test";
+
+        info!("📤 Uploading object to suspended versioning bucket");
+        let result = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(content))
+            .send()
+            .await;
+
+        assert!(result.is_ok(), "PutObject failed: {:?}", result.err());
+        let output = result.unwrap();
+
+        info!("📥 PutObject response - version_id: {:?}", output.version_id);
+
+        // When suspended, version_id must be "null"
+        assert_eq!(
+            output.version_id.as_deref(),
+            Some("null"),
+            "❌ FAILED: version_id should be 'null' when versioning is suspended"
+        );
+
+        info!("✅ PASSED: PutObject correctly returns 'null' version_id");
     }
 }
