@@ -90,6 +90,7 @@ pub struct QuotaCheckResult {
 #[derive(Debug)]
 pub enum QuotaOperation {
     PutObject,
+    PostObject,
     CopyObject,
     DeleteObject,
 }

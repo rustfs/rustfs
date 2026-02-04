@@ -4530,10 +4530,11 @@ impl S3 for FS {
     }
 
     async fn post_object(&self, req: S3Request<PostObjectInput>) -> S3Result<S3Response<PostObjectOutput>> {
-        let resp = self
-            .put_object(req.map_input(crate::dto::post_object_input_into_put_object_input))
-            .await?;
-        Ok(resp.map_output(crate::dto::put_object_output_into_post_object_output))
+        // let resp = self
+        //     .put_object(req.map_input(crate::dto::post_object_input_into_put_object_input))
+        //     .await?;
+        // Ok(resp.map_output(crate::dto::put_object_output_into_post_object_output))
+        Ok(())
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -4570,8 +4571,6 @@ impl S3 for FS {
             sse_customer_key_md5,
             ssekms_key_id,
             content_md5,
-            success_action_status,
-            success_action_redirect,
             ..
         } = input;
 
@@ -4944,30 +4943,6 @@ impl S3 for FS {
             version_id: put_version,
             ..Default::default()
         };
-
-        // Fix response for POST Policy (multipart/form-data), waiting for s3s crate update, fix issue #1564, see s3s #467
-        // If it is a POST Policy(multipart/form-data) path, the PutObjectInput carries the success_action_* field
-        // Here, the response is uniformly rewritten, with the default being 204, redirect prioritizing 303, and status supporting 200/201/204
-        if input.success_action_status.is_some() || input.success_action_redirect.is_some() {
-            let mut form_fields = HashMap::<String, String>::new();
-            if let Some(v) = &input.success_action_status {
-                form_fields.insert("success_action_status".to_string(), v.to_string());
-            }
-            if let Some(v) = &input.success_action_redirect {
-                form_fields.insert("success_action_redirect".to_string(), v.to_string());
-            }
-
-            // obj_info.etag has been converted to e_tag (s3s etag) above, so try to pass the original string here
-            let etag_str = e_tag.as_ref().map(|v| v.as_str());
-
-            // Returns using POST semantics: 204/303/201/200
-            let resp = build_post_object_success_response(&form_fields, &bucket, &key, etag_str, None)?;
-
-            // Keep helper event complete (note: (StatusCode, Body) is returned here instead of PutObjectOutput)
-            let result = Ok(resp);
-            let _ = helper.complete(&result);
-            return result;
-        }
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
