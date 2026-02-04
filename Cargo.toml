@@ -129,7 +129,7 @@ tower = { version = "0.5.3", features = ["timeout"] }
 tower-http = { version = "0.6.8", features = ["cors"] }
 
 # Serialization and Data Formats
-bytes = { version = "1.11.0", features = ["serde"] }
+bytes = { version = "1.11.1", features = ["serde"] }
 bytesize = "2.3.1"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
