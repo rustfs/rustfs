@@ -615,7 +615,7 @@ impl FileMeta {
     }
 
     // delete_version deletes version, returns data_dir
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
         let vid = Some(fi.version_id.unwrap_or(Uuid::nil()));
 

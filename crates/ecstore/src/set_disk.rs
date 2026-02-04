@@ -71,7 +71,7 @@ use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType,
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
+    RawFileInfo, ReplicateDecision, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
 };
 use rustfs_lock::LockClient;
 use rustfs_lock::fast_lock::types::LockResult;
@@ -122,7 +122,7 @@ const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
 /// Defaults to 30 seconds if not set or invalid
-fn get_lock_acquire_timeout() -> Duration {
+pub fn get_lock_acquire_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
 }
 
@@ -2251,23 +2251,42 @@ impl SetDisks {
 
         Ok((fi, parts_metadata, op_online_disks))
     }
-    async fn get_object_info_and_quorum(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<(ObjectInfo, usize)> {
-        let (fi, _, _) = self.get_object_fileinfo(bucket, object, opts, false).await?;
+    async fn get_object_info_and_quorum(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> (ObjectInfo, usize, Option<StorageError>) {
+        let fi = match self.get_object_fileinfo(bucket, object, opts, false).await {
+            Ok((fi, _, _)) => fi,
+            Err(e) => return (ObjectInfo::default(), 0, Some(e)),
+        };
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        // TODO: replicatio
+
+        if !fi.version_purge_status().is_empty() && opts.version_id.is_some() {
+            return (
+                oi,
+                write_quorum,
+                Some(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])),
+            );
+        }
 
         if fi.deleted {
             return if opts.version_id.is_none() || opts.delete_marker {
-                Err(to_object_err(StorageError::FileNotFound, vec![bucket, object]))
+                (oi, write_quorum, Some(to_object_err(StorageError::FileNotFound, vec![bucket, object])))
             } else {
-                Err(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object]))
+                (
+                    oi,
+                    write_quorum,
+                    Some(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])),
+                )
             };
         }
 
-        Ok((oi, write_quorum))
+        (oi, write_quorum, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4461,10 +4480,19 @@ impl StorageAPI for SetDisks {
             return Ok(ObjectInfo::default());
         }
 
-        let (mut goi, write_quorum, gerr) = match self.get_object_info_and_quorum(bucket, object, &opts).await {
-            Ok((oi, wq)) => (oi, wq, None),
-            Err(e) => (ObjectInfo::default(), 0, Some(e)),
-        };
+        // TODO: Lifecycle
+
+        let mut version_found = true;
+        let (mut goi, write_quorum, gerr) = self.get_object_info_and_quorum(bucket, object, &opts).await;
+        if let Some(err) = &gerr
+            && goi.name.is_empty()
+        {
+            if opts.delete_marker {
+                version_found = false;
+            } else {
+                return Err(err.clone());
+            }
+        }
 
         let otd = ObjectToDelete {
             object_name: object.to_string(),
@@ -4475,9 +4503,16 @@ impl StorageAPI for SetDisks {
             ..Default::default()
         };
 
-        let version_found = if opts.delete_marker { gerr.is_none() } else { true };
-
-        let dsc = check_replicate_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await;
+        let dsc = if opts
+            .delete_replication
+            .as_ref()
+            .map(|v| v.replica_status == ReplicationStatusType::Replica)
+            == Some(true)
+        {
+            ReplicateDecision::default()
+        } else {
+            check_replicate_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await
+        };
 
         if dsc.replicate_any() {
             opts.set_delete_replication_state(dsc);
@@ -4501,11 +4536,11 @@ impl StorageAPI for SetDisks {
                 mark_delete = false;
             }
 
-            if opts.version_purge_status() != VersionPurgeStatusType::Complete {
+            if opts.version_purge_status() == VersionPurgeStatusType::Complete {
                 mark_delete = false;
             }
 
-            if version_found && (goi.version_purge_status.is_empty() || !goi.delete_marker) {
+            if version_found && (!goi.version_purge_status.is_empty() || !goi.delete_marker) {
                 delete_marker = false;
             }
         }
@@ -4550,7 +4585,9 @@ impl StorageAPI for SetDisks {
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-            return Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended));
+            let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+            oi.replication_decision = goi.replication_decision;
+            return Ok(oi);
         }
 
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());

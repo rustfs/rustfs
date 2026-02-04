@@ -1539,7 +1539,7 @@ impl S3 for FS {
             return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
         }
 
-        if obj_info.replication_status == ReplicationStatusType::Replica
+        if obj_info.replication_status == ReplicationStatusType::Pending
             || obj_info.version_purge_status == VersionPurgeStatusType::Pending
         {
             schedule_replication_delete(DeletedObjectReplicationInfo {
