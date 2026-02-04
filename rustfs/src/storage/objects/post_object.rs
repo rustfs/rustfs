@@ -14,46 +14,46 @@
 
 use crate::error::ApiError;
 use crate::storage::concurrency::get_concurrency_manager;
-use crate::storage::ecfs::ManagedEncryptionMaterial;
 use crate::storage::helper::OperationHelper;
 use crate::storage::objects::Objects;
 use crate::storage::options::{extract_metadata_from_mime_with_object_name, get_content_sha256, put_opts};
+use crate::storage::sse::{EncryptionRequest, sse_encryption};
 use crate::storage::{
-    apply_lock_retention, build_post_object_success_response, create_managed_encryption_material, get_buffer_size_opt_in,
-    get_validated_store, is_managed_sse, validate_object_key,
+    apply_lock_retention, build_post_object_success_response, get_buffer_size_opt_in, get_validated_store, validate_object_key,
 };
-use base64::prelude::BASE64_STANDARD;
-use base64::Engine;
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
-use rustfs_ecstore::bucket::quota::QuotaOperation;
-use rustfs_ecstore::bucket::replication::{get_must_replicate_options, must_replicate, schedule_replication};
-use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::compress::{is_compressible, MIN_COMPRESSIBLE_SIZE};
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::set_disk::is_valid_storage_class;
-use rustfs_ecstore::store_api::{ObjectIO, ObjectOptions, PutObjReader};
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
-use rustfs_rio::{CompressReader, EncryptReader, HashReader, Reader, WarpReader};
-use rustfs_targets::EventName;
-use rustfs_utils::http::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
-use rustfs_utils::{extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent, CompressionAlgorithm};
-use s3s::dto::{ChecksumAlgorithm, PostObjectInput, PostObjectOutput, PutObjectInput, PutObjectOutput, ServerSideEncryption};
-use s3s::{s3_error, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
-use std::collections::HashMap;
-use std::path::Path;
 use futures_util::StreamExt;
 use http::HeaderMap;
+use rustfs_ecstore::bucket::metadata_sys;
+use rustfs_ecstore::bucket::quota::QuotaOperation;
+use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
+use rustfs_ecstore::bucket::replication::{get_must_replicate_options, must_replicate, schedule_replication};
+use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
+use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
+use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
+use rustfs_ecstore::set_disk::is_valid_storage_class;
+use rustfs_ecstore::store_api::{ObjectIO, ObjectOptions, PutObjReader};
+use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
+use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
+use rustfs_notify::notifier_global;
+use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
+use rustfs_targets::EventName;
+use rustfs_utils::http::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
+use rustfs_utils::{
+    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
+    get_request_user_agent,
+};
+use rustfs_zip::CompressionFormat;
+use s3s::dto::{ChecksumAlgorithm, ETag, PostObjectInput, PostObjectOutput};
+use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use std::collections::HashMap;
+use std::path::Path;
 use tokio_tar::Archive;
 use tokio_util::io::StreamReader;
 use tracing::{debug, error, instrument, warn};
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_notify::notifier_global;
-use rustfs_zip::CompressionFormat;
 
 impl Objects {
     #[instrument(level = "debug", skip(self, req))]
-    async fn post_object(&self, req: S3Request<PostObjectInput>) -> S3Result<S3Response<PostObjectOutput>> {
+    pub async fn post_object(&self, req: S3Request<PostObjectInput>) -> S3Result<S3Response<PostObjectOutput>> {
         let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPost, "s3:PostObject");
         if req
             .headers
@@ -86,13 +86,55 @@ impl Objects {
             sse_customer_key_md5,
             ssekms_key_id,
             content_md5,
+            if_match,
+            if_none_match,
             success_action_status,
             success_action_redirect,
             ..
         } = input;
 
         // Validate object key
-        validate_object_key(&key, "PUT")?;
+        validate_object_key(&key, "POST")?;
+
+        if if_match.is_some() || if_none_match.is_some() {
+            let Some(store) = new_object_layer_fn() else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            };
+
+            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+                Ok(info) => {
+                    if !info.delete_marker {
+                        if let Some(ifmatch) = if_match
+                            && let Some(strong_etag) = ifmatch.into_etag()
+                            && info
+                                .etag
+                                .as_ref()
+                                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                        {
+                            return Err(s3_error!(PreconditionFailed));
+                        }
+                        if let Some(ifnonematch) = if_none_match
+                            && let Some(strong_etag) = ifnonematch.into_etag()
+                            && info
+                                .etag
+                                .as_ref()
+                                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
+                        {
+                            return Err(s3_error!(PreconditionFailed));
+                        }
+                    }
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+
+                    if if_match.is_some() && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
+                        return Err(ApiError::from(err).into());
+                    }
+                }
+            }
+        }
 
         // check quota for put operation
         if let Some(size) = content_length
@@ -157,40 +199,6 @@ impl Objects {
 
         let store = get_validated_store(&bucket).await?;
 
-        // TDD: Get bucket default encryption configuration
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-        debug!("TDD: bucket_sse_config={:?}", bucket_sse_config);
-
-        // TDD: Determine effective encryption configuration (request overrides bucket default)
-        let original_sse = server_side_encryption.clone();
-        let effective_sse = server_side_encryption.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                debug!("TDD: Processing bucket SSE config: {:?}", config);
-                config.rules.first().and_then(|rule| {
-                    debug!("TDD: Processing SSE rule: {:?}", rule);
-                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                        debug!("TDD: Found SSE default: {:?}", sse);
-                        match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
-                        }
-                    })
-                })
-            })
-        });
-        debug!("TDD: effective_sse={:?} (original={:?})", effective_sse, original_sse);
-
-        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
-
         let mut metadata = metadata.unwrap_or_default();
 
         let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
@@ -218,24 +226,6 @@ impl Objects {
 
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_string());
-        }
-
-        // TDD: Store effective SSE information in metadata for GET responses
-        if let Some(sse_alg) = &sse_customer_algorithm {
-            metadata.insert(
-                "x-amz-server-side-encryption-customer-algorithm".to_string(),
-                sse_alg.as_str().to_string(),
-            );
-        }
-        if let Some(sse_md5) = &sse_customer_key_md5 {
-            metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
-        }
-        if let Some(sse) = &effective_sse {
-            metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
-        }
-
-        if let Some(kms_key_id) = &effective_kms_key_id {
-            metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
         }
 
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
@@ -291,75 +281,43 @@ impl Objects {
             opts.want_checksum = reader.checksum();
         }
 
-        // Apply SSE-C encryption if customer provided key
-        if let (Some(_), Some(sse_key), Some(sse_key_md5_provided)) =
-            (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
-        {
-            // Decode the base64 key
-            let key_bytes = BASE64_STANDARD
-                .decode(sse_key)
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {e}"))))?;
+        // Apply encryption using unified SSE API
+        let encryption_request = EncryptionRequest {
+            bucket: &bucket,
+            key: &key,
+            server_side_encryption,
+            ssekms_key_id,
+            sse_customer_algorithm: sse_customer_algorithm.clone(),
+            sse_customer_key,
+            sse_customer_key_md5: sse_customer_key_md5.clone(),
+            content_size: actual_size,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
 
-            // Verify key length (should be 32 bytes for AES-256)
-            if key_bytes.len() != 32 {
-                return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
+        let (effective_sse, effective_kms_key_id) = match sse_encryption(encryption_request).await? {
+            Some(material) => {
+                let server_side_encryption = Some(material.server_side_encryption.clone());
+                let ssekms_key_id = material.kms_key_id.clone();
+
+                // Apply encryption wrapper
+                let encrypted_reader = material.wrap_reader(reader);
+                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                    .map_err(ApiError::from)?;
+
+                // Merge encryption metadata
+                metadata.extend(material.metadata);
+
+                (server_side_encryption, ssekms_key_id)
             }
-
-            // Convert Vec<u8> to [u8; 32]
-            let mut key_array = [0u8; 32];
-            key_array.copy_from_slice(&key_bytes[..32]);
-
-            // Verify MD5 hash of the key matches what the client claims
-            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
-            if computed_md5 != *sse_key_md5_provided {
-                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
-            }
-
-            // Store original size for later retrieval during decryption
-            let original_size = if size >= 0 { size } else { actual_size };
-            metadata.insert(
-                "x-amz-server-side-encryption-customer-original-size".to_string(),
-                original_size.to_string(),
-            );
-
-            // Generate a deterministic nonce from object key for consistency
-            let mut nonce = [0u8; 12];
-            let nonce_source = format!("{bucket}-{key}");
-            let nonce_hash = md5::compute(nonce_source.as_bytes());
-            nonce.copy_from_slice(&nonce_hash.0[..12]);
-
-            // Apply encryption
-            let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
-        }
-
-        // Apply managed SSE (SSE-S3 or SSE-KMS) when requested
-        if sse_customer_algorithm.is_none()
-            && let Some(sse_alg) = &effective_sse
-            && is_managed_sse(sse_alg)
-        {
-            let material =
-                create_managed_encryption_material(&bucket, &key, sse_alg, effective_kms_key_id.clone(), actual_size).await?;
-
-            let ManagedEncryptionMaterial {
-                data_key,
-                headers,
-                kms_key_id: kms_key_used,
-            } = material;
-
-            let key_bytes = data_key.plaintext_key;
-            let nonce = data_key.nonce;
-
-            metadata.extend(headers);
-            effective_kms_key_id = Some(kms_key_used.clone());
-
-            let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
-        }
+            None => (None, None),
+        };
 
         let mut reader = PutObjReader::new(reader);
 
         let mt2 = metadata.clone();
+        opts.user_defined.extend(metadata);
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
@@ -449,8 +407,8 @@ impl Objects {
         let output = PostObjectOutput {
             e_tag,
             server_side_encryption: effective_sse, // TDD: Return effective encryption config
-            sse_customer_algorithm: sse_customer_algorithm.clone(),
-            sse_customer_key_md5: sse_customer_key_md5.clone(),
+            sse_customer_algorithm,
+            sse_customer_key_md5,
             ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
             checksum_crc32,
             checksum_crc32c,
@@ -691,20 +649,20 @@ impl Objects {
 
         if let Some(alg) = &input.checksum_algorithm
             && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
-            let key = match alg.as_str() {
-                ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
-                ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
-                ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
-                ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
-                ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
-                _ => return None,
-            };
-            trailer.read(|headers| {
-                headers
-                    .get(key.unwrap_or_default())
-                    .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                let key = match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+                    _ => return None,
+                };
+                trailer.read(|headers| {
+                    headers
+                        .get(key.unwrap_or_default())
+                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                })
             })
-        })
         {
             match alg.as_str() {
                 ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
