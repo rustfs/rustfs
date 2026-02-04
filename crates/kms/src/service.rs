@@ -274,6 +274,8 @@ impl ObjectEncryptionService {
         // Build encryption context
         let mut context = encryption_context.cloned().unwrap_or_default();
         context.insert("bucket".to_string(), bucket.to_string());
+        context.insert("object_key".to_string(), object_key.to_string());
+        // Backward compatibility: also include legacy "object" context key
         context.insert("object".to_string(), object_key.to_string());
         context.insert("algorithm".to_string(), algorithm.as_str().to_string());
 
