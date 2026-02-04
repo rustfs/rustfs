@@ -11,22 +11,3 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-pub mod access;
-pub mod concurrency;
-pub mod ecfs;
-pub(crate) mod entity;
-pub(crate) mod helper;
-pub mod options;
-pub mod tonic_service;
-
-mod buckets;
-#[cfg(test)]
-mod concurrent_get_object_test;
-mod ecfs_extend;
-#[cfg(test)]
-mod ecfs_test;
-pub(crate) mod head_prefix;
-pub(crate) mod objects;
-
-pub(crate) use ecfs_extend::*;

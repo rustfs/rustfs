@@ -17,13 +17,14 @@ use crate::config::workload_profiles::get_global_buffer_config;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::concurrency::{
-    CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
+    get_concurrency_aware_buffer_size, get_concurrency_manager, CachedGetObject, ConcurrencyManager, GetObjectGuard,
 };
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
-    access::{ReqInfo, authorize_request, has_bypass_governance_header},
+    access::{authorize_request, has_bypass_governance_header, ReqInfo},
+    build_post_object_success_response,
     ecfs_extend::RFC1123,
     options::{
         copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
@@ -39,10 +40,10 @@ use crate::storage::{
     wrap_response_with_cors,
 };
 use crate::storage::{entity, parse_part_number_i32_to_usize};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bytes::Bytes;
 use datafusion::arrow::{
-    csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
+    csv::WriterBuilder as CsvWriterBuilder, json::writer::JsonArray, json::WriterBuilder as JsonWriterBuilder,
 };
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -51,7 +52,7 @@ use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
-            bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts, validate_transition_tier},
+            bucket_lifecycle_ops::{post_restore_opts, validate_transition_tier, RestoreRequestOps},
             lifecycle::{self, Lifecycle, TransitionOptions},
         },
         metadata::{
@@ -60,12 +61,12 @@ use rustfs_ecstore::{
         },
         metadata_sys,
         metadata_sys::get_replication_config,
-        object_lock::objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, check_retention_for_modification},
+        object_lock::objectlock_sys::{check_object_lock_for_deletion, check_retention_for_modification, BucketObjectLockSys},
         policy_sys::PolicySys,
         quota::QuotaOperation,
         replication::{
-            DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate,
-            schedule_replication, schedule_replication_delete,
+            check_replicate_delete, get_must_replicate_options, must_replicate, schedule_replication,
+            schedule_replication_delete, DeletedObjectReplicationInfo,
         },
         tagging::{decode_tags, encode_tags},
         utils::serialize,
@@ -73,11 +74,11 @@ use rustfs_ecstore::{
         versioning_sys::BucketVersioningSys,
     },
     client::object_api_utils::to_s3s_etag,
-    compress::{MIN_COMPRESSIBLE_SIZE, is_compressible},
+    compress::{is_compressible, MIN_COMPRESSIBLE_SIZE},
     disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
-    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
+    error::{is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, StorageError},
     new_object_layer_fn,
-    set_disk::{MAX_PARTS_COUNT, is_valid_storage_class},
+    set_disk::{is_valid_storage_class, MAX_PARTS_COUNT},
     store_api::{
         BucketOptions,
         CompletePart,
@@ -95,10 +96,10 @@ use rustfs_ecstore::{
     },
 };
 use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
+use rustfs_filemeta::{parse_restore_obj_status, RestoreStatusOps};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
-use rustfs_filemeta::{RestoreStatusOps, parse_restore_obj_status};
 use rustfs_kms::DataKey;
-use rustfs_notify::{EventArgsBuilder, notifier_global};
+use rustfs_notify::{notifier_global, EventArgsBuilder};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Validator},
@@ -110,28 +111,28 @@ use rustfs_s3select_api::{
 };
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::{
+    arn::{TargetIDError, ARN},
     EventName,
-    arn::{ARN, TargetIDError},
 };
 use rustfs_utils::http::RUSTFS_FORCE_DELETE;
 use rustfs_utils::string::parse_bool;
 use rustfs_utils::{
-    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
-    get_request_user_agent,
+    extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
     http::{
-        AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
         headers::{
             AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
             AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
             AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT, RESERVED_METADATA_PREFIX,
             RESERVED_METADATA_PREFIX_LOWER,
-        },
+        }, AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE,
+        AMZ_CHECKSUM_TYPE,
     },
     path::{is_dir_object, path_join_buf},
+    CompressionAlgorithm,
 };
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
-use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use s3s::{dto::*, s3_error, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, S3};
 use std::convert::Infallible;
 use std::ops::Add;
 use std::{
@@ -141,7 +142,7 @@ use std::{
     str::FromStr,
     sync::{Arc, LazyLock},
 };
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::{
     io::{AsyncRead, AsyncSeek},
     sync::mpsc,
@@ -4528,6 +4529,13 @@ impl S3 for FS {
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 
+    async fn post_object(&self, req: S3Request<PostObjectInput>) -> S3Result<S3Response<PostObjectOutput>> {
+        let resp = self
+            .put_object(req.map_input(crate::dto::post_object_input_into_put_object_input))
+            .await?;
+        Ok(resp.map_output(crate::dto::put_object_output_into_post_object_output))
+    }
+
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
@@ -4562,6 +4570,8 @@ impl S3 for FS {
             sse_customer_key_md5,
             ssekms_key_id,
             content_md5,
+            success_action_status,
+            success_action_redirect,
             ..
         } = input;
 
