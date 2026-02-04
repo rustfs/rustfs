@@ -26,5 +26,8 @@ mod ecfs_extend;
 #[cfg(test)]
 mod ecfs_test;
 pub(crate) mod head_prefix;
+mod sse;
+#[cfg(test)]
+mod sse_test;
 
 pub(crate) use ecfs_extend::*;

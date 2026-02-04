@@ -22,7 +22,7 @@ use zeroize::Zeroize;
 
 /// Data encryption key (DEK) used for encrypting object data
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataKey {
+pub struct DataKeyInfo {
     /// Key identifier
     pub key_id: String,
     /// Key version
@@ -40,7 +40,7 @@ pub struct DataKey {
     pub created_at: Zoned,
 }
 
-impl DataKey {
+impl DataKeyInfo {
     /// Create a new data key
     ///
     /// # Arguments
@@ -96,7 +96,7 @@ impl DataKey {
 
 /// Master key stored in KMS backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MasterKey {
+pub struct MasterKeyInfo {
     /// Unique key identifier
     pub key_id: String,
     /// Key version
@@ -119,7 +119,7 @@ pub struct MasterKey {
     pub created_by: Option<String>,
 }
 
-impl MasterKey {
+impl MasterKeyInfo {
     /// Create a new master key
     ///
     /// # Arguments
@@ -226,8 +226,8 @@ pub struct KeyInfo {
     pub created_by: Option<String>,
 }
 
-impl From<MasterKey> for KeyInfo {
-    fn from(master_key: MasterKey) -> Self {
+impl From<MasterKeyInfo> for KeyInfo {
+    fn from(master_key: MasterKeyInfo) -> Self {
         Self {
             key_id: master_key.key_id,
             description: master_key.description,
@@ -913,7 +913,7 @@ pub struct CancelKeyDeletionResponse {
 }
 
 // SECURITY: Implement Drop to automatically zero sensitive data when DataKey is dropped
-impl Drop for DataKey {
+impl Drop for DataKeyInfo {
     fn drop(&mut self) {
         self.clear_plaintext();
     }
