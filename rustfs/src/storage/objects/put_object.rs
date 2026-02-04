@@ -22,16 +22,16 @@ use crate::storage::{
     apply_lock_retention, build_post_object_success_response, create_managed_encryption_material, get_buffer_size_opt_in,
     get_validated_store, is_managed_sse, validate_object_key,
 };
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use futures_util::StreamExt;
 use http::HeaderMap;
 use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::quota::QuotaOperation;
+use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::replication::{get_must_replicate_options, must_replicate, schedule_replication};
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::compress::{is_compressible, MIN_COMPRESSIBLE_SIZE};
+use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::is_valid_storage_class;
@@ -42,12 +42,12 @@ use rustfs_rio::{CompressReader, EncryptReader, HashReader, Reader, WarpReader};
 use rustfs_targets::EventName;
 use rustfs_utils::http::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::{
-    extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
-    CompressionAlgorithm,
+    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
+    get_request_user_agent,
 };
 use rustfs_zip::CompressionFormat;
 use s3s::dto::{ChecksumAlgorithm, PostObjectInput, PostObjectOutput, PutObjectInput, PutObjectOutput, ServerSideEncryption};
-use s3s::{s3_error, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::path::Path;
 use tokio_tar::Archive;
