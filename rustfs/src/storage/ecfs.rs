@@ -31,11 +31,12 @@ use crate::storage::{
     },
 };
 use crate::storage::{
-    check_preconditions, create_managed_encryption_material, decrypt_managed_encryption_key, decrypt_multipart_managed_stream,
-    derive_part_nonce, get_buffer_size_opt_in, get_validated_store, has_replication_rules, is_managed_sse,
-    parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations, process_queue_configurations,
-    process_topic_configurations, strip_managed_encryption_metadata, validate_bucket_object_lock_enabled,
-    validate_list_object_unordered_with_delimiter, validate_object_key, wrap_response_with_cors,
+    apply_lock_retention, check_preconditions, create_managed_encryption_material, decrypt_managed_encryption_key,
+    decrypt_multipart_managed_stream, derive_part_nonce, get_buffer_size_opt_in, get_validated_store, has_replication_rules,
+    is_managed_sse, parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations,
+    process_queue_configurations, process_topic_configurations, strip_managed_encryption_metadata,
+    validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter, validate_object_key,
+    wrap_response_with_cors,
 };
 use crate::storage::{entity, parse_part_number_i32_to_usize};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -4666,6 +4667,23 @@ impl S3 for FS {
 
         let mut metadata = metadata.unwrap_or_default();
 
+        let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
+            Ok((cfg, _created)) => Some(cfg),
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    None
+                } else {
+                    warn!("get_object_lock_config err {:?}", err);
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        "Failed to load Object Lock configuration".to_string(),
+                    ));
+                }
+            }
+        };
+
+        apply_lock_retention(object_lock_configuration, &mut metadata);
+
         if let Some(content_type) = content_type {
             metadata.insert("content-type".to_string(), content_type.to_string());
         }
@@ -4841,7 +4859,10 @@ impl S3 for FS {
         let manager = get_concurrency_manager();
         let put_bucket = bucket.clone();
         let put_key = key.clone();
-        let put_version = obj_info.version_id.map(|v| v.to_string());
+        let mut put_version = obj_info.version_id.map(|v| v.to_string());
+        if opts.version_suspended && obj_info.version_id.is_none_or(|v| v.is_nil()) {
+            put_version = Some("null".to_string());
+        }
 
         helper = helper.object(obj_info.clone());
         if let Some(version_id) = &put_version {

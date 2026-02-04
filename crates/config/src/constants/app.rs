@@ -98,6 +98,12 @@ pub const RUSTFS_HTTP_PREFIX: &str = "http://";
 /// Default value: https://
 pub const RUSTFS_HTTPS_PREFIX: &str = "https://";
 
+/// Environment variable for rustfs address
+/// This is the environment variable for rustfs address.
+/// It is used to bind the server to a specific address.
+/// Example: RUSTFS_ADDRESS=":9000"
+pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
+
 /// Default port for rustfs
 /// This is the default port for rustfs.
 /// This is used to bind the server to a specific port.

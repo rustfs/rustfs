@@ -20,6 +20,12 @@ pub enum Error {
     #[error("invalid encryption algorithm ID: {0}")]
     ErrInvalidAlgID(u8),
 
+    #[error("invalid input: {0}")]
+    ErrInvalidInput(String),
+
+    #[error("invalid key length")]
+    ErrInvalidKeyLength,
+
     #[cfg(any(test, feature = "crypto"))]
     #[error("{0}")]
     ErrInvalidLength(#[from] sha2::digest::InvalidLength),
@@ -38,4 +44,13 @@ pub enum Error {
 
     #[error("jwt err: {0}")]
     ErrJwt(#[from] jsonwebtoken::errors::Error),
+
+    #[error("io error: {0}")]
+    ErrIo(#[from] std::io::Error),
+
+    #[error("invalid signature")]
+    ErrInvalidSignature,
+
+    #[error("invalid token")]
+    ErrInvalidToken,
 }
