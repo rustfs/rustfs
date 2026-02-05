@@ -1,0 +1,37 @@
+{{- if eq .Values.ingress.className "contour" }}
+apiVersion: projectcontour.io/v1
+kind: HTTPProxy
+metadata:
+  name: {{ include "rustfs.fullname" . }}-proxy
+  labels:
+    {{- include "rustfs.labels" . | nindent 4 }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  {{- range .Values.ingress.hosts }}
+  virtualhost:
+    fqdn: {{ .host | quote }}
+    {{- if $.Values.ingress.tls.enabled }}
+    tls:
+      secretName: {{ include "rustfs.fullname" $ }}-tls
+    {{- end }}
+  routes:
+    - conditions:
+        {{- range .paths }}
+        - prefix: {{ .path }}
+        {{- end }}
+      services:
+        - name: {{ include "rustfs.fullname" $ }}-svc
+          port: {{ $.Values.service.console.port }}
+      loadBalancerPolicy:
+        strategy: Cookie
+      timeoutPolicy:
+        response: infinity
+        idle: 5m
+      {{- if $.Values.ingress.tls.enabled }}
+      permitInsecure: true
+      {{- end }}
+  {{- end }}
+{{- end }}
