@@ -281,7 +281,7 @@ impl ReplicationState {
                     return repl_status;
                 }
             }
-        } else if self.replica_status != ReplicationStatusType::default() {
+        } else if !self.replica_status.is_empty() {
             return self.replica_status.clone();
         }
 

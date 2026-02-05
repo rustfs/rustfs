@@ -63,6 +63,7 @@ pub mod config;
 mod encryption;
 mod error;
 pub mod manager;
+pub mod service;
 pub mod service_manager;
 pub mod types;
 
@@ -73,10 +74,9 @@ pub use api_types::{
     UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
-pub use encryption::ObjectEncryptionService;
-pub use encryption::service::DataKey;
 pub use error::{KmsError, Result};
 pub use manager::KmsManager;
+pub use service::{DataKey, ObjectEncryptionService};
 pub use service_manager::{
     KmsServiceManager, KmsServiceStatus, get_global_encryption_service, get_global_kms_service_manager,
     init_global_kms_service_manager,
@@ -112,6 +112,7 @@ pub fn shutdown_global_services() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -138,5 +139,92 @@ mod tests {
 
         // Test stop
         manager.stop().await.expect("Stop should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_versioned_service_reconfiguration() {
+        // Test versioned service reconfiguration for zero-downtime
+        let manager = KmsServiceManager::new();
+
+        // Initial state: no version
+        assert!(manager.get_service_version().await.is_none());
+
+        // Start first service
+        let temp_dir1 = TempDir::new().expect("Failed to create temp dir");
+        let config1 = KmsConfig::local(temp_dir1.path().to_path_buf());
+        manager
+            .configure(config1.clone())
+            .await
+            .expect("Configuration should succeed");
+        manager.start().await.expect("Start should succeed");
+
+        // Verify version 1
+        let version1 = manager.get_service_version().await.expect("Service should have version");
+        assert_eq!(version1, 1);
+
+        // Get service reference (simulating ongoing operation)
+        let service1 = manager.get_encryption_service().await.expect("Service should be available");
+
+        // Reconfigure to new service (zero-downtime)
+        let temp_dir2 = TempDir::new().expect("Failed to create temp dir");
+        let config2 = KmsConfig::local(temp_dir2.path().to_path_buf());
+        manager.reconfigure(config2).await.expect("Reconfiguration should succeed");
+
+        // Verify version 2
+        let version2 = manager.get_service_version().await.expect("Service should have version");
+        assert_eq!(version2, 2);
+
+        // Old service reference should still be valid (Arc keeps it alive)
+        // New requests should get version 2
+        let service2 = manager.get_encryption_service().await.expect("Service should be available");
+
+        // Verify they are different instances
+        assert!(!Arc::ptr_eq(&service1, &service2));
+
+        // Old service should still work (simulating long-running operation)
+        // This demonstrates zero-downtime: old operations continue, new operations use new service
+        assert!(service1.health_check().await.is_ok());
+        assert!(service2.health_check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reconfiguration() {
+        // Test that concurrent reconfiguration requests are serialized
+        let manager = Arc::new(KmsServiceManager::new());
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let base_path = temp_dir.path().to_path_buf();
+
+        // Initial configuration
+        let config1 = KmsConfig::local(base_path.clone());
+        manager.configure(config1).await.expect("Configuration should succeed");
+        manager.start().await.expect("Start should succeed");
+
+        // Spawn multiple concurrent reconfiguration requests
+        let mut handles = Vec::new();
+        for _i in 0..5 {
+            let manager_clone = manager.clone();
+            let path = base_path.clone();
+            let handle = tokio::spawn(async move {
+                let config = KmsConfig::local(path);
+                manager_clone.reconfigure(config).await
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all reconfigurations to complete
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await);
+        }
+
+        // All should succeed (serialized by mutex)
+        for result in results {
+            assert!(result.expect("Task should complete").is_ok());
+        }
+
+        // Final version should be 6 (1 initial + 5 reconfigurations)
+        let final_version = manager.get_service_version().await.expect("Service should have version");
+        assert_eq!(final_version, 6);
     }
 }

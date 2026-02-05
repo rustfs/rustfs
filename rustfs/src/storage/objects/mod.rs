@@ -12,9 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Object encryption service implementation
+use std::sync::LazyLock;
 
-pub mod ciphers;
-pub mod dek;
+mod put_object;
 
-pub use dek::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
+pub(crate) struct Objects;
+
+pub(crate) static GLOBAL_OBJECTS: LazyLock<Objects> = LazyLock::new(Objects::new);
+
+impl Objects {
+    pub fn new() -> Self {
+        Objects
+    }
+}
