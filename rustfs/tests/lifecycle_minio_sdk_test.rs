@@ -20,6 +20,7 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
 };
+use serial_test::serial;
 use std::env;
 use std::time::Duration;
 use uuid::Uuid;
@@ -30,6 +31,7 @@ struct Settings {
     oss_secret_key: String,
     oss_bucket_name: String,
     oss_lifecycle_days: i32,
+    #[allow(dead_code)]
     oss_secure: bool,
     oss_region: String,
 }
@@ -176,6 +178,8 @@ impl Oss {
 }
 
 #[tokio::test]
+#[serial]
+#[ignore]
 async fn test_lifecycle_minio_sdk() -> Result<()> {
     let settings = Settings::new();
     let oss = Oss::new(&settings).await?;

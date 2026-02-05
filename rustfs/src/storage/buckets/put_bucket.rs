@@ -12,25 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod access;
-pub mod concurrency;
-pub mod ecfs;
-pub(crate) mod entity;
-pub(crate) mod helper;
-pub mod options;
-pub mod tonic_service;
+#![allow(dead_code)]
 
-#[allow(dead_code)]
-mod buckets;
-#[cfg(test)]
-mod concurrent_get_object_test;
-mod ecfs_extend;
-pub(crate) use ecfs_extend::*;
-#[cfg(test)]
-mod ecfs_test;
-pub(crate) mod head_prefix;
-mod objects;
+use crate::storage::buckets::Buckets;
+use tracing::info;
 
-mod sse;
-#[cfg(test)]
-mod sse_test;
+impl Buckets {
+    /// PutBucket handles the creation of a new bucket in the storage system.
+    pub fn put_bucket(&self) {
+        info!("put_object: start");
+    }
+}

@@ -11,3 +11,19 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+#![allow(dead_code)]
+
+use std::sync::LazyLock;
+
+mod put_bucket;
+
+pub(crate) struct Buckets;
+pub(crate) static GLOBAL_BUCKETS: LazyLock<Buckets> = LazyLock::new(Buckets::new);
+
+impl Buckets {
+    /// Create a new Buckets instance
+    pub fn new() -> Self {
+        Buckets
+    }
+}
