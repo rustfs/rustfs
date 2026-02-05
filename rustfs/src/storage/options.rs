@@ -359,9 +359,7 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
     // Standard HTTP headers that should NOT be returned in the Metadata field
     // These are returned as separate response headers, not user metadata
     const EXCLUDED_HEADERS: &[&str] = &[
-        "content-type",
         "content-encoding",
-        "content-disposition",
         "content-language",
         "cache-control",
         "expires",

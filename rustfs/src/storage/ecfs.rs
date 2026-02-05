@@ -3415,6 +3415,18 @@ impl S3 for FS {
         // takes precedence for these read operations.
         let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
 
+        if let Some(content_disposition) = metadata_map.get("content-disposition")
+            && let Ok(header_value) = HeaderValue::from_str(content_disposition)
+        {
+            response.headers.insert(http::header::CONTENT_DISPOSITION, header_value);
+        }
+
+        if let Some(content_type) = metadata_map.get("content-type")
+            && let Ok(header_value) = HeaderValue::from_str(content_type)
+        {
+            response.headers.insert(http::header::CONTENT_TYPE, header_value);
+        }
+
         // Add x-amz-tagging-count header if object has tags
         // Per S3 API spec, this header should be present in HEAD object response when tags exist
         if tag_count > 0 {

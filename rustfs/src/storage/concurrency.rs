@@ -426,8 +426,8 @@ impl Drop for GetObjectGuard {
     /// This ensures accurate tracking even in error/panic scenarios, as Drop
     /// is called during stack unwinding (unless explicitly forgotten).
     fn drop(&mut self) {
-        // Decrement concurrent request counter
-        ACTIVE_GET_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+        // Decrement concurrent request counter without underflow
+        let _ = ACTIVE_GET_REQUESTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
 
         // Record Prometheus metrics for monitoring and alerting
         #[cfg(feature = "metrics")]
