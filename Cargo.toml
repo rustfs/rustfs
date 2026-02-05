@@ -45,9 +45,6 @@ members = [
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
-    "crates/heal", # Erasure set and object healing
-    "crates/mcp", # MCP server for S3 operations
-    "crates/kms", # Key Management Service
     "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
 ]
 resolver = "2"
