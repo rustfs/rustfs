@@ -188,7 +188,7 @@ pub struct BucketPolicyArgs<'a> {
 /// Empty optional fields are omitted from output to match AWS format.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct BucketPolicy {
-    #[serde(default, rename = "ID", skip_serializing_if = "ID::is_empty")]
+    #[serde(default, rename = "Id", skip_serializing_if = "ID::is_empty")]
     pub id: ID,
     #[serde(rename = "Version")]
     pub version: String,
