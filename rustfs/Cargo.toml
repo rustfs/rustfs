@@ -161,6 +161,10 @@ pprof = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 http.workspace = true
