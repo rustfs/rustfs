@@ -58,12 +58,12 @@ impl QuotaChecker {
         let current_usage = self.get_real_time_usage(bucket).await?;
 
         let expected_usage = match operation {
-            QuotaOperation::PutObject | QuotaOperation::CopyObject => current_usage + operation_size,
+            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => current_usage + operation_size,
             QuotaOperation::DeleteObject => current_usage.saturating_sub(operation_size),
         };
 
         let allowed = match operation {
-            QuotaOperation::PutObject | QuotaOperation::CopyObject => {
+            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => {
                 quota_config.check_operation_allowed(current_usage, operation_size)
             }
             QuotaOperation::DeleteObject => true,
