@@ -14,6 +14,6 @@ spec:
           cookie:
             name: rustfs
             httpOnly: true
-            secure: true
-            sameSite: none
+            secure: {{ .Values.ingress.tls.enabled | default false }}
+            sameSite: {{ if .Values.ingress.tls.enabled }}none{{ else }}lax{{ end }}
 {{- end }}
