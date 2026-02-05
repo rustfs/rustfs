@@ -4312,10 +4312,6 @@ impl S3 for FS {
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 
-    async fn post_object(&self, req: S3Request<PostObjectInput>) -> S3Result<S3Response<PostObjectOutput>> {
-        crate::storage::objects::GLOBAL_OBJECTS.post_object(req).await
-    }
-
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         crate::storage::objects::GLOBAL_OBJECTS.put_object(req).await

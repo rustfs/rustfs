@@ -14,7 +14,6 @@
 
 use std::sync::LazyLock;
 
-mod post_object;
 mod put_object;
 
 pub(crate) struct Objects;
