@@ -3,6 +3,11 @@ apiVersion: projectcontour.io/v1
 kind: HTTPProxy
 metadata:
   name: {{ include "rustfs.fullname" . }}-proxy
+  labels:
+    {{- include "rustfs.labels" . | nindent 4 }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
   namespace: {{ .Release.Namespace }}
 spec:
   {{- range .Values.ingress.hosts }}
