@@ -12,21 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod access;
-pub mod concurrency;
-#[cfg(test)]
-mod concurrent_get_object_test;
-pub mod ecfs;
-mod ecfs_extend;
-pub(crate) mod entity;
-pub(crate) mod helper;
-pub mod options;
-pub mod tonic_service;
-pub(crate) use ecfs_extend::*;
-#[cfg(test)]
-mod ecfs_test;
-pub(crate) mod head_prefix;
-mod objects;
-mod sse;
-#[cfg(test)]
-mod sse_test;
+use std::sync::LazyLock;
+
+mod put_object;
+
+pub(crate) struct Objects;
+
+pub(crate) static GLOBAL_OBJECTS: LazyLock<Objects> = LazyLock::new(Objects::new);
+
+impl Objects {
+    pub fn new() -> Self {
+        Objects
+    }
+}
