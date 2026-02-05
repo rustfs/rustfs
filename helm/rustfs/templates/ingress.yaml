@@ -1,5 +1,4 @@
 {{- if .Values.ingress.enabled -}}
-{{- $secretName := .Values.ingress.tls.secretName }}
 {{- $ingressAnnotations := dict }}
 {{- if eq .Values.ingress.className "nginx" }}
 {{- $ingressAnnotations = .Values.ingress.nginxAnnotations }}
@@ -29,7 +28,7 @@ spec:
         {{- range .Values.ingress.hosts }}
         - {{ .host | quote }}
         {{- end }}
-      secretName: {{ $secretName }}
+      secretName: {{ include "rustfs.fullname" $ }}-tls
   {{- end }}
   rules:
     {{- range .Values.ingress.hosts }}

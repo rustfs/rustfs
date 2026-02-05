@@ -130,14 +130,8 @@ impl ObjectStore {
     }
 
     fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
-        let cred = get_global_action_cred().unwrap_or_default();
-        match rustfs_crypto::decrypt_data(cred.secret_key.as_bytes(), data) {
-            Ok(decrypted) => Ok(decrypted),
-            Err(_) => {
-                warn!("Failed to decrypt IAM config data, treating as unencrypted");
-                Ok(data.to_vec())
-            }
-        }
+        let de = rustfs_crypto::decrypt_data(get_global_action_cred().unwrap_or_default().secret_key.as_bytes(), data)?;
+        Ok(de)
     }
 
     fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {

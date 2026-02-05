@@ -2421,11 +2421,12 @@ impl DiskAPI for LocalDisk {
                     return self.write_metadata("", volume, path, fi).await;
                 }
 
-                return if fi.version_id.is_some() {
-                    Err(DiskError::FileVersionNotFound)
+                let ret_err = if fi.version_id.is_some() {
+                    DiskError::FileVersionNotFound
                 } else {
-                    Err(DiskError::FileNotFound)
+                    DiskError::FileNotFound
                 };
+                return Err(ret_err);
             }
         };
 

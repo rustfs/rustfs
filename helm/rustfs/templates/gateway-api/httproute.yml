@@ -1,8 +1,12 @@
-{{- if and .Values.gatewayApi.enabled (eq .Values.gatewayApi.gatewayClass "traefik") }}
+{{- if .Values.gatewayApi.enabled }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: {{ include "rustfs.fullname" . }}-route
+  annotations:
+    {{- if eq .Values.gatewayApi.gatewayClass "contour" }}
+    projectcontour.io/upstream-hash-policy: "cookie"
+    {{- end }}
 spec:
   parentRefs:
   {{- if .Values.gatewayApi.existingGateway.name }}
@@ -10,8 +14,10 @@ spec:
       {{- if .Values.gatewayApi.existingGateway.namespace }}
       namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
       {{- end }}
+      sectionName: https
   {{- else }}
-    - name: {{ include "rustfs.fullname" . }}-gateway
+    - name: {{ include "rustfs.fullname" $ }}-gateway
+      sectionName: https
   {{- end }}
   hostnames:
     - {{ .Values.gatewayApi.hostname }}
@@ -21,8 +27,37 @@ spec:
             type: PathPrefix
             value: /
       backendRefs:
+        {{- if eq .Values.gatewayApi.gatewayClass "traefik" }}
         - name: {{ include "rustfs.fullname" . }}-sticky-svc
           port: {{ .Values.service.console.port }}
           kind: TraefikService
           group: traefik.io
+        {{- else if eq .Values.gatewayApi.gatewayClass "contour" }}
+        - name: {{ include "rustfs.fullname" $ }}-svc
+          port: {{ .Values.service.console.port }}
+        {{- end }}
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "rustfs.fullname" . }}-redirect
+spec:
+  parentRefs:
+  {{- if .Values.gatewayApi.existingGateway.name }}
+    - name: {{ .Values.gatewayApi.existingGateway.name }}
+      {{- if .Values.gatewayApi.existingGateway.namespace }}
+      namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
+      {{- end }}
+      sectionName: http
+  {{- else }}
+    - name: {{ include "rustfs.fullname" $ }}-gateway
+      sectionName: http
+  {{- end }}
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
 {{- end }}
