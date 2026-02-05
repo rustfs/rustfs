@@ -150,6 +150,11 @@ ingress:
 gatewayApi:
   enabled: false
   gatewayClass: traefik
+  listeners: # Specify which listeners to create on the Gateway. Only support for traefik gatewayClass at the moment.
+    web:
+      port: 8000
+    websecure:
+      port: 8443
   hostname: example.rustfs.com
   existingGateway:
     name: ""

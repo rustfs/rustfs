@@ -5,19 +5,25 @@ metadata:
   name: {{ include "rustfs.fullname" . }}-gateway
 spec:
   gatewayClassName: {{ .Values.gatewayApi.gatewayClass }}
+  {{- with .Values.gatewayApi.listeners }}
   listeners:
+  {{- if .web }}
     - name: http
-      port: 80
+      port: {{ .web.port }}
       protocol: HTTP
       allowedRoutes:
         namespaces:
           from: Same
+  {{- end }}
+  {{- if .websecure }}
     - name: https
-      port: 443
+      port: {{ .websecure.port }}
       protocol: HTTPS
       tls:
         mode: Terminate
         certificateRefs:
-          - name: {{ .Values.ingress.tls.secretName }}
+          - name: {{ include "rustfs.fullname" $ }}-tls
             kind: Secret
+  {{- end }}
+  {{- end }}
 {{- end }}
