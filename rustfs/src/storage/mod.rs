@@ -14,23 +14,19 @@
 
 pub mod access;
 pub mod concurrency;
+#[cfg(test)]
+mod concurrent_get_object_test;
 pub mod ecfs;
+mod ecfs_extend;
 pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod options;
 pub mod tonic_service;
-
-#[allow(dead_code)]
-mod buckets;
-#[cfg(test)]
-mod concurrent_get_object_test;
-mod ecfs_extend;
 pub(crate) use ecfs_extend::*;
 #[cfg(test)]
 mod ecfs_test;
 pub(crate) mod head_prefix;
 mod objects;
-
 mod sse;
 #[cfg(test)]
 mod sse_test;
