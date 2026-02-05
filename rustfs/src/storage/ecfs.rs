@@ -3721,7 +3721,13 @@ impl S3 for FS {
         // S3 API requires the marker field to be echoed back in the response
         let request_marker = req.input.marker.clone();
 
-        let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
+        let v2_resp = self
+            .list_objects_v2(req.map_input(|v1| {
+                let mut v2: ListObjectsV2Input = v1.into();
+                v2.fetch_owner = Some(true);
+                v2
+            }))
+            .await?;
 
         Ok(v2_resp.map_output(|v2| {
             // For ListObjects (v1) API, NextMarker should be the last item returned when truncated
