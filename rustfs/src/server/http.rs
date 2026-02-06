@@ -33,6 +33,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
+use opentelemetry::global;
 use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
@@ -56,6 +57,7 @@ use tower_http::compression::CompressionLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub async fn start_http_server(
     opt: &config::Opt,
@@ -524,6 +526,37 @@ struct ConnectionContext {
     readiness: Arc<GlobalReadiness>,
 }
 
+pub struct HeaderMapCarrier<'a> {
+    headers: &'a HeaderMap,
+}
+
+impl<'a> HeaderMapCarrier<'a> {
+    pub fn new(headers: &'a HeaderMap) -> Self {
+        Self { headers }
+    }
+}
+
+impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.headers.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.headers.keys().map(|k| k.as_str()).collect()
+    }
+
+    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
+        let headers = self
+            .headers
+            .get_all(key)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+
+        if headers.is_empty() { None } else { Some(headers) }
+    }
+}
+
 /// Process a single incoming TCP connection.
 ///
 /// This function is executed in a new Tokio task, and it will:
@@ -593,6 +626,10 @@ fn process_connection(
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("unknown");
 
+                        let parent_context = global::get_text_map_propagator(|propogator| {
+                            propogator.extract(&HeaderMapCarrier::new(request.headers()))
+                        });
+
                         // Extract real client IP from trusted proxy middleware if available
                         let client_info = request.extensions().get::<ClientInfo>();
                         let real_ip = client_info
@@ -607,6 +644,7 @@ fn process_connection(
                             uri = %request.uri(),
                             version = ?request.version(),
                         );
+                        span.set_parent(parent_context).unwrap();
                         for (header_name, header_value) in request.headers() {
                             if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length" {
                                 span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
