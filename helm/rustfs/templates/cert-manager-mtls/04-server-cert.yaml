@@ -10,10 +10,12 @@ spec:
     kind: Issuer
   commonName: {{ include "rustfs.fullname" . }}-cluster
   dnsNames:
-    - "*.rustfs-headless"
-    - "*.rustfs-headless.rustfs.svc.cluster.local"
-    - rustfs-svc.rustfs.svc.cluster.local
-    - xiaomage-ai.cloud
+    - "*.{{ include "rustfs.fullname" . }}-headless"
+    - "*.{{ include "rustfs.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local"
+    - "{{ include "rustfs.fullname" . }}-svc.{{ .Release.Namespace }}.svc.cluster.local"
+  {{- range .Values.ingress.hosts }}
+    {{ .host | quote }}
+  {{- end }}
     - "*.xiaomage-ai.cloud"
   usages:
     - server auth

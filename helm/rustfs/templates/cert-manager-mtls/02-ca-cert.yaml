@@ -8,6 +8,6 @@ spec:
   commonName: {{ include "rustfs.fullname" . }}-root-ca
   secretName: {{ include "rustfs.fullname" . }}-root-ca-secret
   issuerRef:
-    name: selfsigned-cluster-issuer
+    name: {{ include "rustfs.fullname" . }}-selfsigned-issuer
     kind: ClusterIssuer
 {{- end }}

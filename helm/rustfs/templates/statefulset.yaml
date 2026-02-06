@@ -115,6 +115,7 @@ spec:
             {{- end }}
             - name: logs
               mountPath: /mnt/rustfs
+            {{- if .Values.mtls.enabled }}
             - name: client-cert
               mountPath: /opt/tls/client_cert.pem
               subPath: client_cert.pem
@@ -133,29 +134,7 @@ spec:
             - name: server-cert
               mountPath: /opt/tls/ca.crt
               subPath: ca.crt
-      volumes:
-        - name: server-cert
-          secret:
-            secretName: rustfs-server-tls
-            defaultMode: 0444
-            items:
-              - key: tls.crt
-                path: rustfs_cert.pem
-              - key: tls.key
-                path: rustfs_key.pem
-              - key: ca.crt
-                path: ca.crt
-        - name: client-cert
-          secret:
-            secretName: rustfs-client-tls
-            defaultMode: 0444
-            items:
-              - key: tls.key
-                path: client_key.pem
-              - key: tls.crt
-                path: client_cert.pem
-              - key: ca.crt
-                path: client_ca.crt
+            {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
@@ -176,6 +155,7 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            {{- if .Values.mtls.enabled }}
             - name: client-cert
               mountPath: /opt/tls/client_cert.pem
               subPath: client_cert.pem
@@ -194,6 +174,7 @@ spec:
             - name: server-cert
               mountPath: /opt/tls/ca.crt
               subPath: ca.crt
+            {{- end }}
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
@@ -206,6 +187,7 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
+      {{- if .Values.mtls.enabled }}
       volumes:
         - name: server-cert
           secret:
@@ -227,6 +209,7 @@ spec:
                 path: client_key.pem
               - key: ca.crt
                 path: client_ca.crt
+      {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: logs
