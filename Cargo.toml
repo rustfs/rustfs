@@ -103,7 +103,7 @@ rustfs-protocols = { path = "crates/protocols", version = "0.0.5" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
-async-compression = { version = "0.4.37" }
+async-compression = { version = "0.4.38" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
 axum = "0.8.8"
@@ -168,11 +168,11 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # Time and Date
 chrono = { version = "0.4.43", features = ["serde"] }
 humantime = "2.3.0"
-jiff = { version = "0.2.18", features = ["serde"] }
+jiff = { version = "0.2.19", features = ["serde"] }
 time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Utilities and Tools
-anyhow = "1.0.100"
+anyhow = "1.0.101"
 arc-swap = "1.8.1"
 astral-tokio-tar = "0.5.6"
 atoi = "2.0.0"
@@ -261,7 +261,7 @@ walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
 windows = { version = "0.62.2" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
-zip = "7.2.0"
+zip = "7.4.0"
 zstd = "0.13.3"
 
 # Observability and Metrics

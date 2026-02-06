@@ -27,7 +27,7 @@ categories = ["network-programming", "filesystem"]
 
 [features]
 default = []
-ftps = ["libunftp", "suppaftp", "rustls"]
+ftps = ["libunftp", "rustls"]
 
 [dependencies]
 # Core RustFS dependencies
@@ -39,7 +39,6 @@ rustfs-utils = { workspace = true }
 # Async dependencies
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
 tracing = { workspace = true }
-futures = { workspace = true }
 futures-util = { workspace = true }
 
 # Error handling
@@ -50,9 +49,6 @@ serde_json = { workspace = true }
 
 # Utilities
 async-trait = { workspace = true }
-base64 = { workspace = true }
-uuid = { workspace = true }
-tokio-util = { workspace = true, features = ["io"] }
 time = { workspace = true }
 bytes = { workspace = true }
 
@@ -61,7 +57,6 @@ s3s = { workspace = true }
 
 # FTPS specific dependencies (optional)
 libunftp = { workspace = true, optional = true }
-suppaftp = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]

@@ -34,6 +34,7 @@ path = "src/main.rs"
 default = ["metrics"]
 metrics = []
 ftps = ["rustfs-protocols/ftps"]
+full = ["metrics", "ftps"]
 
 [lints]
 workspace = true
