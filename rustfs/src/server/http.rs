@@ -626,8 +626,8 @@ fn process_connection(
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("unknown");
 
-                        let parent_context = global::get_text_map_propagator(|propogator| {
-                            propogator.extract(&HeaderMapCarrier::new(request.headers()))
+                        let parent_context = global::get_text_map_propagator(|propagator| {
+                            propagator.extract(&HeaderMapCarrier::new(request.headers()))
                         });
 
                         // Extract real client IP from trusted proxy middleware if available
