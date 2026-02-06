@@ -33,6 +33,7 @@ path = "src/main.rs"
 [features]
 default = ["metrics"]
 metrics = []
+ftps = ["rustfs-protocols/ftps"]
 
 [lints]
 workspace = true
@@ -54,6 +55,7 @@ rustfs-madmin = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
+rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio.workspace = true
 rustfs-s3select-api = { workspace = true }
@@ -131,12 +133,6 @@ aes-gcm = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
-
-# FTP and SFTP Libraries
-libunftp = { workspace = true }
-russh = { workspace = true }
-russh-sftp = { workspace = true }
-ssh-key = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true

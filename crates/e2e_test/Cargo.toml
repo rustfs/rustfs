@@ -23,6 +23,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+ftps = []
+
 [dependencies]
 rustfs-ecstore.workspace = true
 rustfs-common.workspace = true
@@ -52,7 +56,7 @@ rand = { workspace = true }
 chrono = { workspace = true }
 md5 = { workspace = true }
 sha2 = { workspace = true }
-suppaftp.workspace = true
+suppaftp = { workspace = true, features = ["tokio", "rustls-aws-lc-rs"] }
 rcgen.workspace = true
 anyhow.workspace = true
 rustls.workspace = true
