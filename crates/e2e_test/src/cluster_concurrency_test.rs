@@ -24,7 +24,9 @@ use tracing::{info, warn};
 const BUCKET: &str = "conditional-put-race-bucket";
 
 async fn cleanup_object(client: &Client, key: &str) {
-    let _ = client.delete_object().bucket(BUCKET).key(key).send().await;
+    if let Err(e) = client.delete_object().bucket(BUCKET).key(key).send().await {
+        warn!("Failed to delete object '{}' from bucket '{}' during cleanup: {:?}", key, BUCKET, e);
+    }
 }
 
 async fn conditional_put(
@@ -148,6 +150,7 @@ async fn test_conditional_put_race_cluster() -> Result<(), Box<dyn std::error::E
     let iterations = 5;
     let mut races_detected = 0;
     let mut correct_count = 0;
+    let mut error_count = 0;
 
     for i in 1..=iterations {
         let test_key = format!("race-test-{}-{}", std::process::id(), i);
@@ -161,8 +164,8 @@ async fn test_conditional_put_race_cluster() -> Result<(), Box<dyn std::error::E
                 }
             }
             Err(e) => {
-                races_detected += 1;
-                warn!("Iteration {} failed: {}", i, e)
+                error_count += 1;
+                warn!("Iteration {} failed (not a race; e.g. cluster/network): {}", i, e)
             }
         }
 
@@ -176,8 +179,14 @@ async fn test_conditional_put_race_cluster() -> Result<(), Box<dyn std::error::E
     info!("Total iterations:   {}", iterations);
     info!("Correct (1 winner): {}", correct_count);
     info!("Race conditions:    {}", races_detected);
+    info!("Errors (skipped):   {}", error_count);
 
     assert_eq!(races_detected, 0, "Race conditions detected: {}/{}", races_detected, iterations);
+    assert_eq!(
+        error_count, 0,
+        "{} iteration(s) failed due to errors (e.g. cluster not ready)",
+        error_count
+    );
 
     Ok(())
 }

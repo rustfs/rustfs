@@ -420,7 +420,7 @@ impl RustFSTestClusterEnvironment {
     ///   directory creation failure or available port lookup failure.
     pub async fn new(node_count: usize) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if node_count == 0 {
-            return Err("Zero node will be created".into());
+            return Err("Node count must be greater than zero".into());
         }
         let temp_dir = format!("/tmp/rustfs_cluster_test_{}", Uuid::new_v4());
         fs::create_dir_all(&temp_dir).await?;
@@ -584,7 +584,7 @@ impl RustFSTestClusterEnvironment {
                     clients.push(client);
                     Ok(clients)
                 }
-                Err(e) => Err(format!("Failed to create all S3 client for node: {}", e).into()),
+                Err(e) => Err(format!("Failed to create S3 client for node: {}", e).into()),
             },
         )
     }
