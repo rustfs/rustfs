@@ -526,6 +526,9 @@ struct ConnectionContext {
     readiness: Arc<GlobalReadiness>,
 }
 
+/// Adapter that implements the OpenTelemetry [`Extractor`] trait for Hyper's
+/// [`HeaderMap`], enabling trace context propagation by extracting
+/// OpenTelemetry headers from incoming HTTP requests.
 pub struct HeaderMapCarrier<'a> {
     headers: &'a HeaderMap,
 }
