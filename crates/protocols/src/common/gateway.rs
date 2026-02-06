@@ -12,7 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_credentials;
 use rustfs_policy::policy::action::S3Action as PolicyS3Action;
+use serde_json;
+use std::collections::HashMap;
+use thiserror::Error;
+use tracing::error;
+
+use super::session::SessionContext;
+
+/// Authorization errors
+#[derive(Debug, Error)]
+pub enum AuthorizationError {
+    #[error("Access denied")]
+    AccessDenied,
+}
 
 /// S3 actions that can be performed through the gateway
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -29,6 +43,7 @@ pub enum S3Action {
     PutObject,
     DeleteObject,
     HeadObject,
+    CopyObject,
 
     // Multipart operations
     CreateMultipartUpload,
@@ -43,9 +58,6 @@ pub enum S3Action {
     PutBucketAcl,
     GetObjectAcl,
     PutObjectAcl,
-
-    // Other operations
-    CopyObject,
 }
 
 impl From<S3Action> for PolicyS3Action {
@@ -106,5 +118,103 @@ impl S3Action {
             S3Action::PutObjectAcl => "s3:PutObjectAcl",
             S3Action::CopyObject => "s3:PutObject",
         }
+    }
+}
+
+/// Check if operation is supported for the given protocol
+pub fn is_operation_supported(protocol: super::session::Protocol, action: &S3Action) -> bool {
+    match protocol {
+        super::session::Protocol::Ftps => match action {
+            // Bucket operations
+            S3Action::CreateBucket => true,
+            S3Action::DeleteBucket => true,
+
+            // Object operations
+            S3Action::GetObject => true,    // RETR command
+            S3Action::PutObject => true,    // STOR and APPE commands both map to PutObject
+            S3Action::DeleteObject => true, // DELE command
+            S3Action::HeadObject => true,   // SIZE command
+
+            // Multipart operations
+            S3Action::CreateMultipartUpload => false,
+            S3Action::UploadPart => false,
+            S3Action::CompleteMultipartUpload => false,
+            S3Action::AbortMultipartUpload => false,
+            S3Action::ListMultipartUploads => false,
+            S3Action::ListParts => false,
+
+            // ACL operations
+            S3Action::GetBucketAcl => false,
+            S3Action::PutBucketAcl => false,
+            S3Action::GetObjectAcl => false,
+            S3Action::PutObjectAcl => false,
+
+            // Other operations
+            S3Action::CopyObject => false, // No native copy support in FTPS
+            S3Action::ListBucket => true,  // LIST command
+            S3Action::ListBuckets => true, // LIST at root level
+            S3Action::HeadBucket => true,  // Can check if directory exists
+        },
+    }
+}
+
+/// Check if a principal is allowed to perform an S3 action
+pub async fn is_authorized(session_context: &SessionContext, action: &S3Action, bucket: &str, object: Option<&str>) -> bool {
+    let iam_sys = match rustfs_iam::get() {
+        Ok(sys) => sys,
+        Err(e) => {
+            error!("IAM system unavailable: {}", e);
+            return false;
+        }
+    };
+
+    // Create policy arguments
+    let mut claims = HashMap::new();
+    claims.insert(
+        "principal".to_string(),
+        serde_json::Value::String(session_context.principal.access_key().to_string()),
+    );
+
+    let policy_action: rustfs_policy::policy::action::Action = action.clone().into();
+
+    // Check if user is the owner (admin)
+    let is_owner = if let Some(global_cred) = rustfs_credentials::get_global_action_cred() {
+        session_context.principal.access_key() == global_cred.access_key
+    } else {
+        false
+    };
+
+    let args = rustfs_policy::policy::Args {
+        account: session_context.principal.access_key(),
+        groups: &session_context.principal.user_identity.credentials.groups,
+        action: policy_action,
+        bucket,
+        conditions: &HashMap::new(),
+        is_owner,
+        object: object.unwrap_or(""),
+        claims: &claims,
+        deny_only: false,
+    };
+
+    iam_sys.is_allowed(&args).await
+}
+
+/// Authorize an operation and return an error if not authorized
+pub async fn authorize_operation(
+    session_context: &SessionContext,
+    action: &S3Action,
+    bucket: &str,
+    object: Option<&str>,
+) -> Result<(), AuthorizationError> {
+    // check if the operation is supported
+    if !is_operation_supported(session_context.protocol, action) {
+        return Err(AuthorizationError::AccessDenied);
+    }
+
+    // check IAM authorization
+    if is_authorized(session_context, action, bucket, object).await {
+        Ok(())
+    } else {
+        Err(AuthorizationError::AccessDenied)
     }
 }

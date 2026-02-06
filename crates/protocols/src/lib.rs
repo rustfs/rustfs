@@ -12,7 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! FTPS protocol implementation
+#![deny(unsafe_code)]
 
-pub mod driver;
-pub mod server;
+pub mod common;
+pub mod constants;
+
+#[cfg(feature = "ftps")]
+pub mod ftps;
+
+pub use common::session::Protocol;
+pub use common::{AuthorizationError, ProtocolPrincipal, S3Action, SessionContext, authorize_operation};
+
+#[cfg(feature = "ftps")]
+pub use ftps::{config::FtpsConfig, server::FtpsServer};

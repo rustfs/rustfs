@@ -36,15 +36,26 @@ const FTPS_ADDRESS: &str = "127.0.0.1:9021";
 pub async fn test_ftps_core_operations() -> Result<()> {
     let env = ProtocolTestEnvironment::new().map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // Generate and write certificate
-    let cert = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
-    let cert_path = PathBuf::from(&env.temp_dir).join("ftps.crt");
-    let key_path = PathBuf::from(&env.temp_dir).join("ftps.key");
+    let cert_dir = PathBuf::from(&env.temp_dir).join("ftps_certs");
+    tokio::fs::create_dir_all(&cert_dir).await?;
 
-    let cert_pem = cert.cert.pem();
-    let key_pem = cert.signing_key.serialize_pem();
-    tokio::fs::write(&cert_path, &cert_pem).await?;
-    tokio::fs::write(&key_path, &key_pem).await?;
+    // Generate default certificate for root directory
+    let default_cert = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
+    let default_cert_path = cert_dir.join("rustfs_cert.pem");
+    let default_key_path = cert_dir.join("rustfs_key.pem");
+    tokio::fs::write(&default_cert_path, default_cert.cert.pem()).await?;
+    tokio::fs::write(&default_key_path, default_cert.signing_key.serialize_pem()).await?;
+
+    // Create subdirectory for domain-specific certificate
+    let example_domain_dir = cert_dir.join("example1.com");
+    tokio::fs::create_dir_all(&example_domain_dir).await?;
+    let domain_cert = generate_simple_self_signed(vec!["example1.com".to_string()])?;
+    let domain_cert_path = example_domain_dir.join("rustfs_cert.pem");
+    let domain_key_path = example_domain_dir.join("rustfs_key.pem");
+    tokio::fs::write(&domain_cert_path, domain_cert.cert.pem()).await?;
+    tokio::fs::write(&domain_key_path, domain_cert.signing_key.serialize_pem()).await?;
+
+    info!("Generated 2 certificates in {:?}", cert_dir);
 
     // Start server manually
     info!("Starting FTPS server on {}", FTPS_ADDRESS);
@@ -52,8 +63,7 @@ pub async fn test_ftps_core_operations() -> Result<()> {
     let mut server_process = Command::new(&binary_path)
         .env("RUSTFS_FTPS_ENABLE", "true")
         .env("RUSTFS_FTPS_ADDRESS", FTPS_ADDRESS)
-        .env("RUSTFS_FTPS_CERTS_FILE", cert_path.to_str().unwrap())
-        .env("RUSTFS_FTPS_KEY_FILE", key_path.to_str().unwrap())
+        .env("RUSTFS_FTPS_CERTS_DIR", cert_dir.to_str().unwrap())
         .arg(&env.temp_dir)
         .spawn()?;
 
@@ -73,7 +83,7 @@ pub async fn test_ftps_core_operations() -> Result<()> {
         let mut root_store = RootCertStore::empty();
         // Add the self-signed certificate to the trust store for e2e
         // Note: In a real environment, you'd use proper root certificates
-        let cert_pem = cert.cert.pem();
+        let cert_pem = default_cert.cert.pem();
         let cert_der = rustls_pemfile::certs(&mut Cursor::new(cert_pem))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("Failed to parse cert: {}", e))?;
