@@ -644,7 +644,9 @@ fn process_connection(
                             uri = %request.uri(),
                             version = ?request.version(),
                         );
-                        span.set_parent(parent_context).unwrap();
+                        if let Err(e) = span.set_parent(parent_context) {
+                            warn!("Failed to propogate tracing context: `{:?}`", e);
+                        }
                         for (header_name, header_value) in request.headers() {
                             if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length" {
                                 span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
@@ -871,5 +873,86 @@ fn get_default_tcp_keepalive() -> TcpKeepalive {
             .with_time(Duration::from_secs(60))
             .with_interval(Duration::from_secs(5))
             .with_retries(3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderMap;
+    use opentelemetry::propagation::Extractor;
+
+    #[test]
+    fn test_headermap_carrier_new() {
+        let headers = HeaderMap::new();
+        let carrier = HeaderMapCarrier::new(&headers);
+        assert_eq!(carrier.keys().len(), 0);
+    }
+
+    #[test]
+    fn test_headermap_carrier_get() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", "test-agent".parse().unwrap());
+        headers.insert("x-request-id", "12345".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+
+        assert_eq!(carrier.get("user-agent"), Some("test-agent"));
+        assert_eq!(carrier.get("x-request-id"), Some("12345"));
+        assert_eq!(carrier.get("content-type"), None);
+    }
+
+    #[test]
+    fn test_headermap_carrier_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", "test-agent".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+        let keys = carrier.keys();
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"user-agent"));
+        assert!(keys.contains(&"content-type"));
+    }
+
+    #[test]
+    fn test_headermap_carrier_get_all() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-custom-header", "value1".parse().unwrap());
+        headers.append("x-custom-header", "value2".parse().unwrap());
+        headers.insert("user-agent", "test-agent".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+
+        // Test multi-value header
+        let values = carrier.get_all("x-custom-header");
+        assert!(values.is_some());
+        let v = values.unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v.contains(&"value1"));
+        assert!(v.contains(&"value2"));
+
+        // Test single value header
+        let values = carrier.get_all("user-agent");
+        assert!(values.is_some());
+        let v = values.unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], "test-agent");
+
+        // Test missing header
+        assert_eq!(carrier.get_all("missing-header"), None);
+    }
+
+    #[test]
+    fn test_headermap_carrier_case_insensitivity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+
+        // HeaderMap::get is case insensitive
+        assert_eq!(carrier.get("Content-Type"), Some("application/json"));
+        assert_eq!(carrier.get("CONTENT-TYPE"), Some("application/json"));
     }
 }
