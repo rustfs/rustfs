@@ -17,8 +17,8 @@
 use crate::error::{KmsError, Result};
 use crate::types::EncryptionAlgorithm;
 use aes_gcm::{
-    aead::{Aead, KeyInit}, Aes256Gcm, Key,
-    Nonce,
+    Aes256Gcm, Key, Nonce,
+    aead::{Aead, KeyInit},
 };
 use chacha20poly1305::ChaCha20Poly1305;
 use rand::RngExt;

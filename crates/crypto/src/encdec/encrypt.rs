@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 #[cfg(any(test, feature = "crypto"))]
 pub fn encrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Error> {
     use crate::encdec::id::ID;

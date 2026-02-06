@@ -14,7 +14,7 @@
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
 use rand::{Rng, RngExt};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::io::{Error, Result};
 
 /// Generates a random access key of the specified length.

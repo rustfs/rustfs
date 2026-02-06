@@ -12,25 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::StorageAPI;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata_sys;
+use crate::bucket::replication::ResyncOpts;
+use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::replicate_delete;
 use crate::bucket::replication::replicate_object;
 use crate::bucket::replication::replication_resyncer::{
-    get_heal_replicate_object_info, BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationConfig,
-    ReplicationResyncer,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationConfig, ReplicationResyncer,
+    get_heal_replicate_object_info,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
-use crate::bucket::replication::ResyncOpts;
-use crate::bucket::replication::ResyncStatusType;
 use crate::config::com::read_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
 use crate::store_api::ObjectInfo;
-use crate::StorageAPI;
 use lazy_static::lazy_static;
-use rustfs_filemeta::replication_statuses_map;
-use rustfs_filemeta::version_purge_statuses_map;
 use rustfs_filemeta::MrfReplicateEntry;
 use rustfs_filemeta::ReplicateDecision;
 use rustfs_filemeta::ReplicateObjectInfo;
@@ -40,19 +38,21 @@ use rustfs_filemeta::ReplicationType;
 use rustfs_filemeta::ReplicationWorkerOperation;
 use rustfs_filemeta::ResyncDecision;
 use rustfs_filemeta::VersionPurgeStatusType;
+use rustfs_filemeta::replication_statuses_map;
+use rustfs_filemeta::version_purge_statuses_map;
 use rustfs_filemeta::{REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE};
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use std::any::Any;
+use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::Mutex;
-use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
