@@ -28,7 +28,6 @@ categories = ["network-programming", "filesystem"]
 [features]
 default = []
 ftps = ["libunftp", "suppaftp", "rustls"]
-sftp = ["russh", "russh-sftp", "ssh-key"]
 
 [dependencies]
 # Core RustFS dependencies
@@ -64,11 +63,6 @@ s3s = { workspace = true }
 libunftp = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
-
-# SFTP specific dependencies (optional)
-russh = { workspace = true, optional = true }
-russh-sftp = { workspace = true, optional = true }
-ssh-key = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
 all-features = true

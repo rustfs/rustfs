@@ -155,37 +155,6 @@ pub fn is_operation_supported(protocol: super::session::Protocol, action: &S3Act
             S3Action::ListBuckets => true, // LIST at root level
             S3Action::HeadBucket => true,  // Can check if directory exists
         },
-        super::session::Protocol::Sftp => match action {
-            // Bucket operations: SFTP can create/delete buckets via mkdir/rmdir
-            S3Action::CreateBucket => true,
-            S3Action::DeleteBucket => true,
-
-            // Object operations: All file operations supported
-            S3Action::GetObject => true,    // RealPath + Open + Read
-            S3Action::PutObject => true,    // Open + Write
-            S3Action::DeleteObject => true, // Remove
-            S3Action::HeadObject => true,   // Stat/Fstat
-
-            // Multipart operations
-            S3Action::CreateMultipartUpload => false,
-            S3Action::UploadPart => false,
-            S3Action::CompleteMultipartUpload => false,
-            S3Action::AbortMultipartUpload => false,
-            S3Action::ListMultipartUploads => false,
-            S3Action::ListParts => false,
-
-            // ACL operations
-            S3Action::GetBucketAcl => false,
-            S3Action::PutBucketAcl => false,
-            S3Action::GetObjectAcl => false,
-            S3Action::PutObjectAcl => false,
-
-            // Other operations
-            S3Action::CopyObject => false, // No remote copy, only local rename
-            S3Action::ListBucket => true,  // Readdir
-            S3Action::ListBuckets => true, // Readdir at root
-            S3Action::HeadBucket => true,  // Stat on directory
-        },
     }
 }
 

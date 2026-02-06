@@ -275,9 +275,6 @@ opentelemetry-stdout = { version = "0.31.0" }
 
 # FTP and SFTP
 libunftp = { version = "0.21.0", features = ["experimental"] }
-russh = { version = "0.57.0", features = ["aws-lc-rs", "rsa"], default-features = false }
-russh-sftp = { version = "2.1.1" }
-ssh-key = { version = "0.7.0-rc.6", features = ["std", "rsa", "ed25519", "ecdsa"] }
 suppaftp = { version = "8.0.1", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.7"
 

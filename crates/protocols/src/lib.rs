@@ -20,14 +20,8 @@ pub mod constants;
 #[cfg(feature = "ftps")]
 pub mod ftps;
 
-#[cfg(feature = "sftp")]
-pub mod sftp;
-
 pub use common::session::Protocol;
 pub use common::{AuthorizationError, ProtocolPrincipal, S3Action, SessionContext, authorize_operation};
 
 #[cfg(feature = "ftps")]
 pub use ftps::{config::FtpsConfig, server::FtpsServer};
-
-#[cfg(feature = "sftp")]
-pub use sftp::{config::SftpConfig, server::SftpServer};

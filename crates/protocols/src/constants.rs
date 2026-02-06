@@ -39,24 +39,6 @@ pub mod network {
     pub const AUTH_FAILURE_DELAY_MS: u64 = 300;
 }
 
-/// SFTP constants
-#[cfg(feature = "sftp")]
-pub mod sftp {
-    pub const INITIAL_HANDLE_ID: u32 = 1;
-    pub const HANDLE_ID_PREFIX: &str = "handle_";
-    pub const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024 * 5; // 5GB
-    pub const DEFAULT_CHUNK_SIZE: usize = 8192;
-    pub const MAX_OPEN_HANDLES: u32 = 1000;
-    pub const SFTP_BUFFER_SIZE: usize = 65536;
-    pub const SFTP_SUBSYSTEM: &str = "sftp";
-    pub const CRITICAL_OPTION_SOURCE_ADDRESS: &str = "source-address";
-
-    /// SSH key types
-    pub const SSH_KEY_TYPE_RSA: &str = "ssh-rsa";
-    pub const SSH_KEY_TYPE_ED25519: &str = "ssh-ed25519";
-    pub const SSH_KEY_TYPE_ECDSA: &str = "ecdsa-";
-}
-
 /// FTPS constants
 #[cfg(feature = "ftps")]
 pub mod ftps {
@@ -69,8 +51,6 @@ pub mod defaults {
     /// Default protocol addresses
     #[cfg(feature = "ftps")]
     pub const DEFAULT_FTPS_ADDRESS: &str = "0.0.0.0:8021";
-    #[cfg(feature = "sftp")]
-    pub const DEFAULT_SFTP_ADDRESS: &str = "0.0.0.0:8022";
 
     /// Default FTPS passive port range
     #[cfg(feature = "ftps")]

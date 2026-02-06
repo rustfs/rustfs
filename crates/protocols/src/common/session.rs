@@ -20,7 +20,6 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Ftps,
-    Sftp,
 }
 
 /// Protocol principal representing an authenticated user
