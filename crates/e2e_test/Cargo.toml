@@ -26,7 +26,6 @@ workspace = true
 [features]
 default = []
 ftps = []
-sftp = []
 
 [dependencies]
 rustfs-ecstore.workspace = true
