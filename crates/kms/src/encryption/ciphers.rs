@@ -17,11 +17,11 @@
 use crate::error::{KmsError, Result};
 use crate::types::EncryptionAlgorithm;
 use aes_gcm::{
-    Aes256Gcm, Key, Nonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit}, Aes256Gcm, Key,
+    Nonce,
 };
 use chacha20poly1305::ChaCha20Poly1305;
-use rand::Rng;
+use rand::RngExt;
 
 /// Trait for object encryption ciphers
 #[cfg_attr(not(test), allow(dead_code))]

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
-use rand::{Rng, RngCore};
-use serde::{Serialize, de::DeserializeOwned};
+use rand::{Rng, RngExt};
+use serde::{de::DeserializeOwned, Serialize};
 use std::io::{Error, Result};
 
 /// Generates a random access key of the specified length.

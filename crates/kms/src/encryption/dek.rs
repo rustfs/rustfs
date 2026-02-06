@@ -23,7 +23,7 @@
 use crate::error::{KmsError, Result};
 use async_trait::async_trait;
 use jiff::Zoned;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -96,8 +96,8 @@ impl AesDekCrypto {
 impl DekCrypto for AesDekCrypto {
     async fn encrypt(&self, key_material: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         use aes_gcm::{
-            Aes256Gcm, Key, Nonce,
-            aead::{Aead, KeyInit},
+            aead::{Aead, KeyInit}, Aes256Gcm, Key,
+            Nonce,
         };
 
         // Validate key material length
@@ -128,8 +128,8 @@ impl DekCrypto for AesDekCrypto {
 
     async fn decrypt(&self, key_material: &[u8], ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
         use aes_gcm::{
-            Aes256Gcm, Key, Nonce,
-            aead::{Aead, KeyInit},
+            aead::{Aead, KeyInit}, Aes256Gcm, Key,
+            Nonce,
         };
 
         // Validate nonce length

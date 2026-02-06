@@ -224,7 +224,7 @@ path-absolutize = "3.1.1"
 path-clean = "1.0.1"
 pin-project-lite = "0.2.16"
 pretty_assertions = "1.4.1"
-rand = { version = "0.10.0-rc.8", features = ["serde"], git = "https://github.com/rust-random/rand.git", rev = "9c98f59e8b042e5c7c714e933e49b384a4ce75a6" }
+rand = { version = "0.10.0-rc.9", features = ["serde"] }
 rayon = "1.11.0"
 reed-solomon-simd = { version = "3.1.0" }
 regex = { version = "1.12.3" }
@@ -232,7 +232,7 @@ rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.3", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", rev = "f1e222382438c4de24895ec5070e0f22060acbec" }
+s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", rev = "355141446e358fdd4d71a32408b9fbebd65359c7" }
 serial_test = "3.3.1"
 shadow-rs = { version = "1.7.0", default-features = false }
 siphasher = "1.0.2"
@@ -288,9 +288,6 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profilin
 jemalloc_pprof = { version = "0.8.1", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
-
-#[patch.crates-io]
-#curve25519-dalek = { git = "https://github.com/dalek-cryptography/curve25519-dalek.git", branch = "main" }
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rustfs-mcp"]

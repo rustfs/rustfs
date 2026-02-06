@@ -16,7 +16,7 @@
 
 use backtrace::Backtrace;
 use pprof::protos::Message;
-use rand::Rng;
+use rand::RngExt;
 use starshard::ShardedHashMap;
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;

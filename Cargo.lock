@@ -3043,7 +3043,7 @@ dependencies = [
  "flatbuffers",
  "futures",
  "md5",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "rcgen",
  "reqwest 0.13.1",
  "rmp-serde",
@@ -6338,8 +6338,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.0-rc.8"
-source = "git+https://github.com/rust-random/rand.git?rev=9c98f59e8b042e5c7c714e933e49b384a4ce75a6#9c98f59e8b042e5c7c714e933e49b384a4ce75a6"
+version = "0.10.0-rc.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a8cd8be2e7e2fd2ee3e09045798e65c906682ec9f16293defc4790dd775d5a3"
 dependencies = [
  "chacha20",
  "getrandom 0.4.1",
@@ -6849,7 +6850,7 @@ dependencies = [
  "moka",
  "pin-project-lite",
  "pprof",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "reqwest 0.13.1",
  "rmp-serde",
  "rust-embed",
@@ -6914,7 +6915,7 @@ name = "rustfs-appauth"
 version = "0.0.5"
 dependencies = [
  "base64-simd",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "rsa",
  "serde",
  "serde_json",
@@ -6986,7 +6987,7 @@ name = "rustfs-credentials"
 version = "0.0.5"
 dependencies = [
  "base64-simd",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "serde",
  "serde_json",
  "time",
@@ -7002,7 +7003,7 @@ dependencies = [
  "chacha20poly1305",
  "jsonwebtoken",
  "pbkdf2 0.13.0-rc.9",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "serde_json",
  "sha2 0.11.0-rc.5",
  "test-case",
@@ -7052,7 +7053,7 @@ dependencies = [
  "path-absolutize",
  "pin-project-lite",
  "quick-xml 0.39.0",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "reed-solomon-simd",
  "regex",
  "reqwest 0.13.1",
@@ -7153,7 +7154,7 @@ dependencies = [
  "futures",
  "jsonwebtoken",
  "pollster",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "rustfs-credentials",
  "rustfs-crypto",
  "rustfs-ecstore",
@@ -7181,7 +7182,7 @@ dependencies = [
  "jiff",
  "md5",
  "moka",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "reqwest 0.13.1",
  "serde",
  "serde_json",
@@ -7384,7 +7385,7 @@ dependencies = [
  "http 1.4.0",
  "md-5 0.11.0-rc.5",
  "pin-project-lite",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "reqwest 0.13.1",
  "rustfs-config",
  "rustfs-utils",
@@ -7451,7 +7452,7 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "path-clean",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "rmp-serde",
  "rustfs-common",
  "rustfs-config",
@@ -7552,7 +7553,7 @@ dependencies = [
  "lz4",
  "md-5 0.11.0-rc.5",
  "netif",
- "rand 0.10.0-rc.8",
+ "rand 0.10.0-rc.9",
  "regex",
  "rustfs-config",
  "rustix 1.1.3",
@@ -7775,7 +7776,7 @@ checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 [[package]]
 name = "s3s"
 version = "0.13.0-alpha.2"
-source = "git+https://github.com/s3s-project/s3s.git?rev=f1e222382438c4de24895ec5070e0f22060acbec#f1e222382438c4de24895ec5070e0f22060acbec"
+source = "git+https://github.com/s3s-project/s3s.git?rev=355141446e358fdd4d71a32408b9fbebd65359c7#355141446e358fdd4d71a32408b9fbebd65359c7"
 dependencies = [
  "arc-swap",
  "arrayvec",
