@@ -320,11 +320,24 @@ mod serial_tests {
         let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
         heal_manager.start().await.unwrap();
 
-        // Wait for task completion
-        // The minimal scanner interval is clamped to 10s in manager.rs, so we must wait longer than that
-        tokio::time::sleep(tokio::time::Duration::from_secs(12)).await;
+        // ─── 2️⃣ wait for format.json to be restored with polling + timeout ───────
+        // The minimal scanner interval is clamped to 10s in manager.rs, so we set timeout to 20s
+        let timeout_duration = Duration::from_secs(20);
+        let poll_interval = Duration::from_millis(200);
 
-        // ─── 2️⃣ verify format.json is restored ───────
+        let result = tokio::time::timeout(timeout_duration, async {
+            loop {
+                if format_path.exists() {
+                    break;
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "format.json was not restored within timeout period");
+
+        // ─── 3️⃣ verify format.json is restored ───────
         assert!(format_path.exists(), "format.json does not exist on disk after heal");
 
         info!("Heal format basic test passed");
@@ -367,13 +380,26 @@ mod serial_tests {
         let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
         heal_manager.start().await.unwrap();
 
-        // Wait for task completion
-        // The minimal scanner interval is clamped to 10s in manager.rs, so we must wait longer than that
-        tokio::time::sleep(tokio::time::Duration::from_secs(12)).await;
+        // ─── 2️⃣ wait for format.json and part file to be restored with polling + timeout ───────
+        // The minimal scanner interval is clamped to 10s in manager.rs, so we set timeout to 20s
+        let timeout_duration = Duration::from_secs(20);
+        let poll_interval = Duration::from_millis(200);
 
-        // ─── 2️⃣ verify format.json is restored ───────
+        let result = tokio::time::timeout(timeout_duration, async {
+            loop {
+                if format_path.exists() && target_part.exists() {
+                    break;
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "format.json or part file was not restored within timeout period");
+
+        // ─── 3️⃣ verify format.json is restored ───────
         assert!(format_path.exists(), "format.json does not exist on disk after heal");
-        // ─── 3 verify each part file is restored ───────
+        // ─── 4️⃣ verify each part file is restored ───────
         assert!(target_part.exists());
 
         info!("Heal format basic test passed");

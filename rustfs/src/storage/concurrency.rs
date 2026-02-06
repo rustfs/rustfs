@@ -1718,6 +1718,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_hot_object_cache() {
         let cache = HotObjectCache::new();
         let test_data = vec![1u8; 1024];
@@ -1754,6 +1755,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_reject_large_objects() {
         let cache = HotObjectCache::new();
         let large_data = vec![0u8; 11 * MI_B]; // Larger than max_object_size
@@ -1774,6 +1776,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_disk_read_permits() {
         let manager = ConcurrencyManager::new();
 
@@ -1811,6 +1814,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_hot_keys_tracking() {
         let manager = ConcurrencyManager::new();
 
@@ -1831,6 +1835,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_batch_operations() {
         let manager = ConcurrencyManager::new();
 
@@ -1866,6 +1871,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_warm_cache() {
         let manager = ConcurrencyManager::new();
 
