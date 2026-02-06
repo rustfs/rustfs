@@ -12,16 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Session context for protocol implementations
-
-use crate::protocols::session::principal::ProtocolPrincipal;
+use rustfs_policy::auth::UserIdentity;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 /// Protocol types
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Ftps,
-    Sftp,
+}
+
+/// Protocol principal representing an authenticated user
+#[derive(Debug, Clone)]
+pub struct ProtocolPrincipal {
+    /// User identity from IAM system
+    pub user_identity: Arc<UserIdentity>,
+}
+
+impl ProtocolPrincipal {
+    pub fn new(user_identity: Arc<UserIdentity>) -> Self {
+        Self { user_identity }
+    }
+    pub fn access_key(&self) -> &str {
+        &self.user_identity.credentials.access_key
+    }
 }
 
 /// Session context for protocol operations
@@ -29,10 +43,8 @@ pub enum Protocol {
 pub struct SessionContext {
     /// The protocol principal (authenticated user)
     pub principal: ProtocolPrincipal,
-
     /// The protocol type
     pub protocol: Protocol,
-
     /// The source IP address
     pub source_ip: IpAddr,
 }
