@@ -87,6 +87,22 @@ spec:
               fi
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
+              echo "Checking for certificates in /opt/tls..."
+
+              until [ -f /opt/tls/client_ca.crt ] && [ -f /opt/tls/client_cert.pem ] && [ -f /opt/tls/client_key.pem ]; do
+                echo "Waiting for certificates to be mounted..."
+                sleep 2
+              done
+
+              if [ ! -s /opt/tls/client_ca.crt ]; then
+                echo "ERROR: ca.crt is empty!"
+                exit 1
+              fi
+
+              grep -q "BEGIN CERTIFICATE" /opt/tls/client_ca.crt || { echo "ca.crt is not a valid PEM"; exit 1; }
+
+              echo "All certificates are present and valid. Starting RustFS..."
+
           volumeMounts:
             {{- if eq (int .Values.replicaCount) 4 }}
             {{- range $i := until (int .Values.replicaCount) }}
@@ -99,6 +115,47 @@ spec:
             {{- end }}
             - name: logs
               mountPath: /mnt/rustfs
+            - name: client-cert
+              mountPath: /opt/tls/client_cert.pem
+              subPath: client_cert.pem
+            - name: client-cert
+              mountPath: /opt/tls/client_key.pem
+              subPath: client_key.pem
+            - name: client-cert
+              mountPath: /opt/tls/client_ca.crt
+              subPath: client_ca.crt
+            - name: server-cert
+              mountPath: /opt/tls/rustfs_cert.pem
+              subPath: rustfs_cert.pem
+            - name: server-cert
+              mountPath: /opt/tls/rustfs_key.pem
+              subPath: rustfs_key.pem
+            - name: server-cert
+              mountPath: /opt/tls/ca.crt
+              subPath: ca.crt
+      volumes:
+        - name: server-cert
+          secret:
+            secretName: rustfs-server-tls
+            defaultMode: 0444
+            items:
+              - key: tls.crt
+                path: rustfs_cert.pem
+              - key: tls.key
+                path: rustfs_key.pem
+              - key: ca.crt
+                path: ca.crt
+        - name: client-cert
+          secret:
+            secretName: rustfs-client-tls
+            defaultMode: 0444
+            items:
+              - key: tls.key
+                path: client_key.pem
+              - key: tls.crt
+                path: client_cert.pem
+              - key: ca.crt
+                path: client_ca.crt
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
@@ -118,11 +175,25 @@ spec:
                 name: {{ include "rustfs.secretName" . }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          livenessProbe:
-            {{- toYaml .Values.livenessProbe | nindent 12 }}
-          readinessProbe:
-            {{- toYaml .Values.readinessProbe | nindent 12 }}
           volumeMounts:
+            - name: client-cert
+              mountPath: /opt/tls/client_cert.pem
+              subPath: client_cert.pem
+            - name: client-cert
+              mountPath: /opt/tls/client_key.pem
+              subPath: client_key.pem
+            - name: client-cert
+              mountPath: /opt/tls/client_ca.crt
+              subPath: client_ca.crt
+            - name: server-cert
+              mountPath: /opt/tls/rustfs_cert.pem
+              subPath: rustfs_cert.pem
+            - name: server-cert
+              mountPath: /opt/tls/rustfs_key.pem
+              subPath: rustfs_key.pem
+            - name: server-cert
+              mountPath: /opt/tls/ca.crt
+              subPath: ca.crt
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
@@ -135,6 +206,27 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
+      volumes:
+        - name: server-cert
+          secret:
+            secretName: rustfs-server-tls
+            items:
+              - key: tls.crt
+                path: rustfs_cert.pem
+              - key: tls.key
+                path: rustfs_key.pem
+              - key: ca.crt
+                path: ca.crt
+        - name: client-cert
+          secret:
+            secretName: rustfs-client-tls
+            items:
+              - key: tls.crt
+                path: client_cert.pem
+              - key: tls.key
+                path: client_key.pem
+              - key: ca.crt
+                path: client_ca.crt
   volumeClaimTemplates:
     - metadata:
         name: logs

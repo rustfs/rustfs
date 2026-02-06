@@ -35,3 +35,10 @@ data:
   {{- else }}
   RUSTFS_VOLUMES: "/data"
   {{- end }}
+  {{- if .Values.mtls.enabled }}
+  RUSTFS_SERVER_MTLS_ENABLE: "1"
+  RUSTFS_TLS_KEYLOG: "1"
+  RUSTFS_TLS_PATH: "/opt/tls"
+  {{- end }}
+  # RUSTFS_MTLS_CLIENT_CERT: "/opt/tls/client_cert.pem"
+  # RUSTFS_MTLS_CLIENT_KEY: "/opt/tls/client_key.pem"
