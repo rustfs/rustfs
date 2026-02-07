@@ -1,0 +1,9 @@
+{{- if .Values.mtls.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "rustfs.fullname" . }}-ca-issuer
+spec:
+  ca:
+    secretName: {{ include "rustfs.fullname" . }}-root-ca-secret
+{{- end }}

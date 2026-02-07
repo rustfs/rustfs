@@ -118,11 +118,29 @@ spec:
                 name: {{ include "rustfs.secretName" . }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          livenessProbe:
-            {{- toYaml .Values.livenessProbe | nindent 12 }}
-          readinessProbe:
-            {{- toYaml .Values.readinessProbe | nindent 12 }}
           volumeMounts:
+            {{- if .Values.mtls.enabled }}
+            {{- if not .Values.mtls.serverOnly }}
+            - name: client-cert
+              mountPath: /opt/tls/client_cert.pem
+              subPath: client_cert.pem
+            - name: client-cert
+              mountPath: /opt/tls/client_key.pem
+              subPath: client_key.pem
+            - name: client-cert
+              mountPath: /opt/tls/client_ca.crt
+              subPath: client_ca.crt
+            {{- end }}
+            - name: server-cert
+              mountPath: /opt/tls/rustfs_cert.pem
+              subPath: rustfs_cert.pem
+            - name: server-cert
+              mountPath: /opt/tls/rustfs_key.pem
+              subPath: rustfs_key.pem
+            - name: server-cert
+              mountPath: /opt/tls/ca.crt
+              subPath: ca.crt
+            {{- end }}
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
@@ -135,6 +153,31 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
+      {{- if .Values.mtls.enabled }}
+      volumes:
+        - name: server-cert
+          secret:
+            secretName: rustfs-server-tls
+            items:
+              - key: tls.crt
+                path: rustfs_cert.pem
+              - key: tls.key
+                path: rustfs_key.pem
+              - key: ca.crt
+                path: ca.crt
+        {{- if not .Values.mtls.serverOnly }}
+        - name: client-cert
+          secret:
+            secretName: rustfs-client-tls
+            items:
+              - key: tls.crt
+                path: client_cert.pem
+              - key: tls.key
+                path: client_key.pem
+              - key: ca.crt
+                path: client_ca.crt
+        {{- end }}
+      {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: logs
