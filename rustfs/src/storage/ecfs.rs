@@ -3441,10 +3441,15 @@ impl S3 for FS {
             }
         }
 
-        if let Some(content_type) = metadata_map.get("content-type")
-            && let Ok(header_value) = HeaderValue::from_str(content_type)
+        if !response
+            .headers
+            .contains_key(http::header::CONTENT_TYPE)
         {
-            response.headers.insert(http::header::CONTENT_TYPE, header_value);
+            if let Some(content_type) = metadata_map.get("content-type")
+                && let Ok(header_value) = HeaderValue::from_str(content_type)
+            {
+                response.headers.insert(http::header::CONTENT_TYPE, header_value);
+            }
         }
 
         // Add x-amz-tagging-count header if object has tags
