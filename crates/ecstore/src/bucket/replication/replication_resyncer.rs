@@ -1899,8 +1899,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(err.to_string());
             warn!(
-                "replication put_object failed bucket={} object={} err={:?}",
-                tgt_client.bucket, object, err
+                "replication put_object failed src_bucket={} dest_bucket={} object={} err={:?}",
+                bucket, tgt_client.bucket, object, err
             );
 
             // TODO: check offline
