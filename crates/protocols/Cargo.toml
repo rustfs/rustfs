@@ -27,7 +27,7 @@ categories = ["network-programming", "filesystem"]
 
 [features]
 default = []
-ftps = ["libunftp", "rustls"]
+ftps = ["dep:libunftp", "dep:rustls"]
 
 [dependencies]
 # Core RustFS dependencies
