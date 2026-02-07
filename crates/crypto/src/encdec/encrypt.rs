@@ -58,7 +58,7 @@ fn encrypt<T: aes_gcm::aead::Aead>(
     use crate::error::Error;
     use aes_gcm::AeadCore;
     use aes_gcm::aead::array::Array;
-    use rand::RngCore;
+    use rand::Rng;
 
     let mut nonce: Array<u8, <T as AeadCore>::NonceSize> = Array::default();
     rand::rng().fill_bytes(&mut nonce);
