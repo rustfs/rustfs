@@ -45,6 +45,7 @@ members = [
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
+    "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
 ]
 resolver = "2"
 
@@ -58,6 +59,7 @@ homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
 keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
 categories = ["web-programming", "development-tools", "filesystem", "network-programming"]
+authors = ["RustFS Team"]
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -97,6 +99,7 @@ rustfs-targets = { path = "crates/targets", version = "0.0.5" }
 rustfs-utils = { path = "crates/utils", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
 rustfs-zip = { path = "./crates/zip", version = "0.0.5" }
+rustfs-protocols = { path = "crates/protocols", version = "0.0.5" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
@@ -271,11 +274,8 @@ opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_
 opentelemetry-stdout = { version = "0.31.0" }
 
 # FTP and SFTP
-libunftp = { version = "0.21.0" }
-russh = { version = "0.57.0", features = ["aws-lc-rs", "rsa"], default-features = false }
-russh-sftp = { version = "2.1.1" }
-ssh-key = { version = "0.7.0-rc.6", features = ["std", "rsa", "ed25519"] }
-suppaftp = { version = "7.1.0", features = ["tokio", "tokio-rustls", "rustls"] }
+libunftp = { version = "0.21.0", features = ["experimental"] }
+suppaftp = { version = "8.0.1", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.7"
 
 # Performance Analysis and Memory Profiling

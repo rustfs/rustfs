@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Protocol tests for FTPS and SFTP
+//! Protocol tests for FTPS
 
 pub mod ftps_core;
 pub mod test_env;

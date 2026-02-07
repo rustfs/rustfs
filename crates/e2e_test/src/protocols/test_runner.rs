@@ -59,12 +59,9 @@ struct TestDefinition {
 impl ProtocolTestSuite {
     /// Create default test suite
     pub fn new() -> Self {
-        let tests = vec![
-            TestDefinition {
-                name: "test_ftps_core_operations".to_string(),
-            },
-            // TestDefinition { name: "test_sftp_core_operations".to_string() },
-        ];
+        let tests = vec![TestDefinition {
+            name: "test_ftps_core_operations".to_string(),
+        }];
 
         Self { tests }
     }
@@ -85,10 +82,6 @@ impl ProtocolTestSuite {
                 "test_ftps_core_operations" => {
                     info!("=== Starting FTPS Module Test ===");
                     "FTPS core operations (put, ls, mkdir, rmdir, delete)"
-                }
-                "test_sftp_core_operations" => {
-                    info!("=== Starting SFTP Module Test ===");
-                    "SFTP core operations (put, ls, mkdir, rmdir, delete)"
                 }
                 _ => "",
             };
@@ -128,7 +121,6 @@ impl ProtocolTestSuite {
     async fn run_single_test(&self, test_def: &TestDefinition) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match test_def.name.as_str() {
             "test_ftps_core_operations" => test_ftps_core_operations().await.map_err(|e| e.into()),
-            // "test_sftp_core_operations" => test_sftp_core_operations().await.map_err(|e| e.into()),
             _ => Err(format!("Test {} not implemented", test_def.name).into()),
         }
     }

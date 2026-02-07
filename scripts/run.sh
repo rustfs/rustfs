@@ -196,8 +196,22 @@ export RUSTFS_HEAL_QUEUE_SIZE=10000
 # rustfs trust system CA certificates
 export RUSTFS_TRUST_SYSTEM_CA=true
 
-# Enable FTP server
-export RUSTFS_FTPS_ENABLE=false
+# FTP/FTPS Configuration
+#
+# Certificate directory structure:
+# deploy/certs/ftps/
+# ├── rustfs_cert.pem  (server certificate)
+# ├── rustfs_key.pem   (server private key)
+# └── example1.com/    (optional: domain-specific certificates)
+#     ├── rustfs_cert.pem
+#     └── rustfs_key.pem
+
+# export RUSTFS_FTP_ENABLE=true
+# export RUSTFS_FTP_ADDRESS="0.0.0.0:8021"
+
+# export RUSTFS_FTPS_ENABLE=true
+# export RUSTFS_FTPS_ADDRESS="0.0.0.0:8022"
+# export RUSTFS_FTPS_CERTS_DIR="${current_dir}/deploy/certs/ftps"
 
 # Use default timeout (60 seconds)
 # No environment variable needed
@@ -233,6 +247,8 @@ fi
 # Start main service
 # To run with profiling enabled, uncomment the following line and comment the next line
 #cargo run --profile profiling --bin rustfs
+# To run with FTP/FTPS support, use:
+# cargo run --bin rustfs --features ftps
 # To run in release mode, use the following line
 #cargo run --profile release --bin rustfs
 # To run in debug mode, use the following line
