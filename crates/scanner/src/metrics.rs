@@ -502,8 +502,8 @@ impl Metrics {
 }
 
 // Type aliases for compatibility with existing code
-pub type UpdateCurrentPathFn = Arc<dyn Fn(&str) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
-pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+pub type UpdateCurrentPathFn = Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Create a current path updater for tracking scan progress
 pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
@@ -519,7 +519,7 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
 
     let update_fn = {
         let tracker = Arc::clone(&tracker);
-        Arc::new(move |path: &str| -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Arc::new(move |path: &str| -> Pin<Box<dyn Future<Output = ()> + Send>> {
             let tracker = Arc::clone(&tracker);
             let path = path.to_string();
             Box::pin(async move {
@@ -530,7 +530,7 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
 
     let done_fn = {
         let disk_name = disk_name.clone();
-        Arc::new(move || -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Arc::new(move || -> Pin<Box<dyn Future<Output = ()> + Send>> {
             let disk_name = disk_name.clone();
             Box::pin(async move {
                 global_metrics().current_paths.write().await.remove(&disk_name);
@@ -555,7 +555,7 @@ impl CloseDiskGuard {
     }
 
     pub async fn close(&self) {
-        (self.0)().await;
+        self.0().await;
     }
 }
 

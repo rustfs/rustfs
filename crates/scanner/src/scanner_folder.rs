@@ -1086,7 +1086,7 @@ pub async fn scan_data_folder(
 
     // Create skip_heal flag
     let is_erasure_mode = is_erasure().await;
-    let skip_heal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!is_erasure_mode || cache.info.skip_healing));
+    let skip_heal = Arc::new(std::sync::atomic::AtomicBool::new(!is_erasure_mode || cache.info.skip_healing));
 
     // Create heal_object_select flag
     let heal_object_select = if is_erasure_mode && !cache.info.skip_healing {
@@ -1144,11 +1144,11 @@ pub async fn scan_data_folder(
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = cache.info.next_cycle;
 
-            (close_disk)().await;
+            close_disk().await;
             Ok(new_cache.clone())
         }
         Err(e) => {
-            (close_disk)().await;
+            close_disk().await;
             // No useful information, return original cache
             Err(e)
         }

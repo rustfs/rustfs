@@ -86,13 +86,10 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
 
     // Get last healing information
     match read_config(storeapi, &BACKGROUND_HEAL_INFO_PATH).await {
-        Ok(buf) => match serde_json::from_slice::<BackgroundHealInfo>(&buf) {
-            Ok(info) => info,
-            Err(e) => {
-                error!("Failed to unmarshal background heal info from {}: {}", &*BACKGROUND_HEAL_INFO_PATH, e);
-                BackgroundHealInfo::default()
-            }
-        },
+        Ok(buf) => serde_json::from_slice::<BackgroundHealInfo>(&buf).unwrap_or_else(|e| {
+            error!("Failed to unmarshal background heal info from {}: {}", &*BACKGROUND_HEAL_INFO_PATH, e);
+            BackgroundHealInfo::default()
+        }),
         Err(e) => {
             // Only log if it's not a ConfigNotFound error
             if e != EcstoreError::ConfigNotFound {
@@ -194,7 +191,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
 
 
 
-                let (sender, receiver) = tokio::sync::mpsc::channel::<DataUsageInfo>(1);
+                let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
                 let storeapi_clone = storeapi.clone();
                 let ctx_clone = ctx.clone();
                 tokio::spawn(async move {

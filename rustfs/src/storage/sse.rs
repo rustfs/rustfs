@@ -78,7 +78,7 @@ use aes_gcm::{
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use rand::RngCore;
+use rand::Rng;
 use rustfs_ecstore::error::StorageError;
 use rustfs_filemeta::ObjectPartInfo;
 use rustfs_kms::{

@@ -782,7 +782,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
             }
 
             // Generate random duration between 0 and 1 minute
-            use rand::Rng;
+            use rand::RngExt;
             let duration_millis = rand::rng().random_range(0..60_000);
             let mut duration = Duration::from_millis(duration_millis);
 

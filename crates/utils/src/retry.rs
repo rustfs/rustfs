@@ -165,7 +165,7 @@ pub fn is_request_error_retryable(_err: std::io::Error) -> bool {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use rand::Rng;
+    use rand::RngExt;
     use std::time::UNIX_EPOCH;
 
     #[tokio::test]

@@ -122,9 +122,9 @@ impl<R> TryGetIndex for LimitReader<R> where R: AsyncRead + Unpin + Send + Sync 
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use super::*;
+    use rand::RngExt;
+    use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
 
     #[tokio::test]
@@ -186,7 +186,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_reader_large_file() {
-        use rand::Rng;
         // Generate a 3MB random byte array for testing
         let size = 3 * 1024 * 1024;
         let mut data = vec![0u8; size];

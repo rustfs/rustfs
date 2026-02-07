@@ -112,6 +112,7 @@ mod tests {
     use crate::WarpReader;
 
     use super::*;
+    use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
 
@@ -191,7 +192,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_etag_reader_large_data() {
-        use rand::Rng;
         // Generate 3MB random data
         let size = 3 * 1024 * 1024;
         let mut data = vec![0u8; size];

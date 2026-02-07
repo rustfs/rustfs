@@ -67,7 +67,7 @@ To send telemetry data from your application, configure your OpenTelemetry SDK t
 For example, in a Rust application using the `rustfs-obs` library:
 
 ```bash
-export RUSTFS_OBS_ENDPOINT=http://localhost:4317
+export RUSTFS_OBS_ENDPOINT=http://localhost:4318
 export RUSTFS_OBS_SERVICE_NAME=yourservice
 export RUSTFS_OBS_SERVICE_VERSION=1.0.0
 export RUSTFS_OBS_ENVIRONMENT=development

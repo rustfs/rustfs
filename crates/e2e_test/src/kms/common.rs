@@ -117,7 +117,7 @@ pub async fn create_default_key(
 
 /// Create a KMS key with a specific ID (by directly writing to the key directory)
 pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use rand::RngCore;
+    use rand::Rng;
     use std::collections::HashMap;
     use tokio::fs;
 

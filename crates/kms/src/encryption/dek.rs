@@ -23,7 +23,7 @@
 use crate::error::{KmsError, Result};
 use async_trait::async_trait;
 use jiff::Zoned;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

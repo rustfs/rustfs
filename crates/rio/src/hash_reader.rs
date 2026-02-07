@@ -562,6 +562,7 @@ impl TryGetIndex for HashReader {
 mod tests {
     use super::*;
     use crate::{DecryptReader, WarpReader, encrypt_reader};
+    use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
 
@@ -656,7 +657,6 @@ mod tests {
         use crate::{CompressReader, DecompressReader};
         use md5::{Digest, Md5};
         use rand::Rng;
-        use rand::RngCore;
         use rustfs_utils::compress::CompressionAlgorithm;
 
         // Generate 1MB random data

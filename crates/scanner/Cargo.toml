@@ -22,7 +22,7 @@ repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
 description = "RustFS Scanner provides scanning capabilities for data integrity checks, health monitoring, and storage analysis."
-keywords = ["RustFS", "scanner", "health-monitoring", "data-integrity", "storage-analysis", "Minio"]
+keywords = ["RustFS", "scanner", "health-monitoring", "data-integrity", "storage-analysis"]
 categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-scanner/latest/rustfs_scanner/"
 
@@ -47,7 +47,7 @@ rmp-serde = { workspace = true }
 rustfs-filemeta = { workspace = true }
 rustfs-madmin = { workspace = true }
 tokio-util = { workspace = true }
-rustfs-ecstore  = { workspace = true }
+rustfs-ecstore = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
 s3s = { workspace = true }

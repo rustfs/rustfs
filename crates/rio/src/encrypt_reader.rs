@@ -487,7 +487,7 @@ mod tests {
     use crate::WarpReader;
 
     use super::*;
-    use rand::RngCore;
+    use rand::{Rng, RngExt};
     use tokio::io::{AsyncReadExt, BufReader};
 
     #[tokio::test]
