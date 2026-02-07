@@ -155,6 +155,27 @@ impl QuotaChecker {
     pub async fn get_real_time_usage(&self, bucket: &str) -> Result<u64, QuotaError> {
         Ok(get_bucket_usage_memory(bucket).await.unwrap_or(0))
     }
+
+    /// Fast check if quota is configured for a bucket without expensive usage calculation
+    pub async fn has_quota_configured(&self, bucket: &str) -> Result<bool, QuotaError> {
+        let meta = self
+            .metadata_sys
+            .read()
+            .await
+            .get(bucket)
+            .await
+            .map_err(QuotaError::StorageError)?;
+
+        if meta.quota_config_json.is_empty() {
+            return Ok(false);
+        }
+
+        let quota: BucketQuota = serde_json::from_slice(&meta.quota_config_json).map_err(|e| QuotaError::InvalidConfig {
+            reason: format!("Failed to parse quota config: {}", e),
+        })?;
+
+        Ok(quota.quota.is_some())
+    }
 }
 
 #[cfg(test)]

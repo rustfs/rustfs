@@ -138,24 +138,36 @@ impl Objects {
         {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
 
-            match quota_checker
-                .check_quota(&bucket, QuotaOperation::PutObject, size as u64)
-                .await
-            {
-                Ok(check_result) => {
-                    if !check_result.allowed {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidRequest,
-                            format!(
-                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage,
-                                check_result.quota_limit.unwrap_or(0)
-                            ),
-                        ));
+            // Fast check if quota is configured to avoid expensive usage calculation
+            match quota_checker.has_quota_configured(&bucket).await {
+                Ok(has_quota) if has_quota => {
+                    match quota_checker
+                        .check_quota(&bucket, QuotaOperation::PutObject, size as u64)
+                        .await
+                    {
+                        Ok(check_result) => {
+                            if !check_result.allowed {
+                                return Err(S3Error::with_message(
+                                    S3ErrorCode::InvalidRequest,
+                                    format!(
+                                        "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                                        check_result.current_usage,
+                                        check_result.quota_limit.unwrap_or(0)
+                                    ),
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                        }
                     }
                 }
+                Ok(_) => {
+                    // No quota configured, skip check for performance
+                    debug!("No quota configured for bucket {}, skipping quota check", bucket);
+                }
                 Err(e) => {
-                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                    warn!("Failed to check quota configuration for bucket {}: {}, allowing operation", bucket, e);
                 }
             }
         }
