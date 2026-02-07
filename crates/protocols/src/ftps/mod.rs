@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Session management for protocol implementations
-
-pub mod context;
-pub mod principal;
+pub mod config;
+pub mod driver;
+pub mod server;
