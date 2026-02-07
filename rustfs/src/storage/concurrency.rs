@@ -375,6 +375,7 @@ static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::new(Concurr
 pub struct GetObjectGuard {
     /// Track when the request started for metrics collection.
     /// Used to calculate end-to-end request latency in the Drop implementation.
+    #[allow(dead_code)]
     start_time: Instant,
     /// Reference to the concurrency manager for cleanup operations.
     /// The underscore prefix indicates this is used implicitly (for type safety).
@@ -399,6 +400,7 @@ impl GetObjectGuard {
     ///
     /// Useful for logging or metrics collection during request processing.
     /// Called automatically in the Drop implementation for duration tracking.
+    #[allow(dead_code)]
     pub fn elapsed(&self) -> Duration {
         self.start_time.elapsed()
     }
@@ -430,8 +432,11 @@ impl Drop for GetObjectGuard {
         ACTIVE_GET_REQUESTS.fetch_sub(1, Ordering::Relaxed);
 
         // Record Prometheus metrics for monitoring and alerting
-        #[cfg(feature = "metrics")]
-        {
+        // We strictly disable metrics recording in unit tests (cfg(test)) to prevent
+        // Thread Local Storage (TLS) destruction order issues causing panics.
+        // In production (not(test)), we use a panic check as a safety guard.
+        #[cfg(all(feature = "metrics", not(test)))]
+        if !std::thread::panicking() {
             use metrics::{counter, histogram};
             // Track total completed requests for throughput calculation
             counter!("rustfs.get.object.requests.completed").increment(1);
@@ -464,7 +469,7 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
 
     // Record concurrent request metrics
-    #[cfg(feature = "metrics")]
+    #[cfg(all(feature = "metrics", not(test)))]
     {
         use metrics::gauge;
         gauge!("rustfs.concurrent.get.requests").set(concurrent_requests as f64);
@@ -874,7 +879,7 @@ impl HotObjectCache {
                 cached.access_count.fetch_add(1, Ordering::Relaxed);
                 self.hit_count.fetch_add(1, Ordering::Relaxed);
 
-                #[cfg(feature = "metrics")]
+                #[cfg(all(feature = "metrics", not(test)))]
                 {
                     use metrics::counter;
                     counter!("rustfs.object.cache.hits").increment(1);
@@ -886,7 +891,7 @@ impl HotObjectCache {
             None => {
                 self.miss_count.fetch_add(1, Ordering::Relaxed);
 
-                #[cfg(feature = "metrics")]
+                #[cfg(all(feature = "metrics", not(test)))]
                 {
                     use metrics::counter;
                     counter!("rustfs.object.cache.misses").increment(1);
@@ -918,7 +923,7 @@ impl HotObjectCache {
 
         self.cache.insert(key.clone(), cached_obj).await;
 
-        #[cfg(feature = "metrics")]
+        #[cfg(all(feature = "metrics", not(test)))]
         {
             use metrics::{counter, gauge};
             counter!("rustfs.object.cache.insertions").increment(1);
@@ -1075,7 +1080,7 @@ impl HotObjectCache {
                 cached.data.increment_access();
                 self.hit_count.fetch_add(1, Ordering::Relaxed);
 
-                #[cfg(feature = "metrics")]
+                #[cfg(all(feature = "metrics", not(test)))]
                 {
                     use metrics::counter;
                     counter!("rustfs_object_response_cache_hits").increment(1);
@@ -1087,7 +1092,7 @@ impl HotObjectCache {
             None => {
                 self.miss_count.fetch_add(1, Ordering::Relaxed);
 
-                #[cfg(feature = "metrics")]
+                #[cfg(all(feature = "metrics", not(test)))]
                 {
                     use metrics::counter;
                     counter!("rustfs_object_response_cache_misses").increment(1);
@@ -1124,7 +1129,7 @@ impl HotObjectCache {
 
         self.response_cache.insert(key.clone(), cached_internal).await;
 
-        #[cfg(feature = "metrics")]
+        #[cfg(all(feature = "metrics", not(test)))]
         {
             use metrics::{counter, gauge};
             counter!("rustfs_object_response_cache_insertions").increment(1);
@@ -1147,7 +1152,7 @@ impl HotObjectCache {
         self.cache.invalidate(key).await;
         self.response_cache.invalidate(key).await;
 
-        #[cfg(feature = "metrics")]
+        #[cfg(all(feature = "metrics", not(test)))]
         {
             use metrics::counter;
             counter!("rustfs_object_cache_invalidations").increment(1);
@@ -1329,7 +1334,7 @@ impl ConcurrencyManager {
         }
 
         // Record histogram metric for Prometheus
-        #[cfg(feature = "metrics")]
+        #[cfg(all(feature = "metrics", not(test)))]
         {
             use metrics::histogram;
             histogram!("rustfs.disk.permit.wait.duration.seconds").record(wait_duration.as_secs_f64());
@@ -1664,8 +1669,10 @@ pub(crate) fn reset_active_get_requests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_concurrent_request_tracking() {
         reset_active_get_requests();
         assert_eq!(GetObjectGuard::concurrent_requests(), 0);
@@ -1711,6 +1718,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_hot_object_cache() {
         let cache = HotObjectCache::new();
         let test_data = vec![1u8; 1024];
@@ -1727,6 +1735,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_eviction() {
         let cache = HotObjectCache::new();
 
@@ -1746,6 +1755,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_reject_large_objects() {
         let cache = HotObjectCache::new();
         let large_data = vec![0u8; 11 * MI_B]; // Larger than max_object_size
@@ -1766,6 +1776,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_disk_read_permits() {
         let manager = ConcurrencyManager::new();
 
@@ -1803,6 +1814,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_hot_keys_tracking() {
         let manager = ConcurrencyManager::new();
 
@@ -1823,6 +1835,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_batch_operations() {
         let manager = ConcurrencyManager::new();
 
@@ -1840,6 +1853,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_clear() {
         let manager = ConcurrencyManager::new();
 
@@ -1857,6 +1871,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_warm_cache() {
         let manager = ConcurrencyManager::new();
 

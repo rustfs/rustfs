@@ -90,6 +90,8 @@ pub fn to_unformatted_disk_error(io_err: std::io::Error) -> std::io::Error {
     match io_err.kind() {
         std::io::ErrorKind::NotFound => DiskError::UnformattedDisk.into(),
         std::io::ErrorKind::PermissionDenied => DiskError::DiskAccessDenied.into(),
+        std::io::ErrorKind::UnexpectedEof => DiskError::UnformattedDisk.into(),
+        std::io::ErrorKind::InvalidData => DiskError::UnformattedDisk.into(),
         std::io::ErrorKind::Other => match io_err.downcast::<DiskError>() {
             Ok(err) => match err {
                 DiskError::FileNotFound => DiskError::UnformattedDisk.into(),
@@ -97,11 +99,11 @@ pub fn to_unformatted_disk_error(io_err: std::io::Error) -> std::io::Error {
                 DiskError::VolumeNotFound => DiskError::UnformattedDisk.into(),
                 DiskError::FileAccessDenied => DiskError::DiskAccessDenied.into(),
                 DiskError::DiskAccessDenied => DiskError::DiskAccessDenied.into(),
-                _ => DiskError::CorruptedBackend.into(),
+                _ => DiskError::UnformattedDisk.into(),
             },
-            Err(_err) => DiskError::CorruptedBackend.into(),
+            Err(_err) => DiskError::UnformattedDisk.into(),
         },
-        _ => DiskError::CorruptedBackend.into(),
+        _ => DiskError::UnformattedDisk.into(),
     }
 }
 
@@ -369,18 +371,18 @@ mod tests {
         let result = to_unformatted_disk_error(io_error);
         assert!(contains_disk_error(result, DiskError::DiskAccessDenied));
 
-        // Test Other error kind with other DiskError -> CorruptedBackend
+        // Test Other error kind with other DiskError -> UnformattedDisk
         let io_error = create_io_error_with_disk_error(DiskError::DiskFull);
         let result = to_unformatted_disk_error(io_error);
-        assert!(contains_disk_error(result, DiskError::CorruptedBackend));
+        assert!(contains_disk_error(result, DiskError::UnformattedDisk));
     }
 
     #[test]
     fn test_to_unformatted_disk_error_recursive_behavior() {
         // Test with non-Other error kind that should be handled without infinite recursion
         let result = to_unformatted_disk_error(create_io_error(ErrorKind::Interrupted));
-        // This should not cause infinite recursion and should produce CorruptedBackend
-        assert!(contains_disk_error(result, DiskError::CorruptedBackend));
+        // This should not cause infinite recursion and should produce UnformattedDisk
+        assert!(contains_disk_error(result, DiskError::UnformattedDisk));
     }
 
     #[test]

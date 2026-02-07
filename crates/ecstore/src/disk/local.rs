@@ -339,7 +339,9 @@ impl LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn check_format_json(&self) -> Result<Metadata> {
-        let md = std::fs::metadata(&self.format_path).map_err(to_unformatted_disk_error)?;
+        let md = tokio::fs::metadata(&self.format_path)
+            .await
+            .map_err(to_unformatted_disk_error)?;
         Ok(md)
     }
     async fn make_meta_volumes(&self) -> Result<()> {
@@ -1365,36 +1367,43 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
-        let format_info = {
+        let (id, last_check, file_info) = {
             let format_info = self.format_info.read().await;
-            format_info.clone()
+            (format_info.id, format_info.last_check, format_info.file_info.clone())
         };
 
-        let id = format_info.id;
-
-        // if format_info.last_check_valid() {
-        //     return Ok(id);
-        // }
-
-        if format_info.file_info.is_some() && id.is_some() {
-            // check last check time
-            if let Some(last_check) = format_info.last_check
-                && last_check.unix_timestamp() + 1 < OffsetDateTime::now_utc().unix_timestamp()
-            {
-                return Ok(id);
-            }
+        // Check if we can use cached value without doing any I/O
+        // If we checked recently (within 1 second) and have valid cache, return immediately
+        if let (Some(id), Some(last_check)) = (id, last_check)
+            && last_check.unix_timestamp() + 1 >= OffsetDateTime::now_utc().unix_timestamp()
+        {
+            return Ok(Some(id));
         }
 
-        let file_meta = self.check_format_json().await?;
+        // Get current file metadata (async I/O)
+        let file_meta = match self.check_format_json().await {
+            Ok(meta) => meta,
+            Err(e) => {
+                // file does not exist or cannot be accessed, clear cached format info
+                if matches!(e, DiskError::UnformattedDisk | DiskError::DiskNotFound) {
+                    let mut format_info = self.format_info.write().await;
+                    format_info.id = None;
+                    format_info.file_info = None;
+                    format_info.data = Bytes::new();
+                    format_info.last_check = None;
+                }
+                return Err(e);
+            }
+        };
 
-        if let Some(file_info) = &format_info.file_info
-            && super::fs::same_file(&file_meta, file_info)
+        // Validate cache against current file metadata
+        if let (Some(cached_file_info), Some(id)) = (&file_info, id)
+            && super::fs::same_file(&file_meta, cached_file_info)
         {
+            // Cache is still valid, update last_check and return
             let mut format_info = self.format_info.write().await;
             format_info.last_check = Some(OffsetDateTime::now_utc());
-            drop(format_info);
-
-            return Ok(id);
+            return Ok(Some(id));
         }
 
         debug!("get_disk_id: read format.json");
@@ -1403,7 +1412,7 @@ impl DiskAPI for LocalDisk {
 
         let fm = FormatV3::try_from(b.as_slice()).map_err(|e| {
             warn!("decode format.json  err {:?}", e);
-            DiskError::CorruptedBackend
+            DiskError::UnformattedDisk
         })?;
 
         let (m, n) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
