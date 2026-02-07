@@ -620,7 +620,7 @@ pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str
     use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
     use crate::store_api::{ObjectIO, ObjectOptions};
     use http::HeaderMap;
-    use rand::Rng;
+    use rand::RngExt;
     use std::path::Path;
     use std::time::Duration;
     use tokio::time::sleep;

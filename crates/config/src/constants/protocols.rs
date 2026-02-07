@@ -14,27 +14,34 @@
 
 //! Protocol server configuration constants
 
-/// Default FTPS server bind address
-pub const DEFAULT_FTPS_ADDRESS: &str = "0.0.0.0:8021";
+/// Default FTP server bind address (non-encrypted)
+pub const DEFAULT_FTP_ADDRESS: &str = "0.0.0.0:8021";
 
-/// Default SFTP server bind address
-pub const DEFAULT_SFTP_ADDRESS: &str = "0.0.0.0:8022";
+/// Default FTPS server bind address (FTP over TLS)
+pub const DEFAULT_FTPS_ADDRESS: &str = "0.0.0.0:8022";
+
+/// Default FTP passive ports range (optional)
+pub const DEFAULT_FTP_PASSIVE_PORTS: Option<&str> = None;
 
 /// Default FTPS passive ports range (optional)
 pub const DEFAULT_FTPS_PASSIVE_PORTS: Option<&str> = None;
+
+/// Default FTP external IP (auto-detected)
+pub const DEFAULT_FTP_EXTERNAL_IP: Option<&str> = None;
 
 /// Default FTPS external IP (auto-detected)
 pub const DEFAULT_FTPS_EXTERNAL_IP: Option<&str> = None;
 
 /// Environment variable names
+pub const ENV_FTP_ENABLE: &str = "RUSTFS_FTP_ENABLE";
+pub const ENV_FTP_ADDRESS: &str = "RUSTFS_FTP_ADDRESS";
+pub const ENV_FTP_PASSIVE_PORTS: &str = "RUSTFS_FTP_PASSIVE_PORTS";
+pub const ENV_FTP_EXTERNAL_IP: &str = "RUSTFS_FTP_EXTERNAL_IP";
+
 pub const ENV_FTPS_ENABLE: &str = "RUSTFS_FTPS_ENABLE";
 pub const ENV_FTPS_ADDRESS: &str = "RUSTFS_FTPS_ADDRESS";
-pub const ENV_FTPS_CERTS_FILE: &str = "RUSTFS_FTPS_CERTS_FILE";
-pub const ENV_FTPS_KEY_FILE: &str = "RUSTFS_FTPS_KEY_FILE";
+pub const ENV_FTPS_TLS_ENABLED: &str = "RUSTFS_FTPS_TLS_ENABLED";
+pub const ENV_FTPS_CERTS_DIR: &str = "RUSTFS_FTPS_CERTS_DIR";
+pub const ENV_FTPS_CA_FILE: &str = "RUSTFS_FTPS_CA_FILE";
 pub const ENV_FTPS_PASSIVE_PORTS: &str = "RUSTFS_FTPS_PASSIVE_PORTS";
 pub const ENV_FTPS_EXTERNAL_IP: &str = "RUSTFS_FTPS_EXTERNAL_IP";
-
-pub const ENV_SFTP_ENABLE: &str = "RUSTFS_SFTP_ENABLE";
-pub const ENV_SFTP_ADDRESS: &str = "RUSTFS_SFTP_ADDRESS";
-pub const ENV_SFTP_HOST_KEY: &str = "RUSTFS_SFTP_HOST_KEY";
-pub const ENV_SFTP_AUTHORIZED_KEYS: &str = "RUSTFS_SFTP_AUTHORIZED_KEYS";

@@ -21,7 +21,7 @@
 use bytes::Bytes;
 use http::status::StatusCode;
 use lazy_static::lazy_static;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, hash_map::Entry},

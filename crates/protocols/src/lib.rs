@@ -12,10 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Gateway module for protocol implementations
+#![deny(unsafe_code)]
 
-pub mod action;
-pub mod adapter;
-pub mod authorize;
-pub mod error;
-pub mod restrictions;
+pub mod common;
+pub mod constants;
+
+#[cfg(feature = "ftps")]
+pub mod ftps;
+
+pub use common::session::Protocol;
+pub use common::{AuthorizationError, ProtocolPrincipal, S3Action, SessionContext, authorize_operation};
+
+#[cfg(feature = "ftps")]
+pub use ftps::{config::FtpsConfig, server::FtpsServer};

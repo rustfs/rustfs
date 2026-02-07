@@ -715,7 +715,16 @@ impl ObjectInfo {
             return Ok(actual_size);
         }
 
-        // TODO: IsEncrypted
+        // Check if object is encrypted
+        // Encrypted objects store original size in x-rustfs-encryption-original-size metadata
+        if let Some(size_str) = self.user_defined.get("x-rustfs-encryption-original-size")
+            && !size_str.is_empty()
+        {
+            let size = size_str
+                .parse::<i64>()
+                .map_err(|e| std::io::Error::other(format!("Failed to parse encryption original size: {e}")))?;
+            return Ok(size);
+        }
 
         Ok(self.size)
     }

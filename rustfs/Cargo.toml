@@ -33,6 +33,8 @@ path = "src/main.rs"
 [features]
 default = ["metrics"]
 metrics = []
+ftps = ["rustfs-protocols/ftps"]
+full = ["metrics", "ftps"]
 
 [lints]
 workspace = true
@@ -54,6 +56,7 @@ rustfs-madmin = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
+rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio.workspace = true
 rustfs-s3select-api = { workspace = true }
@@ -126,15 +129,13 @@ urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
 libc = { workspace = true }
+rand = { workspace = true }
+aes-gcm = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
-
-# FTP and SFTP Libraries
-libunftp = { workspace = true }
-russh = { workspace = true }
-russh-sftp = { workspace = true }
-ssh-key = { workspace = true }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
@@ -159,6 +160,10 @@ pprof = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 http.workspace = true

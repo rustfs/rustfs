@@ -12,24 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_policy::auth::UserIdentity;
-use std::sync::Arc;
+pub mod s3;
 
-/// Protocol principal representing an authenticated user
-#[derive(Debug, Clone)]
-pub struct ProtocolPrincipal {
-    /// User identity from IAM system
-    pub user_identity: Arc<UserIdentity>,
-}
-
-impl ProtocolPrincipal {
-    /// Create a new protocol principal
-    pub fn new(user_identity: Arc<UserIdentity>) -> Self {
-        Self { user_identity }
-    }
-
-    /// Get the access key for this principal
-    pub fn access_key(&self) -> &str {
-        &self.user_identity.credentials.access_key
-    }
-}
+pub use s3::StorageBackend as S3StorageBackend;

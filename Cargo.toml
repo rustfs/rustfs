@@ -45,6 +45,7 @@ members = [
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
+    "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
 ]
 resolver = "2"
 
@@ -58,6 +59,7 @@ homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
 keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
 categories = ["web-programming", "development-tools", "filesystem", "network-programming"]
+authors = ["RustFS Team"]
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -97,10 +99,11 @@ rustfs-targets = { path = "crates/targets", version = "0.0.5" }
 rustfs-utils = { path = "crates/utils", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
 rustfs-zip = { path = "./crates/zip", version = "0.0.5" }
+rustfs-protocols = { path = "crates/protocols", version = "0.0.5" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
-async-compression = { version = "0.4.37" }
+async-compression = { version = "0.4.38" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
 axum = "0.8.8"
@@ -129,7 +132,7 @@ tower = { version = "0.5.3", features = ["timeout"] }
 tower-http = { version = "0.6.8", features = ["cors"] }
 
 # Serialization and Data Formats
-bytes = { version = "1.11.0", features = ["serde"] }
+bytes = { version = "1.11.1", features = ["serde"] }
 bytesize = "2.3.1"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
@@ -145,45 +148,45 @@ serde_urlencoded = "0.7.1"
 schemars = "1.2.1"
 
 # Cryptography and Security
-aes-gcm = { version = "0.11.0-rc.2", features = ["rand_core"] }
-argon2 = { version = "0.6.0-rc.6" }
+aes-gcm = { version = "0.11.0-rc.3", features = ["rand_core"] }
+argon2 = { version = "0.6.0-rc.7" }
 blake3 = { version = "1.8.3", features = ["rayon", "mmap"] }
-chacha20poly1305 = { version = "0.11.0-rc.2" }
+chacha20poly1305 = { version = "0.11.0-rc.3" }
 crc-fast = "1.9.0"
-hmac = { version = "0.13.0-rc.3" }
+hmac = { version = "0.13.0-rc.5" }
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
-pbkdf2 = "0.13.0-rc.8"
-rsa = { version = "0.10.0-rc.12" }
+pbkdf2 = "0.13.0-rc.9"
+rsa = { version = "0.10.0-rc.15" }
 rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.14.0"
-sha1 = "0.11.0-rc.3"
-sha2 = "0.11.0-rc.3"
+sha1 = "0.11.0-rc.5"
+sha2 = "0.11.0-rc.5"
 subtle = "2.6"
 zeroize = { version = "1.8.2", features = ["derive"] }
 
 # Time and Date
 chrono = { version = "0.4.43", features = ["serde"] }
 humantime = "2.3.0"
-jiff = { version = "0.2.18", features = ["serde"] }
-time = { version = "0.3.46", features = ["std", "parsing", "formatting", "macros", "serde"] }
+jiff = { version = "0.2.19", features = ["serde"] }
+time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Utilities and Tools
-anyhow = "1.0.100"
-arc-swap = "1.8.0"
+anyhow = "1.0.101"
+arc-swap = "1.8.1"
 astral-tokio-tar = "0.5.6"
 atoi = "2.0.0"
 atomic_enum = "0.3.0"
-aws-config = { version = "1.8.12" }
+aws-config = { version = "1.8.13" }
 aws-credential-types = { version = "1.2.11" }
-aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.122.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-types = { version = "1.4.3" }
 backtrace = "0.3.76"
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"
 cfg-if = "1.0.4"
-clap = { version = "4.5.56", features = ["derive", "env"] }
+clap = { version = "4.5.57", features = ["derive", "env"] }
 const-str = { version = "1.1.0", features = ["std", "proc"] }
 convert_case = "0.11.0"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -192,7 +195,7 @@ datafusion = "52.1.0"
 derive_builder = "0.20.2"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
-flate2 = "1.1.8"
+flate2 = "1.1.9"
 flexi_logger = { version = "0.31.8", features = ["trc", "dont_minimize_extra_stacks", "compress", "kv", "json"] }
 glob = "0.3.3"
 google-cloud-storage = "1.7.0"
@@ -207,7 +210,7 @@ libsystemd = "0.7.2"
 local-ip-address = "0.6.10"
 lz4 = "1.28.1"
 matchit = "0.9.1"
-md-5 = "0.11.0-rc.3"
+md-5 = "0.11.0-rc.5"
 md5 = "0.8.0"
 mime_guess = "2.0.5"
 moka = { version = "0.12.13", features = ["future"] }
@@ -221,15 +224,15 @@ path-absolutize = "3.1.1"
 path-clean = "1.0.1"
 pin-project-lite = "0.2.16"
 pretty_assertions = "1.4.1"
-rand = { version = "0.10.0-rc.6", features = ["serde"] }
+rand = { version = "0.10.0-rc.9", features = ["serde"] }
 rayon = "1.11.0"
 reed-solomon-simd = { version = "3.1.0" }
-regex = { version = "1.12.2" }
+regex = { version = "1.12.3" }
 rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.3", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/rustfs/s3s.git", branch = "dependabot/cargo/dep-0202" }
+s3s = { version = "0.13.0-alpha.2", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", rev = "355141446e358fdd4d71a32408b9fbebd65359c7" }
 serial_test = "3.3.1"
 shadow-rs = { version = "1.7.0", default-features = false }
 siphasher = "1.0.2"
@@ -258,7 +261,7 @@ walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
 windows = { version = "0.62.2" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
-zip = "7.2.0"
+zip = "7.4.0"
 zstd = "0.13.3"
 
 # Observability and Metrics
@@ -271,11 +274,8 @@ opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_
 opentelemetry-stdout = { version = "0.31.0" }
 
 # FTP and SFTP
-libunftp = { version = "0.21.0" }
-russh = { version = "0.57.0", features = ["aws-lc-rs", "rsa"], default-features = false }
-russh-sftp = { version = "2.1.1" }
-ssh-key = { version = "0.7.0-rc.6", features = ["std", "rsa", "ed25519"] }
-suppaftp = { version = "7.1.0", features = ["tokio", "tokio-rustls", "rustls"] }
+libunftp = { version = "0.21.0", features = ["experimental"] }
+suppaftp = { version = "8.0.1", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.7"
 
 # Performance Analysis and Memory Profiling

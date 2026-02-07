@@ -12,26 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::protocols::ftps::driver::FtpsDriver;
-use crate::protocols::session::context::{Protocol as SessionProtocol, SessionContext};
-use crate::protocols::session::principal::ProtocolPrincipal;
-use libunftp::{
-    ServerError,
-    auth::{AuthenticationError, UserDetail},
-    options::FtpsRequired,
-};
+use super::config::{FtpsConfig, FtpsInitError};
+use super::driver::FtpsDriver;
+use crate::common::client::s3::StorageBackend;
+use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
+use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
+use libunftp::auth::{AuthenticationError, UserDetail};
+use libunftp::options::FtpsRequired;
 use std::fmt::{Debug, Display, Formatter};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
-use thiserror::Error;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
-
-const ROOT_PATH: &str = "/";
-const DEFAULT_SOURCE_IP: &str = "0.0.0.0";
-const PORT_RANGE_SEPARATOR: &str = "-";
-const PASSIVE_PORTS_PART_COUNT: usize = 2;
 
 /// FTPS user implementation
 #[derive(Debug, Clone)]
@@ -59,106 +52,22 @@ impl Display for FtpsUser {
     }
 }
 
-/// FTPS server initialization error
-#[derive(Debug, Error)]
-pub enum FtpsInitError {
-    #[error("failed to bind address {0}")]
-    Bind(#[from] std::io::Error),
-
-    #[error("server error: {0}")]
-    Server(#[from] ServerError),
-
-    #[error("invalid FTPS configuration: {0}")]
-    InvalidConfig(String),
-}
-
-/// FTPS server configuration
-#[derive(Debug, Clone)]
-pub struct FtpsConfig {
-    /// Server bind address
-    pub bind_addr: SocketAddr,
-    /// Passive port range (e.g., "40000-50000")
-    pub passive_ports: Option<String>,
-    /// External IP address for passive mode
-    pub external_ip: Option<String>,
-    /// Whether FTPS is required
-    pub ftps_required: bool,
-    /// Certificate file path
-    pub cert_file: Option<String>,
-    /// Private key file path
-    pub key_file: Option<String>,
-}
-
-impl FtpsConfig {
-    /// Validates the configuration
-    pub async fn validate(&self) -> Result<(), FtpsInitError> {
-        if self.ftps_required && (self.cert_file.is_none() || self.key_file.is_none()) {
-            return Err(FtpsInitError::InvalidConfig(
-                "FTPS is required but certificate or key file is missing".to_string(),
-            ));
-        }
-
-        if let Some(path) = &self.cert_file
-            && !tokio::fs::try_exists(path).await.unwrap_or(false)
-        {
-            return Err(FtpsInitError::InvalidConfig(format!("Certificate file not found: {}", path)));
-        }
-
-        if let Some(path) = &self.key_file
-            && !tokio::fs::try_exists(path).await.unwrap_or(false)
-        {
-            return Err(FtpsInitError::InvalidConfig(format!("Key file not found: {}", path)));
-        }
-
-        // Validate passive ports format
-        if self.passive_ports.is_some() {
-            self.parse_passive_ports()?;
-        }
-
-        Ok(())
-    }
-
-    /// Parse passive ports range from string format "start-end"
-    fn parse_passive_ports(&self) -> Result<std::ops::RangeInclusive<u16>, FtpsInitError> {
-        match &self.passive_ports {
-            Some(ports) => {
-                let parts: Vec<&str> = ports.split(PORT_RANGE_SEPARATOR).collect();
-                if parts.len() != PASSIVE_PORTS_PART_COUNT {
-                    return Err(FtpsInitError::InvalidConfig(format!(
-                        "Invalid passive ports format: {}, expected 'start-end'",
-                        ports
-                    )));
-                }
-
-                let start = parts[0]
-                    .parse::<u16>()
-                    .map_err(|e| FtpsInitError::InvalidConfig(format!("Invalid start port: {}", e)))?;
-                let end = parts[1]
-                    .parse::<u16>()
-                    .map_err(|e| FtpsInitError::InvalidConfig(format!("Invalid end port: {}", e)))?;
-
-                if start > end {
-                    return Err(FtpsInitError::InvalidConfig("Start port cannot be greater than end port".to_string()));
-                }
-
-                Ok(start..=end)
-            }
-            None => Err(FtpsInitError::InvalidConfig("No passive ports configured".to_string())),
-        }
-    }
-}
-
 /// FTPS server implementation
-pub struct FtpsServer {
+pub struct FtpsServer<S> {
     /// Server configuration
     config: FtpsConfig,
+    /// S3 storage backend
+    storage: S,
 }
 
-impl FtpsServer {
+impl<S> FtpsServer<S>
+where
+    S: StorageBackend + Clone + Send + Sync + 'static + std::fmt::Debug,
+{
     /// Create a new FTPS server
-    pub async fn new(config: FtpsConfig) -> Result<Self, FtpsInitError> {
+    pub async fn new(config: FtpsConfig, storage: S) -> Result<Self, FtpsInitError> {
         config.validate().await?;
-        Ok(Self { config })
+        Ok(Self { config, storage })
     }
 
     /// Start the FTPS server
@@ -168,8 +77,11 @@ impl FtpsServer {
     pub async fn start(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<(), FtpsInitError> {
         info!("Initializing FTPS server on {}", self.config.bind_addr);
 
-        let mut server_builder =
-            libunftp::ServerBuilder::with_authenticator(Box::new(FtpsDriver::new), Arc::new(FtpsAuthenticator::new()));
+        let storage_clone = self.storage.clone();
+        let mut server_builder = libunftp::ServerBuilder::with_authenticator(
+            Box::new(move || FtpsDriver::new(storage_clone.clone())),
+            Arc::new(FtpsAuthenticator::new()),
+        );
 
         // Configure passive ports for data connections
         if let Some(passive_ports) = &self.config.passive_ports {
@@ -186,19 +98,50 @@ impl FtpsServer {
             server_builder = server_builder.passive_host(external_ip.as_str());
         }
 
+        // Configure both active and passive mode support
+        use libunftp::options::ActivePassiveMode;
+        server_builder = server_builder.active_passive_mode(ActivePassiveMode::ActiveAndPassive);
+        info!("FTPS server configured for both active and passive mode support");
+
         // Configure FTPS / TLS
-        if let Some(cert) = &self.config.cert_file {
-            if let Some(key) = &self.config.key_file {
-                debug!("Enabling FTPS with cert: {} and key: {}", cert, key);
-                server_builder = server_builder.ftps(cert, key);
+        if self.config.tls_enabled {
+            if let Some(cert_dir) = &self.config.cert_dir {
+                debug!("Enabling FTPS with multi-certificate support from directory: {}", cert_dir);
+
+                // Load all certificates from directory
+                let cert_key_pairs = rustfs_utils::load_all_certs_from_directory(cert_dir)
+                    .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to load certificates: {}", e)))?;
+
+                if cert_key_pairs.is_empty() {
+                    return Err(FtpsInitError::InvalidConfig("No valid certificates found in directory".into()));
+                }
+
+                debug!("Loaded {} certificates for FTPS", cert_key_pairs.len());
+
+                // Create multi-certificate resolver with SNI support
+                let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)
+                    .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to create certificate resolver: {}", e)))?;
+
+                // Build ServerConfig with SNI support
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+                let server_config = rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(std::sync::Arc::new(resolver));
+
+                server_builder = server_builder.ftps_manual::<std::path::PathBuf>(std::sync::Arc::new(server_config));
 
                 if self.config.ftps_required {
                     info!("FTPS is explicitly required for all connections");
                     server_builder = server_builder.ftps_required(FtpsRequired::All, FtpsRequired::All);
                 }
+            } else if self.config.ftps_required {
+                return Err(FtpsInitError::InvalidConfig(
+                    "FTPS required but certificate directory not provided".into(),
+                ));
             }
-        } else if self.config.ftps_required {
-            return Err(FtpsInitError::InvalidConfig("FTPS required but certificates not provided".into()));
+        } else {
+            info!("TLS disabled, running in plain FTP mode");
         }
 
         // Build the server instance
@@ -245,6 +188,11 @@ impl FtpsServer {
     pub fn config(&self) -> &FtpsConfig {
         &self.config
     }
+
+    /// Get storage backend
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
 }
 
 /// FTPS authenticator implementation
@@ -265,20 +213,15 @@ impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
         use rustfs_credentials::Credentials as S3Credentials;
         use rustfs_iam::get;
 
-        debug!("FTPS authentication attempt for user: {}", username);
-
         // Access IAM system
         let iam_sys = get().map_err(|e| {
             error!("IAM system unavailable during FTPS auth: {}", e);
             AuthenticationError::ImplPropagated("Internal authentication service unavailable".to_string(), Some(Box::new(e)))
         })?;
 
-        // Map FTP credentials to S3 Credentials structure
-        // Note: FTP PASSWORD is treated as S3 SECRET KEY
         let s3_creds = S3Credentials {
             access_key: username.to_string(),
             secret_key: creds.password.clone().unwrap_or_default(),
-            // Fields below are not used for authentication verification, but for struct compliance
             session_token: String::new(),
             expiration: None,
             status: String::new(),
@@ -304,18 +247,14 @@ impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
             AuthenticationError::BadUser
         })?;
 
-        // Constant time comparison is preferred if available, but for now simple eq
         if !identity.credentials.secret_key.eq(&s3_creds.secret_key) {
             warn!("FTPS login failed: Invalid secret key for '{}'", username);
             return Err(AuthenticationError::BadPassword);
         }
 
-        // Policy conditions relying on `aws:SourceIp` will currently not work correctly for FTP.
-        // TODO: Investigate wrapping the authenticator or using Proxy Protocol metadata if available in future libunftp versions.
         let source_ip: IpAddr = DEFAULT_SOURCE_IP.parse().unwrap();
 
-        let session_context =
-            SessionContext::new(ProtocolPrincipal::new(Arc::new(identity.clone())), SessionProtocol::Ftps, source_ip);
+        let session_context = SessionContext::new(ProtocolPrincipal::new(Arc::new(identity.clone())), Protocol::Ftps, source_ip);
 
         let ftps_user = FtpsUser {
             username: username.to_string(),

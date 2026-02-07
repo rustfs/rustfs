@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Session management for protocol implementations
+pub mod client;
+pub mod gateway;
+pub mod session;
 
-pub mod context;
-pub mod principal;
+pub use client::s3::StorageBackend as S3StorageBackend;
+pub use gateway::{AuthorizationError, S3Action, authorize_operation, is_operation_supported};
+pub use session::{ProtocolPrincipal, SessionContext};

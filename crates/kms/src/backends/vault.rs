@@ -16,14 +16,15 @@
 
 use crate::backends::{BackendInfo, KmsBackend, KmsClient};
 use crate::config::{KmsConfig, VaultConfig};
+use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use jiff::Zoned;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 use vaultrs::{
     client::{VaultClient, VaultClientSettingsBuilder},
@@ -38,6 +39,8 @@ pub struct VaultKmsClient {
     kv_mount: String,
     /// Path prefix for storing keys
     key_path_prefix: String,
+    /// DEK encryption implementation
+    dek_crypto: AesDekCrypto,
 }
 
 /// Key data stored in Vault
@@ -102,25 +105,13 @@ impl VaultKmsClient {
             kv_mount: config.kv_mount.clone(),
             key_path_prefix: config.key_path_prefix.clone(),
             config,
+            dek_crypto: AesDekCrypto::new(),
         })
     }
 
     /// Get the full path for a key in Vault
     fn key_path(&self, key_id: &str) -> String {
         format!("{}/{}", self.key_path_prefix, key_id)
-    }
-
-    /// Generate key material for the given algorithm
-    fn generate_key_material(algorithm: &str) -> Result<Vec<u8>> {
-        let key_size = match algorithm {
-            "AES_256" => 32,
-            "AES_128" => 16,
-            _ => return Err(KmsError::unsupported_algorithm(algorithm)),
-        };
-
-        let mut key_material = vec![0u8; key_size];
-        rand::rng().fill_bytes(&mut key_material);
-        Ok(key_material)
     }
 
     /// Encrypt key material using Vault's transit engine
@@ -139,6 +130,64 @@ impl VaultKmsClient {
             .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))
     }
 
+    /// Get the actual key material for a master key
+    async fn get_key_material(&self, key_id: &str) -> Result<Vec<u8>> {
+        let mut key_data = self.get_key_data(key_id).await?;
+
+        // If encrypted_key_material is empty, generate and store it (fix for old keys)
+        if key_data.encrypted_key_material.is_empty() {
+            warn!("Key {} has empty encrypted_key_material, generating and storing new key material", key_id);
+            let key_material = generate_key_material(&key_data.algorithm)?;
+            key_data.encrypted_key_material = self.encrypt_key_material(&key_material).await?;
+            // Store the updated key data back to Vault
+            self.store_key_data(key_id, &key_data).await?;
+            return Ok(key_material);
+        }
+
+        let key_material = match self.decrypt_key_material(&key_data.encrypted_key_material).await {
+            Ok(km) => km,
+            Err(e) => {
+                warn!("Failed to decrypt key material for key {}: {}, generating new key material", key_id, e);
+                let new_key_material = generate_key_material(&key_data.algorithm)?;
+                key_data.encrypted_key_material = self.encrypt_key_material(&new_key_material).await?;
+                // Store the updated key data back to Vault
+                self.store_key_data(key_id, &key_data).await?;
+                return Ok(new_key_material);
+            }
+        };
+
+        // Validate key material length (should be 32 bytes for AES-256)
+        if key_material.len() != 32 {
+            // Try to fix: generate new key material if length is wrong
+            warn!(
+                "Key {} has invalid key material length ({} bytes), generating new key material",
+                key_id,
+                key_material.len()
+            );
+            let new_key_material = generate_key_material(&key_data.algorithm)?;
+            key_data.encrypted_key_material = self.encrypt_key_material(&new_key_material).await?;
+            // Store the updated key data back to Vault
+            self.store_key_data(key_id, &key_data).await?;
+            return Ok(new_key_material);
+        }
+
+        Ok(key_material)
+    }
+
+    /// Encrypt data using a master key
+    async fn encrypt_with_master_key(&self, key_id: &str, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        // Load the actual master key material
+        let key_material = self.get_key_material(key_id).await?;
+        self.dek_crypto.encrypt(&key_material, plaintext).await
+    }
+
+    /// Decrypt data using a master key
+    async fn decrypt_with_master_key(&self, key_id: &str, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
+        // Load the actual master key material
+        let key_material = self.get_key_material(key_id).await?;
+        self.dek_crypto.decrypt(&key_material, ciphertext, nonce).await
+    }
+
     /// Store key data in Vault
     async fn store_key_data(&self, key_id: &str, key_data: &VaultKeyData) -> Result<()> {
         let path = self.key_path(key_id);
@@ -154,19 +203,36 @@ impl VaultKmsClient {
     async fn store_key_metadata(&self, key_id: &str, request: &CreateKeyRequest) -> Result<()> {
         debug!("Storing key metadata for {}, input tags: {:?}", key_id, request.tags);
 
+        // Get existing key data to preserve encrypted_key_material and other fields
+        // This is called after create_key, so the key should already exist
+        let mut existing_key_data = self.get_key_data(key_id).await?;
+
+        // If encrypted_key_material is empty, generate it (this handles the case where
+        // an old key was created without proper key material)
+        if existing_key_data.encrypted_key_material.is_empty() {
+            warn!("Key {} has empty encrypted_key_material, generating new key material", key_id);
+            let key_material = generate_key_material(&existing_key_data.algorithm)?;
+            existing_key_data.encrypted_key_material = self.encrypt_key_material(&key_material).await?;
+        }
+
+        // Update only the metadata fields, preserving the encrypted_key_material
         let key_data = VaultKeyData {
-            algorithm: "AES_256".to_string(),
+            algorithm: existing_key_data.algorithm.clone(),
             usage: request.key_usage.clone(),
-            created_at: Zoned::now(),
-            status: KeyStatus::Active,
-            version: 1,
+            created_at: existing_key_data.created_at,
+            status: existing_key_data.status,
+            version: existing_key_data.version,
             description: request.description.clone(),
-            metadata: HashMap::new(),
+            metadata: existing_key_data.metadata.clone(),
             tags: request.tags.clone(),
-            encrypted_key_material: String::new(), // Not used for transit keys
+            encrypted_key_material: existing_key_data.encrypted_key_material.clone(), // Preserve the key material
         };
 
-        debug!("VaultKeyData tags before storage: {:?}", key_data.tags);
+        debug!(
+            "VaultKeyData tags before storage: {:?}, encrypted_key_material length: {}",
+            key_data.tags,
+            key_data.encrypted_key_material.len()
+        );
         self.store_key_data(key_id, &key_data).await
     }
 
@@ -225,36 +291,33 @@ impl VaultKmsClient {
 
 #[async_trait]
 impl KmsClient for VaultKmsClient {
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKey> {
+    async fn generate_data_key(&self, request: &GenerateKeyRequest, _context: Option<&OperationContext>) -> Result<DataKeyInfo> {
         debug!("Generating data key for master key: {}", request.master_key_id);
 
-        // Verify master key exists
-        let _master_key = self.describe_key(&request.master_key_id, context).await?;
-
-        // Generate data key material
-        let key_length = match request.key_spec.as_str() {
-            "AES_256" => 32,
-            "AES_128" => 16,
-            _ => return Err(KmsError::unsupported_algorithm(&request.key_spec)),
-        };
-
-        let mut plaintext_key = vec![0u8; key_length];
-        rand::rng().fill_bytes(&mut plaintext_key);
+        // Generate random data key material using the existing method
+        let plaintext_key = generate_key_material(&request.key_spec)?;
 
         // Encrypt the data key with the master key
-        let encrypted_key = self.encrypt_key_material(&plaintext_key).await?;
+        let (encrypted_key, nonce) = self.encrypt_with_master_key(&request.master_key_id, &plaintext_key).await?;
 
-        Ok(DataKey {
-            key_id: request.master_key_id.clone(),
-            version: 1,
-            plaintext: Some(plaintext_key),
-            ciphertext: general_purpose::STANDARD
-                .decode(&encrypted_key)
-                .map_err(|e| KmsError::cryptographic_error("decode", e.to_string()))?,
+        // Create data key envelope with master key version for rotation support
+        let envelope = DataKeyEnvelope {
+            key_id: uuid::Uuid::new_v4().to_string(),
+            master_key_id: request.master_key_id.clone(),
             key_spec: request.key_spec.clone(),
-            metadata: request.encryption_context.clone(),
+            encrypted_key: encrypted_key.clone(),
+            nonce,
+            encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
-        })
+        };
+
+        // Serialize the envelope as the ciphertext
+        let ciphertext = serde_json::to_vec(&envelope)?;
+
+        let data_key = DataKeyInfo::new(envelope.key_id, 1, Some(plaintext_key), ciphertext, request.key_spec.clone());
+
+        info!("Generated data key for master key: {}", request.master_key_id);
+        Ok(data_key)
     }
 
     async fn encrypt(&self, request: &EncryptRequest, _context: Option<&OperationContext>) -> Result<EncryptResponse> {
@@ -279,15 +342,42 @@ impl KmsClient for VaultKmsClient {
         })
     }
 
-    async fn decrypt(&self, _request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
+    async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
         debug!("Decrypting data");
 
-        // For this simple implementation, we assume the key ID is embedded in the ciphertext metadata
-        // In practice, you'd extract this from the ciphertext envelope
-        Err(KmsError::invalid_operation("Decrypt not fully implemented for Vault backend"))
+        // Parse the data key envelope from ciphertext
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
+            .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
+
+        // Verify encryption context matches
+        // Check that all keys in envelope.encryption_context are present in request.encryption_context
+        // and their values match. This ensures the context used for decryption matches what was used for encryption.
+        for (key, expected_value) in &envelope.encryption_context {
+            if let Some(actual_value) = request.encryption_context.get(key) {
+                if actual_value != expected_value {
+                    return Err(KmsError::context_mismatch(format!(
+                        "Context mismatch for key '{key}': expected '{expected_value}', got '{actual_value}'"
+                    )));
+                }
+            } else {
+                // If request.encryption_context is empty, allow decryption (backward compatibility)
+                // Otherwise, require all envelope context keys to be present
+                if !request.encryption_context.is_empty() {
+                    return Err(KmsError::context_mismatch(format!("Missing context key '{key}'")));
+                }
+            }
+        }
+
+        // Decrypt the data key
+        let plaintext = self
+            .decrypt_with_master_key(&envelope.master_key_id, &envelope.encrypted_key, &envelope.nonce)
+            .await?;
+
+        info!("Successfully decrypted data");
+        Ok(plaintext)
     }
 
-    async fn create_key(&self, key_id: &str, algorithm: &str, _context: Option<&OperationContext>) -> Result<MasterKey> {
+    async fn create_key(&self, key_id: &str, algorithm: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         debug!("Creating master key: {} with algorithm: {}", key_id, algorithm);
 
         // Check if key already exists
@@ -296,7 +386,7 @@ impl KmsClient for VaultKmsClient {
         }
 
         // Generate key material
-        let key_material = Self::generate_key_material(algorithm)?;
+        let key_material = generate_key_material(algorithm)?;
         let encrypted_material = self.encrypt_key_material(&key_material).await?;
 
         // Create key data
@@ -315,7 +405,7 @@ impl KmsClient for VaultKmsClient {
         // Store in Vault
         self.store_key_data(key_id, &key_data).await?;
 
-        let master_key = MasterKey {
+        let master_key = MasterKeyInfo {
             key_id: key_id.to_string(),
             version: key_data.version,
             algorithm: key_data.algorithm.clone(),
@@ -438,19 +528,19 @@ impl KmsClient for VaultKmsClient {
         Ok(())
     }
 
-    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKey> {
+    async fn rotate_key(&self, key_id: &str, _context: Option<&OperationContext>) -> Result<MasterKeyInfo> {
         debug!("Rotating key: {}", key_id);
 
         let mut key_data = self.get_key_data(key_id).await?;
         key_data.version += 1;
 
         // Generate new key material
-        let key_material = Self::generate_key_material(&key_data.algorithm)?;
+        let key_material = generate_key_material(&key_data.algorithm)?;
         key_data.encrypted_key_material = self.encrypt_key_material(&key_material).await?;
 
         self.store_key_data(key_id, &key_data).await?;
 
-        let master_key = MasterKey {
+        let master_key = MasterKeyInfo {
             key_id: key_id.to_string(),
             version: key_data.version,
             algorithm: key_data.algorithm,
@@ -506,7 +596,7 @@ impl VaultKmsBackend {
     /// Create a new VaultKmsBackend
     pub async fn new(config: KmsConfig) -> Result<Self> {
         let vault_config = match &config.backend_config {
-            crate::config::BackendConfig::Vault(vault_config) => vault_config.clone(),
+            crate::config::BackendConfig::Vault(vault_config) => (**vault_config).clone(),
             _ => return Err(KmsError::configuration_error("Expected Vault backend configuration")),
         };
 
@@ -681,7 +771,7 @@ impl KmsBackend for VaultKmsBackend {
                 ));
             }
 
-            let deletion_date = Zoned::now() + jiff::Span::new().days(days as i64);
+            let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
             key_metadata.key_state = KeyState::PendingDeletion;
             key_metadata.deletion_date = Some(deletion_date.clone());
 

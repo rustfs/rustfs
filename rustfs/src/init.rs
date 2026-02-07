@@ -209,7 +209,7 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
 
                 rustfs_kms::config::KmsConfig {
                     backend: rustfs_kms::config::KmsBackend::Vault,
-                    backend_config: rustfs_kms::config::BackendConfig::Vault(rustfs_kms::config::VaultConfig {
+                    backend_config: rustfs_kms::config::BackendConfig::Vault(Box::new(rustfs_kms::config::VaultConfig {
                         address: vault_address.clone(),
                         auth_method: rustfs_kms::config::VaultAuthMethod::Token {
                             token: vault_token.clone(),
@@ -219,7 +219,7 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
                         kv_mount: "secret".to_string(),
                         key_path_prefix: "rustfs/kms/keys".to_string(),
                         tls: None,
-                    }),
+                    })),
                     default_key_id: opt.kms_default_key_id.clone(),
                     timeout: std::time::Duration::from_secs(30),
                     retry_attempts: 3,
@@ -317,131 +317,160 @@ pub(crate) fn init_buffer_profile_system(opt: &config::Opt) {
     }
 }
 
+/// Initialize the FTP system
+///
+/// This function initializes the FTP server (non-encrypted) if enabled in the configuration.
+#[cfg(feature = "ftps")]
+#[instrument(skip_all)]
+pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+    {
+        use crate::protocols::ProtocolStorageClient;
+        use rustfs_config::{DEFAULT_FTP_ADDRESS, ENV_FTP_ADDRESS, ENV_FTP_ENABLE, ENV_FTP_EXTERNAL_IP, ENV_FTP_PASSIVE_PORTS};
+        use rustfs_protocols::constants::defaults::DEFAULT_FTPS_PASSIVE_PORTS;
+        use rustfs_protocols::{FtpsConfig, FtpsServer};
+        // Check if FTP is enabled
+        let ftp_enable = rustfs_utils::get_env_bool(ENV_FTP_ENABLE, false);
+        if !ftp_enable {
+            debug!("FTP system is disabled");
+            return Ok(None);
+        }
+
+        // Parse FTP address - force IPv4 for libunftp compatibility
+        let ftp_address_str = rustfs_utils::get_env_str(ENV_FTP_ADDRESS, DEFAULT_FTP_ADDRESS);
+        let addr = rustfs_utils::net::parse_and_resolve_address(&ftp_address_str)
+            .map_err(|e| format!("Invalid FTP address '{ftp_address_str}': {e}"))?;
+        // Force IPv4 binding to avoid libunftp IPv6 compatibility issues
+        let addr = if addr.is_ipv6() {
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), addr.port())
+        } else {
+            addr
+        };
+
+        // Get FTP configuration from environment variables
+        let passive_ports =
+            rustfs_utils::get_env_opt_str(ENV_FTP_PASSIVE_PORTS).or_else(|| Some(DEFAULT_FTPS_PASSIVE_PORTS.to_string())); // Default passive ports range
+        let external_ip = rustfs_utils::get_env_opt_str(ENV_FTP_EXTERNAL_IP);
+
+        // Create FTP configuration (TLS disabled, FTPS not required)
+        let config = FtpsConfig {
+            bind_addr: addr,
+            passive_ports,
+            external_ip,
+            ftps_required: false,
+            tls_enabled: false,
+            cert_dir: None,
+            ca_file: None,
+        };
+
+        // Validate FTP configuration
+        config.validate().await?;
+
+        // Create FTP server with protocol storage client
+        let fs = crate::storage::ecfs::FS::new();
+        let storage_client = ProtocolStorageClient::new(fs);
+        let server: FtpsServer<crate::protocols::ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+
+        // Log server configuration
+        info!(
+            "FTP server configured on {} with passive ports {:?}",
+            server.config().bind_addr,
+            server.config().passive_ports
+        );
+
+        // Start FTP server in background task with proper shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        tokio::spawn(async move {
+            if let Err(e) = server.start(shutdown_rx).await {
+                error!("FTP server error: {}", e);
+            }
+            info!("FTP server shutdown completed");
+        });
+
+        info!("FTP system initialized successfully");
+        Ok(Some(shutdown_tx))
+    }
+}
+
 /// Initialize the FTPS system
 ///
 /// This function initializes the FTPS server if enabled in the configuration.
 /// It sets up the FTPS server with the appropriate configuration and starts
-/// the server in a background task.
-///
-/// MINIO CONSTRAINT: FTPS server MUST follow the same lifecycle management
-/// as other services and MUST integrate with the global shutdown system.
+/// the server in a background task.s
+#[cfg(feature = "ftps")]
 #[instrument(skip_all)]
-pub async fn init_ftp_system(
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use crate::protocols::ftps::server::{FtpsConfig, FtpsServer};
-    use std::net::SocketAddr;
-
-    // Check if FTPS is enabled
-    let ftps_enable = rustfs_utils::get_env_bool(rustfs_config::ENV_FTPS_ENABLE, false);
-    if !ftps_enable {
-        debug!("FTPS system is disabled");
-        return Ok(());
-    }
-
-    // Parse FTPS address
-    let ftps_address_str = rustfs_utils::get_env_str(rustfs_config::ENV_FTPS_ADDRESS, rustfs_config::DEFAULT_FTPS_ADDRESS);
-    let addr: SocketAddr = ftps_address_str
-        .parse()
-        .map_err(|e| format!("Invalid FTPS address '{ftps_address_str}': {e}"))?;
-
-    // Get FTPS configuration from environment variables
-    let cert_file = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_CERTS_FILE);
-    let key_file = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_KEY_FILE);
-    let passive_ports = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_PASSIVE_PORTS);
-    let external_ip = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_EXTERNAL_IP);
-
-    // Create FTPS configuration
-    let config = FtpsConfig {
-        bind_addr: addr,
-        passive_ports,
-        external_ip,
-        ftps_required: true,
-        cert_file,
-        key_file,
-    };
-
-    // Create FTPS server
-    let server = FtpsServer::new(config).await?;
-
-    // Log server configuration
-    info!(
-        "FTPS server configured on {} with passive ports {:?}",
-        server.config().bind_addr,
-        server.config().passive_ports
-    );
-
-    // Start FTPS server in background task
-    let shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        if let Err(e) = server.start(shutdown_rx).await {
-            error!("FTPS server error: {}", e);
+pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+    {
+        use crate::protocols::ProtocolStorageClient;
+        use rustfs_config::{
+            DEFAULT_FTPS_ADDRESS, ENV_FTPS_ADDRESS, ENV_FTPS_CA_FILE, ENV_FTPS_CERTS_DIR, ENV_FTPS_ENABLE, ENV_FTPS_EXTERNAL_IP,
+            ENV_FTPS_PASSIVE_PORTS, ENV_FTPS_TLS_ENABLED,
+        };
+        use rustfs_protocols::constants::defaults::DEFAULT_FTPS_PASSIVE_PORTS;
+        use rustfs_protocols::{FtpsConfig, FtpsServer};
+        // Check if FTPS is enabled
+        let ftps_enable = rustfs_utils::get_env_bool(ENV_FTPS_ENABLE, false);
+        if !ftps_enable {
+            debug!("FTPS system is disabled");
+            return Ok(None);
         }
-    });
 
-    info!("FTPS system initialized successfully");
-    Ok(())
-}
+        // Parse FTPS address - force IPv4 for libunftp compatibility
+        let ftps_address_str = rustfs_utils::get_env_str(ENV_FTPS_ADDRESS, DEFAULT_FTPS_ADDRESS);
+        let addr = rustfs_utils::net::parse_and_resolve_address(&ftps_address_str)
+            .map_err(|e| format!("Invalid FTPS address '{ftps_address_str}': {e}"))?;
+        // Force IPv4 binding to avoid libunftp IPv6 compatibility issues
+        let addr = if addr.is_ipv6() {
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), addr.port())
+        } else {
+            addr
+        };
 
-/// Initialize the SFTP system
-///
-/// This function initializes the SFTP server if enabled in the configuration.
-/// It sets up the SFTP server with the appropriate configuration and starts
-/// the server in a background task.
-///
-/// MINIO CONSTRAINT: SFTP server MUST follow the same lifecycle management
-/// as other services and MUST integrate with the global shutdown system.
-#[instrument(skip_all)]
-pub async fn init_sftp_system(
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use crate::protocols::sftp::server::{SftpConfig, SftpServer};
-    use std::net::SocketAddr;
+        // Get FTPS configuration from environment variables
+        let tls_enabled = rustfs_utils::get_env_bool(ENV_FTPS_TLS_ENABLED, true);
+        let cert_dir = rustfs_utils::get_env_opt_str(ENV_FTPS_CERTS_DIR);
+        let ca_file = rustfs_utils::get_env_opt_str(ENV_FTPS_CA_FILE);
+        let passive_ports =
+            rustfs_utils::get_env_opt_str(ENV_FTPS_PASSIVE_PORTS).or_else(|| Some(DEFAULT_FTPS_PASSIVE_PORTS.to_string())); // Default passive ports range
+        let external_ip = rustfs_utils::get_env_opt_str(ENV_FTPS_EXTERNAL_IP);
 
-    // Check if SFTP is enabled
-    let sftp_enable = rustfs_utils::get_env_bool(rustfs_config::ENV_SFTP_ENABLE, false);
-    if !sftp_enable {
-        debug!("SFTP system is disabled");
-        return Ok(());
+        // Create FTPS configuration
+        let config = FtpsConfig {
+            bind_addr: addr,
+            passive_ports,
+            external_ip,
+            ftps_required: true,
+            tls_enabled,
+            cert_dir,
+            ca_file,
+        };
+
+        // Validate FTPS configuration
+        config.validate().await?;
+
+        // Create FTPS server with protocol storage client
+        let fs = crate::storage::ecfs::FS::new();
+        let storage_client = ProtocolStorageClient::new(fs);
+        let server: FtpsServer<crate::protocols::ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+
+        // Log server configuration
+        info!(
+            "FTPS server configured on {} with passive ports {:?}",
+            server.config().bind_addr,
+            server.config().passive_ports
+        );
+
+        // Start FTPS server in background task with proper shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        tokio::spawn(async move {
+            if let Err(e) = server.start(shutdown_rx).await {
+                error!("FTPS server error: {}", e);
+            }
+            info!("FTPS server shutdown completed");
+        });
+
+        info!("FTPS system initialized successfully");
+        Ok(Some(shutdown_tx))
     }
-
-    // Parse SFTP address
-    let sftp_address_str = rustfs_utils::get_env_str(rustfs_config::ENV_SFTP_ADDRESS, rustfs_config::DEFAULT_SFTP_ADDRESS);
-    let addr: SocketAddr = sftp_address_str
-        .parse()
-        .map_err(|e| format!("Invalid SFTP address '{sftp_address_str}': {e}"))?;
-
-    // Get SFTP configuration from environment variables
-    let host_key = rustfs_utils::get_env_opt_str(rustfs_config::ENV_SFTP_HOST_KEY);
-    let authorized_keys = rustfs_utils::get_env_opt_str(rustfs_config::ENV_SFTP_AUTHORIZED_KEYS);
-
-    // Create SFTP configuration
-    let config = SftpConfig {
-        bind_addr: addr,
-        require_key_auth: false,               // TODO: Add key auth configuration
-        cert_file: None,                       // CA certificates for client certificate authentication
-        key_file: host_key,                    // SFTP server host key
-        authorized_keys_file: authorized_keys, // Pre-loaded authorized SSH public keys
-    };
-
-    // Create SFTP server
-    let server = SftpServer::new(config)?;
-
-    // Log server configuration
-    info!(
-        "SFTP server configured on {} with key auth requirement: {}",
-        server.config().bind_addr,
-        server.config().require_key_auth
-    );
-
-    // Start SFTP server in background task
-    let shutdown_rx = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        if let Err(e) = server.start(shutdown_rx).await {
-            error!("SFTP server error: {}", e);
-        }
-    });
-
-    info!("SFTP system initialized successfully");
-    Ok(())
 }

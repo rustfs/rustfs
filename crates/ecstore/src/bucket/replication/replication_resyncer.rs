@@ -28,6 +28,7 @@ use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_fo
 use crate::event::name::EventName;
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
+use crate::set_disk::get_lock_acquire_timeout;
 use crate::store_api::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
 use aws_sdk_s3::error::SdkError;
@@ -1273,7 +1274,58 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         }
     };
 
-    //TODO: nslock
+    let ns_lock = match storage
+        .new_ns_lock(&bucket, format!("/[replicate]/{}", dobj.delete_object.object_name).as_str())
+        .await
+    {
+        Ok(ns_lock) => ns_lock,
+        Err(e) => {
+            warn!(
+                "failed to get ns lock for bucket:{} object:{} error:{}",
+                bucket, dobj.delete_object.object_name, e
+            );
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: dobj.delete_object.object_name.clone(),
+                    version_id,
+                    delete_marker: dobj.delete_object.delete_marker,
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+            return;
+        }
+    };
+
+    let _lock_guard = match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+        Ok(lock_guard) => lock_guard,
+        Err(e) => {
+            warn!(
+                "failed to get write lock for bucket:{} object:{} error:{}",
+                bucket, dobj.delete_object.object_name, e
+            );
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: dobj.delete_object.object_name.clone(),
+                    version_id,
+                    delete_marker: dobj.delete_object.delete_marker,
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+            return;
+        }
+    };
 
     // Initialize replicated infos
     let mut rinfos = ReplicatedInfos {
@@ -1379,7 +1431,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         dobj.delete_object.version_id.map(|v| v.to_string()),
     );
     if replication_status != prev_status {
-        drs.replica_timestamp = Some(OffsetDateTime::now_utc());
+        drs.replication_timestamp = Some(OffsetDateTime::now_utc());
     }
 
     let event_name = if replication_status == ReplicationStatusType::Completed {
@@ -1521,6 +1573,13 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         }
     }
 
+    if rinfo.replication_status == ReplicationStatusType::Completed
+        && !tgt_client.reset_id.is_empty()
+        && dobj.op_type == ReplicationType::ExistingObject
+    {
+        rinfo.resync_timestamp = format!("{};{}", OffsetDateTime::now_utc().format(&Rfc3339).unwrap(), tgt_client.reset_id);
+    }
+
     rinfo
 }
 
@@ -1621,8 +1680,17 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     let mut object_info = roi.to_object_info();
 
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
+        let mut eval_metadata = HashMap::new();
+        if let Some(ref s) = new_replication_internal {
+            eval_metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}replication-status"), s.clone());
+        }
+        eval_metadata.insert(
+            format!("{RESERVED_METADATA_PREFIX_LOWER}replication-timestamp"),
+            OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+        );
         let popts = ObjectOptions {
             version_id: roi.version_id.map(|v| v.to_string()),
+            eval_metadata: Some(eval_metadata),
             ..Default::default()
         };
 
@@ -1830,6 +1898,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         } {
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(err.to_string());
+            warn!(
+                "replication put_object failed src_bucket={} dest_bucket={} object={} err={:?}",
+                bucket, tgt_client.bucket, object, err
+            );
 
             // TODO: check offline
             return rinfo;

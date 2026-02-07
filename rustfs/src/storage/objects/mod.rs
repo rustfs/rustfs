@@ -12,7 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! FTPS protocol implementation
+use std::sync::LazyLock;
 
-pub mod driver;
-pub mod server;
+mod put_object;
+
+pub(crate) struct Objects;
+
+pub(crate) static GLOBAL_OBJECTS: LazyLock<Objects> = LazyLock::new(Objects::new);
+
+impl Objects {
+    pub fn new() -> Self {
+        Objects
+    }
+}
