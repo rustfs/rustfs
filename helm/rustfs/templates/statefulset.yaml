@@ -87,22 +87,6 @@ spec:
               fi
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
-              echo "Checking for certificates in /opt/tls..."
-
-              until [ -f /opt/tls/client_ca.crt ] && [ -f /opt/tls/client_cert.pem ] && [ -f /opt/tls/client_key.pem ]; do
-                echo "Waiting for certificates to be mounted..."
-                sleep 2
-              done
-
-              if [ ! -s /opt/tls/client_ca.crt ]; then
-                echo "ERROR: ca.crt is empty!"
-                exit 1
-              fi
-
-              grep -q "BEGIN CERTIFICATE" /opt/tls/client_ca.crt || { echo "ca.crt is not a valid PEM"; exit 1; }
-
-              echo "All certificates are present and valid. Starting RustFS..."
-
           volumeMounts:
             {{- if eq (int .Values.replicaCount) 4 }}
             {{- range $i := until (int .Values.replicaCount) }}
@@ -115,26 +99,6 @@ spec:
             {{- end }}
             - name: logs
               mountPath: /mnt/rustfs
-            {{- if .Values.mtls.enabled }}
-            - name: client-cert
-              mountPath: /opt/tls/client_cert.pem
-              subPath: client_cert.pem
-            - name: client-cert
-              mountPath: /opt/tls/client_key.pem
-              subPath: client_key.pem
-            - name: client-cert
-              mountPath: /opt/tls/client_ca.crt
-              subPath: client_ca.crt
-            - name: server-cert
-              mountPath: /opt/tls/rustfs_cert.pem
-              subPath: rustfs_cert.pem
-            - name: server-cert
-              mountPath: /opt/tls/rustfs_key.pem
-              subPath: rustfs_key.pem
-            - name: server-cert
-              mountPath: /opt/tls/ca.crt
-              subPath: ca.crt
-            {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
@@ -156,6 +120,7 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             {{- if .Values.mtls.enabled }}
+            {{- if not .Values.mtls.serverOnly }}
             - name: client-cert
               mountPath: /opt/tls/client_cert.pem
               subPath: client_cert.pem
@@ -165,6 +130,7 @@ spec:
             - name: client-cert
               mountPath: /opt/tls/client_ca.crt
               subPath: client_ca.crt
+            {{- end }}
             - name: server-cert
               mountPath: /opt/tls/rustfs_cert.pem
               subPath: rustfs_cert.pem
@@ -199,6 +165,7 @@ spec:
                 path: rustfs_key.pem
               - key: ca.crt
                 path: ca.crt
+        {{- if not .Values.mtls.serverOnly }}
         - name: client-cert
           secret:
             secretName: rustfs-client-tls
@@ -209,6 +176,7 @@ spec:
                 path: client_key.pem
               - key: ca.crt
                 path: client_ca.crt
+        {{- end }}
       {{- end }}
   volumeClaimTemplates:
     - metadata:

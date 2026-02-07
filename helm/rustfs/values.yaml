@@ -162,6 +162,7 @@ gatewayApi:
 
 mtls:
   enabled: false
+  serverOnly: false # If true, only server side TLS will be enabled. If false, both server and client side TLS will be enabled.
   # This is for setting up mTLS for ingress.
 
 resources: {}
