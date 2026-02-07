@@ -21,6 +21,7 @@ use nu_ansi_term::Color;
 use opentelemetry::{KeyValue, global, trace::TracerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::{
     Resource,
     logs::SdkLoggerProvider,
@@ -439,6 +440,7 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
 
             let provider = builder.build();
             global::set_tracer_provider(provider.clone());
+            global::set_text_map_propagator(TraceContextPropagator::new());
             Some(provider)
         }
     };
