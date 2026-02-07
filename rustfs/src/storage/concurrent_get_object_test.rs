@@ -93,6 +93,7 @@ mod tests {
         CachedGetObject, ConcurrencyManager, GetObjectGuard, get_advanced_buffer_size, get_concurrency_aware_buffer_size,
     };
     use rustfs_config::{KI_B, MI_B};
+    use serial_test::serial;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::{Instant, sleep};
@@ -117,6 +118,7 @@ mod tests {
     /// uses `ACTIVE_GET_REQUESTS` to determine optimal buffer sizes. A leaked
     /// counter would cause permanently reduced buffer sizes, degrading performance.
     #[tokio::test]
+    #[serial]
     async fn test_concurrent_request_tracking() {
         // Start with current baseline (may not be zero if other tests are running)
         let initial = GetObjectGuard::concurrent_requests();
@@ -191,6 +193,7 @@ mod tests {
     /// ACTIVE_GET_REQUESTS is a global atomic counter. The test uses widened
     /// tolerances to account for this.
     #[tokio::test]
+    #[serial]
     async fn test_adaptive_buffer_sizing() {
         let file_size = 32 * MI_B as i64; // 32MB file (matches issue #911 test case)
         let base_buffer = 256 * KI_B; // 256KB base buffer (typical for S3-like workloads)
@@ -527,6 +530,7 @@ mod tests {
 
     /// Test advanced buffer sizing with file patterns
     #[tokio::test]
+    #[serial]
     async fn test_advanced_buffer_sizing() {
         crate::storage::concurrency::reset_active_get_requests();
 

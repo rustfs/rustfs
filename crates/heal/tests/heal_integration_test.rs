@@ -321,7 +321,8 @@ mod serial_tests {
         heal_manager.start().await.unwrap();
 
         // Wait for task completion
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // The minimal scanner interval is clamped to 10s in manager.rs, so we must wait longer than that
+        tokio::time::sleep(tokio::time::Duration::from_secs(12)).await;
 
         // ─── 2️⃣ verify format.json is restored ───────
         assert!(format_path.exists(), "format.json does not exist on disk after heal");
@@ -367,7 +368,8 @@ mod serial_tests {
         heal_manager.start().await.unwrap();
 
         // Wait for task completion
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // The minimal scanner interval is clamped to 10s in manager.rs, so we must wait longer than that
+        tokio::time::sleep(tokio::time::Duration::from_secs(12)).await;
 
         // ─── 2️⃣ verify format.json is restored ───────
         assert!(format_path.exists(), "format.json does not exist on disk after heal");
