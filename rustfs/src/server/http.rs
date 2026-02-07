@@ -648,7 +648,7 @@ fn process_connection(
                             version = ?request.version(),
                         );
                         if let Err(e) = span.set_parent(parent_context) {
-                            warn!("Failed to propogate tracing context: `{:?}`", e);
+                            warn!("Failed to propagate tracing context: `{:?}`", e);
                         }
                         for (header_name, header_value) in request.headers() {
                             if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length" {
