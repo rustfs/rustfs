@@ -667,6 +667,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         // check quota after completing multipart upload
+        let mut quota_usage_calculated = false;
         if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
 
@@ -682,20 +683,25 @@ impl S3 for FS {
                             S3ErrorCode::InvalidRequest,
                             format!(
                                 "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage,
+                                check_result.current_usage.unwrap_or(0),
                                 check_result.quota_limit.unwrap_or(0)
                             ),
                         ));
                     }
-                    // Update quota tracking after successful multipart upload
-                    if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
-                        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
-                    }
+                    // Track if usage was actually calculated (not just returned as None/0)
+                    quota_usage_calculated = check_result.current_usage.is_some();
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
                 }
             }
+        }
+
+        // Only increment usage cache when quota checking actually calculated real usage.
+        // This prevents cache corruption: when quotas are disabled, the cache remains unset.
+        // When quotas are later enabled, the cache will miss and recalculate from backend.
+        if quota_usage_calculated {
+            rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
         }
 
         // Invalidate cache for the completed multipart object
@@ -1036,6 +1042,7 @@ impl S3 for FS {
         }
 
         // check quota for copy operation
+        let mut quota_usage_calculated = false;
         if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
 
@@ -1049,11 +1056,13 @@ impl S3 for FS {
                             S3ErrorCode::InvalidRequest,
                             format!(
                                 "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage,
+                                check_result.current_usage.unwrap_or(0),
                                 check_result.quota_limit.unwrap_or(0)
                             ),
                         ));
                     }
+                    // Track if usage was actually calculated (not just returned as None/0)
+                    quota_usage_calculated = check_result.current_usage.is_some();
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
@@ -1066,8 +1075,10 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        // Update quota tracking after successful copy
-        if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
+        // Only increment usage cache when quota checking actually calculated real usage.
+        // This prevents cache corruption: when quotas are disabled, the cache remains unset.
+        // When quotas are later enabled, the cache will miss and recalculate from backend.
+        if quota_usage_calculated {
             rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
         }
 
