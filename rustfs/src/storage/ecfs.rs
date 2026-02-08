@@ -670,49 +670,30 @@ impl S3 for FS {
         if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
 
-            // Fast check if quota is configured to avoid expensive usage calculation
-            match quota_checker.has_quota_configured(&bucket).await {
-                Ok(has_quota) if has_quota => {
-                    match quota_checker
-                        .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
-                        .await
-                    {
-                        Ok(check_result) => {
-                            if !check_result.allowed {
-                                // Quota exceeded, delete the completed object
-                                let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
-                                return Err(S3Error::with_message(
-                                    S3ErrorCode::InvalidRequest,
-                                    format!(
-                                        "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                        check_result.current_usage,
-                                        check_result.quota_limit.unwrap_or(0)
-                                    ),
-                                ));
-                            }
-                            // Update quota tracking after successful multipart upload
-                            if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
-                                rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
-                        }
+            match quota_checker
+                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
+                .await
+            {
+                Ok(check_result) => {
+                    if !check_result.allowed {
+                        // Quota exceeded, delete the completed object
+                        let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            format!(
+                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                                check_result.current_usage,
+                                check_result.quota_limit.unwrap_or(0)
+                            ),
+                        ));
                     }
-                }
-                Ok(_) => {
-                    // No quota configured, skip check for performance but still update usage tracking
-                    debug!("No quota configured for bucket {}, skipping quota check", bucket);
+                    // Update quota tracking after successful multipart upload
                     if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
                         rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to check quota configuration for bucket {}: {}, allowing operation", bucket, e);
-                    // Still update usage tracking even if quota config check failed
-                    if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
-                        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
-                    }
+                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
                 }
             }
         }
@@ -1058,36 +1039,24 @@ impl S3 for FS {
         if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
 
-            // Fast check if quota is configured to avoid expensive usage calculation
-            match quota_checker.has_quota_configured(&bucket).await {
-                Ok(has_quota) if has_quota => {
-                    match quota_checker
-                        .check_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
-                        .await
-                    {
-                        Ok(check_result) => {
-                            if !check_result.allowed {
-                                return Err(S3Error::with_message(
-                                    S3ErrorCode::InvalidRequest,
-                                    format!(
-                                        "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                        check_result.current_usage,
-                                        check_result.quota_limit.unwrap_or(0)
-                                    ),
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
-                        }
+            match quota_checker
+                .check_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
+                .await
+            {
+                Ok(check_result) => {
+                    if !check_result.allowed {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            format!(
+                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                                check_result.current_usage,
+                                check_result.quota_limit.unwrap_or(0)
+                            ),
+                        ));
                     }
                 }
-                Ok(_) => {
-                    // No quota configured, skip check for performance
-                    debug!("No quota configured for bucket {}, skipping quota check", bucket);
-                }
                 Err(e) => {
-                    warn!("Failed to check quota configuration for bucket {}: {}, allowing operation", bucket, e);
+                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
                 }
             }
         }
