@@ -4,7 +4,7 @@ kind: ServersTransport
 metadata:
   name: {{ include "rustfs.fullname" . }}-transport
 spec:
-  rootCAsSecrets:
+  rootcas:
     - {{ include "rustfs.fullname" . }}-root-ca-secret
   certificatesSecrets:
     - {{ include "rustfs.fullname" . }}-mtls-secret
