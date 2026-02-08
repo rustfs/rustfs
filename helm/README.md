@@ -75,6 +75,8 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | livenessProbe.timeoutSeconds | int | `3` |  |
 | mode.distributed.enabled | bool | `true` | RustFS distributed mode support, namely multiple pod multiple pvc. |
 | mode.standalone.enabled | bool | `false` | RustFS standalone mode support, namely one pod one pvc.  |
+| mtls.enabled | bool | `false` | Enable mtls betweens pods. |
+| mtls.serverOnly | bool | `false` | Only enable server https. |
 | nameOverride | string | `""` |  |
 | nodeSelector | object | `{}` |  |
 | pdb.create | bool | `false` | Enable/disable a Pod Disruption Budget creation |
