@@ -14,9 +14,9 @@ spec:
     - "*.{{ include "rustfs.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local"
     - "{{ include "rustfs.fullname" . }}-svc.{{ .Release.Namespace }}.svc.cluster.local"
   {{- range .Values.ingress.hosts }}
-    {{ .host | quote }}
+    - {{ .host | quote }}
+    - {{ printf "*.%s" .host | quote }}
   {{- end }}
-    - "*.xiaomage-ai.cloud"
   usages:
     - server auth
 {{- end }}
