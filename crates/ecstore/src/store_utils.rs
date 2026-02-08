@@ -18,6 +18,13 @@ use regex::Regex;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS};
 use std::collections::HashMap;
 use std::io::{Error, Result};
+use std::sync::LazyLock;
+
+static IP_ADDRESS_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+\.){3}\d+$").expect("valid ip address regex"));
+static STRICT_BUCKET_NAME_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9\.\-]{1,61}[a-z0-9]$").expect("valid strict bucket name regex"));
+static NON_STRICT_BUCKET_NAME_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9\.\-_:]{1,61}[A-Za-z0-9]$").expect("valid non-strict bucket name regex"));
 
 pub fn clean_metadata(metadata: &mut HashMap<String, String>) {
     remove_standard_storage_class(metadata);
@@ -70,15 +77,14 @@ fn check_bucket_name(bucket_name: &str, strict: bool) -> Result<()> {
         return Err(Error::other("Bucket name cannot be longer than 63 characters"));
     }
 
-    let ip_address_regex = Regex::new(r"^(\d+\.){3}\d+$").unwrap();
-    if ip_address_regex.is_match(bucket_name) {
+    if IP_ADDRESS_REGEX.is_match(bucket_name) {
         return Err(Error::other("Bucket name cannot be an IP address"));
     }
 
     let valid_bucket_name_regex = if strict {
-        Regex::new(r"^[a-z0-9][a-z0-9\.\-]{1,61}[a-z0-9]$").unwrap()
+        &*STRICT_BUCKET_NAME_REGEX
     } else {
-        Regex::new(r"^[A-Za-z0-9][A-Za-z0-9\.\-_:]{1,61}[A-Za-z0-9]$").unwrap()
+        &*NON_STRICT_BUCKET_NAME_REGEX
     };
 
     if !valid_bucket_name_regex.is_match(bucket_name) {
