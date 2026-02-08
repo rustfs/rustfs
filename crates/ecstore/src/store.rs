@@ -66,7 +66,7 @@ use crate::{
 use futures::future::join_all;
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use rand::Rng as _;
+use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;

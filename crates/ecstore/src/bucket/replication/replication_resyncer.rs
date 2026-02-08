@@ -1680,8 +1680,17 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     let mut object_info = roi.to_object_info();
 
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
+        let mut eval_metadata = HashMap::new();
+        if let Some(ref s) = new_replication_internal {
+            eval_metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}replication-status"), s.clone());
+        }
+        eval_metadata.insert(
+            format!("{RESERVED_METADATA_PREFIX_LOWER}replication-timestamp"),
+            OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+        );
         let popts = ObjectOptions {
             version_id: roi.version_id.map(|v| v.to_string()),
+            eval_metadata: Some(eval_metadata),
             ..Default::default()
         };
 
@@ -1889,6 +1898,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         } {
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(err.to_string());
+            warn!(
+                "replication put_object failed src_bucket={} dest_bucket={} object={} err={:?}",
+                bucket, tgt_client.bucket, object, err
+            );
 
             // TODO: check offline
             return rinfo;

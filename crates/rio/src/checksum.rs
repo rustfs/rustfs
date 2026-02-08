@@ -505,7 +505,7 @@ pub fn get_content_checksum(headers: &HeaderMap) -> Result<Option<Checksum>, std
 
         for header in trailing_headers {
             let mut duplicates = false;
-            for &checksum_type in crate::checksum::BASE_CHECKSUM_TYPES {
+            for &checksum_type in BASE_CHECKSUM_TYPES {
                 if let Some(key) = checksum_type.key()
                     && header.eq_ignore_ascii_case(key)
                 {
@@ -570,17 +570,17 @@ fn get_content_checksum_direct(headers: &HeaderMap) -> (ChecksumType, String) {
         if checksum_type.is_set()
             && let Some(key) = checksum_type.key()
         {
-            if let Some(value) = headers.get(key).and_then(|v| v.to_str().ok()) {
-                return (checksum_type, value.to_string());
+            return if let Some(value) = headers.get(key).and_then(|v| v.to_str().ok()) {
+                (checksum_type, value.to_string())
             } else {
-                return (ChecksumType::NONE, String::new());
-            }
+                (ChecksumType::NONE, String::new())
+            };
         }
         return (checksum_type, String::new());
     }
 
     // Check individual checksum headers
-    for &ct in crate::checksum::BASE_CHECKSUM_TYPES {
+    for &ct in BASE_CHECKSUM_TYPES {
         if let Some(key) = ct.key()
             && let Some(value) = headers.get(key).and_then(|v| v.to_str().ok())
         {

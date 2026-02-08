@@ -439,6 +439,7 @@ mod tests {
     use crate::WarpReader;
 
     use super::*;
+    use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
 
@@ -494,7 +495,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_compress_reader_large() {
-        use rand::Rng;
         // Generate 1MB of random bytes
         let mut data = vec![0u8; 1024 * 1024 * 32];
         rand::rng().fill(&mut data[..]);
@@ -513,7 +513,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_compress_reader_large_deflate() {
-        use rand::Rng;
         // Generate 1MB of random bytes
         let mut data = vec![0u8; 1024 * 1024 * 3 + 512];
         rand::rng().fill(&mut data[..]);
