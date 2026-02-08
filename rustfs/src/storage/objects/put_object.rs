@@ -138,20 +138,14 @@ impl Objects {
         {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
 
+            // Use optimized quota check for write operations
             match quota_checker
-                .check_quota(&bucket, QuotaOperation::PutObject, size as u64)
+                .check_quota_for_operation(&bucket, QuotaOperation::PutObject, size as u64)
                 .await
             {
-                Ok(check_result) => {
-                    if !check_result.allowed {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidRequest,
-                            format!(
-                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage,
-                                check_result.quota_limit.unwrap_or(0)
-                            ),
-                        ));
+                Ok(allowed) => {
+                    if !allowed {
+                        return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Bucket quota exceeded"));
                     }
                 }
                 Err(e) => {

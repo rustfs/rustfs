@@ -670,22 +670,16 @@ impl S3 for FS {
         if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
 
+            // Use optimized quota check for write operations
             match quota_checker
-                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
+                .check_quota_for_operation(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
                 .await
             {
-                Ok(check_result) => {
-                    if !check_result.allowed {
+                Ok(allowed) => {
+                    if !allowed {
                         // Quota exceeded, delete the completed object
                         let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidRequest,
-                            format!(
-                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage,
-                                check_result.quota_limit.unwrap_or(0)
-                            ),
-                        ));
+                        return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Bucket quota exceeded"));
                     }
                     // Update quota tracking after successful multipart upload
                     if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
@@ -694,6 +688,10 @@ impl S3 for FS {
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                    // Still update usage tracking even if quota check failed
+                    if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
+                        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+                    }
                 }
             }
         }
@@ -1039,20 +1037,14 @@ impl S3 for FS {
         if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
 
+            // Use optimized quota check for write operations
             match quota_checker
-                .check_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
+                .check_quota_for_operation(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
                 .await
             {
-                Ok(check_result) => {
-                    if !check_result.allowed {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidRequest,
-                            format!(
-                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage,
-                                check_result.quota_limit.unwrap_or(0)
-                            ),
-                        ));
+                Ok(allowed) => {
+                    if !allowed {
+                        return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Bucket quota exceeded"));
                     }
                 }
                 Err(e) => {

@@ -31,6 +31,43 @@ impl QuotaChecker {
         Self { metadata_sys }
     }
 
+    /// Fast quota check optimized for write operations - avoids expensive usage calculation when no quota configured
+    pub async fn check_quota_for_operation(
+        &self,
+        bucket: &str,
+        operation: QuotaOperation,
+        operation_size: u64,
+    ) -> Result<bool, QuotaError> {
+        let quota_config = self.get_quota_config(bucket).await?;
+
+        // If no quota limit is set, allow operation without expensive usage calculation
+        let quota_limit = match quota_config.quota {
+            None => {
+                debug!("No quota configured for bucket {}, allowing operation", bucket);
+                return Ok(true);
+            }
+            Some(q) => q,
+        };
+
+        // Only calculate usage if quota is actually configured
+        let current_usage = self.get_real_time_usage(bucket).await?;
+        let allowed = match operation {
+            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => {
+                quota_config.check_operation_allowed(current_usage, operation_size)
+            }
+            QuotaOperation::DeleteObject => true,
+        };
+
+        if !allowed {
+            warn!(
+                "Quota exceeded for bucket: {}, current: {}, limit: {}, attempted: {}",
+                bucket, current_usage, quota_limit, operation_size
+            );
+        }
+
+        Ok(allowed)
+    }
+
     pub async fn check_quota(
         &self,
         bucket: &str,
