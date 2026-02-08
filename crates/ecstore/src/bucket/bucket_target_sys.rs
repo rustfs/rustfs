@@ -64,6 +64,8 @@ use uuid::Uuid;
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
 
+const REPLICATION_REQUEST_TRUE: HeaderValue = HeaderValue::from_static("true");
+
 pub static GLOBAL_BUCKET_TARGET_SYS: OnceLock<BucketTargetSys> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -1173,6 +1175,10 @@ impl TargetClient {
             && let Ok(header_value) = HeaderValue::from_str(&version_id)
         {
             headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
+        }
+
+        if opts.internal.replication_request {
+            headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE);
         }
 
         match builder

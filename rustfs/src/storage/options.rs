@@ -45,6 +45,8 @@ use crate::auth::AuthType;
 use crate::auth::get_request_auth_type;
 use crate::auth::is_request_presigned_signature_v4;
 
+const REPLICATION_REQUEST_TRUE: HeaderValue = HeaderValue::from_static("true");
+
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
     bucket: &str,
@@ -282,7 +284,11 @@ pub fn copy_src_opts(_bucket: &str, _object: &str, headers: &HeaderMap<HeaderVal
 }
 
 pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap<String, String>) -> Result<ObjectOptions> {
-    get_default_opts(headers, metadata, false)
+    let mut opts = get_default_opts(headers, metadata, false)?;
+    if headers.get(RUSTFS_BUCKET_REPLICATION_REQUEST) == Some(&REPLICATION_REQUEST_TRUE) {
+        opts.replication_request = true;
+    }
+    Ok(opts)
 }
 
 /// Creates default options for getting an object from a bucket.
