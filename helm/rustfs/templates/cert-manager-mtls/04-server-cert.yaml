@@ -1,0 +1,22 @@
+{{- if .Values.mtls.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "rustfs.fullname" . }}-server-tls
+spec:
+  secretName: {{ include "rustfs.fullname" . }}-server-tls
+  issuerRef:
+    name: {{ include "rustfs.fullname" . }}-ca-issuer
+    kind: Issuer
+  commonName: {{ include "rustfs.fullname" . }}-cluster
+  dnsNames:
+    - "*.{{ include "rustfs.fullname" . }}-headless"
+    - "*.{{ include "rustfs.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local"
+    - "{{ include "rustfs.fullname" . }}-svc.{{ .Release.Namespace }}.svc.cluster.local"
+  {{- range .Values.ingress.hosts }}
+    - {{ .host | quote }}
+    - {{ printf "*.%s" .host | quote }}
+  {{- end }}
+  usages:
+    - server auth
+{{- end }}

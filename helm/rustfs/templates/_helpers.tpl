@@ -103,11 +103,17 @@ Render imagePullSecrets for workloads - appends registry secret
 Render RUSTFS_VOLUMES
 */}}
 {{- define "rustfs.volumes" -}}
+
+{{- $protocol := "http" -}}
+{{- if .Values.mtls.enabled -}}
+  {{- $protocol = "https" -}}
+{{- end -}}
+
 {{- if eq (int .Values.replicaCount) 4 }}
-{{- printf "http://%s-{0...%d}.%s-headless:%d/data/rustfs{0...%d}" (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" . ) (.Values.service.endpoint.port | int) (sub (.Values.replicaCount | int) 1) }}
+{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data/rustfs{0...%d}" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" . ) .Release.Namespace (.Values.service.endpoint.port | int) (sub (.Values.replicaCount | int) 1) }}
 {{- end }}
 {{- if eq (int .Values.replicaCount) 16 }}
-{{- printf "http://%s-{0...%d}.%s-headless:%d/data" (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) (.Values.service.endpoint.port | int) }}
+{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) .Release.Namespace (.Values.service.endpoint.port | int) }}
 {{- end }}
 {{- end }}
 
