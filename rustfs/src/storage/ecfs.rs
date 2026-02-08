@@ -682,7 +682,7 @@ impl S3 for FS {
                             S3ErrorCode::InvalidRequest,
                             format!(
                                 "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage,
+                                check_result.current_usage.unwrap_or(0),
                                 check_result.quota_limit.unwrap_or(0)
                             ),
                         ));
@@ -1049,7 +1049,7 @@ impl S3 for FS {
                             S3ErrorCode::InvalidRequest,
                             format!(
                                 "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage,
+                                check_result.current_usage.unwrap_or(0),
                                 check_result.quota_limit.unwrap_or(0)
                             ),
                         ));
