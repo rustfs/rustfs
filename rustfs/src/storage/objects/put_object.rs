@@ -133,6 +133,7 @@ impl Objects {
         }
 
         // check quota for put operation
+        let mut quota_usage_calculated = false;
         if let Some(size) = content_length
             && let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get()
         {
@@ -148,11 +149,13 @@ impl Objects {
                             S3ErrorCode::InvalidRequest,
                             format!(
                                 "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage,
+                                check_result.current_usage.unwrap_or(0),
                                 check_result.quota_limit.unwrap_or(0)
                             ),
                         ));
                     }
+                    // Track if usage was actually calculated (not just returned as None/0)
+                    quota_usage_calculated = check_result.current_usage.is_some();
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
@@ -332,8 +335,12 @@ impl Objects {
             .await
             .map_err(ApiError::from)?;
 
-        // Fast in-memory update for immediate quota consistency
-        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+        // Only increment usage cache when quota checking actually calculated real usage.
+        // This prevents cache corruption: when quotas are disabled, the cache remains unset.
+        // When quotas are later enabled, the cache will miss and recalculate from backend.
+        if quota_usage_calculated {
+            rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+        }
 
         // Invalidate cache for the written object to prevent stale data
         let manager = get_concurrency_manager();
