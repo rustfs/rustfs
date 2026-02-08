@@ -27,13 +27,13 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "rustfs.fullname" . }}-svc
-  {{- if .Values.mode.distributed.enabled }}
-  {{- if eq .Values.ingress.className "traefik" }}
-  {{- with .Values.ingress.traefikAnnotations }}
+  {{- if and .Values.mode.distributed.enabled (eq .Values.ingress.className "traefik")}}
   annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  {{- end }}
+    {{- toYaml .Values.ingress.traefikAnnotations | nindent 4 }}
+    {{- if and .Values.mtls.enabled (eq .Values.ingress.className "traefik") }}
+    traefik.ingress.kubernetes.io/service.serversscheme: https
+    traefik.ingress.kubernetes.io/service.serverstransport: {{ .Release.Namespace }}-{{ include "rustfs.fullname" . }}-transport@kubernetescrd
+    {{- end }}
   {{- end }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
