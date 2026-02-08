@@ -323,14 +323,6 @@ mod serial_tests {
         assert!(!format_path.exists(), "format.json still exists after deletion");
         println!("✅ Deleted format.json on disk: {format_path:?}");
 
-        // Create heal manager with faster interval
-        let cfg = HealConfig {
-            heal_interval: Duration::from_secs(2),
-            ..Default::default()
-        };
-        let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
-        heal_manager.start().await.unwrap();
-
         let (_result, error) = heal_storage.heal_format(false).await.expect("Failed to heal format");
         assert!(error.is_none(), "Heal format returned error: {error:?}");
 
