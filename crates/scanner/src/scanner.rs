@@ -15,13 +15,12 @@
 use std::sync::Arc;
 
 use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
-use crate::metrics::CurrentCycle;
-use crate::metrics::global_metrics;
 use crate::scanner_folder::data_usage_update_dir_cycles;
 use crate::scanner_io::ScannerIO;
 use crate::{DataUsageInfo, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
+use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, global_metrics};
 use rustfs_config::{DEFAULT_DATA_SCANNER_START_DELAY_SECS, ENV_DATA_SCANNER_START_DELAY_SECS};
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
@@ -199,9 +198,11 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
                 });
 
 
+               let done_cycle = Metrics::time(Metric::ScanCycle);
                if let Err(e) = storeapi.clone().nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode).await {
                 error!("Failed to scan namespace: {e}");
                } else {
+                done_cycle();
                 info!("Namespace scanned successfully");
 
                 cycle_info.next +=1;
