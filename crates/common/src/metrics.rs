@@ -330,8 +330,11 @@ const OTEL_SCANNER_OBJECTS_SCANNED: &str = "rustfs.scanner.objects_scanned_total
 const OTEL_SCANNER_DIRECTORIES_SCANNED: &str = "rustfs.scanner.directories_scanned_total";
 const OTEL_SCANNER_BUCKETS_SCANNED: &str = "rustfs.scanner.buckets_scanned_total";
 const OTEL_SCANNER_CYCLES: &str = "rustfs.scanner.cycles_total";
+const OTEL_SCANNER_CYCLE_DURATION_SECONDS: &str = "rustfs.scanner.cycle_duration_seconds";
+const OTEL_SCANNER_BUCKET_DRIVE_DURATION_SECONDS: &str = "rustfs.scanner.bucket_drive_duration_seconds";
 
 /// Emit an OTEL counter increment for the given scanner metric.
+/// ScanCycle and ScanBucketDrive are handled by dedicated emit functions with labels.
 fn emit_otel_counter(metric: usize, count: u64) {
     match Metric::from_index(metric) {
         Some(Metric::ScanObject) => {
@@ -340,14 +343,37 @@ fn emit_otel_counter(metric: usize, count: u64) {
         Some(Metric::ScanFolder) => {
             metrics::counter!(OTEL_SCANNER_DIRECTORIES_SCANNED).increment(count);
         }
-        Some(Metric::ScanBucketDrive) => {
-            metrics::counter!(OTEL_SCANNER_BUCKETS_SCANNED).increment(count);
-        }
-        Some(Metric::ScanCycle) => {
-            metrics::counter!(OTEL_SCANNER_CYCLES).increment(count);
-        }
         _ => {}
     }
+}
+
+/// Emit OTel metrics for a completed scan cycle.
+/// Counter with result label + gauge for last successful cycle duration.
+pub fn emit_scan_cycle_complete(success: bool, duration: Duration) {
+    let result = if success { "success" } else { "error" };
+    metrics::counter!(OTEL_SCANNER_CYCLES, "result" => result).increment(1);
+    if success {
+        metrics::gauge!(OTEL_SCANNER_CYCLE_DURATION_SECONDS).set(duration.as_secs_f64());
+    }
+}
+
+/// Emit OTel metrics for a completed bucket-drive scan.
+/// Counter with result/bucket/disk labels + histogram for duration.
+pub fn emit_scan_bucket_drive_complete(success: bool, bucket: &str, disk: &str, duration: Duration) {
+    let result = if success { "success" } else { "error" };
+    metrics::counter!(
+        OTEL_SCANNER_BUCKETS_SCANNED,
+        "result" => result,
+        "bucket" => bucket.to_owned(),
+        "disk" => disk.to_owned()
+    )
+    .increment(1);
+    metrics::histogram!(
+        OTEL_SCANNER_BUCKET_DRIVE_DURATION_SECONDS,
+        "bucket" => bucket.to_owned(),
+        "disk" => disk.to_owned()
+    )
+    .record(duration.as_secs_f64());
 }
 
 impl Metrics {

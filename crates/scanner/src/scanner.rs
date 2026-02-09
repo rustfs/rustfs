@@ -20,7 +20,7 @@ use crate::scanner_io::ScannerIO;
 use crate::{DataUsageInfo, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, global_metrics};
+use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
 use rustfs_config::{DEFAULT_DATA_SCANNER_START_DELAY_SECS, ENV_DATA_SCANNER_START_DELAY_SECS};
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
@@ -199,10 +199,13 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
 
 
                let done_cycle = Metrics::time(Metric::ScanCycle);
+               let cycle_start = std::time::Instant::now();
                if let Err(e) = storeapi.clone().nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode).await {
                 error!("Failed to scan namespace: {e}");
+                emit_scan_cycle_complete(false, cycle_start.elapsed());
                } else {
                 done_cycle();
+                emit_scan_cycle_complete(true, cycle_start.elapsed());
                 info!("Namespace scanned successfully");
 
                 cycle_info.next +=1;
