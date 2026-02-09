@@ -734,15 +734,7 @@ impl FolderScanner {
                     self.send_update().await;
                 }
 
-                if !into.compacted
-                    && self
-                        .update_cache
-                        .find(&this_hash.key())
-                        .is_some_and(|v| !v.compacted)
-                {
-                        .find(&this_hash.key())
-                        .is_some_and(|v| !v.compacted)
-                {
+                if !into.compacted && self.update_cache.find(&this_hash.key()).is_some_and(|v| !v.compacted) {
                     self.update_cache.delete_recursive(&h);
                     self.update_cache
                         .copy_with_children(&self.new_cache, &h, &Some(this_hash.clone()));
