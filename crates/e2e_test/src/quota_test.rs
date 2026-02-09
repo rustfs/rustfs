@@ -584,10 +584,7 @@ mod integration_tests {
         // Create a normal user via admin API
         let normal_ak = "normaluser";
         let normal_sk = "normaluser123";
-        let add_user_url = format!(
-            "{}/rustfs/admin/v3/add-user?accessKey={}",
-            env.env.url, normal_ak
-        );
+        let add_user_url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.env.url, normal_ak);
         let user_body = serde_json::json!({ "secretKey": normal_sk, "status": "enabled" }).to_string();
         awscurl_put(&add_user_url, &user_body, &env.env.access_key, &env.env.secret_key).await?;
 
