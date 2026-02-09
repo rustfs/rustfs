@@ -4786,7 +4786,9 @@ impl StorageAPI for SetDisks {
             }
         }
 
-        fi.mod_time = opts.mod_time;
+        if opts.mod_time.is_some() {
+            fi.mod_time = opts.mod_time;
+        }
         if let Some(ref version_id) = opts.version_id {
             fi.version_id = Uuid::parse_str(version_id).ok();
         }
