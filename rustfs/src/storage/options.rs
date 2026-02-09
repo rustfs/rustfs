@@ -293,10 +293,27 @@ pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap
     let mut opts = get_default_opts(headers, metadata, false)?;
     if headers.get(RUSTFS_BUCKET_REPLICATION_REQUEST) == Some(&REPLICATION_REQUEST_TRUE) {
         opts.replication_request = true;
-        if let Some(v) = headers.get(RUSTFS_BUCKET_SOURCE_MTIME)
-            && let Ok(s) = v.to_str()
-        {
-            opts.mod_time = time::OffsetDateTime::parse(s.trim(), &time::format_description::well_known::Rfc3339).ok();
+        if let Some(v) = headers.get(RUSTFS_BUCKET_SOURCE_MTIME) {
+            match v.to_str() {
+                Ok(s) => {
+                    let trimmed_s = s.trim();
+                    match time::OffsetDateTime::parse(trimmed_s, &time::format_description::well_known::Rfc3339) {
+                        Ok(mtime) => opts.mod_time = Some(mtime),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Invalid X-RustFS-Source-Mtime value '{}' (replication request=true): {}",
+                                trimmed_s,
+                                e
+                            );
+                            opts.mod_time = None;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("X-RustFS-Source-Mtime header is not valid UTF-8 (replication request=true): {}", e);
+                    opts.mod_time = None;
+                }
+            }
         }
     }
     Ok(opts)
