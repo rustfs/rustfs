@@ -386,7 +386,7 @@ mod serial_tests {
             .expect("Expected object to be readable after heal");
         assert_eq!(obj_info.size as usize, test_data.len());
 
-        info!("Heal format basic test passed");
+        info!("Heal format with data test passed");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
