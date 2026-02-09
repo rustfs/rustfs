@@ -390,10 +390,14 @@ pub fn extract_metadata_from_mime_with_object_name(
 }
 
 pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
-    // HTTP headers that should NOT be returned in the Metadata field
-    // These headers are returned as separate response headers, not user metadata
-    // Note: content-type and content-disposition are intentionally NOT excluded here
-    // as they are handled as user metadata and will be surfaced as x-amz-meta-* headers
+    // HTTP headers that should NOT be returned in the Metadata field.
+    // These headers are returned as separate response headers, not user metadata.
+    //
+    // Note: content-type and content-disposition are intentionally NOT excluded here.
+    // They remain in the filtered metadata so they can continue to be exposed via
+    // x-amz-meta-* style user metadata for backward compatibility, while the HEAD
+    // implementation also mirrors their values into the standard Content-Type and
+    // Content-Disposition response headers where appropriate.
     const EXCLUDED_HEADERS: &[&str] = &[
         "content-encoding",
         "content-language",
