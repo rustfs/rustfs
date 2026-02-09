@@ -23,6 +23,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+ftps = []
+
 [dependencies]
 rustfs-ecstore.workspace = true
 rustfs-common.workspace = true
@@ -35,7 +39,7 @@ serde.workspace = true
 serde_json.workspace = true
 tonic = { workspace = true }
 tokio = { workspace = true }
-url.workspace = true
+tokio-stream = { workspace = true }
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes.workspace = true
@@ -51,3 +55,9 @@ base64 = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 md5 = { workspace = true }
+sha2 = { workspace = true }
+suppaftp = { workspace = true, features = ["tokio", "rustls-aws-lc-rs"] }
+rcgen.workspace = true
+anyhow.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true

@@ -36,6 +36,12 @@ clen = "clen"
 datas = "datas"
 bre = "bre"
 abd = "abd"
+mak = "mak"
+gae = "gae"
+GAE = "GAE"
+# s3-tests original test names (cannot be changed)
+nonexisted = "nonexisted"
+consts = "consts"
 
 [files]
 extend-exclude = []

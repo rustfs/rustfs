@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::BitrotReader;
-use super::BitrotWriterWrapper;
-use super::decode::ParallelReader;
 use crate::disk::error::{Error, Result};
+use crate::erasure_coding::BitrotReader;
+use crate::erasure_coding::BitrotWriterWrapper;
+use crate::erasure_coding::decode::ParallelReader;
 use crate::erasure_coding::encode::MultiWriter;
 use bytes::Bytes;
 use tokio::io::AsyncRead;
@@ -45,7 +45,7 @@ impl super::Erasure {
 
         let start_block = 0;
         let mut end_block = total_length / self.block_size;
-        if total_length % self.block_size != 0 {
+        if !total_length.is_multiple_of(self.block_size) {
             end_block += 1;
         }
 

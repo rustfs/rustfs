@@ -12,14 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::HashMap,
-    io::{Cursor, Read as _, Write as _},
-};
-
 use crate::{
     admin::{auth::validate_admin_request, router::Operation},
     auth::{check_key_valid, get_session_token},
+    server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
@@ -60,6 +56,10 @@ use s3s::{
 };
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
+use std::{
+    collections::HashMap,
+    io::{Cursor, Read as _, Write as _},
+};
 use time::OffsetDateTime;
 use tracing::warn;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -97,6 +97,7 @@ impl Operation for ExportBucketMetadata {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -389,6 +390,7 @@ impl Operation for ImportBucketMetadata {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 

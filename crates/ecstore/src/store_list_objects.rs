@@ -14,6 +14,7 @@
 
 use crate::StorageAPI;
 use crate::bucket::metadata_sys::get_versioning_config;
+use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::disk::error::DiskError;
@@ -22,7 +23,6 @@ use crate::error::{
     Error, Result, StorageError, is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found, to_object_err,
 };
 use crate::set_disk::SetDisks;
-use crate::store::check_list_objs_args;
 use crate::store_api::{
     ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOptions, WalkOptions, WalkVersionsSortOrder,
 };
@@ -256,19 +256,21 @@ impl ECStore {
         max_keys: i32,
         incl_deleted: bool,
     ) -> Result<ListObjectsInfo> {
+        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
-            limit: max_keys_plus_one(max_keys, marker.is_some()),
+            // Always request max_keys + 1 to detect if there are more results
+            limit: effective_max_keys,
             marker,
             incl_deleted,
             ask_disks: "strict".to_owned(), //TODO: from config
             ..Default::default()
         };
 
-        // use get
-        if !opts.prefix.is_empty() && opts.limit == 1 && opts.marker.is_none() {
+        // Optimization: use get for single object lookup with exact prefix
+        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
             match self
                 .get_object_info(
                     &opts.bucket,
@@ -302,10 +304,10 @@ impl ECStore {
                 ..Default::default()
             });
 
-        if let Some(err) = list_result.err.clone() {
-            if err != rustfs_filemeta::Error::Unexpected {
-                return Err(to_object_err(err.into(), vec![bucket, prefix]));
-            }
+        if let Some(err) = list_result.err.clone()
+            && err != rustfs_filemeta::Error::Unexpected
+        {
+            return Err(to_object_err(err.into(), vec![bucket, prefix]));
         }
 
         if let Some(result) = list_result.entries.as_mut() {
@@ -322,14 +324,16 @@ impl ECStore {
         )
         .await;
 
-        let is_truncated = {
-            if max_keys > 0 && get_objects.len() > max_keys as usize {
-                get_objects.truncate(max_keys as usize);
-                true
-            } else {
-                list_result.err.is_none() && !get_objects.is_empty()
-            }
-        };
+        // Determine if there are more results: we requested max_keys + 1, so if we got more
+        // than max_keys, there are more results available
+        let mut is_truncated = false;
+        if max_keys <= 0 {
+            get_objects.clear();
+        } else if get_objects.len() > max_keys as usize {
+            is_truncated = true;
+            // Truncate to max_keys if we have more results
+            get_objects.truncate(max_keys as usize);
+        }
 
         let next_marker = {
             if is_truncated {
@@ -387,17 +391,23 @@ impl ECStore {
         }
 
         let version_marker = if let Some(marker) = version_marker {
-            Some(Uuid::parse_str(&marker)?)
+            // "null" is used for non-versioned objects in AWS S3 API
+            if marker == "null" {
+                None
+            } else {
+                Some(Uuid::parse_str(&marker)?)
+            }
         } else {
             None
         };
 
-        // if marker set, limit +1
+        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
+        // Always request max_keys + 1 to detect if there are more results
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
-            limit: max_keys_plus_one(max_keys, marker.is_some()),
+            limit: effective_max_keys,
             marker,
             incl_deleted: true,
             ask_disks: "strict".to_owned(),
@@ -405,18 +415,18 @@ impl ECStore {
             ..Default::default()
         };
 
-        let mut list_result = match self.list_path(&opts).await {
-            Ok(res) => res,
-            Err(err) => MetaCacheEntriesSortedResult {
+        let mut list_result = self
+            .list_path(&opts)
+            .await
+            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
                 err: Some(err.into()),
                 ..Default::default()
-            },
-        };
+            });
 
-        if let Some(err) = list_result.err.clone() {
-            if err != rustfs_filemeta::Error::Unexpected {
-                return Err(to_object_err(err.into(), vec![bucket, prefix]));
-            }
+        if let Some(err) = list_result.err.clone()
+            && err != rustfs_filemeta::Error::Unexpected
+        {
+            return Err(to_object_err(err.into(), vec![bucket, prefix]));
         }
 
         if let Some(result) = list_result.entries.as_mut() {
@@ -432,20 +442,28 @@ impl ECStore {
         )
         .await;
 
-        let is_truncated = {
-            if max_keys > 0 && get_objects.len() > max_keys as usize {
-                get_objects.truncate(max_keys as usize);
-                true
-            } else {
-                list_result.err.is_none() && !get_objects.is_empty()
-            }
-        };
+        // Determine if there are more results: we requested max_keys + 1, so if we got more
+        // than max_keys, there are more results available
+        let mut is_truncated = false;
+        if max_keys <= 0 {
+            get_objects.clear();
+        } else if get_objects.len() > max_keys as usize {
+            is_truncated = true;
+            // Truncate to max_keys if we have more results
+            get_objects.truncate(max_keys as usize);
+        }
 
         let (next_marker, next_version_idmarker) = {
             if is_truncated {
                 get_objects
                     .last()
-                    .map(|last| (Some(last.name.clone()), last.version_id.map(|v| v.to_string())))
+                    .map(|last| {
+                        (
+                            Some(last.name.clone()),
+                            // AWS S3 API returns "null" for non-versioned objects
+                            Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+                        )
+                    })
                     .unwrap_or_default()
             } else {
                 (None, None)
@@ -498,10 +516,11 @@ impl ECStore {
         let mut o = o.clone();
         o.marker = o.marker.filter(|v| v >= &o.prefix);
 
-        if let Some(marker) = &o.marker {
-            if !o.prefix.is_empty() && !marker.starts_with(&o.prefix) {
-                return Err(Error::Unexpected);
-            }
+        if let Some(marker) = &o.marker
+            && !o.prefix.is_empty()
+            && !marker.starts_with(&o.prefix)
+        {
+            return Err(Error::Unexpected);
         }
 
         if o.limit == 0 {
@@ -806,10 +825,10 @@ impl ECStore {
                                     let value = tx2.clone();
                                     let resolver = resolver.clone();
                                     async move {
-                                        if let Some(entry) = entries.resolve(resolver) {
-                                            if let Err(err) = value.send(entry).await {
-                                                error!("list_path send fail {:?}", err);
-                                            }
+                                        if let Some(entry) = entries.resolve(resolver)
+                                            && let Err(err) = value.send(entry).await
+                                        {
+                                            error!("list_path send fail {:?}", err);
                                         }
                                     }
                                 })
@@ -975,20 +994,21 @@ async fn gather_results(
             continue;
         }
 
-        if let Some(marker) = &opts.marker {
-            if &entry.name < marker {
-                continue;
-            }
+        if let Some(marker) = &opts.marker
+            && &entry.name <= marker
+        {
+            continue;
         }
 
         if !entry.name.starts_with(&opts.prefix) {
             continue;
         }
 
-        if let Some(separator) = &opts.separator {
-            if !opts.recursive && !entry.is_in_dir(&opts.prefix, separator) {
-                continue;
-            }
+        if let Some(separator) = &opts.separator
+            && !opts.recursive
+            && !entry.is_in_dir(&opts.prefix, separator)
+        {
+            continue;
         }
 
         if !opts.incl_deleted && entry.is_object() && entry.is_latest_delete_marker() && !entry.is_object_dir() {
@@ -1189,16 +1209,16 @@ async fn merge_entry_channels(
                     }
                 }
 
-                if let Some(xl) = has_xl.as_mut() {
-                    if !versions.is_empty() {
-                        xl.versions = merge_file_meta_versions(read_quorum, true, 0, &versions);
+                if let Some(xl) = has_xl.as_mut()
+                    && !versions.is_empty()
+                {
+                    xl.versions = merge_file_meta_versions(read_quorum, true, 0, &versions);
 
-                        if let Ok(meta) = xl.marshal_msg() {
-                            if let Some(b) = best.as_mut() {
-                                b.metadata = meta;
-                                b.cached = Some(xl.clone());
-                            }
-                        }
+                    if let Ok(meta) = xl.marshal_msg()
+                        && let Some(b) = best.as_mut()
+                    {
+                        b.metadata = meta;
+                        b.cached = Some(xl.clone());
                     }
                 }
             }
@@ -1206,11 +1226,11 @@ async fn merge_entry_channels(
             to_merge.clear();
         }
 
-        if let Some(best_entry) = &best {
-            if best_entry.name > last {
-                out_channel.send(best_entry.clone()).await.map_err(Error::other)?;
-                last = best_entry.name.clone();
-            }
+        if let Some(best_entry) = &best
+            && best_entry.name > last
+        {
+            out_channel.send(best_entry.clone()).await.map_err(Error::other)?;
+            last = best_entry.name.clone();
         }
 
         select_from(&mut in_channels, best_idx, &mut top, &mut n_done).await?;
@@ -1296,10 +1316,10 @@ impl SetDisks {
                         let value = tx2.clone();
                         let resolver = resolver.clone();
                         async move {
-                            if let Some(entry) = entries.resolve(resolver) {
-                                if let Err(err) = value.send(entry).await {
-                                    error!("list_path send fail {:?}", err);
-                                }
+                            if let Some(entry) = entries.resolve(resolver)
+                                && let Err(err) = value.send(entry).await
+                            {
+                                error!("list_path send fail {:?}", err);
                             }
                         }
                     })
@@ -1374,6 +1394,78 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
+    use uuid::Uuid;
+
+    /// Test that "null" version marker is handled correctly
+    /// AWS S3 API uses "null" string to represent non-versioned objects
+    #[test]
+    fn test_null_version_marker_handling() {
+        // "null" should be treated as None (non-versioned)
+        let version_marker = "null";
+        let parsed: Option<Uuid> = if version_marker == "null" {
+            None
+        } else {
+            Uuid::parse_str(version_marker).ok()
+        };
+        assert!(parsed.is_none(), "\"null\" should be parsed as None");
+
+        // Valid UUID should be parsed correctly
+        let valid_uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let parsed: Option<Uuid> = if valid_uuid == "null" {
+            None
+        } else {
+            Uuid::parse_str(valid_uuid).ok()
+        };
+        assert!(parsed.is_some(), "Valid UUID should be parsed correctly");
+        assert_eq!(parsed.unwrap().to_string(), "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    /// Test that next_version_idmarker returns "null" for non-versioned objects
+    #[test]
+    fn test_next_version_idmarker_null_string() {
+        // When version_id is None, next_version_idmarker should be "null"
+        let version_id: Option<Uuid> = None;
+        let next_version_idmarker = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+        assert_eq!(next_version_idmarker, "null");
+
+        // When version_id is Some, next_version_idmarker should be the UUID string
+        let version_id: Option<Uuid> = Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap());
+        let next_version_idmarker = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+        assert_eq!(next_version_idmarker, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    /// Test the round-trip: next_version_idmarker -> VersionIdMarker parameter -> parsing
+    #[test]
+    fn test_version_marker_round_trip() {
+        // Scenario 1: Non-versioned object
+        // Server returns "null" as NextVersionIdMarker
+        // Client sends "null" as VersionIdMarker
+        // Server parses "null" as None
+        let server_response = "null";
+        let client_request = server_response;
+        let parsed: Option<Uuid> = if client_request == "null" {
+            None
+        } else {
+            Uuid::parse_str(client_request).ok()
+        };
+        assert!(parsed.is_none());
+
+        // Scenario 2: Versioned object
+        // Server returns UUID as NextVersionIdMarker
+        // Client sends UUID as VersionIdMarker
+        // Server parses UUID correctly
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+        let server_response = uuid_str;
+        let client_request = server_response;
+        let parsed: Option<Uuid> = if client_request == "null" {
+            None
+        } else {
+            Uuid::parse_str(client_request).ok()
+        };
+        assert!(parsed.is_some());
+        assert_eq!(parsed.unwrap().to_string(), uuid_str);
+    }
+
     // use std::sync::Arc;
 
     // use crate::cache_value::metacache_set::list_path_raw;
@@ -1391,7 +1483,6 @@ mod test {
     // use crate::error::Error;
     // use crate::metacache::writer::MetacacheReader;
     // use crate::set_disk::SetDisks;
-    // use crate::store::ECStore;
     // use crate::store_list_objects::ListPathOptions;
     // use crate::store_list_objects::WalkOptions;
     // use crate::store_list_objects::WalkVersionsSortOrder;

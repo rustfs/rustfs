@@ -7,11 +7,16 @@ replicaCount: 4
 
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
 image:
-  repository: rustfs/rustfs
-  # This sets the pull policy for images.
-  pullPolicy: IfNotPresent
-  # Overrides the image tag whose default is the chart appVersion.
-  tag: "1.0.0-alpha.73"
+  rustfs: # This sets the rustfs image repository and tag.
+    repository: rustfs/rustfs
+    # This sets the pull policy for images.
+    pullPolicy: IfNotPresent
+    # Overrides the image tag whose default is the chart appVersion.
+    tag: ""
+  initImage: # This sets the init container image repository and tag.
+    repository: busybox
+    pullPolicy: IfNotPresent
+    tag: "stable"
 
 # This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
 imagePullSecrets: []
@@ -30,6 +35,11 @@ fullnameOverride: ""
 mode:
   standalone:
     enabled: false
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 0
+        maxUnavailable: 1
   distributed:
     enabled: true
 
@@ -48,11 +58,17 @@ config:
     address: ":9000"
     console_enable: "true"
     console_address: ":9001"
-    log_level: "debug"
-    rust_log: "debug"
+    log_level: "info"
     region: "us-east-1"
     obs_log_directory: "/logs"
-    obs_environment: "develop"
+    obs_environment: "development"
+    # Optionally enable support for virtual-hosted-style requests.
+    # See more information: https://docs.rustfs.com/integration/virtual.html
+    domains: "" # e.g. "example.com"
+    log_rotation: # Specify log rotation settings
+      # size: 100 # Default value: 100 MB
+      # time: hour # Default value: hour, eg: day,hour,minute,second
+      # keep_files: 30 # number of rotated log files to keep
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
@@ -87,6 +103,7 @@ containerSecurityContext:
     drop:
       - ALL
   readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
   runAsNonRoot: true
 
 service:
@@ -110,42 +127,55 @@ ingress:
     traefik.ingress.kubernetes.io/service.sticky.cookie.secure: "true"
   nginxAnnotations:
     nginx.ingress.kubernetes.io/affinity: cookie
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
     nginx.ingress.kubernetes.io/session-cookie-expires: "3600"
     nginx.ingress.kubernetes.io/session-cookie-hash: sha1
     nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
     nginx.ingress.kubernetes.io/session-cookie-name: rustfs
-  certManagerAnnotations:
-    {} # Specify cert manager issuer annotations,cert-manager.io/issuer or cert-manager.io/cluster-issuer.
-    # cert-manager.io/issuer: "letsencrypt-staging"
   customAnnotations: # Specify custom annotations
     {} # Customize annotations
   hosts:
-    - host: xmg.rustfs.com
+    - host: example.rustfs.com
       paths:
         - path: /
           pathType: Prefix
-  tls: 
+  tls:
     enabled: false # Enable tls and access rustfs via https.
     certManager:
       enabled: false # Enable certmanager to generate certificate for rustfs, default false.
-      issuer:
-        name: letsencrypt-staging # Specify cert manager issuer name
-        kind: Issuer # Specify cert manager issuer kind, Issuer or ClusterIssuer.
     secretName: secret-tls
     crt: tls.crt
     key: tls.key
 
-resources:
+gatewayApi:
+  enabled: false
+  gatewayClass: traefik
+  listeners: # Specify which listeners to create on the Gateway. Only support for traefik gatewayClass at the moment.
+    web:
+      port: 8000
+    websecure:
+      port: 8443
+  hostname: example.rustfs.com
+  existingGateway:
+    name: ""
+    namespace: ""
+
+mtls:
+  enabled: false
+  serverOnly: false # If true, only server side TLS will be enabled. If false, both server and client side TLS will be enabled.
+  # This is for setting up mTLS for ingress.
+
+resources: {}
   # We usually recommend not to specify default resources and to leave this as a conscious
   # choice for the user. This also increases chances charts run on environments with little
   # resources, such as Minikube. If you do want to specify resources, uncomment the following
   # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-  limits:
-    cpu: 200m
-    memory: 512Mi
-  requests:
-    cpu: 100m
-    memory: 128Mi
+  # limits:
+  #   cpu: 200m
+  #   memory: 512Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
 
 # This is to setup the liveness and readiness probes more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
 livenessProbe:
@@ -182,5 +212,15 @@ storageclass:
   name: local-path
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
+
+pdb:
+  create: false
+  # Minimum number/percentage of pods that should remain scheduled
+  minAvailable: ""
+  # Maximum number/percentage of pods that may be made unavailable
+  maxUnavailable: 1
+
+# Whether information about services should be injected into pod's environment variable
+enableServiceLinks: false
 
 extraManifests: []

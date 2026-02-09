@@ -66,8 +66,8 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
 #export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
-export RUSTFS_OBS_ENVIRONMENT=production # Environment name
-export RUSTFS_OBS_LOGGER_LEVEL=warn # Log level, supports trace, debug, info, warn, error
+export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
+export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
 export RUSTFS_OBS_LOG_STDOUT_ENABLED=false # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
@@ -79,7 +79,7 @@ export RUSTFS_OBS_LOG_FLUSH_MS=300 # Log flush interval in milliseconds
 #tokio runtime
 export RUSTFS_RUNTIME_WORKER_THREADS=16
 export RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=1024
-export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=true
+export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=false
 # shellcheck disable=SC2125
 export RUSTFS_RUNTIME_THREAD_STACK_SIZE=1024*1024
 export RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=60
@@ -90,30 +90,30 @@ export OTEL_INSTRUMENTATION_VERSION="0.1.1"
 export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
 export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
 
-## notify
-#export RUSTFS_NOTIFY_WEBHOOK_ENABLE="on" # Whether to enable webhook notification
-#export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://127.0.0.1:3020/webhook" # Webhook notification address
-#export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
-#
-#export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook notification
-#export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY="http://127.0.0.1:3020/webhook" # Webhook notification address
-#export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/notify"
-#
-#export RUSTFS_NOTIFY_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook notification
-#export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MASTER="http://127.0.0.1:3020/webhook" # Webhook notification address
-#export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
-#
-#export RUSTFS_AUDIT_WEBHOOK_ENABLE="on" # Whether to enable webhook audit
-#export RUSTFS_AUDIT_WEBHOOK_ENDPOINT="http://127.0.0.1:3020/webhook" # Webhook audit address
-#export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/audit"
-#
-#export RUSTFS_AUDIT_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook audit
-#export RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY="http://127.0.0.1:3020/webhook" # Webhook audit address
-#export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/audit"
-#
-#export RUSTFS_AUDIT_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook audit
-#export RUSTFS_AUDIT_WEBHOOK_ENDPOINT_MASTER="http://127.0.0.1:3020/webhook" # Webhook audit address
-#export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/audit"
+# # notify
+# export RUSTFS_NOTIFY_WEBHOOK_ENABLE="on" # Whether to enable webhook notification
+# export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # Webhook notification address
+# export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
+
+# export RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook notification
+# export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY="http://[::]:3020/webhook" # Webhook notification address
+# export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/notify"
+
+# export RUSTFS_NOTIFY_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook notification
+# export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MASTER="http://[::]:3020/webhook" # Webhook notification address
+# export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
+
+# export RUSTFS_AUDIT_WEBHOOK_ENABLE="on" # Whether to enable webhook audit
+# export RUSTFS_AUDIT_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # Webhook audit address
+# export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/audit"
+
+# export RUSTFS_AUDIT_WEBHOOK_ENABLE_PRIMARY="on" # Whether to enable webhook audit
+# export RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY="http://[::]:3020/webhook" # Webhook audit address
+# export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR_PRIMARY="$current_dir/deploy/logs/audit"
+
+# export RUSTFS_AUDIT_WEBHOOK_ENABLE_MASTER="on" # Whether to enable webhook audit
+# export RUSTFS_AUDIT_WEBHOOK_ENDPOINT_MASTER="http://[::]:3020/webhook" # Webhook audit address
+# export RUSTFS_AUDIT_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/audit"
 
 # export RUSTFS_POLICY_PLUGIN_URL="http://localhost:8181/v1/data/rustfs/authz/allow"  # The URL of the OPA system
 # export RUSTFS_POLICY_PLUGIN_AUTH_TOKEN="your-opa-token"  # The authentication token for the OPA system is optional
@@ -168,23 +168,59 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 # - Minimum size threshold prevents compression of small files where overhead > benefit
 # - Wildcard patterns supported in MIME types (e.g., text/* matches text/plain, text/html, etc.)
 
+# Trusted Proxy Configuration
+# export RUSTFS_TRUSTED_PROXY_ENABLED=true
+# export RUSTFS_TRUSTED_PROXY_NETWORKS=127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8
+# export RUSTFS_TRUSTED_PROXY_VALIDATION_MODE=hop_by_hop
+# export RUSTFS_TRUSTED_PROXY_ENABLE_RFC7239=true
+# export RUSTFS_TRUSTED_PROXY_MAX_HOPS=10
+# export RUSTFS_TRUSTED_PROXY_METRICS_ENABLED=true
+
 #export RUSTFS_REGION="us-east-1"
 
-export RUSTFS_ENABLE_SCANNER=false
+export RUSTFS_ENABLE_SCANNER=true
 
-export RUSTFS_ENABLE_HEAL=false
+export RUSTFS_ENABLE_HEAL=true
 
 # Object cache configuration
 export RUSTFS_OBJECT_CACHE_ENABLE=true
 
 # Profiling configuration
 export RUSTFS_ENABLE_PROFILING=false
+# Memory profiling periodic dump
+export RUSTFS_PROF_MEM_PERIODIC=false
 
 # Heal configuration queue size
 export RUSTFS_HEAL_QUEUE_SIZE=10000
 
 # rustfs trust system CA certificates
 export RUSTFS_TRUST_SYSTEM_CA=true
+
+# FTP/FTPS Configuration
+#
+# Certificate directory structure:
+# deploy/certs/ftps/
+# ├── rustfs_cert.pem  (server certificate)
+# ├── rustfs_key.pem   (server private key)
+# └── example1.com/    (optional: domain-specific certificates)
+#     ├── rustfs_cert.pem
+#     └── rustfs_key.pem
+
+# export RUSTFS_FTP_ENABLE=true
+# export RUSTFS_FTP_ADDRESS="0.0.0.0:8021"
+
+# export RUSTFS_FTPS_ENABLE=true
+# export RUSTFS_FTPS_ADDRESS="0.0.0.0:8022"
+# export RUSTFS_FTPS_CERTS_DIR="${current_dir}/deploy/certs/ftps"
+
+# Use default timeout (60 seconds)
+# No environment variable needed
+
+# Increase timeout for high-latency network storage
+#export RUSTFS_LOCK_ACQUIRE_TIMEOUT=120
+
+# Reduce timeout for low-latency local storage
+export RUSTFS_LOCK_ACQUIRE_TIMEOUT=30
 
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
@@ -211,6 +247,8 @@ fi
 # Start main service
 # To run with profiling enabled, uncomment the following line and comment the next line
 #cargo run --profile profiling --bin rustfs
+# To run with FTP/FTPS support, use:
+# cargo run --bin rustfs --features ftps
 # To run in release mode, use the following line
 #cargo run --profile release --bin rustfs
 # To run in debug mode, use the following line

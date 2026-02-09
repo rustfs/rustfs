@@ -51,6 +51,7 @@ pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 
 // S3 transition restore
+pub const AMZ_RESTORE: &str = "x-amz-restore";
 pub const AMZ_RESTORE_EXPIRY_DAYS: &str = "X-Amz-Restore-Expiry-Days";
 pub const AMZ_RESTORE_REQUEST_DATE: &str = "X-Amz-Restore-Request-Date";
 
@@ -66,8 +67,11 @@ pub const AMZ_COPY_SOURCE_VERSION_ID: &str = "X-Amz-Copy-Source-Version-Id";
 pub const AMZ_COPY_SOURCE_RANGE: &str = "X-Amz-Copy-Source-Range";
 pub const AMZ_METADATA_DIRECTIVE: &str = "X-Amz-Metadata-Directive";
 pub const AMZ_OBJECT_LOCK_MODE: &str = "X-Amz-Object-Lock-Mode";
+pub const AMZ_OBJECT_LOCK_MODE_LOWER: &str = "x-amz-object-lock-mode";
 pub const AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE: &str = "X-Amz-Object-Lock-Retain-Until-Date";
+pub const AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER: &str = "x-amz-object-lock-retain-until-date";
 pub const AMZ_OBJECT_LOCK_LEGAL_HOLD: &str = "X-Amz-Object-Lock-Legal-Hold";
+pub const AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER: &str = "x-amz-object-lock-legal-hold";
 pub const AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE: &str = "X-Amz-Bypass-Governance-Retention";
 pub const AMZ_BUCKET_REPLICATION_STATUS: &str = "X-Amz-Replication-Status";
 
@@ -144,6 +148,8 @@ pub const AMZ_META_NAME: &str = "X-Amz-Meta-Name";
 
 pub const AMZ_META_UNENCRYPTED_CONTENT_LENGTH: &str = "X-Amz-Meta-X-Amz-Unencrypted-Content-Length";
 pub const AMZ_META_UNENCRYPTED_CONTENT_MD5: &str = "X-Amz-Meta-X-Amz-Unencrypted-Content-Md5";
+pub const RUSTFS_ENCRYPTION: &str = "X-Rustfs-Encryption-";
+pub const RUSTFS_ENCRYPTION_LOWER: &str = "x-rustfs-encryption-";
 
 pub const RESERVED_METADATA_PREFIX: &str = "X-RustFS-Internal-";
 pub const RESERVED_METADATA_PREFIX_LOWER: &str = "x-rustfs-internal-";

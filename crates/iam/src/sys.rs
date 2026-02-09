@@ -24,19 +24,18 @@ use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
 use crate::utils::extract_claims;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;
 use rustfs_policy::arn::ARN;
-use rustfs_policy::auth::Credentials;
 use rustfs_policy::auth::{
     ACCOUNT_ON, UserIdentity, contains_reserved_chars, create_new_credentials_with_metadata, generate_credentials,
     is_access_key_valid, is_secret_key_valid,
 };
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
-use rustfs_policy::policy::{EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, iam_policy_claim_name_sa};
+use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa};
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -67,6 +66,13 @@ pub struct IamSys<T> {
 }
 
 impl<T: Store> IamSys<T> {
+    /// Create a new IamSys instance with the given IamCache store
+    ///
+    /// # Arguments
+    /// * `store` - An Arc to the IamCache instance
+    ///
+    /// # Returns
+    /// A new instance of IamSys
     pub fn new(store: Arc<IamCache<T>>) -> Self {
         tokio::spawn(async move {
             match opa::lookup_config().await {
@@ -87,6 +93,11 @@ impl<T: Store> IamSys<T> {
             roles_map: HashMap::new(),
         }
     }
+
+    /// Check if the IamSys has a watcher configured
+    ///
+    /// # Returns
+    /// `true` if a watcher is configured, `false` otherwise
     pub fn has_watcher(&self) -> bool {
         self.store.api.has_watcher()
     }
@@ -192,13 +203,13 @@ impl<T: Store> IamSys<T> {
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
         let updated_at = self.store.set_policy(name, policy).await?;
 
-        if !self.has_watcher() {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.load_policy(name).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify load_policy failed: {}", err);
-                    }
+        if !self.has_watcher()
+            && let Some(notification_sys) = get_global_notification_sys()
+        {
+            let resp = notification_sys.load_policy(name).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify load_policy failed: {}", err);
                 }
             }
         }
@@ -221,13 +232,14 @@ impl<T: Store> IamSys<T> {
     pub async fn delete_user(&self, name: &str, notify: bool) -> Result<()> {
         self.store.delete_user(name, UserType::Reg).await?;
 
-        if notify && !self.has_watcher() {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.delete_user(name).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify delete_user failed: {}", err);
-                    }
+        if notify
+            && !self.has_watcher()
+            && let Some(notification_sys) = get_global_notification_sys()
+        {
+            let resp = notification_sys.delete_user(name).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify delete_user failed: {}", err);
                 }
             }
         }
@@ -465,13 +477,12 @@ impl<T: Store> IamSys<T> {
 
         let op_pt = claims.get(&iam_policy_claim_name_sa());
         let op_sp = claims.get(SESSION_POLICY_NAME);
-        if let (Some(pt), Some(sp)) = (op_pt, op_sp) {
-            if pt == EMBEDDED_POLICY_TYPE {
-                let policy = serde_json::from_slice(
-                    &base64_simd::URL_SAFE_NO_PAD.decode_to_vec(sp.as_str().unwrap_or_default().as_bytes())?,
-                )?;
-                return Ok((sa, Some(policy)));
-            }
+        if let (Some(pt), Some(sp)) = (op_pt, op_sp)
+            && pt == EMBEDDED_POLICY_TYPE
+        {
+            let policy =
+                serde_json::from_slice(&base64_simd::URL_SAFE_NO_PAD.decode_to_vec(sp.as_str().unwrap_or_default().as_bytes())?)?;
+            return Ok((sa, Some(policy)));
         }
 
         Ok((sa, None))
@@ -526,13 +537,12 @@ impl<T: Store> IamSys<T> {
 
         let op_pt = claims.get(&iam_policy_claim_name_sa());
         let op_sp = claims.get(SESSION_POLICY_NAME);
-        if let (Some(pt), Some(sp)) = (op_pt, op_sp) {
-            if pt == EMBEDDED_POLICY_TYPE {
-                let policy = serde_json::from_slice(
-                    &base64_simd::URL_SAFE_NO_PAD.decode_to_vec(sp.as_str().unwrap_or_default().as_bytes())?,
-                )?;
-                return Ok((sa, Some(policy)));
-            }
+        if let (Some(pt), Some(sp)) = (op_pt, op_sp)
+            && pt == EMBEDDED_POLICY_TYPE
+        {
+            let policy =
+                serde_json::from_slice(&base64_simd::URL_SAFE_NO_PAD.decode_to_vec(sp.as_str().unwrap_or_default().as_bytes())?)?;
+            return Ok((sa, Some(policy)));
         }
 
         Ok((sa, None))
@@ -561,13 +571,14 @@ impl<T: Store> IamSys<T> {
 
         self.store.delete_user(access_key, UserType::Svc).await?;
 
-        if notify && !self.has_watcher() {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.delete_service_account(access_key).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify delete_service_account failed: {}", err);
-                    }
+        if notify
+            && !self.has_watcher()
+            && let Some(notification_sys) = get_global_notification_sys()
+        {
+            let resp = notification_sys.delete_service_account(access_key).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify delete_service_account failed: {}", err);
                 }
             }
         }
@@ -626,11 +637,24 @@ impl<T: Store> IamSys<T> {
         self.store.update_user_secret_key(access_key, secret_key).await
     }
 
+    /// Add SSH public key for a user (for SFTP authentication)
+    pub async fn add_user_ssh_public_key(&self, access_key: &str, public_key: &str) -> Result<()> {
+        if !is_access_key_valid(access_key) {
+            return Err(IamError::InvalidAccessKeyLength);
+        }
+
+        if public_key.is_empty() {
+            return Err(IamError::InvalidArgument);
+        }
+
+        self.store.add_user_ssh_public_key(access_key, public_key).await
+    }
+
     pub async fn check_key(&self, access_key: &str) -> Result<(Option<UserIdentity>, bool)> {
-        if let Some(sys_cred) = get_global_action_cred() {
-            if sys_cred.access_key == access_key {
-                return Ok((Some(UserIdentity::new(sys_cred)), true));
-            }
+        if let Some(sys_cred) = get_global_action_cred()
+            && sys_cred.access_key == access_key
+        {
+            return Ok((Some(UserIdentity::new(sys_cred)), true));
         }
 
         match self.store.get_user(access_key).await {
@@ -701,13 +725,13 @@ impl<T: Store> IamSys<T> {
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
         let updated_at = self.store.policy_db_set(name, user_type, is_group, policy).await?;
 
-        if !self.has_watcher() {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.load_policy_mapping(name, user_type.to_u64(), is_group).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify load_policy failed: {}", err);
-                    }
+        if !self.has_watcher()
+            && let Some(notification_sys) = get_global_notification_sys()
+        {
+            let resp = notification_sys.load_policy_mapping(name, user_type.to_u64(), is_group).await;
+            for r in resp {
+                if let Some(err) = r.err {
+                    warn!("notify load_policy failed: {}", err);
                 }
             }
         }
@@ -858,6 +882,11 @@ impl<T: Store> IamSys<T> {
         }
 
         self.get_combined_policy(&policies).await.is_allowed(args).await
+    }
+
+    /// Check if the underlying store is ready
+    pub fn is_ready(&self) -> bool {
+        self.store.is_ready()
     }
 }
 

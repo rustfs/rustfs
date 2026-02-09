@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::BitrotWriterWrapper;
-use super::Erasure;
 use crate::disk::error::Error;
 use crate::disk::error_reduce::count_errs;
 use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_write_quorum_errs};
+use crate::erasure_coding::BitrotWriterWrapper;
+use crate::erasure_coding::Erasure;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -150,10 +150,10 @@ impl Erasure {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         // Check if the inner error is a checksum mismatch - if so, propagate it
-                        if let Some(inner) = e.get_ref() {
-                            if rustfs_rio::is_checksum_mismatch(inner) {
-                                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
-                            }
+                        if let Some(inner) = e.get_ref()
+                            && rustfs_rio::is_checksum_mismatch(inner)
+                        {
+                            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
                         }
                         break;
                     }

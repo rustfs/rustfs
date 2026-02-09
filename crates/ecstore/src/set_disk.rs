@@ -22,12 +22,12 @@ use crate::bucket::replication::check_replicate_delete;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
-use crate::disk::STORAGE_FORMAT_FILE;
 use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
 use crate::disk::{
     self, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     conv_part_err_to_int, has_part_err,
 };
+use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
 use crate::erasure_coding;
 use crate::erasure_coding::bitrot_verify;
 use crate::error::{Error, Result, is_err_version_not_found};
@@ -71,9 +71,12 @@ use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType,
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
+    RawFileInfo, ReplicateDecision, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
 };
+use rustfs_lock::LockClient;
 use rustfs_lock::fast_lock::types::LockResult;
+use rustfs_lock::local_lock::LocalLock;
+use rustfs_lock::{FastLockGuard, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
@@ -117,9 +120,14 @@ pub const MAX_PARTS_COUNT: usize = 10000;
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 
+/// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
+/// Defaults to 30 seconds if not set or invalid
+pub fn get_lock_acquire_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+}
+
 #[derive(Clone, Debug)]
 pub struct SetDisks {
-    pub fast_lock_manager: Arc<rustfs_lock::FastObjectLockManager>,
     pub locker_owner: String,
     pub disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
     pub set_endpoints: Vec<Endpoint>,
@@ -129,6 +137,7 @@ pub struct SetDisks {
     pub pool_index: usize,
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
+    pub lockers: Vec<Arc<dyn LockClient>>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,7 +159,6 @@ impl DiskHealthEntry {
 impl SetDisks {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        fast_lock_manager: Arc<rustfs_lock::FastObjectLockManager>,
         locker_owner: String,
         disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
         set_drive_count: usize,
@@ -159,9 +167,9 @@ impl SetDisks {
         pool_index: usize,
         set_endpoints: Vec<Endpoint>,
         format: FormatV3,
+        lockers: Vec<Arc<dyn LockClient>>,
     ) -> Arc<Self> {
         Arc::new(SetDisks {
-            fast_lock_manager,
             locker_owner,
             disks,
             set_drive_count,
@@ -171,59 +179,60 @@ impl SetDisks {
             format,
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
+            lockers,
         })
     }
 
-    async fn cached_disk_health(&self, index: usize) -> Option<bool> {
-        let cache = self.disk_health_cache.read().await;
-        cache
-            .get(index)
-            .and_then(|entry| entry.as_ref().and_then(|state| state.cached_value()))
-    }
+    // async fn cached_disk_health(&self, index: usize) -> Option<bool> {
+    //     let cache = self.disk_health_cache.read().await;
+    //     cache
+    //         .get(index)
+    //         .and_then(|entry| entry.as_ref().and_then(|state| state.cached_value()))
+    // }
 
-    async fn update_disk_health(&self, index: usize, online: bool) {
-        let mut cache = self.disk_health_cache.write().await;
-        if cache.len() <= index {
-            cache.resize(index + 1, None);
-        }
-        cache[index] = Some(DiskHealthEntry {
-            last_check: Instant::now(),
-            online,
-        });
-    }
+    // async fn update_disk_health(&self, index: usize, online: bool) {
+    //     let mut cache = self.disk_health_cache.write().await;
+    //     if cache.len() <= index {
+    //         cache.resize(index + 1, None);
+    //     }
+    //     cache[index] = Some(DiskHealthEntry {
+    //         last_check: Instant::now(),
+    //         online,
+    //     });
+    // }
 
-    async fn is_disk_online_cached(&self, index: usize, disk: &DiskStore) -> bool {
-        if let Some(online) = self.cached_disk_health(index).await {
-            return online;
-        }
+    // async fn is_disk_online_cached(&self, index: usize, disk: &DiskStore) -> bool {
+    //     if let Some(online) = self.cached_disk_health(index).await {
+    //         return online;
+    //     }
 
-        let disk_clone = disk.clone();
-        let online = timeout(DISK_ONLINE_TIMEOUT, async move { disk_clone.is_online().await })
-            .await
-            .unwrap_or(false);
-        self.update_disk_health(index, online).await;
-        online
-    }
+    //     let disk_clone = disk.clone();
+    //     let online = timeout(DISK_ONLINE_TIMEOUT, async move { disk_clone.is_online().await })
+    //         .await
+    //         .unwrap_or(false);
+    //     self.update_disk_health(index, online).await;
+    //     online
+    // }
 
-    async fn filter_online_disks(&self, disks: Vec<Option<DiskStore>>) -> (Vec<Option<DiskStore>>, usize) {
-        let mut filtered = Vec::with_capacity(disks.len());
-        let mut online_count = 0;
+    // async fn filter_online_disks(&self, disks: Vec<Option<DiskStore>>) -> (Vec<Option<DiskStore>>, usize) {
+    //     let mut filtered = Vec::with_capacity(disks.len());
+    //     let mut online_count = 0;
 
-        for (idx, disk) in disks.into_iter().enumerate() {
-            if let Some(disk_store) = disk {
-                if self.is_disk_online_cached(idx, &disk_store).await {
-                    filtered.push(Some(disk_store));
-                    online_count += 1;
-                } else {
-                    filtered.push(None);
-                }
-            } else {
-                filtered.push(None);
-            }
-        }
+    //     for (idx, disk) in disks.into_iter().enumerate() {
+    //         if let Some(disk_store) = disk {
+    //             if self.is_disk_online_cached(idx, &disk_store).await {
+    //                 filtered.push(Some(disk_store));
+    //                 online_count += 1;
+    //             } else {
+    //                 filtered.push(None);
+    //             }
+    //         } else {
+    //             filtered.push(None);
+    //         }
+    //     }
 
-        (filtered, online_count)
-    }
+    //     (filtered, online_count)
+    // }
     fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
         match err {
             LockResult::Timeout => {
@@ -234,6 +243,27 @@ impl SetDisks {
                 current_mode,
             } => format!("{mode} lock conflicted on {bucket}/{object}: held by {current_owner} as {current_mode:?}"),
             LockResult::Acquired => format!("unexpected lock state while acquiring {mode} lock on {bucket}/{object}"),
+        }
+    }
+
+    fn format_lock_error_from_error(
+        &self,
+        bucket: &str,
+        object: &str,
+        mode: &str,
+        err: &rustfs_lock::error::LockError,
+    ) -> String {
+        match err {
+            rustfs_lock::error::LockError::Timeout { .. } => {
+                format!(
+                    "ns_loc: {mode} lock acquisition timed out on {bucket}/{object} (owner={})",
+                    self.locker_owner
+                )
+            }
+            rustfs_lock::error::LockError::AlreadyLocked { owner, .. } => {
+                format!("ns_loc: {mode} lock conflicted on {bucket}/{object}: held by {owner}")
+            }
+            _ => format!("ns_loc: {mode} lock acquisition failed on {bucket}/{object}: {}", err),
         }
     }
     async fn get_disks_internal(&self) -> Vec<Option<DiskStore>> {
@@ -259,9 +289,28 @@ impl SetDisks {
     }
 
     async fn get_online_disks(&self) -> Vec<Option<DiskStore>> {
-        let disks = self.get_disks_internal().await;
-        let (filtered, _) = self.filter_online_disks(disks).await;
-        filtered.into_iter().filter(|disk| disk.is_some()).collect()
+        let mut disks = self.get_disks_internal().await;
+
+        // TODO: diskinfo filter online
+
+        let mut new_disk = Vec::with_capacity(disks.len());
+
+        for disk in disks.iter() {
+            if let Some(d) = disk
+                && d.is_online().await
+            {
+                new_disk.push(disk.clone());
+            }
+        }
+
+        let mut rng = rand::rng();
+
+        disks.shuffle(&mut rng);
+
+        new_disk
+        // let disks = self.get_disks_internal().await;
+        // let (filtered, _) = self.filter_online_disks(disks).await;
+        // filtered.into_iter().filter(|disk| disk.is_some()).collect()
     }
     async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
         let mut disks = self.get_online_disks().await;
@@ -582,8 +631,10 @@ impl SetDisks {
         Ok(())
     }
 
-    #[tracing::instrument(skip(disks))]
-    async fn cleanup_multipart_path(disks: &[Option<DiskStore>], paths: &[String]) {
+    #[tracing::instrument(skip(self))]
+    async fn cleanup_multipart_path(&self, paths: &[String]) {
+        let disks = self.get_disks_internal().await;
+
         let mut errs = Vec::with_capacity(disks.len());
 
         // Use improved simple batch processor instead of join_all for better performance
@@ -811,7 +862,9 @@ impl SetDisks {
     }
 
     #[tracing::instrument(skip(disks, meta))]
+    #[allow(clippy::too_many_arguments)]
     async fn rename_part(
+        &self,
         disks: &[Option<DiskStore>],
         src_bucket: &str,
         src_object: &str,
@@ -858,7 +911,8 @@ impl SetDisks {
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
             warn!("rename_part errs {:?}", &errs);
-            Self::cleanup_multipart_path(disks, &[dst_object.to_string(), format!("{dst_object}.meta")]).await;
+            self.cleanup_multipart_path(&[dst_object.to_string(), format!("{dst_object}.meta")])
+                .await;
             return Err(err);
         }
 
@@ -1307,7 +1361,7 @@ impl SetDisks {
         quorum: usize,
     ) -> disk::error::Result<FileInfo> {
         if quorum < 1 {
-            error!("find_file_info_in_quorum: quorum < 1");
+            warn!("find_file_info_in_quorum: quorum < 1");
             return Err(DiskError::ErasureReadQuorum);
         }
 
@@ -1388,7 +1442,7 @@ impl SetDisks {
         }
 
         if max_count < quorum {
-            error!("find_file_info_in_quorum: max_count < quorum, max_val={:?}", max_val);
+            warn!("find_file_info_in_quorum: max_count < quorum, max_val={:?}", max_val);
             return Err(DiskError::ErasureReadQuorum);
         }
 
@@ -1398,22 +1452,21 @@ impl SetDisks {
         let mut valid_obj_map = HashMap::new();
 
         for (i, op_hash) in meta_hashes.iter().enumerate() {
-            if let Some(hash) = op_hash {
-                if let Some(max_hash) = max_val {
-                    if hash == max_hash {
-                        if metas[i].is_valid() && !found {
-                            found_fi = Some(metas[i].clone());
-                            found = true;
-                        }
-
-                        let props = ObjProps {
-                            mod_time: metas[i].mod_time,
-                            num_versions: metas[i].num_versions,
-                        };
-
-                        *valid_obj_map.entry(props).or_insert(0) += 1;
-                    }
+            if let Some(hash) = op_hash
+                && let Some(max_hash) = max_val
+                && hash == max_hash
+            {
+                if metas[i].is_valid() && !found {
+                    found_fi = Some(metas[i].clone());
+                    found = true;
                 }
+
+                let props = ObjProps {
+                    mod_time: metas[i].mod_time,
+                    num_versions: metas[i].num_versions,
+                };
+
+                *valid_obj_map.entry(props).or_insert(0) += 1;
             }
         }
 
@@ -1433,7 +1486,7 @@ impl SetDisks {
             return Ok(fi);
         }
 
-        error!("find_file_info_in_quorum: fileinfo not found");
+        warn!("find_file_info_in_quorum: fileinfo not found");
 
         Err(DiskError::ErasureReadQuorum)
     }
@@ -1468,17 +1521,7 @@ impl SetDisks {
             let version_id = version_id.clone();
             tokio::spawn(async move {
                 if let Some(disk) = disk {
-                    if version_id.is_empty() {
-                        match disk.read_xl(&bucket, &object, read_data).await {
-                            Ok(info) => {
-                                let fi = file_info_from_raw(info, &bucket, &object, read_data).await?;
-                                Ok(fi)
-                            }
-                            Err(err) => Err(err),
-                        }
-                    } else {
-                        disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
-                    }
+                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
                 }
@@ -1606,7 +1649,7 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         read_data: bool,
-        _incl_free_vers: bool,
+        incl_free_vers: bool,
     ) -> (Vec<FileInfo>, Vec<Option<DiskError>>) {
         let mut metadata_array = vec![None; fileinfos.len()];
         let mut meta_file_infos = vec![FileInfo::default(); fileinfos.len()];
@@ -1656,7 +1699,7 @@ impl SetDisks {
             ..Default::default()
         };
 
-        let finfo = match meta.into_fileinfo(bucket, object, "", true, true) {
+        let finfo = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
             Ok(res) => res,
             Err(err) => {
                 for item in errs.iter_mut() {
@@ -1683,7 +1726,7 @@ impl SetDisks {
 
         for (idx, meta_op) in metadata_array.iter().enumerate() {
             if let Some(meta) = meta_op {
-                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, true) {
+                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, incl_free_vers, true) {
                     Ok(res) => meta_file_infos[idx] = res,
                     Err(err) => errs[idx] = Some(err.into()),
                 }
@@ -1799,14 +1842,14 @@ impl SetDisks {
     }
 
     pub async fn renew_disk(&self, ep: &Endpoint) {
-        debug!("renew_disk start {:?}", ep);
+        debug!("renew_disk: start {:?}", ep);
 
         let (new_disk, fm) = match Self::connect_endpoint(ep).await {
             Ok(res) => res,
             Err(e) => {
-                warn!("connect_endpoint err {:?}", &e);
+                warn!("renew_disk: connect_endpoint err {:?}", &e);
                 if ep.is_local && e == DiskError::UnformattedDisk {
-                    info!("unformatteddisk will trigger heal_disk, {:?}", ep);
+                    info!("renew_disk unformatteddisk will trigger heal_disk, {:?}", ep);
                     let set_disk_id = format!("pool_{}_set_{}", ep.pool_idx, ep.set_idx);
                     let _ = send_heal_disk(set_disk_id, Some(HealChannelPriority::Normal)).await;
                 }
@@ -1817,7 +1860,7 @@ impl SetDisks {
         let (set_idx, disk_idx) = match self.find_disk_index(&fm) {
             Ok(res) => res,
             Err(e) => {
-                warn!("find_disk_index err {:?}", e);
+                warn!("renew_disk: find_disk_index err {:?}", e);
                 return;
             }
         };
@@ -1837,7 +1880,7 @@ impl SetDisks {
             }
         }
 
-        debug!("renew_disk update {:?}", fm.erasure.this);
+        debug!("renew_disk: update {:?}", fm.erasure.this);
 
         let mut disk_lock = self.disks.write().await;
         disk_lock[disk_idx] = Some(new_disk);
@@ -2139,6 +2182,18 @@ impl SetDisks {
         shuffled_disks
     }
 
+    fn shuffle_check_parts(parts_errs: &[usize], distribution: &[usize]) -> Vec<usize> {
+        if distribution.is_empty() {
+            return parts_errs.to_vec();
+        }
+        let mut shuffled_parts_errs = vec![0; parts_errs.len()];
+        for (i, v) in parts_errs.iter().enumerate() {
+            let idx = distribution[i];
+            shuffled_parts_errs[idx - 1] = *v;
+        }
+        shuffled_parts_errs
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn get_object_fileinfo(
         &self,
@@ -2196,23 +2251,42 @@ impl SetDisks {
 
         Ok((fi, parts_metadata, op_online_disks))
     }
-    async fn get_object_info_and_quorum(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<(ObjectInfo, usize)> {
-        let (fi, _, _) = self.get_object_fileinfo(bucket, object, opts, false).await?;
+    async fn get_object_info_and_quorum(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> (ObjectInfo, usize, Option<StorageError>) {
+        let fi = match self.get_object_fileinfo(bucket, object, opts, false).await {
+            Ok((fi, _, _)) => fi,
+            Err(e) => return (ObjectInfo::default(), 0, Some(e)),
+        };
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        // TODO: replicatio
+
+        if !fi.version_purge_status().is_empty() && opts.version_id.is_some() {
+            return (
+                oi,
+                write_quorum,
+                Some(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])),
+            );
+        }
 
         if fi.deleted {
             return if opts.version_id.is_none() || opts.delete_marker {
-                Err(to_object_err(StorageError::FileNotFound, vec![bucket, object]))
+                (oi, write_quorum, Some(to_object_err(StorageError::FileNotFound, vec![bucket, object])))
             } else {
-                Err(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object]))
+                (
+                    oi,
+                    write_quorum,
+                    Some(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])),
+                )
             };
         }
 
-        Ok((oi, write_quorum))
+        (oi, write_quorum, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2594,68 +2668,27 @@ impl SetDisks {
         opts: &HealOpts,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
         info!(?opts, "Starting heal_object");
+
+        let disks = self.get_disks_internal().await;
+
         let mut result = HealResultItem {
             heal_item_type: HealItemType::Object.to_string(),
             bucket: bucket.to_string(),
             object: object.to_string(),
             version_id: version_id.to_string(),
-            disk_count: self.disks.read().await.len(),
+            disk_count: disks.len(),
             ..Default::default()
         };
 
-        let _write_lock_guard = if !opts.no_lock {
-            info!("Acquiring write lock for object: {}, owner: {}", object, self.locker_owner);
-
-            // Check if lock is already held
-            let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
-            let mut reuse_existing_lock = false;
-            if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key) {
-                if lock_info.owner.as_ref() == self.locker_owner.as_str()
-                    && matches!(lock_info.mode, rustfs_lock::fast_lock::types::LockMode::Exclusive)
-                {
-                    reuse_existing_lock = true;
-                    debug!("Reusing existing exclusive lock for object {} held by {}", object, self.locker_owner);
-                } else {
-                    warn!("Lock already exists for object {}: {:?}", object, lock_info);
-                }
-            } else {
-                info!("No existing lock found for object {}", object);
-            }
-
-            if reuse_existing_lock {
-                None
-            } else {
-                let mut lock_result = None;
-                for i in 0..3 {
-                    let start_time = Instant::now();
-                    match self
-                        .fast_lock_manager
-                        .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-                        .await
-                    {
-                        Ok(res) => {
-                            let elapsed = start_time.elapsed();
-                            info!(duration = ?elapsed, attempt = i + 1, "Write lock acquired");
-                            lock_result = Some(res);
-                            break;
-                        }
-                        Err(e) => {
-                            let elapsed = start_time.elapsed();
-                            info!(error = ?e, attempt = i + 1, duration = ?elapsed, "Lock acquisition failed, retrying");
-                            if i < 2 {
-                                tokio::time::sleep(Duration::from_millis(50 * (i as u64 + 1))).await;
-                            } else {
-                                let message = self.format_lock_error(bucket, object, "write", &e);
-                                error!("Failed to acquire write lock after retries: {}", message);
-                                return Err(DiskError::other(message));
-                            }
-                        }
-                    }
-                }
-                lock_result
-            }
+        let write_lock_guard = if !opts.no_lock {
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                StorageError::other(format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error_from_error(bucket, object, "write", &e)
+                ))
+            })?)
         } else {
-            info!("Skipping lock acquisition (no_lock=true)");
             None
         };
 
@@ -2667,39 +2700,16 @@ impl SetDisks {
             }
         };
 
-        let disks = { self.disks.read().await.clone() };
+        let (mut parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
 
-        let (mut parts_metadata, errs) = {
-            let mut retry_count = 0;
-            loop {
-                let (parts, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
-
-                // Check if we have enough valid metadata to proceed
-                // If we have too many errors, and we haven't exhausted retries, try again
-                let valid_count = errs.iter().filter(|e| e.is_none()).count();
-                // Simple heuristic: if valid_count is less than expected quorum (e.g. half disks), retry
-                // But we don't know the exact quorum yet. Let's just retry on high error rate if possible.
-                // Actually, read_all_fileinfo shouldn't fail easily.
-                // Let's just retry if we see ANY non-NotFound errors that might be transient (like timeouts)
-
-                let has_transient_error = errs
-                    .iter()
-                    .any(|e| matches!(e, Some(DiskError::SourceStalled) | Some(DiskError::Timeout)));
-
-                if !has_transient_error || retry_count >= 3 {
-                    break (parts, errs);
-                }
-
-                info!(
-                    "read_all_fileinfo encountered transient errors, retrying (attempt {}/3). Errs: {:?}",
-                    retry_count + 1,
-                    errs
-                );
-                tokio::time::sleep(Duration::from_millis(50 * (retry_count as u64 + 1))).await;
-                retry_count += 1;
-            }
-        };
-        info!(parts_count = parts_metadata.len(), ?errs, "File info read complete");
+        info!(
+            parts_count = parts_metadata.len(),
+            bucket = bucket,
+            object = object,
+            version_id = version_id,
+            ?errs,
+            "File info read complete"
+        );
         if DiskError::is_all_not_found(&errs) {
             warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
@@ -2718,25 +2728,33 @@ impl SetDisks {
             ));
         }
 
-        info!(parts_count = parts_metadata.len(), "Initiating quorum check");
+        info!(parts_count = parts_metadata.len(), "heal_object Initiating quorum check");
         match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count) {
             Ok((read_quorum, _)) => {
                 result.parity_blocks = result.disk_count - read_quorum as usize;
                 result.data_blocks = read_quorum as usize;
 
-                let ((online_disks, mod_time, etag), disk_len) = {
+                let ((mut online_disks, quorum_mod_time, quorum_etag), disk_len) = {
                     let disks = self.disks.read().await;
                     let disk_len = disks.len();
                     (Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum as usize), disk_len)
                 };
 
-                match Self::pick_valid_fileinfo(&parts_metadata, mod_time, etag, read_quorum as usize) {
+                info!(?parts_metadata, ?errs, ?read_quorum, ?disk_len, "heal_object List disks metadata");
+
+                info!(?online_disks, ?quorum_mod_time, ?quorum_etag, "heal_object List online disks");
+
+                let filter_by_etag = quorum_etag.is_some();
+                match Self::pick_valid_fileinfo(&parts_metadata, quorum_mod_time, quorum_etag.clone(), read_quorum as usize) {
                     Ok(latest_meta) => {
-                        let (available_disks, data_errs_by_disk, data_errs_by_part) = disks_with_all_parts(
-                            &online_disks,
+                        info!("heal_object latest_meta: {:?}", latest_meta);
+
+                        let (data_errs_by_disk, data_errs_by_part) = disks_with_all_parts(
+                            &mut online_disks,
                             &mut parts_metadata,
                             &errs,
                             &latest_meta,
+                            filter_by_etag,
                             bucket,
                             object,
                             opts.scan_mode,
@@ -2744,9 +2762,9 @@ impl SetDisks {
                         .await?;
 
                         info!(
-                            "disks_with_all_parts results: available_disks count={}, total_disks={}",
-                            available_disks.iter().filter(|d| d.is_some()).count(),
-                            available_disks.len()
+                            "disks_with_all_parts heal_object results: available_disks count={}, total_disks={}",
+                            online_disks.iter().filter(|d| d.is_some()).count(),
+                            online_disks.len()
                         );
 
                         let erasure = if !latest_meta.deleted && !latest_meta.is_remote() {
@@ -2765,27 +2783,25 @@ impl SetDisks {
                         // Loop to find number of disks with valid data, per-drive
                         // data state and a list of outdated disks on which data needs
                         // to be healed.
-                        let mut outdate_disks = vec![None; disk_len];
+                        let mut out_dated_disks = vec![None; disk_len];
                         let mut disks_to_heal_count = 0;
+                        let mut meta_to_heal_count = 0;
 
-                        info!("Checking {} disks for healing needs (bucket={}, object={})", disk_len, bucket, object);
-                        for index in 0..available_disks.len() {
-                            let (yes, reason) = should_heal_object_on_disk(
+                        for index in 0..online_disks.len() {
+                            let (yes, is_meta, reason) = should_heal_object_on_disk(
                                 &errs[index],
                                 &data_errs_by_disk[&index],
                                 &parts_metadata[index],
                                 &latest_meta,
                             );
 
-                            info!(
-                                "Disk {} heal check: should_heal={}, reason={:?}, err={:?}, endpoint={}",
-                                index, yes, reason, errs[index], self.set_endpoints[index]
-                            );
-
                             if yes {
-                                outdate_disks[index] = disks[index].clone();
+                                out_dated_disks[index] = disks[index].clone();
                                 disks_to_heal_count += 1;
-                                info!("Disk {} marked for healing (endpoint={})", index, self.set_endpoints[index]);
+                                if is_meta {
+                                    meta_to_heal_count += 1;
+                                }
+                                debug!("heal_object Disk {} marked for healing (endpoint={})", index, self.set_endpoints[index]);
                             }
 
                             let drive_state = match reason {
@@ -2796,7 +2812,8 @@ impl SetDisks {
                                     | DiskError::VolumeNotFound
                                     | DiskError::PartMissingOrCorrupt
                                     | DiskError::OutdatedXLMeta => DriveState::Missing.to_string(),
-                                    _ => DriveState::Corrupt.to_string(),
+                                    DiskError::FileCorrupt => DriveState::Corrupt.to_string(),
+                                    _ => DriveState::Unknown(err.to_string()).to_string(),
                                 },
                                 None => DriveState::Ok.to_string(),
                             };
@@ -2813,45 +2830,29 @@ impl SetDisks {
                             });
                         }
 
-                        info!(
-                            "Heal check complete: {} disks need healing out of {} total (bucket={}, object={})",
-                            disks_to_heal_count, disk_len, bucket, object
-                        );
-
-                        if DiskError::is_all_not_found(&errs) {
-                            warn!(
-                                "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
-                                bucket, object, version_id
-                            );
-                            let err = if !version_id.is_empty() {
-                                DiskError::FileVersionNotFound
-                            } else {
-                                DiskError::FileNotFound
-                            };
-
-                            return Ok((
-                                self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
-                                    .await,
-                                Some(err),
-                            ));
-                        }
-
                         if disks_to_heal_count == 0 {
-                            info!("No disks to heal, returning early");
                             return Ok((result, None));
                         }
 
                         if opts.dry_run {
-                            info!("Dry run mode, returning early");
                             return Ok((result, None));
                         }
 
-                        info!(
-                            "Proceeding with heal: disks_to_heal_count={}, dry_run={}",
-                            disks_to_heal_count, opts.dry_run
-                        );
+                        let mut cannot_heal = !latest_meta.deleted && meta_to_heal_count > latest_meta.erasure.parity_blocks;
+                        if cannot_heal && quorum_etag.is_some() {
+                            cannot_heal = false;
+                        }
 
-                        if !latest_meta.deleted && disks_to_heal_count > latest_meta.erasure.parity_blocks {
+                        if !latest_meta.deleted && !latest_meta.is_remote() {
+                            for (_, part_errs) in data_errs_by_part.iter() {
+                                if count_part_not_success(part_errs) > latest_meta.erasure.parity_blocks {
+                                    cannot_heal = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if cannot_heal {
                             let total_disks = parts_metadata.len();
                             let healthy_count = total_disks.saturating_sub(disks_to_heal_count);
                             let required_data = total_disks.saturating_sub(latest_meta.erasure.parity_blocks);
@@ -2910,10 +2911,10 @@ impl SetDisks {
                             };
                         }
 
-                        if !latest_meta.deleted && latest_meta.erasure.distribution.len() != available_disks.len() {
+                        if !latest_meta.deleted && latest_meta.erasure.distribution.len() != online_disks.len() {
                             let err_str = format!(
                                 "unexpected file distribution ({:?}) from available disks ({:?}), looks like backend disks have been manually modified refusing to heal {}/{}({})",
-                                latest_meta.erasure.distribution, available_disks, bucket, object, version_id
+                                latest_meta.erasure.distribution, online_disks, bucket, object, version_id
                             );
                             warn!(err_str);
                             let err = DiskError::other(err_str);
@@ -2923,11 +2924,11 @@ impl SetDisks {
                             ));
                         }
 
-                        let latest_disks = Self::shuffle_disks(&available_disks, &latest_meta.erasure.distribution);
-                        if !latest_meta.deleted && latest_meta.erasure.distribution.len() != outdate_disks.len() {
+                        let latest_disks = Self::shuffle_disks(&online_disks, &latest_meta.erasure.distribution);
+                        if !latest_meta.deleted && latest_meta.erasure.distribution.len() != out_dated_disks.len() {
                             let err_str = format!(
                                 "unexpected file distribution ({:?}) from outdated disks ({:?}), looks like backend disks have been manually modified refusing to heal {}/{}({})",
-                                latest_meta.erasure.distribution, outdate_disks, bucket, object, version_id
+                                latest_meta.erasure.distribution, out_dated_disks, bucket, object, version_id
                             );
                             warn!(err_str);
                             let err = DiskError::other(err_str);
@@ -2954,7 +2955,7 @@ impl SetDisks {
                             ));
                         }
 
-                        let out_dated_disks = Self::shuffle_disks(&outdate_disks, &latest_meta.erasure.distribution);
+                        out_dated_disks = Self::shuffle_disks(&out_dated_disks, &latest_meta.erasure.distribution);
                         let mut parts_metadata = Self::shuffle_parts_metadata(&parts_metadata, &latest_meta.erasure.distribution);
                         let mut copy_parts_metadata = vec![None; parts_metadata.len()];
                         for (index, disk) in latest_disks.iter().enumerate() {
@@ -2985,27 +2986,35 @@ impl SetDisks {
                         let src_data_dir = latest_meta.data_dir.unwrap().to_string();
                         let dst_data_dir = latest_meta.data_dir.unwrap();
 
-                        info!(
-                            "Checking heal conditions: deleted={}, is_remote={}",
-                            latest_meta.deleted,
-                            latest_meta.is_remote()
-                        );
                         if !latest_meta.deleted && !latest_meta.is_remote() {
-                            let erasure_info = latest_meta.erasure;
-                            for part in latest_meta.parts.iter() {
+                            let erasure_info = latest_meta.erasure.clone();
+
+                            for (part_index, part) in latest_meta.parts.iter().enumerate() {
                                 let till_offset = erasure.shard_file_offset(0, part.size, part.size);
                                 let checksum_algo = erasure_info.get_checksum_info(part.number).algorithm;
                                 let mut readers = Vec::with_capacity(latest_disks.len());
                                 let mut writers = Vec::with_capacity(out_dated_disks.len());
                                 // let mut errors = Vec::with_capacity(out_dated_disks.len());
+
                                 let mut prefer = vec![false; latest_disks.len()];
                                 for (index, disk) in latest_disks.iter().enumerate() {
+                                    let this_part_errs =
+                                        Self::shuffle_check_parts(&data_errs_by_part[&part_index], &erasure_info.distribution);
+                                    if this_part_errs[index] != CHECK_PART_SUCCESS {
+                                        info!(
+                                            "reading part {}: index={}, part_errs={:?}, skipping",
+                                            part.number, index, this_part_errs[index]
+                                        );
+                                        readers.push(None);
+                                        continue;
+                                    }
+
                                     if let (Some(disk), Some(metadata)) = (disk, &copy_parts_metadata[index]) {
                                         match create_bitrot_reader(
                                             metadata.data.as_deref(),
                                             Some(disk),
                                             bucket,
-                                            &format!("{}/{}/part.{}", object, src_data_dir, part.number),
+                                            &path_join_buf(&[object, &src_data_dir, &format!("part.{}", part.number)]),
                                             0,
                                             till_offset,
                                             erasure.shard_size(),
@@ -3017,12 +3026,10 @@ impl SetDisks {
                                                 readers.push(Some(reader));
                                             }
                                             Ok(None) => {
-                                                error!("heal_object disk not available");
                                                 readers.push(None);
                                                 continue;
                                             }
                                             Err(e) => {
-                                                error!("heal_object read_file err: {:?}", e);
                                                 readers.push(None);
                                                 continue;
                                             }
@@ -3043,93 +3050,53 @@ impl SetDisks {
                                     }
                                 };
                                 // create writers for all disk positions, but only for outdated disks
-                                info!(
-                                    "Creating writers: latest_disks len={}, out_dated_disks len={}",
-                                    latest_disks.len(),
-                                    out_dated_disks.len()
-                                );
-                                for (index, disk) in latest_disks.iter().enumerate() {
-                                    if let Some(outdated_disk) = &out_dated_disks[index] {
-                                        info!(disk_index = index, "Creating writer for outdated disk");
-                                        let writer = create_bitrot_writer(
+                                for (index, disk_op) in out_dated_disks.iter().enumerate() {
+                                    if let Some(outdated_disk) = disk_op {
+                                        let writer = match create_bitrot_writer(
                                             is_inline_buffer,
                                             Some(outdated_disk),
                                             RUSTFS_META_TMP_BUCKET,
-                                            &format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number),
+                                            &path_join_buf(&[
+                                                &tmp_id.to_string(),
+                                                &dst_data_dir.to_string(),
+                                                &format!("part.{}", part.number),
+                                            ]),
                                             erasure.shard_file_size(part.size as i64),
                                             erasure.shard_size(),
                                             HashAlgorithm::HighwayHash256,
                                         )
-                                        .await?;
+                                        .await
+                                        {
+                                            Ok(writer) => writer,
+                                            Err(err) => {
+                                                info!(
+                                                    "create_bitrot_writer  disk {}, err {:?}, skipping operation",
+                                                    outdated_disk.to_string(),
+                                                    err
+                                                );
+                                                writers.push(None);
+                                                continue;
+                                            }
+                                        };
                                         writers.push(Some(writer));
                                     } else {
-                                        info!(disk_index = index, "Skipping writer (disk not outdated)");
                                         writers.push(None);
                                     }
-
-                                    // if let Some(disk) = disk {
-                                    //     // let filewriter = {
-                                    //     //     if is_inline_buffer {
-                                    //     //         Box::new(Cursor::new(Vec::new()))
-                                    //     //     } else {
-                                    //     //         let disk = disk.clone();
-                                    //     //         let part_path = format!("{}/{}/part.{}", object, src_data_dir, part.number);
-                                    //     //         disk.create_file("", RUSTFS_META_TMP_BUCKET, &part_path, 0).await?
-                                    //     //     }
-                                    //     // };
-
-                                    //     if is_inline_buffer {
-                                    //         let writer = BitrotWriter::new(
-                                    //             Writer::from_cursor(Cursor::new(Vec::new())),
-                                    //             erasure.shard_size(),
-                                    //             HashAlgorithm::HighwayHash256,
-                                    //         );
-                                    //         writers.push(Some(writer));
-                                    //     } else {
-                                    //         let f = disk
-                                    //             .create_file(
-                                    //                 "",
-                                    //                 RUSTFS_META_TMP_BUCKET,
-                                    //                 &format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number),
-                                    //                 0,
-                                    //             )
-                                    //             .await?;
-                                    //         let writer = BitrotWriter::new(
-                                    //             Writer::from_tokio_writer(f),
-                                    //             erasure.shard_size(),
-                                    //             HashAlgorithm::HighwayHash256,
-                                    //         );
-                                    //         writers.push(Some(writer));
-                                    //     }
-
-                                    //     // let writer = new_bitrot_filewriter(
-                                    //     //     disk.clone(),
-                                    //     //     RUSTFS_META_TMP_BUCKET,
-                                    //     //     format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number).as_str(),
-                                    //     //     is_inline_buffer,
-                                    //     //     DEFAULT_BITROT_ALGO,
-                                    //     //     erasure.shard_size(erasure.block_size),
-                                    //     // )
-                                    //     // .await?;
-
-                                    //     // writers.push(Some(writer));
-                                    // } else {
-                                    //     writers.push(None);
-                                    // }
                                 }
+
                                 // Heal each part. erasure.Heal() will write the healed
                                 // part to .rustfs/tmp/uuid/ which needs to be renamed
                                 // later to the final location.
                                 erasure.heal(&mut writers, readers, part.size, &prefer).await?;
                                 // close_bitrot_writers(&mut writers).await?;
 
-                                for (index, disk) in out_dated_disks.iter().enumerate() {
-                                    if disk.is_none() {
+                                for (index, disk_op) in out_dated_disks.iter_mut().enumerate() {
+                                    if disk_op.is_none() {
                                         continue;
                                     }
 
                                     if writers[index].is_none() {
-                                        outdate_disks[index] = None;
+                                        *disk_op = None;
                                         disks_to_heal_count -= 1;
                                         continue;
                                     }
@@ -3169,12 +3136,6 @@ impl SetDisks {
                             }
                         }
                         // Rename from tmp location to the actual location.
-                        info!(
-                            "Starting rename phase: {} disks to process (bucket={}, object={})",
-                            out_dated_disks.iter().filter(|d| d.is_some()).count(),
-                            bucket,
-                            object
-                        );
                         for (index, outdated_disk) in out_dated_disks.iter().enumerate() {
                             if let Some(disk) = outdated_disk {
                                 // record the index of the updated disks
@@ -3182,67 +3143,15 @@ impl SetDisks {
                                 // Attempt a rename now from healed data to final location.
                                 parts_metadata[index].set_healing();
 
-                                info!(
-                                    "Renaming healed data for disk {} (endpoint={}): src_volume={}, src_path={}, dst_volume={}, dst_path={}",
-                                    index, self.set_endpoints[index], RUSTFS_META_TMP_BUCKET, tmp_id, bucket, object
-                                );
                                 let rename_result = disk
                                     .rename_data(RUSTFS_META_TMP_BUCKET, &tmp_id, parts_metadata[index].clone(), bucket, object)
                                     .await;
 
                                 if let Err(err) = &rename_result {
-                                    info!(
-                                        error = %err,
-                                        disk_index = index,
-                                        endpoint = %self.set_endpoints[index],
-                                        "Rename failed, attempting fallback"
-                                    );
-
-                                    // Preserve temp files for safety
-                                    info!(temp_uuid = %tmp_id, "Rename failed, preserving temporary files for safety");
-
-                                    let healthy_index = latest_disks.iter().position(|d| d.is_some()).unwrap_or(0);
-
-                                    if let Some(healthy_disk) = &latest_disks[healthy_index] {
-                                        let xlmeta_path = format!("{object}/xl.meta");
-
-                                        match healthy_disk.read_all(bucket, &xlmeta_path).await {
-                                            Ok(xlmeta_bytes) => {
-                                                if let Err(e) = disk.write_all(bucket, &xlmeta_path, xlmeta_bytes).await {
-                                                    info!("fallback xl.meta overwrite failed: {}", e.to_string());
-
-                                                    return Ok((
-                                                        result,
-                                                        Some(DiskError::other(format!("fallback xl.meta overwrite failed: {e}"))),
-                                                    ));
-                                                } else {
-                                                    info!("fallback xl.meta overwrite succeeded for disk {}", disk.to_string());
-                                                }
-                                            }
-
-                                            Err(e) => {
-                                                info!("read healthy xl.meta failed: {}", e.to_string());
-
-                                                return Ok((
-                                                    result,
-                                                    Some(DiskError::other(format!("read healthy xl.meta failed: {e}"))),
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        info!("no healthy disk found for xl.meta fallback overwrite");
-
-                                        return Ok((
-                                            result,
-                                            Some(DiskError::other("no healthy disk found for xl.meta fallback overwrite")),
-                                        ));
-                                    }
+                                    self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id)
+                                        .await
+                                        .map_err(DiskError::other)?;
                                 } else {
-                                    info!(
-                                        "Successfully renamed healed data for disk {} (endpoint={}), removing temp files from volume={}, path={}",
-                                        index, self.set_endpoints[index], RUSTFS_META_TMP_BUCKET, tmp_id
-                                    );
-
                                     self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id)
                                         .await
                                         .map_err(DiskError::other)?;
@@ -3277,10 +3186,7 @@ impl SetDisks {
 
                         Ok((result, None))
                     }
-                    Err(err) => {
-                        warn!("heal_object can not pick valid file info");
-                        Ok((result, Some(err)))
-                    }
+                    Err(err) => Ok((result, Some(err))),
                 }
             }
             Err(err) => {
@@ -3429,11 +3335,15 @@ impl SetDisks {
         remove: bool,
     ) -> Result<(HealResultItem, Option<DiskError>)> {
         let _write_lock_guard = self
-            .fast_lock_manager
-            .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+            .new_ns_lock(bucket, object)
+            .await?
+            .get_write_lock(get_lock_acquire_timeout())
             .await
             .map_err(|e| {
-                let message = self.format_lock_error(bucket, object, "write", &e);
+                let message = format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error_from_error(bucket, object, "write", &e)
+                );
                 DiskError::other(message)
             })?;
 
@@ -3514,73 +3424,99 @@ impl SetDisks {
         data_errs_by_part: &HashMap<usize, Vec<usize>>,
         opts: ObjectOptions,
     ) -> disk::error::Result<FileInfo> {
-        if let Ok(m) = is_object_dang_ling(meta_arr, errs, data_errs_by_part) {
-            let mut tags = HashMap::new();
-            tags.insert("set", self.set_index.to_string());
-            tags.insert("pool", self.pool_index.to_string());
-            tags.insert("merrs", join_errs(errs));
-            tags.insert("derrs", format!("{data_errs_by_part:?}"));
-            if m.is_valid() {
-                tags.insert("sz", m.size.to_string());
-                tags.insert(
-                    "mt",
-                    m.mod_time
-                        .as_ref()
-                        .map_or(String::new(), |mod_time| mod_time.unix_timestamp().to_string()),
-                );
-                tags.insert("d:p", format!("{}:{}", m.erasure.data_blocks, m.erasure.parity_blocks));
-            } else {
-                tags.insert("invalid", "1".to_string());
-                tags.insert(
-                    "d:p",
-                    format!("{}:{}", self.set_drive_count - self.default_parity_count, self.default_parity_count),
-                );
-            }
-            let mut offline = 0;
-            for (i, err) in errs.iter().enumerate() {
-                let mut found = false;
-                if let Some(err) = err {
-                    if err == &DiskError::DiskNotFound {
-                        found = true;
-                    }
-                }
-                for p in data_errs_by_part {
-                    if let Some(v) = p.1.get(i) {
-                        if *v == CHECK_PART_DISK_NOT_FOUND {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
+        let (m, can_heal) = is_object_dang_ling(meta_arr, errs, data_errs_by_part);
 
-                if found {
-                    offline += 1;
-                }
-            }
-
-            if offline > 0 {
-                tags.insert("offline", offline.to_string());
-            }
-
-            // TODO: audit
-            let mut fi = FileInfo::default();
-            if let Some(ref version_id) = opts.version_id {
-                fi.version_id = Uuid::parse_str(version_id).ok();
-            }
-            // TODO: tier
-            for disk in self.disks.read().await.iter().flatten() {
-                let _ = disk
-                    .delete_version(bucket, object, fi.clone(), false, DeleteOptions::default())
-                    .await;
-            }
-            Ok(m)
-        } else {
-            error!(
-                "Object {}/{} is corrupted but not dangling (some parts exist). Preserving data for potential manual recovery. Errors: {:?}",
-                bucket, object, errs
-            );
-            Err(DiskError::ErasureReadQuorum)
+        if !can_heal {
+            return Err(DiskError::ErasureReadQuorum);
         }
+
+        let mut tags: HashMap<String, String> = HashMap::new();
+        tags.insert("set".to_string(), self.set_index.to_string());
+        tags.insert("pool".to_string(), self.pool_index.to_string());
+        tags.insert("merrs".to_string(), join_errs(errs));
+        tags.insert("derrs".to_string(), format!("{data_errs_by_part:?}"));
+        if m.is_valid() {
+            tags.insert("sz".to_string(), m.size.to_string());
+            tags.insert(
+                "mt".to_string(),
+                m.mod_time
+                    .as_ref()
+                    .map_or(String::new(), |mod_time| mod_time.unix_timestamp().to_string()),
+            );
+            tags.insert("d:p".to_string(), format!("{}:{}", m.erasure.data_blocks, m.erasure.parity_blocks));
+        } else {
+            tags.insert("invalid".to_string(), "1".to_string());
+            tags.insert(
+                "d:p".to_string(),
+                format!("{}:{}", self.set_drive_count - self.default_parity_count, self.default_parity_count),
+            );
+        }
+        let mut offline = 0;
+        for (i, err) in errs.iter().enumerate() {
+            let mut found = false;
+            if let Some(err) = err
+                && err == &DiskError::DiskNotFound
+            {
+                found = true;
+            }
+            for p in data_errs_by_part {
+                if let Some(v) = p.1.get(i)
+                    && *v == CHECK_PART_DISK_NOT_FOUND
+                {
+                    found = true;
+                    break;
+                }
+            }
+
+            if found {
+                offline += 1;
+            }
+        }
+
+        if offline > 0 {
+            tags.insert("offline".to_string(), offline.to_string());
+        }
+
+        let mut fi = FileInfo::default();
+        if let Some(ref version_id) = opts.version_id {
+            fi.version_id = Uuid::parse_str(version_id).ok();
+        }
+
+        fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+
+        let disks = self.get_disks_internal().await;
+
+        let mut futures = Vec::with_capacity(disks.len());
+        for disk_op in disks.iter() {
+            let bucket = bucket.to_string();
+            let object = object.to_string();
+            let fi = fi.clone();
+            futures.push(async move {
+                if let Some(disk) = disk_op {
+                    disk.delete_version(&bucket, &object, fi, false, DeleteOptions::default())
+                        .await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                }
+            });
+        }
+
+        let results = join_all(futures).await;
+        for (index, result) in results.into_iter().enumerate() {
+            let key = format!("ddisk-{index}");
+            match result {
+                Ok(_) => {
+                    tags.insert(key, "<nil>".to_string());
+                }
+                Err(e) => {
+                    tags.insert(key, e.to_string());
+                }
+            }
+        }
+
+        // TODO: audit
+
+        Ok(m)
     }
 
     async fn delete_prefix(&self, bucket: &str, prefix: &str) -> disk::error::Result<()> {
@@ -3666,6 +3602,10 @@ impl SetDisks {
 
         match oi {
             Ok(oi) => {
+                // If top level is a delete marker proceed to upload.
+                if oi.delete_marker {
+                    return None;
+                }
                 if should_prevent_write(&oi, http_preconditions.if_none_match, http_preconditions.if_match) {
                     return Some(StorageError::PreconditionFailed);
                 }
@@ -3705,10 +3645,16 @@ impl ObjectIO for SetDisks {
         // Acquire a shared read-lock early to protect read consistency
         let read_lock_guard = if !opts.no_lock {
             Some(
-                self.fast_lock_manager
-                    .acquire_read_lock(bucket, object, self.locker_owner.as_str())
+                self.new_ns_lock(bucket, object)
+                    .await?
+                    .get_read_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "read", &e)))?,
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "Failed to acquire read lock: {}",
+                            self.format_lock_error_from_error(bucket, object, "read", &e)
+                        ))
+                    })?,
             )
         } else {
             None
@@ -3749,7 +3695,11 @@ impl ObjectIO for SetDisks {
         }
 
         if object_info.is_remote() {
-            let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, opts).await?;
+            let mut opts = opts.clone();
+            if object_info.parts.len() == 1 {
+                opts.part_number = Some(1);
+            }
+            let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, &opts).await?;
             return Ok(gr);
         }
 
@@ -3790,22 +3740,21 @@ impl ObjectIO for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self, data,))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let disks_snapshot = self.get_disks_internal().await;
-        let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
+        let disks = self.get_disks_internal().await;
 
-        // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
-        let _object_lock_guard = if !opts.no_lock {
-            Some(
-                self.fast_lock_manager
-                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-                    .await
-                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
-            )
-        } else {
-            None
-        };
+        let mut object_lock_guard = None;
 
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
+            if !opts.no_lock {
+                let ns_lock = self.new_ns_lock(bucket, object).await?;
+                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                    StorageError::other(format!(
+                        "Failed to acquire write lock: {}",
+                        self.format_lock_error_from_error(bucket, object, "write", &e)
+                    ))
+                })?);
+            }
+
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
                 return Err(err);
             }
@@ -3832,13 +3781,13 @@ impl ObjectIO for SetDisks {
             write_quorum += 1
         }
 
-        if filtered_online < write_quorum {
-            warn!(
-                "online disk snapshot {} below write quorum {} for {}/{}; returning erasure write quorum error",
-                filtered_online, write_quorum, bucket, object
-            );
-            return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
-        }
+        // if filtered_online < write_quorum {
+        //     warn!(
+        //         "online disk snapshot {} below write quorum {} for {}/{}; returning erasure write quorum error",
+        //         filtered_online, write_quorum, bucket, object
+        //     );
+        //     return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
+        // }
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
 
@@ -3877,8 +3826,10 @@ impl ObjectIO for SetDisks {
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
-            if let Some(disk) = disk_op {
-                let writer = create_bitrot_writer(
+            if let Some(disk) = disk_op
+                && disk.is_online().await
+            {
+                let writer = match create_bitrot_writer(
                     is_inline_buffer,
                     Some(disk),
                     RUSTFS_META_TMP_BUCKET,
@@ -3887,29 +3838,16 @@ impl ObjectIO for SetDisks {
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,
                 )
-                .await?;
-
-                // let writer = if is_inline_buffer {
-                //     BitrotWriter::new(
-                //         Writer::from_cursor(Cursor::new(Vec::new())),
-                //         erasure.shard_size(),
-                //         HashAlgorithm::HighwayHash256,
-                //     )
-                // } else {
-                //     let f = match disk
-                //         .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_object, erasure.shard_file_size(data.content_length))
-                //         .await
-                //     {
-                //         Ok(f) => f,
-                //         Err(e) => {
-                //             errors.push(Some(e));
-                //             writers.push(None);
-                //             continue;
-                //         }
-                //     };
-
-                //     BitrotWriter::new(Writer::from_tokio_writer(f), erasure.shard_size(), HashAlgorithm::HighwayHash256)
-                // };
+                .await
+                {
+                    Ok(writer) => writer,
+                    Err(err) => {
+                        warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                        errors.push(Some(err));
+                        writers.push(None);
+                        continue;
+                    }
+                };
 
                 writers.push(Some(writer));
                 errors.push(None);
@@ -3980,16 +3918,16 @@ impl ObjectIO for SetDisks {
             }
         }
 
-        if fi.checksum.is_none() {
-            if let Some(content_hash) = data.as_hash_reader().content_hash() {
-                fi.checksum = Some(content_hash.to_bytes(&[]));
-            }
+        if fi.checksum.is_none()
+            && let Some(content_hash) = data.as_hash_reader().content_hash()
+        {
+            fi.checksum = Some(content_hash.to_bytes(&[]));
         }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
-            if sc == storageclass::STANDARD {
-                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
-            }
+        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+            && sc == storageclass::STANDARD
+        {
+            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
         }
 
         let mod_time = if let Some(mod_time) = opts.mod_time {
@@ -4021,6 +3959,16 @@ impl ObjectIO for SetDisks {
 
         drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
 
+        if !opts.no_lock && object_lock_guard.is_none() {
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                StorageError::other(format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error_from_error(bucket, object, "write", &e)
+                ))
+            })?);
+        }
+
         let (online_disks, _, op_old_dir) = Self::rename_data(
             &shuffle_disks,
             RUSTFS_META_TMP_BUCKET,
@@ -4037,14 +3985,16 @@ impl ObjectIO for SetDisks {
                 .await?;
         }
 
+        drop(object_lock_guard); // drop object lock guard to release the lock
+
         self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
 
         for (i, op_disk) in online_disks.iter().enumerate() {
-            if let Some(disk) = op_disk {
-                if disk.is_online().await {
-                    fi = parts_metadatas[i].clone();
-                    break;
-                }
+            if let Some(disk) = op_disk
+                && disk.is_online().await
+            {
+                fi = parts_metadatas[i].clone();
+                break;
             }
         }
 
@@ -4059,6 +4009,33 @@ impl ObjectIO for SetDisks {
 #[async_trait::async_trait]
 impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
+        let set_lock = if is_dist_erasure().await {
+            // Calculate quorum based on lockers count (majority)
+            let lockers_count = self.lockers.len();
+            let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
+            NamespaceLock::with_clients_and_quorum(
+                format!("set-{}-{}", self.pool_index, self.set_index),
+                self.lockers.clone(),
+                write_quorum,
+            )
+        } else {
+            NamespaceLock::Local(LocalLock::new(
+                format!("set-{}-{}", self.pool_index, self.set_index),
+                Arc::new(rustfs_lock::GlobalLockManager::new()),
+            ))
+        };
+
+        let resource = ObjectKey {
+            bucket: Arc::from(bucket),
+            object: Arc::from(object),
+            version: None,
+        };
+
+        Ok(NamespaceLockWrapper::new(set_lock, resource, self.locker_owner.clone()))
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
         unimplemented!()
     }
@@ -4072,7 +4049,7 @@ impl StorageAPI for SetDisks {
     async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
         let disks = self.get_disks_internal().await;
 
-        let mut local_disks: Vec<Option<Arc<disk::Disk>>> = Vec::new();
+        let mut local_disks: Vec<Option<DiskStore>> = Vec::new();
         let mut local_endpoints = Vec::new();
 
         for (i, ep) in self.set_endpoints.iter().enumerate() {
@@ -4117,10 +4094,16 @@ impl StorageAPI for SetDisks {
 
         // Guard lock for source object metadata update
         let _lock_guard = self
-            .fast_lock_manager
-            .acquire_write_lock(src_bucket, src_object, self.locker_owner.as_str())
+            .new_ns_lock(src_bucket, src_object)
+            .await?
+            .get_write_lock(get_lock_acquire_timeout())
             .await
-            .map_err(|e| Error::other(self.format_lock_error(src_bucket, src_object, "write", &e)))?;
+            .map_err(|e| {
+                Error::other(format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error_from_error(src_bucket, src_object, "write", &e)
+                ))
+            })?;
 
         let disks = self.get_disks_internal().await;
 
@@ -4215,12 +4198,6 @@ impl StorageAPI for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        // // Guard lock for single object delete-version
-        // let _lock_guard = self
-        //     .fast_lock_manager
-        //     .acquire_write_lock("", object, self.locker_owner.as_str())
-        //     .await
-        //     .map_err(|_| Error::other("can not get lock. please retry".to_string()))?;
         let disks = self.get_disks(0, 0).await?;
         let write_quorum = disks.len() / 2 + 1;
 
@@ -4282,33 +4259,40 @@ impl StorageAPI for SetDisks {
         let mut unique_objects: HashSet<String> = HashSet::new();
         for dobj in &objects {
             if unique_objects.insert(dobj.object_name.clone()) {
-                batch = batch.add_write_lock(bucket, dobj.object_name.clone());
+                batch = batch.add_write_lock(rustfs_lock::ObjectKey::new(bucket, dobj.object_name.clone()));
             }
         }
 
-        let batch_result = self.fast_lock_manager.acquire_locks_batch(batch).await;
-        let locked_objects: HashSet<String> = batch_result
-            .successful_locks
-            .iter()
-            .map(|key| key.object.as_ref().to_string())
-            .collect();
-        let _lock_guards = batch_result.guards;
+        let mut failed_map = HashMap::new();
+        let mut batch_guards = Vec::with_capacity(batch.requests.len());
 
-        let failed_map: HashMap<(String, String), LockResult> = batch_result
-            .failed_locks
-            .into_iter()
-            .map(|(key, err)| ((key.bucket.as_ref().to_string(), key.object.as_ref().to_string()), err))
-            .collect();
+        let mut locked_objects = HashSet::new();
+
+        for req in batch.requests.iter() {
+            let ns_lock = match self.new_ns_lock(req.key.bucket.as_ref(), req.key.object.as_ref()).await {
+                Ok(ns_lock) => ns_lock,
+                Err(e) => {
+                    failed_map.insert((req.key.bucket.as_ref().to_string(), req.key.object.as_ref().to_string()), e.to_string());
+                    continue;
+                }
+            };
+            let _lock_guard = match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+                Ok(lock_guard) => lock_guard,
+                Err(e) => {
+                    failed_map.insert((req.key.bucket.as_ref().to_string(), req.key.object.as_ref().to_string()), e.to_string());
+                    continue;
+                }
+            };
+            batch_guards.push(_lock_guard);
+            locked_objects.insert(req.key.object.as_ref().to_string());
+        }
 
         // Mark failures for objects that could not be locked
         for (i, dobj) in objects.iter().enumerate() {
             if let Some(err) = failed_map.get(&(bucket.to_string(), dobj.object_name.clone())) {
-                let message = self.format_lock_error(bucket, dobj.object_name.as_str(), "write", err);
-                del_errs[i] = Some(Error::other(message));
+                del_errs[i] = Some(Error::other(err.to_string()));
             }
         }
-
-        // let mut del_fvers = Vec::with_capacity(objects.len());
 
         let ver_cfg = BucketVersioningSys::get(bucket).await.unwrap_or_default();
 
@@ -4474,10 +4458,16 @@ impl StorageAPI for SetDisks {
         // Guard lock for single object delete
         let _lock_guard = if !opts.delete_prefix {
             Some(
-                self.fast_lock_manager
-                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                self.new_ns_lock(bucket, object)
+                    .await?
+                    .get_write_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "Failed to acquire write lock: {}",
+                            self.format_lock_error_from_error(bucket, object, "write", &e)
+                        ))
+                    })?,
             )
         } else {
             None
@@ -4490,10 +4480,19 @@ impl StorageAPI for SetDisks {
             return Ok(ObjectInfo::default());
         }
 
-        let (mut goi, write_quorum, gerr) = match self.get_object_info_and_quorum(bucket, object, &opts).await {
-            Ok((oi, wq)) => (oi, wq, None),
-            Err(e) => (ObjectInfo::default(), 0, Some(e)),
-        };
+        // TODO: Lifecycle
+
+        let mut version_found = true;
+        let (mut goi, write_quorum, gerr) = self.get_object_info_and_quorum(bucket, object, &opts).await;
+        if let Some(err) = &gerr
+            && goi.name.is_empty()
+        {
+            if opts.delete_marker {
+                version_found = false;
+            } else {
+                return Err(err.clone());
+            }
+        }
 
         let otd = ObjectToDelete {
             object_name: object.to_string(),
@@ -4504,9 +4503,16 @@ impl StorageAPI for SetDisks {
             ..Default::default()
         };
 
-        let version_found = if opts.delete_marker { gerr.is_none() } else { true };
-
-        let dsc = check_replicate_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await;
+        let dsc = if opts
+            .delete_replication
+            .as_ref()
+            .map(|v| v.replica_status == ReplicationStatusType::Replica)
+            == Some(true)
+        {
+            ReplicateDecision::default()
+        } else {
+            check_replicate_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await
+        };
 
         if dsc.replicate_any() {
             opts.set_delete_replication_state(dsc);
@@ -4530,11 +4536,11 @@ impl StorageAPI for SetDisks {
                 mark_delete = false;
             }
 
-            if opts.version_purge_status() != VersionPurgeStatusType::Complete {
+            if opts.version_purge_status() == VersionPurgeStatusType::Complete {
                 mark_delete = false;
             }
 
-            if version_found && (goi.version_purge_status.is_empty() || !goi.delete_marker) {
+            if version_found && (!goi.version_purge_status.is_empty() || !goi.delete_marker) {
                 delete_marker = false;
             }
         }
@@ -4579,7 +4585,9 @@ impl StorageAPI for SetDisks {
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-            return Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended));
+            let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+            oi.replication_decision = goi.replication_decision;
+            return Ok(oi);
         }
 
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
@@ -4605,7 +4613,9 @@ impl StorageAPI for SetDisks {
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        Ok(ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended))
+        let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
+        obj_info.size = goi.size;
+        Ok(obj_info)
     }
 
     #[tracing::instrument(skip(self))]
@@ -4652,10 +4662,16 @@ impl StorageAPI for SetDisks {
         // Acquire a shared read-lock to protect consistency during info fetch
         let _read_lock_guard = if !opts.no_lock {
             Some(
-                self.fast_lock_manager
-                    .acquire_read_lock(bucket, object, self.locker_owner.as_str())
+                self.new_ns_lock(bucket, object)
+                    .await?
+                    .get_read_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "read", &e)))?,
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "Failed to acquire read lock: {}",
+                            self.format_lock_error_from_error(bucket, object, "read", &e)
+                        ))
+                    })?,
             )
         } else {
             None
@@ -4702,10 +4718,16 @@ impl StorageAPI for SetDisks {
         // Guard lock for metadata update
         let _lock_guard = if !opts.no_lock {
             Some(
-                self.fast_lock_manager
-                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
+                self.new_ns_lock(bucket, object)
+                    .await?
+                    .get_write_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "Failed to acquire write lock: {}",
+                            self.format_lock_error_from_error(bucket, object, "write", &e)
+                        ))
+                    })?,
             )
         } else {
             None
@@ -4714,17 +4736,8 @@ impl StorageAPI for SetDisks {
         let disks = self.get_disks_internal().await;
 
         let (metas, errs) = {
-            if opts.version_id.is_some() {
-                Self::read_all_fileinfo(
-                    &disks,
-                    "",
-                    bucket,
-                    object,
-                    opts.version_id.as_ref().unwrap().to_string().as_str(),
-                    false,
-                    false,
-                )
-                .await?
+            if let Some(version_id) = &opts.version_id {
+                Self::read_all_fileinfo(&disks, "", bucket, object, version_id.to_string().as_str(), false, false).await?
             } else {
                 Self::read_all_xl(&disks, bucket, object, false, false).await
             }
@@ -4826,10 +4839,18 @@ impl StorageAPI for SetDisks {
         // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
         let transition_etag = rustfs_utils::path::trim_etag(&opts.transition.etag);
         let stored_etag = rustfs_utils::path::trim_etag(&get_raw_etag(&fi.metadata));
-        if opts.mod_time.expect("err").unix_timestamp() != fi.mod_time.as_ref().expect("err").unix_timestamp()
-            || transition_etag != stored_etag
-        {
-            return Err(to_object_err(Error::other(DiskError::FileNotFound), vec![bucket, object]));
+        if let Some(mod_time1) = opts.mod_time {
+            if let Some(mod_time2) = fi.mod_time.as_ref() {
+                if mod_time1.unix_timestamp() != mod_time2.unix_timestamp()
+                /*|| transition_etag != stored_etag*/
+                {
+                    return Err(to_object_err(Error::other(DiskError::FileNotFound), vec![bucket, object]));
+                }
+            } else {
+                return Err(Error::other("mod_time 2 error.".to_string()));
+            }
+        } else {
+            return Err(Error::other("mod_time 1 error.".to_string()));
         }
         if fi.transition_status == TRANSITION_COMPLETE {
             return Ok(());
@@ -4908,9 +4929,7 @@ impl StorageAPI for SetDisks {
 
         for disk in disks.iter() {
             if let Some(disk) = disk {
-                if disk.is_online().await {
-                    continue;
-                }
+                continue;
             }
             let _ = self.add_partial(bucket, object, opts.version_id.as_ref().expect("err")).await;
             break;
@@ -4961,8 +4980,10 @@ impl StorageAPI for SetDisks {
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
         let ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
         if oi.parts.len() == 1 {
+            let mut opts = opts.clone();
+            opts.part_number = Some(1);
             let rs: Option<HTTPRangeSpec> = None;
-            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, opts).await;
+            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &opts).await;
             if let Err(err) = gr {
                 return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
             }
@@ -5129,16 +5150,16 @@ impl StorageAPI for SetDisks {
             return Err(Error::other(format!("checksum mismatch: {checksum}")));
         }
 
-        let disks_snapshot = self.get_disks_internal().await;
-        let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
+        let disks = self.get_disks_internal().await;
+        // let (disks, filtered_online) = self.filter_online_disks(disks_snapshot).await;
 
-        if filtered_online < write_quorum {
-            warn!(
-                "online disk snapshot {} below write quorum {} for multipart {}/{}; returning erasure write quorum error",
-                filtered_online, write_quorum, bucket, object
-            );
-            return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
-        }
+        // if filtered_online < write_quorum {
+        //     warn!(
+        //         "online disk snapshot {} below write quorum {} for multipart {}/{}; returning erasure write quorum error",
+        //         filtered_online, write_quorum, bucket, object
+        //     );
+        //     return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
+        // }
 
         let shuffle_disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
@@ -5152,7 +5173,7 @@ impl StorageAPI for SetDisks {
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
             if let Some(disk) = disk_op {
-                let writer = create_bitrot_writer(
+                let writer = match create_bitrot_writer(
                     false,
                     Some(disk),
                     RUSTFS_META_TMP_BUCKET,
@@ -5161,23 +5182,16 @@ impl StorageAPI for SetDisks {
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,
                 )
-                .await?;
-
-                // let writer = {
-                //     let f = match disk
-                //         .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, erasure.shard_file_size(data.content_length))
-                //         .await
-                //     {
-                //         Ok(f) => f,
-                //         Err(e) => {
-                //             errors.push(Some(e));
-                //             writers.push(None);
-                //             continue;
-                //         }
-                //     };
-
-                //     BitrotWriter::new(Writer::from_tokio_writer(f), erasure.shard_size(), HashAlgorithm::HighwayHash256)
-                // };
+                .await
+                {
+                    Ok(writer) => writer,
+                    Err(err) => {
+                        warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                        errors.push(Some(err));
+                        writers.push(None);
+                        continue;
+                    }
+                };
 
                 writers.push(Some(writer));
                 errors.push(None);
@@ -5248,16 +5262,17 @@ impl StorageAPI for SetDisks {
         drop(writers); // drop writers to close all files
 
         let part_path = format!("{}/{}/{}", upload_id_path, fi.data_dir.unwrap_or_default(), part_suffix);
-        let _ = Self::rename_part(
-            &disks,
-            RUSTFS_META_TMP_BUCKET,
-            &tmp_part_path,
-            RUSTFS_META_MULTIPART_BUCKET,
-            &part_path,
-            part_info_buff.into(),
-            write_quorum,
-        )
-        .await?;
+        let _ = self
+            .rename_part(
+                &disks,
+                RUSTFS_META_TMP_BUCKET,
+                &tmp_part_path,
+                RUSTFS_META_MULTIPART_BUCKET,
+                &part_path,
+                part_info_buff.into(),
+                write_quorum,
+            )
+            .await?;
 
         let ret: PartInfo = PartInfo {
             etag: Some(etag.clone()),
@@ -5545,6 +5560,24 @@ impl StorageAPI for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
+        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+            let object_lock_guard = if !opts.no_lock {
+                let ns_lock = self.new_ns_lock(bucket, object).await?;
+                Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                    StorageError::other(format!(
+                        "Failed to acquire write lock: {}",
+                        self.format_lock_error_from_error(bucket, object, "write", &e)
+                    ))
+                })?)
+            } else {
+                None
+            };
+
+            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
+                return Err(err);
+            }
+        }
+
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
@@ -5555,10 +5588,10 @@ impl StorageAPI for SetDisks {
             user_defined.insert("etag".to_owned(), etag.clone());
         }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
-            if sc == storageclass::STANDARD {
-                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
-            }
+        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+            && sc == storageclass::STANDARD
+        {
+            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
         }
 
         let sc_parity_drives = {
@@ -5607,10 +5640,10 @@ impl StorageAPI for SetDisks {
             // TODO: get content-type
         }
 
-        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
-            if sc == storageclass::STANDARD {
-                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
-            }
+        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
+            && sc == storageclass::STANDARD
+        {
+            let _ = user_defined.remove(AMZ_STORAGE_CLASS);
         }
 
         if let Some(checksum) = &opts.want_checksum {
@@ -5700,16 +5733,24 @@ impl StorageAPI for SetDisks {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        let _object_lock_guard = if !opts.no_lock {
-            Some(
-                self.fast_lock_manager
-                    .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-                    .await
-                    .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
-            )
-        } else {
-            None
-        };
+        let mut object_lock_guard = None;
+
+        // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
+        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+            if !opts.no_lock {
+                let ns_lock = self.new_ns_lock(bucket, object).await?;
+                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                    StorageError::other(format!(
+                        "Failed to acquire write lock: {}",
+                        self.format_lock_error_from_error(bucket, object, "write", &e)
+                    ))
+                })?);
+            }
+
+            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
+                return Err(err);
+            }
+        }
 
         let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
@@ -5720,25 +5761,6 @@ impl StorageAPI for SetDisks {
 
         let disks = disks.clone();
         // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
-
-        // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
-            // if !opts.no_lock {
-            //     let guard_opt = self
-            //         .namespace_lock
-            //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-            //         .await?;
-
-            //     if guard_opt.is_none() {
-            //         return Err(Error::other("can not get lock. please retry".to_string()));
-            //     }
-            //     _object_lock_guard = guard_opt;
-            // }
-
-            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
-                return Err(err);
-            }
-        }
 
         let part_path = format!("{}/{}/", upload_id_path, fi.data_dir.unwrap_or(Uuid::nil()));
 
@@ -5763,20 +5785,12 @@ impl StorageAPI for SetDisks {
                 return Err(Error::other("checksum type not found"));
             };
 
-            if opts.want_checksum.is_some()
-                && !opts.want_checksum.as_ref().is_some_and(|v| {
-                    v.checksum_type
-                        .is(rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct))
-                })
-            {
-                return Err(Error::other(format!(
-                    "checksum type mismatch, got {:?}, want {:?}",
-                    opts.want_checksum.as_ref().unwrap(),
-                    rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct)
-                )));
-            }
-
             checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct);
+            if let Some(want) = opts.want_checksum.as_ref()
+                && !want.checksum_type.is(checksum_type)
+            {
+                return Err(Error::other(format!("checksum type mismatch, got {:?}, want {:?}", want, checksum_type)));
+            }
         }
 
         for (i, part) in object_parts.iter().enumerate() {
@@ -5818,17 +5832,20 @@ impl StorageAPI for SetDisks {
             ..Default::default()
         };
 
+        // Build a lookup map for O(1) part resolution instead of O(n) find() in the loop
+        // This optimizes from O(n^2) to O(n) when processing many parts
+        use std::collections::HashMap;
+        let part_lookup: HashMap<usize, &rustfs_filemeta::ObjectPartInfo> =
+            curr_fi.parts.iter().map(|part| (part.number, part)).collect();
+
         for (i, p) in uploaded_parts.iter().enumerate() {
-            let has_part = curr_fi.parts.iter().find(|v| v.number == p.part_num);
-            if has_part.is_none() {
+            let Some(ext_part) = part_lookup.get(&p.part_num) else {
                 error!(
-                    "complete_multipart_upload has_part.is_none() {:?}, part_id={}, bucket={}, object={}",
-                    has_part, p.part_num, bucket, object
+                    "complete_multipart_upload part not found: part_id={}, bucket={}, object={}",
+                    p.part_num, bucket, object
                 );
                 return Err(Error::InvalidPart(p.part_num, "".to_owned(), p.etag.clone().unwrap_or_default()));
-            }
-
-            let ext_part = &curr_fi.parts[i];
+            };
             info!(target:"rustfs_ecstore::set_disk", part_number = p.part_num, part_size = ext_part.size, part_actual_size = ext_part.actual_size, "Completing multipart part");
 
             // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
@@ -5912,14 +5929,14 @@ impl StorageAPI for SetDisks {
                     return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
                 }
 
-                if checksum_type.full_object_requested() {
-                    if let Err(err) = checksum.add_part(&cs, ext_part.actual_size) {
-                        error!(
-                            "complete_multipart_upload checksum add_part failed part_id={}, bucket={}, object={}",
-                            p.part_num, bucket, object
-                        );
-                        return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
-                    }
+                if checksum_type.full_object_requested()
+                    && let Err(err) = checksum.add_part(&cs, ext_part.actual_size)
+                {
+                    error!(
+                        "complete_multipart_upload checksum add_part failed part_id={}, bucket={}, object={}",
+                        p.part_num, bucket, object
+                    );
+                    return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
                 }
 
                 checksum_combined.extend_from_slice(cs.raw.as_slice());
@@ -6059,10 +6076,17 @@ impl StorageAPI for SetDisks {
             }
         }
 
-        {
-            let disks = self.get_disks_internal().await;
-            Self::cleanup_multipart_path(&disks, &parts).await;
+        if !opts.no_lock && object_lock_guard.is_none() {
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                StorageError::other(format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error_from_error(bucket, object, "write", &e)
+                ))
+            })?);
         }
+
+        self.cleanup_multipart_path(&parts).await;
 
         let (online_disks, versions, op_old_dir) = Self::rename_data(
             &shuffle_disks,
@@ -6079,6 +6103,9 @@ impl StorageAPI for SetDisks {
             self.commit_rename_data_dir(&shuffle_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
         }
+
+        drop(object_lock_guard); // drop object lock guard to release the lock
+
         if let Some(versions) = versions {
             let _ =
                 rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
@@ -6099,11 +6126,11 @@ impl StorageAPI for SetDisks {
         });
 
         for (i, op_disk) in online_disks.iter().enumerate() {
-            if let Some(disk) = op_disk {
-                if disk.is_online().await {
-                    fi = parts_metadatas[i].clone();
-                    break;
-                }
+            if let Some(disk) = op_disk
+                && disk.is_online().await
+            {
+                fi = parts_metadatas[i].clone();
+                break;
             }
         }
 
@@ -6145,80 +6172,14 @@ impl StorageAPI for SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        // let mut effective_object = object.to_string();
-        //
-        // // Optimization: Only attempt correction if the name looks suspicious (quotes or URL encoded)
-        // // and the original object does NOT exist.
-        // let has_quotes = (effective_object.starts_with('\'') && effective_object.ends_with('\''))
-        //     || (effective_object.starts_with('"') && effective_object.ends_with('"'));
-        // let has_percent = effective_object.contains('%');
-        //
-        // if has_quotes || has_percent {
-        //     let disks = self.disks.read().await;
-        //     // 1. Check if the original object exists (lightweight check)
-        //     let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, &effective_object, version_id, false, false).await?;
-        //
-        //     if DiskError::is_all_not_found(&errs) {
-        //         // Original not found. Try candidates.
-        //         let mut candidates = Vec::new();
-        //
-        //         // Candidate 1: URL Decoded (Priority for web access issues)
-        //         if has_percent {
-        //             if let Ok(decoded) = urlencoding::decode(&effective_object) {
-        //                 if decoded != effective_object {
-        //                     candidates.push(decoded.to_string());
-        //                 }
-        //             }
-        //         }
-        //
-        //         // Candidate 2: Quote Stripped (For shell copy-paste issues)
-        //         if has_quotes && effective_object.len() >= 2 {
-        //             candidates.push(effective_object[1..effective_object.len() - 1].to_string());
-        //         }
-        //
-        //         // Check candidates
-        //         for candidate in candidates {
-        //             let (_, errs_cand) =
-        //                 Self::read_all_fileinfo(&disks, "", bucket, &candidate, version_id, false, false).await?;
-        //
-        //             if !DiskError::is_all_not_found(&errs_cand) {
-        //                 info!(
-        //                     "Heal request for object '{}' failed (not found). Auto-corrected to '{}'.",
-        //                     effective_object, candidate
-        //                 );
-        //                 effective_object = candidate;
-        //                 break; // Found a match, stop searching
-        //             }
-        //         }
-        //     }
-        // }
-        // let object = effective_object.as_str();
-
         let _write_lock_guard = if !opts.no_lock {
-            let key = rustfs_lock::fast_lock::types::ObjectKey::new(bucket, object);
-            let mut skip_lock = false;
-            if let Some(lock_info) = self.fast_lock_manager.get_lock_info(&key) {
-                if lock_info.owner.as_ref() == self.locker_owner.as_str()
-                    && matches!(lock_info.mode, rustfs_lock::fast_lock::types::LockMode::Exclusive)
-                {
-                    debug!(
-                        "Reusing existing exclusive lock for heal operation on {}/{} held by {}",
-                        bucket, object, self.locker_owner
-                    );
-                    skip_lock = true;
-                }
-            }
-            if skip_lock {
-                None
-            } else {
-                info!(?opts, "Starting heal_object");
-                Some(
-                    self.fast_lock_manager
-                        .acquire_write_lock(bucket, object, self.locker_owner.as_str())
-                        .await
-                        .map_err(|e| Error::other(self.format_lock_error(bucket, object, "write", &e)))?,
-                )
-            }
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                StorageError::other(format!(
+                    "Failed to acquire write lock: {}",
+                    self.format_lock_error_from_error(bucket, object, "write", &e)
+                ))
+            })?)
         } else {
             None
         };
@@ -6313,8 +6274,7 @@ fn is_object_dang_ling(
     meta_arr: &[FileInfo],
     errs: &[Option<DiskError>],
     data_errs_by_part: &HashMap<usize, Vec<usize>>,
-) -> disk::error::Result<FileInfo> {
-    let mut valid_meta = FileInfo::default();
+) -> (FileInfo, bool) {
     let (not_found_meta_errs, non_actionable_meta_errs) = dang_ling_meta_errs_count(errs);
 
     let (mut not_found_parts_errs, mut non_actionable_parts_errs) = (0, 0);
@@ -6326,42 +6286,42 @@ fn is_object_dang_ling(
         }
     });
 
-    meta_arr.iter().for_each(|fi| {
+    let mut valid_meta = FileInfo::default();
+
+    for fi in meta_arr.iter() {
         if fi.is_valid() {
             valid_meta = fi.clone();
+            break;
         }
-    });
+    }
 
     if !valid_meta.is_valid() {
         let data_blocks = meta_arr.len().div_ceil(2);
         if not_found_parts_errs > data_blocks {
-            return Ok(valid_meta);
+            return (valid_meta, true);
         }
 
-        return Err(DiskError::other("not ok"));
+        return (valid_meta, false);
     }
 
     if non_actionable_meta_errs > 0 || non_actionable_parts_errs > 0 {
-        return Err(DiskError::other("not ok"));
+        return (valid_meta, false);
     }
 
     if valid_meta.deleted {
         let data_blocks = errs.len().div_ceil(2);
-        if not_found_meta_errs > data_blocks {
-            return Ok(valid_meta);
-        }
-        return Err(DiskError::other("not ok"));
+        return (valid_meta, not_found_meta_errs > data_blocks);
     }
 
     if not_found_meta_errs > 0 && not_found_meta_errs > valid_meta.erasure.parity_blocks {
-        return Ok(valid_meta);
+        return (valid_meta, true);
     }
 
     if !valid_meta.is_remote() && not_found_parts_errs > 0 && not_found_parts_errs > valid_meta.erasure.parity_blocks {
-        return Ok(valid_meta);
+        return (valid_meta, true);
     }
 
-    Err(DiskError::other("not ok"))
+    (valid_meta, false)
 }
 
 fn dang_ling_meta_errs_count(cerrs: &[Option<DiskError>]) -> (usize, usize) {
@@ -6435,33 +6395,27 @@ fn join_errs(errs: &[Option<DiskError>]) -> String {
 /// It sets partsMetadata and onlineDisks when xl.meta is inexistant/corrupted or outdated.
 /// It also checks if the status of each part (corrupted, missing, ok) in each drive.
 /// Returns (availableDisks, dataErrsByDisk, dataErrsByPart).
+#[allow(clippy::too_many_arguments)]
 async fn disks_with_all_parts(
-    online_disks: &[Option<DiskStore>],
+    online_disks: &mut [Option<DiskStore>],
     parts_metadata: &mut [FileInfo],
     errs: &[Option<DiskError>],
     latest_meta: &FileInfo,
+    filter_by_etag: bool,
     bucket: &str,
     object: &str,
     scan_mode: HealScanMode,
-) -> disk::error::Result<(Vec<Option<DiskStore>>, HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>)> {
+) -> disk::error::Result<(HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>)> {
     let object_name = latest_meta.name.clone();
-    debug!(
-        "disks_with_all_partsv2: starting with object_name={}, online_disks.len()={}, scan_mode={:?}",
-        object_name,
-        online_disks.len(),
-        scan_mode
-    );
-
-    let mut available_disks = vec![None; online_disks.len()];
 
     // Initialize dataErrsByDisk and dataErrsByPart with 0 (CHECK_PART_UNKNOWN) to match Go
     let mut data_errs_by_disk: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..online_disks.len() {
-        data_errs_by_disk.insert(i, vec![CHECK_PART_SUCCESS; latest_meta.parts.len()]);
+        data_errs_by_disk.insert(i, vec![CHECK_PART_UNKNOWN; latest_meta.parts.len()]);
     }
     let mut data_errs_by_part: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..latest_meta.parts.len() {
-        data_errs_by_part.insert(i, vec![CHECK_PART_SUCCESS; online_disks.len()]);
+        data_errs_by_part.insert(i, vec![CHECK_PART_UNKNOWN; online_disks.len()]);
     }
 
     // Check for inconsistent erasure distribution
@@ -6497,49 +6451,63 @@ async fn disks_with_all_parts(
         meta_errs.push(None);
     }
 
+    let online_disks_len = online_disks.len();
+
     // Process meta errors
-    for (index, disk) in online_disks.iter().enumerate() {
+    for (index, disk_op) in online_disks.iter_mut().enumerate() {
         if let Some(err) = &errs[index] {
             meta_errs[index] = Some(err.clone());
             continue;
         }
 
-        let disk = if let Some(disk) = disk {
-            disk
-        } else {
-            meta_errs[index] = Some(DiskError::DiskNotFound);
-            continue;
-        };
-
-        if !disk.is_online().await {
+        if disk_op.is_none() {
             meta_errs[index] = Some(DiskError::DiskNotFound);
             continue;
         }
 
         let meta = &parts_metadata[index];
-        // Check if metadata is corrupted (equivalent to filterByETag=false in Go)
-        let corrupted = !meta.mod_time.eq(&latest_meta.mod_time) || !meta.data_dir.eq(&latest_meta.data_dir);
+
+        let corrupted = if filter_by_etag {
+            latest_meta.get_etag() != meta.get_etag()
+        } else {
+            !meta.mod_time.eq(&latest_meta.mod_time) || !meta.data_dir.eq(&latest_meta.data_dir)
+        };
 
         if corrupted {
+            info!(
+                "disks_with_all_partsv2: metadata is corrupted, object_name={}, index: {index}",
+                object_name
+            );
             meta_errs[index] = Some(DiskError::FileCorrupt);
             parts_metadata[index] = FileInfo::default();
+            *disk_op = None;
+
             continue;
         }
 
         if erasure_distribution_reliable {
             if !meta.is_valid() {
+                info!(
+                    "disks_with_all_partsv2: metadata is not valid, object_name={}, index: {index}",
+                    object_name
+                );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
+                *disk_op = None;
                 continue;
             }
 
-            #[allow(clippy::collapsible_if)]
-            if !meta.deleted && meta.erasure.distribution.len() != online_disks.len() {
+            if !meta.deleted && meta.erasure.distribution.len() != online_disks_len {
                 // Erasure distribution is not the same as onlineDisks
                 // attempt a fix if possible, assuming other entries
                 // might have the right erasure distribution.
+                info!(
+                    "disks_with_all_partsv2: erasure distribution is not the same as onlineDisks, object_name={}, index: {index}",
+                    object_name
+                );
                 parts_metadata[index] = FileInfo::default();
                 meta_errs[index] = Some(DiskError::FileCorrupt);
+                *disk_op = None;
                 continue;
             }
         }
@@ -6550,14 +6518,10 @@ async fn disks_with_all_parts(
         if err.is_some() {
             let part_err = conv_part_err_to_int(err);
             for p in 0..latest_meta.parts.len() {
-                if let Some(vec) = data_errs_by_part.get_mut(&p) {
-                    if index < vec.len() {
-                        info!(
-                            "data_errs_by_part: copy meta errors to part errors: object_name={}, index: {index}, part: {p}, part_err: {part_err}",
-                            object_name
-                        );
-                        vec[index] = part_err;
-                    }
+                if let Some(vec) = data_errs_by_part.get_mut(&p)
+                    && index < vec.len()
+                {
+                    vec[index] = part_err;
                 }
             }
         }
@@ -6596,14 +6560,10 @@ async fn disks_with_all_parts(
                 .await
                 .err();
 
-                if let Some(vec) = data_errs_by_part.get_mut(&0) {
-                    if index < vec.len() {
-                        vec[index] = conv_part_err_to_int(&verify_err.map(|e| e.into()));
-                        info!(
-                            "data_errs_by_part:bitrot check result: object_name={}, index: {index}, result: {}",
-                            object_name, vec[index]
-                        );
-                    }
+                if let Some(vec) = data_errs_by_part.get_mut(&0)
+                    && index < vec.len()
+                {
+                    vec[index] = conv_part_err_to_int(&verify_err.map(|e| e.into()));
                 }
             }
             continue;
@@ -6623,7 +6583,7 @@ async fn disks_with_all_parts(
                     verify_resp = v;
                 }
                 Err(err) => {
-                    warn!("verify_file failed: {err:?}, object_name={}, index: {index}", object_name);
+                    info!("verify_file failed: {err:?}, object_name={}, index: {index}", object_name);
                     verify_err = Some(err);
                 }
             }
@@ -6633,7 +6593,7 @@ async fn disks_with_all_parts(
                     verify_resp = v;
                 }
                 Err(err) => {
-                    warn!("check_parts failed: {err:?}, object_name={}, index: {index}", object_name);
+                    info!("check_parts failed: {err:?}, object_name={}, index: {index}", object_name);
                     verify_err = Some(err);
                 }
             }
@@ -6641,32 +6601,18 @@ async fn disks_with_all_parts(
 
         // Update dataErrsByPart for all parts
         for p in 0..latest_meta.parts.len() {
-            if let Some(vec) = data_errs_by_part.get_mut(&p) {
-                if index < vec.len() {
-                    if verify_err.is_some() {
-                        info!(
-                            "data_errs_by_part: verify_err: object_name={}, index: {index}, part: {p}, verify_err: {verify_err:?}",
-                            object_name
-                        );
-                        vec[index] = conv_part_err_to_int(&verify_err.clone());
+            if let Some(vec) = data_errs_by_part.get_mut(&p)
+                && index < vec.len()
+            {
+                if verify_err.is_some() {
+                    vec[index] = conv_part_err_to_int(&verify_err.clone());
+                } else {
+                    // Fix: verify_resp.results length is based on meta.parts, not latest_meta.parts
+                    // We need to check bounds to avoid panic
+                    if p < verify_resp.results.len() {
+                        vec[index] = verify_resp.results[p];
                     } else {
-                        // Fix: verify_resp.results length is based on meta.parts, not latest_meta.parts
-                        // We need to check bounds to avoid panic
-                        if p < verify_resp.results.len() {
-                            info!(
-                                "data_errs_by_part: update data_errs_by_part: object_name={}, index: {}, part: {}, verify_resp.results: {:?}",
-                                object_name, index, p, verify_resp.results[p]
-                            );
-                            vec[index] = verify_resp.results[p];
-                        } else {
-                            debug!(
-                                "data_errs_by_part: verify_resp.results length mismatch: expected at least {}, got {}, object_name={}, index: {index}, part: {p}",
-                                p + 1,
-                                verify_resp.results.len(),
-                                object_name
-                            );
-                            vec[index] = CHECK_PART_SUCCESS;
-                        }
+                        vec[index] = CHECK_PART_SUCCESS;
                     }
                 }
             }
@@ -6675,48 +6621,16 @@ async fn disks_with_all_parts(
 
     // Build dataErrsByDisk from dataErrsByPart
     for (part, disks) in data_errs_by_part.iter() {
-        for (disk_idx, disk_err) in disks.iter().enumerate() {
-            if let Some(vec) = data_errs_by_disk.get_mut(&disk_idx) {
-                if *part < vec.len() {
-                    vec[*part] = *disk_err;
-                    info!(
-                        "data_errs_by_disk: update data_errs_by_disk: object_name={}, part: {part}, disk_idx: {disk_idx}, disk_err: {disk_err}",
-                        object_name,
-                    );
-                }
+        for disk_idx in disks.iter() {
+            if let Some(parts) = data_errs_by_disk.get_mut(disk_idx)
+                && *part < parts.len()
+            {
+                parts[*part] = disks[*disk_idx];
             }
         }
     }
 
-    // Calculate available_disks based on meta_errs and data_errs_by_disk
-    for (i, disk) in online_disks.iter().enumerate() {
-        if let Some(disk_errs) = data_errs_by_disk.get(&i) {
-            if meta_errs[i].is_none() && disk.is_some() && !has_part_err(disk_errs) {
-                available_disks[i] = Some(disk.clone().unwrap());
-            } else {
-                warn!(
-                    "disks_with_all_partsv2: disk is not available, object_name={}, index: {}, meta_errs={:?}, disk_errs={:?}, disk_is_some={:?}",
-                    object_name,
-                    i,
-                    meta_errs[i],
-                    disk_errs,
-                    disk.is_some(),
-                );
-                parts_metadata[i] = FileInfo::default();
-            }
-        } else {
-            warn!(
-                "disks_with_all_partsv2: data_errs_by_disk missing entry for  object_name={},index {}, meta_errs={:?}, disk_is_some={:?}",
-                object_name,
-                i,
-                meta_errs[i],
-                disk.is_some(),
-            );
-            parts_metadata[i] = FileInfo::default();
-        }
-    }
-
-    Ok((available_disks, data_errs_by_disk, data_errs_by_part))
+    Ok((data_errs_by_disk, data_errs_by_part))
 }
 
 pub fn should_heal_object_on_disk(
@@ -6724,30 +6638,34 @@ pub fn should_heal_object_on_disk(
     parts_errs: &[usize],
     meta: &FileInfo,
     latest_meta: &FileInfo,
-) -> (bool, Option<DiskError>) {
-    if let Some(err) = err {
-        if err == &DiskError::FileNotFound || err == &DiskError::FileVersionNotFound || err == &DiskError::FileCorrupt {
-            return (true, Some(err.clone()));
-        }
+) -> (bool, bool, Option<DiskError>) {
+    if let Some(err) = err
+        && (err == &DiskError::FileNotFound || err == &DiskError::FileVersionNotFound || err == &DiskError::FileCorrupt)
+    {
+        return (true, true, Some(err.clone()));
     }
 
-    if latest_meta.volume != meta.volume
-        || latest_meta.name != meta.name
-        || latest_meta.version_id != meta.version_id
-        || latest_meta.deleted != meta.deleted
-    {
-        info!("latest_meta not Eq meta, latest_meta: {:?}, meta: {:?}", latest_meta, meta);
-        return (true, Some(DiskError::OutdatedXLMeta));
+    if err.is_some() {
+        return (false, false, err.clone());
     }
+
+    if !meta.equals(latest_meta) {
+        warn!(
+            "should_heal_object_on_disk: metadata is outdated, object_name={}, meta: {:?}, latest_meta: {:?}",
+            meta.name, meta, latest_meta
+        );
+        return (true, true, Some(DiskError::OutdatedXLMeta));
+    }
+
     if !meta.deleted && !meta.is_remote() {
         let err_vec = [CHECK_PART_FILE_NOT_FOUND, CHECK_PART_FILE_CORRUPT];
         for part_err in parts_errs.iter() {
             if err_vec.contains(part_err) {
-                return (true, Some(DiskError::PartMissingOrCorrupt));
+                return (true, false, Some(DiskError::PartMissingOrCorrupt));
             }
         }
     }
-    (false, err.clone())
+    (false, false, None)
 }
 
 async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<rustfs_madmin::Disk> {
@@ -6769,7 +6687,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                     healing: res.healing,
                     scanning: res.scanning,
 
-                    uuid: res.id.clone(),
+                    uuid: res.id.map_or("".to_string(), |id| id.to_string()),
                     major: res.major as u32,
                     minor: res.minor as u32,
                     model: None,
@@ -6813,13 +6731,30 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
     ret
 }
 async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rustfs_madmin::StorageInfo {
+    // let mut disks = get_disks_info(disks, eps).await;
+    // disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
+    //
+    // rustfs_madmin::StorageInfo {
+    //     disks,
+    //     backend: rustfs_madmin::BackendInfo {
+    //         backend_type: rustfs_madmin::BackendByte::Erasure,
+    //         ..Default::default()
+    //     },
+    // }
     let mut disks = get_disks_info(disks, eps).await;
     disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
+
+    // Provide minimal backend shape for callers. Do NOT guess parity here since it belongs to higher-level config.
+    // Missing/empty standard_sc_data will be handled by capacity fallback logic.
+    let drives_per_set = vec![eps.len()];
+    let total_sets = vec![1];
 
     rustfs_madmin::StorageInfo {
         disks,
         backend: rustfs_madmin::BackendInfo {
             backend_type: rustfs_madmin::BackendByte::Erasure,
+            drives_per_set,
+            total_sets,
             ..Default::default()
         },
     }
@@ -6893,15 +6828,15 @@ pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
 pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
     match &oi.etag {
         Some(etag) => {
-            if let Some(if_none_match) = if_none_match {
-                if e_tag_matches(etag, &if_none_match) {
-                    return true;
-                }
+            if let Some(if_none_match) = if_none_match
+                && e_tag_matches(etag, &if_none_match)
+            {
+                return true;
             }
-            if let Some(if_match) = if_match {
-                if !e_tag_matches(etag, &if_match) {
-                    return true;
-                }
+            if let Some(if_match) = if_match
+                && !e_tag_matches(etag, &if_match)
+            {
+                return true;
             }
             false
         }
@@ -7284,15 +7219,15 @@ mod tests {
 
         // Test with file not found error
         let err = Some(DiskError::FileNotFound);
-        let (should_heal, _) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
+        let (should_heal, _, _) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
         assert!(should_heal);
 
         // Test with no error and no part errors
-        let (should_heal, _) = should_heal_object_on_disk(&None, &[CHECK_PART_SUCCESS], &meta, &latest_meta);
+        let (should_heal, _, _) = should_heal_object_on_disk(&None, &[CHECK_PART_SUCCESS], &meta, &latest_meta);
         assert!(!should_heal);
 
         // Test with part corruption
-        let (should_heal, _) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
+        let (should_heal, _, _) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
         assert!(should_heal);
     }
 

@@ -39,7 +39,6 @@ use crate::tier::{
     tier_config::TierS3,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
 };
-use rustfs_utils::path::SLASH_SEPARATOR;
 
 pub struct WarmBackendS3 {
     pub client: Arc<Client>,

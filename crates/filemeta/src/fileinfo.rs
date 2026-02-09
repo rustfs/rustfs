@@ -22,6 +22,7 @@ use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{format_description::FormatItem, macros::format_description};
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
@@ -36,6 +37,9 @@ pub const TIER_FV_MARKER: &str = "tier-free-marker";
 pub const TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
 
 const ERR_RESTORE_HDR_MALFORMED: &str = "x-amz-restore header malformed";
+
+const RFC1123: &[FormatItem<'_>] =
+    format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
@@ -169,12 +173,31 @@ impl ErasureInfo {
 
     /// Check if this ErasureInfo equals another ErasureInfo
     pub fn equals(&self, other: &ErasureInfo) -> bool {
-        self.algorithm == other.algorithm
-            && self.data_blocks == other.data_blocks
-            && self.parity_blocks == other.parity_blocks
-            && self.block_size == other.block_size
-            && self.index == other.index
-            && self.distribution == other.distribution
+        if self.algorithm != other.algorithm {
+            return false;
+        }
+
+        if self.data_blocks != other.data_blocks {
+            return false;
+        }
+
+        if self.parity_blocks != other.parity_blocks {
+            return false;
+        }
+
+        if self.block_size != other.block_size {
+            return false;
+        }
+
+        if self.distribution.len() != other.distribution.len() {
+            return false;
+        }
+        for (i, v) in self.distribution.iter().enumerate() {
+            if v != &other.distribution[i] {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -438,21 +461,28 @@ impl FileInfo {
     pub fn equals(&self, other: &FileInfo) -> bool {
         // Check if both are compressed or both are not compressed
         if self.is_compressed() != other.is_compressed() {
+            tracing::warn!("equals: is_compressed is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check transition info
         if !self.transition_info_equals(other) {
+            tracing::warn!("equals: transition_info_equals is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check mod time
         if self.mod_time != other.mod_time {
+            tracing::warn!("equals: mod_time is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check erasure info
-        self.erasure.equals(&other.erasure)
+        if !self.erasure.equals(&other.erasure) {
+            tracing::warn!("equals: erasure is not equal, object_name={}", self.name);
+            return false;
+        }
+        true
     }
 
     /// Check if transition related information are equal
@@ -505,6 +535,10 @@ impl FileInfo {
             ReplicationStatusType::Empty
         }
     }
+
+    pub fn shard_file_size(&self, total_length: i64) -> i64 {
+        self.erasure.shard_file_size(total_length)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -550,6 +584,7 @@ pub trait RestoreStatusOps {
     fn on_going(&self) -> bool;
     fn on_disk(&self) -> bool;
     fn to_string(&self) -> String;
+    fn to_string2(&self) -> String;
 }
 
 impl RestoreStatusOps for RestoreStatus {
@@ -588,9 +623,21 @@ impl RestoreStatusOps for RestoreStatus {
                 .unwrap()
         )
     }
+
+    fn to_string2(&self) -> String {
+        if self.on_going() {
+            return "ongoing-request=\"true\"".to_string();
+        }
+        format!(
+            "ongoing-request=\"false\", expiry-date=\"{}\"",
+            OffsetDateTime::from(self.restore_expiry_date.clone().unwrap())
+                .format(&RFC1123)
+                .unwrap()
+        )
+    }
 }
 
-fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
+pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
     let tokens: Vec<&str> = restore_hdr.splitn(2, ",").collect();
     let progress_tokens: Vec<&str> = tokens[0].splitn(2, "=").collect();
     if progress_tokens.len() != 2 {
@@ -620,10 +667,8 @@ fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
             if expiry_tokens[0].trim() != "expiry-date" {
                 return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
             }
-            let expiry = OffsetDateTime::parse(expiry_tokens[1].trim_matches('"'), &Rfc3339).unwrap();
-            /*if err != nil {
-                return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
-            }*/
+            let expiry = OffsetDateTime::parse(expiry_tokens[1].trim_matches('"'), &Rfc3339)
+                .map_err(|_| Error::other(ERR_RESTORE_HDR_MALFORMED))?;
             return Ok(RestoreStatus {
                 is_restore_in_progress: Some(false),
                 restore_expiry_date: Some(Timestamp::from(expiry)),
@@ -635,10 +680,10 @@ fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
 }
 
 pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
-    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str()) {
-        if let Ok(restore_status) = parse_restore_obj_status(restore_hdr) {
-            return restore_status.on_disk();
-        }
+    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str())
+        && let Ok(restore_status) = parse_restore_obj_status(restore_hdr)
+    {
+        return restore_status.on_disk();
     }
     false
 }

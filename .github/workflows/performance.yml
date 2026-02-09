@@ -40,7 +40,7 @@ env:
 jobs:
   performance-profile:
     name: Performance Profiling
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -107,7 +107,7 @@ jobs:
 
       - name: Upload profile data
         if: steps.profiling.outputs.profile_generated == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: performance-profile-${{ github.run_number }}
           path: samply-profile.json
@@ -115,7 +115,7 @@ jobs:
 
   benchmark:
     name: Benchmark Tests
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -135,7 +135,7 @@ jobs:
           tee benchmark-results.json
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results-${{ github.run_number }}
           path: benchmark-results.json

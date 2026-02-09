@@ -13,14 +13,19 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys;
+use crate::disk::error::DiskError;
 use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
-use crate::disk::{DiskAPI, DiskStore};
+use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
+use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
-    disk::{self, VolumeInfo},
+    disk::{
+        self, VolumeInfo,
+        disk_store::{CHECK_EVERY, CHECK_TIMEOUT_DURATION, DiskHealthTracker},
+    },
     endpoints::{EndpointServerPools, Node},
     store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
 };
@@ -28,14 +33,17 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use rustfs_common::heal_channel::{DriveState, HealItemType, HealOpts, RUSTFS_RESERVED_BUCKET};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_protos::node_service_time_out_client;
+use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_protos::proto_gen::node_service::{
     DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
 };
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
-use tokio::sync::RwLock;
+use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
+use tokio::{net::TcpStream, sync::RwLock, time};
+use tokio_util::sync::CancellationToken;
 use tonic::Request;
-use tracing::info;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
+use tracing::{debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
 
@@ -96,10 +104,10 @@ impl S3PeerSys {
         for pool_idx in 0..self.pools_count {
             let mut per_pool_errs = vec![None; self.clients.len()];
             for (i, client) in self.clients.iter().enumerate() {
-                if let Some(v) = client.get_pools() {
-                    if v.contains(&pool_idx) {
-                        per_pool_errs[i] = errs[i].clone();
-                    }
+                if let Some(v) = client.get_pools()
+                    && v.contains(&pool_idx)
+                {
+                    per_pool_errs[i] = errs[i].clone();
                 }
             }
             let qu = per_pool_errs.len() / 2;
@@ -131,10 +139,10 @@ impl S3PeerSys {
         for pool_idx in 0..self.pools_count {
             let mut per_pool_errs = vec![None; self.clients.len()];
             for (i, client) in self.clients.iter().enumerate() {
-                if let Some(v) = client.get_pools() {
-                    if v.contains(&pool_idx) {
-                        per_pool_errs[i] = errs[i].clone();
-                    }
+                if let Some(v) = client.get_pools()
+                    && v.contains(&pool_idx)
+                {
+                    per_pool_errs[i] = errs[i].clone();
                 }
             }
             let qu = per_pool_errs.len() / 2;
@@ -559,15 +567,165 @@ pub struct RemotePeerS3Client {
     pub node: Option<Node>,
     pub pools: Option<Vec<usize>>,
     addr: String,
+    /// Health tracker for connection monitoring
+    health: Arc<DiskHealthTracker>,
+    /// Cancellation token for monitoring tasks
+    cancel_token: CancellationToken,
 }
 
 impl RemotePeerS3Client {
     pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
         let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default().to_string();
-        Self { node, pools, addr }
+        let client = Self {
+            node,
+            pools,
+            addr,
+            health: Arc::new(DiskHealthTracker::new()),
+            cancel_token: CancellationToken::new(),
+        };
+
+        // Start health monitoring
+        client.start_health_monitoring();
+
+        client
     }
+
+    pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+            .await
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))
+    }
+
     pub fn get_addr(&self) -> String {
         self.addr.clone()
+    }
+
+    /// Start health monitoring for the remote peer
+    fn start_health_monitoring(&self) {
+        let health = Arc::clone(&self.health);
+        let cancel_token = self.cancel_token.clone();
+        let addr = self.addr.clone();
+
+        tokio::spawn(async move {
+            Self::monitor_remote_peer_health(addr, health, cancel_token).await;
+        });
+    }
+
+    /// Monitor remote peer health periodically
+    async fn monitor_remote_peer_health(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
+        let mut interval = time::interval(CHECK_EVERY);
+
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    debug!("Health monitoring cancelled for remote peer: {}", addr);
+                    return;
+                }
+                _ = interval.tick() => {
+                    if cancel_token.is_cancelled() {
+                        return;
+                    }
+
+                    // Skip health check if peer is already marked as faulty
+                    if health.is_faulty() {
+                        continue;
+                    }
+
+                    // Perform basic connectivity check
+                    if Self::perform_connectivity_check(&addr).await.is_err() && health.swap_ok_to_faulty() {
+                        warn!("Remote peer health check failed for {}: marking as faulty", addr);
+
+                        // Start recovery monitoring
+                        let health_clone = Arc::clone(&health);
+                        let addr_clone = addr.clone();
+                        let cancel_clone = cancel_token.clone();
+
+                        tokio::spawn(async move {
+                            Self::monitor_remote_peer_recovery(addr_clone, health_clone, cancel_clone).await;
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Monitor remote peer recovery and mark as healthy when recovered
+    async fn monitor_remote_peer_recovery(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
+        let mut interval = time::interval(Duration::from_secs(5)); // Check every 5 seconds
+
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    return;
+                }
+                _ = interval.tick() => {
+                    if Self::perform_connectivity_check(&addr).await.is_ok() {
+                        info!("Remote peer recovered: {}", addr);
+                        health.set_ok();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Perform basic connectivity check for remote peer
+    async fn perform_connectivity_check(addr: &str) -> Result<()> {
+        use tokio::time::timeout;
+
+        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {e}")))?;
+
+        let Some(host) = url.host_str() else {
+            return Err(Error::other("No host in URL".to_string()));
+        };
+
+        let port = url.port_or_known_default().unwrap_or(80);
+
+        // Try to establish TCP connection
+        match timeout(CHECK_TIMEOUT_DURATION, TcpStream::connect((host, port))).await {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
+        }
+    }
+
+    /// Execute operation with timeout and health tracking
+    async fn execute_with_timeout<T, F, Fut>(&self, operation: F, timeout_duration: Duration) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        // Check if peer is faulty
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+
+        // Record operation start
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        self.health.last_started.store(now, std::sync::atomic::Ordering::Relaxed);
+        self.health.increment_waiting();
+
+        // Execute operation with timeout
+        let result = time::timeout(timeout_duration, operation()).await;
+
+        match result {
+            Ok(operation_result) => {
+                // Log success and decrement waiting counter
+                if operation_result.is_ok() {
+                    self.health.log_success();
+                }
+                self.health.decrement_waiting();
+                operation_result
+            }
+            Err(_) => {
+                // Timeout occurred, mark peer as potentially faulty
+                self.health.decrement_waiting();
+                warn!("Remote peer operation timeout after {:?}", timeout_duration);
+                Err(Error::other(format!("Remote peer operation timeout after {timeout_duration:?}")))
+            }
+        }
     }
 }
 
@@ -578,115 +736,135 @@ impl PeerS3Client for RemotePeerS3Client {
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
-        let options: String = serde_json::to_string(opts)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(HealBucketRequest {
-            bucket: bucket.to_string(),
-            options,
-        });
-        let response = client.heal_bucket(request).await?.into_inner();
-        if !response.success {
-            return if let Some(err) = response.error {
-                Err(err.into())
-            } else {
-                Err(Error::other(""))
-            };
-        }
+        self.execute_with_timeout(
+            || async {
+                let options: String = serde_json::to_string(opts)?;
+                let mut client = self.get_client().await?;
+                let request = Request::new(HealBucketRequest {
+                    bucket: bucket.to_string(),
+                    options,
+                });
+                let response = client.heal_bucket(request).await?.into_inner();
+                if !response.success {
+                    return if let Some(err) = response.error {
+                        Err(err.into())
+                    } else {
+                        Err(Error::other(""))
+                    };
+                }
 
-        Ok(HealResultItem {
-            heal_item_type: HealItemType::Bucket.to_string(),
-            bucket: bucket.to_string(),
-            set_count: 0,
-            ..Default::default()
-        })
+                Ok(HealResultItem {
+                    heal_item_type: HealItemType::Bucket.to_string(),
+                    bucket: bucket.to_string(),
+                    set_count: 0,
+                    ..Default::default()
+                })
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
-        let options = serde_json::to_string(opts)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(ListBucketRequest { options });
-        let response = client.list_bucket(request).await?.into_inner();
-        if !response.success {
-            return if let Some(err) = response.error {
-                Err(err.into())
-            } else {
-                Err(Error::other(""))
-            };
-        }
-        let bucket_infos = response
-            .bucket_infos
-            .into_iter()
-            .filter_map(|json_str| serde_json::from_str::<BucketInfo>(&json_str).ok())
-            .collect();
+        self.execute_with_timeout(
+            || async {
+                let options = serde_json::to_string(opts)?;
+                let mut client = self.get_client().await?;
+                let request = Request::new(ListBucketRequest { options });
+                let response = client.list_bucket(request).await?.into_inner();
+                if !response.success {
+                    return if let Some(err) = response.error {
+                        Err(err.into())
+                    } else {
+                        Err(Error::other(""))
+                    };
+                }
+                let bucket_infos = response
+                    .bucket_infos
+                    .into_iter()
+                    .filter_map(|json_str| serde_json::from_str::<BucketInfo>(&json_str).ok())
+                    .collect();
 
-        Ok(bucket_infos)
+                Ok(bucket_infos)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        let options = serde_json::to_string(opts)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(MakeBucketRequest {
-            name: bucket.to_string(),
-            options,
-        });
-        let response = client.make_bucket(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let options = serde_json::to_string(opts)?;
+                let mut client = self.get_client().await?;
+                let request = Request::new(MakeBucketRequest {
+                    name: bucket.to_string(),
+                    options,
+                });
+                let response = client.make_bucket(request).await?.into_inner();
 
-        // TODO: deal with error
-        if !response.success {
-            return if let Some(err) = response.error {
-                Err(err.into())
-            } else {
-                Err(Error::other(""))
-            };
-        }
+                // TODO: deal with error
+                if !response.success {
+                    return if let Some(err) = response.error {
+                        Err(err.into())
+                    } else {
+                        Err(Error::other(""))
+                    };
+                }
 
-        Ok(())
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
-        let options = serde_json::to_string(opts)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(GetBucketInfoRequest {
-            bucket: bucket.to_string(),
-            options,
-        });
-        let response = client.get_bucket_info(request).await?.into_inner();
-        if !response.success {
-            return if let Some(err) = response.error {
-                Err(err.into())
-            } else {
-                Err(Error::other(""))
-            };
-        }
-        let bucket_info = serde_json::from_str::<BucketInfo>(&response.bucket_info)?;
+        self.execute_with_timeout(
+            || async {
+                let options = serde_json::to_string(opts)?;
+                let mut client = self.get_client().await?;
+                let request = Request::new(GetBucketInfoRequest {
+                    bucket: bucket.to_string(),
+                    options,
+                });
+                let response = client.get_bucket_info(request).await?.into_inner();
+                if !response.success {
+                    return if let Some(err) = response.error {
+                        Err(err.into())
+                    } else {
+                        Err(Error::other(""))
+                    };
+                }
+                let bucket_info = serde_json::from_str::<BucketInfo>(&response.bucket_info)?;
 
-        Ok(bucket_info)
+                Ok(bucket_info)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+        self.execute_with_timeout(
+            || async {
+                let mut client = self.get_client().await?;
 
-        let request = Request::new(DeleteBucketRequest {
-            bucket: bucket.to_string(),
-        });
-        let response = client.delete_bucket(request).await?.into_inner();
-        if !response.success {
-            return if let Some(err) = response.error {
-                Err(err.into())
-            } else {
-                Err(Error::other(""))
-            };
-        }
+                let request = Request::new(DeleteBucketRequest {
+                    bucket: bucket.to_string(),
+                });
+                let response = client.delete_bucket(request).await?.into_inner();
+                if !response.success {
+                    return if let Some(err) = response.error {
+                        Err(err.into())
+                    } else {
+                        Err(Error::other(""))
+                    };
+                }
 
-        Ok(())
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 }
 

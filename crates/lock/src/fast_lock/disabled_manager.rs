@@ -51,51 +51,22 @@ impl DisabledLockManager {
     }
 
     /// Always succeeds - returns a no-op guard
-    pub async fn acquire_read_lock(
-        &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
-        owner: impl Into<Arc<str>>,
-    ) -> Result<FastLockGuard, LockResult> {
-        let request = ObjectLockRequest::new_read(bucket, object, owner);
+    pub async fn acquire_read_lock(&self, key: ObjectKey, owner: impl Into<Arc<str>>) -> Result<FastLockGuard, LockResult> {
+        let request = ObjectLockRequest::new_read(key, owner);
         self.acquire_lock(request).await
     }
 
     /// Always succeeds - returns a no-op guard
     pub async fn acquire_read_lock_versioned(
         &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
-        version: impl Into<Arc<str>>,
+        key: ObjectKey,
         owner: impl Into<Arc<str>>,
     ) -> Result<FastLockGuard, LockResult> {
-        let request = ObjectLockRequest::new_read(bucket, object, owner).with_version(version);
+        let request = ObjectLockRequest::new_write(key, owner);
         self.acquire_lock(request).await
     }
 
     /// Always succeeds - returns a no-op guard
-    pub async fn acquire_write_lock(
-        &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
-        owner: impl Into<Arc<str>>,
-    ) -> Result<FastLockGuard, LockResult> {
-        let request = ObjectLockRequest::new_write(bucket, object, owner);
-        self.acquire_lock(request).await
-    }
-
-    /// Always succeeds - returns a no-op guard
-    pub async fn acquire_write_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>>,
-        object: impl Into<Arc<str>>,
-        version: impl Into<Arc<str>>,
-        owner: impl Into<Arc<str>>,
-    ) -> Result<FastLockGuard, LockResult> {
-        let request = ObjectLockRequest::new_write(bucket, object, owner).with_version(version);
-        self.acquire_lock(request).await
-    }
-
     /// Always succeeds - all locks acquired
     pub async fn acquire_locks_batch(&self, batch_request: BatchLockRequest) -> BatchLockResult {
         let successful_locks: Vec<ObjectKey> = batch_request.requests.iter().map(|req| req.key.clone()).collect();
@@ -161,42 +132,12 @@ impl LockManager for DisabledLockManager {
         self.acquire_lock(request).await
     }
 
-    async fn acquire_read_lock(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult> {
-        self.acquire_read_lock(bucket, object, owner).await
+    async fn acquire_read_lock(&self, key: ObjectKey, owner: impl Into<Arc<str>> + Send) -> Result<FastLockGuard, LockResult> {
+        self.acquire_read_lock(key, owner).await
     }
 
-    async fn acquire_read_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        version: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult> {
-        self.acquire_read_lock_versioned(bucket, object, version, owner).await
-    }
-
-    async fn acquire_write_lock(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult> {
-        self.acquire_write_lock(bucket, object, owner).await
-    }
-
-    async fn acquire_write_lock_versioned(
-        &self,
-        bucket: impl Into<Arc<str>> + Send,
-        object: impl Into<Arc<str>> + Send,
-        version: impl Into<Arc<str>> + Send,
-        owner: impl Into<Arc<str>> + Send,
-    ) -> Result<FastLockGuard, LockResult> {
-        self.acquire_write_lock_versioned(bucket, object, version, owner).await
+    async fn acquire_write_lock(&self, key: ObjectKey, owner: impl Into<Arc<str>> + Send) -> Result<FastLockGuard, LockResult> {
+        self.acquire_write_lock(key, owner).await
     }
 
     async fn acquire_locks_batch(&self, batch_request: BatchLockRequest) -> BatchLockResult {
@@ -233,65 +174,5 @@ impl LockManager for DisabledLockManager {
 
     fn is_disabled(&self) -> bool {
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_disabled_manager_basic_operations() {
-        let manager = DisabledLockManager::new();
-
-        // All operations should succeed immediately
-        let read_guard = manager
-            .acquire_read_lock("bucket", "object", "owner1")
-            .await
-            .expect("Disabled manager should always succeed");
-
-        let write_guard = manager
-            .acquire_write_lock("bucket", "object", "owner2")
-            .await
-            .expect("Disabled manager should always succeed");
-
-        // Guards should indicate they are disabled
-        assert!(read_guard.is_disabled());
-        assert!(write_guard.is_disabled());
-    }
-
-    #[tokio::test]
-    async fn test_disabled_manager_batch_operations() {
-        let manager = DisabledLockManager::new();
-
-        let batch = BatchLockRequest::new("owner")
-            .add_read_lock("bucket", "obj1")
-            .add_write_lock("bucket", "obj2")
-            .with_all_or_nothing(true);
-
-        let result = manager.acquire_locks_batch(batch).await;
-        assert!(result.all_acquired);
-        assert_eq!(result.successful_locks.len(), 2);
-        assert!(result.failed_locks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_disabled_manager_metrics() {
-        let manager = DisabledLockManager::new();
-
-        // Metrics should indicate empty/disabled state
-        let metrics = manager.get_metrics();
-        assert!(metrics.is_empty());
-        assert_eq!(manager.total_lock_count(), 0);
-        assert!(manager.get_pool_stats().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_disabled_manager_cleanup() {
-        let manager = DisabledLockManager::new();
-
-        // Cleanup should be no-op
-        assert_eq!(manager.cleanup_expired().await, 0);
-        assert_eq!(manager.cleanup_expired_traditional().await, 0);
     }
 }

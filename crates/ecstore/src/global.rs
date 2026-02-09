@@ -21,7 +21,7 @@ use crate::{
     tier::tier::TierConfigMgr,
 };
 use lazy_static::lazy_static;
-use rustfs_policy::auth::Credentials;
+use rustfs_lock::client::LockClient;
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
@@ -56,53 +56,12 @@ lazy_static! {
     pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
     pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
     pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
+    pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn rustfs_lock::client::LockClient>> = OnceLock::new();
+    pub static ref GLOBAL_LOCK_CLIENTS: OnceLock<HashMap<String, Arc<dyn LockClient>>> = OnceLock::new();
 }
 
 /// Global cancellation token for background services (data scanner and auto heal)
 static GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
-
-/// Global active credentials
-static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
-
-/// Initialize the global action credentials
-///
-/// # Arguments
-/// * `ak` - Optional access key
-/// * `sk` - Optional secret key
-///
-/// # Returns
-/// * None
-///
-pub fn init_global_action_credentials(ak: Option<String>, sk: Option<String>) {
-    let ak = {
-        if let Some(k) = ak {
-            k
-        } else {
-            rustfs_utils::string::gen_access_key(20).unwrap_or_default()
-        }
-    };
-
-    let sk = {
-        if let Some(k) = sk {
-            k
-        } else {
-            rustfs_utils::string::gen_secret_key(32).unwrap_or_default()
-        }
-    };
-
-    GLOBAL_ACTIVE_CRED
-        .set(Credentials {
-            access_key: ak,
-            secret_key: sk,
-            ..Default::default()
-        })
-        .unwrap();
-}
-
-/// Get the global action credentials
-pub fn get_global_action_cred() -> Option<Credentials> {
-    GLOBAL_ACTIVE_CRED.get().cloned()
-}
 
 /// Get the global rustfs port
 ///
@@ -318,4 +277,52 @@ pub fn shutdown_background_services() {
     if let Some(cancel_token) = GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN.get() {
         cancel_token.cancel();
     }
+}
+
+/// Set the global lock client (first LocalClient created)
+///
+/// # Arguments
+/// * `client` - The LockClient instance to set globally
+///
+/// # Returns
+/// * `Ok(())` if successful
+/// * `Err(Arc<dyn LockClient>)` if setting fails (client already set)
+///
+pub fn set_global_lock_client(
+    client: Arc<dyn rustfs_lock::client::LockClient>,
+) -> Result<(), Arc<dyn rustfs_lock::client::LockClient>> {
+    GLOBAL_LOCAL_LOCK_CLIENT.set(client)
+}
+
+/// Get the global lock client
+///
+/// # Returns
+/// * `Option<Arc<dyn LockClient>>` - The global lock client, if set
+///
+pub fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
+    GLOBAL_LOCAL_LOCK_CLIENT.get().cloned()
+}
+
+/// Set the global lock clients map
+///
+/// # Arguments
+/// * `clients` - The HashMap of lock clients to set globally
+///
+/// # Returns
+/// * `Ok(())` if successful
+/// * `Err(HashMap<String, Arc<dyn LockClient>>)` if setting fails (clients already set)
+///
+pub fn set_global_lock_clients(
+    clients: HashMap<String, Arc<dyn LockClient>>,
+) -> Result<(), HashMap<String, Arc<dyn LockClient>>> {
+    GLOBAL_LOCK_CLIENTS.set(clients)
+}
+
+/// Get the global lock clients map
+///
+/// # Returns
+/// * `Option<&HashMap<String, Arc<dyn LockClient>>>` - The global lock clients map, if set
+///
+pub fn get_global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
+    GLOBAL_LOCK_CLIENTS.get()
 }

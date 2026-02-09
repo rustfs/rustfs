@@ -18,12 +18,11 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use http::StatusCode;
+use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde::{de::Deserializer, ser::Serializer};
 use std::fmt::Display;
 
-use s3s::Body;
 use s3s::S3ErrorCode;
 
 const _REPORT_ISSUE: &str = "Please report this issue at https://github.com/rustfs/rustfs/issues.";
@@ -95,20 +94,31 @@ pub fn to_error_response(err: &std::io::Error) -> ErrorResponse {
 }
 
 pub fn http_resp_to_error_response(
-    resp: &http::Response<Body>,
+    resp_status: StatusCode,
+    h: &HeaderMap,
     b: Vec<u8>,
     bucket_name: &str,
     object_name: &str,
 ) -> ErrorResponse {
     let err_body = String::from_utf8(b).unwrap();
+    if h.is_empty() || resp_status.is_client_error() || resp_status.is_server_error() {
+        return ErrorResponse {
+            status_code: resp_status,
+            code: S3ErrorCode::ResponseInterrupted,
+            message: "Invalid HTTP response.".to_string(),
+            bucket_name: bucket_name.to_string(),
+            key: object_name.to_string(),
+            ..Default::default()
+        };
+    }
     let err_resp_ = quick_xml::de::from_str::<ErrorResponse>(&err_body);
     let mut err_resp = ErrorResponse::default();
     if err_resp_.is_err() {
-        match resp.status() {
+        match resp_status {
             StatusCode::NOT_FOUND => {
                 if object_name == "" {
                     err_resp = ErrorResponse {
-                        status_code: resp.status(),
+                        status_code: resp_status,
                         code: S3ErrorCode::NoSuchBucket,
                         message: "The specified bucket does not exist.".to_string(),
                         bucket_name: bucket_name.to_string(),
@@ -116,7 +126,7 @@ pub fn http_resp_to_error_response(
                     };
                 } else {
                     err_resp = ErrorResponse {
-                        status_code: resp.status(),
+                        status_code: resp_status,
                         code: S3ErrorCode::NoSuchKey,
                         message: "The specified key does not exist.".to_string(),
                         bucket_name: bucket_name.to_string(),
@@ -127,7 +137,7 @@ pub fn http_resp_to_error_response(
             }
             StatusCode::FORBIDDEN => {
                 err_resp = ErrorResponse {
-                    status_code: resp.status(),
+                    status_code: resp_status,
                     code: S3ErrorCode::AccessDenied,
                     message: "Access Denied.".to_string(),
                     bucket_name: bucket_name.to_string(),
@@ -137,7 +147,7 @@ pub fn http_resp_to_error_response(
             }
             StatusCode::CONFLICT => {
                 err_resp = ErrorResponse {
-                    status_code: resp.status(),
+                    status_code: resp_status,
                     code: S3ErrorCode::BucketNotEmpty,
                     message: "Bucket not empty.".to_string(),
                     bucket_name: bucket_name.to_string(),
@@ -146,7 +156,7 @@ pub fn http_resp_to_error_response(
             }
             StatusCode::PRECONDITION_FAILED => {
                 err_resp = ErrorResponse {
-                    status_code: resp.status(),
+                    status_code: resp_status,
                     code: S3ErrorCode::PreconditionFailed,
                     message: "Pre condition failed.".to_string(),
                     bucket_name: bucket_name.to_string(),
@@ -155,13 +165,13 @@ pub fn http_resp_to_error_response(
                 };
             }
             _ => {
-                let mut msg = resp.status().to_string();
+                let mut msg = resp_status.to_string();
                 if err_body.len() > 0 {
                     msg = err_body;
                 }
                 err_resp = ErrorResponse {
-                    status_code: resp.status(),
-                    code: S3ErrorCode::Custom(resp.status().to_string().into()),
+                    status_code: resp_status,
+                    code: S3ErrorCode::Custom(resp_status.to_string().into()),
                     message: msg,
                     bucket_name: bucket_name.to_string(),
                     ..Default::default()
@@ -171,32 +181,32 @@ pub fn http_resp_to_error_response(
     } else {
         err_resp = err_resp_.unwrap();
     }
-    err_resp.status_code = resp.status();
-    if let Some(server_name) = resp.headers().get("Server") {
+    err_resp.status_code = resp_status;
+    if let Some(server_name) = h.get("Server") {
         err_resp.server = server_name.to_str().expect("err").to_string();
     }
 
-    let code = resp.headers().get("x-minio-error-code");
+    let code = h.get("x-minio-error-code");
     if code.is_some() {
         err_resp.code = S3ErrorCode::Custom(code.expect("err").to_str().expect("err").into());
     }
-    let desc = resp.headers().get("x-minio-error-desc");
+    let desc = h.get("x-minio-error-desc");
     if desc.is_some() {
         err_resp.message = desc.expect("err").to_str().expect("err").trim_matches('"').to_string();
     }
 
     if err_resp.request_id == "" {
-        if let Some(x_amz_request_id) = resp.headers().get("x-amz-request-id") {
+        if let Some(x_amz_request_id) = h.get("x-amz-request-id") {
             err_resp.request_id = x_amz_request_id.to_str().expect("err").to_string();
         }
     }
     if err_resp.host_id == "" {
-        if let Some(x_amz_id_2) = resp.headers().get("x-amz-id-2") {
+        if let Some(x_amz_id_2) = h.get("x-amz-id-2") {
             err_resp.host_id = x_amz_id_2.to_str().expect("err").to_string();
         }
     }
     if err_resp.region == "" {
-        if let Some(x_amz_bucket_region) = resp.headers().get("x-amz-bucket-region") {
+        if let Some(x_amz_bucket_region) = h.get("x-amz-bucket-region") {
             err_resp.region = x_amz_bucket_region.to_str().expect("err").to_string();
         }
     }

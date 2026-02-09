@@ -15,19 +15,20 @@
 use super::ecfs::FS;
 use crate::auth::{check_key_valid, get_condition_values, get_session_token};
 use crate::license::license_check;
+use crate::server::RemoteAddr;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
 use rustfs_iam::error::Error as IamError;
-use rustfs_policy::auth;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_policy::policy::{Args, BucketPolicyArgs};
+use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
 
 #[allow(dead_code)]
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub(crate) struct ReqInfo {
-    pub cred: Option<auth::Credentials>,
+    pub cred: Option<rustfs_credentials::Credentials>,
     pub is_owner: bool,
     pub bucket: Option<String>,
     pub object: Option<String>,
@@ -37,6 +38,8 @@ pub(crate) struct ReqInfo {
 
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+
     let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
 
     if let Some(cred) = &req_info.cred {
@@ -49,7 +52,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
-        let conditions = get_condition_values(&req.headers, cred, req_info.version_id.as_deref(), None);
+        let conditions = get_condition_values(&req.headers, cred, req_info.version_id.as_deref(), None, remote_addr);
 
         if action == Action::S3Action(S3Action::DeleteObjectAction)
             && req_info.version_id.is_some()
@@ -66,6 +69,16 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                     deny_only: false,
                 })
                 .await
+            && !PolicySys::is_allowed(&BucketPolicyArgs {
+                bucket: req_info.bucket.as_deref().unwrap_or(""),
+                action: Action::S3Action(S3Action::DeleteObjectVersionAction),
+                is_owner: req_info.is_owner,
+                account: &cred.access_key,
+                groups: &cred.groups,
+                conditions: &conditions,
+                object: req_info.object.as_deref().unwrap_or(""),
+            })
+            .await
         {
             return Err(s3_error!(AccessDenied, "Access Denied"));
         }
@@ -87,8 +100,22 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             return Ok(());
         }
 
-        if action == Action::S3Action(S3Action::ListBucketVersionsAction)
-            && iam_store
+        if PolicySys::is_allowed(&BucketPolicyArgs {
+            bucket: req_info.bucket.as_deref().unwrap_or(""),
+            action,
+            is_owner: req_info.is_owner,
+            account: &cred.access_key,
+            groups: &cred.groups,
+            conditions: &conditions,
+            object: req_info.object.as_deref().unwrap_or(""),
+        })
+        .await
+        {
+            return Ok(());
+        }
+
+        if action == Action::S3Action(S3Action::ListBucketVersionsAction) {
+            if iam_store
                 .is_allowed(&Args {
                     account: &cred.access_key,
                     groups: &cred.groups,
@@ -101,15 +128,31 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                     deny_only: false,
                 })
                 .await
-        {
-            return Ok(());
+            {
+                return Ok(());
+            }
+
+            if PolicySys::is_allowed(&BucketPolicyArgs {
+                bucket: req_info.bucket.as_deref().unwrap_or(""),
+                action: Action::S3Action(S3Action::ListBucketAction),
+                is_owner: req_info.is_owner,
+                account: &cred.access_key,
+                groups: &cred.groups,
+                conditions: &conditions,
+                object: req_info.object.as_deref().unwrap_or(""),
+            })
+            .await
+            {
+                return Ok(());
+            }
         }
     } else {
         let conditions = get_condition_values(
             &req.headers,
-            &auth::Credentials::default(),
+            &rustfs_credentials::Credentials::default(),
             req_info.version_id.as_deref(),
             req.region.as_deref(),
+            remote_addr,
         );
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
@@ -145,6 +188,15 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     }
 
     Err(s3_error!(AccessDenied, "Access Denied"))
+}
+
+/// Check if the request has the x-amz-bypass-governance-retention header set to true
+pub fn has_bypass_governance_header(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 #[async_trait::async_trait]
@@ -300,7 +352,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketCorsAction)).await
+        authorize_request(req, Action::S3Action(S3Action::DeleteBucketCorsAction)).await
     }
 
     /// Checks whether the DeleteBucketEncryption request has accesses to the resources.
@@ -406,7 +458,14 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await
+        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await?;
+
+        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
+        if has_bypass_governance_header(&req.headers) {
+            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
+        }
+
+        Ok(())
     }
 
     /// Checks whether the DeleteObjectTagging request has accesses to the resources.
@@ -424,7 +483,19 @@ impl S3Access for FS {
     /// Checks whether the DeleteObjects request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_objects(&self, _req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
+    async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = None;
+        req_info.version_id = None;
+
+        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await?;
+
+        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
+        if has_bypass_governance_header(&req.headers) {
+            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
+        }
+
         Ok(())
     }
 
@@ -810,11 +881,14 @@ impl S3Access for FS {
         authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await
     }
 
-    /// Checks whether the ListObjectVersions request has accesses to the resources.
+    /// Checks whether the `ListObjectVersions` request is authorized for the requested bucket.
     ///
-    /// This method returns `Ok(())` by default.
-    async fn list_object_versions(&self, _req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
-        Ok(())
+    /// Returns `Ok(())` if the request is allowed, or an error if access is denied or another
+    /// authorization-related issue occurs.
+    async fn list_object_versions(&self, req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
     }
 
     /// Checks whether the ListObjects request has accesses to the resources.
@@ -1064,15 +1138,20 @@ impl S3Access for FS {
     }
 
     /// Checks whether the PutObjectRetention request has accesses to the resources.
-    ///
-    /// This method returns `Ok(())` by default.
     async fn put_object_retention(&self, req: &mut S3Request<PutObjectRetentionInput>) -> S3Result<()> {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+
+        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
+        if has_bypass_governance_header(&req.headers) {
+            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
+        }
+
+        Ok(())
     }
 
     /// Checks whether the PutObjectTagging request has accesses to the resources.

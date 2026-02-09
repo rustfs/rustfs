@@ -15,11 +15,12 @@
 use crate::{
     admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
     auth::{check_key_valid, constant_time_eq, get_session_token},
+    server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
 use rustfs_madmin::GroupAddRemove;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -57,6 +58,7 @@ impl Operation for ListGroups {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListGroupsAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -95,6 +97,7 @@ impl Operation for GetGroup {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::GetGroupAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -142,6 +145,7 @@ impl Operation for SetGroupStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableGroupAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -209,6 +213,7 @@ impl Operation for UpdateGroupMembers {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::AddUserToGroupAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -272,10 +277,11 @@ impl Operation for UpdateGroupMembers {
         } else {
             warn!("add group members");
 
-            if let Err(err) = iam_store.get_group_description(&args.group).await {
-                if is_err_no_such_group(&err) && has_space_be(&args.group) {
-                    return Err(s3_error!(InvalidArgument, "not such group"));
-                }
+            if let Err(err) = iam_store.get_group_description(&args.group).await
+                && is_err_no_such_group(&err)
+                && has_space_be(&args.group)
+            {
+                return Err(s3_error!(InvalidArgument, "not such group"));
             }
 
             iam_store.add_users_to_group(&args.group, args.members).await.map_err(|e| {

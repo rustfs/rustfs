@@ -20,6 +20,7 @@ use crate::{
     manager::{extract_jwt_claims, get_default_policyes},
 };
 use futures::future::join_all;
+use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::store_api::{ObjectInfoOrErr, WalkOptions};
 use rustfs_ecstore::{
@@ -27,7 +28,6 @@ use rustfs_ecstore::{
         RUSTFS_CONFIG_PREFIX,
         com::{delete_config, read_config, read_config_with_metadata, save_config},
     },
-    global::get_global_action_cred,
     store::ECStore,
     store_api::{ObjectInfo, ObjectOptions},
 };
@@ -38,7 +38,7 @@ use std::sync::LazyLock;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam"));
 pub static IAM_CONFIG_USERS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_CONFIG_PREFIX}/iam/users/"));
@@ -120,52 +120,18 @@ fn split_path(s: &str, last_index: bool) -> (&str, &str) {
 #[derive(Clone)]
 pub struct ObjectStore {
     object_api: Arc<ECStore>,
-    prev_cred: Option<rustfs_policy::auth::Credentials>,
 }
 
 impl ObjectStore {
     const BUCKET_NAME: &'static str = ".rustfs.sys";
-    const PREV_CRED_FILE: &'static str = "config/iam/prev_cred.json";
 
-    /// Load previous credentials from persistent storage in .rustfs.sys bucket
-    async fn load_prev_cred(object_api: Arc<ECStore>) -> Option<rustfs_policy::auth::Credentials> {
-        match read_config(object_api, Self::PREV_CRED_FILE).await {
-            Ok(data) => serde_json::from_slice::<rustfs_policy::auth::Credentials>(&data).ok(),
-            Err(_) => None,
-        }
+    pub fn new(object_api: Arc<ECStore>) -> Self {
+        Self { object_api }
     }
 
-    /// Save previous credentials to persistent storage in .rustfs.sys bucket
-    async fn save_prev_cred(object_api: Arc<ECStore>, cred: &Option<rustfs_policy::auth::Credentials>) -> Result<()> {
-        match cred {
-            Some(c) => {
-                let data = serde_json::to_vec(c).map_err(|e| Error::other(format!("Failed to serialize cred: {}", e)))?;
-                save_config(object_api, Self::PREV_CRED_FILE, data)
-                    .await
-                    .map_err(|e| Error::other(format!("Failed to write cred to storage: {}", e)))
-            }
-            None => {
-                // If no credentials, remove the config
-                match delete_config(object_api, Self::PREV_CRED_FILE).await {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        // Ignore ConfigNotFound error when trying to delete non-existent config
-                        if matches!(e, rustfs_ecstore::error::StorageError::ConfigNotFound) {
-                            Ok(())
-                        } else {
-                            Err(Error::other(format!("Failed to delete cred from storage: {}", e)))
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pub async fn new(object_api: Arc<ECStore>) -> Self {
-        // Load previous credentials from persistent storage in .rustfs.sys bucket
-        let prev_cred = Self::load_prev_cred(object_api.clone()).await.or_else(get_global_action_cred);
-
-        Self { object_api, prev_cred }
+    fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
+        let de = rustfs_crypto::decrypt_data(get_global_action_cred().unwrap_or_default().secret_key.as_bytes(), data)?;
+        Ok(de)
     }
 
     fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
@@ -173,65 +139,10 @@ impl ObjectStore {
         Ok(en)
     }
 
-    /// Decrypt data with credential fallback mechanism
-    /// First tries current credentials, then falls back to previous credentials if available
-    async fn decrypt_fallback(&self, data: &[u8], path: &str) -> Result<Vec<u8>> {
-        let current_cred = get_global_action_cred().unwrap_or_default();
-
-        // Try current credentials first
-        match rustfs_crypto::decrypt_data(current_cred.secret_key.as_bytes(), data) {
-            Ok(decrypted) => {
-                // Update persistent storage with current credentials for consistency
-                let _ = Self::save_prev_cred(self.object_api.clone(), &Some(current_cred)).await;
-                Ok(decrypted)
-            }
-            Err(_) => {
-                // Current credentials failed, try previous credentials
-                if let Some(ref prev_cred) = self.prev_cred {
-                    match rustfs_crypto::decrypt_data(prev_cred.secret_key.as_bytes(), data) {
-                        Ok(prev_decrypted) => {
-                            warn!("Decryption succeeded with previous credentials, path: {}", path);
-
-                            // Re-encrypt with current credentials
-                            match rustfs_crypto::encrypt_data(current_cred.secret_key.as_bytes(), &prev_decrypted) {
-                                Ok(re_encrypted) => {
-                                    let _ = save_config(self.object_api.clone(), path, re_encrypted).await;
-                                }
-                                Err(e) => {
-                                    warn!("Failed to re-encrypt with current credentials: {}, path: {}", e, path);
-                                }
-                            }
-
-                            // Update persistent storage with current credentials
-                            let _ = Self::save_prev_cred(self.object_api.clone(), &Some(current_cred)).await;
-                            Ok(prev_decrypted)
-                        }
-                        Err(_) => {
-                            // Both attempts failed
-                            warn!("Decryption failed with both current and previous credentials, deleting config: {}", path);
-                            let _ = self.delete_iam_config(path).await;
-                            Err(Error::ConfigNotFound)
-                        }
-                    }
-                } else {
-                    // No previous credentials available
-                    warn!(
-                        "Decryption failed with current credentials and no previous credentials available, deleting config: {}",
-                        path
-                    );
-                    let _ = self.delete_iam_config(path).await;
-                    Err(Error::ConfigNotFound)
-                }
-            }
-        }
-    }
-
     async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, ObjectInfo)> {
         let (data, obj) = read_config_with_metadata(self.object_api.clone(), path.as_ref(), &ObjectOptions::default()).await?;
 
-        let decrypted_data = self.decrypt_fallback(&data, path.as_ref()).await?;
-
-        Ok((decrypted_data, obj))
+        Ok((Self::decrypt_data(&data)?, obj))
     }
 
     async fn list_iam_config_items(&self, prefix: &str, ctx: CancellationToken, sender: Sender<StringOrErr>) {
@@ -430,6 +341,27 @@ impl ObjectStore {
         Ok(policies)
     }
 
+    /// Checks if the underlying ECStore is ready for metadata operations.
+    /// This prevents silent failures during the storage boot-up phase.
+    ///
+    /// Performs a lightweight probe by attempting to read a known configuration object.
+    /// If the object is not found, it indicates the storage metadata is not ready.
+    /// The upper-level caller should handle retries if needed.
+    async fn check_storage_readiness(&self) -> Result<()> {
+        // Probe path for a fixed object under the IAM root prefix.
+        // If it doesn't exist, the system bucket or metadata is not ready.
+        let probe_path = format!("{}/format.json", *IAM_CONFIG_PREFIX);
+
+        match read_config(self.object_api.clone(), &probe_path).await {
+            Ok(_) => Ok(()),
+            Err(rustfs_ecstore::error::StorageError::ConfigNotFound) => Err(Error::other(format!(
+                "Storage metadata not ready: probe object '{}' not found (expected IAM config to be initialized)",
+                probe_path
+            ))),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     // async fn load_policy(&self, name: &str) -> Result<PolicyDoc> {
     //     let mut policy = self
     //         .load_iam_config::<PolicyDoc>(&format!("config/iam/policies/{name}/policy.json"))
@@ -475,17 +407,61 @@ impl Store for ObjectStore {
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
         let mut data = read_config(self.object_api.clone(), path.as_ref()).await?;
 
-        data = self.decrypt_fallback(&data, path.as_ref()).await?;
+        data = match Self::decrypt_data(&data) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!("config decrypt failed, keeping file: {}, path: {}", err, path.as_ref());
+                // keep the config file when decrypt failed - do not delete
+                return Err(Error::ConfigNotFound);
+            }
+        };
 
         Ok(serde_json::from_slice(&data)?)
     }
+    /// Saves IAM configuration with a retry mechanism on failure.
+    ///
+    /// Attempts to save the IAM configuration up to 5 times if the storage layer is not ready,
+    /// using exponential backoff between attempts (starting at 200ms, doubling each retry).
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - The IAM configuration item to save, must implement `Serialize` and `Send`.
+    /// * `path` - The path where the configuration will be saved.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - `Ok(())` on success, or an `Error` if all attempts fail.
     #[tracing::instrument(level = "debug", skip(self, item, path))]
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()> {
         let mut data = serde_json::to_vec(&item)?;
         data = Self::encrypt_data(&data)?;
 
-        save_config(self.object_api.clone(), path.as_ref(), data).await?;
-        Ok(())
+        let mut attempts = 0;
+        let max_attempts = 5;
+        let path_ref = path.as_ref();
+
+        loop {
+            match save_config(self.object_api.clone(), path_ref, data.clone()).await {
+                Ok(_) => {
+                    debug!("Successfully saved IAM config to {}", path_ref);
+                    return Ok(());
+                }
+                Err(e) if attempts < max_attempts => {
+                    attempts += 1;
+                    // Exponential backoff: 200ms, 400ms, 800ms...
+                    let wait_ms = 200 * (1 << attempts);
+                    warn!(
+                        "Storage layer not ready for IAM write (attempt {}/{}). Retrying in {}ms. Path: {}, Error: {:?}",
+                        attempts, max_attempts, wait_ms, path_ref, e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                }
+                Err(e) => {
+                    error!("Final failure saving IAM config to {}: {:?}", path_ref, e);
+                    return Err(e.into());
+                }
+            }
+        }
     }
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()> {
         delete_config(self.object_api.clone(), path.as_ref()).await?;
@@ -499,8 +475,16 @@ impl Store for ObjectStore {
         user_identity: UserIdentity,
         _ttl: Option<usize>,
     ) -> Result<()> {
-        self.save_iam_config(user_identity, get_user_identity_path(name, user_type))
-            .await
+        // Pre-check storage health
+        self.check_storage_readiness().await?;
+
+        let path = get_user_identity_path(name, user_type);
+        debug!("Saving IAM identity to path: {}", path);
+
+        self.save_iam_config(user_identity, path).await.map_err(|e| {
+            error!("ObjectStore save failure for {}: {:?}", name, e);
+            e
+        })
     }
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()> {
         self.delete_iam_config(get_user_identity_path(name, user_type))
@@ -649,10 +633,10 @@ impl Store for ObjectStore {
 
             if let Some(item) = v.item {
                 let name = rustfs_utils::path::dir(&item);
-                if let Err(err) = self.load_group(&name, m).await {
-                    if !is_err_no_such_group(&err) {
-                        return Err(err);
-                    }
+                if let Err(err) = self.load_group(&name, m).await
+                    && !is_err_no_such_group(&err)
+                {
+                    return Err(err);
                 }
             }
         }
@@ -952,10 +936,10 @@ impl Store for ObjectStore {
                 let name = item.trim_end_matches(".json");
 
                 info!("load group policy: {}", name);
-                if let Err(err) = self.load_mapped_policy(name, UserType::Reg, true, &mut items_cache).await {
-                    if !is_err_no_such_policy(&err) {
-                        return Err(Error::other(format!("load group policy failed: {err}")));
-                    }
+                if let Err(err) = self.load_mapped_policy(name, UserType::Reg, true, &mut items_cache).await
+                    && !is_err_no_such_policy(&err)
+                {
+                    return Err(Error::other(format!("load group policy failed: {err}")));
                 };
             }
 
@@ -971,10 +955,10 @@ impl Store for ObjectStore {
             for item in item_name_list.iter() {
                 let name = rustfs_utils::path::dir(item);
                 info!("load svc user: {}", name);
-                if let Err(err) = self.load_user(&name, UserType::Svc, &mut items_cache).await {
-                    if !is_err_no_such_user(&err) {
-                        return Err(Error::other(format!("load svc user failed: {err}")));
-                    }
+                if let Err(err) = self.load_user(&name, UserType::Svc, &mut items_cache).await
+                    && !is_err_no_such_user(&err)
+                {
+                    return Err(Error::other(format!("load svc user failed: {err}")));
                 };
             }
 
@@ -985,10 +969,9 @@ impl Store for ObjectStore {
                     if let Err(err) = self
                         .load_mapped_policy(&parent, UserType::Sts, false, &mut sts_policies_cache)
                         .await
+                        && !is_err_no_such_policy(&err)
                     {
-                        if !is_err_no_such_policy(&err) {
-                            return Err(Error::other(format!("load_mapped_policy failed: {err}")));
-                        }
+                        return Err(Error::other(format!("load_mapped_policy failed: {err}")));
                     }
                 }
             }

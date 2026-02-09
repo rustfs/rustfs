@@ -19,25 +19,30 @@ mod error;
 mod init;
 mod license;
 mod profiling;
+#[cfg(feature = "ftps")]
+mod protocols;
 mod server;
 mod storage;
 mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
-use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check};
+use crate::init::{
+    add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
+};
+
+#[cfg(feature = "ftps")]
+use crate::init::{init_ftp_system, init_ftps_system};
+
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
-use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
-use rustfs_ahm::{
-    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
-    scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
-};
-use rustfs_common::globals::set_global_addr;
+use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
+use rustfs_credentials::init_global_action_credentials;
+use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
     StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
@@ -53,8 +58,12 @@ use rustfs_ecstore::{
     store_api::BucketOptions,
     update_erasure_type,
 };
+use rustfs_heal::{
+    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
+};
 use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
+use rustfs_scanner::init_data_scanner;
 use rustfs_utils::net::parse_and_resolve_address;
 use std::io::{Error, Result};
 use std::sync::Arc;
@@ -65,34 +74,28 @@ use tracing::{debug, error, info, instrument, warn};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+#[global_allocator]
+static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
+    profiling::allocator::TracingAllocator::new(mimalloc::MiMalloc);
+
+#[cfg(target_os = "windows")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const LOGO: &str = r#"
-
-░█▀▄░█░█░█▀▀░▀█▀░█▀▀░█▀▀
-░█▀▄░█░█░▀▀█░░█░░█▀▀░▀▀█
-░▀░▀░▀▀▀░▀▀▀░░▀░░▀░░░▀▀▀
-
-"#;
-
-#[instrument]
-fn print_server_info() {
-    let current_year = chrono::Utc::now().year();
-    // Use custom macros to print server information
-    info!("RustFS Object Storage Server");
-    info!("Copyright: 2024-{} RustFS, Inc", current_year);
-    info!("License: Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0");
-    info!("Version: {}", version::get_version());
-    info!("Docs: https://rustfs.com/docs/");
-}
-
-fn main() -> Result<()> {
+fn main() {
     let runtime = server::get_tokio_runtime_builder()
         .build()
         .expect("Failed to build Tokio runtime");
-    runtime.block_on(async_main())
+    let result = runtime.block_on(async_main());
+    if let Err(ref e) = result {
+        eprintln!("{} Server encountered an error and is shutting down: {}", jiff::Zoned::now(), e);
+        error!("Server encountered an error and is shutting down: {}", e);
+        std::process::exit(1);
+    }
 }
 async fn async_main() -> Result<()> {
     // Parse the obtained parameters
@@ -112,7 +115,9 @@ async fn async_main() -> Result<()> {
 
     // Store in global storage
     match set_global_guard(guard).map_err(Error::other) {
-        Ok(_) => (),
+        Ok(_) => {
+            info!(target: "rustfs::main", "Global observability guard set successfully.");
+        }
         Err(e) => {
             error!("Failed to set global observability guard: {}", e);
             return Err(e);
@@ -120,14 +125,25 @@ async fn async_main() -> Result<()> {
     }
 
     // print startup logo
-    info!("{}", LOGO);
+    info!("{}", server::LOGO);
 
     // Initialize performance profiling if enabled
     profiling::init_from_env().await;
 
+    // Initialize trusted proxies system
+    rustfs_trusted_proxies::init();
+
     // Initialize TLS if a certificate path is provided
     if let Some(tls_path) = &opt.tls_path {
-        init_cert(tls_path).await
+        match init_cert(tls_path).await {
+            Ok(_) => {
+                info!(target: "rustfs::main", "TLS initialized successfully with certs from {}", tls_path);
+            }
+            Err(e) => {
+                error!("Failed to initialize TLS from {}: {}", tls_path, e);
+                return Err(Error::other(e));
+            }
+        }
     }
 
     // Run parameters
@@ -143,6 +159,8 @@ async fn async_main() -> Result<()> {
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
+    // 1. Initialize global readiness tracker
+    let readiness = Arc::new(GlobalReadiness::new());
 
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
@@ -163,7 +181,16 @@ async fn run(opt: config::Opt) -> Result<()> {
     );
 
     // Set up AK and SK
-    rustfs_ecstore::global::init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
+    match init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone())) {
+        Ok(_) => {
+            info!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
+        }
+        Err(e) => {
+            let msg = format!("init global action credentials failed: {e:?}");
+            error!(target: "rustfs::main::run","{msg}");
+            return Err(Error::other(msg));
+        }
+    };
 
     set_global_rustfs_port(server_port);
 
@@ -173,6 +200,14 @@ async fn run(opt: config::Opt) -> Result<()> {
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
         .await
         .map_err(Error::other)?;
+
+    set_global_endpoints(endpoint_pools.as_ref().clone());
+    update_erasure_type(setup_type).await;
+
+    // Initialize the local disk
+    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
+    // Initialize the lock clients
+    init_lock_clients(endpoint_pools.clone());
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
@@ -214,28 +249,23 @@ async fn run(opt: config::Opt) -> Result<()> {
     let s3_shutdown_tx = {
         let mut s3_opt = opt.clone();
         s3_opt.console_enable = false;
-        let s3_shutdown_tx = start_http_server(&s3_opt, state_manager.clone()).await?;
+        let s3_shutdown_tx = start_http_server(&s3_opt, state_manager.clone(), readiness.clone()).await?;
         Some(s3_shutdown_tx)
     };
 
     let console_shutdown_tx = if opt.console_enable && !opt.console_address.is_empty() {
         let mut console_opt = opt.clone();
         console_opt.address = console_opt.console_address.clone();
-        let console_shutdown_tx = start_http_server(&console_opt, state_manager.clone()).await?;
+        let console_shutdown_tx = start_http_server(&console_opt, state_manager.clone(), readiness.clone()).await?;
         Some(console_shutdown_tx)
     } else {
         None
     };
 
-    set_global_endpoints(endpoint_pools.as_ref().clone());
-    update_erasure_type(setup_type).await;
-
-    // Initialize the local disk
-    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
-
     let ctx = CancellationToken::new();
 
     // init store
+    // 2. Start Storage Engine (ECStore)
     let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
         .await
         .inspect_err(|err| {
@@ -243,13 +273,63 @@ async fn run(opt: config::Opt) -> Result<()> {
         })?;
 
     ecconfig::init();
-    // config system configuration
-    GLOBAL_CONFIG_SYS.init(store.clone()).await?;
 
-    // init  replication_pool
+    // // Initialize global configuration system
+    let mut retry_count = 0;
+    while let Err(e) = GLOBAL_CONFIG_SYS.init(store.clone()).await {
+        error!("GLOBAL_CONFIG_SYS.init failed {:?}", e);
+        // TODO: check error type
+        retry_count += 1;
+        if retry_count > 15 {
+            return Err(Error::other("GLOBAL_CONFIG_SYS.init failed"));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+    readiness.mark_stage(SystemStage::StorageReady);
+    // init replication_pool
     init_background_replication(store.clone()).await;
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
+
+    // Initialize FTP system if enabled
+    #[cfg(feature = "ftps")]
+    let ftp_shutdown_tx = match init_ftp_system().await {
+        Ok(Some(tx)) => {
+            info!("FTP system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("FTP system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize FTP system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "ftps"))]
+    let ftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+
+    // Initialize FTPS system if enabled
+    #[cfg(feature = "ftps")]
+    let ftps_shutdown_tx = match init_ftps_system().await {
+        Ok(Some(tx)) => {
+            info!("FTPS system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("FTPS system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize FTPS system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "ftps"))]
+    let ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
 
     // Initialize buffer profiling system
     init_buffer_profile_system(&opt);
@@ -279,7 +359,10 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
+    // 3. Initialize IAM System (Blocking load)
+    // This ensures data is in memory before moving forward
     init_iam_sys(store.clone()).await.map_err(Error::other)?;
+    readiness.mark_stage(SystemStage::IamReady);
 
     add_bucket_notification_configuration(buckets.clone()).await;
 
@@ -305,23 +388,11 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Initialize heal manager and scanner based on environment variables
     if enable_heal || enable_scanner {
-        if enable_heal {
-            // Initialize heal manager with channel processor
-            let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-            let heal_manager = init_heal_manager(heal_storage, None).await?;
+        let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
 
-            if enable_scanner {
-                info!(target: "rustfs::main::run","Starting scanner with heal manager...");
-                let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
-                scanner.start().await?;
-            } else {
-                info!(target: "rustfs::main::run","Scanner disabled, but heal manager is initialized and available");
-            }
-        } else if enable_scanner {
-            info!("Starting scanner without heal manager...");
-            let scanner = Scanner::new(Some(ScannerConfig::default()), None);
-            scanner.start().await?;
-        }
+        init_heal_manager(heal_storage, None).await?;
+
+        init_data_scanner(ctx.clone(), store.clone()).await;
     } else {
         info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }
@@ -331,17 +402,46 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     init_update_check();
 
+    println!(
+        "RustFS server version: {} started successfully at {}, current time: {}",
+        version::get_version(),
+        &server_address,
+        jiff::Zoned::now()
+    );
+    info!(target: "rustfs::main::run","server started successfully at {}", &server_address);
+    // 4. Mark as Full Ready now that critical components are warm
+    readiness.mark_stage(SystemStage::FullReady);
+
+    // Set the global RustFS initialization time to now
+    rustfs_common::set_global_init_time_now().await;
+
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
     // listen to the shutdown signal
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(
+                &state_manager,
+                s3_shutdown_tx,
+                console_shutdown_tx,
+                ftp_shutdown_tx,
+                ftps_shutdown_tx,
+                ctx.clone(),
+            )
+            .await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(
+                &state_manager,
+                s3_shutdown_tx,
+                console_shutdown_tx,
+                ftp_shutdown_tx,
+                ftps_shutdown_tx,
+                ctx.clone(),
+            )
+            .await;
         }
     }
 
@@ -354,6 +454,8 @@ async fn handle_shutdown(
     state_manager: &ServiceStateManager,
     s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    ftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -389,6 +491,23 @@ async fn handle_shutdown(
         );
     }
 
+    // Shutdown FTP and FTPS servers
+    if let Some(ftp_shutdown_tx) = ftp_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down FTP server..."
+        );
+        let _ = ftp_shutdown_tx.send(());
+    }
+
+    if let Some(ftps_shutdown_tx) = ftps_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down FTPS server..."
+        );
+        let _ = ftps_shutdown_tx.send(());
+    }
+
     // Stop the notification system
     info!(
         target: "rustfs::main::handle_shutdown",
@@ -405,6 +524,13 @@ async fn handle_shutdown(
         Ok(_) => info!("Audit system stopped successfully."),
         Err(e) => error!("Failed to stop audit system: {}", e),
     }
+
+    // Stop profiling tasks
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Stopping profiling tasks..."
+    );
+    profiling::shutdown_profiling();
 
     info!(
         target: "rustfs::main::handle_shutdown",

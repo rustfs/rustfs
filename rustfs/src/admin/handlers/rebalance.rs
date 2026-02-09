@@ -12,8 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{
+    admin::{auth::validate_admin_request, router::Operation},
+    auth::{check_key_valid, get_session_token},
+    server::RemoteAddr,
+};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
+use rustfs_ecstore::rebalance::RebalanceMeta;
 use rustfs_ecstore::{
     StorageAPI,
     error::StorageError,
@@ -32,12 +38,6 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tracing::warn;
-
-use crate::{
-    admin::{auth::validate_admin_request, router::Operation},
-    auth::{check_key_valid, get_session_token},
-};
-use rustfs_ecstore::rebalance::RebalanceMeta;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RebalanceResp {
@@ -104,6 +104,7 @@ impl Operation for RebalanceStart {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -181,6 +182,7 @@ impl Operation for RebalanceStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -298,6 +300,7 @@ impl Operation for RebalanceStop {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 

@@ -19,6 +19,7 @@ use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -269,20 +270,18 @@ impl ReplicationState {
                         return repl_status;
                     }
 
-                    if repl_status == ReplicationStatusType::Completed {
-                        if let (Some(replica_timestamp), Some(replication_timestamp)) =
+                    if repl_status == ReplicationStatusType::Completed
+                        && let (Some(replica_timestamp), Some(replication_timestamp)) =
                             (self.replica_timestamp, self.replication_timestamp)
-                        {
-                            if replica_timestamp > replication_timestamp {
-                                return self.replica_status.clone();
-                            }
-                        }
+                        && replica_timestamp > replication_timestamp
+                    {
+                        return self.replica_status.clone();
                     }
 
                     return repl_status;
                 }
             }
-        } else if self.replica_status != ReplicationStatusType::default() {
+        } else if !self.replica_status.is_empty() {
             return self.replica_status.clone();
         }
 
@@ -709,7 +708,7 @@ pub fn parse_replicate_decision(_bucket: &str, s: &str) -> std::io::Result<Repli
     // }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicateObjectInfo {
     pub name: String,
     pub size: i64,
@@ -773,9 +772,7 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref REPL_STATUS_REGEX: Regex = Regex::new(r"([^=].*?)=([^,].*?);").unwrap();
-}
+static REPL_STATUS_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([^=].*?)=([^,].*?);").unwrap());
 
 impl ReplicateObjectInfo {
     /// Returns replication status of a target

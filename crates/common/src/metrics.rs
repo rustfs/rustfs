@@ -18,6 +18,7 @@ use rustfs_madmin::metrics::ScannerMetrics as M_ScannerMetrics;
 use std::{
     collections::HashMap,
     fmt::Display,
+    future::Future,
     pin::Pin,
     sync::{
         Arc, OnceLock,
@@ -95,6 +96,11 @@ pub enum Metric {
     ApplyNonCurrent,
     HealAbandonedVersion,
 
+    // Quota metrics:
+    QuotaCheck,
+    QuotaViolation,
+    QuotaSync,
+
     // START Trace metrics:
     StartTrace,
     ScanObject, // Scan object. All operations included.
@@ -115,7 +121,7 @@ pub enum Metric {
 
 impl Metric {
     /// Convert to string representation for metrics
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::ReadMetadata => "read_metadata",
             Self::CheckMissing => "check_missing",
@@ -130,6 +136,9 @@ impl Metric {
             Self::CleanAbandoned => "clean_abandoned",
             Self::ApplyNonCurrent => "apply_non_current",
             Self::HealAbandonedVersion => "heal_abandoned_version",
+            Self::QuotaCheck => "quota_check",
+            Self::QuotaViolation => "quota_violation",
+            Self::QuotaSync => "quota_sync",
             Self::StartTrace => "start_trace",
             Self::ScanObject => "scan_object",
             Self::HealAbandonedObject => "heal_abandoned_object",
@@ -162,15 +171,18 @@ impl Metric {
             10 => Some(Self::CleanAbandoned),
             11 => Some(Self::ApplyNonCurrent),
             12 => Some(Self::HealAbandonedVersion),
-            13 => Some(Self::StartTrace),
-            14 => Some(Self::ScanObject),
-            15 => Some(Self::HealAbandonedObject),
-            16 => Some(Self::LastRealtime),
-            17 => Some(Self::ScanFolder),
-            18 => Some(Self::ScanCycle),
-            19 => Some(Self::ScanBucketDrive),
-            20 => Some(Self::CompactFolder),
-            21 => Some(Self::Last),
+            13 => Some(Self::QuotaCheck),
+            14 => Some(Self::QuotaViolation),
+            15 => Some(Self::QuotaSync),
+            16 => Some(Self::StartTrace),
+            17 => Some(Self::ScanObject),
+            18 => Some(Self::HealAbandonedObject),
+            19 => Some(Self::LastRealtime),
+            20 => Some(Self::ScanFolder),
+            21 => Some(Self::ScanCycle),
+            22 => Some(Self::ScanBucketDrive),
+            23 => Some(Self::CompactFolder),
+            24 => Some(Self::Last),
             _ => None,
         }
     }
@@ -460,27 +472,32 @@ impl Metrics {
             metrics.current_started = cycle.started;
         }
 
+        // Replace default start time with global init time if it's the placeholder
+        if let Some(init_time) = crate::get_global_init_time().await {
+            metrics.current_started = init_time;
+        }
+
         metrics.collected_at = Utc::now();
         metrics.active_paths = self.get_current_paths().await;
 
         // Lifetime operations
         for i in 0..Metric::Last as usize {
             let count = self.operations[i].load(Ordering::Relaxed);
-            if count > 0 {
-                if let Some(metric) = Metric::from_index(i) {
-                    metrics.life_time_ops.insert(metric.as_str().to_string(), count);
-                }
+            if count > 0
+                && let Some(metric) = Metric::from_index(i)
+            {
+                metrics.life_time_ops.insert(metric.as_str().to_string(), count);
             }
         }
 
         // Last minute statistics for realtime metrics
         for i in 0..Metric::LastRealtime as usize {
             let last_min = self.latency[i].total().await;
-            if last_min.n > 0 {
-                if let Some(_metric) = Metric::from_index(i) {
-                    // Convert to madmin TimedAction format if needed
-                    // This would require implementing the conversion
-                }
+            if last_min.n > 0
+                && let Some(_metric) = Metric::from_index(i)
+            {
+                // Convert to madmin TimedAction format if needed
+                // This would require implementing the conversion
             }
         }
 
@@ -489,8 +506,8 @@ impl Metrics {
 }
 
 // Type aliases for compatibility with existing code
-pub type UpdateCurrentPathFn = Arc<dyn Fn(&str) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
-pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+pub type UpdateCurrentPathFn = Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Create a current path updater for tracking scan progress
 pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
@@ -506,7 +523,7 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
 
     let update_fn = {
         let tracker = Arc::clone(&tracker);
-        Arc::new(move |path: &str| -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Arc::new(move |path: &str| -> Pin<Box<dyn Future<Output = ()> + Send>> {
             let tracker = Arc::clone(&tracker);
             let path = path.to_string();
             Box::pin(async move {
@@ -517,7 +534,7 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
 
     let done_fn = {
         let disk_name = disk_name.clone();
-        Arc::new(move || -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Arc::new(move || -> Pin<Box<dyn Future<Output = ()> + Send>> {
             let disk_name = disk_name.clone();
             Box::pin(async move {
                 global_metrics().current_paths.write().await.remove(&disk_name);

@@ -13,16 +13,44 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, ops::Deref};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, Error as DeError, Visitor},
+};
+use std::{collections::HashSet, fmt, ops::Deref};
 use strum::{EnumString, IntoStaticStr};
 
 use super::{Error as IamError, Validator, utils::wildcard};
 
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+/// A set of policy actions that always serializes as an array of strings,
+/// conforming to the S3 policy specification for consistency and compatibility.
+#[derive(Clone, Default, Debug)]
 pub struct ActionSet(pub HashSet<Action>);
 
+impl Serialize for ActionSet {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        // Always serialize as array, even for single action, to match S3 specification
+        // and ensure compatibility with AWS SDK clients that expect array format
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for action in &self.0 {
+            let action_str: &str = action.into();
+            seq.serialize_element(action_str)?;
+        }
+        seq.end()
+    }
+}
+
 impl ActionSet {
+    /// Returns true if the action set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn is_match(&self, action: &Action) -> bool {
         for act in self.0.iter() {
             if act.is_match(action) {
@@ -58,6 +86,54 @@ impl Validator for ActionSet {
 impl PartialEq for ActionSet {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len() && self.0.iter().all(|x| other.0.contains(x))
+    }
+}
+
+impl<'de> Deserialize<'de> for ActionSet {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ActionOrVecVisitor;
+
+        impl<'de> Visitor<'de> for ActionOrVecVisitor {
+            type Value = ActionSet;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string or an array of strings")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let action = Action::try_from(value).map_err(|e| E::custom(format!("invalid action: {}", e)))?;
+                let mut set = HashSet::new();
+                set.insert(action);
+                Ok(ActionSet(set))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+                A::Error: DeError,
+            {
+                let mut set = HashSet::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(value) = seq.next_element::<String>()? {
+                    match Action::try_from(value.as_str()) {
+                        Ok(action) => {
+                            set.insert(action);
+                        }
+                        Err(e) => {
+                            return Err(A::Error::custom(format!("invalid action: {}", e)));
+                        }
+                    }
+                }
+                Ok(ActionSet(set))
+            }
+        }
+
+        deserializer.deserialize_any(ActionOrVecVisitor)
     }
 }
 
@@ -99,6 +175,10 @@ impl Action {
 impl TryFrom<&str> for Action {
     type Error = Error;
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        // Support wildcard "*" which matches all S3 actions (AWS S3 standard)
+        if value == "*" {
+            return Ok(Self::S3Action(S3Action::AllActions));
+        }
         if value.starts_with(Self::S3_PREFIX) {
             Ok(Self::S3Action(
                 S3Action::try_from(value).map_err(|_| IamError::InvalidAction(value.into()))?,
@@ -507,4 +587,62 @@ pub enum StsAction {}
 pub enum KmsAction {
     #[strum(serialize = "kms:*")]
     AllActions,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_action_wildcard_parsing() {
+        // Test that "*" parses to S3Action::AllActions
+        let action = Action::try_from("*").expect("Should parse wildcard");
+        assert!(matches!(action, Action::S3Action(S3Action::AllActions)));
+    }
+
+    #[test]
+    fn test_actionset_serialize_single_element() {
+        // Single element should serialize as array for S3 specification compliance
+        let mut set = HashSet::new();
+        set.insert(Action::S3Action(S3Action::GetObjectAction));
+        let actionset = ActionSet(set);
+
+        let json = serde_json::to_string(&actionset).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        assert!(parsed.is_array(), "Should serialize as array");
+        let arr = parsed.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str().unwrap(), "s3:GetObject");
+    }
+
+    #[test]
+    fn test_actionset_serialize_multiple_elements() {
+        // Multiple elements should serialize as array
+        let mut set = HashSet::new();
+        set.insert(Action::S3Action(S3Action::GetObjectAction));
+        set.insert(Action::S3Action(S3Action::PutObjectAction));
+        let actionset = ActionSet(set);
+
+        let json = serde_json::to_string(&actionset).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        assert!(parsed.is_array());
+        let arr = parsed.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn test_actionset_wildcard_serialization() {
+        // Wildcard action should serialize as array for S3 specification compliance
+        let mut set = HashSet::new();
+        set.insert(Action::try_from("*").expect("Should parse wildcard"));
+        let actionset = ActionSet(set);
+
+        let json = serde_json::to_string(&actionset).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        assert!(parsed.is_array(), "Should serialize as array");
+        let arr = parsed.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str().unwrap(), "s3:*");
+    }
 }

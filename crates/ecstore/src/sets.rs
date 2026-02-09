@@ -13,8 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
-
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
@@ -27,7 +25,7 @@ use crate::{
     },
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
-    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
+    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
@@ -40,21 +38,22 @@ use futures::future::join_all;
 use http::HeaderMap;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_common::{
-    globals::GLOBAL_LOCAL_NODE_NAME,
+    GLOBAL_LOCAL_NODE_NAME,
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
-
+use rustfs_lock::NamespaceLockWrapper;
+use rustfs_lock::client::LockClient;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
-
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{error, info};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Sets {
@@ -93,35 +92,30 @@ impl Sets {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
-        let mut unique: Vec<Vec<String>> = (0..set_count).map(|_| vec![]).collect();
-
-        for (idx, endpoint) in endpoints.endpoints.as_ref().iter().enumerate() {
-            let set_idx = idx / set_drive_count;
-            if endpoint.is_local && !unique[set_idx].contains(&"local".to_string()) {
-                unique[set_idx].push("local".to_string());
-            }
-
-            if !endpoint.is_local {
-                let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap());
-                if !unique[set_idx].contains(&host_port) {
-                    unique[set_idx].push(host_port);
-                }
-            }
-        }
-
         let mut disk_set = Vec::with_capacity(set_count);
 
-        // Create fast lock manager for high performance
-        let fast_lock_manager = Arc::new(rustfs_lock::FastObjectLockManager::new());
+        // Get lock clients from global storage
+        let lock_clients = get_global_lock_clients();
 
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
+            let mut set_lock_clients: HashMap<String, Arc<dyn LockClient>> = HashMap::new();
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
                 let mut disk = disks[idx].clone();
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
+
+                if let Some(lock_clients_map) = lock_clients {
+                    let host_port = endpoint.host_port();
+                    if let Some(lock_client) = lock_clients_map.get(&host_port)
+                        && !set_lock_clients.contains_key(&host_port)
+                    {
+                        set_lock_clients.insert(host_port, lock_client.clone());
+                    }
+                }
+
                 set_endpoints.push(endpoint);
 
                 if disk.is_none() {
@@ -165,11 +159,8 @@ impl Sets {
                 }
             }
 
-            // Note: write_quorum was used for the old lock system, no longer needed with FastLock
-            let _write_quorum = set_drive_count - parity_count;
-
+            let lockers = set_lock_clients.values().cloned().collect::<Vec<Arc<dyn LockClient>>>();
             let set_disks = SetDisks::new(
-                fast_lock_manager.clone(),
                 GLOBAL_LOCAL_NODE_NAME.read().await.to_string(),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
@@ -178,6 +169,7 @@ impl Sets {
                 pool_idx,
                 set_endpoints,
                 fm.clone(),
+                lockers,
             )
             .await;
 
@@ -255,7 +247,7 @@ impl Sets {
         self.connect_disks().await;
 
         // TODO: config interval
-        let mut interval = tokio::time::interval(Duration::from_secs(15 * 3));
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
                _= interval.tick()=>{
@@ -366,6 +358,10 @@ impl ObjectIO for Sets {
 
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
+    #[tracing::instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
+        self.disk_set[0].new_ns_lock(bucket, object).await
+    }
     #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
         unimplemented!()
@@ -491,12 +487,12 @@ impl StorageAPI for Sets {
         let cp_src_dst_same = path_join_buf(&[src_bucket, src_object]) == path_join_buf(&[dst_bucket, dst_object]);
 
         if cp_src_dst_same {
-            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id) {
-                if src_vid == dst_vid {
-                    return src_set
-                        .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-                        .await;
-                }
+            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
+                && src_vid == dst_vid
+            {
+                return src_set
+                    .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+                    .await;
             }
 
             if !dst_opts.versioned && src_opts.version_id.is_none() {
@@ -823,10 +819,10 @@ impl StorageAPI for Sets {
                         Ok((m, n)) => (m, n),
                         Err(_) => continue,
                     };
-                    if let Some(set) = self.disk_set.get(m) {
-                        if let Some(Some(disk)) = set.disks.read().await.get(n) {
-                            let _ = disk.close().await;
-                        }
+                    if let Some(set) = self.disk_set.get(m)
+                        && let Some(Some(disk)) = set.disks.read().await.get(n)
+                    {
+                        let _ = disk.close().await;
                     }
 
                     if let Some(Some(disk)) = disks.get(index) {
@@ -980,25 +976,24 @@ fn new_heal_format_sets(
     let mut current_disks_info = vec![vec![DiskInfo::default(); set_drive_count]; set_count];
     for (i, set) in ref_format.erasure.sets.iter().enumerate() {
         for j in 0..set.len() {
-            if let Some(Some(err)) = errs.get(i * set_drive_count + j) {
-                if *err == DiskError::UnformattedDisk {
-                    let mut fm = FormatV3::new(set_count, set_drive_count);
-                    fm.id = ref_format.id;
-                    fm.format = ref_format.format.clone();
-                    fm.version = ref_format.version.clone();
-                    fm.erasure.this = ref_format.erasure.sets[i][j];
-                    fm.erasure.sets = ref_format.erasure.sets.clone();
-                    fm.erasure.version = ref_format.erasure.version.clone();
-                    fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
-                    new_formats[i][j] = Some(fm);
-                }
+            if let Some(Some(err)) = errs.get(i * set_drive_count + j)
+                && *err == DiskError::UnformattedDisk
+            {
+                let mut fm = FormatV3::new(set_count, set_drive_count);
+                fm.id = ref_format.id;
+                fm.format = ref_format.format.clone();
+                fm.version = ref_format.version.clone();
+                fm.erasure.this = ref_format.erasure.sets[i][j];
+                fm.erasure.sets = ref_format.erasure.sets.clone();
+                fm.erasure.version = ref_format.erasure.version.clone();
+                fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
+                new_formats[i][j] = Some(fm);
             }
-            if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j]) {
-                if let Some(info) = &format.disk_info {
-                    if !info.endpoint.is_empty() {
-                        current_disks_info[i][j] = info.clone();
-                    }
-                }
+            if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j])
+                && let Some(info) = &format.disk_info
+                && !info.endpoint.is_empty()
+            {
+                current_disks_info[i][j] = info.clone();
             }
         }
     }

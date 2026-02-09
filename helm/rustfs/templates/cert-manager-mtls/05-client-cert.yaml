@@ -1,0 +1,14 @@
+{{- if .Values.mtls.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "rustfs.fullname" . }}-client-tls
+spec:
+  secretName: {{ include "rustfs.fullname" . }}-client-tls
+  issuerRef:
+    name: {{ include "rustfs.fullname" . }}-ca-issuer
+    kind: Issuer
+  commonName: {{ include "rustfs.fullname" . }}-cluster
+  usages:
+    - client auth
+{{- end }}

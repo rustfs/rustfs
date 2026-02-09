@@ -1,22 +1,33 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::StorageAPI;
+use crate::bucket::bucket_target_sys::BucketTargetSys;
+use crate::bucket::metadata_sys;
 use crate::bucket::replication::ResyncOpts;
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::replicate_delete;
 use crate::bucket::replication::replicate_object;
-use crate::disk::BUCKET_META_PREFIX;
-use std::any::Any;
-use std::sync::Arc;
-use std::sync::atomic::AtomicI32;
-use std::sync::atomic::Ordering;
-
 use crate::bucket::replication::replication_resyncer::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationResyncer,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationConfig, ReplicationResyncer,
+    get_heal_replicate_object_info,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::read_config;
+use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
 use crate::store_api::ObjectInfo;
-
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfReplicateEntry;
 use rustfs_filemeta::ReplicateDecision;
@@ -26,9 +37,15 @@ use rustfs_filemeta::ReplicationStatusType;
 use rustfs_filemeta::ReplicationType;
 use rustfs_filemeta::ReplicationWorkerOperation;
 use rustfs_filemeta::ResyncDecision;
+use rustfs_filemeta::VersionPurgeStatusType;
 use rustfs_filemeta::replication_statuses_map;
 use rustfs_filemeta::version_purge_statuses_map;
+use rustfs_filemeta::{REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE};
 use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
+use std::any::Any;
+use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
@@ -512,20 +529,20 @@ impl<S: StorageAPI> ReplicationPool<S> {
             if !lrg_workers.is_empty() {
                 let index = (hash as usize) % lrg_workers.len();
 
-                if let Some(worker) = lrg_workers.get(index) {
-                    if worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err() {
-                        // Queue to MRF if worker is busy
-                        let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
+                if let Some(worker) = lrg_workers.get(index)
+                    && worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err()
+                {
+                    // Queue to MRF if worker is busy
+                    let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
 
-                        // Try to add more workers if possible
-                        let max_l_workers = *self.max_l_workers.read().await;
-                        let existing = lrg_workers.len();
-                        if self.active_lrg_workers() < std::cmp::min(max_l_workers, LARGE_WORKER_COUNT) as i32 {
-                            let workers = std::cmp::min(existing + 1, max_l_workers);
+                    // Try to add more workers if possible
+                    let max_l_workers = *self.max_l_workers.read().await;
+                    let existing = lrg_workers.len();
+                    if self.active_lrg_workers() < std::cmp::min(max_l_workers, LARGE_WORKER_COUNT) as i32 {
+                        let workers = std::cmp::min(existing + 1, max_l_workers);
 
-                            drop(lrg_workers);
-                            self.resize_lrg_workers(workers, existing).await;
-                        }
+                        drop(lrg_workers);
+                        self.resize_lrg_workers(workers, existing).await;
                     }
                 }
             }
@@ -539,47 +556,45 @@ impl<S: StorageAPI> ReplicationPool<S> {
             _ => self.get_worker_ch(&ri.bucket, &ri.name, ri.size).await,
         };
 
-        if let Some(channel) = ch {
-            if channel.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err() {
-                // Queue to MRF if all workers are busy
-                let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
+        if let Some(channel) = ch
+            && channel.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err()
+        {
+            // Queue to MRF if all workers are busy
+            let _ = self.mrf_save_tx.try_send(ri.to_mrf_entry());
 
-                // Try to scale up workers based on priority
-                let priority = self.priority.read().await.clone();
-                let max_workers = *self.max_workers.read().await;
+            // Try to scale up workers based on priority
+            let priority = self.priority.read().await.clone();
+            let max_workers = *self.max_workers.read().await;
 
-                match priority {
-                    ReplicationPriority::Fast => {
-                        // Log warning about unable to keep up
-                        info!("Warning: Unable to keep up with incoming traffic");
+            match priority {
+                ReplicationPriority::Fast => {
+                    // Log warning about unable to keep up
+                    info!("Warning: Unable to keep up with incoming traffic");
+                }
+                ReplicationPriority::Slow => {
+                    info!("Warning: Unable to keep up with incoming traffic - recommend increasing replication priority to auto");
+                }
+                ReplicationPriority::Auto => {
+                    let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
+                    let active_workers = self.active_workers();
+
+                    if active_workers < max_w as i32 {
+                        let workers = self.workers.read().await;
+                        let new_count = std::cmp::min(workers.len() + 1, max_w);
+                        let existing = workers.len();
+
+                        drop(workers);
+                        self.resize_workers(new_count, existing).await;
                     }
-                    ReplicationPriority::Slow => {
-                        info!(
-                            "Warning: Unable to keep up with incoming traffic - recommend increasing replication priority to auto"
-                        );
-                    }
-                    ReplicationPriority::Auto => {
-                        let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                        let active_workers = self.active_workers();
 
-                        if active_workers < max_w as i32 {
-                            let workers = self.workers.read().await;
-                            let new_count = std::cmp::min(workers.len() + 1, max_w);
-                            let existing = workers.len();
+                    let max_mrf_workers = std::cmp::min(max_workers, MRF_WORKER_MAX_LIMIT);
+                    let active_mrf = self.active_mrf_workers();
 
-                            drop(workers);
-                            self.resize_workers(new_count, existing).await;
-                        }
+                    if active_mrf < max_mrf_workers as i32 {
+                        let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
+                        let new_mrf = std::cmp::min(current_mrf + 1, max_mrf_workers as i32);
 
-                        let max_mrf_workers = std::cmp::min(max_workers, MRF_WORKER_MAX_LIMIT);
-                        let active_mrf = self.active_mrf_workers();
-
-                        if active_mrf < max_mrf_workers as i32 {
-                            let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
-                            let new_mrf = std::cmp::min(current_mrf + 1, max_mrf_workers as i32);
-
-                            self.resize_failed_workers(new_mrf).await;
-                        }
+                        self.resize_failed_workers(new_mrf).await;
                     }
                 }
             }
@@ -593,31 +608,29 @@ impl<S: StorageAPI> ReplicationPool<S> {
             _ => self.get_worker_ch(&doi.bucket, &doi.delete_object.object_name, 0).await,
         };
 
-        if let Some(channel) = ch {
-            if channel.try_send(ReplicationOperation::Delete(Box::new(doi.clone()))).is_err() {
-                let _ = self.mrf_save_tx.try_send(doi.to_mrf_entry());
+        if let Some(channel) = ch
+            && channel.try_send(ReplicationOperation::Delete(Box::new(doi.clone()))).is_err()
+        {
+            let _ = self.mrf_save_tx.try_send(doi.to_mrf_entry());
 
-                let priority = self.priority.read().await.clone();
-                let max_workers = *self.max_workers.read().await;
+            let priority = self.priority.read().await.clone();
+            let max_workers = *self.max_workers.read().await;
 
-                match priority {
-                    ReplicationPriority::Fast => {
-                        info!("Warning: Unable to keep up with incoming deletes");
-                    }
-                    ReplicationPriority::Slow => {
-                        info!(
-                            "Warning: Unable to keep up with incoming deletes - recommend increasing replication priority to auto"
-                        );
-                    }
-                    ReplicationPriority::Auto => {
-                        let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                        if self.active_workers() < max_w as i32 {
-                            let workers = self.workers.read().await;
-                            let new_count = std::cmp::min(workers.len() + 1, max_w);
-                            let existing = workers.len();
-                            drop(workers);
-                            self.resize_workers(new_count, existing).await;
-                        }
+            match priority {
+                ReplicationPriority::Fast => {
+                    info!("Warning: Unable to keep up with incoming deletes");
+                }
+                ReplicationPriority::Slow => {
+                    info!("Warning: Unable to keep up with incoming deletes - recommend increasing replication priority to auto");
+                }
+                ReplicationPriority::Auto => {
+                    let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
+                    if self.active_workers() < max_w as i32 {
+                        let workers = self.workers.read().await;
+                        let new_count = std::cmp::min(workers.len() + 1, max_w);
+                        let existing = workers.len();
+                        drop(workers);
+                        self.resize_workers(new_count, existing).await;
                     }
                 }
             }
@@ -769,7 +782,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
             }
 
             // Generate random duration between 0 and 1 minute
-            use rand::Rng;
+            use rand::RngExt;
             let duration_millis = rand::rng().random_range(0..60_000);
             let mut duration = Duration::from_millis(duration_millis);
 
@@ -1030,6 +1043,155 @@ pub async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
             stats
                 .update(&dv.bucket, &ri, ReplicationStatusType::Pending, ReplicationStatusType::Empty)
                 .await;
+        }
+    }
+}
+
+/// QueueReplicationHeal is a wrapper for queue_replication_heal_internal
+pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u32) {
+    // ignore modtime zero objects
+    if oi.mod_time.is_none() || oi.mod_time == Some(OffsetDateTime::UNIX_EPOCH) {
+        return;
+    }
+
+    let rcfg = match metadata_sys::get_replication_config(bucket).await {
+        Ok((config, _)) => config,
+        Err(err) => {
+            warn!("Failed to get replication config for bucket {}: {}", bucket, err);
+
+            return;
+        }
+    };
+
+    let tgts = match BucketTargetSys::get().list_bucket_targets(bucket).await {
+        Ok(targets) => Some(targets),
+        Err(err) => {
+            warn!("Failed to list bucket targets for bucket {}: {}", bucket, err);
+            None
+        }
+    };
+
+    let rcfg_wrapper = ReplicationConfig::new(Some(rcfg), tgts);
+    queue_replication_heal_internal(bucket, oi, rcfg_wrapper, retry_count).await;
+}
+
+/// queue_replication_heal_internal enqueues objects that failed replication OR eligible for resyncing through
+/// an ongoing resync operation or via existing objects replication configuration setting.
+pub async fn queue_replication_heal_internal(
+    _bucket: &str,
+    oi: ObjectInfo,
+    rcfg: ReplicationConfig,
+    retry_count: u32,
+) -> ReplicateObjectInfo {
+    let mut roi = ReplicateObjectInfo::default();
+
+    // ignore modtime zero objects
+    if oi.mod_time.is_none() || oi.mod_time == Some(OffsetDateTime::UNIX_EPOCH) {
+        return roi;
+    }
+
+    if rcfg.config.is_none() || rcfg.remotes.is_none() {
+        return roi;
+    }
+
+    roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+    roi.retry_count = retry_count;
+
+    if !roi.dsc.replicate_any() {
+        return roi;
+    }
+
+    // early return if replication already done, otherwise we need to determine if this
+    // version is an existing object that needs healing.
+    if roi.replication_status == ReplicationStatusType::Completed
+        && roi.version_purge_status.is_empty()
+        && !roi.existing_obj_resync.must_resync()
+    {
+        return roi;
+    }
+
+    if roi.delete_marker || !roi.version_purge_status.is_empty() {
+        let (version_id, dm_version_id) = if roi.version_purge_status.is_empty() {
+            (None, roi.version_id)
+        } else {
+            (roi.version_id, None)
+        };
+
+        let dv = DeletedObjectReplicationInfo {
+            delete_object: crate::store_api::DeletedObject {
+                object_name: roi.name.clone(),
+                delete_marker_version_id: dm_version_id,
+                version_id,
+                replication_state: roi.replication_state.clone(),
+                delete_marker_mtime: roi.mod_time,
+                delete_marker: roi.delete_marker,
+                ..Default::default()
+            },
+            bucket: roi.bucket.clone(),
+            op_type: ReplicationType::Heal,
+            event_type: REPLICATE_HEAL_DELETE.to_string(),
+            ..Default::default()
+        };
+
+        // heal delete marker replication failure or versioned delete replication failure
+        if roi.replication_status == ReplicationStatusType::Pending
+            || roi.replication_status == ReplicationStatusType::Failed
+            || roi.version_purge_status == VersionPurgeStatusType::Failed
+            || roi.version_purge_status == VersionPurgeStatusType::Pending
+        {
+            if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+                pool.queue_replica_delete_task(dv).await;
+            }
+            return roi;
+        }
+
+        // if replication status is Complete on DeleteMarker and existing object resync required
+        let existing_obj_resync = roi.existing_obj_resync.clone();
+        if existing_obj_resync.must_resync()
+            && (roi.replication_status == ReplicationStatusType::Completed || roi.replication_status.is_empty())
+        {
+            queue_replicate_deletes_wrapper(dv, existing_obj_resync).await;
+            return roi;
+        }
+
+        return roi;
+    }
+
+    if roi.existing_obj_resync.must_resync() {
+        roi.op_type = ReplicationType::ExistingObject;
+    }
+
+    match roi.replication_status {
+        ReplicationStatusType::Pending | ReplicationStatusType::Failed => {
+            roi.event_type = REPLICATE_HEAL.to_string();
+            if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+                pool.queue_replica_task(roi.clone()).await;
+            }
+            return roi;
+        }
+        _ => {}
+    }
+
+    if roi.existing_obj_resync.must_resync() {
+        roi.event_type = REPLICATE_EXISTING.to_string();
+        if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+            pool.queue_replica_task(roi.clone()).await;
+        }
+    }
+
+    roi
+}
+
+/// Wrapper function for queueing replicate deletes with resync decision
+async fn queue_replicate_deletes_wrapper(doi: DeletedObjectReplicationInfo, existing_obj_resync: ResyncDecision) {
+    for (k, v) in existing_obj_resync.targets.iter() {
+        if v.replicate {
+            let mut dv = doi.clone();
+            dv.reset_id = v.reset_id.clone();
+            dv.target_arn = k.clone();
+            if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+                pool.queue_replica_delete_task(dv).await;
+            }
         }
     }
 }

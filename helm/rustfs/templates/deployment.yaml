@@ -1,3 +1,5 @@
+{{- $logDir := .Values.config.rustfs.obs_log_directory }}
+
 {{- if .Values.mode.standalone.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -10,6 +12,10 @@ metadata:
     {{- end }}
 spec:
   replicas: 1
+  {{- with .Values.mode.standalone.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "rustfs.selectorLabels" . | nindent 6 }}
@@ -24,6 +30,10 @@ spec:
       {{- with include "chart.imagePullSecrets" . }}
       imagePullSecrets:
         {{- . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.nodeSelector (not .Values.affinity.nodeAffinity) }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
       {{- end }}
       {{- if .Values.affinity }}
       affinity:
@@ -47,58 +57,48 @@ spec:
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
       {{- end }}
-      {{- if .Values.podSecurityContext }}
       securityContext:
-      {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- end }}
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- if .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       {{- end }}
       initContainers:
         - name: init-step
-          image: busybox
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: "{{ .Values.image.initImage.repository }}:{{ .Values.image.initImage.tag }}"
+          imagePullPolicy: {{ .Values.image.initImage.pullPolicy }}
           securityContext:
-            runAsUser: 0
-            runAsGroup: 0
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           command:
             - sh
             - -c
             - |
-              mkdir -p /data /logs
-              chown -R 10001:10001 /data /logs
+              mkdir -p /data /mnt/rustfs/logs
+              chmod 755 /mnt/rustfs/logs
           volumeMounts:
             - name: data
               mountPath: /data
             - name: logs
-              mountPath: /logs
+              mountPath: /mnt/rustfs
       containers:
         - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
           command: ["/usr/bin/rustfs"]
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if .Values.containerSecurityContext }}
+          imagePullPolicy: {{ .Values.image.rustfs.pullPolicy }}
           securityContext:
-          {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          {{- end }}
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           ports:
-            - containerPort: {{ .Values.service.ep_port }}
-              name: endpoint
-            - containerPort: {{ .Values.service.console_port }}
-              name: console
+            - name: endpoint
+              containerPort: {{ .Values.service.endpoint.port }}
+            - name: console
+              containerPort: {{ .Values.service.console.port }}
           envFrom:
             - configMapRef:
                 name: {{ include "rustfs.fullname" . }}-config
             - secretRef:
                 name: {{ include "rustfs.secretName" . }}
           resources:
-            requests:
-              memory: {{ .Values.resources.requests.memory }}
-              cpu: {{ .Values.resources.requests.cpu }}
-            limits:
-              memory: {{ .Values.resources.limits.memory }}
-              cpu: {{ .Values.resources.limits.cpu }}
+            {{- toYaml .Values.resources | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /health
@@ -119,14 +119,11 @@ spec:
             failureThreshold: 3
           volumeMounts:
             - name: logs
-              mountPath: /logs
+              mountPath: {{ $logDir }}
+              subPath: logs
             - name: data
               mountPath: /data
-            - name: tmp
-              mountPath: /tmp
       volumes:
-        - name: tmp
-          emptyDir: {}
         - name: logs
           persistentVolumeClaim:
             claimName: {{ include "rustfs.fullname" . }}-logs

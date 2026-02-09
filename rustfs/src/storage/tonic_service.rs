@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
-use rustfs_common::{globals::GLOBAL_LOCAL_NODE_NAME, heal_channel::HealOpts};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, heal_channel::HealOpts};
 use rustfs_ecstore::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},
@@ -24,6 +24,7 @@ use rustfs_ecstore::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts,
         error::DiskError,
     },
+    get_global_lock_client,
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
     new_object_layer_fn,
     rpc::{LocalPeerS3Client, PeerS3Client},
@@ -74,16 +75,11 @@ type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 #[derive(Debug)]
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
-    lock_manager: Arc<rustfs_lock::LocalClient>,
 }
 
 pub fn make_server() -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    let lock_manager = Arc::new(rustfs_lock::LocalClient::new());
-    NodeService {
-        local_peer,
-        lock_manager,
-    }
+    NodeService { local_peer }
 }
 
 impl NodeService {
@@ -93,6 +89,12 @@ impl NodeService {
 
     async fn all_disk(&self) -> Vec<String> {
         all_local_disk_path().await
+    }
+
+    /// Get the global lock client, returning an error if not initialized
+    fn get_lock_client(&self) -> Result<Arc<dyn LockClient>, Status> {
+        get_global_lock_client()
+            .ok_or_else(|| Status::internal("Lock client not initialized. Please ensure storage is initialized first."))
     }
 }
 
@@ -1072,6 +1074,29 @@ impl Node for NodeService {
             }))
         }
     }
+    async fn read_metadata(&self, request: Request<ReadMetadataRequest>) -> Result<Response<ReadMetadataResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            match disk.read_metadata(&request.volume, &request.path).await {
+                Ok(data) => Ok(Response::new(ReadMetadataResponse {
+                    success: true,
+                    data,
+                    error: None,
+                })),
+                Err(err) => Ok(Response::new(ReadMetadataResponse {
+                    success: false,
+                    data: Bytes::new(),
+                    error: Some(err.into()),
+                })),
+            }
+        } else {
+            Ok(Response::new(ReadMetadataResponse {
+                success: false,
+                data: Bytes::new(),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
+            }))
+        }
+    }
 
     async fn update_metadata(&self, request: Request<UpdateMetadataRequest>) -> Result<Response<UpdateMetadataResponse>, Status> {
         let request = request.into_inner();
@@ -1435,21 +1460,29 @@ impl Node for NodeService {
                 return Ok(Response::new(GenerallyLockResponse {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
                 }));
             }
         };
 
-        match self.lock_manager.acquire_exclusive(&args).await {
-            Ok(result) => Ok(Response::new(GenerallyLockResponse {
-                success: result.success,
-                error_info: None,
-            })),
+        let lock_client = self.get_lock_client()?;
+        match lock_client.acquire_lock(&args).await {
+            Ok(result) => {
+                // Serialize lock_info if available
+                let lock_info_json = result.lock_info.as_ref().and_then(|info| serde_json::to_string(info).ok());
+                Ok(Response::new(GenerallyLockResponse {
+                    success: result.success,
+                    error_info: None,
+                    lock_info: lock_info_json,
+                }))
+            }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!(
                     "can not lock, resource: {0}, owner: {1}, err: {2}",
                     args.resource, args.owner, err
                 )),
+                lock_info: None,
             })),
         }
     }
@@ -1462,14 +1495,17 @@ impl Node for NodeService {
                 return Ok(Response::new(GenerallyLockResponse {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
                 }));
             }
         };
 
-        match self.lock_manager.release(&args.lock_id).await {
+        let lock_client = self.get_lock_client()?;
+        match lock_client.release(&args.lock_id).await {
             Ok(_) => Ok(Response::new(GenerallyLockResponse {
                 success: true,
                 error_info: None,
+                lock_info: None,
             })),
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
@@ -1477,60 +1513,7 @@ impl Node for NodeService {
                     "can not unlock, resource: {0}, owner: {1}, err: {2}",
                     args.resource, args.owner, err
                 )),
-            })),
-        }
-    }
-
-    async fn r_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
-        let request = request.into_inner();
-        let args: LockRequest = match serde_json::from_str(&request.args) {
-            Ok(args) => args,
-            Err(err) => {
-                return Ok(Response::new(GenerallyLockResponse {
-                    success: false,
-                    error_info: Some(format!("can not decode args, err: {err}")),
-                }));
-            }
-        };
-
-        match self.lock_manager.acquire_shared(&args).await {
-            Ok(result) => Ok(Response::new(GenerallyLockResponse {
-                success: result.success,
-                error_info: None,
-            })),
-            Err(err) => Ok(Response::new(GenerallyLockResponse {
-                success: false,
-                error_info: Some(format!(
-                    "can not rlock, resource: {0}, owner: {1}, err: {2}",
-                    args.resource, args.owner, err
-                )),
-            })),
-        }
-    }
-
-    async fn r_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
-        let request = request.into_inner();
-        let args: LockRequest = match serde_json::from_str(&request.args) {
-            Ok(args) => args,
-            Err(err) => {
-                return Ok(Response::new(GenerallyLockResponse {
-                    success: false,
-                    error_info: Some(format!("can not decode args, err: {err}")),
-                }));
-            }
-        };
-
-        match self.lock_manager.release(&args.lock_id).await {
-            Ok(_) => Ok(Response::new(GenerallyLockResponse {
-                success: true,
-                error_info: None,
-            })),
-            Err(err) => Ok(Response::new(GenerallyLockResponse {
-                success: false,
-                error_info: Some(format!(
-                    "can not runlock, resource: {0}, owner: {1}, err: {2}",
-                    args.resource, args.owner, err
-                )),
+                lock_info: None,
             })),
         }
     }
@@ -1543,14 +1526,17 @@ impl Node for NodeService {
                 return Ok(Response::new(GenerallyLockResponse {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
                 }));
             }
         };
 
-        match self.lock_manager.release(&args.lock_id).await {
+        let lock_client = self.get_lock_client()?;
+        match lock_client.release(&args.lock_id).await {
             Ok(_) => Ok(Response::new(GenerallyLockResponse {
                 success: true,
                 error_info: None,
+                lock_info: None,
             })),
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
@@ -1558,6 +1544,7 @@ impl Node for NodeService {
                     "can not force_unlock, resource: {0}, owner: {1}, err: {2}",
                     args.resource, args.owner, err
                 )),
+                lock_info: None,
             })),
         }
     }
@@ -1570,6 +1557,7 @@ impl Node for NodeService {
                 return Ok(Response::new(GenerallyLockResponse {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
                 }));
             }
         };
@@ -1577,6 +1565,7 @@ impl Node for NodeService {
         Ok(Response::new(GenerallyLockResponse {
             success: true,
             error_info: None,
+            lock_info: None,
         }))
     }
 
@@ -1774,11 +1763,34 @@ impl Node for NodeService {
 
     async fn get_metrics(&self, request: Request<GetMetricsRequest>) -> Result<Response<GetMetricsResponse>, Status> {
         let request = request.into_inner();
-        let mut buf_t = Deserializer::new(Cursor::new(request.metric_type));
-        let t: MetricType = Deserialize::deserialize(&mut buf_t).unwrap();
 
+        // Deserialize metric_type with error handling
+        let mut buf_t = Deserializer::new(Cursor::new(request.metric_type));
+        let t: MetricType = match Deserialize::deserialize(&mut buf_t) {
+            Ok(t) => t,
+            Err(err) => {
+                error!("Failed to deserialize metric_type: {}", err);
+                return Ok(Response::new(GetMetricsResponse {
+                    success: false,
+                    realtime_metrics: Bytes::new(),
+                    error_info: Some(format!("Invalid metric_type: {err}")),
+                }));
+            }
+        };
+
+        // Deserialize opts with error handling
         let mut buf_o = Deserializer::new(Cursor::new(request.opts));
-        let opts: CollectMetricsOpts = Deserialize::deserialize(&mut buf_o).unwrap();
+        let opts: CollectMetricsOpts = match Deserialize::deserialize(&mut buf_o) {
+            Ok(opts) => opts,
+            Err(err) => {
+                error!("Failed to deserialize opts: {}", err);
+                return Ok(Response::new(GetMetricsResponse {
+                    success: false,
+                    realtime_metrics: Bytes::new(),
+                    error_info: Some(format!("Invalid opts: {err}")),
+                }));
+            }
+        };
 
         let info = collect_local_metrics(t, &opts).await;
 
@@ -3164,38 +3176,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_r_lock_invalid_args() {
-        let service = create_test_node_service();
-
-        let request = Request::new(GenerallyLockRequest {
-            args: "invalid json".to_string(),
-        });
-
-        let response = service.r_lock(request).await;
-        assert!(response.is_ok());
-
-        let rlock_response = response.unwrap().into_inner();
-        assert!(!rlock_response.success);
-        assert!(rlock_response.error_info.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_r_un_lock_invalid_args() {
-        let service = create_test_node_service();
-
-        let request = Request::new(GenerallyLockRequest {
-            args: "invalid json".to_string(),
-        });
-
-        let response = service.r_un_lock(request).await;
-        assert!(response.is_ok());
-
-        let runlock_response = response.unwrap().into_inner();
-        assert!(!runlock_response.success);
-        assert!(runlock_response.error_info.is_some());
-    }
-
-    #[tokio::test]
     async fn test_force_un_lock_invalid_args() {
         let service = create_test_node_service();
 
@@ -3647,5 +3627,33 @@ mod tests {
         let disk = service.find_disk(&"non-existent-disk".to_string()).await;
         // Should return None for non-existent disk
         assert!(disk.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_metrics_invalid_metric_type() {
+        let service = create_test_node_service();
+        let request = Request::new(GetMetricsRequest {
+            metric_type: Bytes::from(vec![0x00u8, 0x01u8]), // Invalid rmp data
+            opts: Bytes::new(),                             // Valid or invalid
+        });
+        let response = service.get_metrics(request).await.unwrap().into_inner();
+        assert!(!response.success);
+        assert!(response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_metrics_invalid_opts() {
+        let service = create_test_node_service();
+        // Serialize a valid MetricType
+        let metric_type = MetricType::DISK;
+        let metric_type_bytes = rmp_serde::to_vec(&metric_type).unwrap();
+
+        let request = Request::new(GetMetricsRequest {
+            metric_type: Bytes::from(metric_type_bytes),
+            opts: Bytes::from(vec![0x00u8, 0x01u8]), // Invalid rmp data
+        });
+        let response = service.get_metrics(request).await.unwrap().into_inner();
+        assert!(!response.success);
+        assert!(response.error_info.is_some());
     }
 }

@@ -18,14 +18,14 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
+use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
+use crate::global::GLOBAL_TierConfigMgr;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::io::Write;
+use uuid::Uuid;
 use xxhash_rust::xxh64;
-
-use super::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
-use super::lifecycle::{self, ObjectOpts};
-use crate::global::GLOBAL_TierConfigMgr;
 
 static XXHASH_SEED: u64 = 0;
 
@@ -34,7 +34,7 @@ static XXHASH_SEED: u64 = 0;
 struct ObjSweeper {
     object: String,
     bucket: String,
-    version_id: String,
+    version_id: Option<Uuid>,
     versioned: bool,
     suspended: bool,
     transition_status: String,
@@ -54,8 +54,8 @@ impl ObjSweeper {
         })
     }
 
-    pub fn with_version(&mut self, vid: String) -> &Self {
-        self.version_id = vid;
+    pub fn with_version(&mut self, vid: Option<Uuid>) -> &Self {
+        self.version_id = vid.clone();
         self
     }
 
@@ -72,8 +72,8 @@ impl ObjSweeper {
             version_suspended: self.suspended,
             ..Default::default()
         };
-        if self.suspended && self.version_id == "" {
-            opts.version_id = String::from("");
+        if self.suspended && self.version_id.is_none_or(|v| v.is_nil()) {
+            opts.version_id = None;
         }
         opts
     }
@@ -94,7 +94,7 @@ impl ObjSweeper {
         if !self.versioned || self.suspended {
             // 1, 2.a, 2.b
             del_tier = true;
-        } else if self.versioned && self.version_id != "" {
+        } else if self.versioned && self.version_id.is_some_and(|v| !v.is_nil()) {
             // 3.a
             del_tier = true;
         }

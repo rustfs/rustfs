@@ -18,6 +18,7 @@ use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
+use rustfs_utils::http::RUSTFS_FORCE_DELETE;
 use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
 use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
@@ -32,6 +33,7 @@ use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_REQUEST;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
 use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_VERSION_ID;
+use rustfs_utils::http::RUSTFS_ENCRYPTION_LOWER;
 use rustfs_utils::path::is_dir_object;
 use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
@@ -57,26 +59,40 @@ pub async fn del_opts(
     let vid = if vid.is_none() {
         headers
             .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
-            .map(|v| v.to_str().unwrap().to_owned())
+            .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
     } else {
         vid
     };
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if *id != Uuid::nil().to_string()
-            && let Err(err) = Uuid::parse_str(id.as_str())
-        {
-            error!("del_opts: invalid version id: {} error: {}", id, err);
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+    // Handle AWS S3 special case: "null" string represents null version ID
+    // When VersionId='null' is specified, it means delete the object with null version ID
+    let vid = if let Some(ref id) = vid {
+        if id.eq_ignore_ascii_case("null") {
+            // Convert "null" to Uuid::nil() string representation
+            Some(Uuid::nil().to_string())
+        } else {
+            // Validate UUID format for other version IDs
+            if *id != Uuid::nil().to_string() && Uuid::parse_str(id.as_str()).is_err() {
+                error!("del_opts: invalid version id: {} error: invalid UUID format", id);
+                return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+            }
+            Some(id.clone())
         }
-    }
+    } else {
+        None
+    };
 
     let mut opts = put_opts_from_headers(headers, metadata.clone()).map_err(|err| {
         error!("del_opts: invalid argument: {} error: {}", object, err);
         StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())
     })?;
+
+    opts.delete_prefix = headers
+        .get(RUSTFS_FORCE_DELETE)
+        .map(|v| v.to_str().unwrap_or_default() == "true")
+        .unwrap_or_default();
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
@@ -111,20 +127,28 @@ pub async fn get_opts(
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if *id != Uuid::nil().to_string()
-            && let Err(_err) = Uuid::parse_str(id.as_str())
-        {
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+    let nil_uuid_str = Uuid::nil().to_string();
+
+    let vid = match vid {
+        Some(ref id) => {
+            if id.eq_ignore_ascii_case("null") {
+                Some(nil_uuid_str.clone())
+            } else {
+                if id.as_str() != nil_uuid_str.as_str() && Uuid::parse_str(id).is_err() {
+                    return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+                }
+                Some(id.clone())
+            }
         }
-    }
+        None => None,
+    };
 
     let mut opts = get_default_opts(headers, HashMap::new(), false)
         .map_err(|err| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string()))?;
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::nil().to_string())
+            Some(nil_uuid_str)
         } else {
             vid
         }
@@ -180,19 +204,18 @@ pub async fn put_opts(
     let vid = if vid.is_none() {
         headers
             .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
-            .map(|v| v.to_str().unwrap().to_owned())
+            .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
     } else {
         vid
     };
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if *id != Uuid::nil().to_string()
-            && let Err(_err) = Uuid::parse_str(id.as_str())
-        {
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
+    if let Some(ref id) = vid
+        && *id != Uuid::nil().to_string()
+        && let Err(_err) = Uuid::parse_str(id.as_str())
+    {
+        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
 
     let mut opts = put_opts_from_headers(headers, metadata)
@@ -333,29 +356,60 @@ pub fn extract_metadata_from_mime_with_object_name(
 }
 
 pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    // Standard HTTP headers that should NOT be returned in the Metadata field
+    // These are returned as separate response headers, not user metadata
+    const EXCLUDED_HEADERS: &[&str] = &[
+        "content-type",
+        "content-encoding",
+        "content-disposition",
+        "content-language",
+        "cache-control",
+        "expires",
+        "etag",
+        "x-amz-storage-class",
+        "x-amz-tagging",
+        "x-amz-replication-status",
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key-md5",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+    ];
+
     let mut filtered_metadata = HashMap::new();
     for (k, v) in metadata {
-        if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
+        let lower_key = k.to_ascii_lowercase();
+        // Skip internal/reserved metadata
+        if lower_key.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
             continue;
         }
+
+        // Skip internal encryption metadata
+        if lower_key.starts_with(RUSTFS_ENCRYPTION_LOWER) {
+            continue;
+        }
+
+        // Skip empty object lock values
         if v.is_empty() && (k == &X_AMZ_OBJECT_LOCK_MODE.to_string() || k == &X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string()) {
             continue;
         }
 
+        // Skip UNENCRYPTED metadata placeholders
         if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
             continue;
         }
 
-        let lower_key = k.to_ascii_lowercase();
-        if let Some(key) = lower_key.strip_prefix("x-amz-meta-") {
-            filtered_metadata.insert(key.to_string(), v.to_string());
-            continue;
-        }
-        if let Some(key) = lower_key.strip_prefix("x-rustfs-meta-") {
-            filtered_metadata.insert(key.to_string(), v.to_string());
+        // Skip standard HTTP headers (they are returned as separate headers, not metadata)
+        if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {
             continue;
         }
 
+        // Skip any x-amz-* headers that are not user metadata
+        // User metadata was stored WITHOUT the x-amz-meta- prefix by extract_metadata_from_mime
+        if lower_key.starts_with("x-amz-") {
+            continue;
+        }
+
+        // Include user-defined metadata (keys like "meta1", "custom-key", etc.)
         filtered_metadata.insert(k.clone(), v.clone());
     }
     if filtered_metadata.is_empty() {
@@ -404,6 +458,10 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "x-amz-tagging",
         "expires",
         "x-amz-replication-status",
+        // Object Lock headers - required for S3 Object Lock functionality
+        "x-amz-object-lock-mode",
+        "x-amz-object-lock-retain-until-date",
+        "x-amz-object-lock-legal-hold",
     ]
 });
 
@@ -512,12 +570,11 @@ fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
             // such broken clients and content-length > 0.
             // For now, we'll assume strict compatibility is disabled
             // In a real implementation, you would check a global config
-            if let Some(content_length) = headers.get("content-length") {
-                if let Ok(length_str) = content_length.to_str() {
-                    if let Ok(length) = length_str.parse::<i64>() {
-                        return length > 0; // && !global_server_ctxt.strict_s3_compat
-                    }
-                }
+            if let Some(content_length) = headers.get("content-length")
+                && let Ok(length_str) = content_length.to_str()
+                && let Ok(length) = length_str.parse::<i64>()
+            {
+                return length > 0; // && !global_server_ctxt.strict_s3_compat
             }
             false
         }
@@ -546,10 +603,10 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
     };
 
     // We found 'X-Amz-Content-Sha256' return the captured value.
-    if let Some(header_value) = content_sha256 {
-        if let Ok(value) = header_value.to_str() {
-            return value.to_string();
-        }
+    if let Some(header_value) = content_sha256
+        && let Ok(value) = header_value.to_str()
+    {
+        return value.to_string();
     }
 
     // We couldn't find 'X-Amz-Content-Sha256'.
@@ -640,6 +697,62 @@ mod tests {
                 _ => panic!("Expected InvalidVersionID error"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_del_opts_with_delete_prefix() {
+        let mut headers = create_test_headers();
+        let metadata = create_test_metadata();
+
+        // Test without RUSTFS_FORCE_DELETE header - should default to false
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(!opts.delete_prefix);
+
+        // Test with RUSTFS_FORCE_DELETE header set to "true"
+        headers.insert(RUSTFS_FORCE_DELETE, HeaderValue::from_static("true"));
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(opts.delete_prefix);
+
+        // Test with RUSTFS_FORCE_DELETE header set to "false"
+        headers.insert(RUSTFS_FORCE_DELETE, HeaderValue::from_static("false"));
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(!opts.delete_prefix);
+
+        // Test with RUSTFS_FORCE_DELETE header set to other value
+        headers.insert(RUSTFS_FORCE_DELETE, HeaderValue::from_static("maybe"));
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(!opts.delete_prefix);
+    }
+
+    #[tokio::test]
+    async fn test_del_opts_with_null_version_id() {
+        let headers = create_test_headers();
+        let metadata = create_test_metadata();
+        let result = del_opts("test-bucket", "test-object", Some("null".to_string()), &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let result = del_opts("test-bucket", "test-object", Some("NULL".to_string()), &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_ops_with_null_version_id() {
+        let headers = create_test_headers();
+        let result = get_opts("test-bucket", "test-object", Some("null".to_string()), None, &headers).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+        let result = get_opts("test-bucket", "test-object", Some("NULL".to_string()), None, &headers).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
     }
 
     #[tokio::test]
@@ -939,10 +1052,13 @@ mod tests {
             "x-amz-tagging",
             "expires",
             "x-amz-replication-status",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-object-lock-legal-hold",
         ];
 
         assert_eq!(*SUPPORTED_HEADERS, expected_headers);
-        assert_eq!(SUPPORTED_HEADERS.len(), 9);
+        assert_eq!(SUPPORTED_HEADERS.len(), 12);
     }
 
     #[test]

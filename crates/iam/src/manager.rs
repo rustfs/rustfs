@@ -24,19 +24,18 @@ use crate::{
     },
 };
 use futures::future::join_all;
-use rustfs_ecstore::global::get_global_action_cred;
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
-    auth::{self, Credentials, UserIdentity, is_secret_key_valid, jwt_sign},
+    auth::{self, UserIdentity, is_secret_key_valid, jwt_sign},
     format::Format,
-    policy::{
-        EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
-    },
+    policy::{Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa},
 };
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::AtomicU8;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -76,9 +75,19 @@ fn get_iam_format_file_path() -> String {
     path_join_buf(&[&IAM_CONFIG_PREFIX, IAM_FORMAT_FILE])
 }
 
+#[repr(u8)]
+#[derive(Debug, PartialEq)]
+pub enum IamState {
+    Uninitialized = 0,
+    Loading = 1,
+    Ready = 2,
+    Error = 3,
+}
+
 pub struct IamCache<T> {
     pub cache: Cache,
     pub api: T,
+    pub state: Arc<AtomicU8>,
     pub loading: Arc<AtomicBool>,
     pub roles: HashMap<ARN, Vec<String>>,
     pub send_chan: Sender<i64>,
@@ -89,12 +98,19 @@ impl<T> IamCache<T>
 where
     T: Store,
 {
+    /// Create a new IAM system instance
+    /// # Arguments
+    /// * `api` - The storage backend implementing the Store trait
+    ///
+    /// # Returns
+    /// An Arc-wrapped instance of IamSystem
     pub(crate) async fn new(api: T) -> Arc<Self> {
         let (sender, receiver) = mpsc::channel::<i64>(100);
 
         let sys = Arc::new(Self {
             api,
             cache: Cache::default(),
+            state: Arc::new(AtomicU8::new(IamState::Uninitialized as u8)),
             loading: Arc::new(AtomicBool::new(false)),
             send_chan: sender,
             roles: HashMap::new(),
@@ -105,10 +121,32 @@ where
         sys
     }
 
+    /// Initialize the IAM system
     async fn init(self: Arc<Self>, receiver: Receiver<i64>) -> Result<()> {
+        self.state.store(IamState::Loading as u8, Ordering::SeqCst);
+        // Ensure the IAM format file is persisted first
         self.clone().save_iam_formatter().await?;
-        self.clone().load().await?;
 
+        // Critical: Load all existing users/policies into memory cache
+        const MAX_RETRIES: usize = 3;
+        for attempt in 0..MAX_RETRIES {
+            if let Err(e) = self.clone().load().await {
+                if attempt == MAX_RETRIES - 1 {
+                    self.state.store(IamState::Error as u8, Ordering::SeqCst);
+                    error!("IAM fail to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
+                    return Err(e);
+                } else {
+                    warn!("IAM load failed, retrying... attempt {}", attempt + 1);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            } else {
+                break;
+            }
+        }
+        self.state.store(IamState::Ready as u8, Ordering::SeqCst);
+        info!("IAM System successfully initialized and marked as READY");
+
+        // Background ticker for synchronization
         // Check if environment variable is set
         let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK").is_ok();
 
@@ -150,6 +188,11 @@ where
         }
 
         Ok(())
+    }
+
+    /// Check if IAM system is ready
+    pub fn is_ready(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == IamState::Ready as u8
     }
 
     async fn _notify(&self) {
@@ -203,12 +246,12 @@ where
             }
 
             let sts_user = has_sts_user.map(|sts| sts.credentials.access_key.clone());
-            if let Some(ref sts) = sts_user {
-                if let Some(plc) = sts_policy_map.get(sts) {
-                    for p in plc.to_slice().iter() {
-                        if !policy_docs_map.contains_key(p) {
-                            let _ = self.api.load_policy_doc(p, &mut policy_docs_map).await;
-                        }
+            if let Some(ref sts) = sts_user
+                && let Some(plc) = sts_policy_map.get(sts)
+            {
+                for p in plc.to_slice().iter() {
+                    if !policy_docs_map.contains_key(p) {
+                        let _ = self.api.load_policy_doc(p, &mut policy_docs_map).await;
                     }
                 }
             }
@@ -592,10 +635,10 @@ where
         }
 
         let users = self.cache.users.load();
-        if let Some(x) = users.get(&cred.access_key) {
-            if x.credentials.is_service_account() {
-                return Err(Error::IAMActionNotAllowed);
-            }
+        if let Some(x) = users.get(&cred.access_key)
+            && x.credentials.is_service_account()
+        {
+            return Err(Error::IAMActionNotAllowed);
         }
 
         let u = UserIdentity::new(cred);
@@ -746,10 +789,10 @@ where
 
             if !policy_present {
                 let mut m = HashMap::new();
-                if let Err(err) = self.api.load_mapped_policy(name, UserType::Reg, true, &mut m).await {
-                    if !is_err_no_such_policy(&err) {
-                        return Err(err);
-                    }
+                if let Err(err) = self.api.load_mapped_policy(name, UserType::Reg, true, &mut m).await
+                    && !is_err_no_such_policy(&err)
+                {
+                    return Err(err);
                 }
                 if let Some(p) = m.get(name) {
                     Cache::add_or_update(&self.cache.group_policies, name, p, OffsetDateTime::now_utc());
@@ -772,10 +815,10 @@ where
             Some(p) => p.clone(),
             None => {
                 let mut m = HashMap::new();
-                if let Err(err) = self.api.load_mapped_policy(name, UserType::Reg, false, &mut m).await {
-                    if !is_err_no_such_policy(&err) {
-                        return Err(err);
-                    }
+                if let Err(err) = self.api.load_mapped_policy(name, UserType::Reg, false, &mut m).await
+                    && !is_err_no_such_policy(&err)
+                {
+                    return Err(err);
                 }
                 if let Some(p) = m.get(name) {
                     Cache::add_or_update(&self.cache.user_policies, name, p, OffsetDateTime::now_utc());
@@ -785,10 +828,10 @@ where
                         Some(p) => p.clone(),
                         None => {
                             let mut m = HashMap::new();
-                            if let Err(err) = self.api.load_mapped_policy(name, UserType::Sts, false, &mut m).await {
-                                if !is_err_no_such_policy(&err) {
-                                    return Err(err);
-                                }
+                            if let Err(err) = self.api.load_mapped_policy(name, UserType::Sts, false, &mut m).await
+                                && !is_err_no_such_policy(&err)
+                            {
+                                return Err(err);
                             }
                             if let Some(p) = m.get(name) {
                                 Cache::add_or_update(&self.cache.sts_policies, name, p, OffsetDateTime::now_utc());
@@ -821,10 +864,10 @@ where
                     Some(p) => p.clone(),
                     None => {
                         let mut m = HashMap::new();
-                        if let Err(err) = self.api.load_mapped_policy(group, UserType::Reg, true, &mut m).await {
-                            if !is_err_no_such_policy(&err) {
-                                return Err(err);
-                            }
+                        if let Err(err) = self.api.load_mapped_policy(group, UserType::Reg, true, &mut m).await
+                            && !is_err_no_such_policy(&err)
+                        {
+                            return Err(err);
                         }
                         if let Some(p) = m.get(group) {
                             Cache::add_or_update(&self.cache.group_policies, group, p, OffsetDateTime::now_utc());
@@ -867,10 +910,10 @@ where
                 Some(p) => p.clone(),
                 None => {
                     let mut m = HashMap::new();
-                    if let Err(err) = self.api.load_mapped_policy(group, UserType::Reg, true, &mut m).await {
-                        if !is_err_no_such_policy(&err) {
-                            return Err(err);
-                        }
+                    if let Err(err) = self.api.load_mapped_policy(group, UserType::Reg, true, &mut m).await
+                        && !is_err_no_such_policy(&err)
+                    {
+                        return Err(err);
                     }
                     if let Some(p) = m.get(group) {
                         Cache::add_or_update(&self.cache.group_policies, group, p, OffsetDateTime::now_utc());
@@ -894,10 +937,10 @@ where
         }
 
         if policy.is_empty() {
-            if let Err(err) = self.api.delete_mapped_policy(name, user_type, is_group).await {
-                if !is_err_no_such_policy(&err) {
-                    return Err(err);
-                }
+            if let Err(err) = self.api.delete_mapped_policy(name, user_type, is_group).await
+                && !is_err_no_such_policy(&err)
+            {
+                return Err(err);
             }
 
             if is_group {
@@ -1177,10 +1220,10 @@ where
 
         Cache::delete(&self.cache.user_policies, access_key, OffsetDateTime::now_utc());
 
-        if let Err(err) = self.api.delete_user_identity(access_key, utype).await {
-            if !is_err_no_such_user(&err) {
-                return Err(err);
-            }
+        if let Err(err) = self.api.delete_user_identity(access_key, utype).await
+            && !is_err_no_such_user(&err)
+        {
+            return Err(err);
         }
 
         if utype == UserType::Sts {
@@ -1213,6 +1256,28 @@ where
             .await?;
 
         self.update_user_with_claims(access_key, u)
+    }
+
+    /// Add SSH public key for a user (for SFTP authentication)
+    pub async fn add_user_ssh_public_key(&self, access_key: &str, public_key: &str) -> Result<()> {
+        if access_key.is_empty() || public_key.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let users = self.cache.users.load();
+        let u = match users.get(access_key) {
+            Some(u) => u,
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
+        };
+
+        let mut user_identity = u.clone();
+        user_identity.add_ssh_public_key(public_key);
+
+        self.api
+            .save_user_identity(access_key, UserType::Reg, user_identity.clone(), None)
+            .await?;
+
+        self.update_user_with_claims(access_key, user_identity)
     }
 
     pub async fn set_user_status(&self, access_key: &str, status: AccountStatus) -> Result<OffsetDateTime> {
@@ -1467,16 +1532,16 @@ where
         }
 
         if members.is_empty() {
-            if let Err(err) = self.api.delete_mapped_policy(group, UserType::Reg, true).await {
-                if !is_err_no_such_policy(&err) {
-                    return Err(err);
-                }
+            if let Err(err) = self.api.delete_mapped_policy(group, UserType::Reg, true).await
+                && !is_err_no_such_policy(&err)
+            {
+                return Err(err);
             }
 
-            if let Err(err) = self.api.delete_group_info(group).await {
-                if !is_err_no_such_group(&err) {
-                    return Err(err);
-                }
+            if let Err(err) = self.api.delete_group_info(group).await
+                && !is_err_no_such_group(&err)
+            {
+                return Err(err);
             }
 
             Cache::delete(&self.cache.groups, group, OffsetDateTime::now_utc());
@@ -1626,10 +1691,10 @@ where
             let member_of = self.cache.user_group_memberships.load();
             if let Some(m) = member_of.get(name) {
                 for group in m.iter() {
-                    if let Err(err) = self.remove_members_from_group(group, vec![name.to_string()], true).await {
-                        if !is_err_no_such_group(&err) {
-                            return Err(err);
-                        }
+                    if let Err(err) = self.remove_members_from_group(group, vec![name.to_string()], true).await
+                        && !is_err_no_such_group(&err)
+                    {
+                        return Err(err);
                     }
                 }
             }
@@ -1794,11 +1859,11 @@ fn filter_policies(cache: &Cache, policy_name: &str, bucket_name: &str) -> (Stri
             continue;
         }
 
-        if let Some(p) = cache.policy_docs.load().get(&policy) {
-            if bucket_name.is_empty() || pollster::block_on(p.policy.match_resource(bucket_name)) {
-                policies.push(policy);
-                to_merge.push(p.policy.clone());
-            }
+        if let Some(p) = cache.policy_docs.load().get(&policy)
+            && (bucket_name.is_empty() || pollster::block_on(p.policy.match_resource(bucket_name)))
+        {
+            policies.push(policy);
+            to_merge.push(p.policy.clone());
         }
     }
 

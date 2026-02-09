@@ -28,9 +28,13 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.region | string | `"us-east-1"` |  |
 | config.rustfs.rust_log | string | `"debug"` |  |
 | config.rustfs.volumes | string | `""` |  |
+| config.rustfs.log_rotation.size | int | `"100"` | Default log rotation size mb for rustfs. |
+| config.rustfs.log_rotation.time | string | `"hour"` | Default log rotation time for rustfs. |
+| config.rustfs.log_rotation.keep_files | int | `"30"` | Default log keep files for rustfs.  |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
+| enableServiceLinks | bool | `false` |  |
 | extraManifests | list | `[]` | List of additional k8s manifests. |
 | fullnameOverride | string | `""` |  |
 | image.pullPolicy | string | `"IfNotPresent"` |  |
@@ -44,7 +48,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | imageRegistryCredentials.username | string | `""` | The username to pull rustfs image from private registry. |
 | ingress.className | string | `"traefik"` | Specify the ingress class, traefik or nginx. |
 | ingress.enabled | bool | `true` |  |
-| ingress.hosts[0].host | string | `"your.rustfs.com"` |  |
+| ingress.hosts[0].host | string | `"example.rustfs.com"` |  |
 | ingress.hosts[0].paths[0].path | string | `"/"` |  |
 | ingress.hosts[0].paths[0].pathType | string | `"ImplementationSpecific"` |  |
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/affinity" | string | `"cookie"` |  |
@@ -52,6 +56,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-hash" | string | `"sha1"` |  |
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-max-age" | string | `"3600"` |  |
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-name" | string | `"rustfs"` |  |
+| ingress.customAnnotations | dict | `{}` |Customize annotations.  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie" | string | `"true"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.httponly" | string | `"true"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.name" | string | `"rustfs"` |  |
@@ -59,8 +64,6 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.secure" | string | `"true"` |  |
 | ingress.tls.enabled | bool | `false` | Enable tls and access rustfs via https. |
 | ingress.tls.certManager.enabled | string | `false` | Enable cert manager support to generate certificate automatically. |
-| ingress.tls.certManager.issuer.name | string | `false` | The name of cert manager issuer. |
-| ingress.tls.certManager.issuer.kind | string | `false` | The kind of cert manager issuer, issuer or cluster-issuer. |
 | ingress.tls.crt | string | "" | The content of certificate file. |
 | ingress.tls.key | string | "" | The content of key file. |
 | livenessProbe.failureThreshold | int | `3` |  |
@@ -72,8 +75,13 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | livenessProbe.timeoutSeconds | int | `3` |  |
 | mode.distributed.enabled | bool | `true` | RustFS distributed mode support, namely multiple pod multiple pvc. |
 | mode.standalone.enabled | bool | `false` | RustFS standalone mode support, namely one pod one pvc.  |
+| mtls.enabled | bool | `false` | Enable mtls betweens pods. |
+| mtls.serverOnly | bool | `false` | Only enable server https. |
 | nameOverride | string | `""` |  |
 | nodeSelector | object | `{}` |  |
+| pdb.create | bool | `false` | Enable/disable a Pod Disruption Budget creation |
+| pdb.maxUnavailable | string | `1` |  |
+| pdb.minAvailable | string | `""` |  |
 | podAnnotations | object | `{}` |  |
 | podLabels | object | `{}` |  |
 | podSecurityContext.fsGroup | int | `10001` |  |
@@ -94,9 +102,11 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | secret.existingSecret | string | `""` | Use existing secret with a credentials. |
 | secret.rustfs.access_key | string | `"rustfsadmin"` | RustFS Access Key ID |
 | secret.rustfs.secret_key | string | `"rustfsadmin"` | RustFS Secret Key ID |
-| service.console_port | int | `9001` |  |
-| service.ep_port | int | `9000` |  |
 | service.type | string | `"NodePort"` |  |
+| service.console.nodePort | int | `32001` |  |
+| service.console.port | int | `9001` |  |
+| service.endpoint.nodePort | int | `32000` |  |
+| service.endpoint.port | int | `9000` |  |
 | serviceAccount.annotations | object | `{}` |  |
 | serviceAccount.automount | bool | `true` |  |
 | serviceAccount.create | bool | `true` |  |
@@ -105,6 +115,12 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | storageclass.logStorageSize | string | `"256Mi"` | The storage size for logs PVC. |
 | storageclass.name | string | `"local-path"` | The name for StorageClass. |
 | tolerations | list | `[]` |  |
+| gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
+| gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
+| gatewayApi.hostname | string | Hostname to access RustFS via gateway api. |
+| gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
+| gatewayApi.existingGateway.name | string | `""` |  The existing gateway name, instead of creating a new one. |
+| gatewayApi.existingGateway.namespace | string | `""` |  The namespace of the existing gateway, if not the local namespace. |
 
 ---
 
@@ -179,12 +195,12 @@ Check the ingress status
 ```
 kubectl -n rustfs get ing
 NAME     CLASS   HOSTS            ADDRESS         PORTS     AGE
-rustfs   nginx   your.rustfs.com   10.43.237.152   80, 443   29m
+rustfs   nginx   example.rustfs.com   10.43.237.152   80, 443   29m
 ```
 
-Access the rustfs cluster via `https://your.rustfs.com` with the default username and password `rustfsadmin`.
+Access the rustfs cluster via `https://example.rustfs.com` with the default username and password `rustfsadmin`.
 
-> Replace the `your.rustfs.com` with your own domain as well as the certificates.
+> Replace the `example.rustfs.com` with your own domain as well as the certificates.
 
 # TLS configuration
 
@@ -201,6 +217,22 @@ You should use `--set-file` parameter when running `helm install` command, for e
 ```
 helm install rustfs rustfs/rustfs -n rustfs --set tls.enabled=true,--set-file tls.crt=./tls.crt,--set-file tls.key=./tls.key
 ```
+
+# Gateway API support (alpha)
+
+Due to [ingress nginx retirement](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) in March 2026, so RustFS adds support for [gateway api](https://gateway-api.sigs.k8s.io/). Currently, RustFS only supports traefik as gateway class, more and more gateway class support will be added in the future after those classes are tested. If you want to enable gateway api, specify `gatewayApi.enabled` to `true` while specify `ingress.enabled` to `false`. After installation, you can find the `Gateway` and `HttpRoute` resources,
+
+```
+$ kubectl -n rustfs get gateway
+NAME             CLASS     ADDRESS   PROGRAMMED   AGE
+rustfs-gateway   traefik             True         169m
+
+$ kubectl -n rustfs get httproute
+NAME           HOSTNAMES            AGE
+rustfs-route   ["example.rustfs.com"]   172m
+```
+
+Then, via RustFS instance via `https://example.rustfs.com` or `http://example.rustfs.com`.
 
 # Uninstall
 

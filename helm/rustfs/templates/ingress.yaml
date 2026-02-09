@@ -1,13 +1,9 @@
 {{- if .Values.ingress.enabled -}}
-{{- $secretName := .Values.ingress.tls.secretName }}
 {{- $ingressAnnotations := dict }}
 {{- if eq .Values.ingress.className "nginx" }}
-  {{- $ingressAnnotations = merge $ingressAnnotations (.Values.ingress.nginxAnnotations | default dict) }}
+{{- $ingressAnnotations = .Values.ingress.nginxAnnotations }}
 {{- else if eq .Values.ingress.className "" }}
-  {{- $ingressAnnotations = merge $ingressAnnotations (.Values.ingress.customAnnoations | default dict) }}
-{{- end }}
-{{- if .Values.ingress.tls.certManager.enabled }}
-  {{- $ingressAnnotations = merge $ingressAnnotations (.Values.ingress.certManagerAnnotations | default dict) }}
+{{- $ingressAnnotations = .Values.ingress.customAnnotations }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -32,7 +28,7 @@ spec:
         {{- range .Values.ingress.hosts }}
         - {{ .host | quote }}
         {{- end }}
-      secretName: {{ $secretName }}
+      secretName: {{ include "rustfs.fullname" $ }}-tls
   {{- end }}
   rules:
     {{- range .Values.ingress.hosts }}

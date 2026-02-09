@@ -21,7 +21,7 @@ use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_targets::EventName;
 use rustfs_utils::{
-    extract_req_params, extract_req_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
+    extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
 use s3s::{S3Request, S3Response, S3Result};
 use std::future::Future;
@@ -86,18 +86,19 @@ impl OperationHelper {
             .req_path(req.uri.path().to_string())
             .req_query(extract_req_params(req));
 
-        if let Some(req_id) = req.headers.get("x-amz-request-id") {
-            if let Ok(id_str) = req_id.to_str() {
-                audit_builder = audit_builder.request_id(id_str);
-            }
+        if let Some(req_id) = req.headers.get("x-amz-request-id")
+            && let Ok(id_str) = req_id.to_str()
+        {
+            audit_builder = audit_builder.request_id(id_str);
         }
 
         // initialize event builder
         // object is a placeholder that must be set later using the `object()` method.
         let event_builder = EventArgsBuilder::new(event, bucket, ObjectInfo::default())
             .host(get_request_host(&req.headers))
+            .port(get_request_port(&req.headers))
             .user_agent(get_request_user_agent(&req.headers))
-            .req_params(extract_req_params_header(&req.headers));
+            .req_params(extract_params_header(&req.headers));
 
         Self {
             audit_builder: Some(audit_builder),
@@ -162,9 +163,17 @@ impl OperationHelper {
                 .build();
 
             let mut final_builder = builder.api(api_details.clone());
+            if let Ok(res) = result {
+                final_builder = final_builder.resp_header(extract_resp_elements(res));
+            }
             if let Some(err) = error_msg {
                 final_builder = final_builder.error(err);
             }
+
+            if let Some(sk) = rustfs_credentials::get_global_access_key_opt() {
+                final_builder = final_builder.access_key(&sk);
+            }
+
             self.audit_builder = Some(final_builder);
             self.api_builder = ApiDetailsBuilder(api_details); // Store final details for Drop use
         }
@@ -194,15 +203,15 @@ impl Drop for OperationHelper {
         }
 
         // Distribute event notification (only on success)
-        if self.api_builder.0.status.as_deref() == Some("success") {
-            if let Some(builder) = self.event_builder.take() {
-                let event_args = builder.build();
-                // Avoid generating notifications for copy requests
-                if !event_args.is_replication_request() {
-                    spawn_background(async move {
-                        notifier_global::notify(event_args).await;
-                    });
-                }
+        if self.api_builder.0.status.as_deref() == Some("success")
+            && let Some(builder) = self.event_builder.take()
+        {
+            let event_args = builder.build();
+            // Avoid generating notifications for copy requests
+            if !event_args.is_replication_request() {
+                spawn_background(async move {
+                    notifier_global::notify(event_args).await;
+                });
             }
         }
     }

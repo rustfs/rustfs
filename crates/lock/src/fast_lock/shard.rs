@@ -69,10 +69,10 @@ impl LockShard {
     /// Try fast path only (without fallback to slow path)
     pub fn try_fast_path_only(&self, request: &ObjectLockRequest) -> bool {
         // Early check to avoid unnecessary lock contention
-        if let Some(state) = self.objects.read().get(&request.key) {
-            if !state.atomic_state.is_fast_path_available(request.mode) {
-                return false;
-            }
+        if let Some(state) = self.objects.read().get(&request.key)
+            && !state.atomic_state.is_fast_path_available(request.mode)
+        {
+            return false;
         }
         self.try_fast_path(request).is_some()
     }
@@ -441,36 +441,36 @@ impl LockShard {
     /// Get lock information for monitoring
     pub fn get_lock_info(&self, key: &ObjectKey) -> Option<crate::fast_lock::types::ObjectLockInfo> {
         let objects = self.objects.read();
-        if let Some(state) = objects.get(key) {
-            if let Some(mode) = state.current_mode() {
-                let (owner, acquired_at, lock_timeout) = match mode {
-                    LockMode::Exclusive => {
-                        let current_owner = state.current_owner.read();
-                        let info = current_owner.clone()?;
-                        (info.owner, info.acquired_at, info.lock_timeout)
-                    }
-                    LockMode::Shared => {
-                        let shared_owners = state.shared_owners.read();
-                        let entry = shared_owners.first()?.clone();
-                        (entry.owner, entry.acquired_at, entry.lock_timeout)
-                    }
-                };
+        if let Some(state) = objects.get(key)
+            && let Some(mode) = state.current_mode()
+        {
+            let (owner, acquired_at, lock_timeout) = match mode {
+                LockMode::Exclusive => {
+                    let current_owner = state.current_owner.read();
+                    let info = current_owner.clone()?;
+                    (info.owner, info.acquired_at, info.lock_timeout)
+                }
+                LockMode::Shared => {
+                    let shared_owners = state.shared_owners.read();
+                    let entry = shared_owners.first()?.clone();
+                    (entry.owner, entry.acquired_at, entry.lock_timeout)
+                }
+            };
 
-                let priority = *state.priority.read();
+            let priority = *state.priority.read();
 
-                let expires_at = acquired_at
-                    .checked_add(lock_timeout)
-                    .unwrap_or_else(|| acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
+            let expires_at = acquired_at
+                .checked_add(lock_timeout)
+                .unwrap_or_else(|| acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
 
-                return Some(crate::fast_lock::types::ObjectLockInfo {
-                    key: key.clone(),
-                    mode,
-                    owner,
-                    acquired_at,
-                    expires_at,
-                    priority,
-                });
-            }
+            return Some(crate::fast_lock::types::ObjectLockInfo {
+                key: key.clone(),
+                mode,
+                owner,
+                acquired_at,
+                expires_at,
+                priority,
+            });
         }
         None
     }
@@ -759,13 +759,17 @@ mod tests {
         let shard = LockShard::new(0);
 
         // First acquire a lock that will block the batch operation
-        let blocking_request = ObjectLockRequest::new_write("bucket", "obj1", "blocking_owner");
+        let blocking_request = ObjectLockRequest::new_write(ObjectKey::new("bucket", "obj1"), "blocking_owner")
+            .with_acquire_timeout(Duration::from_secs(1));
         shard.acquire_lock(&blocking_request).await.unwrap();
 
-        // Now try a batch operation that should fail and clean up properly
+        // Use short acquire timeout so the test fails fast when obj1 is already locked
+        // (default is 60s which would make this test very slow)
         let requests = vec![
-            ObjectLockRequest::new_read("bucket", "obj2", "batch_owner"), // This should succeed
-            ObjectLockRequest::new_write("bucket", "obj1", "batch_owner"), // This should fail due to existing lock
+            ObjectLockRequest::new_read(ObjectKey::new("bucket", "obj2"), "batch_owner")
+                .with_acquire_timeout(Duration::from_millis(100)), // This should succeed
+            ObjectLockRequest::new_write(ObjectKey::new("bucket", "obj1"), "batch_owner")
+                .with_acquire_timeout(Duration::from_millis(100)), // This should fail due to existing lock
         ];
 
         let result = shard.acquire_locks_batch(requests, true).await;

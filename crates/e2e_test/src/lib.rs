@@ -18,6 +18,9 @@ mod reliant;
 #[cfg(test)]
 pub mod common;
 
+#[cfg(test)]
+mod version_id_regression_test;
+
 // Data usage regression tests
 #[cfg(test)]
 mod data_usage_test;
@@ -25,6 +28,13 @@ mod data_usage_test;
 // KMS-specific test modules
 #[cfg(test)]
 mod kms;
+
+// Quota tests
+#[cfg(test)]
+mod quota_test;
+
+#[cfg(test)]
+mod bucket_policy_check_test;
 
 // Special characters in path test modules
 #[cfg(test)]
@@ -34,6 +44,26 @@ mod special_chars_test;
 #[cfg(test)]
 mod content_encoding_test;
 
+// ListObjectsV2 pagination test (Issue #1596)
+#[cfg(test)]
+mod list_objects_v2_pagination_test;
+
 // Policy variables tests
 #[cfg(test)]
 mod policy;
+
+#[cfg(test)]
+mod compression_test;
+#[cfg(test)]
+mod protocols;
+
+// Object Lock tests
+#[cfg(test)]
+mod object_lock;
+
+#[cfg(test)]
+mod cluster_concurrency_test;
+
+// PutObject / MultipartUpload with checksum (Content-MD5, x-amz-checksum-*)
+#[cfg(test)]
+mod checksum_upload_test;

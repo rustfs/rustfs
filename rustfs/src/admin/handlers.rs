@@ -18,6 +18,7 @@ use crate::auth::check_key_valid;
 use crate::auth::get_condition_values;
 use crate::auth::get_session_token;
 use crate::error::ApiError;
+use crate::server::RemoteAddr;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, Uri};
@@ -25,22 +26,20 @@ use hyper::StatusCode;
 use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_HEAL_REQUEST_SIZE};
+use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::target::BucketTarget;
+use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::data_usage::{
-    aggregate_local_snapshots, compute_bucket_usage, load_data_usage_from_backend, store_data_usage_in_backend,
-};
+use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::global::get_global_action_cred;
 use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
-use rustfs_ecstore::store::is_valid_object_prefix;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
@@ -72,7 +71,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 use tracing::{error, info, warn};
 use url::Host;
-// use url::UrlQuery;
 
 pub mod bucket_meta;
 pub mod event;
@@ -83,6 +81,7 @@ pub mod kms_keys;
 pub mod policies;
 pub mod pools;
 pub mod profile;
+pub mod quota;
 pub mod rebalance;
 pub mod service_account;
 pub mod sts;
@@ -131,7 +130,7 @@ impl Operation for HealthCheckHandler {
         let health_info = json!({
             "status": "ok",
             "service": "rustfs-endpoint",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": jiff::Zoned::now().to_string(),
             "version": env!("CARGO_PKG_VERSION")
         });
 
@@ -211,7 +210,8 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let conditions = get_condition_values(&req.headers, &cred_clone, None, None);
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let conditions = get_condition_values(&req.headers, &cred_clone, None, None, remote_addr);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
 
@@ -406,12 +406,14 @@ impl Operation for ServerInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            remote_addr,
         )
         .await?;
 
@@ -452,12 +454,14 @@ impl Operation for StorageInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::StorageInfoAdminAction)],
+            remote_addr,
         )
         .await?;
 
@@ -493,6 +497,7 @@ impl Operation for DataUsageInfoHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
@@ -502,6 +507,7 @@ impl Operation for DataUsageInfoHandler {
                 Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
                 Action::S3Action(S3Action::ListBucketAction),
             ],
+            remote_addr,
         )
         .await?;
 
@@ -509,74 +515,86 @@ impl Operation for DataUsageInfoHandler {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let (disk_statuses, mut info) = match aggregate_local_snapshots(store.clone()).await {
-            Ok((statuses, usage)) => (statuses, usage),
-            Err(err) => {
-                warn!("aggregate_local_snapshots failed: {:?}", err);
-                (
-                    Vec::new(),
-                    load_data_usage_from_backend(store.clone()).await.map_err(|e| {
-                        error!("load_data_usage_from_backend failed {:?}", e);
-                        s3_error!(InternalError, "load_data_usage_from_backend failed")
-                    })?,
-                )
-            }
-        };
+        let mut info = load_data_usage_from_backend(store.clone()).await.map_err(|e| {
+            error!("load_data_usage_from_backend failed {:?}", e);
+            s3_error!(InternalError, "load_data_usage_from_backend failed")
+        })?;
 
-        let snapshots_available = disk_statuses.iter().any(|status| status.snapshot_exists);
-        if !snapshots_available {
-            if let Ok(fallback) = load_data_usage_from_backend(store.clone()).await {
-                let mut fallback_info = fallback;
-                fallback_info.disk_usage_status = disk_statuses.clone();
-                info = fallback_info;
-            }
-        } else {
-            info.disk_usage_status = disk_statuses.clone();
-        }
+        let sinfo = store.storage_info().await;
 
-        let last_update_age = info.last_update.and_then(|ts| ts.elapsed().ok());
-        let data_missing = info.objects_total_count == 0 && info.buckets_count == 0;
-        let stale = last_update_age
-            .map(|elapsed| elapsed > std::time::Duration::from_secs(300))
-            .unwrap_or(true);
+        // 🔧 Use the fixed capacity calculation function (built-in deduplication)
+        let raw_total = get_total_usable_capacity(&sinfo.disks, &sinfo);
+        let raw_free = get_total_usable_capacity_free(&sinfo.disks, &sinfo);
 
-        if data_missing {
-            info!("No data usage statistics found, attempting real-time collection");
+        // 🔧 Add a plausibility check (extra layer of protection)
+        const MAX_REASONABLE_CAPACITY: u64 = 100_000 * 1024 * 1024 * 1024 * 1024; // 100 PiB
+        const MIN_REASONABLE_CAPACITY: u64 = 1024 * 1024 * 1024; // 1 GiB
 
-            if let Err(e) = collect_realtime_data_usage(&mut info, store.clone()).await {
-                warn!("Failed to collect real-time data usage: {}", e);
-            } else if let Err(e) = store_data_usage_in_backend(info.clone(), store.clone()).await {
-                warn!("Failed to persist refreshed data usage: {}", e);
-            }
-        } else if stale {
-            info!(
-                "Data usage statistics are stale (last update {:?} ago), refreshing asynchronously",
-                last_update_age
+        let total_u64 = raw_total as u64;
+        let free_u64 = raw_free as u64;
+
+        // Detect outliers
+        if total_u64 > MAX_REASONABLE_CAPACITY {
+            error!(
+                "Abnormal total capacity detected: {} bytes ({:.2} TiB), capping to physical capacity",
+                total_u64,
+                total_u64 as f64 / (1024.0_f64.powi(4))
             );
 
-            let mut info_for_refresh = info.clone();
-            let store_for_refresh = store.clone();
-            spawn(async move {
-                if let Err(e) = collect_realtime_data_usage(&mut info_for_refresh, store_for_refresh.clone()).await {
-                    warn!("Background data usage refresh failed: {}", e);
-                    return;
-                }
+            // Use the number of disks and the average capacity to estimate reasonable values
+            let disk_count = sinfo.disks.len();
+            if disk_count > 0 {
+                // Calculate the actual number of disks after deduplication (via endpoint + drive_path)
+                use std::collections::HashSet;
+                let unique_disks: HashSet<String> = sinfo
+                    .disks
+                    .iter()
+                    .map(|d| format!("{}|{}", d.endpoint, d.drive_path))
+                    .collect();
 
-                if let Err(e) = store_data_usage_in_backend(info_for_refresh, store_for_refresh).await {
-                    warn!("Background data usage persistence failed: {}", e);
+                let actual_disk_count = unique_disks.len();
+
+                // Use the capacity of the first disk as a reference
+                if let Some(first_disk) = sinfo.disks.first() {
+                    info.total_capacity = first_disk.total_space * actual_disk_count as u64;
+                    info.total_free_capacity = first_disk.available_space * actual_disk_count as u64;
+
+                    info!(
+                        "Applied capacity correction: {} unique disks, capacity per disk: {} bytes",
+                        actual_disk_count, first_disk.total_space
+                    );
+                } else {
+                    info.total_capacity = 0;
+                    info.total_free_capacity = 0;
                 }
-            });
+            } else {
+                info.total_capacity = 0;
+                info.total_free_capacity = 0;
+            }
+        } else if total_u64 < MIN_REASONABLE_CAPACITY && total_u64 > 0 {
+            warn!(
+                "Unusually small total capacity: {} bytes ({:.2} GiB)",
+                total_u64,
+                total_u64 as f64 / (1024.0_f64.powi(3))
+            );
+            info.total_capacity = total_u64;
+            info.total_free_capacity = free_u64;
+        } else {
+            // Normal
+            info.total_capacity = total_u64;
+            info.total_free_capacity = free_u64;
         }
 
-        info.disk_usage_status = disk_statuses;
+        // Calculate the used capacity
+        info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
 
-        // Set capacity information
-        let sinfo = store.storage_info().await;
-        info.total_capacity = get_total_usable_capacity(&sinfo.disks, &sinfo) as u64;
-        info.total_free_capacity = get_total_usable_capacity_free(&sinfo.disks, &sinfo) as u64;
-        if info.total_capacity > info.total_free_capacity {
-            info.total_used_capacity = info.total_capacity - info.total_free_capacity;
-        }
+        // Record the final statistical results
+        debug!(
+            "Capacity statistics: total={:.2} TiB, free={:.2} TiB, used={:.2} TiB",
+            info.total_capacity as f64 / (1024.0_f64.powi(4)),
+            info.total_free_capacity as f64 / (1024.0_f64.powi(4)),
+            info.total_used_capacity as f64 / (1024.0_f64.powi(4))
+        );
 
         let data = serde_json::to_vec(&info)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse DataUsageInfo failed"))?;
@@ -629,50 +647,50 @@ fn extract_metrics_init_params(uri: &Uri) -> MetricsParams {
         for param in params {
             let mut parts = param.split('=');
             if let Some(key) = parts.next() {
-                if key == "disks" {
-                    if let Some(value) = parts.next() {
-                        mp.disks = value.to_string();
-                    }
+                if key == "disks"
+                    && let Some(value) = parts.next()
+                {
+                    mp.disks = value.to_string();
                 }
-                if key == "hosts" {
-                    if let Some(value) = parts.next() {
-                        mp.hosts = value.to_string();
-                    }
+                if key == "hosts"
+                    && let Some(value) = parts.next()
+                {
+                    mp.hosts = value.to_string();
                 }
-                if key == "interval" {
-                    if let Some(value) = parts.next() {
-                        mp.tick = value.to_string();
-                    }
+                if key == "interval"
+                    && let Some(value) = parts.next()
+                {
+                    mp.tick = value.to_string();
                 }
-                if key == "n" {
-                    if let Some(value) = parts.next() {
-                        mp.n = value.parse::<u64>().unwrap_or(u64::MAX);
-                    }
+                if key == "n"
+                    && let Some(value) = parts.next()
+                {
+                    mp.n = value.parse::<u64>().unwrap_or(u64::MAX);
                 }
-                if key == "types" {
-                    if let Some(value) = parts.next() {
-                        mp.types = value.parse::<u32>().unwrap_or_default();
-                    }
+                if key == "types"
+                    && let Some(value) = parts.next()
+                {
+                    mp.types = value.parse::<u32>().unwrap_or_default();
                 }
-                if key == "by-disk" {
-                    if let Some(value) = parts.next() {
-                        mp.by_disk = value.to_string();
-                    }
+                if key == "by-disk"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_disk = value.to_string();
                 }
-                if key == "by-host" {
-                    if let Some(value) = parts.next() {
-                        mp.by_host = value.to_string();
-                    }
+                if key == "by-host"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_host = value.to_string();
                 }
-                if key == "by-jobID" {
-                    if let Some(value) = parts.next() {
-                        mp.by_job_id = value.to_string();
-                    }
+                if key == "by-jobID"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_job_id = value.to_string();
                 }
-                if key == "by-depID" {
-                    if let Some(value) = parts.next() {
-                        mp.by_dep_id = value.to_string();
-                    }
+                if key == "by-depID"
+                    && let Some(value) = parts.next()
+                {
+                    mp.by_dep_id = value.to_string();
                 }
             }
         }
@@ -688,7 +706,6 @@ impl Stream for MetricsStream {
     type Item = Result<Bytes, StdError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        info!("MetricsStream poll_next");
         let this = Pin::into_inner(self);
         this.inner.poll_next_unpin(cx)
     }
@@ -750,7 +767,6 @@ impl Operation for MetricsHandler {
         let body = Body::from(in_stream);
         spawn(async move {
             while n > 0 {
-                info!("loop, n: {n}");
                 let mut m = RealtimeMetrics::default();
                 let m_local = collect_local_metrics(types, &opts).await;
                 m.merge(m_local);
@@ -767,7 +783,6 @@ impl Operation for MetricsHandler {
                 // todo write resp
                 match serde_json::to_vec(&m) {
                     Ok(re) => {
-                        info!("got metrics, send it to client, m: {m:?}");
                         let _ = tx.send(Ok(Bytes::from(re))).await;
                     }
                     Err(e) => {
@@ -823,10 +838,10 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
         for param in params {
             let mut parts = param.split('=');
             if let Some(key) = parts.next() {
-                if key == "clientToken" {
-                    if let Some(value) = parts.next() {
-                        hip.client_token = value.to_string();
-                    }
+                if key == "clientToken"
+                    && let Some(value) = parts.next()
+                {
+                    hip.client_token = value.to_string();
                 }
                 if key == "forceStart" && parts.next().is_some() {
                     hip.force_start = true;
@@ -1259,62 +1274,6 @@ impl Operation for RemoveRemoteTargetHandler {
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
-}
-
-/// Real-time data collection function
-async fn collect_realtime_data_usage(
-    info: &mut rustfs_common::data_usage::DataUsageInfo,
-    store: Arc<rustfs_ecstore::store::ECStore>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Get bucket list and collect basic statistics
-    let buckets = store.list_bucket(&BucketOptions::default()).await?;
-
-    info.buckets_count = buckets.len() as u64;
-    info.last_update = Some(std::time::SystemTime::now());
-    info.buckets_usage.clear();
-    info.bucket_sizes.clear();
-    info.disk_usage_status.clear();
-    info.objects_total_count = 0;
-    info.objects_total_size = 0;
-    info.versions_total_count = 0;
-    info.delete_markers_total_count = 0;
-
-    let mut total_objects = 0u64;
-    let mut total_versions = 0u64;
-    let mut total_size = 0u64;
-    let mut total_delete_markers = 0u64;
-
-    // For each bucket, try to get object count
-    for bucket_info in buckets {
-        let bucket_name = &bucket_info.name;
-
-        // Skip system buckets
-        if bucket_name.starts_with('.') {
-            continue;
-        }
-
-        match compute_bucket_usage(store.clone(), bucket_name).await {
-            Ok(bucket_usage) => {
-                total_objects = total_objects.saturating_add(bucket_usage.objects_count);
-                total_versions = total_versions.saturating_add(bucket_usage.versions_count);
-                total_size = total_size.saturating_add(bucket_usage.size);
-                total_delete_markers = total_delete_markers.saturating_add(bucket_usage.delete_markers_count);
-
-                info.buckets_usage.insert(bucket_name.clone(), bucket_usage.clone());
-                info.bucket_sizes.insert(bucket_name.clone(), bucket_usage.size);
-            }
-            Err(e) => {
-                warn!("Failed to compute bucket usage for {}: {}", bucket_name, e);
-            }
-        }
-    }
-
-    info.objects_total_count = total_objects;
-    info.objects_total_size = total_size;
-    info.versions_total_count = total_versions;
-    info.delete_markers_total_count = total_delete_markers;
-
-    Ok(())
 }
 
 pub struct ProfileHandler {}

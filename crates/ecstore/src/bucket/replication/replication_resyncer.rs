@@ -1,3 +1,17 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, BucketTargetSys, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
@@ -14,9 +28,9 @@ use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_fo
 use crate::event::name::EventName;
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
+use crate::set_disk::get_lock_acquire_timeout;
 use crate::store_api::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
-
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
@@ -24,7 +38,6 @@ use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
 use byteorder::ByteOrder;
 use futures::future::join_all;
 use http::HeaderMap;
-
 use regex::Regex;
 use rustfs_filemeta::{
     MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateDecision, ReplicateObjectInfo,
@@ -242,11 +255,10 @@ impl ReplicationResyncer {
 
 
 
-                        if let Some(last_update) = status.last_update {
-                            if last_update > *last_update_times.get(bucket).unwrap_or(&OffsetDateTime::UNIX_EPOCH) {
+                        if let Some(last_update) = status.last_update
+                            && last_update > *last_update_times.get(bucket).unwrap_or(&OffsetDateTime::UNIX_EPOCH) {
                                 update = true;
                             }
-                        }
 
                         if update {
                             if let Err(err) = save_resync_status(bucket, status, api.clone()).await {
@@ -345,13 +357,12 @@ impl ReplicationResyncer {
             return;
         };
 
-        if !heal {
-            if let Err(e) = self
+        if !heal
+            && let Err(e) = self
                 .mark_status(ResyncStatusType::ResyncStarted, opts.clone(), storage.clone())
                 .await
-            {
-                error!("Failed to mark resync status: {}", e);
-            }
+        {
+            error!("Failed to mark resync status: {}", e);
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -744,7 +755,7 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicationConfig {
     pub config: Option<ReplicationConfiguration>,
     pub remotes: Option<BucketTargets>,
@@ -1263,7 +1274,58 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         }
     };
 
-    //TODO: nslock
+    let ns_lock = match storage
+        .new_ns_lock(&bucket, format!("/[replicate]/{}", dobj.delete_object.object_name).as_str())
+        .await
+    {
+        Ok(ns_lock) => ns_lock,
+        Err(e) => {
+            warn!(
+                "failed to get ns lock for bucket:{} object:{} error:{}",
+                bucket, dobj.delete_object.object_name, e
+            );
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: dobj.delete_object.object_name.clone(),
+                    version_id,
+                    delete_marker: dobj.delete_object.delete_marker,
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+            return;
+        }
+    };
+
+    let _lock_guard = match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+        Ok(lock_guard) => lock_guard,
+        Err(e) => {
+            warn!(
+                "failed to get write lock for bucket:{} object:{} error:{}",
+                bucket, dobj.delete_object.object_name, e
+            );
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: dobj.delete_object.object_name.clone(),
+                    version_id,
+                    delete_marker: dobj.delete_object.delete_marker,
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+            return;
+        }
+    };
 
     // Initialize replicated infos
     let mut rinfos = ReplicatedInfos {
@@ -1369,7 +1431,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         dobj.delete_object.version_id.map(|v| v.to_string()),
     );
     if replication_status != prev_status {
-        drs.replica_timestamp = Some(OffsetDateTime::now_utc());
+        drs.replication_timestamp = Some(OffsetDateTime::now_utc());
     }
 
     let event_name = if replication_status == ReplicationStatusType::Completed {
@@ -1463,21 +1525,18 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         Some(version_id.to_string())
     };
 
-    if dobj.delete_object.delete_marker_version_id.is_some() {
-        if let Err(e) = tgt_client
+    if dobj.delete_object.delete_marker_version_id.is_some()
+        && let Err(e) = tgt_client
             .head_object(&tgt_client.bucket, &dobj.delete_object.object_name, version_id.clone())
             .await
-        {
-            if let SdkError::ServiceError(service_err) = &e {
-                if !service_err.err().is_not_found() {
-                    rinfo.replication_status = ReplicationStatusType::Failed;
-                    rinfo.error = Some(e.to_string());
+        && let SdkError::ServiceError(service_err) = &e
+        && !service_err.err().is_not_found()
+    {
+        rinfo.replication_status = ReplicationStatusType::Failed;
+        rinfo.error = Some(e.to_string());
 
-                    return rinfo;
-                }
-            }
-        };
-    }
+        return rinfo;
+    };
 
     match tgt_client
         .remove_object(
@@ -1512,6 +1571,13 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             }
             // TODO: check offline
         }
+    }
+
+    if rinfo.replication_status == ReplicationStatusType::Completed
+        && !tgt_client.reset_id.is_empty()
+        && dobj.op_type == ReplicationType::ExistingObject
+    {
+        rinfo.resync_timestamp = format!("{};{}", OffsetDateTime::now_utc().format(&Rfc3339).unwrap(), tgt_client.reset_id);
     }
 
     rinfo
@@ -1614,8 +1680,17 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     let mut object_info = roi.to_object_info();
 
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
+        let mut eval_metadata = HashMap::new();
+        if let Some(ref s) = new_replication_internal {
+            eval_metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}replication-status"), s.clone());
+        }
+        eval_metadata.insert(
+            format!("{RESERVED_METADATA_PREFIX_LOWER}replication-timestamp"),
+            OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+        );
         let popts = ObjectOptions {
             version_id: roi.version_id.map(|v| v.to_string()),
+            eval_metadata: Some(eval_metadata),
             ..Default::default()
         };
 
@@ -1823,6 +1898,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         } {
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(err.to_string());
+            warn!(
+                "replication put_object failed src_bucket={} dest_bucket={} object={} err={:?}",
+                bucket, tgt_client.bucket, object, err
+            );
 
             // TODO: check offline
             return rinfo;
@@ -2167,35 +2246,122 @@ fn is_standard_header(k: &str) -> bool {
     STANDARD_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(k))
 }
 
+// Valid SSE replication headers mapping from internal to replication headers
+static VALID_SSE_REPLICATION_HEADERS: &[(&str, &str)] = &[
+    (
+        "X-Rustfs-Internal-Server-Side-Encryption-Sealed-Key",
+        "X-Rustfs-Replication-Server-Side-Encryption-Sealed-Key",
+    ),
+    (
+        "X-Rustfs-Internal-Server-Side-Encryption-Seal-Algorithm",
+        "X-Rustfs-Replication-Server-Side-Encryption-Seal-Algorithm",
+    ),
+    (
+        "X-Rustfs-Internal-Server-Side-Encryption-Iv",
+        "X-Rustfs-Replication-Server-Side-Encryption-Iv",
+    ),
+    ("X-Rustfs-Internal-Encrypted-Multipart", "X-Rustfs-Replication-Encrypted-Multipart"),
+    ("X-Rustfs-Internal-Actual-Object-Size", "X-Rustfs-Replication-Actual-Object-Size"),
+];
+
+const REPLICATION_SSEC_CHECKSUM_HEADER: &str = "X-Rustfs-Replication-Ssec-Crc";
+
+fn is_valid_sse_header(k: &str) -> Option<&str> {
+    VALID_SSE_REPLICATION_HEADERS
+        .iter()
+        .find(|(internal, _)| k.eq_ignore_ascii_case(internal))
+        .map(|(_, replication)| *replication)
+}
+
 fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
+    use crate::config::storageclass::{RRS, STANDARD};
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use rustfs_utils::http::{
+        AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
+    };
+
     let mut meta = HashMap::new();
+    let is_ssec = is_ssec_encrypted(&object_info.user_defined);
 
+    // Process user-defined metadata
     for (k, v) in object_info.user_defined.iter() {
-        if strings_has_prefix_fold(k, RESERVED_METADATA_PREFIX) {
-            continue;
+        let has_valid_sse_header = is_valid_sse_header(k).is_some();
+
+        // In case of SSE-C objects copy the allowed internal headers as well
+        if !is_ssec || !has_valid_sse_header {
+            if strings_has_prefix_fold(k, RESERVED_METADATA_PREFIX) {
+                continue;
+            }
+            if is_standard_header(k) {
+                continue;
+            }
         }
 
-        if is_standard_header(k) {
-            continue;
+        if let Some(replication_header) = is_valid_sse_header(k) {
+            meta.insert(replication_header.to_string(), v.to_string());
+        } else {
+            meta.insert(k.to_string(), v.to_string());
         }
-
-        meta.insert(k.to_string(), v.to_string());
     }
 
-    let is_multipart = object_info.is_multipart();
+    let mut is_multipart = object_info.is_multipart();
+
+    // Handle checksum
+    if let Some(checksum_data) = &object_info.checksum
+        && !checksum_data.is_empty()
+    {
+        // Add encrypted CRC to metadata for SSE-C objects
+        if is_ssec {
+            let encoded = BASE64_STANDARD.encode(checksum_data);
+            meta.insert(REPLICATION_SSEC_CHECKSUM_HEADER.to_string(), encoded);
+        } else {
+            // Get checksum metadata for non-SSE-C objects
+            let (cs_meta, is_mp) = object_info.decrypt_checksums(0, &http::HeaderMap::new())?;
+            is_multipart = is_mp;
+
+            // Set object checksum metadata
+            for (k, v) in cs_meta.iter() {
+                if k != AMZ_CHECKSUM_TYPE {
+                    meta.insert(k.clone(), v.clone());
+                }
+            }
+
+            // For objects where checksum is full object, use the cheaper PutObject replication
+            if !object_info.is_multipart()
+                && cs_meta
+                    .get(AMZ_CHECKSUM_TYPE)
+                    .map(|v| v.as_str() == AMZ_CHECKSUM_TYPE_FULL_OBJECT)
+                    .unwrap_or(false)
+            {
+                is_multipart = false;
+            }
+        }
+    }
+
+    // Handle storage class default
+    let storage_class = if sc.is_empty() {
+        let obj_sc = object_info.storage_class.as_deref().unwrap_or_default();
+        if obj_sc == STANDARD || obj_sc == RRS {
+            obj_sc.to_string()
+        } else {
+            sc.to_string()
+        }
+    } else {
+        sc.to_string()
+    };
 
     let mut put_op = PutObjectOptions {
         user_metadata: meta,
         content_type: object_info.content_type.clone().unwrap_or_default(),
         content_encoding: object_info.content_encoding.clone().unwrap_or_default(),
         expires: object_info.expires.unwrap_or(OffsetDateTime::UNIX_EPOCH),
-        storage_class: sc.to_string(),
+        storage_class,
         internal: AdvancedPutOptions {
             source_version_id: object_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
             source_etag: object_info.etag.clone().unwrap_or_default(),
             source_mtime: object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH),
-            replication_status: ReplicationStatusType::Pending,
-            replication_request: true,
+            replication_status: ReplicationStatusType::Replica, // Changed from Pending to Replica
+            replication_request: true, // always set this to distinguish between replication and normal PUT operation
             ..Default::default()
         },
         ..Default::default()
@@ -2206,36 +2372,43 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
 
         if !tags.is_empty() {
             put_op.user_tags = tags;
+            // set tag timestamp in opts
             put_op.internal.tagging_timestamp = if let Some(ts) = object_info
                 .user_defined
-                .get(&format!("{RESERVED_METADATA_PREFIX}tagging-timestamp"))
+                .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}tagging-timestamp"))
             {
-                OffsetDateTime::parse(ts, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+                OffsetDateTime::parse(ts, &Rfc3339)
+                    .map_err(|e| Error::other(format!("Failed to parse tagging timestamp: {}", e)))?
             } else {
                 object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
             };
         }
     }
 
-    if let Some(lang) = object_info.user_defined.lookup(headers::CONTENT_LANGUAGE) {
+    // Use case-insensitive lookup for headers
+    let lk_map = object_info.user_defined.clone();
+
+    if let Some(lang) = lk_map.lookup(headers::CONTENT_LANGUAGE) {
         put_op.content_language = lang.to_string();
     }
 
-    if let Some(cd) = object_info.user_defined.lookup(headers::CONTENT_DISPOSITION) {
+    if let Some(cd) = lk_map.lookup(headers::CONTENT_DISPOSITION) {
         put_op.content_disposition = cd.to_string();
     }
 
-    if let Some(v) = object_info.user_defined.lookup(headers::CACHE_CONTROL) {
+    if let Some(v) = lk_map.lookup(headers::CACHE_CONTROL) {
         put_op.cache_control = v.to_string();
     }
 
-    if let Some(v) = object_info.user_defined.lookup(headers::AMZ_OBJECT_LOCK_MODE) {
+    if let Some(v) = lk_map.lookup(headers::AMZ_OBJECT_LOCK_MODE) {
         let mode = v.to_string().to_uppercase();
         put_op.mode = Some(aws_sdk_s3::types::ObjectLockRetentionMode::from(mode.as_str()));
     }
 
-    if let Some(v) = object_info.user_defined.lookup(headers::AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE) {
-        put_op.retain_until_date = OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    if let Some(v) = lk_map.lookup(headers::AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE) {
+        put_op.retain_until_date =
+            OffsetDateTime::parse(v, &Rfc3339).map_err(|e| Error::other(format!("Failed to parse retain until date: {}", e)))?;
+        // set retention timestamp in opts
         put_op.internal.retention_timestamp = if let Some(v) = object_info
             .user_defined
             .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}objectlock-retention-timestamp"))
@@ -2246,9 +2419,10 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
         };
     }
 
-    if let Some(v) = object_info.user_defined.lookup(headers::AMZ_OBJECT_LOCK_LEGAL_HOLD) {
+    if let Some(v) = lk_map.lookup(headers::AMZ_OBJECT_LOCK_LEGAL_HOLD) {
         let hold = v.to_uppercase();
         put_op.legalhold = Some(ObjectLockLegalHoldStatus::from(hold.as_str()));
+        // set legalhold timestamp in opts
         put_op.internal.legalhold_timestamp = if let Some(v) = object_info
             .user_defined
             .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}objectlock-legalhold-timestamp"))
@@ -2259,7 +2433,34 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
         };
     }
 
-    // TODO: is encrypted
+    // Handle SSE-S3 encryption
+    if object_info
+        .user_defined
+        .get(AMZ_SERVER_SIDE_ENCRYPTION)
+        .map(|v| v.eq_ignore_ascii_case("AES256"))
+        .unwrap_or(false)
+    {
+        // SSE-S3 detected - set ServerSideEncryption
+        // Note: This requires the PutObjectOptions to support SSE
+        // TODO: Implement SSE-S3 support in PutObjectOptions if not already present
+    }
+
+    // Handle SSE-KMS encryption
+    if object_info.user_defined.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID) {
+        // SSE-KMS detected
+        // If KMS key ID replication is enabled (as by default)
+        // we include the object's KMS key ID. In any case, we
+        // always set the SSE-KMS header. If no KMS key ID is
+        // specified, MinIO is supposed to use whatever default
+        // config applies on the site or bucket.
+        // TODO: Implement SSE-KMS support with key ID replication
+        // let key_id = if kms::replicate_key_id() {
+        //     object_info.kms_key_id()
+        // } else {
+        //     None
+        // };
+        // TODO: Set SSE-KMS encryption in put_op
+    }
 
     Ok((put_op, is_multipart))
 }

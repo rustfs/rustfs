@@ -69,7 +69,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CARGO_BUILD_JOBS: 8
+  CARGO_BUILD_JOBS: 2
 
 jobs:
 
@@ -78,7 +78,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
@@ -93,7 +93,7 @@ jobs:
 
   typos:
     name: Typos
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -136,7 +136,7 @@ jobs:
     name: End-to-End Tests
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: ubicloud-standard-2
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -159,14 +159,14 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: s3s-e2e
-          git: https://github.com/Nugine/s3s.git
-          rev: b7714bfaa17ddfa9b23ea01774a1e7bbdbfc2ca3
+          git: https://github.com/s3s-project/s3s.git
+          rev: 4a04a670cf41274d9be9ab65dc36f4aa3f92fbad
 
       - name: Build debug binary
         run: |
           touch rustfs/build.rs
           # Limit concurrency to prevent OOM
-          cargo build -p rustfs --bins --jobs 4
+          cargo build -p rustfs --bins --jobs 2
 
       - name: Run end-to-end tests
         run: |
@@ -175,7 +175,7 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: e2e-test-logs-${{ github.run_number }}
           path: /tmp/rustfs.log

@@ -33,17 +33,20 @@ path = "src/main.rs"
 [features]
 default = ["metrics"]
 metrics = []
+ftps = ["rustfs-protocols/ftps"]
+full = ["metrics", "ftps"]
 
 [lints]
 workspace = true
 
 [dependencies]
 # RustFS Internal Crates
-rustfs-ahm = { workspace = true }
+rustfs-heal = { workspace = true }
 rustfs-appauth = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
+rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-filemeta.workspace = true
 rustfs-iam = { workspace = true }
@@ -53,18 +56,20 @@ rustfs-madmin = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
+rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio.workspace = true
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-trusted-proxies = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
+rustfs-scanner = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
 axum.workspace = true
-axum-extra = { workspace = true }
 axum-server = { workspace = true }
 futures.workspace = true
 futures-util.workspace = true
@@ -72,6 +77,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
+http-body-util.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
@@ -80,7 +86,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic = { workspace = true }
 tower.workspace = true
-tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id"] }
+tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id", "add-extension"] }
 
 # Serialization and Data Formats
 bytes = { workspace = true }
@@ -93,9 +99,8 @@ serde_urlencoded = { workspace = true }
 # Cryptography and Security
 rustls = { workspace = true }
 subtle = { workspace = true }
-
-# Time and Date
-chrono = { workspace = true }
+rustls-pemfile = { workspace = true }
+jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 
 # Utilities and Tools
@@ -123,18 +128,27 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+aes-gcm = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
-
-[target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-sysctl = { workspace = true }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
+
+# Only enable pprof-based profiling on non-Windows targets.
+[target.'cfg(all(not(target_os = "windows"), not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))'.dependencies]
+starshard = { workspace = true }
+backtrace = { workspace = true }
+rand = { workspace = true }
+pprof = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = { workspace = true }
@@ -145,6 +159,11 @@ pprof = { workspace = true }
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
+tempfile = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 http.workspace = true

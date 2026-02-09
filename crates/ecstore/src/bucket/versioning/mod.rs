@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
-
 use rustfs_utils::string::match_simple;
+use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 
 pub trait VersioningApi {
     fn enabled(&self) -> bool;
@@ -37,10 +36,8 @@ impl VersioningApi for VersioningConfiguration {
             return true;
         }
 
-        if let Some(exclude_folders) = self.exclude_folders {
-            if exclude_folders && prefix.ends_with('/') {
-                return false;
-            }
+        if self.exclude_folders.unwrap_or(false) && prefix.ends_with('/') {
+            return false;
         }
 
         if let Some(ref excluded_prefixes) = self.excluded_prefixes {
@@ -67,10 +64,11 @@ impl VersioningApi for VersioningConfiguration {
                 return false;
             }
 
-            if let Some(exclude_folders) = self.exclude_folders {
-                if exclude_folders && prefix.ends_with('/') {
-                    return true;
-                }
+            if let Some(exclude_folders) = self.exclude_folders
+                && exclude_folders
+                && prefix.ends_with('/')
+            {
+                return true;
             }
 
             if let Some(ref excluded_prefixes) = self.excluded_prefixes {

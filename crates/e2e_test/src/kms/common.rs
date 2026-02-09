@@ -117,7 +117,7 @@ pub async fn create_default_key(
 
 /// Create a KMS key with a specific ID (by directly writing to the key directory)
 pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use rand::RngCore;
+    use rand::Rng;
     use std::collections::HashMap;
     use tokio::fs;
 
@@ -406,11 +406,11 @@ impl VaultTestEnvironment {
             let port_check = TcpStream::connect(VAULT_ADDRESS).await.is_ok();
             if port_check {
                 // Additional check by making a health request
-                if let Ok(response) = reqwest::get(&format!("{VAULT_URL}/v1/sys/health")).await {
-                    if response.status().is_success() {
-                        info!("Vault server is ready after {} seconds", i);
-                        return Ok(());
-                    }
+                if let Ok(response) = reqwest::get(&format!("{VAULT_URL}/v1/sys/health")).await
+                    && response.status().is_success()
+                {
+                    info!("Vault server is ready after {} seconds", i);
+                    return Ok(());
                 }
             }
 

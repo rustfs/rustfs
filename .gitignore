@@ -6,6 +6,8 @@
 /test
 /logs
 /data
+/docs
+/rustfs-data/
 .devcontainer
 rustfs/static/*
 !rustfs/static/.gitkeep
@@ -25,7 +27,7 @@ profile.json
 *.pb
 *.svg
 deploy/logs/*.log.*
-
+artifacts/
 # s3-tests local artifacts (root directory only)
 /s3-tests/
 /s3-tests-local/
@@ -34,3 +36,7 @@ deploy/logs/*.log.*
 *.events
 *.audit
 *.snappy
+PR_DESCRIPTION.md
+IMPLEMENTATION_PLAN.md
+scripts/s3-tests/selected_tests.txt
+docs
