@@ -54,10 +54,10 @@ fn test_config_loader_env_vars() {
         std::env::set_var(ENV_TRUSTED_PROXY_PROXIES, "192.168.1.0/24,10.0.0.0/8");
     }
     unsafe {
-        std::env::set_var("RUSTFS_TRUSTED_PROXY_VALIDATION_MODE", "strict");
+        std::env::set_var(ENV_TRUSTED_PROXY_VALIDATION_MODE, "strict");
     }
     unsafe {
-        std::env::set_var("RUSTFS_TRUSTED_PROXY_MAX_HOPS", "5");
+        std::env::set_var(ENV_TRUSTED_PROXY_MAX_HOPS, "5");
     }
 
     let config = ConfigLoader::from_env();
@@ -71,10 +71,10 @@ fn test_config_loader_env_vars() {
             std::env::remove_var(ENV_TRUSTED_PROXY_PROXIES);
         }
         unsafe {
-            std::env::remove_var("RUSTFS_TRUSTED_PROXY_VALIDATION_MODE");
+            std::env::remove_var(ENV_TRUSTED_PROXY_VALIDATION_MODE);
         }
         unsafe {
-            std::env::remove_var("RUSTFS_TRUSTED_PROXY_MAX_HOPS");
+            std::env::remove_var(ENV_TRUSTED_PROXY_MAX_HOPS);
         }
         unsafe {
             std::env::remove_var("SERVER_PORT");

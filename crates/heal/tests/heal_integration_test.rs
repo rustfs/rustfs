@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{
     disk::endpoint::Endpoint,
@@ -240,6 +241,19 @@ mod serial_tests {
         // ─── 2️⃣ verify each part file is restored ───────
         assert!(target_part.exists());
 
+        // ─── 3️⃣ verify object data integrity by actually reading it ───────
+        let mut reader = ecstore
+            .get_object_reader(bucket_name, object_name, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("Failed to get object reader after heal");
+
+        let mut downloaded_data = Vec::new();
+        tokio::io::copy(&mut reader, &mut downloaded_data)
+            .await
+            .expect("Failed to read healed object data");
+
+        assert_eq!(downloaded_data, test_data, "Healed object data does not match original");
+
         info!("Heal object basic test passed");
     }
 
@@ -380,11 +394,25 @@ mod serial_tests {
             .expect("Failed to heal object");
         assert!(error.is_none(), "Heal object returned error: {error:?}");
 
+        // Verify object metadata is accessible
         let obj_info = ecstore
             .get_object_info(bucket_name, object_name, &ObjectOptions::default())
             .await
             .expect("Expected object to be readable after heal");
         assert_eq!(obj_info.size as usize, test_data.len());
+
+        // Actually read the object data to verify integrity
+        let mut reader = ecstore
+            .get_object_reader(bucket_name, object_name, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("Failed to get object reader");
+
+        let mut downloaded_data = Vec::new();
+        tokio::io::copy(&mut reader, &mut downloaded_data)
+            .await
+            .expect("Failed to read object data");
+
+        assert_eq!(downloaded_data, test_data, "Healed object data does not match original");
 
         info!("Heal format with data test passed");
     }
