@@ -252,10 +252,7 @@ pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> s
         {
             user_defined.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}Actual-Object-Size"), actual_size_str.to_string());
         } else {
-            tracing::warn!(
-                "Failed to get or parse {} header",
-                RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE
-            );
+            tracing::warn!("Failed to get or parse {} header", RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE);
         }
     }
 
@@ -914,15 +911,9 @@ mod tests {
     #[test]
     fn test_put_opts_from_headers_with_replication_request() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            RUSTFS_BUCKET_REPLICATION_REQUEST,
-            REPLICATION_REQUEST_TRUE.clone(),
-        );
+        headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE.clone());
         let valid_mtime = "2024-05-20T10:30:00+08:00";
-        headers.insert(
-            RUSTFS_BUCKET_SOURCE_MTIME,
-            HeaderValue::from_static(valid_mtime),
-        );
+        headers.insert(RUSTFS_BUCKET_SOURCE_MTIME, HeaderValue::from_static(valid_mtime));
 
         let metadata = HashMap::new();
 
@@ -937,14 +928,8 @@ mod tests {
         assert_eq!(opts.mod_time, Some(expected_mtime));
 
         let mut headers_invalid_mtime = HeaderMap::new();
-        headers_invalid_mtime.insert(
-            RUSTFS_BUCKET_REPLICATION_REQUEST,
-            REPLICATION_REQUEST_TRUE.clone(),
-        );
-        headers_invalid_mtime.insert(
-            RUSTFS_BUCKET_SOURCE_MTIME,
-            HeaderValue::from_static("invalid-time"),
-        );
+        headers_invalid_mtime.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE.clone());
+        headers_invalid_mtime.insert(RUSTFS_BUCKET_SOURCE_MTIME, HeaderValue::from_static("invalid-time"));
         let result_invalid = put_opts_from_headers(&headers_invalid_mtime, HashMap::new());
         assert!(result_invalid.is_ok());
         let opts_invalid = result_invalid.unwrap();

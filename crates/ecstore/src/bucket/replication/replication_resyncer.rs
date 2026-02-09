@@ -1855,18 +1855,12 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 if let Some(se) = e.as_service_error() {
                     if !se.is_not_found() {
                         rinfo.error = Some(e.to_string());
-                        warn!(
-                            "replication head_object failed bucket:{} arn:{} error:{}",
-                            bucket, tgt_client.arn, e
-                        );
+                        warn!("replication head_object failed bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
                         return rinfo;
                     }
                 } else {
                     rinfo.error = Some(e.to_string());
-                    warn!(
-                        "replication head_object failed bucket:{} arn:{} error:{}",
-                        bucket, tgt_client.arn, e
-                    );
+                    warn!("replication head_object failed bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
                     return rinfo;
                 }
             }

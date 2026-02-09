@@ -1001,10 +1001,7 @@ impl PutObjectOptions {
         if self.internal.source_mtime.unix_timestamp() != 0 {
             header.insert(
                 RUSTFS_BUCKET_SOURCE_MTIME,
-                HeaderValue::from_str(
-                    &self.internal.source_mtime.format(&Rfc3339).unwrap_or_default(),
-                )
-                .expect("err"),
+                HeaderValue::from_str(&self.internal.source_mtime.format(&Rfc3339).unwrap_or_default()).expect("err"),
             );
         }
 
@@ -1183,7 +1180,6 @@ impl TargetClient {
         {
             headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
         }
-
 
         match builder
             .bucket(bucket)
