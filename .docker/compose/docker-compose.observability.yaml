@@ -69,6 +69,9 @@ services:
       - TZ=Asia/Shanghai
     networks:
       - rustfs-network
+    volumes:
+      - ../../.docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../.docker/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
 
   node1:
     build:
