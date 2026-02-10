@@ -69,7 +69,6 @@ exporters:
       queue_size: 5000  # Queue size
   prometheus: # Prometheus exporter for metrics data
     endpoint: "0.0.0.0:8889"  # Prometheus scraping endpoint
-    namespace: "metrics"  # indicator prefix
     send_timestamps: true  # Send timestamp
     metric_expiration: 5m  # Metric expiration time
     resource_to_telemetry_conversion:
