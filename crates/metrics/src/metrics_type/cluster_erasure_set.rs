@@ -14,7 +14,6 @@
 
 #![allow(dead_code)]
 
-/// Erasure code set related metric descriptors
 use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 

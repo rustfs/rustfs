@@ -14,12 +14,6 @@
 
 #![allow(dead_code)]
 
-/// Memory-related metric descriptors
-///
-/// This module provides a set of metric descriptors for system memory statistics.
-/// These descriptors are initialized lazily using `std::sync::LazyLock` to ensure
-/// they are only created when actually needed, improving performance and reducing
-/// startup overhead.
 use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 

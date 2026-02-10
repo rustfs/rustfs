@@ -621,8 +621,8 @@ impl DataUsageCache {
         }
     }
 
-    pub fn find(&self, path: &str) -> Option<DataUsageEntry> {
-        self.cache.get(&hash_path(path).key()).cloned()
+    pub fn find(&self, path: &str) -> Option<&DataUsageEntry> {
+        self.cache.get(&hash_path(path).key())
     }
 
     pub fn find_children_copy(&mut self, h: DataUsageHash) -> DataUsageHashMap {
@@ -677,10 +677,10 @@ impl DataUsageCache {
         match self.find(path) {
             Some(root) => {
                 if root.children.is_empty() {
-                    return Some(root);
+                    return Some(root.clone());
                 }
-                let mut flat = self.flatten(&root);
-                if flat.replication_stats.is_some() && flat.replication_stats.as_ref().unwrap().empty() {
+                let mut flat = self.flatten(root);
+                if flat.replication_stats.as_ref().is_some_and(|rs| rs.empty()) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
@@ -721,7 +721,7 @@ impl DataUsageCache {
         }
         let top = hash_path(&self.info.name).key();
         let top_e = match self.find(&top) {
-            Some(e) => e,
+            Some(e) => e.clone(),
             None => return,
         };
         // Note: DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS constant would need to be passed as parameter
@@ -797,12 +797,9 @@ impl DataUsageCache {
     }
 
     pub fn total_children_rec(&self, path: &str) -> usize {
-        let root = self.find(path);
-
-        if root.is_none() {
+        let Some(root) = self.find(path) else {
             return 0;
-        }
-        let root = root.unwrap();
+        };
         if root.children.is_empty() {
             return 0;
         }
@@ -848,7 +845,7 @@ impl DataUsageCache {
     }
 
     pub fn root(&self) -> Option<DataUsageEntry> {
-        self.find(&self.info.name)
+        self.find(&self.info.name).cloned()
     }
 
     /// Convert cache to DataUsageInfo for a specific path
@@ -857,7 +854,7 @@ impl DataUsageCache {
             Some(e) => e,
             None => return DataUsageInfo::default(),
         };
-        let flat = self.flatten(&e);
+        let flat = self.flatten(e);
 
         let mut buckets_usage = HashMap::new();
         for bucket_name in buckets.iter() {
@@ -865,7 +862,7 @@ impl DataUsageCache {
                 Some(e) => e,
                 None => continue,
             };
-            let flat = self.flatten(&e);
+            let flat = self.flatten(e);
             let mut bui = BucketUsageInfo {
                 size: flat.size as u64,
                 versions_count: flat.versions as u64,

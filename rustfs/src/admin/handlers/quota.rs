@@ -21,7 +21,7 @@ use hyper::StatusCode;
 use matchit::Params;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
-use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -185,7 +185,7 @@ impl Operation for GetBucketQuotaHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::GetBucketQuotaAdminAction)],
+            vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
             None,
         )
         .await?;
@@ -313,7 +313,7 @@ impl Operation for GetBucketQuotaStatsHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::GetBucketQuotaAdminAction)],
+            vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
             None,
         )
         .await?;
@@ -380,7 +380,7 @@ impl Operation for CheckBucketQuotaHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::GetBucketQuotaAdminAction)],
+            vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
             None,
         )
         .await?;
@@ -422,7 +422,7 @@ impl Operation for CheckBucketQuotaHandler {
         };
 
         let result = quota_checker
-            .check_quota(&bucket, operation, request.operation_size)
+            .check_quota_with_usage_reporting(&bucket, operation, request.operation_size, true)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to check quota: {}", e))?;
 
@@ -431,7 +431,7 @@ impl Operation for CheckBucketQuotaHandler {
             operation_type: request.operation_type,
             operation_size: request.operation_size,
             allowed: result.allowed,
-            current_usage: result.current_usage,
+            current_usage: result.current_usage.unwrap_or(0),
             quota_limit: result.quota_limit,
             remaining_quota: result.remaining,
         };

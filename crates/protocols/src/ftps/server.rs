@@ -17,7 +17,7 @@ use super::driver::FtpsDriver;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
 use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
-use libunftp::auth::{AuthenticationError, UserDetail};
+use libunftp::auth::{AuthenticationError, Authenticator, Principal, UserDetail, UserDetailError, UserDetailProvider};
 use libunftp::options::FtpsRequired;
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
@@ -78,10 +78,11 @@ where
         info!("Initializing FTPS server on {}", self.config.bind_addr);
 
         let storage_clone = self.storage.clone();
-        let mut server_builder = libunftp::ServerBuilder::with_authenticator(
+        let mut server_builder = libunftp::ServerBuilder::with_user_detail_provider(
             Box::new(move || FtpsDriver::new(storage_clone.clone())),
-            Arc::new(FtpsAuthenticator::new()),
-        );
+            Arc::new(FtpsUserDetailProvider),
+        )
+        .authenticator(Arc::new(FtpsAuthenticator::new()));
 
         // Configure passive ports for data connections
         if let Some(passive_ports) = &self.config.passive_ports {
@@ -195,6 +196,49 @@ where
     }
 }
 
+/// FTPS user detail provider implementation
+#[derive(Debug)]
+pub struct FtpsUserDetailProvider;
+
+#[async_trait::async_trait]
+impl UserDetailProvider for FtpsUserDetailProvider {
+    type User = FtpsUser;
+
+    async fn provide_user_detail(&self, principal: &Principal) -> Result<Self::User, UserDetailError> {
+        use rustfs_iam::get;
+
+        // Access IAM system
+        let iam_sys = get().map_err(|e| {
+            error!("IAM system unavailable during FTPS user detail fetch: {}", e);
+            UserDetailError::ImplPropagated("Internal authentication service unavailable".to_string(), Some(Box::new(e)))
+        })?;
+
+        let (user_identity, _is_valid) = iam_sys.check_key(&principal.username).await.map_err(|e| {
+            error!("IAM check_key failed for {}: {}", principal.username, e);
+            UserDetailError::ImplPropagated("Authentication verification failed".to_string(), Some(Box::new(e)))
+        })?;
+
+        let identity = user_identity.ok_or_else(|| {
+            error!("User identity missing for {}", principal.username);
+            UserDetailError::UserNotFound {
+                username: principal.username.clone(),
+            }
+        })?;
+
+        let source_ip: IpAddr = DEFAULT_SOURCE_IP.parse().unwrap();
+
+        let session_context = SessionContext::new(ProtocolPrincipal::new(Arc::new(identity.clone())), Protocol::Ftps, source_ip);
+
+        let ftps_user = FtpsUser {
+            username: principal.username.clone(),
+            name: identity.credentials.name.clone(),
+            session_context,
+        };
+
+        Ok(ftps_user)
+    }
+}
+
 /// FTPS authenticator implementation
 #[derive(Debug, Default)]
 pub struct FtpsAuthenticator;
@@ -207,9 +251,9 @@ impl FtpsAuthenticator {
 }
 
 #[async_trait::async_trait]
-impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
+impl Authenticator for FtpsAuthenticator {
     /// Authenticate FTP user against RustFS IAM system
-    async fn authenticate(&self, username: &str, creds: &libunftp::auth::Credentials) -> Result<FtpsUser, AuthenticationError> {
+    async fn authenticate(&self, username: &str, creds: &libunftp::auth::Credentials) -> Result<Principal, AuthenticationError> {
         use rustfs_credentials::Credentials as S3Credentials;
         use rustfs_iam::get;
 
@@ -252,17 +296,9 @@ impl libunftp::auth::Authenticator<FtpsUser> for FtpsAuthenticator {
             return Err(AuthenticationError::BadPassword);
         }
 
-        let source_ip: IpAddr = DEFAULT_SOURCE_IP.parse().unwrap();
-
-        let session_context = SessionContext::new(ProtocolPrincipal::new(Arc::new(identity.clone())), Protocol::Ftps, source_ip);
-
-        let ftps_user = FtpsUser {
-            username: username.to_string(),
-            name: identity.credentials.name.clone(),
-            session_context,
-        };
-
         info!("FTPS user '{}' authenticated successfully", username);
-        Ok(ftps_user)
+        Ok(Principal {
+            username: username.to_string(),
+        })
     }
 }

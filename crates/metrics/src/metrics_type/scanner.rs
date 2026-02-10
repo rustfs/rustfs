@@ -14,7 +14,6 @@
 
 #![allow(dead_code)]
 
-/// Scanner-related metric descriptors
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 

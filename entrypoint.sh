@@ -57,15 +57,8 @@ process_data_volumes() {
 
   for vol in $VOLUME_LIST; do
     case "$vol" in
-      /*)
-        case "$vol" in
-          http://*|https://*) : ;;
-          *) DATA_VOLUMES="$DATA_VOLUMES $vol" ;;
-        esac
-        ;;
-      *)
-        : # skip non-local paths
-        ;;
+      /*) DATA_VOLUMES="$DATA_VOLUMES $vol" ;;
+      *)  : ;; # skip non-absolute paths (including http(s):// URLs)
     esac
   done
   

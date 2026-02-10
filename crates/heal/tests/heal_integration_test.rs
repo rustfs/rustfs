@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{
     disk::endpoint::Endpoint,
@@ -229,6 +230,19 @@ mod serial_tests {
         // ─── 2️⃣ verify each part file is restored ───────
         assert!(target_part.exists());
 
+        // ─── 3️⃣ verify object data integrity by actually reading it ───────
+        let mut reader = ecstore
+            .get_object_reader(bucket_name, object_name, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("Failed to get object reader after heal");
+
+        let mut downloaded_data = Vec::new();
+        tokio::io::copy(&mut reader, &mut downloaded_data)
+            .await
+            .expect("Failed to read healed object data");
+
+        assert_eq!(downloaded_data, test_data, "Healed object data does not match original");
+
         info!("Heal object basic test passed");
     }
 
@@ -312,13 +326,8 @@ mod serial_tests {
         assert!(!format_path.exists(), "format.json still exists after deletion");
         println!("✅ Deleted format.json on disk: {format_path:?}");
 
-        // Create heal manager with faster interval
-        let cfg = HealConfig {
-            heal_interval: Duration::from_secs(2),
-            ..Default::default()
-        };
-        let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
-        heal_manager.start().await.unwrap();
+        let (_result, error) = heal_storage.heal_format(false).await.expect("Failed to heal format");
+        assert!(error.is_none(), "Heal format returned error: {error:?}");
 
         // ─── 2️⃣ wait for format.json to be restored with polling + timeout ───────
         // The minimal scanner interval is clamped to 10s in manager.rs, so we set timeout to 20s
@@ -402,7 +411,27 @@ mod serial_tests {
         // ─── 4️⃣ verify each part file is restored ───────
         assert!(target_part.exists());
 
-        info!("Heal format basic test passed");
+        // Verify object metadata is accessible
+        let obj_info = ecstore
+            .get_object_info(bucket_name, object_name, &ObjectOptions::default())
+            .await
+            .expect("Expected object to be readable after heal");
+        assert_eq!(obj_info.size as usize, test_data.len());
+
+        // Actually read the object data to verify integrity
+        let mut reader = ecstore
+            .get_object_reader(bucket_name, object_name, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("Failed to get object reader");
+
+        let mut downloaded_data = Vec::new();
+        tokio::io::copy(&mut reader, &mut downloaded_data)
+            .await
+            .expect("Failed to read object data");
+
+        assert_eq!(downloaded_data, test_data, "Healed object data does not match original");
+
+        info!("Heal format with data test passed");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

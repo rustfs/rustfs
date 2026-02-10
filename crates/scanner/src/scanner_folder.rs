@@ -734,10 +734,7 @@ impl FolderScanner {
                     self.send_update().await;
                 }
 
-                if !into.compacted
-                    && let Some(parent) = self.update_cache.find(&this_hash.key())
-                    && !parent.compacted
-                {
+                if !into.compacted && self.update_cache.find(&this_hash.key()).is_some_and(|v| !v.compacted) {
                     self.update_cache.delete_recursive(&h);
                     self.update_cache
                         .copy_with_children(&self.new_cache, &h, &Some(this_hash.clone()));
@@ -1086,7 +1083,7 @@ pub async fn scan_data_folder(
 
     // Create skip_heal flag
     let is_erasure_mode = is_erasure().await;
-    let skip_heal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!is_erasure_mode || cache.info.skip_healing));
+    let skip_heal = Arc::new(std::sync::atomic::AtomicBool::new(!is_erasure_mode || cache.info.skip_healing));
 
     // Create heal_object_select flag
     let heal_object_select = if is_erasure_mode && !cache.info.skip_healing {
@@ -1144,11 +1141,11 @@ pub async fn scan_data_folder(
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = cache.info.next_cycle;
 
-            (close_disk)().await;
+            close_disk().await;
             Ok(new_cache.clone())
         }
         Err(e) => {
-            (close_disk)().await;
+            close_disk().await;
             // No useful information, return original cache
             Err(e)
         }

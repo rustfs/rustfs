@@ -14,7 +14,6 @@
 
 #![allow(dead_code)]
 
-/// Bucket copy metric descriptor
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 

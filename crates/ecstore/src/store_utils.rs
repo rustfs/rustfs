@@ -18,6 +18,13 @@ use regex::Regex;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS};
 use std::collections::HashMap;
 use std::io::{Error, Result};
+use std::sync::LazyLock;
+
+static IP_ADDRESS_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+\.){3}\d+$").expect("valid ip address regex"));
+static STRICT_BUCKET_NAME_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9\.\-]{1,61}[a-z0-9]$").expect("valid strict bucket name regex"));
+static NON_STRICT_BUCKET_NAME_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9\.\-_:]{1,61}[A-Za-z0-9]$").expect("valid non-strict bucket name regex"));
 
 pub fn clean_metadata(metadata: &mut HashMap<String, String>) {
     remove_standard_storage_class(metadata);
@@ -70,15 +77,14 @@ fn check_bucket_name(bucket_name: &str, strict: bool) -> Result<()> {
         return Err(Error::other("Bucket name cannot be longer than 63 characters"));
     }
 
-    let ip_address_regex = Regex::new(r"^(\d+\.){3}\d+$").unwrap();
-    if ip_address_regex.is_match(bucket_name) {
+    if IP_ADDRESS_REGEX.is_match(bucket_name) {
         return Err(Error::other("Bucket name cannot be an IP address"));
     }
 
     let valid_bucket_name_regex = if strict {
-        Regex::new(r"^[a-z0-9][a-z0-9\.\-]{1,61}[a-z0-9]$").unwrap()
+        &*STRICT_BUCKET_NAME_REGEX
     } else {
-        Regex::new(r"^[A-Za-z0-9][A-Za-z0-9\.\-_:]{1,61}[A-Za-z0-9]$").unwrap()
+        &*NON_STRICT_BUCKET_NAME_REGEX
     };
 
     if !valid_bucket_name_regex.is_match(bucket_name) {
@@ -91,4 +97,154 @@ fn check_bucket_name(bucket_name: &str, strict: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Invalid bucket names (should return true) ---
+
+    #[test]
+    fn test_empty_string_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket("", false));
+        assert!(is_reserved_or_invalid_bucket("", true));
+    }
+
+    #[test]
+    fn test_whitespace_only_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket("   ", false));
+        assert!(is_reserved_or_invalid_bucket("   ", true));
+    }
+
+    #[test]
+    fn test_too_short_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket("ab", false));
+        assert!(is_reserved_or_invalid_bucket("ab", true));
+    }
+
+    #[test]
+    fn test_too_long_is_invalid() {
+        let long_name = "a".repeat(64);
+        assert!(is_reserved_or_invalid_bucket(&long_name, false));
+        assert!(is_reserved_or_invalid_bucket(&long_name, true));
+    }
+
+    #[test]
+    fn test_ip_address_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket("192.168.1.1", false));
+        assert!(is_reserved_or_invalid_bucket("10.0.0.1", true));
+    }
+
+    #[test]
+    fn test_double_dots_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket("my..bucket", false));
+        assert!(is_reserved_or_invalid_bucket("my..bucket", true));
+    }
+
+    #[test]
+    fn test_dot_dash_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket("my.-bucket", false));
+        assert!(is_reserved_or_invalid_bucket("my.-bucket", true));
+    }
+
+    #[test]
+    fn test_dash_dot_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket("my-.bucket", false));
+        assert!(is_reserved_or_invalid_bucket("my-.bucket", true));
+    }
+
+    #[test]
+    fn test_reserved_name_rustfs_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket("rustfs", false));
+        assert!(is_reserved_or_invalid_bucket("rustfs", true));
+    }
+
+    #[test]
+    fn test_meta_bucket_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket(RUSTFS_META_BUCKET, false));
+        assert!(is_reserved_or_invalid_bucket(RUSTFS_META_BUCKET, true));
+    }
+
+    #[test]
+    fn test_starts_with_invalid_char_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket("-my-bucket", false));
+        assert!(is_reserved_or_invalid_bucket(".my-bucket", false));
+    }
+
+    #[test]
+    fn test_ends_with_invalid_char_is_invalid() {
+        assert!(is_reserved_or_invalid_bucket("my-bucket-", false));
+        assert!(is_reserved_or_invalid_bucket("my-bucket.", false));
+    }
+
+    // --- Strict vs non-strict differences ---
+
+    #[test]
+    fn test_uppercase_valid_non_strict_invalid_strict() {
+        assert!(!is_reserved_or_invalid_bucket("MyBucket", false));
+        assert!(is_reserved_or_invalid_bucket("MyBucket", true));
+    }
+
+    #[test]
+    fn test_underscore_valid_non_strict_invalid_strict() {
+        assert!(!is_reserved_or_invalid_bucket("my_bucket", false));
+        assert!(is_reserved_or_invalid_bucket("my_bucket", true));
+    }
+
+    #[test]
+    fn test_colon_valid_non_strict_invalid_strict() {
+        assert!(!is_reserved_or_invalid_bucket("my:bucket", false));
+        assert!(is_reserved_or_invalid_bucket("my:bucket", true));
+    }
+
+    // --- Valid bucket names (should return false) ---
+
+    #[test]
+    fn test_simple_valid_bucket() {
+        assert!(!is_reserved_or_invalid_bucket("my-bucket", false));
+        assert!(!is_reserved_or_invalid_bucket("my-bucket", true));
+    }
+
+    #[test]
+    fn test_valid_bucket_with_dots() {
+        assert!(!is_reserved_or_invalid_bucket("my.bucket.name", false));
+        assert!(!is_reserved_or_invalid_bucket("my.bucket.name", true));
+    }
+
+    #[test]
+    fn test_numeric_bucket() {
+        assert!(!is_reserved_or_invalid_bucket("123", false));
+        assert!(!is_reserved_or_invalid_bucket("123", true));
+    }
+
+    #[test]
+    fn test_min_length_bucket() {
+        assert!(!is_reserved_or_invalid_bucket("abc", false));
+        assert!(!is_reserved_or_invalid_bucket("abc", true));
+    }
+
+    #[test]
+    fn test_max_length_bucket() {
+        let max_name = "a".repeat(63);
+        assert!(!is_reserved_or_invalid_bucket(&max_name, false));
+        assert!(!is_reserved_or_invalid_bucket(&max_name, true));
+    }
+
+    #[test]
+    fn test_trailing_slash_stripped() {
+        assert!(!is_reserved_or_invalid_bucket("my-bucket/", false));
+        assert!(!is_reserved_or_invalid_bucket("my-bucket/", true));
+    }
+
+    #[test]
+    fn test_multiple_calls_same_result() {
+        // Ensures static regex caching doesn't break across calls
+        for _ in 0..100 {
+            assert!(!is_reserved_or_invalid_bucket("my-bucket", false));
+            assert!(!is_reserved_or_invalid_bucket("my-bucket", true));
+            assert!(is_reserved_or_invalid_bucket("192.168.1.1", false));
+            assert!(is_reserved_or_invalid_bucket("", false));
+        }
+    }
 }

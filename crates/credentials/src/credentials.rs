@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{DEFAULT_SECRET_KEY, ENV_RPC_SECRET, IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;

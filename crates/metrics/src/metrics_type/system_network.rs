@@ -14,12 +14,6 @@
 
 #![allow(dead_code)]
 
-/// Network-related metric descriptors
-///
-/// These metrics capture internode network communication statistics including:
-/// - Error counts for connection and general internode calls
-/// - Network dial performance metrics
-/// - Data transfer volume in both directions
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 

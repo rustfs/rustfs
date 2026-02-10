@@ -34,6 +34,7 @@ path = "src/main.rs"
 default = ["metrics"]
 metrics = []
 ftps = ["rustfs-protocols/ftps"]
+full = ["metrics", "ftps"]
 
 [lints]
 workspace = true
@@ -52,6 +53,7 @@ rustfs-iam = { workspace = true }
 rustfs-kms = { workspace = true }
 rustfs-lock.workspace = true
 rustfs-madmin = { workspace = true }
+rustfs-metrics = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
@@ -133,6 +135,8 @@ aes-gcm = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
