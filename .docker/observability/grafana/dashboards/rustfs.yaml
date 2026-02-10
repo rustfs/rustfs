@@ -90,7 +90,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_api_requests_total{job=~\"$pod\"})",
+          "expr": "sum(rustfs_api_requests_total{job=~\"$pod\", key_request_uri_path=~\"$path\"})",
           "legendFormat": "Total Requests",
           "range": true,
           "refId": "A"
@@ -155,7 +155,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(rustfs_api_requests_total{job=~\"$pod\", key_request_uri_path=~\"$bucket\"}[5m]))",
+          "expr": "sum(rate(rustfs_api_requests_total{job=~\"$pod\", key_request_uri_path=~\"$path\"}[5m]))",
           "hide": false,
           "instant": false,
           "legendFormat": "__auto",
@@ -336,7 +336,7 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "linear",
+            "lineInterpolation": "smooth",
             "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
@@ -398,7 +398,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (key_request_method) (rate(rustfs_api_requests_total{job=~\"$pod\", key_request_uri_path=~\"$bucket\"}[5m]))",
+          "expr": "sum by (key_request_method) (rate(rustfs_api_requests_total{job=~\"$pod\", key_request_uri_path=~\"$path\"}[5m]))",
           "legendFormat": "{{key_request_method}}",
           "range": true,
           "refId": "A"
@@ -434,7 +434,7 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "linear",
+            "lineInterpolation": "smooth",
             "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
@@ -498,13 +498,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (key_request_uri_path) (rate(rustfs_api_requests_total{job=~\"$pod\", key_request_uri_path=~\"$bucket\"}[5m]))",
+          "expr": "sum by (key_request_uri_path) (rate(rustfs_api_requests_total{job=~\"$pod\", key_request_uri_path=~\"$path\"}[5m]))",
           "legendFormat": "{{key_request_uri_path}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Request Rate (Bucket)",
+      "title": "Request Rate (Path)",
       "type": "timeseries"
     },
     {
@@ -534,8 +534,8 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -650,7 +650,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$pod\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$pod\", key_request_uri_path=~\"$path\"}[5m])))",
           "legendFormat": "P50",
           "range": true,
           "refId": "A"
@@ -661,7 +661,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$pod\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$pod\", key_request_uri_path=~\"$path\"}[5m])))",
           "legendFormat": "P95",
           "range": true,
           "refId": "B"
@@ -672,7 +672,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$pod\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$pod\", key_request_uri_path=~\"$path\"}[5m])))",
           "legendFormat": "P99",
           "range": true,
           "refId": "C"
@@ -708,8 +708,8 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -824,7 +824,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$pod\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$pod\", key_request_uri_path=~\"$path\"}[5m])))",
           "legendFormat": "P50",
           "range": true,
           "refId": "A"
@@ -895,7 +895,7 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "linear",
+            "lineInterpolation": "smooth",
             "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
@@ -922,7 +922,7 @@
               }
             ]
           },
-          "unit": "vCPU"
+          "unit": "percent"
         },
         "overrides": []
       },
@@ -993,7 +993,7 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "linear",
+            "lineInterpolation": "smooth",
             "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
@@ -1091,7 +1091,7 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "linear",
+            "lineInterpolation": "smooth",
             "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
@@ -1185,8 +1185,8 @@
     "list": [
       {
         "current": {
-          "text": "Prometheus",
-          "value": "prometheus"
+          "text": "prometheus",
+          "value": "afcscfhj591c0d"
         },
         "includeAll": false,
         "label": "Data Source",
@@ -1228,7 +1228,9 @@
       {
         "allValue": ".*",
         "current": {
-          "text": "All",
+          "text": [
+            "All"
+          ],
           "value": [
             "$__all"
           ]
@@ -1239,9 +1241,9 @@
         },
         "definition": "label_values(rustfs_api_requests_total{job=~\"$pod\"}, key_request_uri_path)",
         "includeAll": true,
-        "label": "Bucket/Path",
+        "label": "Path",
         "multi": true,
-        "name": "bucket",
+        "name": "path",
         "options": [],
         "query": {
           "qryType": 1,
@@ -1263,5 +1265,5 @@
   "timezone": "browser",
   "title": "RustFS",
   "uid": "rustfs-s3",
-  "version": 2
+  "version": 3
 }
