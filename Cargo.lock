@@ -7148,6 +7148,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures",
+ "http 1.4.0",
  "rustfs-common",
  "rustfs-config",
  "rustfs-ecstore",
