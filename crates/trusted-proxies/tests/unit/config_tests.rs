@@ -12,15 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_config::{DEFAULT_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_PROXIES};
+use rustfs_config::{
+    DEFAULT_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_ENABLE_RFC7239, ENV_TRUSTED_PROXY_MAX_HOPS, ENV_TRUSTED_PROXY_PROXIES,
+    ENV_TRUSTED_PROXY_VALIDATION_MODE,
+};
 use rustfs_trusted_proxies::{ConfigLoader, TrustedProxy, TrustedProxyConfig, ValidationMode};
 use std::net::IpAddr;
+use std::sync::Mutex;
+
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 #[test]
 #[allow(unsafe_code)]
 fn test_config_loader_default() {
+    let _guard = ENV_MUTEX.lock().unwrap();
     unsafe {
         std::env::remove_var(ENV_TRUSTED_PROXY_PROXIES);
+    }
+    unsafe {
+        std::env::remove_var(ENV_TRUSTED_PROXY_VALIDATION_MODE);
+    }
+    unsafe {
+        std::env::remove_var(ENV_TRUSTED_PROXY_MAX_HOPS);
+    }
+    unsafe {
+        std::env::remove_var(ENV_TRUSTED_PROXY_ENABLE_RFC7239);
     }
     let config = ConfigLoader::from_env_or_default();
     assert_eq!(config.server_addr.port(), 9000);
@@ -33,14 +49,15 @@ fn test_config_loader_default() {
 #[test]
 #[allow(unsafe_code)]
 fn test_config_loader_env_vars() {
+    let _guard = ENV_MUTEX.lock().unwrap();
     unsafe {
         std::env::set_var(ENV_TRUSTED_PROXY_PROXIES, "192.168.1.0/24,10.0.0.0/8");
     }
     unsafe {
-        std::env::set_var("RUSTFS_TRUSTED_PROXY_VALIDATION_MODE", "strict");
+        std::env::set_var(ENV_TRUSTED_PROXY_VALIDATION_MODE, "strict");
     }
     unsafe {
-        std::env::set_var("RUSTFS_TRUSTED_PROXY_MAX_HOPS", "5");
+        std::env::set_var(ENV_TRUSTED_PROXY_MAX_HOPS, "5");
     }
 
     let config = ConfigLoader::from_env();
@@ -54,10 +71,10 @@ fn test_config_loader_env_vars() {
             std::env::remove_var(ENV_TRUSTED_PROXY_PROXIES);
         }
         unsafe {
-            std::env::remove_var("RUSTFS_TRUSTED_PROXY_VALIDATION_MODE");
+            std::env::remove_var(ENV_TRUSTED_PROXY_VALIDATION_MODE);
         }
         unsafe {
-            std::env::remove_var("RUSTFS_TRUSTED_PROXY_MAX_HOPS");
+            std::env::remove_var(ENV_TRUSTED_PROXY_MAX_HOPS);
         }
         unsafe {
             std::env::remove_var("SERVER_PORT");

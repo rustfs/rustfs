@@ -426,8 +426,19 @@ impl Drop for GetObjectGuard {
     /// This ensures accurate tracking even in error/panic scenarios, as Drop
     /// is called during stack unwinding (unless explicitly forgotten).
     fn drop(&mut self) {
-        // Decrement concurrent request counter
-        ACTIVE_GET_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+        // Decrement concurrent request counter without underflow.
+        // If the counter is already 0, `checked_sub` returns None and `fetch_update`
+        // yields Err(previous). We treat that as a lifecycle bug (e.g., unmatched drop)
+        // and surface it in debug builds instead of silently discarding it.
+        if let Err(previous) =
+            ACTIVE_GET_REQUESTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
+        {
+            debug_assert_eq!(
+                previous, 0,
+                "ACTIVE_GET_REQUESTS underflow attempt in GetObjectGuard::drop; previous value = {}",
+                previous
+            );
+        }
 
         // Record Prometheus metrics for monitoring and alerting
         #[cfg(feature = "metrics")]
