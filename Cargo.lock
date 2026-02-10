@@ -6864,6 +6864,7 @@ dependencies = [
  "rustfs-kms",
  "rustfs-lock",
  "rustfs-madmin",
+ "rustfs-metrics",
  "rustfs-notify",
  "rustfs-obs",
  "rustfs-policy",
@@ -7243,6 +7244,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rustfs-metrics"
+version = "0.0.5"
+dependencies = [
+ "metrics",
+ "rustfs-ecstore",
+ "rustfs-utils",
+ "sysinfo",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

@@ -30,7 +30,6 @@
 //! # use all functions
 //! rustfs-obs = { version = "0.1.0", features = ["full"] }
 //! ```
-mod collectors;
 ///
 /// ## Usage
 ///
@@ -57,7 +56,6 @@ mod collectors;
 mod config;
 mod error;
 mod global;
-mod metrics;
 mod recorder;
 mod system;
 mod telemetry;
@@ -65,7 +63,6 @@ mod telemetry;
 pub use config::*;
 pub use error::*;
 pub use global::*;
-pub use metrics::*;
 pub use recorder::*;
 pub use system::SystemObserver;
 pub use telemetry::OtelGuard;

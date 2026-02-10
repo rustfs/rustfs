@@ -56,7 +56,7 @@ docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
 - docker compose v2.0.0 or before
 
 ```bash
-docke-compose -f docker-compose.yml -f docker-compose.override.yml up -d
+docker-compose -f docker-compose.yml -f docker-compose.override.yml up -d
 ```
 
 To access the Grafana dashboard, navigate to `http://localhost:3000` in your browser. The default username and password
