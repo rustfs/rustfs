@@ -33,5 +33,7 @@ use tokio_util::sync::CancellationToken;
 /// ```
 /// Note: This function should only be called once during the application's lifecycle. Calling it multiple times may lead to unexpected behavior.
 pub fn init_metrics_system(token: CancellationToken) {
+    tracing::info!("init metrics system start");
     crate::collectors::init_metrics_collectors(token);
+    tracing::info!("init metrics system done");
 }

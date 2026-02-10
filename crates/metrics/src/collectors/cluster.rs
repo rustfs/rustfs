@@ -128,6 +128,7 @@ pub fn collect_cluster_metrics(stats: &ClusterStats) -> Vec<PrometheusMetric> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::report_metrics;
 
     #[test]
     fn test_collect_cluster_metrics() {
@@ -141,6 +142,7 @@ mod tests {
         };
 
         let metrics = collect_cluster_metrics(&stats);
+        report_metrics(&metrics);
 
         assert_eq!(metrics.len(), 6);
 
@@ -170,6 +172,7 @@ mod tests {
         let stats = ClusterStats::default();
 
         let metrics = collect_cluster_metrics(&stats);
+        report_metrics(&metrics);
 
         assert_eq!(metrics.len(), 6);
 

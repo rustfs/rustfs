@@ -69,6 +69,7 @@ const METRIC_COUNT: usize = 3;
 ///     uptime_seconds: 3600,
 /// };
 /// let metrics = collect_resource_metrics(&stats);
+/// assert_eq!(metrics.len(), 3);
 /// ```
 #[must_use]
 #[inline]
@@ -97,6 +98,7 @@ pub fn collect_resource_metrics(stats: &ResourceStats) -> Vec<PrometheusMetric> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::report_metrics;
 
     #[test]
     fn test_collect_resource_metrics() {
@@ -107,6 +109,7 @@ mod tests {
         };
 
         let metrics = collect_resource_metrics(&stats);
+        report_metrics(&metrics);
 
         assert_eq!(metrics.len(), 3);
 
@@ -131,6 +134,7 @@ mod tests {
         let stats = ResourceStats::default();
 
         let metrics = collect_resource_metrics(&stats);
+        report_metrics(&metrics);
 
         assert_eq!(metrics.len(), 3);
 
@@ -149,6 +153,7 @@ mod tests {
         };
 
         let metrics = collect_resource_metrics(&stats);
+        report_metrics(&metrics);
 
         let cpu = metrics.iter().find(|m| m.name == METRIC_CPU);
         assert!(cpu.is_some());

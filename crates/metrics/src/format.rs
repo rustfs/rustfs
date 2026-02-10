@@ -71,7 +71,7 @@ pub fn report_metrics(metrics: &[PrometheusMetric]) {
 /// the name and help text, which are typically compile-time constants.
 /// Labels use `Cow<'static, str>` to avoid allocations when possible.
 #[derive(Debug, Clone)]
-pub(crate) struct PrometheusMetric {
+pub struct PrometheusMetric {
     /// The metric name (e.g., "http_requests_total").
     pub name: &'static str,
     /// The type of this metric (counter, gauge, or histogram).

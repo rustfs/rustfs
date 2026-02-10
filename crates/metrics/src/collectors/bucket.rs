@@ -110,6 +110,7 @@ pub fn collect_bucket_metrics(buckets: &[BucketStats]) -> Vec<PrometheusMetric> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::report_metrics;
 
     #[test]
     fn test_collect_bucket_metrics() {
@@ -129,6 +130,7 @@ mod tests {
         ];
 
         let metrics = collect_bucket_metrics(&buckets);
+        report_metrics(&metrics); // This will compile and run, but we can't easily assert on the global recorder state here.
 
         // 2 buckets * 3 metrics each (size, objects, quota) = 6 metrics
         assert_eq!(metrics.len(), 6);
@@ -151,6 +153,7 @@ mod tests {
         }];
 
         let metrics = collect_bucket_metrics(&buckets);
+        report_metrics(&metrics);
 
         // 1 bucket * 3 metrics (size, objects, quota) = 3 metrics
         assert_eq!(metrics.len(), 3);
@@ -178,6 +181,7 @@ mod tests {
         }];
 
         let metrics = collect_bucket_metrics(&buckets);
+        report_metrics(&metrics);
 
         // Zero quota should still produce a quota metric with value 0 for consistent PromQL queries
         assert_eq!(metrics.len(), 3);

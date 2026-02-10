@@ -31,7 +31,7 @@
 //! # Example
 //!
 //! ```
-//! use rustfs_metrics::::{
+//! use rustfs_metrics::collectors::{
 //!     collect_cluster_metrics, ClusterStats,
 //!     collect_bucket_metrics, BucketStats,
 //!     collect_node_metrics, DiskStats,
