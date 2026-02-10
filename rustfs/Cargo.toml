@@ -31,10 +31,30 @@ name = "rustfs"
 path = "src/main.rs"
 
 [features]
-default = ["metrics"]
+default = ["metrics", "default-rustls-provider"]
 metrics = []
 ftps = ["rustfs-protocols/ftps"]
 full = ["metrics", "ftps"]
+
+default-rustls-provider = ["rustls-aws-lc-rs"]
+rustls-aws-lc-rs = [
+    "rustls/aws-lc-rs",
+    "tokio-rustls/aws-lc-rs",
+    "hyper-rustls/aws-lc-rs",
+    "jsonwebtoken/aws_lc_rs",
+    "axum-server/tls-rustls",
+    "reqwest/rustls",
+    "aws-sdk-s3/default-https-client"
+]
+rustls-ring = [
+    "rustls/ring",
+    "tokio-rustls/ring",
+    "hyper-rustls/ring",
+    "jsonwebtoken/rust_crypto",
+    "axum-server/tls-rustls-no-provider",
+    "reqwest/rustls-no-provider",
+    "aws-sdk-s3/rustls"
+]
 
 [lints]
 workspace = true
@@ -57,7 +77,7 @@ rustfs-metrics = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
-rustfs-protocols = { workspace = true }
+rustfs-protocols = { workspace = true, optional = true }
 rustfs-protos = { workspace = true }
 rustfs-rio.workspace = true
 rustfs-s3select-api = { workspace = true }
@@ -79,10 +99,10 @@ hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
-reqwest = { workspace = true }
+reqwest = { workspace = true, optional = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
-tokio-rustls = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic = { workspace = true }
@@ -98,11 +118,13 @@ serde_json.workspace = true
 serde_urlencoded = { workspace = true }
 
 # Cryptography and Security
-rustls = { workspace = true }
+rustls = { workspace = true, optional = true }
 subtle = { workspace = true }
 rustls-pemfile = { workspace = true }
 jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
+jsonwebtoken = { workspace = true }
+hyper-rustls = { workspace = true, optional = true }
 
 # Utilities and Tools
 astral-tokio-tar = { workspace = true }

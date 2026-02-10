@@ -28,7 +28,8 @@ mod version;
 
 // Ensure the correct path for parse_license is imported
 use crate::init::{
-    add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
+    add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_rustls_crypto_provider,
+    init_update_check, print_server_info,
 };
 
 #[cfg(feature = "ftps")]
@@ -124,6 +125,9 @@ async fn async_main() -> Result<()> {
             return Err(e);
         }
     }
+
+    // Initialize rustls crypto provider
+    init_rustls_crypto_provider();
 
     // print startup logo
     info!("{}", server::LOGO);

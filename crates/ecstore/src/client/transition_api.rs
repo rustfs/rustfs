@@ -165,7 +165,6 @@ impl TransitionClient {
     async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let scheme = endpoint_url.scheme();
         let client;
         let tls = if let Some(store) = load_root_store_from_tls_path() {
@@ -922,7 +921,7 @@ impl Default for ObjectInfo {
             content_type: None,
             metadata: HeaderMap::new(),
             user_metadata: HashMap::new(),
-            user_tags: "".to_string(),
+            user_tags: "".to_string(), // Tags would need separate parsing
             user_tag_count: 0,
             owner: Owner::default(),
             storage_class: "".to_string(),

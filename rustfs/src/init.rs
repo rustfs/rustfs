@@ -34,6 +34,21 @@ pub(crate) fn print_server_info() {
     info!("Docs: https://rustfs.com/docs/");
 }
 
+/// Initialize the default crypto provider for rustls based on enabled features.
+pub(crate) fn init_rustls_crypto_provider() {
+    #[cfg(feature = "rustls-aws-lc-rs")]
+    {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        debug!("Rustls default crypto provider initialized with aws-lc-rs");
+    }
+
+    #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc-rs")))]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        debug!("Rustls default crypto provider initialized with ring");
+    }
+}
+
 /// Initialize the asynchronous update check system.
 /// This function checks if update checking is enabled via
 /// environment variable or default configuration. If enabled,

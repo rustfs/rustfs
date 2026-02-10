@@ -124,8 +124,6 @@ where
                     .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to create certificate resolver: {}", e)))?;
 
                 // Build ServerConfig with SNI support
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
                 let server_config = rustls::ServerConfig::builder()
                     .with_no_client_auth()
                     .with_cert_resolver(std::sync::Arc::new(resolver));

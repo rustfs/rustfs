@@ -24,8 +24,19 @@ rust-version.workspace = true
 workspace = true
 
 [features]
-default = []
+default = ["default-rustls-provider"]
 ftps = []
+default-rustls-provider = ["rustls-aws-lc-rs"]
+rustls-aws-lc-rs = [
+    "rustls/aws-lc-rs",
+    "reqwest/rustls",
+    "suppaftp/rustls-aws-lc-rs"
+]
+rustls-ring = [
+    "rustls/ring",
+    "reqwest/rustls-no-provider",
+    "suppaftp/rustls-ring"
+]
 
 [dependencies]
 rustfs-ecstore.workspace = true
@@ -47,7 +58,7 @@ serial_test = { workspace = true }
 aws-sdk-s3.workspace = true
 aws-config = { workspace = true }
 async-trait = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
@@ -56,8 +67,8 @@ rand = { workspace = true }
 chrono = { workspace = true }
 md5 = { workspace = true }
 sha2 = { workspace = true }
-suppaftp = { workspace = true, features = ["tokio", "rustls-aws-lc-rs"] }
+suppaftp = { workspace = true, features = ["tokio"], optional = true }
 rcgen.workspace = true
 anyhow.workspace = true
-rustls.workspace = true
+rustls = { workspace = true, optional = true }
 rustls-pemfile.workspace = true
