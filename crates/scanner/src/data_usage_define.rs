@@ -680,7 +680,7 @@ impl DataUsageCache {
                     return Some(root.clone());
                 }
                 let mut flat = self.flatten(root);
-                if flat.replication_stats.is_some() && flat.replication_stats.as_ref().unwrap().empty() {
+                if flat.replication_stats.as_ref().is_some_and(|rs| rs.empty()) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
