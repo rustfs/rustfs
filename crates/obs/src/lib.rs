@@ -56,7 +56,6 @@
 mod config;
 mod error;
 mod global;
-mod metrics;
 mod recorder;
 mod system;
 mod telemetry;
@@ -64,7 +63,6 @@ mod telemetry;
 pub use config::*;
 pub use error::*;
 pub use global::*;
-pub use metrics::*;
 pub use recorder::*;
 pub use system::SystemObserver;
 pub use telemetry::OtelGuard;

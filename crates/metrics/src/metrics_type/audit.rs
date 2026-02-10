@@ -14,9 +14,6 @@
 
 #![allow(dead_code)]
 
-/// audit related metric descriptors
-///
-/// This module contains the metric descriptors for the audit subsystem.
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 

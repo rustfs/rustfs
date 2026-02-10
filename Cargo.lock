@@ -3661,7 +3661,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "percent-encoding",
  "pin-project",
- "prost 0.14.3",
+ "prost",
  "prost-types",
  "reqwest 0.13.2",
  "rustc_version",
@@ -3772,7 +3772,7 @@ dependencies = [
  "md5",
  "percent-encoding",
  "pin-project",
- "prost 0.14.3",
+ "prost",
  "prost-types",
  "reqwest 0.13.2",
  "serde",
@@ -4455,9 +4455,9 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "jemalloc_pprof"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74ff642505c7ce8d31c0d43ec0e235c6fd4585d9b8172d8f9dd04d36590200b5"
+checksum = "8a0d44c349cfe2654897fadcb9de4f0bfbf48288ec344f700b2bd59f152dd209"
 dependencies = [
  "anyhow",
  "libc",
@@ -4690,9 +4690,9 @@ checksum = "2c4a545a15244c7d945065b5d392b2d2d7f21526fba56ce51467b06ed445e8f7"
 
 [[package]]
 name = "libc"
-version = "0.2.180"
+version = "0.2.181"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
+checksum = "459427e2af2b9c839b132acb702a1c654d95e10f8c326bfc2ad11310e458b1c5"
 
 [[package]]
 name = "libloading"
@@ -4771,9 +4771,9 @@ dependencies = [
 
 [[package]]
 name = "libunftp"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8270fae0f77279620962f533153fa727a9cf9485dbb79d47eed3086d42b17264"
+checksum = "3186f219c64999ae9a2900c78ebfaf4a6b4acc3b2bbf5afe5e027e5ca5978593"
 dependencies = [
  "async-trait",
  "bitflags 2.10.0",
@@ -4787,11 +4787,10 @@ dependencies = [
  "libc",
  "md-5 0.10.6",
  "moka",
- "nix 0.29.0",
+ "nix 0.30.1",
  "prometheus",
  "proxy-protocol",
  "rustls",
- "rustls-pemfile",
  "slog",
  "slog-stdlog",
  "thiserror 2.0.18",
@@ -4801,7 +4800,7 @@ dependencies = [
  "tracing",
  "tracing-attributes",
  "uuid",
- "x509-parser 0.17.0",
+ "x509-parser",
 ]
 
 [[package]]
@@ -4907,9 +4906,9 @@ dependencies = [
 
 [[package]]
 name = "mappings"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db4d277bb50d4508057e7bddd7fcd19ef4a4cc38051b6a5a36868d75ae2cbeb9"
+checksum = "8bab1e61a4b76757edb59cd81fcaa7f3ba9018d43b527d9abfad877b4c6c60f2"
 dependencies = [
  "anyhow",
  "libc",
@@ -5139,6 +5138,18 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.10.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -5493,7 +5504,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk",
- "prost 0.14.3",
+ "prost",
  "reqwest 0.12.28",
  "thiserror 2.0.18",
  "tracing",
@@ -5507,7 +5518,7 @@ checksum = "a7175df06de5eaee9909d4805a3d07e28bb752c34cab57fa9cff549da596b30f"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
- "prost 0.14.3",
+ "prost",
  "tonic",
  "tonic-prost",
 ]
@@ -5971,9 +5982,9 @@ dependencies = [
 
 [[package]]
 name = "pprof_util"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4429d44e5e2c8a69399fc0070379201eed018e3df61e04eb7432811df073c224"
+checksum = "eea0cc524de808a6d98d192a3d99fe95617031ad4a52ec0a0f987ef4432e8fe1"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -5981,7 +5992,7 @@ dependencies = [
  "inferno 0.12.4",
  "num",
  "paste",
- "prost 0.13.5",
+ "prost",
 ]
 
 [[package]]
@@ -6060,22 +6071,12 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
-dependencies = [
- "bytes",
- "prost-derive 0.13.5",
-]
-
-[[package]]
-name = "prost"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
 dependencies = [
  "bytes",
- "prost-derive 0.14.3",
+ "prost-derive",
 ]
 
 [[package]]
@@ -6090,26 +6091,13 @@ dependencies = [
  "multimap",
  "petgraph",
  "prettyplease",
- "prost 0.14.3",
+ "prost",
  "prost-types",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "regex",
  "syn 2.0.114",
  "tempfile",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
-dependencies = [
- "anyhow",
- "itertools 0.14.0",
- "proc-macro2",
- "quote",
- "syn 2.0.114",
 ]
 
 [[package]]
@@ -6131,7 +6119,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
 dependencies = [
- "prost 0.14.3",
+ "prost",
 ]
 
 [[package]]
@@ -6421,7 +6409,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
- "x509-parser 0.18.1",
+ "x509-parser",
  "yasna",
 ]
 
@@ -6876,6 +6864,7 @@ dependencies = [
  "rustfs-kms",
  "rustfs-lock",
  "rustfs-madmin",
+ "rustfs-metrics",
  "rustfs-notify",
  "rustfs-obs",
  "rustfs-policy",
@@ -7137,6 +7126,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures",
+ "http 1.4.0",
  "rustfs-common",
  "rustfs-config",
  "rustfs-ecstore",
@@ -7258,6 +7248,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-metrics"
+version = "0.0.5"
+dependencies = [
+ "metrics",
+ "rustfs-ecstore",
+ "rustfs-utils",
+ "sysinfo",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "rustfs-notify"
 version = "0.0.5"
 dependencies = [
@@ -7369,7 +7372,7 @@ name = "rustfs-protos"
 version = "0.0.5"
 dependencies = [
  "flatbuffers",
- "prost 0.14.3",
+ "prost",
  "rustfs-common",
  "tonic",
  "tonic-prost",
@@ -8774,12 +8777,12 @@ dependencies = [
 
 [[package]]
 name = "tempfile"
-version = "3.24.0"
+version = "3.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "655da9c7eb6305c55742045d5a8d2037996d61d8de95806335c7c86ce0f82e9c"
+checksum = "0136791f7c95b1f6dd99f9cc786b91bb81c3800b639b3478e561ddb7be95e5f1"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.3",
  "windows-sys 0.61.2",
@@ -9151,7 +9154,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6c55a2d6a14174563de34409c9f92ff981d006f56da9c6ecd40d9d4a31500b0"
 dependencies = [
  "bytes",
- "prost 0.14.3",
+ "prost",
  "tonic",
 ]
 
@@ -10277,23 +10280,6 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
-
-[[package]]
-name = "x509-parser"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4569f339c0c402346d4a75a9e39cf8dad310e287eef1ff56d4c68e5067f53460"
-dependencies = [
- "asn1-rs",
- "data-encoding",
- "der-parser",
- "lazy_static",
- "nom 7.1.3",
- "oid-registry",
- "rusticata-macros",
- "thiserror 2.0.18",
- "time",
-]
 
 [[package]]
 name = "x509-parser"

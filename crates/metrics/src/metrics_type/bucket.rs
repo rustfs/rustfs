@@ -14,7 +14,6 @@
 
 #![allow(dead_code)]
 
-/// bucket level s3 metric descriptor
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, new_histogram_md, subsystems};
 use std::sync::LazyLock;
 
