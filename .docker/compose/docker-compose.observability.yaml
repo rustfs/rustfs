@@ -82,7 +82,7 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
@@ -99,7 +99,7 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
@@ -116,7 +116,7 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
@@ -133,7 +133,7 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:

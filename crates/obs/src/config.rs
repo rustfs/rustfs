@@ -185,7 +185,7 @@ impl AppConfig {
     /// ```no_run
     /// use rustfs_obs::AppConfig;
     ///
-    /// let config = AppConfig::new_with_endpoint(Some("http://localhost:4317".to_string()));
+    /// let config = AppConfig::new_with_endpoint(Some("http://localhost:4318".to_string()));
     /// ```
     pub fn new_with_endpoint(endpoint: Option<String>) -> Self {
         Self {
