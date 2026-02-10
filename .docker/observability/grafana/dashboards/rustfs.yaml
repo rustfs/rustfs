@@ -90,7 +90,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_api_requests_total{job=~\"$job\", key_request_uri_path=~\"$path\", key_request_method=~\"$method\"})",
+          "expr": "sum(rustfs_api_requests_total{job=~\"$job\", key_request_uri_path=~\"$path\"})",
           "legendFormat": "Total Requests",
           "range": true,
           "refId": "A"
@@ -155,7 +155,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(rustfs_api_requests_total{job=~\"$job\", key_request_uri_path=~\"$path\", key_request_method=~\"$method\"}[5m]))",
+          "expr": "sum(rate(rustfs_api_requests_total{job=~\"$job\", key_request_uri_path=~\"$path\"}[5m]))",
           "hide": false,
           "instant": false,
           "legendFormat": "__auto",
@@ -373,104 +373,6 @@
         "x": 0,
         "y": 7
       },
-      "id": 7,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "right",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "12.3.2",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (key_request_method) (rate(rustfs_api_requests_total{job=~\"$job\", key_request_uri_path=~\"$path\", key_request_method=~\"$method\"}[5m]))",
-          "legendFormat": "{{key_request_method}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Request Rate (Operation)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "smooth",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              }
-            ]
-          },
-          "unit": "reqps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 24,
-        "x": 0,
-        "y": 14
-      },
       "id": 2,
       "options": {
         "legend": {
@@ -498,13 +400,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (key_request_uri_path) (rate(rustfs_api_requests_total{job=~\"$job\", key_request_uri_path=~\"$path\", key_request_method=~\"$method\"}[5m]))",
+          "expr": "sum by (key_request_uri_path) (rate(rustfs_api_requests_total{job=~\"$job\", key_request_uri_path=~\"$path\"}[$__rate_interval]))",
           "legendFormat": "{{key_request_uri_path}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Request Rate (Path)",
+      "title": "Request Rate",
       "type": "timeseries"
     },
     {
@@ -623,7 +525,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 21
+        "y": 14
       },
       "id": 3,
       "options": {
@@ -797,7 +699,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 28
+        "y": 21
       },
       "id": 8,
       "options": {
@@ -861,7 +763,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 28
       },
       "id": 12,
       "panels": [],
@@ -930,7 +832,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 29
       },
       "id": 9,
       "options": {
@@ -1028,7 +930,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 43
+        "y": 36
       },
       "id": 10,
       "options": {
@@ -1126,7 +1028,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 50
+        "y": 43
       },
       "id": 5,
       "options": {
@@ -1175,7 +1077,7 @@
     }
   ],
   "preload": false,
-  "refresh": "30s",
+  "refresh": "10s",
   "schemaVersion": 42,
   "tags": [
     "rustfs",
@@ -1228,18 +1130,14 @@
       {
         "allValue": ".*",
         "current": {
-          "text": [
-            "All"
-          ],
-          "value": [
-            "$__all"
-          ]
+          "text": "All",
+          "value": "$__all"
         },
         "datasource": {
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(rustfs_api_requests_total{job=~\"$pod\"}, key_request_uri_path)",
+        "definition": "label_values(rustfs_api_requests_total,key_request_uri_path)",
         "includeAll": true,
         "label": "Path",
         "multi": true,
@@ -1247,36 +1145,12 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(rustfs_api_requests_total{job=~\"$pod\"}, key_request_uri_path)",
+          "query": "label_values(rustfs_api_requests_total,key_request_uri_path)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
-        "refresh": 1,
+        "refresh": 2,
         "regex": "",
         "sort": 1,
-        "type": "query"
-      },
-      {
-        "current": {
-          "text": [
-            "All"
-          ],
-          "value": [
-            "$__all"
-          ]
-        },
-        "definition": "label_values(rustfs_api_requests_total,key_request_method)",
-        "includeAll": true,
-        "label": "Method",
-        "multi": true,
-        "name": "method",
-        "options": [],
-        "query": {
-          "qryType": 1,
-          "query": "label_values(rustfs_api_requests_total,key_request_method)",
-          "refId": "PrometheusVariableQueryEditor-VariableQuery"
-        },
-        "refresh": 1,
-        "regex": "",
         "type": "query"
       }
     ]
@@ -1289,5 +1163,5 @@
   "timezone": "browser",
   "title": "RustFS",
   "uid": "rustfs-s3",
-  "version": 5
+  "version": 8
 }
