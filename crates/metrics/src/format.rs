@@ -18,7 +18,7 @@
 //! Optimized for minimal allocations and fast rendering.
 
 use crate::MetricType;
-use metrics::{describe_counter, describe_gauge, describe_histogram, gauge};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge};
 use std::borrow::Cow;
 
 /// Report metrics using the `metrics` crate.
@@ -26,7 +26,7 @@ use std::borrow::Cow;
 /// This function iterates over the provided metrics and reports them using
 /// the `metrics` crate's API. This allows integration with various metrics
 /// exporters (e.g., Prometheus) that are configured globally.
-pub(crate) fn report_metrics(metrics: &[PrometheusMetric]) {
+pub fn report_metrics(metrics: &[PrometheusMetric]) {
     for metric in metrics {
         // Register metric description (help text)
         // Note: In a real-world scenario, descriptions should ideally be registered once at startup.
@@ -38,96 +38,20 @@ pub(crate) fn report_metrics(metrics: &[PrometheusMetric]) {
         }
 
         // Convert labels to the format expected by `metrics` crate
-        // The `metrics` macros expect labels as an iterable of references, e.g., &[(&str, &str)] or similar.
-        // We need to convert our Cow strings to something compatible.
-        // However, the macros are a bit picky. The most robust way is to use the `Label` trait or pass
-        // a reference to a slice of key-value pairs if the macro supports it.
-        //
-        // Looking at the `metrics` crate documentation and examples:
-        // gauge!("name", &labels) where labels is [("key", "value")] works.
-        // But our labels are dynamic Vec<(String, String)>.
-        // We need to convert them to a format the macro accepts.
-        //
-        // The error "no rules expected `,`" suggests the macro invocation syntax is wrong for the arguments provided.
-        // Specifically, `gauge!(name, value, labels)` might not be a valid pattern if `labels` isn't matched correctly.
-        //
-        // The `metrics` macros support:
-        // - (name, value)
-        // - (name, value, key => val, ...)
-        // - (name, value, &labels)
-        //
-        // Let's try to construct a vector of `Label` or similar if possible, or just use the slice.
-        // The issue might be that `&labels` where `labels` is `Vec<(String, String)>` isn't directly supported
-        // if the macro expects `&[(&str, &str)]` or `&[Label]`.
-        //
-        // Actually, `metrics` 0.24 supports `Into<Label>` for keys and values.
-        // Let's try to convert our labels into a `Vec<metrics::Label>`.
-        // Or simpler: `metrics` macros often take `&[(&str, &str)]` or similar.
-        //
-        // Let's try to pass the labels as a reference to the vector, but we need to make sure the vector content
-        // is compatible.
-        //
-        // The error message `no rules expected ,` usually means the macro parser got confused.
-        //
-        // Let's try to use the `gauge!` macro with the `labels` argument properly.
-        // If `labels` is a `Vec<(String, String)>`, `&labels` is `&Vec<(String, String)>` which derefs to `&[(String, String)]`.
-        //
-        // Let's try to use `metrics::gauge!(metric.name, metric.value, &labels)` but ensure `labels` is correct.
-        //
-        // Wait, the error is on `gauge!(metric.name, metric.value, &labels);`.
-        // The macro definition is:
-        // ($name:expr, $value:expr, $labels:expr) => { ... }
-        //
-        // If the macro expects labels to be passed in a specific way, we must adhere to it.
-        //
-        // Let's try to use the `recorder()` directly if the macro is too restrictive, or fix the macro usage.
-        // But `metrics` crate encourages macros.
-        //
-        // Re-reading the docs provided in the prompt:
-        // `let labels = [("dynamic_key", format!("{}!", dynamic_val))];`
-        // `let gauge = gauge!("some_metric_name", &labels);`
-        // `gauge.set(1337.0);`
-        //
-        // Ah! The `gauge!` macro returns a `Gauge` handle, it doesn't take a value directly in that form!
-        // The docs say:
-        // `let gauge = gauge!("some_metric_name");`
-        // `gauge.increment(1.0);`
-        //
-        // OR
-        //
-        // `let gauge = gauge!("some_metric_name", &labels);`
-        // `gauge.set(1337.0);`
-        //
-        // It seems `gauge!(name, value, labels)` is NOT a valid syntax for `metrics` 0.24 macros based on the provided docs.
-        // The docs show `gauge!(name, labels)` returning a handle, then you call `.set(value)`.
-        //
-        // Let's fix the code to follow this pattern.
-
         let labels: Vec<(String, String)> = metric.labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
+        // Report the metric value
         match metric.metric_type {
             MetricType::Counter => {
-                // Counter doesn't have a `set` method usually, it has `increment`.
-                // But if we are reporting absolute values, we might be misusing Counter.
-                // However, `metrics` 0.21+ might have `absolute` or we just use Gauge.
+                // Use counter! macro to get a handle, then set absolute value.
+                // Note: `metrics` crate counters are typically monotonic and support `increment`.
+                // Setting an absolute value directly requires `absolute` method if supported by the backend/handle,
+                // or we assume the value provided is the absolute count we want to report.
                 //
-                // If we must use Counter:
-                // `let counter = metrics::counter!(metric.name, &labels);`
-                // `counter.absolute(metric.value as u64);` // If supported
-                //
-                // But wait, the prompt docs say:
-                // `describe_counter!`
-                // `let counter = counter!("name");`
-                // `counter.increment(1.0);`
-                //
-                // It doesn't show a `counter!` macro that takes a value.
-                //
-                // If we are reporting snapshots, we should use Gauge for everything as previously discussed,
-                // OR we need to know the delta. Since we don't know the delta, Gauge is safer.
-                //
-                // Let's use Gauge for everything for now to fix the compilation error and logic.
-                let gauge = gauge!(metric.name, &labels);
-                gauge.set(metric.value);
+                // Since `metrics` 0.21+, `Counter` has an `absolute` method which sets the counter to a specific value.
+                // This is useful for mirroring an external counter.
+                let counter = counter!(metric.name, &labels);
+                counter.absolute(metric.value as u64);
             }
             MetricType::Gauge => {
                 let gauge = gauge!(metric.name, &labels);

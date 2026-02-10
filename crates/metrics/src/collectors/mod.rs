@@ -37,7 +37,7 @@
 //!     collect_node_metrics, DiskStats,
 //!     collect_resource_metrics, ResourceStats,
 //! };
-//! use rustfs_metrics::collectors::report_metrics;
+//! use rustfs_metrics::report_metrics;
 //!
 //! // Collect cluster metrics
 //! let cluster_stats = ClusterStats {
