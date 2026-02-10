@@ -204,8 +204,7 @@ pub mod subsystems {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MetricType;
-    use crate::{MetricDescriptor, MetricName, MetricNamespace};
+    use crate::{MetricDescriptor, MetricName, MetricNamespace, MetricType};
 
     #[test]
     fn test_metric_subsystem_formatting() {

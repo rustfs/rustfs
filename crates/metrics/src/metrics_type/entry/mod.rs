@@ -14,12 +14,12 @@
 
 use crate::{MetricDescriptor, MetricName, MetricNamespace, MetricSubsystem, MetricType};
 
-pub(crate) mod descriptor;
-pub(crate) mod metric_name;
-pub(crate) mod metric_type;
-pub(crate) mod namespace;
+pub mod descriptor;
+pub mod metric_name;
+pub mod metric_type;
+pub mod namespace;
 mod path_utils;
-pub(crate) mod subsystem;
+pub mod subsystem;
 
 /// Create a new counter metric descriptor
 pub fn new_counter_md(
@@ -76,7 +76,7 @@ pub fn new_histogram_md(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subsystems;
+    use crate::{MetricName, MetricNamespace, MetricSubsystem, subsystems};
 
     #[test]
     fn test_new_histogram_md() {

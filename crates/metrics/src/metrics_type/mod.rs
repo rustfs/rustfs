@@ -12,26 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod audit;
-pub(crate) mod bucket;
-pub(crate) mod bucket_replication;
-pub(crate) mod cluster_config;
-pub(crate) mod cluster_erasure_set;
-pub(crate) mod cluster_health;
-pub(crate) mod cluster_iam;
-pub(crate) mod cluster_notification;
-pub(crate) mod cluster_usage;
-pub(crate) mod entry;
-pub(crate) mod ilm;
-pub(crate) mod logger_webhook;
-pub(crate) mod replication;
-pub(crate) mod request;
-pub(crate) mod scanner;
-pub(crate) mod system_cpu;
-pub(crate) mod system_drive;
-pub(crate) mod system_memory;
-pub(crate) mod system_network;
-pub(crate) mod system_process;
+pub mod audit;
+pub mod bucket;
+pub mod bucket_replication;
+pub mod cluster_config;
+pub mod cluster_erasure_set;
+pub mod cluster_health;
+pub mod cluster_iam;
+pub mod cluster_notification;
+pub mod cluster_usage;
+pub mod entry;
+pub mod ilm;
+pub mod logger_webhook;
+pub mod replication;
+pub mod request;
+pub mod scanner;
+pub mod system_cpu;
+pub mod system_drive;
+pub mod system_memory;
+pub mod system_network;
+pub mod system_process;
 
 pub use entry::descriptor::MetricDescriptor;
 pub use entry::metric_name::MetricName;

@@ -14,7 +14,6 @@
 
 #![allow(dead_code)]
 
-/// Metrics for replication subsystem
 use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
