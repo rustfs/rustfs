@@ -1684,10 +1684,6 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         if let Some(ref s) = new_replication_internal {
             eval_metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}replication-status"), s.clone());
         }
-        eval_metadata.insert(
-            format!("{RESERVED_METADATA_PREFIX_LOWER}replication-timestamp"),
-            OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
-        );
         let popts = ObjectOptions {
             version_id: roi.version_id.map(|v| v.to_string()),
             eval_metadata: Some(eval_metadata),
@@ -1838,6 +1834,36 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 ..Default::default()
             });
             return rinfo;
+        }
+
+        let mut replication_action = replication_action;
+        match tgt_client
+            .head_object(&tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))
+            .await
+        {
+            Ok(oi) => {
+                replication_action = get_replication_action(&object_info, &oi, self.op_type);
+                if replication_action == ReplicationAction::None {
+                    rinfo.replication_status = ReplicationStatusType::Completed;
+                    rinfo.replication_resynced = true;
+                    rinfo.replication_action = ReplicationAction::None;
+                    rinfo.size = size;
+                    return rinfo;
+                }
+            }
+            Err(e) => {
+                if let Some(se) = e.as_service_error() {
+                    if !se.is_not_found() {
+                        rinfo.error = Some(e.to_string());
+                        warn!("replication head_object failed bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                        return rinfo;
+                    }
+                } else {
+                    rinfo.error = Some(e.to_string());
+                    warn!("replication head_object failed bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
+                    return rinfo;
+                }
+            }
         }
 
         rinfo.replication_status = ReplicationStatusType::Completed;
