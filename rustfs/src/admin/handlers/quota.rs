@@ -21,7 +21,7 @@ use hyper::StatusCode;
 use matchit::Params;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
-use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -185,7 +185,7 @@ impl Operation for GetBucketQuotaHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::GetBucketQuotaAdminAction)],
+            vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
             None,
         )
         .await?;
@@ -313,7 +313,7 @@ impl Operation for GetBucketQuotaStatsHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::GetBucketQuotaAdminAction)],
+            vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
             None,
         )
         .await?;
@@ -380,7 +380,7 @@ impl Operation for CheckBucketQuotaHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::GetBucketQuotaAdminAction)],
+            vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
             None,
         )
         .await?;
