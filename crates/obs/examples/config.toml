@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [observability]
-endpoint = "http://localhost:4317" # Default is "http://localhost:4317" if not specified
+endpoint = "http://localhost:4318" # Default is "http://localhost:4318" if not specified
 use_stdout = false # Output with stdout, true output, false no output
 sample_ratio = 1
 meter_interval = 30

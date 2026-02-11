@@ -38,7 +38,7 @@ services:
       - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_OBS_LOGGER_LEVEL=info
       - RUSTFS_TLS_PATH=/opt/tls
-      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
     volumes:
       - ./deploy/data/pro:/data
       - ./deploy/logs:/app/logs
