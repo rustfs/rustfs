@@ -7533,6 +7533,8 @@ dependencies = [
  "rustfs-utils",
  "serde",
  "serde_json",
+ "serial_test",
+ "temp-env",
  "thiserror 2.0.18",
  "tokio",
  "tower",

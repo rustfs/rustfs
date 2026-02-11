@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{Error, Result};
+use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::disk::{BUCKET_META_PREFIX, DiskAPI, DiskStore, RUSTFS_META_BUCKET};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -180,7 +181,9 @@ impl ResumeManager {
         };
 
         // save initial state
-        manager.save_state().await?;
+        if let Err(e) = manager.save_state().await {
+            warn!("Failed to save initial resume state: {}", e);
+        }
         Ok(manager)
     }
 
@@ -297,12 +300,15 @@ impl ResumeManager {
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{}_{}", state.task_id, RESUME_STATE_FILE));
 
         let path_str = path_to_str(&file_path)?;
-        self.disk
-            .write_all(RUSTFS_META_BUCKET, path_str, state_data.into())
-            .await
-            .map_err(|e| Error::TaskExecutionFailed {
+        if let Err(e) = self.disk.write_all(RUSTFS_META_BUCKET, path_str, state_data.into()).await {
+            if matches!(e, DiskError::UnformattedDisk) {
+                warn!("Cannot save resume state: unformatted disk");
+                return Ok(());
+            }
+            return Err(Error::TaskExecutionFailed {
                 message: format!("Failed to save resume state: {e}"),
-            })?;
+            });
+        }
 
         debug!("Saved resume state for task: {}", state.task_id);
         Ok(())
@@ -395,7 +401,9 @@ impl CheckpointManager {
         };
 
         // save initial checkpoint
-        manager.save_checkpoint().await?;
+        if let Err(e) = manager.save_checkpoint().await {
+            warn!("Failed to save initial checkpoint: {}", e);
+        }
         Ok(manager)
     }
 
