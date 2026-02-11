@@ -13,75 +13,55 @@
 // limitations under the License.
 
 use rustfs_config::{
-    DEFAULT_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_ENABLE_RFC7239, ENV_TRUSTED_PROXY_MAX_HOPS, ENV_TRUSTED_PROXY_PROXIES,
-    ENV_TRUSTED_PROXY_VALIDATION_MODE,
+    DEFAULT_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_MAX_HOPS, ENV_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_VALIDATION_MODE,
 };
 use rustfs_trusted_proxies::{ConfigLoader, TrustedProxy, TrustedProxyConfig, ValidationMode};
+use serial_test::serial;
 use std::net::IpAddr;
-use std::sync::Mutex;
-
-static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 #[test]
-#[allow(unsafe_code)]
+#[serial]
 fn test_config_loader_default() {
-    let _guard = ENV_MUTEX.lock().unwrap();
-    unsafe {
-        std::env::remove_var(ENV_TRUSTED_PROXY_PROXIES);
-    }
-    unsafe {
-        std::env::remove_var(ENV_TRUSTED_PROXY_VALIDATION_MODE);
-    }
-    unsafe {
-        std::env::remove_var(ENV_TRUSTED_PROXY_MAX_HOPS);
-    }
-    unsafe {
-        std::env::remove_var(ENV_TRUSTED_PROXY_ENABLE_RFC7239);
-    }
-    let config = ConfigLoader::from_env_or_default();
-    assert_eq!(config.server_addr.port(), 9000);
-    assert!(!config.proxy.proxies.is_empty());
-    assert_eq!(config.proxy.validation_mode, ValidationMode::HopByHop);
-    assert!(config.proxy.enable_rfc7239);
-    assert_eq!(config.proxy.max_hops, 10);
+    // Clean up environment variables explicitly to ensure clean state
+    temp_env::with_vars_unset(
+        vec![
+            ENV_TRUSTED_PROXY_PROXIES,
+            ENV_TRUSTED_PROXY_VALIDATION_MODE,
+            ENV_TRUSTED_PROXY_MAX_HOPS,
+        ],
+        || {
+            let config = ConfigLoader::from_env_or_default();
+            assert_eq!(config.server_addr.port(), 9000);
+            assert!(!config.proxy.proxies.is_empty());
+            assert_eq!(config.proxy.validation_mode, ValidationMode::HopByHop);
+            assert!(config.proxy.enable_rfc7239);
+            assert_eq!(config.proxy.max_hops, 10);
+        },
+    );
 }
 
 #[test]
-#[allow(unsafe_code)]
+#[serial]
 fn test_config_loader_env_vars() {
-    let _guard = ENV_MUTEX.lock().unwrap();
-    unsafe {
-        std::env::set_var(ENV_TRUSTED_PROXY_PROXIES, "192.168.1.0/24,10.0.0.0/8");
-    }
-    unsafe {
-        std::env::set_var(ENV_TRUSTED_PROXY_VALIDATION_MODE, "strict");
-    }
-    unsafe {
-        std::env::set_var(ENV_TRUSTED_PROXY_MAX_HOPS, "5");
-    }
+    // Use temp_env to ensure environment variables are cleaned up even if test fails
+    temp_env::with_vars(
+        vec![
+            (ENV_TRUSTED_PROXY_PROXIES, Some("192.168.1.0/24,10.0.0.0/8")),
+            (ENV_TRUSTED_PROXY_VALIDATION_MODE, Some("strict")),
+            (ENV_TRUSTED_PROXY_MAX_HOPS, Some("5")),
+        ],
+        || {
+            let config = ConfigLoader::from_env();
 
-    let config = ConfigLoader::from_env();
-
-    if let Ok(config) = config {
-        assert_eq!(config.server_addr.port(), 9000);
-        assert_eq!(config.proxy.validation_mode, ValidationMode::Strict);
-        assert_eq!(config.proxy.max_hops, 5);
-
-        unsafe {
-            std::env::remove_var(ENV_TRUSTED_PROXY_PROXIES);
-        }
-        unsafe {
-            std::env::remove_var(ENV_TRUSTED_PROXY_VALIDATION_MODE);
-        }
-        unsafe {
-            std::env::remove_var(ENV_TRUSTED_PROXY_MAX_HOPS);
-        }
-        unsafe {
-            std::env::remove_var("SERVER_PORT");
-        }
-    } else {
-        panic!("Failed to load configuration from environment variables");
-    }
+            if let Ok(config) = config {
+                assert_eq!(config.server_addr.port(), 9000);
+                assert_eq!(config.proxy.validation_mode, ValidationMode::Strict);
+                assert_eq!(config.proxy.max_hops, 5);
+            } else {
+                panic!("Failed to load configuration from environment variables");
+            }
+        },
+    );
 }
 
 #[test]
