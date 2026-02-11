@@ -27,7 +27,7 @@ use rustfs_heal::heal::{
 };
 use serial_test::serial;
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Once, OnceLock},
     time::Duration,
 };
@@ -47,17 +47,6 @@ pub fn init_tracing() {
             .with_thread_names(true)
             .try_init();
     });
-}
-
-async fn wait_for_path_exists(path: &Path, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if path.exists() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    path.exists()
 }
 
 /// Test helper: Create test environment with ECStore
@@ -340,11 +329,25 @@ mod serial_tests {
         let (_result, error) = heal_storage.heal_format(false).await.expect("Failed to heal format");
         assert!(error.is_none(), "Heal format returned error: {error:?}");
 
-        // Wait for task completion
-        let restored = wait_for_path_exists(&format_path, Duration::from_secs(20)).await;
+        // ─── 2️⃣ wait for format.json to be restored with polling + timeout ───────
+        // The minimal scanner interval is clamped to 10s in manager.rs, so we set timeout to 20s
+        let timeout_duration = Duration::from_secs(20);
+        let poll_interval = Duration::from_millis(200);
 
-        // ─── 2️⃣ verify format.json is restored ───────
-        assert!(restored, "format.json does not exist on disk after heal");
+        let result = tokio::time::timeout(timeout_duration, async {
+            loop {
+                if format_path.exists() {
+                    break;
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "format.json was not restored within timeout period");
+
+        // ─── 3️⃣ verify format.json is restored ───────
+        assert!(format_path.exists(), "format.json does not exist on disk after heal");
 
         info!("Heal format basic test passed");
     }
@@ -362,37 +365,51 @@ mod serial_tests {
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
 
+        let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
+        let target_part = WalkDir::new(&obj_dir)
+            .min_depth(2)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+            .map(|e| e.into_path())
+            .expect("Failed to locate part file to delete");
+
         // ─── 1️⃣ delete format.json on one disk ──────────────
         let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
         std::fs::remove_dir_all(&disk_paths[0]).expect("failed to delete all contents under disk_paths[0]");
         std::fs::create_dir_all(&disk_paths[0]).expect("failed to recreate disk_paths[0] directory");
         println!("✅ Deleted format.json on disk: {:?}", disk_paths[0]);
 
-        let (_result, error) = heal_storage.heal_format(false).await.expect("Failed to heal format");
-        assert!(error.is_none(), "Heal format returned error: {error:?}");
-
-        // Wait for task completion
-        let restored = wait_for_path_exists(&format_path, Duration::from_secs(20)).await;
-
-        // ─── 2️⃣ verify format.json is restored ───────
-        assert!(restored, "format.json does not exist on disk after heal");
-        // ─── 3 verify each part file is restored ───────
-        let heal_opts = HealOpts {
-            recursive: false,
-            dry_run: false,
-            remove: false,
-            recreate: true,
-            scan_mode: HealScanMode::Normal,
-            update_parity: true,
-            no_lock: false,
-            pool: None,
-            set: None,
+        // Create heal manager with faster interval
+        let cfg = HealConfig {
+            heal_interval: Duration::from_secs(1),
+            ..Default::default()
         };
-        let (_result, error) = heal_storage
-            .heal_object(bucket_name, object_name, None, &heal_opts)
-            .await
-            .expect("Failed to heal object");
-        assert!(error.is_none(), "Heal object returned error: {error:?}");
+        let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
+        heal_manager.start().await.unwrap();
+
+        // ─── 2️⃣ wait for format.json and part file to be restored with polling + timeout ───────
+        // The minimal scanner interval is clamped to 10s in manager.rs, so we set timeout to 20s
+        let timeout_duration = Duration::from_secs(20);
+        let poll_interval = Duration::from_millis(200);
+
+        let result = tokio::time::timeout(timeout_duration, async {
+            loop {
+                if format_path.exists() && target_part.exists() {
+                    break;
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "format.json or part file was not restored within timeout period");
+
+        // ─── 3️⃣ verify format.json is restored ───────
+        assert!(format_path.exists(), "format.json does not exist on disk after heal");
+        // ─── 4️⃣ verify each part file is restored ───────
+        assert!(target_part.exists());
 
         // Verify object metadata is accessible
         let obj_info = ecstore
