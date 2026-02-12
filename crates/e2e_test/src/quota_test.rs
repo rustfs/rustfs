@@ -422,7 +422,7 @@ mod integration_tests {
         // Check if we can upload 1KB (should succeed - we haven't used the full quota yet)
         let check_result = env.check_bucket_quota("PUT", 1024).await?;
         assert!(check_result.get("allowed").unwrap().as_bool().unwrap());
-        assert_eq!(check_result.get("remaining_quota").unwrap().as_u64().unwrap(), 512 * 1024 - 1024);
+        assert_eq!(check_result.get("remaining_quota").unwrap().as_u64().unwrap(), 523264); // 511 * 1024
 
         // Check if we can upload 600KB (should fail - would exceed quota)
         let check_result = env.check_bucket_quota("PUT", 600 * 1024).await?;
@@ -567,6 +567,60 @@ mod integration_tests {
 
         env.cleanup_bucket().await?;
 
+        Ok(())
+    }
+
+    /// Test that a normal user with `readwrite` policy can read quota but cannot set/clear quota.
+    #[tokio::test]
+    #[serial]
+    async fn test_quota_normal_user_permissions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        init_logging();
+        let env = QuotaTestEnv::new().await?;
+        env.create_bucket().await?;
+
+        // Admin sets quota first
+        env.set_bucket_quota(1024 * 1024).await?;
+
+        // Create a normal user via admin API
+        let normal_ak = "normaluser";
+        let normal_sk = "normaluser123";
+        let add_user_url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.env.url, normal_ak);
+        let user_body = serde_json::json!({ "secretKey": normal_sk, "status": "enabled" }).to_string();
+        awscurl_put(&add_user_url, &user_body, &env.env.access_key, &env.env.secret_key).await?;
+
+        // Attach `readwrite` policy to the normal user
+        let policy_url = format!(
+            "{}/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup={}&isGroup=false",
+            env.env.url, normal_ak
+        );
+        awscurl_put(&policy_url, "", &env.env.access_key, &env.env.secret_key).await?;
+
+        // Normal user reads quota — should succeed
+        let get_url = format!("{}/rustfs/admin/v3/quota/{}", env.env.url, env.bucket_name);
+        let resp = awscurl_get(&get_url, normal_ak, normal_sk).await?;
+        let quota_info: serde_json::Value = serde_json::from_str(&resp)?;
+        assert_eq!(quota_info.get("quota").and_then(|v| v.as_u64()), Some(1024 * 1024));
+
+        // Normal user reads quota stats — should succeed
+        let stats_url = format!("{}/rustfs/admin/v3/quota-stats/{}", env.env.url, env.bucket_name);
+        let resp = awscurl_get(&stats_url, normal_ak, normal_sk).await?;
+        assert!(resp.contains("quota_limit"));
+
+        // Normal user sets quota — should be denied
+        let set_resp = awscurl_put(
+            &get_url,
+            &serde_json::json!({"quota": 2048, "quota_type": "HARD"}).to_string(),
+            normal_ak,
+            normal_sk,
+        )
+        .await;
+        assert!(set_resp.is_err(), "normal user should not be able to set quota");
+
+        // Normal user clears quota — should be denied
+        let del_resp = awscurl_delete(&get_url, normal_ak, normal_sk).await;
+        assert!(del_resp.is_err(), "normal user should not be able to clear quota");
+
+        env.cleanup_bucket().await?;
         Ok(())
     }
 

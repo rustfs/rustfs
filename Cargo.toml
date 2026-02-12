@@ -31,9 +31,11 @@ members = [
     "crates/lock", # Distributed locking implementation
     "crates/madmin", # Management dashboard and admin API interface
     "crates/mcp", # MCP server for S3 operations
+    "crates/metrics", # Metrics collection and reporting
     "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
     "crates/policy", # Policy management
+    "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
     "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
     "crates/s3select-api", # S3 Select API interface
@@ -45,7 +47,6 @@ members = [
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
     "crates/zip", # ZIP file handling and compression
-    "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
 ]
 resolver = "2"
 
@@ -85,6 +86,7 @@ rustfs-kms = { path = "crates/kms", version = "0.0.5" }
 rustfs-lock = { path = "crates/lock", version = "0.0.5" }
 rustfs-madmin = { path = "crates/madmin", version = "0.0.5" }
 rustfs-mcp = { path = "crates/mcp", version = "0.0.5" }
+rustfs-metrics = { path = "crates/metrics", version = "0.0.5" }
 rustfs-notify = { path = "crates/notify", version = "0.0.5" }
 rustfs-obs = { path = "crates/obs", version = "0.0.5" }
 rustfs-policy = { path = "crates/policy", version = "0.0.5" }
@@ -139,7 +141,7 @@ flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.3"
 quick-xml = "0.39.0"
-rmcp = { version = "0.14.0" }
+rmcp = { version = "0.15.0" }
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -180,7 +182,7 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.8.13" }
 aws-credential-types = { version = "1.2.11" }
 aws-sdk-s3 = { version = "1.122.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
-aws-smithy-types = { version = "1.4.3" }
+aws-smithy-types = { version = "1.4.4" }
 backtrace = "0.3.76"
 base64 = "0.22.1"
 base64-simd = "0.8.0"
@@ -205,7 +207,7 @@ hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
 ipnetwork = { version = "0.21.1", features = ["serde"] }
 lazy_static = "1.5.0"
-libc = "0.2.180"
+libc = "0.2.181"
 libsystemd = "0.7.2"
 local-ip-address = "0.6.10"
 lz4 = "1.28.1"
@@ -244,7 +246,7 @@ starshard = { version = "1.1.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.27.2", features = ["derive"] }
 sysinfo = "0.38.1"
 temp-env = "0.3.6"
-tempfile = "3.24.0"
+tempfile = "3.25.0"
 test-case = "3.3.1"
 thiserror = "2.0.18"
 tracing = { version = "0.1.44" }
@@ -285,7 +287,7 @@ tikv-jemallocator = { version = "0.6", features = ["profiling", "stats", "unpref
 # Used to control and obtain statistics for jemalloc at runtime
 tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profiling"] }
 # Used to generate pprof-compatible memory profiling data and support symbolization and flame graphs
-jemalloc_pprof = { version = "0.8.1", features = ["symbolize", "flamegraph"] }
+jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 

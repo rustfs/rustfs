@@ -14,7 +14,6 @@
 
 #![allow(dead_code)]
 
-/// Descriptors of metrics related to cluster object and bucket usage
 use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
