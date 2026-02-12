@@ -18,7 +18,7 @@ Or simply run `make pre-commit` which covers all checks. **DO NOT commit if any 
 
 ## Communication Rules
 
-- Respond to the user in English.
+- Respond to the user in the same language used by the user.
 - Code and documentation must be written in English only.
 - **Pull Request titles and descriptions must be written in English** to ensure consistency and accessibility for all contributors.
 

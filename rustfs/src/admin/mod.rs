@@ -240,6 +240,14 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&bucket_meta::ImportBucketMetadata {}),
     )?;
 
+    register_replication_route(&mut r)?;
+    register_profiling_route(&mut r)?;
+    register_kms_route(&mut r)?;
+
+    Ok(r)
+}
+
+fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/list-remote-targets").as_str(),
@@ -264,6 +272,10 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 
+    Ok(())
+}
+
+fn register_profiling_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     // Performance profiling endpoints (available on all platforms, with platform-specific responses)
     r.insert(
         Method::GET,
@@ -277,6 +289,10 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&handlers::ProfileStatusHandler {}),
     )?;
 
+    Ok(())
+}
+
+fn register_kms_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     // KMS management endpoints
     r.insert(
         Method::POST,
@@ -382,7 +398,7 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
         AdminOperation(&kms_keys::DescribeKmsKeyHandler {}),
     )?;
 
-    Ok(r)
+    Ok(())
 }
 
 /// user router
@@ -537,6 +553,12 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         AdminOperation(&policies::SetPolicyForUserOrGroup {}),
     )?;
 
+    register_notification_target_route(r)?;
+
+    Ok(())
+}
+
+fn register_notification_target_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/target/list").as_str(),
