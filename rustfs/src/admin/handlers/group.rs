@@ -13,11 +13,16 @@
 // limitations under the License.
 
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
+    admin::{
+        auth::validate_admin_request,
+        router::{AdminOperation, Operation, S3Router},
+        utils::has_space_be,
+    },
     auth::{check_key_valid, constant_time_eq, get_session_token},
-    server::RemoteAddr,
+    server::{ADMIN_PREFIX, RemoteAddr},
 };
 use http::{HeaderMap, StatusCode};
+use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
@@ -32,6 +37,34 @@ use s3s::{
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tracing::warn;
+
+pub fn register_group_management_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/groups").as_str(),
+        AdminOperation(&ListGroups {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/group").as_str(),
+        AdminOperation(&GetGroup {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-group-status").as_str(),
+        AdminOperation(&SetGroupStatus {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/update-group-members").as_str(),
+        AdminOperation(&UpdateGroupMembers {}),
+    )?;
+
+    Ok(())
+}
 
 #[derive(Debug, Deserialize, Default)]
 pub struct GroupQuery {

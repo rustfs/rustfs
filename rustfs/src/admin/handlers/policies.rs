@@ -13,11 +13,16 @@
 // limitations under the License.
 
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
+    admin::{
+        auth::validate_admin_request,
+        router::{AdminOperation, Operation, S3Router},
+        utils::has_space_be,
+    },
     auth::{check_key_valid, get_session_token},
-    server::RemoteAddr,
+    server::{ADMIN_PREFIX, RemoteAddr},
 };
 use http::{HeaderMap, StatusCode};
+use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
@@ -36,6 +41,40 @@ use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use tracing::warn;
+
+pub fn register_iam_policy_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/list-canned-policies").as_str(),
+        AdminOperation(&ListCannedPolicies {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/info-canned-policy").as_str(),
+        AdminOperation(&InfoCannedPolicy {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/add-canned-policy").as_str(),
+        AdminOperation(&AddCannedPolicy {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/remove-canned-policy").as_str(),
+        AdminOperation(&RemoveCannedPolicy {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-user-or-group-policy").as_str(),
+        AdminOperation(&SetPolicyForUserOrGroup {}),
+    )?;
+
+    Ok(())
+}
 
 #[derive(Debug, Deserialize, Default)]
 pub struct BucketQuery {
