@@ -12,12 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::{account_info::AccountInfoHandler, event, group, policies, service_account};
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
+    admin::{
+        auth::validate_admin_request,
+        router::{AdminOperation, Operation, S3Router},
+        utils::has_space_be,
+    },
     auth::{check_key_valid, constant_time_eq, get_session_token},
-    server::RemoteAddr,
+    server::{ADMIN_PREFIX, RemoteAddr},
 };
 use http::{HeaderMap, StatusCode};
+use hyper::Method;
 use matchit::Params;
 use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
 use rustfs_credentials::get_global_action_cred;
@@ -48,6 +54,73 @@ pub struct AddUserQuery {
     #[serde(rename = "accessKey")]
     pub access_key: Option<String>,
     pub status: Option<String>,
+}
+
+pub fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    register_user_management_route(r)?;
+    group::register_group_management_route(r)?;
+    service_account::register_service_account_route(r)?;
+    register_user_iam_route(r)?;
+    policies::register_iam_policy_route(r)?;
+    event::register_notification_target_route(r)?;
+
+    Ok(())
+}
+
+fn register_user_management_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/accountinfo").as_str(),
+        AdminOperation(&AccountInfoHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/list-users").as_str(),
+        AdminOperation(&ListUsers {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/user-info").as_str(),
+        AdminOperation(&GetUserInfo {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/remove-user").as_str(),
+        AdminOperation(&RemoveUser {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/add-user").as_str(),
+        AdminOperation(&AddUser {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-user-status").as_str(),
+        AdminOperation(&SetUserStatus {}),
+    )?;
+
+    Ok(())
+}
+
+fn register_user_iam_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/export-iam").as_str(),
+        AdminOperation(&ExportIam {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/import-iam").as_str(),
+        AdminOperation(&ImportIam {}),
+    )?;
+
+    Ok(())
 }
 
 pub struct AddUser {}

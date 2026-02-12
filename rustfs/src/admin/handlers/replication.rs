@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::admin::auth::validate_admin_request;
-use crate::admin::router::Operation;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
-use crate::server::RemoteAddr;
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue, Uri};
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
@@ -45,6 +45,34 @@ fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
     }
 
     params
+}
+
+pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/list-remote-targets").as_str(),
+        AdminOperation(&ListRemoteTargetHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/replicationmetrics").as_str(),
+        AdminOperation(&GetReplicationMetricsHandler {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-remote-target").as_str(),
+        AdminOperation(&SetRemoteTargetHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
+        AdminOperation(&RemoveRemoteTargetHandler {}),
+    )?;
+
+    Ok(())
 }
 
 async fn validate_replication_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {

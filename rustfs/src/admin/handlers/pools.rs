@@ -23,11 +23,43 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation},
+    admin::{
+        auth::validate_admin_request,
+        router::{AdminOperation, Operation, S3Router},
+    },
     auth::{check_key_valid, get_session_token},
     error::ApiError,
-    server::RemoteAddr,
+    server::{ADMIN_PREFIX, RemoteAddr},
 };
+use hyper::Method;
+
+pub fn register_pool_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/pools/list").as_str(),
+        AdminOperation(&ListPools {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/pools/status").as_str(),
+        AdminOperation(&StatusPool {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/pools/decommission").as_str(),
+        AdminOperation(&StartDecommission {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/pools/cancel").as_str(),
+        AdminOperation(&CancelDecommission {}),
+    )?;
+
+    Ok(())
+}
 
 pub struct ListPools {}
 

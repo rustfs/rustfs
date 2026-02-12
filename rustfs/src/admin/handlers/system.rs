@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::metrics;
 use crate::admin::auth::validate_admin_request;
-use crate::admin::router::Operation;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::RemoteAddr;
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
@@ -28,6 +29,52 @@ use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use tracing::{debug, error, info, warn};
+
+pub fn register_system_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/service").as_str(),
+        AdminOperation(&ServiceHandle {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/info").as_str(),
+        AdminOperation(&ServerInfoHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/inspect-data").as_str(),
+        AdminOperation(&InspectDataHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/inspect-data").as_str(),
+        AdminOperation(&InspectDataHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/storageinfo").as_str(),
+        AdminOperation(&StorageInfoHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/datausageinfo").as_str(),
+        AdminOperation(&DataUsageInfoHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/metrics").as_str(),
+        AdminOperation(&metrics::MetricsHandler {}),
+    )?;
+
+    Ok(())
+}
 
 pub struct ServiceHandle {}
 

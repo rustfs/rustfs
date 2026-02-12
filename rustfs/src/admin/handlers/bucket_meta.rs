@@ -13,11 +13,15 @@
 // limitations under the License.
 
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation},
+    admin::{
+        auth::validate_admin_request,
+        router::{AdminOperation, Operation, S3Router},
+    },
     auth::{check_key_valid, get_session_token},
-    server::RemoteAddr,
+    server::{ADMIN_PREFIX, RemoteAddr},
 };
 use http::{HeaderMap, StatusCode};
+use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
 use rustfs_ecstore::{
@@ -70,6 +74,22 @@ pub struct ExportBucketMetadataQuery {
 }
 
 pub struct ExportBucketMetadata {}
+
+pub fn register_bucket_meta_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/export-bucket-metadata").as_str(),
+        AdminOperation(&ExportBucketMetadata {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/import-bucket-metadata").as_str(),
+        AdminOperation(&ImportBucketMetadata {}),
+    )?;
+
+    Ok(())
+}
 
 #[async_trait::async_trait]
 impl Operation for ExportBucketMetadata {

@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::Operation;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::server::ADMIN_PREFIX;
 use bytes::Bytes;
 use http::Uri;
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
@@ -91,6 +92,30 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
     }
 
     Ok(hip)
+}
+
+pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    // Some APIs are only available in EC mode
+    // if is_dist_erasure().await || is_erasure().await {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}").as_str(),
+        AdminOperation(&HealHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{prefix}").as_str(),
+        AdminOperation(&HealHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/background-heal/status").as_str(),
+        AdminOperation(&BackgroundHealStatusHandler {}),
+    )?;
+
+    Ok(())
 }
 
 pub struct HealHandler {}
