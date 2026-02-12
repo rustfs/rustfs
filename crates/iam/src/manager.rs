@@ -161,7 +161,7 @@ where
                             _ = ticker.tick() => {
                                 info!("iam load ticker");
                                 if let Err(err) =s.clone().load().await{
-                                    error!("iam load err {:?}", err);
+                                    warn!("iam load err {:?}", err);
                                 }
                             },
                             i = receiver.recv() => {
@@ -172,7 +172,7 @@ where
                                         if last <= t {
                                             info!("iam load receiver load");
                                             if let Err(err) =s.clone().load().await{
-                                                error!("iam load err {:?}", err);
+                                                warn!("iam load err {:?}", err);
                                             }
                                             ticker.reset();
                                         }
