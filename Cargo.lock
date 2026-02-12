@@ -7787,7 +7787,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.13.0-alpha.3"
-source = "git+https://github.com/s3s-project/s3s.git?rev=7b8e22b49bc76839e6085a4ddfa553323f1b8049#7b8e22b49bc76839e6085a4ddfa553323f1b8049"
+source = "git+https://github.com/s3s-project/s3s.git?rev=f7967e604a74d39fec0e0cdd7a8599811d3edb80#f7967e604a74d39fec0e0cdd7a8599811d3edb80"
 dependencies = [
  "arc-swap",
  "arrayvec",

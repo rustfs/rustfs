@@ -161,7 +161,10 @@ impl Validator for Policy {
     type Error = Error;
 
     fn is_valid(&self) -> Result<()> {
-        if !self.version.is_empty() && !self.version.eq(DEFAULT_VERSION) {
+        if self.version.is_empty() {
+            return Err(IamError::InvalidVersion("".to_string()).into());
+        }
+        if !self.version.eq(DEFAULT_VERSION) {
             return Err(IamError::InvalidVersion(self.version.clone()).into());
         }
 
@@ -222,7 +225,10 @@ impl Validator for BucketPolicy {
     type Error = Error;
 
     fn is_valid(&self) -> Result<()> {
-        if !self.version.is_empty() && !self.version.eq(DEFAULT_VERSION) {
+        if self.version.is_empty() {
+            return Err(IamError::InvalidVersion("".to_string()).into());
+        }
+        if !self.version.eq(DEFAULT_VERSION) {
             return Err(IamError::InvalidVersion(self.version.clone()).into());
         }
 
@@ -1023,6 +1029,88 @@ mod test {
                     && error_msg.contains("NotResource")
                     && error_msg.contains("cannot both be specified"),
                 "Error should be BothResourceAndNotResource, got: {}",
+                error_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_statement_with_only_notaction_is_valid() {
+        // IAM allows a statement with only NotAction (no Action). Deserialization should accept
+        // missing "Action" (default to empty) and validate when exactly one of Action/NotAction is set.
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "NotAction": ["s3:DeleteBucket", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::mybucket/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_ok(), "Statement with only NotAction should be valid, got: {:?}", result.err());
+        let policy = result.unwrap();
+        assert_eq!(policy.statements.len(), 1);
+        assert!(policy.statements[0].actions.is_empty());
+        assert!(!policy.statements[0].not_actions.is_empty());
+    }
+
+    #[test]
+    fn test_statement_with_both_action_and_notaction_is_invalid() {
+        // Test: A statement with both Action and NotAction returns BothActionAndNotAction error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "NotAction": ["s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::mybucket/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with both Action and NotAction should be invalid");
+
+        if let Err(e) = result {
+            let error_msg = format!("{}", e);
+            assert!(
+                error_msg.contains("Action") && error_msg.contains("NotAction") && error_msg.contains("cannot both be specified"),
+                "Error should be BothActionAndNotAction, got: {}",
+                error_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_statement_with_neither_action_nor_notaction_is_invalid() {
+        // Statement with both Action and NotAction omitted (both default to empty) fails validation.
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Resource": ["arn:aws:s3:::mybucket/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with neither Action nor NotAction should be invalid");
+        if let Err(e) = result {
+            let error_msg = format!("{}", e);
+            assert!(
+                error_msg.contains("Action") && error_msg.contains("NotAction") && error_msg.contains("empty"),
+                "Error should be NonAction, got: {}",
                 error_msg
             );
         }
