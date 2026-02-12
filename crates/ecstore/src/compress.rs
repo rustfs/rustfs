@@ -14,6 +14,7 @@
 
 use rustfs_utils::string::{has_pattern, has_string_suffix_in_slice};
 use std::env;
+use std::sync::OnceLock;
 use tracing::debug;
 
 pub const MIN_COMPRESSIBLE_SIZE: usize = 4096;
@@ -21,7 +22,36 @@ pub const MIN_COMPRESSIBLE_SIZE: usize = 4096;
 // Environment variable name to control whether compression is enabled
 pub const ENV_COMPRESSION_ENABLED: &str = "RUSTFS_COMPRESSION_ENABLED";
 
+// Environment variable for additional extensions to exclude from compression (comma-separated, e.g. ".foo,.bar")
+pub const ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS: &str = "RUSTFS_ADDED_EXCLUDE_COMPRESS_EXTENSIONS";
+
+/// Parses RUSTFS_ADDED_EXCLUDE_COMPRESS_EXTENSIONS (comma-separated). Called once at first use via OnceLock.
+pub(crate) fn parse_added_exclude_extensions() -> Vec<String> {
+    env::var(ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS)
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|v| {
+                    let v = v.trim().to_lowercase();
+                    if v.is_empty() {
+                        String::new()
+                    } else if v.starts_with('.') {
+                        v
+                    } else {
+                        format!(".{v}")
+                    }
+                })
+                .filter(|v| !v.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// Parsed once at first use, then reused for all is_compressible() checks.
+static ADDED_EXCLUDE_COMPRESS_EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
+
 // Some standard object extensions which we strictly dis-allow for compression.
+#[rustfmt::skip]
 pub const STANDARD_EXCLUDE_COMPRESS_EXTENSIONS: &[&str] = &[
     // Compressed archives
     ".gz", ".bz2", ".rar", ".zip", ".7z", ".xz", ".zst", ".lz4", ".br", ".lzo", ".sz", ".tgz",
@@ -77,6 +107,12 @@ pub fn is_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
 
     if has_string_suffix_in_slice(object_name, STANDARD_EXCLUDE_COMPRESS_EXTENSIONS) {
         debug!("object_name: {} is not compressible", object_name);
+        return false;
+    }
+
+    let added = ADDED_EXCLUDE_COMPRESS_EXTENSIONS.get_or_init(parse_added_exclude_extensions);
+    if !added.is_empty() && has_string_suffix_in_slice(object_name, &added) {
+        debug!("object_name: {} is not compressible (added exclusion)", object_name);
         return false;
     }
 
@@ -196,6 +232,36 @@ mod tests {
 
             headers.insert("content-type", "application/json".parse().unwrap());
             assert!(is_compressible(&headers, "file.json"));
+        });
+    }
+
+    #[test]
+    fn test_added_exclude_compress_extensions_parsing() {
+        temp_env::with_var(ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS, Some(".foo,.bar"), || {
+            let added = parse_added_exclude_extensions();
+            assert_eq!(added, [".foo", ".bar"]);
+        });
+        temp_env::with_var(ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS, Some("baz, .qux"), || {
+            let added = parse_added_exclude_extensions();
+            assert_eq!(added, [".baz", ".qux"]);
+        });
+        temp_env::with_var_unset(ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS, || {
+            let added = parse_added_exclude_extensions();
+            assert!(added.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_added_exclude_compress_extensions_default_compressible() {
+        use http::HeaderMap;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/plain".parse().unwrap());
+        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
+            temp_env::with_var_unset(ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS, || {
+                assert!(is_compressible(&headers, "file.foo"));
+                assert!(is_compressible(&headers, "file.bar"));
+            });
         });
     }
 }
