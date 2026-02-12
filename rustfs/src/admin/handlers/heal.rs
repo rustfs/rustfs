@@ -77,7 +77,10 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
     }
 
     if (hip.force_start && hip.force_stop) || (!hip.client_token.is_empty() && (hip.force_start || hip.force_stop)) {
-        return Err(s3_error!(InvalidRequest, ""));
+        return Err(s3_error!(
+            InvalidRequest,
+            "invalid combination of clientToken, forceStart, and forceStop parameters"
+        ));
     }
 
     if hip.client_token.is_empty() {
@@ -230,6 +233,10 @@ impl Operation for BackgroundHealStatusHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::extract_heal_init_params;
+    use bytes::Bytes;
+    use http::Uri;
+    use matchit::Router;
     use rustfs_common::heal_channel::HealOpts;
     use serde_json::json;
     use tracing::debug;
@@ -277,6 +284,25 @@ mod tests {
         let decoded: HealOpts = serde_urlencoded::from_str(&encoded).unwrap();
         assert_eq!(decoded.recursive, opts.recursive);
         assert_eq!(decoded.scan_mode, opts.scan_mode);
+    }
+
+    #[test]
+    fn test_extract_heal_init_params_invalid_control_combination_returns_descriptive_error() {
+        let uri: Uri = "/rustfs/admin/v3/heal/test-bucket?clientToken=token&forceStart=true"
+            .parse()
+            .expect("uri should parse");
+
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/heal/{bucket}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/heal/test-bucket").expect("route should match");
+
+        let err = extract_heal_init_params(&Bytes::new(), &uri, matched.params).expect_err("must reject invalid combo");
+        assert!(
+            err.to_string()
+                .contains("invalid combination of clientToken, forceStart, and forceStop parameters")
+        );
     }
 
     #[ignore] // FIXME: failed in github actions - keeping original test

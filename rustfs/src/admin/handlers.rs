@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::router::Operation;
-
 pub mod account_info;
 pub mod bucket_meta;
 pub mod event;

@@ -16,7 +16,7 @@ use crate::admin::auth::validate_admin_request;
 use crate::admin::router::Operation;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_ecstore::admin_server_info::get_server_info;
@@ -69,7 +69,7 @@ impl Operation for ServerInfoHandler {
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse serverInfo failed"))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -119,10 +119,10 @@ impl Operation for StorageInfoHandler {
         let info = store.storage_info().await;
 
         let data = serde_json::to_vec(&info)
-            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
+            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize storage info"))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -239,7 +239,7 @@ impl Operation for DataUsageInfoHandler {
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse DataUsageInfo failed"))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }

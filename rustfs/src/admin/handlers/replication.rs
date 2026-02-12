@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::auth::validate_admin_request;
 use crate::admin::router::Operation;
+use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
-use http::{HeaderMap, Uri};
+use crate::server::RemoteAddr;
+use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -25,6 +28,7 @@ use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOptions, StorageAPI};
+use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
@@ -35,14 +39,24 @@ fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
     let mut params = HashMap::new();
 
     if let Some(query) = uri.query() {
-        query.split('&').for_each(|pair| {
-            if let Some((key, value)) = pair.split_once('=') {
-                params.insert(key.to_string(), value.to_string());
-            }
-        });
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            params.insert(key.into_owned(), value.into_owned());
+        }
     }
 
     params
+}
+
+async fn validate_replication_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
+    let Some(input_cred) = req.credentials.as_ref() else {
+        return Err(s3_error!(InvalidRequest, "get cred failed"));
+    };
+
+    let (cred, owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
 }
 
 #[allow(dead_code)]
@@ -70,6 +84,8 @@ pub struct SetRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for SetRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+
         let queries = extract_query_params(&req.uri);
 
         let Some(bucket) = queries.get("bucket") else {
@@ -230,7 +246,7 @@ impl Operation for ListRemoteTargetHandler {
             })?;
 
             let mut header = HeaderMap::new();
-            header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
             return Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header));
         }
@@ -243,7 +259,7 @@ impl Operation for ListRemoteTargetHandler {
         })?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header))
     }
@@ -254,6 +270,8 @@ pub struct RemoveRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for RemoveRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+
         debug!("remove remote target called");
         let queries = extract_query_params(&req.uri);
         let Some(bucket) = queries.get("bucket") else {
@@ -301,5 +319,22 @@ impl Operation for RemoveRemoteTargetHandler {
             })?;
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_query_params;
+    use http::Uri;
+
+    #[test]
+    fn test_extract_query_params_decodes_percent_encoded_values() {
+        let uri: Uri = "/rustfs/admin/v3/list-remote-targets?bucket=foo%2Fbar&flag=a+b"
+            .parse()
+            .expect("uri should parse");
+        let params = extract_query_params(&uri);
+
+        assert_eq!(params.get("bucket"), Some(&"foo/bar".to_string()));
+        assert_eq!(params.get("flag"), Some(&"a b".to_string()));
     }
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::router::Operation;
-use http::{HeaderMap, Uri};
+use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use s3s::header::CONTENT_TYPE;
@@ -26,11 +26,9 @@ fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
     let mut params = HashMap::new();
 
     if let Some(query) = uri.query() {
-        query.split('&').for_each(|pair| {
-            if let Some((key, value)) = pair.split_once('=') {
-                params.insert(key.to_string(), value.to_string());
-            }
-        });
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            params.insert(key.into_owned(), value.into_owned());
+        }
     }
 
     params
@@ -74,7 +72,7 @@ impl Operation for ProfileHandler {
                     Ok(path) => match tokio::fs::read(&path).await {
                         Ok(bytes) => {
                             let mut headers = HeaderMap::new();
-                            headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+                            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
                             Ok(S3Response::with_headers((StatusCode::OK, Body::from(bytes)), headers))
                         }
                         Err(e) => Ok(S3Response::new((
@@ -120,7 +118,7 @@ impl Operation for ProfileHandler {
                     }
 
                     let mut headers = HeaderMap::new();
-                    headers.insert(CONTENT_TYPE, "image/svg+xml".parse().unwrap());
+                    headers.insert(CONTENT_TYPE, HeaderValue::from_static("image/svg+xml"));
                     Ok(S3Response::with_headers((StatusCode::OK, Body::from(flamegraph_buf)), headers))
                 }
                 _ => Ok(S3Response::new((
@@ -173,7 +171,7 @@ impl Operation for ProfileStatusHandler {
         match serde_json::to_string(&status) {
             Ok(json) => {
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(json)), headers))
             }
             Err(e) => {
@@ -184,5 +182,22 @@ impl Operation for ProfileStatusHandler {
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_query_params;
+    use http::Uri;
+
+    #[test]
+    fn test_extract_query_params_decodes_percent_encoded_values() {
+        let uri: Uri = "/rustfs/admin/debug/pprof/profile?format=flamegraph&note=a%2Bb+value"
+            .parse()
+            .expect("uri should parse");
+        let params = extract_query_params(&uri);
+
+        assert_eq!(params.get("format"), Some(&"flamegraph".to_string()));
+        assert_eq!(params.get("note"), Some(&"a+b value".to_string()));
     }
 }

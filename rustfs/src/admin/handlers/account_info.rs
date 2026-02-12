@@ -15,7 +15,7 @@
 use crate::admin::router::Operation;
 use crate::auth::{check_key_valid, get_condition_values, get_session_token};
 use crate::server::RemoteAddr;
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_credentials::get_global_action_cred;
@@ -42,6 +42,10 @@ pub struct AccountInfo {
 }
 
 pub struct AccountInfoHandler {}
+
+fn resolve_bucket_access(can_list_bucket: bool, can_get_bucket_location: bool, can_put_object: bool) -> (bool, bool) {
+    (can_list_bucket || can_get_bucket_location, can_put_object)
+}
 
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
@@ -79,8 +83,7 @@ impl Operation for AccountInfoHandler {
                 let cred_clone = Arc::clone(&cred_clone);
                 let conditions = Arc::clone(&conditions);
                 async move {
-                    let (mut rd, mut wr) = (false, false);
-                    if !iam_clone
+                    let can_list_bucket = iam_clone
                         .is_allowed(&Args {
                             account: &cred_clone.access_key,
                             groups: &cred_clone.groups,
@@ -92,12 +95,9 @@ impl Operation for AccountInfoHandler {
                             claims,
                             deny_only: false,
                         })
-                        .await
-                    {
-                        rd = true
-                    }
+                        .await;
 
-                    if !iam_clone
+                    let can_get_bucket_location = iam_clone
                         .is_allowed(&Args {
                             account: &cred_clone.access_key,
                             groups: &cred_clone.groups,
@@ -109,12 +109,9 @@ impl Operation for AccountInfoHandler {
                             claims,
                             deny_only: false,
                         })
-                        .await
-                    {
-                        rd = true
-                    }
+                        .await;
 
-                    if !iam_clone
+                    let can_put_object = iam_clone
                         .is_allowed(&Args {
                             account: &cred_clone.access_key,
                             groups: &cred_clone.groups,
@@ -126,12 +123,9 @@ impl Operation for AccountInfoHandler {
                             claims,
                             deny_only: false,
                         })
-                        .await
-                    {
-                        wr = true
-                    }
+                        .await;
 
-                    (rd, wr)
+                    resolve_bucket_access(can_list_bucket, can_get_bucket_location, can_put_object)
                 }
             }
         });
@@ -233,7 +227,7 @@ impl Operation for AccountInfoHandler {
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -267,5 +261,13 @@ mod tests {
         let default_info = AccountInfo::default();
 
         assert!(default_info.account_name.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_bucket_access() {
+        assert_eq!(resolve_bucket_access(false, false, false), (false, false));
+        assert_eq!(resolve_bucket_access(true, false, false), (true, false));
+        assert_eq!(resolve_bucket_access(false, true, false), (true, false));
+        assert_eq!(resolve_bucket_access(false, false, true), (false, true));
     }
 }

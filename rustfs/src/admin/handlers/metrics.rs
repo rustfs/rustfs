@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info};
+use tracing::{debug, error};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MetricsParams {
@@ -146,12 +146,12 @@ pub struct MetricsHandler {}
 #[async_trait::async_trait]
 impl Operation for MetricsHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        info!("handle MetricsHandler, req: {:?}, params: {:?}", req, params);
-        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
-        info!("cred: {:?}", cred);
+        debug!("handle MetricsHandler, uri: {:?}, params: {:?}", req.uri, params);
+        let Some(_cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
+        debug!("validated metrics request credentials");
 
         let mp = extract_metrics_init_params(&req.uri);
-        info!("mp: {:?}", mp);
+        debug!("mp: {:?}", mp);
 
         let tick = parse_duration(&mp.tick).unwrap_or_else(|_| std_Duration::from_secs(3));
 
