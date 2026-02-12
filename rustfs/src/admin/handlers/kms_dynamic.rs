@@ -14,8 +14,8 @@
 
 //! KMS dynamic configuration admin API handlers
 
-use super::Operation;
 use crate::admin::auth::validate_admin_request;
+use crate::admin::router::Operation;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;
 use hyper::StatusCode;

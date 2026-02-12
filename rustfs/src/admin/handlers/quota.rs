@@ -14,8 +14,8 @@
 
 //! Quota admin handlers for HTTP API
 
-use super::Operation;
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
+use crate::admin::router::Operation;
 use crate::auth::{check_key_valid, get_session_token};
 use hyper::StatusCode;
 use matchit::Params;
