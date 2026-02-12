@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::Operation;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_condition_values, get_session_token};
-use crate::server::RemoteAddr;
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
@@ -42,6 +42,16 @@ pub struct AccountInfo {
 }
 
 pub struct AccountInfoHandler {}
+
+pub fn register_account_info_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/accountinfo").as_str(),
+        AdminOperation(&AccountInfoHandler {}),
+    )?;
+
+    Ok(())
+}
 
 fn resolve_bucket_access(can_list_bucket: bool, can_get_bucket_location: bool, can_put_object: bool) -> (bool, bool) {
     (can_list_bucket || can_get_bucket_location, can_put_object)
