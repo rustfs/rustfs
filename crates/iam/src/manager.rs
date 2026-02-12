@@ -133,8 +133,7 @@ where
             if let Err(e) = self.clone().load().await {
                 if attempt == MAX_RETRIES - 1 {
                     self.state.store(IamState::Error as u8, Ordering::SeqCst);
-                    error!("IAM fail to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
-                    return Err(e);
+                    warn!("IAM failed to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
                 } else {
                     warn!("IAM load failed, retrying... attempt {}", attempt + 1);
                     tokio::time::sleep(Duration::from_secs(1)).await;
