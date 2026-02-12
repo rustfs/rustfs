@@ -154,6 +154,8 @@ mod tests {
             assert!(!is_compressible(&headers, "file.deb"));
             assert!(!is_compressible(&headers, "file.rpm"));
             assert!(!is_compressible(&headers, "file.jar"));
+
+            // Test non-compressible extensions - web fonts
             assert!(!is_compressible(&headers, "file.woff2"));
 
             // Test non-compressible content types
