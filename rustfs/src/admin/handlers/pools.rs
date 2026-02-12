@@ -54,6 +54,7 @@ impl Operation for ListPools {
                 Action::AdminAction(AdminAction::ServerInfoAdminAction),
                 Action::AdminAction(AdminAction::DecommissionAdminAction),
             ],
+            crate::admin::auth::AdminPermissionMode::Any,
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -121,6 +122,7 @@ impl Operation for StatusPool {
                 Action::AdminAction(AdminAction::ServerInfoAdminAction),
                 Action::AdminAction(AdminAction::DecommissionAdminAction),
             ],
+            crate::admin::auth::AdminPermissionMode::Any,
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -197,6 +199,7 @@ impl Operation for StartDecommission {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DecommissionAdminAction)],
+            Default::default(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -296,6 +299,7 @@ impl Operation for CancelDecommission {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DecommissionAdminAction)],
+            Default::default(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;

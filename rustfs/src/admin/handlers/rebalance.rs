@@ -104,6 +104,7 @@ impl Operation for RebalanceStart {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+            Default::default(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -182,6 +183,7 @@ impl Operation for RebalanceStatus {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+            Default::default(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -300,6 +302,7 @@ impl Operation for RebalanceStop {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
+            Default::default(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;

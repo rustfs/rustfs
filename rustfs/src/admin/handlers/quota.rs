@@ -99,6 +99,7 @@ impl Operation for SetBucketQuotaHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetBucketQuotaAdminAction)],
+            Default::default(),
             None,
         )
         .await?;
@@ -186,6 +187,7 @@ impl Operation for GetBucketQuotaHandler {
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
+            Default::default(),
             None,
         )
         .await?;
@@ -241,6 +243,7 @@ impl Operation for ClearBucketQuotaHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetBucketQuotaAdminAction)],
+            Default::default(),
             None,
         )
         .await?;
@@ -314,6 +317,7 @@ impl Operation for GetBucketQuotaStatsHandler {
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
+            Default::default(),
             None,
         )
         .await?;
@@ -381,6 +385,7 @@ impl Operation for CheckBucketQuotaHandler {
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
+            Default::default(),
             None,
         )
         .await?;

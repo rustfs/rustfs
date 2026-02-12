@@ -26,7 +26,7 @@ pub struct Statement {
     pub sid: ID,
     #[serde(rename = "Effect")]
     pub effect: Effect,
-    #[serde(rename = "Action")]
+    #[serde(rename = "Action", default)]
     pub actions: ActionSet,
     #[serde(rename = "NotAction", default)]
     pub not_actions: ActionSet,
@@ -151,6 +151,10 @@ impl Validator for Statement {
             return Err(IamError::NonAction.into());
         }
 
+        if !self.actions.is_empty() && !self.not_actions.is_empty() {
+            return Err(IamError::BothActionAndNotAction.into());
+        }
+
         // policy must contain either Resource or NotResource (but not both), and cannot have both empty.
         if self.resources.is_empty() && self.not_resources.is_empty() {
             return Err(IamError::NonResource.into());
@@ -250,6 +254,10 @@ impl Validator for BPStatement {
 
         if self.actions.is_empty() && self.not_actions.is_empty() {
             return Err(IamError::NonAction.into());
+        }
+
+        if !self.actions.is_empty() && !self.not_actions.is_empty() {
+            return Err(IamError::BothActionAndNotAction.into());
         }
 
         if self.resources.is_empty() && self.not_resources.is_empty() {

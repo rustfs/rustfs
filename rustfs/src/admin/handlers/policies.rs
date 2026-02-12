@@ -61,6 +61,7 @@ impl Operation for ListCannedPolicies {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ListUserPoliciesAdminAction)],
+            Default::default(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -120,6 +121,7 @@ impl Operation for AddCannedPolicy {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::CreatePolicyAdminAction)],
+            Default::default(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -156,10 +158,6 @@ impl Operation for AddCannedPolicy {
             S3Error::with_message(S3ErrorCode::InvalidRequest, e.to_string())
         })?;
 
-        if policy.version.is_empty() {
-            return Err(s3_error!(InvalidRequest, "policy version is empty"));
-        }
-
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         iam_store.set_policy(&query.name, policy).await.map_err(|e| {
@@ -193,6 +191,7 @@ impl Operation for InfoCannedPolicy {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::GetPolicyAdminAction)],
+            Default::default(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -251,6 +250,7 @@ impl Operation for RemoveCannedPolicy {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::DeletePolicyAdminAction)],
+            Default::default(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -312,6 +312,7 @@ impl Operation for SetPolicyForUserOrGroup {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::AttachPolicyAdminAction)],
+            Default::default(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;

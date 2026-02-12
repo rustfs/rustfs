@@ -370,6 +370,7 @@ impl Operation for ServerInfoHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            Default::default(),
             remote_addr,
         )
         .await?;
@@ -418,6 +419,7 @@ impl Operation for StorageInfoHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::StorageInfoAdminAction)],
+            Default::default(),
             remote_addr,
         )
         .await?;
@@ -464,6 +466,7 @@ impl Operation for DataUsageInfoHandler {
                 Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
                 Action::S3Action(S3Action::ListBucketAction),
             ],
+            crate::admin::auth::AdminPermissionMode::All,
             remote_addr,
         )
         .await?;
