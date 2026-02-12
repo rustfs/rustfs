@@ -14,11 +14,15 @@
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation},
+    admin::{
+        auth::validate_admin_request,
+        router::{AdminOperation, Operation, S3Router},
+    },
     auth::{check_key_valid, get_session_token},
-    server::RemoteAddr,
+    server::{ADMIN_PREFIX, RemoteAddr},
 };
 use http::{HeaderMap, StatusCode};
+use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::{
@@ -71,6 +75,47 @@ pub struct AddTierQuery {
 }
 
 pub struct AddTier {}
+
+pub fn register_tier_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
+        AdminOperation(&ListTiers {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier-stats").as_str(),
+        AdminOperation(&GetTierInfo {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
+        AdminOperation(&RemoveTier {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
+        AdminOperation(&AddTier {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
+        AdminOperation(&EditTier {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/clear").as_str(),
+        AdminOperation(&ClearTier {}),
+    )?;
+
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Operation for AddTier {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {

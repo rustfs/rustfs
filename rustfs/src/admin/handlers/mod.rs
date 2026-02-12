@@ -37,15 +37,6 @@ pub mod tier;
 pub mod trace;
 pub mod user;
 
-pub use account_info::AccountInfoHandler;
-pub use heal::{BackgroundHealStatusHandler, HealHandler};
-pub use health::HealthCheckHandler;
-pub use is_admin::IsAdminHandler;
-pub use metrics::MetricsHandler;
-pub use profile_admin::{ProfileHandler, ProfileStatusHandler};
-pub use replication::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
-pub use system::{DataUsageInfoHandler, InspectDataHandler, ServerInfoHandler, ServiceHandle, StorageInfoHandler};
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,19 +44,21 @@ mod tests {
     #[test]
     fn test_handler_struct_creation() {
         // Test that handler structs can be created
-        let _account_handler = AccountInfoHandler {};
-        let _service_handler = ServiceHandle {};
-        let _server_info_handler = ServerInfoHandler {};
-        let _inspect_data_handler = InspectDataHandler {};
-        let _storage_info_handler = StorageInfoHandler {};
-        let _data_usage_handler = DataUsageInfoHandler {};
-        let _metrics_handler = MetricsHandler {};
-        let _heal_handler = HealHandler {};
-        let _bg_heal_handler = BackgroundHealStatusHandler {};
-        let _replication_metrics_handler = GetReplicationMetricsHandler {};
-        let _set_remote_target_handler = SetRemoteTargetHandler {};
-        let _list_remote_target_handler = ListRemoteTargetHandler {};
-        let _remove_remote_target_handler = RemoveRemoteTargetHandler {};
+        let _account_handler = account_info::AccountInfoHandler {};
+        let _service_handler = system::ServiceHandle {};
+        let _server_info_handler = system::ServerInfoHandler {};
+        let _inspect_data_handler = system::InspectDataHandler {};
+        let _storage_info_handler = system::StorageInfoHandler {};
+        let _data_usage_handler = system::DataUsageInfoHandler {};
+        let _metrics_handler = metrics::MetricsHandler {};
+        let _profile_handler = profile_admin::ProfileHandler {};
+        let _profile_status_handler = profile_admin::ProfileStatusHandler {};
+        let _heal_handler = heal::HealHandler {};
+        let _bg_heal_handler = heal::BackgroundHealStatusHandler {};
+        let _replication_metrics_handler = replication::GetReplicationMetricsHandler {};
+        let _set_remote_target_handler = replication::SetRemoteTargetHandler {};
+        let _list_remote_target_handler = replication::ListRemoteTargetHandler {};
+        let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
 
         // Just verify they can be created without panicking
         // Test passes if we reach this point without panicking

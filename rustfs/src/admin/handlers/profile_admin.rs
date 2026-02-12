@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::Operation;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::server::ADMIN_PREFIX;
 use http::{HeaderMap, HeaderValue, Uri};
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result};
@@ -32,6 +33,22 @@ fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
     }
 
     params
+}
+
+pub fn register_profiling_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/profile").as_str(),
+        AdminOperation(&ProfileHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/debug/pprof/status").as_str(),
+        AdminOperation(&ProfileStatusHandler {}),
+    )?;
+
+    Ok(())
 }
 
 pub struct ProfileHandler {}

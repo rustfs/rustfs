@@ -12,12 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::Operation;
+use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
+use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::server::{HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use http::{HeaderMap, HeaderValue};
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result};
+
+pub fn register_health_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    // Health check endpoint for monitoring and orchestration
+    r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::GET, PROFILE_CPU_PATH, AdminOperation(&TriggerProfileCPU {}))?;
+    r.insert(Method::GET, PROFILE_MEMORY_PATH, AdminOperation(&TriggerProfileMemory {}))?;
+
+    Ok(())
+}
 
 /// Health check handler for endpoint monitoring
 pub struct HealthCheckHandler {}
