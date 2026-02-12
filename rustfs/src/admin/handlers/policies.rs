@@ -195,10 +195,6 @@ impl Operation for AddCannedPolicy {
             S3Error::with_message(S3ErrorCode::InvalidRequest, e.to_string())
         })?;
 
-        if policy.version.is_empty() {
-            return Err(s3_error!(InvalidRequest, "policy version is empty"));
-        }
-
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
         iam_store.set_policy(&query.name, policy).await.map_err(|e| {
