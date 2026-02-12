@@ -14,7 +14,7 @@
 
 use rustfs_utils::string::{has_pattern, has_string_suffix_in_slice};
 use std::env;
-use tracing::error;
+use tracing::debug;
 
 pub const MIN_COMPRESSIBLE_SIZE: usize = 4096;
 
@@ -23,25 +23,41 @@ pub const ENV_COMPRESSION_ENABLED: &str = "RUSTFS_COMPRESSION_ENABLED";
 
 // Some standard object extensions which we strictly dis-allow for compression.
 pub const STANDARD_EXCLUDE_COMPRESS_EXTENSIONS: &[&str] = &[
-    ".gz", ".bz2", ".rar", ".zip", ".7z", ".xz", ".mp4", ".mkv", ".mov", ".jpg", ".png", ".gif",
+    // Compressed archives
+    ".gz", ".bz2", ".rar", ".zip", ".7z", ".xz", ".zst", ".lz4", ".br", ".lzo", ".sz", ".tgz", // Images
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic", ".heif", ".jxl", // Video
+    ".mp4", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg", // Audio
+    ".mp3", ".aac", ".ogg", ".flac", ".wma", ".m4a", ".opus", // Documents (internally compressed)
+    ".pdf", ".docx", ".xlsx", ".pptx", // Package formats
+    ".deb", ".rpm", ".jar", ".war", ".apk", // Web fonts
+    ".woff", ".woff2",
 ];
 
 // Some standard content-types which we strictly dis-allow for compression.
 pub const STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES: &[&str] = &[
     "video/*",
     "audio/*",
+    "image/*",
     "application/zip",
     "application/x-gzip",
     "application/x-zip-compressed",
     "application/x-compress",
     "application/x-spoon",
+    "application/x-rar-compressed",
+    "application/x-7z-compressed",
+    "application/x-bzip2",
+    "application/x-xz",
+    "application/zstd",
+    "application/pdf",
+    "application/wasm",
+    "font/*",
 ];
 
 pub fn is_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
     // Check if compression is enabled via environment variable, default disabled
     if let Ok(compression_enabled) = env::var(ENV_COMPRESSION_ENABLED) {
         if compression_enabled.to_lowercase() != "true" {
-            error!("Compression is disabled by environment variable");
+            debug!("Compression is disabled by environment variable");
             return false;
         }
     } else {
@@ -54,12 +70,12 @@ pub fn is_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
     // TODO: crypto request return false
 
     if has_string_suffix_in_slice(object_name, STANDARD_EXCLUDE_COMPRESS_EXTENSIONS) {
-        error!("object_name: {} is not compressible", object_name);
+        debug!("object_name: {} is not compressible", object_name);
         return false;
     }
 
     if !content_type.is_empty() && has_pattern(STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES, content_type) {
-        error!("content_type: {} is not compressible", content_type);
+        debug!("content_type: {} is not compressible", content_type);
         return false;
     }
     true
@@ -93,12 +109,46 @@ mod tests {
 
         temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
             let mut headers = HeaderMap::new();
-            // Test non-compressible extensions
+            // Test non-compressible extensions - compressed archives
             headers.insert("content-type", "text/plain".parse().unwrap());
             assert!(!is_compressible(&headers, "file.gz"));
             assert!(!is_compressible(&headers, "file.zip"));
-            assert!(!is_compressible(&headers, "file.mp4"));
+            assert!(!is_compressible(&headers, "file.7z"));
+            assert!(!is_compressible(&headers, "file.zst"));
+            assert!(!is_compressible(&headers, "file.br"));
+            assert!(!is_compressible(&headers, "file.tgz"));
+
+            // Test non-compressible extensions - images
             assert!(!is_compressible(&headers, "file.jpg"));
+            assert!(!is_compressible(&headers, "file.jpeg"));
+            assert!(!is_compressible(&headers, "file.png"));
+            assert!(!is_compressible(&headers, "file.gif"));
+            assert!(!is_compressible(&headers, "file.webp"));
+            assert!(!is_compressible(&headers, "file.avif"));
+
+            // Test non-compressible extensions - video
+            assert!(!is_compressible(&headers, "file.mp4"));
+            assert!(!is_compressible(&headers, "file.mkv"));
+            assert!(!is_compressible(&headers, "file.webm"));
+
+            // Test non-compressible extensions - audio
+            assert!(!is_compressible(&headers, "file.mp3"));
+            assert!(!is_compressible(&headers, "file.aac"));
+            assert!(!is_compressible(&headers, "file.ogg"));
+            assert!(!is_compressible(&headers, "file.flac"));
+            assert!(!is_compressible(&headers, "file.opus"));
+
+            // Test non-compressible extensions - documents
+            assert!(!is_compressible(&headers, "file.pdf"));
+            assert!(!is_compressible(&headers, "file.docx"));
+            assert!(!is_compressible(&headers, "file.xlsx"));
+            assert!(!is_compressible(&headers, "file.pptx"));
+
+            // Test non-compressible extensions - packages
+            assert!(!is_compressible(&headers, "file.deb"));
+            assert!(!is_compressible(&headers, "file.rpm"));
+            assert!(!is_compressible(&headers, "file.jar"));
+            assert!(!is_compressible(&headers, "file.woff2"));
 
             // Test non-compressible content types
             headers.insert("content-type", "video/mp4".parse().unwrap());
@@ -107,10 +157,25 @@ mod tests {
             headers.insert("content-type", "audio/mpeg".parse().unwrap());
             assert!(!is_compressible(&headers, "file.txt"));
 
+            headers.insert("content-type", "image/png".parse().unwrap());
+            assert!(!is_compressible(&headers, "file.txt"));
+
+            headers.insert("content-type", "image/webp".parse().unwrap());
+            assert!(!is_compressible(&headers, "file.txt"));
+
             headers.insert("content-type", "application/zip".parse().unwrap());
             assert!(!is_compressible(&headers, "file.txt"));
 
             headers.insert("content-type", "application/x-gzip".parse().unwrap());
+            assert!(!is_compressible(&headers, "file.txt"));
+
+            headers.insert("content-type", "application/x-7z-compressed".parse().unwrap());
+            assert!(!is_compressible(&headers, "file.txt"));
+
+            headers.insert("content-type", "application/pdf".parse().unwrap());
+            assert!(!is_compressible(&headers, "file.txt"));
+
+            headers.insert("content-type", "font/woff2".parse().unwrap());
             assert!(!is_compressible(&headers, "file.txt"));
 
             // Test compressible cases
