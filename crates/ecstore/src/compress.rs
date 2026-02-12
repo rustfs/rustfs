@@ -24,12 +24,18 @@ pub const ENV_COMPRESSION_ENABLED: &str = "RUSTFS_COMPRESSION_ENABLED";
 // Some standard object extensions which we strictly dis-allow for compression.
 pub const STANDARD_EXCLUDE_COMPRESS_EXTENSIONS: &[&str] = &[
     // Compressed archives
-    ".gz", ".bz2", ".rar", ".zip", ".7z", ".xz", ".zst", ".lz4", ".br", ".lzo", ".sz", ".tgz", // Images
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic", ".heif", ".jxl", // Video
-    ".mp4", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg", // Audio
-    ".mp3", ".aac", ".ogg", ".flac", ".wma", ".m4a", ".opus", // Documents (internally compressed)
-    ".pdf", ".docx", ".xlsx", ".pptx", // Package formats
-    ".deb", ".rpm", ".jar", ".war", ".apk", // Web fonts
+    ".gz", ".bz2", ".rar", ".zip", ".7z", ".xz", ".zst", ".lz4", ".br", ".lzo", ".sz", ".tgz",
+    // Images
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic", ".heif", ".jxl",
+    // Video
+    ".mp4", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg",
+    // Audio
+    ".mp3", ".aac", ".ogg", ".flac", ".wma", ".m4a", ".opus",
+    // Documents (internally compressed)
+    ".pdf", ".docx", ".xlsx", ".pptx",
+    // Package formats
+    ".deb", ".rpm", ".jar", ".war", ".apk",
+    // Web fonts
     ".woff", ".woff2",
 ];
 
