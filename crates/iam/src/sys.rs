@@ -744,7 +744,7 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn is_allowed_sts(&self, args: &Args<'_>, parent_user: &str) -> bool {
-        let is_owner = parent_user == get_global_action_cred().unwrap().access_key;
+        let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
         let role_arn = args.get_role_arn();
         let policies = {
             if is_owner {
@@ -794,7 +794,7 @@ impl<T: Store> IamSys<T> {
             return false;
         }
 
-        let is_owner = parent_user == get_global_action_cred().unwrap().access_key;
+        let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
 
         let role_arn = args.get_role_arn();
 

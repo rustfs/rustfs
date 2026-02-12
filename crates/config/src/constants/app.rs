@@ -62,8 +62,8 @@ pub const DEFAULT_CONSOLE_ENABLE: bool = true;
 /// Default OBS configuration endpoint
 /// Environment variable: DEFAULT_OBS_ENDPOINT
 /// Command line argument: --obs-endpoint
-/// Example: DEFAULT_OBS_ENDPOINT="http://localost:4317"
-/// Example: --obs-endpoint http://localost:4317
+/// Example: DEFAULT_OBS_ENDPOINT="http://localost:4318"
+/// Example: --obs-endpoint http://localost:4318
 pub const DEFAULT_OBS_ENDPOINT: &str = "";
 
 /// Default TLS key for rustfs

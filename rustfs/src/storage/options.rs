@@ -32,8 +32,10 @@ use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_REQUEST;
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
+use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_MTIME;
 use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_VERSION_ID;
 use rustfs_utils::http::RUSTFS_ENCRYPTION_LOWER;
+use rustfs_utils::http::RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE;
 use rustfs_utils::path::is_dir_object;
 use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
@@ -44,6 +46,8 @@ use uuid::Uuid;
 use crate::auth::AuthType;
 use crate::auth::get_request_auth_type;
 use crate::auth::is_request_presigned_signature_v4;
+
+const REPLICATION_REQUEST_TRUE: HeaderValue = HeaderValue::from_static("true");
 
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
@@ -240,12 +244,16 @@ pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> s
     let mut user_defined = HashMap::new();
 
     let mut replication_request = false;
-    if let Some(v) = headers.get(RUSTFS_BUCKET_REPLICATION_REQUEST) {
-        user_defined.insert(
-            format!("{RESERVED_METADATA_PREFIX_LOWER}Actual-Object-Size"),
-            v.to_str().unwrap_or_default().to_owned(),
-        );
+    if headers.get(RUSTFS_BUCKET_REPLICATION_REQUEST) == Some(&REPLICATION_REQUEST_TRUE) {
         replication_request = true;
+        if let Some(actual_size_str) = headers
+            .get(RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE)
+            .and_then(|h| h.to_str().ok())
+        {
+            user_defined.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}Actual-Object-Size"), actual_size_str.to_string());
+        } else {
+            tracing::warn!("Failed to get or parse {} header", RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE);
+        }
     }
 
     if let Some(v) = headers.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM) {
@@ -282,7 +290,33 @@ pub fn copy_src_opts(_bucket: &str, _object: &str, headers: &HeaderMap<HeaderVal
 }
 
 pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap<String, String>) -> Result<ObjectOptions> {
-    get_default_opts(headers, metadata, false)
+    let mut opts = get_default_opts(headers, metadata, false)?;
+    if headers.get(RUSTFS_BUCKET_REPLICATION_REQUEST) == Some(&REPLICATION_REQUEST_TRUE) {
+        opts.replication_request = true;
+        if let Some(v) = headers.get(RUSTFS_BUCKET_SOURCE_MTIME) {
+            match v.to_str() {
+                Ok(s) => {
+                    let trimmed_s = s.trim();
+                    match time::OffsetDateTime::parse(trimmed_s, &time::format_description::well_known::Rfc3339) {
+                        Ok(mtime) => opts.mod_time = Some(mtime),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Invalid X-RustFS-Source-Mtime value '{}' (replication request=true): {}",
+                                trimmed_s,
+                                e
+                            );
+                            opts.mod_time = None;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("X-RustFS-Source-Mtime header is not valid UTF-8 (replication request=true): {}", e);
+                    opts.mod_time = None;
+                }
+            }
+        }
+    }
+    Ok(opts)
 }
 
 /// Creates default options for getting an object from a bucket.
@@ -356,12 +390,16 @@ pub fn extract_metadata_from_mime_with_object_name(
 }
 
 pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
-    // Standard HTTP headers that should NOT be returned in the Metadata field
-    // These are returned as separate response headers, not user metadata
+    // HTTP headers that should NOT be returned in the Metadata field.
+    // These headers are returned as separate response headers, not user metadata.
+    //
+    // Note: content-type and content-disposition are intentionally NOT excluded here.
+    // They remain in the filtered metadata so they can continue to be exposed via
+    // x-amz-meta-* style user metadata for backward compatibility, while the HEAD
+    // implementation also mirrors their values into the standard Content-Type and
+    // Content-Disposition response headers where appropriate.
     const EXCLUDED_HEADERS: &[&str] = &[
-        "content-type",
         "content-encoding",
-        "content-disposition",
         "content-language",
         "cache-control",
         "expires",
@@ -398,7 +436,8 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
             continue;
         }
 
-        // Skip standard HTTP headers (they are returned as separate headers, not metadata)
+        // Skip excluded HTTP headers (they are returned as separate headers, not metadata)
+        // Note: content-type and content-disposition are NOT excluded and will be treated as user metadata
         if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {
             continue;
         }
@@ -889,6 +928,35 @@ mod tests {
         let user_defined = opts.user_defined;
         assert_eq!(user_defined.get("key1"), Some(&"value1".to_string()));
         assert_eq!(user_defined.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_put_opts_from_headers_with_replication_request() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE.clone());
+        let valid_mtime = "2024-05-20T10:30:00+08:00";
+        headers.insert(RUSTFS_BUCKET_SOURCE_MTIME, HeaderValue::from_static(valid_mtime));
+
+        let metadata = HashMap::new();
+
+        let result = put_opts_from_headers(&headers, metadata);
+
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+
+        assert!(opts.replication_request);
+
+        let expected_mtime = time::OffsetDateTime::parse(valid_mtime, &time::format_description::well_known::Rfc3339).unwrap();
+        assert_eq!(opts.mod_time, Some(expected_mtime));
+
+        let mut headers_invalid_mtime = HeaderMap::new();
+        headers_invalid_mtime.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE.clone());
+        headers_invalid_mtime.insert(RUSTFS_BUCKET_SOURCE_MTIME, HeaderValue::from_static("invalid-time"));
+        let result_invalid = put_opts_from_headers(&headers_invalid_mtime, HashMap::new());
+        assert!(result_invalid.is_ok());
+        let opts_invalid = result_invalid.unwrap();
+        assert!(opts_invalid.replication_request);
+        assert!(opts_invalid.mod_time.is_none());
     }
 
     #[test]

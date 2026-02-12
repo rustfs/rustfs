@@ -64,6 +64,8 @@ use uuid::Uuid;
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
 
+const REPLICATION_REQUEST_TRUE: HeaderValue = HeaderValue::from_static("true");
+
 pub static GLOBAL_BUCKET_TARGET_SYS: OnceLock<BucketTargetSys> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -999,8 +1001,12 @@ impl PutObjectOptions {
         if self.internal.source_mtime.unix_timestamp() != 0 {
             header.insert(
                 RUSTFS_BUCKET_SOURCE_MTIME,
-                HeaderValue::from_str(&self.internal.source_mtime.unix_timestamp().to_string()).expect("err"),
+                HeaderValue::from_str(&self.internal.source_mtime.format(&Rfc3339).unwrap_or_default()).expect("err"),
             );
+        }
+
+        if self.internal.replication_request {
+            header.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE);
         }
 
         header
@@ -1210,6 +1216,9 @@ impl TargetClient {
             && let Ok(header_value) = HeaderValue::from_str(&version_id)
         {
             headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
+        }
+        if opts.internal.replication_request {
+            headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE);
         }
 
         match self

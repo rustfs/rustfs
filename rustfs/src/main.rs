@@ -62,6 +62,7 @@ use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
 use rustfs_iam::init_iam_sys;
+use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -401,6 +402,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     print_server_info();
 
     init_update_check();
+
+    if rustfs_obs::observability_metric_enabled() {
+        // Initialize metrics system
+        init_metrics_system(ctx.clone());
+    }
 
     println!(
         "RustFS server version: {} started successfully at {}, current time: {}",

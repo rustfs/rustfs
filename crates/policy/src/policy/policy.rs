@@ -320,6 +320,7 @@ pub mod default {
                             let mut hash_set = HashSet::new();
                             hash_set.insert(Action::S3Action(S3Action::GetBucketLocationAction));
                             hash_set.insert(Action::S3Action(S3Action::GetObjectAction));
+                            hash_set.insert(Action::S3Action(S3Action::GetBucketQuotaAction));
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
