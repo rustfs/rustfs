@@ -75,6 +75,7 @@ use url::Host;
 pub mod bucket_meta;
 pub mod event;
 pub mod group;
+pub mod health;
 pub mod kms;
 pub mod kms_dynamic;
 pub mod kms_keys;
@@ -88,6 +89,7 @@ pub mod sts;
 pub mod tier;
 pub mod trace;
 pub mod user;
+pub use health::HealthCheckHandler;
 
 #[derive(Debug, Serialize)]
 pub struct IsAdminResponse {
@@ -103,51 +105,6 @@ pub struct AccountInfo {
     pub account_name: String,
     pub server: rustfs_madmin::BackendInfo,
     pub policy: BucketPolicy,
-}
-
-/// Health check handler for endpoint monitoring
-pub struct HealthCheckHandler {}
-
-#[async_trait::async_trait]
-impl Operation for HealthCheckHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        use serde_json::json;
-
-        // Extract the original HTTP Method (encapsulated by s3s into S3Request)
-        let method = req.method;
-
-        // Only GET and HEAD are allowed
-        if method != http::Method::GET && method != http::Method::HEAD {
-            // 405 Method Not Allowed
-            let mut headers = HeaderMap::new();
-            headers.insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
-            return Ok(S3Response::with_headers(
-                (StatusCode::METHOD_NOT_ALLOWED, Body::from("Method Not Allowed".to_string())),
-                headers,
-            ));
-        }
-
-        let health_info = json!({
-            "status": "ok",
-            "service": "rustfs-endpoint",
-            "timestamp": jiff::Zoned::now().to_string(),
-            "version": env!("CARGO_PKG_VERSION")
-        });
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        if method == http::Method::HEAD {
-            // HEAD: only returns the header and status code, not the body
-            return Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), headers));
-        }
-
-        // GET: Return JSON body normally
-        let body_str = serde_json::to_string(&health_info).unwrap_or_else(|_| "{}".to_string());
-        let body = Body::from(body_str);
-
-        Ok(S3Response::with_headers((StatusCode::OK, body), headers))
-    }
 }
 
 pub struct IsAdminHandler {}
