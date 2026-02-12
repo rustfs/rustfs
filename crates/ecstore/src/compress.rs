@@ -111,7 +111,7 @@ pub fn is_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
     }
 
     let added = ADDED_EXCLUDE_COMPRESS_EXTENSIONS.get_or_init(parse_added_exclude_extensions);
-    if !added.is_empty() && has_string_suffix_in_slice(object_name, &added) {
+    if !added.is_empty() && has_string_suffix_in_slice(object_name, added) {
         debug!("object_name: {} is not compressible (added exclusion)", object_name);
         return false;
     }
