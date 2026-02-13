@@ -21,6 +21,7 @@ mod ecfs_extend;
 pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod options;
+pub(crate) mod readers;
 pub(crate) mod s3_api;
 pub mod tonic_service;
 pub(crate) use ecfs_extend::*;

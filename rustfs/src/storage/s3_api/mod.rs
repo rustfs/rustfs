@@ -22,8 +22,8 @@ pub(crate) mod bucket {}
 pub(crate) mod encryption {}
 pub(crate) mod multipart {}
 pub(crate) mod object;
-pub(crate) mod r#replication {}
+pub(crate) mod replication {}
 pub(crate) mod response {}
 pub(crate) mod restore {}
-pub(crate) mod r#select {}
+pub(crate) mod select {}
 pub(crate) mod validation {}

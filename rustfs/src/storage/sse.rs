@@ -94,7 +94,7 @@ use tokio::io::AsyncRead;
 use tracing::{debug, error};
 
 use crate::error::ApiError;
-use crate::storage::s3_api::object::InMemoryAsyncReader;
+use crate::storage::readers::InMemoryAsyncReader;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::error::Error;
 use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};

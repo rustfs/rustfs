@@ -22,7 +22,7 @@ use crate::storage::concurrency::{
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
-use crate::storage::s3_api::object::InMemoryAsyncReader;
+use crate::storage::readers::InMemoryAsyncReader;
 use crate::storage::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
     sse_prepare_encryption, strip_managed_encryption_metadata,
