@@ -22,6 +22,7 @@ pub mod is_admin;
 pub mod kms;
 pub mod kms_dynamic;
 pub mod kms_keys;
+pub mod kms_management;
 pub mod metrics;
 pub mod policies;
 pub mod pools;

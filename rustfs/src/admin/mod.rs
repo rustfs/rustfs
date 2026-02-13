@@ -21,6 +21,8 @@ pub mod utils;
 
 #[cfg(test)]
 mod console_test;
+#[cfg(test)]
+mod route_registration_test;
 
 use handlers::{bucket_meta, heal, health, kms, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user};
 use router::{AdminOperation, S3Router};
