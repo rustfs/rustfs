@@ -187,6 +187,66 @@ impl std::fmt::Debug for Opt {
     }
 }
 
+#[derive(Clone)]
+pub struct Config {
+    /// DIR points to a directory on a filesystem.
+    pub volumes: Vec<String>,
+
+    /// bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname
+    pub address: String,
+
+    /// Domain name used for virtual-hosted-style requests.
+    pub server_domains: Vec<String>,
+
+    /// Access key used for authentication.
+    pub access_key: String,
+
+    /// Secret key used for authentication.
+    pub secret_key: String,
+
+    /// Enable console server
+    pub console_enable: bool,
+
+    /// Console server bind address
+    pub console_address: String,
+
+    /// Observability endpoint for trace, metrics and logs,only support grpc mode.
+    pub obs_endpoint: String,
+
+    /// tls path for rustfs API and console.
+    pub tls_path: Option<String>,
+
+    pub license: Option<String>,
+
+    pub region: Option<String>,
+
+    /// Enable KMS encryption for server-side encryption
+    pub kms_enable: bool,
+
+    /// KMS backend type (local or vault)
+    pub kms_backend: String,
+
+    /// KMS key directory for local backend
+    pub kms_key_dir: Option<String>,
+
+    /// Vault address for vault backend
+    pub kms_vault_address: Option<String>,
+
+    /// Vault token for vault backend
+    pub kms_vault_token: Option<String>,
+
+    /// Default KMS key ID for encryption
+    pub kms_default_key_id: Option<String>,
+
+    /// Disable adaptive buffer sizing with workload profiles
+    /// Set this flag to use legacy fixed-size buffer behavior from PR #869
+    pub buffer_profile_disable: bool,
+
+    /// Workload profile for adaptive buffer sizing
+    /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
+    pub buffer_profile: String,
+}
+
 // lazy_static::lazy_static! {
 //     pub(crate)  static ref OPT: OnceLock<Opt> = OnceLock::new();
 // }
