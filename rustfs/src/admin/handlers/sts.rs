@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::is_admin::IsAdminHandler;
 use crate::{
-    admin::router::Operation,
+    admin::router::{AdminOperation, Operation, S3Router},
     auth::{check_key_valid, get_session_token},
+    server::ADMIN_PREFIX,
 };
 use http::StatusCode;
+use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::bucket::utils::serialize;
@@ -36,6 +39,18 @@ use tracing::{error, info, warn};
 
 const ASSUME_ROLE_ACTION: &str = "AssumeRole";
 const ASSUME_ROLE_VERSION: &str = "2011-06-15";
+
+pub fn register_admin_auth_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(Method::POST, "/", AdminOperation(&AssumeRoleHandle {}))?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/is-admin").as_str(),
+        AdminOperation(&IsAdminHandler {}),
+    )?;
+
+    Ok(())
+}
 
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "PascalCase", default)]
