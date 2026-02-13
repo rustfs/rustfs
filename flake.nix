@@ -11,10 +11,13 @@
 {
   description = "RustFS - High-performance S3-compatible object storage";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    fenix.url = "github:nix-community/fenix";
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    inputs@{ nixpkgs, ... }:
     let
       systems = [
         "x86_64-linux"
@@ -29,9 +32,15 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          fnx = inputs.fenix.packages.${system};
+
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = fnx.stable.cargo;
+            rustc = fnx.stable.rustc;
+          };
         in
         {
-          default = pkgs.rustPlatform.buildRustPackage {
+          default = rustPlatform.buildRustPackage {
             pname = "rustfs";
             version = "0.0.5";
 
@@ -42,12 +51,12 @@
               allowBuiltinFetchGit = true;
             };
 
-            nativeBuildInputs = with pkgs; [
-              pkg-config
-              protobuf
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.protobuf
             ];
 
-            buildInputs = with pkgs; [ openssl ];
+            buildInputs = [ pkgs.openssl ];
 
             cargoBuildFlags = [
               "--package"
