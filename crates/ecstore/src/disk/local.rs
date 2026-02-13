@@ -976,6 +976,7 @@ impl LocalDisk {
         opts: &WalkDirOptions,
         out: &mut MetacacheWriter<W>,
         objs_returned: &mut i32,
+        emit_current_object: bool,
     ) -> Result<()>
     where
         W: AsyncWrite + Unpin + Send,
@@ -1036,6 +1037,7 @@ impl LocalDisk {
         let bucket = opts.bucket.as_str();
 
         let mut dir_objes = HashSet::new();
+        let mut object_data_dirs = HashSet::new();
 
         // First-level filtering
         for item in entries.iter_mut() {
@@ -1080,21 +1082,41 @@ impl LocalDisk {
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
 
-                // if opts.limit > 0
-                //     && let Ok(meta) = FileMeta::load(&metadata)
-                //     && !meta.all_hidden(true)
-                // {
-                *objs_returned += 1;
-                // }
+                if emit_current_object {
+                    // if opts.limit > 0
+                    //     && let Ok(meta) = FileMeta::load(&metadata)
+                    //     && !meta.all_hidden(true)
+                    // {
+                    *objs_returned += 1;
+                    // }
 
-                out.write_obj(&MetaCacheEntry {
-                    name: name.clone(),
-                    metadata: metadata.to_vec(),
-                    ..Default::default()
-                })
-                .await?;
+                    out.write_obj(&MetaCacheEntry {
+                        name: name.clone(),
+                        metadata: metadata.to_vec(),
+                        ..Default::default()
+                    })
+                    .await?;
+                }
 
-                return Ok(());
+                // Keep scanning this directory so nested children like
+                // "foo/bar/xyzzy" are still discoverable when "foo/bar" exists.
+                if opts.recursive
+                    && let Ok(fi) = get_file_info(
+                        &metadata,
+                        bucket,
+                        &name,
+                        "",
+                        FileInfoOpts {
+                            data: false,
+                            include_free_versions: false,
+                        },
+                    )
+                    && let Some(data_dir) = fi.data_dir
+                {
+                    object_data_dirs.insert(data_dir.to_string());
+                }
+
+                continue;
             }
         }
 
@@ -1121,7 +1143,13 @@ impl LocalDisk {
                 continue;
             }
 
+            // Skip object data directories. They are internal storage layout, not user objects.
+            if opts.recursive && object_data_dirs.contains(entry) {
+                continue;
+            }
+
             let name = path_join_buf(&[current.as_str(), entry.as_str()]);
+            let object_dir_name = name.clone();
 
             while let Some(pop) = dir_stack.last().cloned()
                 && pop < name
@@ -1133,7 +1161,7 @@ impl LocalDisk {
                 .await?;
 
                 if opts.recursive
-                    && let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned)).await
+                    && let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, true)).await
                 {
                     error!("scan_dir err {:?}", er);
                 }
@@ -1172,6 +1200,22 @@ impl LocalDisk {
                     // {
                     *objs_returned += 1;
                     // }
+
+                    // This object directory can also contain nested children objects.
+                    // Recurse, but do not emit the current object again.
+                    if opts.recursive
+                        && let Err(er) = Box::pin(self.scan_dir(
+                            format!("{object_dir_name}{SLASH_SEPARATOR}"),
+                            prefix.clone(),
+                            opts,
+                            out,
+                            objs_returned,
+                            false,
+                        ))
+                        .await
+                    {
+                        warn!("scan_dir err {:?}", &er);
+                    }
                 }
                 Err(err) => {
                     if err == Error::FileNotFound || err == Error::IsNotRegular {
@@ -1200,7 +1244,7 @@ impl LocalDisk {
             .await?;
 
             if opts.recursive
-                && let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned)).await
+                && let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, true)).await
             {
                 warn!("scan_dir err {:?}", &er);
             }
@@ -1958,6 +2002,7 @@ impl DiskAPI for LocalDisk {
             &opts,
             &mut out,
             &mut objs_returned,
+            true,
         )
         .await?;
 
@@ -2635,6 +2680,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
 #[cfg(test)]
 mod test {
     use super::*;
+    use rustfs_filemeta::MetacacheReader;
 
     #[tokio::test]
     async fn test_skip_access_checks() {
@@ -2932,6 +2978,134 @@ mod test {
 
         // Clean up
         let _ = fs::remove_file(test_file).await;
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_lists_nested_child_when_parent_has_xlmeta() {
+        let test_dir = format!("./test_scan_dir_nested_{}", uuid::Uuid::new_v4());
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir.as_str()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let bucket = "test-volume";
+        disk.make_volume(bucket).await.unwrap();
+
+        // Parent object metadata: foo/bar
+        let parent_meta = disk.get_object_path(bucket, "foo/bar/xl.meta").unwrap();
+        if let Some(parent) = parent_meta.parent() {
+            fs::create_dir_all(parent).await.unwrap();
+        }
+        fs::write(&parent_meta, b"parent-object").await.unwrap();
+
+        // Child object metadata: foo/bar/xyzzy
+        let child_meta = disk.get_object_path(bucket, "foo/bar/xyzzy/xl.meta").unwrap();
+        if let Some(parent) = child_meta.parent() {
+            fs::create_dir_all(parent).await.unwrap();
+        }
+        fs::write(&child_meta, b"child-object").await.unwrap();
+
+        let (rd, mut wr) = tokio::io::duplex(16 * 1024);
+        let mut out = MetacacheWriter::new(&mut wr);
+        let mut objs_returned = 0;
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "foo/bar".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+
+        disk.scan_dir("foo/bar".to_string(), String::new(), &opts, &mut out, &mut objs_returned, true)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(rd);
+        let entries = reader.read_all().await.unwrap();
+
+        let object_names = entries
+            .iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+
+        assert!(
+            object_names.iter().any(|name| name == "foo/bar" || name == "foo/bar/"),
+            "expected parent object in scan result, got: {:?}",
+            object_names
+        );
+        assert!(
+            object_names
+                .iter()
+                .any(|name| name == "foo/bar/xyzzy" || name == "foo/bar/xyzzy/"),
+            "expected nested child object in scan result, got: {:?}",
+            object_names
+        );
+
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_lists_parent_and_child_from_bucket_root() {
+        let test_dir = format!("./test_scan_dir_root_nested_{}", uuid::Uuid::new_v4());
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir.as_str()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let bucket = "test-volume";
+        disk.make_volume(bucket).await.unwrap();
+
+        // Parent object metadata: foo/bar
+        let parent_meta = disk.get_object_path(bucket, "foo/bar/xl.meta").unwrap();
+        if let Some(parent) = parent_meta.parent() {
+            fs::create_dir_all(parent).await.unwrap();
+        }
+        fs::write(&parent_meta, b"parent-object").await.unwrap();
+
+        // Child object metadata: foo/bar/xyzzy
+        let child_meta = disk.get_object_path(bucket, "foo/bar/xyzzy/xl.meta").unwrap();
+        if let Some(parent) = child_meta.parent() {
+            fs::create_dir_all(parent).await.unwrap();
+        }
+        fs::write(&child_meta, b"child-object").await.unwrap();
+
+        let (rd, mut wr) = tokio::io::duplex(16 * 1024);
+        let mut out = MetacacheWriter::new(&mut wr);
+        let mut objs_returned = 0;
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: String::new(),
+            recursive: true,
+            ..Default::default()
+        };
+
+        disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objs_returned, true)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(rd);
+        let entries = reader.read_all().await.unwrap();
+
+        let object_names = entries
+            .iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name.trim_start_matches('/').trim_end_matches('/').to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            object_names.iter().any(|name| name == "foo/bar"),
+            "expected parent object in root scan result, got: {:?}",
+            object_names
+        );
+        assert!(
+            object_names.iter().any(|name| name == "foo/bar/xyzzy"),
+            "expected child object in root scan result, got: {:?}",
+            object_names
+        );
+
+        let _ = fs::remove_dir_all(&test_dir).await;
     }
 
     #[test]

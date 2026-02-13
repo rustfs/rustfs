@@ -392,13 +392,9 @@ pub fn extract_metadata_from_mime_with_object_name(
 pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
     // HTTP headers that should NOT be returned in the Metadata field.
     // These headers are returned as separate response headers, not user metadata.
-    //
-    // Note: content-type and content-disposition are intentionally NOT excluded here.
-    // They remain in the filtered metadata so they can continue to be exposed via
-    // x-amz-meta-* style user metadata for backward compatibility, while the HEAD
-    // implementation also mirrors their values into the standard Content-Type and
-    // Content-Disposition response headers where appropriate.
     const EXCLUDED_HEADERS: &[&str] = &[
+        "content-type",
+        "content-disposition",
         "content-encoding",
         "content-language",
         "cache-control",
@@ -437,7 +433,6 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
         }
 
         // Skip excluded HTTP headers (they are returned as separate headers, not metadata)
-        // Note: content-type and content-disposition are NOT excluded and will be treated as user metadata
         if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {
             continue;
         }
@@ -1207,6 +1202,34 @@ mod tests {
 
         // Should preserve existing content-type, not overwrite
         assert_eq!(metadata.get("content-type"), Some(&"custom/type".to_string()));
+    }
+
+    #[test]
+    fn test_filter_object_metadata_excludes_standard_headers() {
+        let mut metadata = HashMap::new();
+        metadata.insert("content-type".to_string(), "application/octet-stream".to_string());
+        metadata.insert("content-disposition".to_string(), "inline".to_string());
+        metadata.insert("cache-control".to_string(), "no-cache".to_string());
+        metadata.insert("x-amz-storage-class".to_string(), "STANDARD".to_string());
+        metadata.insert("custom-key".to_string(), "custom-value".to_string());
+
+        let filtered = filter_object_metadata(&metadata).unwrap();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.get("custom-key"), Some(&"custom-value".to_string()));
+        assert!(!filtered.contains_key("content-type"));
+        assert!(!filtered.contains_key("content-disposition"));
+        assert!(!filtered.contains_key("cache-control"));
+        assert!(!filtered.contains_key("x-amz-storage-class"));
+    }
+
+    #[test]
+    fn test_filter_object_metadata_returns_none_for_only_content_type() {
+        let mut metadata = HashMap::new();
+        metadata.insert("content-type".to_string(), "application/octet-stream".to_string());
+
+        let filtered = filter_object_metadata(&metadata);
+        assert!(filtered.is_none(), "content-type must not be exposed as user metadata");
     }
 
     #[test]

@@ -27,6 +27,7 @@ mod tests {
     use rustfs_config::MI_B;
     use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
     use rustfs_ecstore::store_api::ObjectInfo;
+    use rustfs_policy::policy::{BucketPolicy, Validator};
     use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, RESERVED_METADATA_PREFIX_LOWER};
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
@@ -1010,6 +1011,34 @@ mod tests {
         assert!(filtered_key_marker.is_some());
         assert!(filtered_version_marker.is_some());
         assert_eq!(filtered_version_marker.unwrap(), "null");
+    }
+
+    #[test]
+    fn test_bucket_policy_round_trip_preserves_original_json_text() {
+        let policy = r#"{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"AWS": "*"},
+    "Action": "s3:ListBucket",
+    "Resource": [
+      "arn:aws:s3:::example-bucket",
+      "arn:aws:s3:::example-bucket/*"
+    ]
+  }]
+}"#;
+
+        let parsed: BucketPolicy = serde_json::from_str(policy).unwrap();
+        assert!(parsed.is_valid().is_ok());
+
+        // Normalized serialization can differ (for example, Action becomes an array).
+        let normalized = serde_json::to_string(&parsed).unwrap();
+        assert_ne!(normalized, policy);
+
+        // Stored raw policy bytes must preserve exact text for GetBucketPolicy round trip.
+        let stored = policy.as_bytes().to_vec();
+        let round_trip = String::from_utf8(stored).unwrap();
+        assert_eq!(round_trip, policy);
     }
 
     #[test]
