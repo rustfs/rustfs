@@ -14,7 +14,8 @@
 
 use tokio::io::{AsyncRead, AsyncSeek};
 
-/// Seekable in-memory async reader used by GET/HEAD object fast paths.
+/// Seekable in-memory async reader used by internal S3 API fast paths (e.g., GET/HEAD)
+/// and other components such as server-side encryption (SSE) flows.
 pub(crate) struct InMemoryAsyncReader {
     cursor: std::io::Cursor<Vec<u8>>,
 }
