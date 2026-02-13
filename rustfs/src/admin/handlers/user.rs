@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{account_info, event, group, policies, service_account, user_iam, user_lifecycle};
+use super::{account_info, group, service_account, user_iam, user_lifecycle, user_policy_binding};
 use crate::{
     admin::{
         auth::validate_admin_request,
@@ -61,8 +61,7 @@ pub fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
     group::register_group_management_route(r)?;
     service_account::register_service_account_route(r)?;
     user_iam::register_user_iam_route(r)?;
-    policies::register_iam_policy_route(r)?;
-    event::register_notification_target_route(r)?;
+    user_policy_binding::register_user_policy_binding_route(r)?;
 
     Ok(())
 }

@@ -38,6 +38,7 @@ pub mod trace;
 pub mod user;
 pub mod user_iam;
 pub mod user_lifecycle;
+pub mod user_policy_binding;
 
 #[cfg(test)]
 mod tests {
