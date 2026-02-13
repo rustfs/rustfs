@@ -113,7 +113,7 @@ fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
 pub fn register_kms_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     register_kms_management_route(r)?;
     kms_dynamic::register_kms_dynamic_route(r)?;
-    register_kms_key_route(r)?;
+    kms_keys::register_kms_key_route(r)?;
 
     Ok(())
 }
@@ -159,40 +159,6 @@ fn register_kms_management_route(r: &mut S3Router<AdminOperation>) -> std::io::R
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/clear-cache").as_str(),
         AdminOperation(&KmsClearCacheHandler {}),
-    )?;
-
-    Ok(())
-}
-
-fn register_kms_key_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
-        AdminOperation(&kms_keys::CreateKmsKeyHandler {}),
-    )?;
-
-    r.insert(
-        Method::DELETE,
-        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/delete").as_str(),
-        AdminOperation(&kms_keys::DeleteKmsKeyHandler {}),
-    )?;
-
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/cancel-deletion").as_str(),
-        AdminOperation(&kms_keys::CancelKmsKeyDeletionHandler {}),
-    )?;
-
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
-        AdminOperation(&kms_keys::ListKmsKeysHandler {}),
-    )?;
-
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/{key_id}").as_str(),
-        AdminOperation(&kms_keys::DescribeKmsKeyHandler {}),
     )?;
 
     Ok(())
