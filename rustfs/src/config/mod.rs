@@ -247,6 +247,58 @@ pub struct Config {
     pub buffer_profile: String,
 }
 
+impl Config {
+    /// parse the command line arguments and environment arguments from [`Opt`] and convert them
+    /// into a ready to use [`Config`]
+    ///
+    /// This includes some intermediate checks for mutual exclusive options
+    pub fn parse() -> Self {
+        let Opt {
+            volumes,
+            address,
+            server_domains,
+            access_key,
+            secret_key,
+            console_enable,
+            console_address,
+            obs_endpoint,
+            tls_path,
+            license,
+            region,
+            kms_enable,
+            kms_backend,
+            kms_key_dir,
+            kms_vault_address,
+            kms_vault_token,
+            kms_default_key_id,
+            buffer_profile_disable,
+            buffer_profile,
+        } = Opt::parse();
+
+        Config {
+            volumes,
+            address,
+            server_domains,
+            access_key,
+            secret_key,
+            console_enable,
+            console_address,
+            obs_endpoint,
+            tls_path,
+            license,
+            region,
+            kms_enable,
+            kms_backend,
+            kms_key_dir,
+            kms_vault_address,
+            kms_vault_token,
+            kms_default_key_id,
+            buffer_profile_disable,
+            buffer_profile,
+        }
+    }
+}
+
 // lazy_static::lazy_static! {
 //     pub(crate)  static ref OPT: OnceLock<Opt> = OnceLock::new();
 // }
