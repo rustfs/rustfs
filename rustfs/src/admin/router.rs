@@ -71,6 +71,14 @@ impl<T: Operation> S3Router<T> {
     }
 }
 
+#[cfg(test)]
+impl<T: Operation> S3Router<T> {
+    pub(crate) fn contains_route(&self, method: Method, path: &str) -> bool {
+        let route = Self::make_route_str(method, path);
+        self.router.at(&route).is_ok()
+    }
+}
+
 impl<T: Operation> Default for S3Router<T> {
     fn default() -> Self {
         Self::new(false)
