@@ -3045,6 +3045,69 @@ mod test {
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
+    #[tokio::test]
+    async fn test_scan_dir_lists_parent_and_child_from_bucket_root() {
+        let test_dir = format!("./test_scan_dir_root_nested_{}", uuid::Uuid::new_v4());
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir.as_str()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let bucket = "test-volume";
+        disk.make_volume(bucket).await.unwrap();
+
+        // Parent object metadata: foo/bar
+        let parent_meta = disk.get_object_path(bucket, "foo/bar/xl.meta").unwrap();
+        if let Some(parent) = parent_meta.parent() {
+            fs::create_dir_all(parent).await.unwrap();
+        }
+        fs::write(&parent_meta, b"parent-object").await.unwrap();
+
+        // Child object metadata: foo/bar/xyzzy
+        let child_meta = disk.get_object_path(bucket, "foo/bar/xyzzy/xl.meta").unwrap();
+        if let Some(parent) = child_meta.parent() {
+            fs::create_dir_all(parent).await.unwrap();
+        }
+        fs::write(&child_meta, b"child-object").await.unwrap();
+
+        let (rd, mut wr) = tokio::io::duplex(16 * 1024);
+        let mut out = MetacacheWriter::new(&mut wr);
+        let mut objs_returned = 0;
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: String::new(),
+            recursive: true,
+            ..Default::default()
+        };
+
+        disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objs_returned, true)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(rd);
+        let entries = reader.read_all().await.unwrap();
+
+        let object_names = entries
+            .iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name.trim_start_matches('/').trim_end_matches('/').to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            object_names.iter().any(|name| name == "foo/bar"),
+            "expected parent object in root scan result, got: {:?}",
+            object_names
+        );
+        assert!(
+            object_names.iter().any(|name| name == "foo/bar/xyzzy"),
+            "expected child object in root scan result, got: {:?}",
+            object_names
+        );
+
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
     #[test]
     fn test_is_root_path() {
         // Unix root path
