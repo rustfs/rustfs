@@ -19,7 +19,6 @@ on:
     branches: [ main ]
     paths-ignore:
       - "**.md"
-      - "**.txt"
       - "docs/**"
       - "deploy/**"
       - "scripts/dev_*.sh"
@@ -39,7 +38,6 @@ on:
     branches: [ main ]
     paths-ignore:
       - "**.md"
-      - "**.txt"
       - "docs/**"
       - "deploy/**"
       - "scripts/dev_*.sh"
@@ -179,4 +177,44 @@ jobs:
         with:
           name: e2e-test-logs-${{ github.run_number }}
           path: /tmp/rustfs.log
+          retention-days: 3
+
+  s3-implemented-tests:
+    name: S3 Implemented Tests
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubicloud-standard-4
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-s3tests-${{ hashFiles('**/Cargo.lock') }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build debug binary
+        run: |
+          touch rustfs/build.rs
+          cargo build -p rustfs --bins --jobs 2
+
+      - name: Run implemented s3-tests
+        run: |
+          DEPLOY_MODE=binary \
+          RUSTFS_BINARY=./target/debug/rustfs \
+          TEST_MODE=single \
+          MAXFAIL=1 \
+          ./scripts/s3-tests/run.sh
+
+      - name: Upload s3 test artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: s3tests-implemented-${{ github.run_number }}
+          path: artifacts/s3tests-single/**
+          if-no-files-found: ignore
           retention-days: 3
