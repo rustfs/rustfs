@@ -14,10 +14,11 @@
 
 //! Quota admin handlers for HTTP API
 
-use super::Operation;
 use crate::admin::auth::validate_admin_request;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
-use hyper::StatusCode;
+use crate::server::ADMIN_PREFIX;
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
@@ -79,6 +80,40 @@ pub struct GetBucketQuotaHandler;
 pub struct ClearBucketQuotaHandler;
 pub struct GetBucketQuotaStatsHandler;
 pub struct CheckBucketQuotaHandler;
+
+pub fn register_quota_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota/{bucket}").as_str(),
+        AdminOperation(&SetBucketQuotaHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota/{bucket}").as_str(),
+        AdminOperation(&GetBucketQuotaHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota/{bucket}").as_str(),
+        AdminOperation(&ClearBucketQuotaHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota-stats/{bucket}").as_str(),
+        AdminOperation(&GetBucketQuotaStatsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota-check/{bucket}").as_str(),
+        AdminOperation(&CheckBucketQuotaHandler {}),
+    )?;
+
+    Ok(())
+}
 
 #[async_trait::async_trait]
 impl Operation for SetBucketQuotaHandler {

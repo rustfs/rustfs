@@ -2832,5 +2832,5 @@
   "timezone": "browser",
   "title": "RustFS",
   "uid": "rustfs-s3",
-  "version": 2
+  "version": 10
 }

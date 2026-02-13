@@ -14,12 +14,13 @@
 
 //! KMS admin handlers for HTTP API
 
-use super::Operation;
+use super::{kms_dynamic, kms_keys};
 use crate::admin::auth::validate_admin_request;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::RemoteAddr;
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use base64::Engine;
-use hyper::{HeaderMap, StatusCode};
+use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{get_global_encryption_service, types::*};
@@ -107,6 +108,128 @@ fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
         });
     }
     params
+}
+
+pub fn register_kms_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    register_kms_management_route(r)?;
+    register_kms_dynamic_route(r)?;
+    register_kms_key_route(r)?;
+
+    Ok(())
+}
+
+fn register_kms_management_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/create-key").as_str(),
+        AdminOperation(&CreateKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/describe-key").as_str(),
+        AdminOperation(&DescribeKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/list-keys").as_str(),
+        AdminOperation(&ListKeysHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/generate-data-key").as_str(),
+        AdminOperation(&GenerateDataKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/status").as_str(),
+        AdminOperation(&KmsStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/config").as_str(),
+        AdminOperation(&KmsConfigHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/clear-cache").as_str(),
+        AdminOperation(&KmsClearCacheHandler {}),
+    )?;
+
+    Ok(())
+}
+
+fn register_kms_dynamic_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/configure").as_str(),
+        AdminOperation(&kms_dynamic::ConfigureKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/start").as_str(),
+        AdminOperation(&kms_dynamic::StartKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/stop").as_str(),
+        AdminOperation(&kms_dynamic::StopKmsHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/service-status").as_str(),
+        AdminOperation(&kms_dynamic::GetKmsStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/reconfigure").as_str(),
+        AdminOperation(&kms_dynamic::ReconfigureKmsHandler {}),
+    )?;
+
+    Ok(())
+}
+
+fn register_kms_key_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&kms_keys::CreateKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/delete").as_str(),
+        AdminOperation(&kms_keys::DeleteKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/cancel-deletion").as_str(),
+        AdminOperation(&kms_keys::CancelKmsKeyDeletionHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&kms_keys::ListKmsKeysHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/{key_id}").as_str(),
+        AdminOperation(&kms_keys::DescribeKmsKeyHandler {}),
+    )?;
+
+    Ok(())
 }
 
 /// Create a new KMS master key

@@ -4265,7 +4265,9 @@ impl S3 for FS {
             return Err(s3_error!(MalformedPolicy));
         }
 
-        let data = serde_json::to_vec(&cfg).map_err(|e| s3_error!(InternalError, "parse policy failed {:?}", e))?;
+        // Preserve the original JSON text so GetBucketPolicy can return byte-for-byte content.
+        // s3-tests expects exact string round-trip equality.
+        let data = policy.into_bytes();
 
         metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
             .await
