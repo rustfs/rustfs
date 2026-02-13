@@ -12,22 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod access;
-pub mod concurrency;
-#[cfg(test)]
-mod concurrent_get_object_test;
-pub mod ecfs;
-mod ecfs_extend;
-pub(crate) mod entity;
-pub(crate) mod helper;
-pub mod options;
-pub(crate) mod s3_api;
-pub mod tonic_service;
-pub(crate) use ecfs_extend::*;
-#[cfg(test)]
-mod ecfs_test;
-pub(crate) mod head_prefix;
-mod objects;
-mod sse;
-#[cfg(test)]
-mod sse_test;
+//! Facade modules for incremental S3 API extraction from `ecfs.rs`.
+//!
+//! This file intentionally starts as skeleton-only. Behavior remains in place
+//! until each helper is moved with dedicated small refactor steps.
+
+pub(crate) mod acl {}
+pub(crate) mod bucket {}
+pub(crate) mod encryption {}
+pub(crate) mod multipart {}
+pub(crate) mod object;
+pub(crate) mod r#replication {}
+pub(crate) mod response {}
+pub(crate) mod restore {}
+pub(crate) mod r#select {}
+pub(crate) mod validation {}
