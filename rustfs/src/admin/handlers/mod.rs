@@ -36,6 +36,7 @@ pub mod system;
 pub mod tier;
 pub mod trace;
 pub mod user;
+pub mod user_iam;
 
 #[cfg(test)]
 mod tests {
