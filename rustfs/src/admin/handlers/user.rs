@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{account_info, event, group, policies, service_account, user_iam};
+use super::{account_info, event, group, policies, service_account, user_iam, user_lifecycle};
 use crate::{
     admin::{
         auth::validate_admin_request,
@@ -20,10 +20,9 @@ use crate::{
         utils::has_space_be,
     },
     auth::{check_key_valid, constant_time_eq, get_session_token},
-    server::{ADMIN_PREFIX, RemoteAddr},
+    server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
-use hyper::Method;
 use matchit::Params;
 use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
 use rustfs_credentials::get_global_action_cred;
@@ -58,46 +57,12 @@ pub struct AddUserQuery {
 
 pub fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     account_info::register_account_info_route(r)?;
-    register_user_management_route(r)?;
+    user_lifecycle::register_user_lifecycle_route(r)?;
     group::register_group_management_route(r)?;
     service_account::register_service_account_route(r)?;
     user_iam::register_user_iam_route(r)?;
     policies::register_iam_policy_route(r)?;
     event::register_notification_target_route(r)?;
-
-    Ok(())
-}
-
-fn register_user_management_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/list-users").as_str(),
-        AdminOperation(&ListUsers {}),
-    )?;
-
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/user-info").as_str(),
-        AdminOperation(&GetUserInfo {}),
-    )?;
-
-    r.insert(
-        Method::DELETE,
-        format!("{}{}", ADMIN_PREFIX, "/v3/remove-user").as_str(),
-        AdminOperation(&RemoveUser {}),
-    )?;
-
-    r.insert(
-        Method::PUT,
-        format!("{}{}", ADMIN_PREFIX, "/v3/add-user").as_str(),
-        AdminOperation(&AddUser {}),
-    )?;
-
-    r.insert(
-        Method::PUT,
-        format!("{}{}", ADMIN_PREFIX, "/v3/set-user-status").as_str(),
-        AdminOperation(&SetUserStatus {}),
-    )?;
 
     Ok(())
 }
