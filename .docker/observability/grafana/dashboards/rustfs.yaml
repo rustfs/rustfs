@@ -92,7 +92,7 @@
           },
           "editorMode": "code",
           "expr": "rustfs_process_uptime_seconds{job=~\"$job\"}",
-          "legendFormat": "Total Requests",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
@@ -158,7 +158,7 @@
           },
           "editorMode": "code",
           "expr": "sum(increase(rustfs_api_requests_total{job=~\"$job\"}[$__range]))",
-          "legendFormat": "Total Requests",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
@@ -224,6 +224,7 @@
           },
           "editorMode": "code",
           "expr": "sum(rustfs_cluster_buckets_total{job=~\"$job\"})",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
@@ -289,6 +290,7 @@
           },
           "editorMode": "code",
           "expr": "sum(rustfs_cluster_objects_total{job=~\"$job\"})",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
@@ -448,7 +450,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_capacity_used_bytes{job=~\"$job\"} / rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
+          "expr": "sum(rustfs_cluster_capacity_used_bytes{job=~\"$job\"}) / sum(rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
           "hide": false,
           "instant": false,
           "legendFormat": "Percent",
@@ -480,7 +482,7 @@
               }
             ]
           },
-          "unit": "recps"
+          "unit": "reqps"
         },
         "overrides": []
       },
@@ -585,7 +587,7 @@
           },
           "editorMode": "code",
           "expr": "sum(increase(rustfs_create_bucket_total{job=~\"$job\"}[$__range]))",
-          "legendFormat": "Total Requests",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
@@ -651,7 +653,7 @@
           },
           "editorMode": "code",
           "expr": "sum(increase(rustfs_object_cache_invalidations_total{job=~\"$job\"}[$__range]))",
-          "legendFormat": "Total Requests",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
@@ -1725,7 +1727,7 @@
           },
           "editorMode": "code",
           "expr": "sum by (bucket) (rustfs_bucket_objects_total{job=~\"$job\", bucket=~\"$bucket\"})",
-          "legendFormat": "{{key_request_uri_path}}",
+          "legendFormat": "{{bucket}}",
           "range": true,
           "refId": "A"
         }
@@ -1825,7 +1827,7 @@
           },
           "editorMode": "code",
           "expr": "sum by (bucket) (rustfs_bucket_usage_bytes{job=~\"$job\", bucket=~\"$bucket\"})",
-          "legendFormat": "{{key_request_uri_path}}",
+          "legendFormat": "{{bucket}}",
           "range": true,
           "refId": "A"
         }
@@ -2262,7 +2264,7 @@
           },
           "editorMode": "code",
           "expr": "sum by (level) (rate(rustfs_io_strategy_selected_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{strategy}}",
+          "legendFormat": "{{level}}",
           "range": true,
           "refId": "A"
         }
@@ -2716,9 +2718,7 @@
         "allValue": ".*",
         "current": {
           "text": "All",
-          "value": [
-            "$__all"
-          ]
+          "value": "$__all"
         },
         "datasource": {
           "type": "prometheus",
@@ -2770,9 +2770,7 @@
         "allowCustomValue": false,
         "current": {
           "text": "All",
-          "value": [
-            "$__all"
-          ]
+          "value": "$__all"
         },
         "definition": "label_values(rustfs_bucket_objects_total,bucket)",
         "includeAll": true,
@@ -2793,9 +2791,7 @@
         "allowCustomValue": false,
         "current": {
           "text": "All",
-          "value": [
-            "$__all"
-          ]
+          "value": "$__all"
         },
         "definition": "label_values(rustfs_node_disk_used_bytes,drive)",
         "includeAll": true,
@@ -2815,8 +2811,8 @@
     ]
   },
   "time": {
-    "from": "now-1h",
-    "to": "now"
+    "from": "2026-02-12T00:12:25.251Z",
+    "to": "2026-02-12T03:40:23.150Z"
   },
   "timepicker": {
     "refresh_intervals": [
@@ -2836,5 +2832,5 @@
   "timezone": "browser",
   "title": "RustFS",
   "uid": "rustfs-s3",
-  "version": 9
+  "version": 2
 }
