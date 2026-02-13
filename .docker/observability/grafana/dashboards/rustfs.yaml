@@ -2811,8 +2811,8 @@
     ]
   },
   "time": {
-    "from": "2026-02-12T00:12:25.251Z",
-    "to": "2026-02-12T03:40:23.150Z"
+    "from": "now-1h",
+    "to": "now"
   },
   "timepicker": {
     "refresh_intervals": [
