@@ -32,8 +32,9 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          # access to fenix packages
           fnx = inputs.fenix.packages.${system};
-
+          # create custom rust toolchain with latest fenix cargo/rustc
           rustPlatform = pkgs.makeRustPlatform {
             cargo = fnx.stable.cargo;
             rustc = fnx.stable.rustc;
