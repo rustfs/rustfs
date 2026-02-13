@@ -1982,7 +1982,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (drive) (rustfs_node_disk_used_bytes{job=~\"$job\"} / rustfs_node_disk_total_bytes{job=~\"$job\"})",
+          "expr": "sum by (drive) (rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"}) / sum by (drive)(rustfs_node_disk_total_bytes{job=~\"$job\", drive=~\"$drive\"})",
           "hide": false,
           "instant": false,
           "legendFormat": "{{drive}} (percent)",
@@ -2735,7 +2735,7 @@
           "query": "label_values(rustfs_api_requests_total, job)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
-        "refresh": 1,
+        "refresh": 2,
         "regex": "",
         "sort": 1,
         "type": "query"
@@ -2783,7 +2783,7 @@
           "query": "label_values(rustfs_bucket_objects_total,bucket)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
-        "refresh": 1,
+        "refresh": 2,
         "regex": "",
         "type": "query"
       },
@@ -2804,15 +2804,15 @@
           "query": "label_values(rustfs_node_disk_used_bytes,drive)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
-        "refresh": 1,
+        "refresh": 2,
         "regex": "",
         "type": "query"
       }
     ]
   },
   "time": {
-    "from": "2026-02-12T00:12:25.251Z",
-    "to": "2026-02-12T03:40:23.150Z"
+    "from": "now-1h",
+    "to": "now"
   },
   "timepicker": {
     "refresh_intervals": [
