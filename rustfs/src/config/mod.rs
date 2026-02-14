@@ -89,7 +89,7 @@ pub struct Opt {
     #[arg(long, env = "RUSTFS_SECRET_KEY", group = "secret-key")]
     pub secret_key: Option<String>,
 
-    /// Secret key used for authentication.
+    /// Secret key stored in a file used for authentication.
     #[arg(long, env = "RUSTFS_SECRET_KEY_FILE", group = "secret-key")]
     pub secret_key_file: Option<PathBuf>,
 
