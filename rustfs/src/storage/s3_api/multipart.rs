@@ -14,6 +14,7 @@
 
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
+use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo};
 use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
@@ -74,6 +75,42 @@ pub(crate) fn parse_list_parts_params(
     Ok((part_number_marker, max_parts))
 }
 
+pub(crate) fn parse_list_multipart_uploads_params(
+    prefix: Option<String>,
+    key_marker: Option<String>,
+    max_uploads: Option<i32>,
+) -> Result<(String, Option<String>, usize), S3Error> {
+    let prefix = prefix.unwrap_or_default();
+    let max_uploads = match max_uploads {
+        Some(value) => {
+            let value = usize::try_from(value).map_err(|_| {
+                S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    format!("max-uploads must be between 1 and {}", MAX_PARTS_COUNT),
+                )
+            })?;
+
+            if value == 0 || value > MAX_PARTS_COUNT {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    format!("max-uploads must be between 1 and {}", MAX_PARTS_COUNT),
+                ));
+            }
+
+            value
+        }
+        None => MAX_PARTS_COUNT,
+    };
+
+    if let Some(key_marker) = &key_marker
+        && !key_marker.starts_with(prefix.as_str())
+    {
+        return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "Invalid key marker".to_string()));
+    }
+
+    Ok((prefix, key_marker, max_uploads))
+}
+
 pub(crate) fn build_list_multipart_uploads_output(
     bucket: String,
     prefix: String,
@@ -112,8 +149,12 @@ pub(crate) fn build_list_multipart_uploads_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_list_multipart_uploads_output, build_list_parts_output, parse_list_parts_params};
+    use super::{
+        build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params,
+        parse_list_parts_params,
+    };
     use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
+    use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
     use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
     use s3s::S3ErrorCode;
     use s3s::dto::Timestamp;
@@ -243,6 +284,46 @@ mod tests {
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
 
         let err = parse_list_parts_params(None, Some(1001)).expect_err("expected invalid max_parts");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_parse_list_multipart_uploads_params_defaults_and_valid_values() {
+        let (prefix, key_marker, max_uploads) =
+            parse_list_multipart_uploads_params(Some("prefix/".to_string()), Some("prefix/key-marker".to_string()), Some(100))
+                .expect("expected valid params");
+        assert_eq!(prefix, "prefix/");
+        assert_eq!(key_marker.as_deref(), Some("prefix/key-marker"));
+        assert_eq!(max_uploads, 100);
+
+        let (prefix, key_marker, max_uploads) =
+            parse_list_multipart_uploads_params(None, None, None).expect("expected default params");
+        assert_eq!(prefix, "");
+        assert_eq!(key_marker, None);
+        assert_eq!(max_uploads, MAX_PARTS_COUNT);
+    }
+
+    #[test]
+    fn test_parse_list_multipart_uploads_params_rejects_invalid_key_marker() {
+        let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), Some("other/key-marker".to_string()), None)
+            .expect_err("expected invalid key marker");
+
+        assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(err.message(), Some("Invalid key marker"));
+    }
+
+    #[test]
+    fn test_parse_list_multipart_uploads_params_rejects_invalid_max_uploads() {
+        let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), None, Some(-1))
+            .expect_err("expected invalid max_uploads");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+
+        let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), None, Some(0))
+            .expect_err("expected invalid max_uploads");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+
+        let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), None, Some((MAX_PARTS_COUNT + 1) as i32))
+            .expect_err("expected invalid max_uploads");
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
     }
 }
