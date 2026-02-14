@@ -4,6 +4,7 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: {{ include "rustfs.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
     {{- with .Values.commonLabels }}

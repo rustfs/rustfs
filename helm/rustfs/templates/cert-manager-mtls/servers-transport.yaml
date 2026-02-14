@@ -3,6 +3,7 @@ apiVersion: traefik.io/v1alpha1
 kind: ServersTransport
 metadata:
   name: {{ include "rustfs.fullname" . }}-transport
+  namespace: {{ .Release.Namespace }}
 spec:
   rootcas:
     - {{ include "rustfs.fullname" . }}-root-ca-secret

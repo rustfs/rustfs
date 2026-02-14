@@ -3,6 +3,7 @@ apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
   name: {{ include "rustfs.fullname" . }}-server-tls
+  namespace: {{ .Release.Namespace }}
 spec:
   secretName: {{ include "rustfs.fullname" . }}-server-tls
   issuerRef:
