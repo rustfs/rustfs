@@ -3,6 +3,7 @@ apiVersion: traefik.io/v1alpha1
 kind: TraefikService
 metadata:
   name: {{ include "rustfs.fullname" . }}-sticky-svc
+  namespace: {{ .Release.Namespace }}
 spec:
   weighted:
     services:
