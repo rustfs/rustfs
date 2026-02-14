@@ -255,7 +255,7 @@ pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) ->
     // Log aggregation summary of format load results
     let ok_count = errors.iter().filter(|e| e.is_none()).count();
     let err_count = errors.iter().filter(|e| e.is_some()).count();
-    // Count occurances of each unique error
+    // Count occurrences of each unique error
     let mut err_counts: HashMap<String, usize> = HashMap::new();
     for err in errors.iter().flatten() {
         *err_counts.entry(format!("{err}")).or_default() += 1;
