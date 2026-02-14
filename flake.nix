@@ -14,24 +14,26 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     fenix.url = "github:nix-community/fenix";
+    flake-parts.url = "github:hercules-ci/flake-parts";
   };
 
   outputs =
-    inputs@{ nixpkgs, ... }:
-    let
+    inputs@{ flake-parts, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "x86_64-linux"
         "aarch64-linux"
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-      forAllSystems = nixpkgs.lib.genAttrs systems;
-    in
-    {
-      packages = forAllSystems (
-        system:
+
+      perSystem =
+        {
+          pkgs,
+          system,
+          ...
+        }:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
           # access to fenix packages
           fnx = inputs.fenix.packages.${system};
           # create custom rust toolchain with latest fenix cargo/rustc
@@ -41,7 +43,7 @@
           };
         in
         {
-          default = rustPlatform.buildRustPackage {
+          packages.default = rustPlatform.buildRustPackage {
             pname = "rustfs";
             version = "0.0.5";
 
@@ -73,7 +75,6 @@
               mainProgram = "rustfs";
             };
           };
-        }
-      );
+        };
     };
 }
