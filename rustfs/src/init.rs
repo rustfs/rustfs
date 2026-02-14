@@ -166,19 +166,19 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
 /// * `opt` - The application configuration options
 ///
 /// Returns `std::io::Result<()>` indicating success or failure
-#[instrument(skip(opt))]
-pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
+#[instrument(skip(config))]
+pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)
     let service_manager = rustfs_kms::init_global_kms_service_manager();
 
     // If KMS is enabled in configuration, configure and start the service
-    if opt.kms_enable {
+    if config.kms_enable {
         info!("KMS is enabled via command line, configuring and starting service...");
 
         // Create KMS configuration from command line options
-        let kms_config = match opt.kms_backend.as_str() {
+        let kms_config = match config.kms_backend.as_str() {
             "local" => {
-                let key_dir = opt
+                let key_dir = config
                     .kms_key_dir
                     .as_ref()
                     .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
@@ -190,7 +190,7 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
                         master_key: None,
                         file_permissions: Some(0o600),
                     }),
-                    default_key_id: opt.kms_default_key_id.clone(),
+                    default_key_id: config.kms_default_key_id.clone(),
                     timeout: std::time::Duration::from_secs(30),
                     retry_attempts: 3,
                     enable_cache: true,
@@ -198,11 +198,11 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
                 }
             }
             "vault" => {
-                let vault_address = opt
+                let vault_address = config
                     .kms_vault_address
                     .as_ref()
                     .ok_or_else(|| Error::other("Vault address is required for vault backend"))?;
-                let vault_token = opt
+                let vault_token = config
                     .kms_vault_token
                     .as_ref()
                     .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
@@ -220,14 +220,14 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
                         key_path_prefix: "rustfs/kms/keys".to_string(),
                         tls: None,
                     })),
-                    default_key_id: opt.kms_default_key_id.clone(),
+                    default_key_id: config.kms_default_key_id.clone(),
                     timeout: std::time::Duration::from_secs(30),
                     retry_attempts: 3,
                     enable_cache: true,
                     cache_config: rustfs_kms::config::CacheConfig::default(),
                 }
             }
-            _ => return Err(Error::other(format!("Unsupported KMS backend: {}", opt.kms_backend))),
+            _ => return Err(Error::other(format!("Unsupported KMS backend: {}", config.kms_backend))),
         };
 
         // Configure the KMS service
@@ -287,22 +287,22 @@ pub(crate) async fn init_kms_system(opt: &config::Opt) -> std::io::Result<()> {
 /// - Custom profile: Set via `--buffer-profile` or `RUSTFS_BUFFER_PROFILE` environment variable
 ///
 /// # Arguments
-/// * `opt` - The application configuration options
-pub(crate) fn init_buffer_profile_system(opt: &config::Opt) {
+/// * `config` - The application configuration options
+pub(crate) fn init_buffer_profile_system(config: &config::Config) {
     use crate::config::workload_profiles::{
         RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
     };
 
-    if opt.buffer_profile_disable {
+    if config.buffer_profile_disable {
         // User explicitly disabled buffer profiling - use GeneralPurpose profile in disabled mode
         info!("Buffer profiling disabled via --buffer-profile-disable, using GeneralPurpose profile");
         set_buffer_profile_enabled(false);
     } else {
         // Enabled by default: use configured workload profile
-        info!("Buffer profiling enabled with profile: {}", opt.buffer_profile);
+        info!("Buffer profiling enabled with profile: {}", config.buffer_profile);
 
         // Parse the workload profile from configuration string
-        let profile = WorkloadProfile::from_name(&opt.buffer_profile);
+        let profile = WorkloadProfile::from_name(&config.buffer_profile);
 
         // Log the selected profile for operational visibility
         info!("Active buffer profile: {:?}", profile);
