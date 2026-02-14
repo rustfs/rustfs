@@ -226,7 +226,7 @@ impl Config {
     /// parse the command line arguments and environment arguments from [`Opt`] and convert them
     /// into a ready to use [`Config`]
     ///
-    /// This includes some intermediate checks for mutual exclusive options
+    /// This includes some intermediate checks for mutually exclusive options
     pub fn parse() -> std::io::Result<Self> {
         let Opt {
             volumes,
