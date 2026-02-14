@@ -25,7 +25,7 @@ use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
 use crate::storage::s3_api::bucket::{build_list_objects_output, build_list_objects_v2_output};
 use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::s3_api::multipart::{build_list_multipart_uploads_output, build_list_parts_output};
+use crate::storage::s3_api::multipart::{build_list_multipart_uploads_output, build_list_parts_output, parse_list_parts_params};
 use crate::storage::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
     sse_prepare_encryption, strip_managed_encryption_metadata,
@@ -3801,16 +3801,7 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let part_number_marker = part_number_marker.map(|x| x as usize);
-        let max_parts = match max_parts {
-            Some(parts) => {
-                if !(1..=1000).contains(&parts) {
-                    return Err(s3_error!(InvalidArgument, "max-parts must be between 1 and 1000"));
-                }
-                parts as usize
-            }
-            None => 1000,
-        };
+        let (part_number_marker, max_parts) = parse_list_parts_params(part_number_marker, max_parts)?;
 
         let res = store
             .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())

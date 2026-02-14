@@ -16,6 +16,7 @@ use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo};
 use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
+use s3s::{S3Error, S3ErrorCode};
 
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
     let owner = rustfs_owner();
@@ -50,6 +51,27 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
         },
         ..Default::default()
     }
+}
+
+pub(crate) fn parse_list_parts_params(
+    part_number_marker: Option<i32>,
+    max_parts: Option<i32>,
+) -> Result<(Option<usize>, usize), S3Error> {
+    let part_number_marker = part_number_marker.map(|x| x as usize);
+    let max_parts = match max_parts {
+        Some(parts) => {
+            if !(1..=1000).contains(&parts) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "max-parts must be between 1 and 1000".to_string(),
+                ));
+            }
+            parts as usize
+        }
+        None => 1000,
+    };
+
+    Ok((part_number_marker, max_parts))
 }
 
 pub(crate) fn build_list_multipart_uploads_output(
@@ -90,9 +112,10 @@ pub(crate) fn build_list_multipart_uploads_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_list_multipart_uploads_output, build_list_parts_output};
+    use super::{build_list_multipart_uploads_output, build_list_parts_output, parse_list_parts_params};
     use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
     use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
+    use s3s::S3ErrorCode;
     use s3s::dto::Timestamp;
     use time::OffsetDateTime;
 
@@ -201,5 +224,25 @@ mod tests {
         assert_eq!(common_prefixes.len(), 2);
         assert_eq!(common_prefixes[0].prefix.as_deref(), Some("prefix-a/"));
         assert_eq!(common_prefixes[1].prefix.as_deref(), Some("prefix-b/"));
+    }
+
+    #[test]
+    fn test_parse_list_parts_params_defaults_and_valid_values() {
+        let (part_number_marker, max_parts) = parse_list_parts_params(Some(5), Some(100)).expect("expected valid params");
+        assert_eq!(part_number_marker, Some(5));
+        assert_eq!(max_parts, 100);
+
+        let (part_number_marker, max_parts) = parse_list_parts_params(None, None).expect("expected default params");
+        assert_eq!(part_number_marker, None);
+        assert_eq!(max_parts, 1000);
+    }
+
+    #[test]
+    fn test_parse_list_parts_params_rejects_invalid_max_parts() {
+        let err = parse_list_parts_params(None, Some(0)).expect_err("expected invalid max_parts");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+
+        let err = parse_list_parts_params(None, Some(1001)).expect_err("expected invalid max_parts");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
     }
 }
