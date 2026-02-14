@@ -324,22 +324,6 @@ mod tests {
 
         let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), None, Some((MAX_PARTS_COUNT + 1) as i32))
             .expect_err("expected invalid max_uploads");
-        assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
-        assert_eq!(err.message(), "Invalid key marker");
-    }
-
-    #[test]
-    fn test_parse_list_multipart_uploads_params_rejects_invalid_max_uploads() {
-        let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), None, Some(0))
-            .expect_err("expected invalid max_uploads");
-        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
-
-        let err = parse_list_multipart_uploads_params(
-            Some("prefix/".to_string()),
-            None,
-            Some((MAX_PARTS_COUNT + 1) as i32),
-        )
-        .expect_err("expected invalid max_uploads");
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
     }
 }
