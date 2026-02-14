@@ -33,13 +33,13 @@ on:
       - '.github/workflows/nix.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   nix-validation:
     name: Nix Build & Check
     runs-on: ubuntu-latest
-    permissions:
-      id-token: "write"
-      contents: "read"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
