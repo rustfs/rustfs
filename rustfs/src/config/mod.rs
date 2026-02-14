@@ -227,7 +227,7 @@ impl Config {
     /// into a ready to use [`Config`]
     ///
     /// This includes some intermediate checks for mutual exclusive options
-    pub fn parse() -> Self {
+    pub fn parse() -> std::io::Result<Self> {
         let Opt {
             volumes,
             address,
@@ -253,26 +253,30 @@ impl Config {
         } = Opt::parse();
 
         let access_key = access_key
+            .map(Ok)
             .or_else(|| {
                 let path = access_key_file.as_ref()?;
-                std::fs::read_to_string(path).ok()
+                Some(std::fs::read_to_string(path))
             })
+            .transpose()?
             .unwrap_or_else(|| {
                 // neither argument was specified ... using default
                 rustfs_credentials::DEFAULT_ACCESS_KEY.to_string()
             });
 
         let secret_key = secret_key
+            .map(Ok)
             .or_else(|| {
                 let path = secret_key_file.as_ref()?;
-                std::fs::read_to_string(path).ok()
+                Some(std::fs::read_to_string(path))
             })
+            .transpose()?
             .unwrap_or_else(|| {
                 // neither argument was specified ... using default
                 rustfs_credentials::DEFAULT_SECRET_KEY.to_string()
             });
 
-        Config {
+        Ok(Config {
             volumes,
             address,
             server_domains,
@@ -292,7 +296,7 @@ impl Config {
             kms_default_key_id,
             buffer_profile_disable,
             buffer_profile,
-        }
+        })
     }
 }
 

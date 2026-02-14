@@ -99,7 +99,7 @@ fn main() {
 }
 async fn async_main() -> Result<()> {
     // Parse the obtained parameters
-    let config = config::Config::parse();
+    let config = config::Config::parse()?;
 
     // Initialize the configuration
     init_license(config.license.clone());
