@@ -14,7 +14,7 @@
 
 use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::server::{HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
+use crate::server::{HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -26,6 +26,8 @@ pub fn register_health_route(r: &mut S3Router<AdminOperation>) -> std::io::Resul
     // Health check endpoint for monitoring and orchestration
     r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
     r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::GET, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
+    r.insert(Method::HEAD, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
     r.insert(Method::GET, PROFILE_CPU_PATH, AdminOperation(&TriggerProfileCPU {}))?;
     r.insert(Method::GET, PROFILE_MEMORY_PATH, AdminOperation(&TriggerProfileMemory {}))?;
 
@@ -42,27 +44,32 @@ pub(crate) struct HealthCheckState {
     pub(crate) ready: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HealthProbe {
+    Liveness,
+    Readiness,
+}
+
 pub(crate) fn collect_dependency_readiness() -> (bool, bool) {
     let storage_ready = rustfs_ecstore::new_object_layer_fn().is_some();
     let iam_ready = rustfs_iam::get().is_ok();
     (storage_ready, iam_ready)
 }
 
-pub(crate) fn health_check_state(storage_ready: bool, iam_ready: bool) -> HealthCheckState {
+pub(crate) fn health_check_state(storage_ready: bool, iam_ready: bool, probe: HealthProbe) -> HealthCheckState {
     let ready = storage_ready && iam_ready;
+    let status = if ready { "ok" } else { "degraded" };
 
-    if ready {
-        HealthCheckState {
-            status_code: StatusCode::OK,
-            status: "ok",
-            ready,
-        }
-    } else {
-        HealthCheckState {
-            status_code: StatusCode::SERVICE_UNAVAILABLE,
-            status: "degraded",
-            ready,
-        }
+    let status_code = match probe {
+        HealthProbe::Liveness => StatusCode::OK,
+        HealthProbe::Readiness if ready => StatusCode::OK,
+        HealthProbe::Readiness => StatusCode::SERVICE_UNAVAILABLE,
+    };
+
+    HealthCheckState {
+        status_code,
+        status,
+        ready,
     }
 }
 
@@ -96,8 +103,13 @@ impl Operation for HealthCheckHandler {
             ));
         }
 
+        let probe = if req.uri.path() == HEALTH_READY_PATH {
+            HealthProbe::Readiness
+        } else {
+            HealthProbe::Liveness
+        };
         let (storage_ready, iam_ready) = collect_dependency_readiness();
-        let health = health_check_state(storage_ready, iam_ready);
+        let health = health_check_state(storage_ready, iam_ready, probe);
 
         let health_info = json!({
             "status": health.status,
@@ -129,24 +141,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_health_check_state_ready() {
-        let state = health_check_state(true, true);
+    fn test_readiness_state_ready() {
+        let state = health_check_state(true, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::OK);
         assert_eq!(state.status, "ok");
         assert!(state.ready);
     }
 
     #[test]
-    fn test_health_check_state_storage_not_ready() {
-        let state = health_check_state(false, true);
+    fn test_readiness_state_storage_not_ready() {
+        let state = health_check_state(false, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
     }
 
     #[test]
-    fn test_health_check_state_iam_not_ready() {
-        let state = health_check_state(true, false);
+    fn test_liveness_state_iam_not_ready() {
+        let state = health_check_state(true, false, HealthProbe::Liveness);
+        assert_eq!(state.status_code, StatusCode::OK);
+        assert_eq!(state.status, "degraded");
+        assert!(!state.ready);
+    }
+
+    #[test]
+    fn test_readiness_state_iam_not_ready() {
+        let state = health_check_state(true, false, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
