@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn test_access_key_arguments_mutually_exclusive() {
+    fn test_access_key_arguments_mutually_exclusive_cli() {
         // Test that CLI args configuration fails on conflict
         let args = vec![
             "rustfs",
@@ -541,7 +541,12 @@ mod tests {
         assert!(opt_res.is_err());
         let err = opt_res.err().unwrap();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_access_key_arguments_mutually_exclusive_env_var() {
         // Test that env var args configuration fails on conflict
         with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {
             with_env_var("RUSTFS_ACCESS_KEY", "foo", || {
@@ -559,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn test_secret_key_arguments_mutually_exclusive() {
+    fn test_secret_key_arguments_mutually_exclusive_cli() {
         // Test that CLI args configuration fails on conflict
         let args = vec![
             "rustfs",
@@ -575,7 +580,12 @@ mod tests {
         assert!(opt_res.is_err());
         let err = opt_res.err().unwrap();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_secret_key_arguments_mutually_exclusive_env_var() {
         // Test that env var args configuration fails on conflict
         with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {
             with_env_var("RUSTFS_SECRET_KEY", "foo", || {
