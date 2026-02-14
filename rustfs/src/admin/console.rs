@@ -16,27 +16,23 @@ use crate::config::build;
 use crate::license::get_license;
 use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, RUSTFS_ADMIN_PREFIX};
 use axum::{
+    Router,
     body::Body,
     extract::Request,
     middleware,
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
-use axum_server::tls_rustls::RustlsConfig;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
-use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use serde::Serialize;
 use serde_json::json;
 use std::{
-    io::Result,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, OnceLock},
+    sync::OnceLock,
     time::Duration,
 };
-use tokio_rustls::rustls::ServerConfig;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
