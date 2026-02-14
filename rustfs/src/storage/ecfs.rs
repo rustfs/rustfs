@@ -24,6 +24,7 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
 use crate::storage::s3_api::bucket::{build_list_objects_output, build_list_objects_v2_output};
+use crate::storage::s3_api::multipart::build_list_parts_output;
 use crate::storage::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
     sse_prepare_encryption, strip_managed_encryption_metadata,
@@ -3846,38 +3847,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let output = ListPartsOutput {
-            bucket: Some(res.bucket),
-            key: Some(res.object),
-            upload_id: Some(res.upload_id),
-            parts: Some(
-                res.parts
-                    .into_iter()
-                    .map(|p| Part {
-                        e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
-                        last_modified: p.last_mod.map(Timestamp::from),
-                        part_number: Some(p.part_num as i32),
-                        size: Some(p.size as i64),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            initiator: Some(Initiator {
-                id: RUSTFS_OWNER.id.clone(),
-                display_name: RUSTFS_OWNER.display_name.clone(),
-            }),
-            is_truncated: Some(res.is_truncated),
-            next_part_number_marker: res.next_part_number_marker.try_into().ok(),
-            max_parts: res.max_parts.try_into().ok(),
-            part_number_marker: res.part_number_marker.try_into().ok(),
-            storage_class: if res.storage_class.is_empty() {
-                None
-            } else {
-                Some(res.storage_class.into())
-            },
-            ..Default::default()
-        };
+        let output = build_list_parts_output(res);
         Ok(S3Response::new(output))
     }
 
