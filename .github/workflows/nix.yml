@@ -1,0 +1,79 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Nix CI
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/nix.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/nix.yml'
+  workflow_dispatch:
+
+jobs:
+  nix-validation:
+    name: Nix Build & Check
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: "write"
+      contents: "read"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Setup Flake Checker
+        uses: DeterminateSystems/flake-checker-action@main
+
+      - name: Verify Flake
+        run: |
+          echo "Checking flake structure and evaluation..."
+          nix flake show
+          nix flake check --print-build-logs
+
+      - name: Build RustFS
+        run: |
+          echo "Building the default package..."
+          nix build .#default --print-build-logs
+
+      - name: Test Binary
+        run: |
+          echo "Verifying the built binary..."
+          if [ -x "./result/bin/rustfs" ]; then
+              ./result/bin/rustfs --help
+              echo "Binary verification successful."
+          else
+              echo "Error: Binary not found or not executable at ./result/bin/rustfs"
+              exit 1
+          fi
