@@ -29,7 +29,7 @@ pub(crate) mod multipart;
 /// Object-specific extraction steps can be added here incrementally.
 pub(crate) mod object {}
 pub(crate) mod replication {}
-pub(crate) mod response {}
+pub(crate) mod response;
 pub(crate) mod restore {}
 pub(crate) mod select {}
 pub(crate) mod validation {}
