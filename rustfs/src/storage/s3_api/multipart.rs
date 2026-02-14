@@ -81,7 +81,26 @@ pub(crate) fn parse_list_multipart_uploads_params(
     max_uploads: Option<i32>,
 ) -> Result<(String, Option<String>, usize), S3Error> {
     let prefix = prefix.unwrap_or_default();
-    let max_uploads = max_uploads.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
+    let max_uploads = match max_uploads {
+        Some(value) => {
+            let value = usize::try_from(value).map_err(|_| {
+                S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    format!("max-uploads must be between 1 and {}", MAX_PARTS_COUNT),
+                )
+            })?;
+
+            if value == 0 || value > MAX_PARTS_COUNT {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    format!("max-uploads must be between 1 and {}", MAX_PARTS_COUNT),
+                ));
+            }
+
+            value
+        }
+        None => MAX_PARTS_COUNT,
+    };
 
     if let Some(key_marker) = &key_marker
         && !key_marker.starts_with(prefix.as_str())
@@ -290,5 +309,21 @@ mod tests {
             .expect_err("expected invalid key marker");
 
         assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(err.message(), Some("Invalid key marker"));
+    }
+
+    #[test]
+    fn test_parse_list_multipart_uploads_params_rejects_invalid_max_uploads() {
+        let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), None, Some(-1))
+            .expect_err("expected invalid max_uploads");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+
+        let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), None, Some(0))
+            .expect_err("expected invalid max_uploads");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+
+        let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), None, Some((MAX_PARTS_COUNT + 1) as i32))
+            .expect_err("expected invalid max_uploads");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
     }
 }
