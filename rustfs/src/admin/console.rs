@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::handlers::health::{build_component_details, collect_dependency_readiness, health_check_state};
 use crate::config::build;
 use crate::license::get_license;
 use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, RUSTFS_ADMIN_PREFIX};
@@ -449,40 +450,23 @@ fn setup_console_middleware_stack(
 /// - A `Response` containing the health check result.
 #[instrument]
 async fn health_check(method: Method) -> Response {
+    let (storage_ready, iam_ready) = collect_dependency_readiness();
+    let health = health_check_state(storage_ready, iam_ready);
+
     let builder = Response::builder()
-        .status(StatusCode::OK)
+        .status(health.status_code)
         .header("content-type", "application/json");
+
     match method {
         // GET: Returns complete JSON
         Method::GET => {
-            let mut health_status = "ok";
-            let mut details = json!({});
-
-            // Check storage backend health
-            if let Some(_store) = rustfs_ecstore::new_object_layer_fn() {
-                details["storage"] = json!({"status": "connected"});
-            } else {
-                health_status = "degraded";
-                details["storage"] = json!({"status": "disconnected"});
-            }
-
-            // Check IAM system health
-            match rustfs_iam::get() {
-                Ok(_) => {
-                    details["iam"] = json!({"status": "connected"});
-                }
-                Err(_) => {
-                    health_status = "degraded";
-                    details["iam"] = json!({"status": "disconnected"});
-                }
-            }
-
             let body_json = json!({
-                "status": health_status,
+                "status": health.status,
+                "ready": health.ready,
                 "service": "rustfs-console",
                 "timestamp": jiff::Zoned::now().to_string(),
                 "version": env!("CARGO_PKG_VERSION"),
-                "details": details,
+                "details": build_component_details(storage_ready, iam_ready),
                 "uptime": std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
