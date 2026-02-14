@@ -163,7 +163,7 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
 /// If not enabled, it attempts to load any persisted KMS configuration from
 /// cluster storage and starts the service if found.
 /// # Arguments
-/// * `opt` - The application configuration options
+/// * `config` - The application configuration options
 ///
 /// Returns `std::io::Result<()>` indicating success or failure
 #[instrument(skip(config))]
