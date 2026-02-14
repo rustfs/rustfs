@@ -98,6 +98,30 @@ pub const RUSTFS_HTTP_PREFIX: &str = "http://";
 /// Default value: https://
 pub const RUSTFS_HTTPS_PREFIX: &str = "https://";
 
+/// Default documentation URL for rustfs
+/// This is the default documentation URL for rustfs.
+/// It is used to provide the documentation of the application.
+/// Default value: https://docs.rustfs.com
+pub const RUSTFS_DOCS_URL: &str = "https://docs.rustfs.com";
+
+/// Default GitHub URL for rustfs
+/// This is the default GitHub URL for rustfs.
+/// It is used to provide the source code of the application.
+/// Default value: https://github.com/rustfs/rustfs
+pub const RUSTFS_GITHUB_URL: &str = "https://github.com/rustfs/rustfs";
+
+/// Default license for rustfs
+/// This is the default license for rustfs.
+/// It is used to provide the license of the application.
+/// Default value: Apache-2.0
+pub const RUSTFS_LICENSE: &str = "Apache-2.0";
+
+/// Default license URL for rustfs
+/// This is the default license URL for rustfs.
+/// It is used to provide the license URL of the application.
+/// Default value: https://www.apache.org/licenses/LICENSE-2.0
+pub const RUSTFS_LICENSE_URL: &str = "https://www.apache.org/licenses/LICENSE-2.0";
+
 /// Environment variable for rustfs address
 /// This is the environment variable for rustfs address.
 /// It is used to bind the server to a specific address.
@@ -119,13 +143,21 @@ pub const DEFAULT_CONSOLE_PORT: u16 = 9001;
 
 /// Default address for rustfs console
 /// This is the default address for rustfs console.
+/// This is used to bind the console server to a specific address.
+/// Default value: :9001
 pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
+
+/// Default region for rustfs
+/// This is the default region for rustfs.
+/// It is used to identify the region of the application.
+/// Default value: cn-east-1
+pub const RUSTFS_REGION: &str = "cn-east-1";
 
 /// Default log filename for rustfs
 /// This is the default log filename for rustfs.
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_FILENAME
+/// Environment variable: RUSTFS_OBS_LOG_FILENAME
 pub const DEFAULT_LOG_FILENAME: &str = "rustfs";
 
 /// Default OBS log filename for rustfs
@@ -166,7 +198,7 @@ pub const DEFAULT_LOG_KEEP_FILES: usize = 30;
 /// This is the default log local logging enabled for rustfs.
 /// It is used to enable or disable local logging of the application.
 /// Default value: false
-/// Environment variable: RUSTFS_OBS_LOGL_STDOUT_ENABLED
+/// Environment variable: RUSTFS_OBS_LOG_STDOUT_ENABLED
 pub const DEFAULT_OBS_LOG_STDOUT_ENABLED: bool = false;
 
 /// Constant representing 1 Kibibyte (1024 bytes)
