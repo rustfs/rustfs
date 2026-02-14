@@ -262,7 +262,9 @@ impl Config {
             .unwrap_or_else(|| {
                 // neither argument was specified ... using default
                 rustfs_credentials::DEFAULT_ACCESS_KEY.to_string()
-            });
+            })
+            .trim()
+            .to_string();
 
         let secret_key = secret_key
             .map(Ok)
@@ -274,7 +276,9 @@ impl Config {
             .unwrap_or_else(|| {
                 // neither argument was specified ... using default
                 rustfs_credentials::DEFAULT_SECRET_KEY.to_string()
-            });
+            })
+            .trim()
+            .to_string();
 
         Ok(Config {
             volumes,
