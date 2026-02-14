@@ -15,6 +15,7 @@
 use clap::Parser;
 use clap::builder::NonEmptyStringValueParser;
 use const_str::concat;
+use std::path::PathBuf;
 use std::string::ToString;
 shadow_rs::shadow!(build);
 
@@ -77,20 +78,20 @@ pub struct Opt {
     pub server_domains: Vec<String>,
 
     /// Access key used for authentication.
-    #[arg(
-        long,
-        default_value_t = rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(),
-        env = "RUSTFS_ACCESS_KEY"
-    )]
-    pub access_key: String,
+    #[arg(long, env = "RUSTFS_ACCESS_KEY", group = "access-key")]
+    pub access_key: Option<String>,
+
+    /// Access key stored in a file used for authentication.
+    #[arg(long, env = "RUSTFS_ACCESS_KEY_FILE", group = "access-key")]
+    pub access_key_file: Option<PathBuf>,
 
     /// Secret key used for authentication.
-    #[arg(
-        long,
-        default_value_t = rustfs_credentials::DEFAULT_SECRET_KEY.to_string(),
-        env = "RUSTFS_SECRET_KEY"
-    )]
-    pub secret_key: String,
+    #[arg(long, env = "RUSTFS_SECRET_KEY", group = "secret-key")]
+    pub secret_key: Option<String>,
+
+    /// Secret key used for authentication.
+    #[arg(long, env = "RUSTFS_SECRET_KEY_FILE", group = "secret-key")]
+    pub secret_key_file: Option<PathBuf>,
 
     /// Enable console server
     #[arg(
@@ -168,7 +169,7 @@ impl std::fmt::Debug for Opt {
             .field("address", &self.address)
             .field("server_domains", &self.server_domains)
             .field("access_key", &self.access_key)
-            .field("secret_key", &rustfs_credentials::Masked(Some(&self.secret_key))) // Hide sensitive values
+            .field("secret_key", &rustfs_credentials::Masked(self.secret_key.as_ref().map(|s| s.as_str()))) // Hide sensitive values
             .field("console_enable", &self.console_enable)
             .field("console_address", &self.console_address)
             .field("obs_endpoint", &self.obs_endpoint)
@@ -258,7 +259,9 @@ impl Config {
             address,
             server_domains,
             access_key,
+            access_key_file,
             secret_key,
+            secret_key_file,
             console_enable,
             console_address,
             obs_endpoint,
@@ -274,6 +277,26 @@ impl Config {
             buffer_profile_disable,
             buffer_profile,
         } = Opt::parse();
+
+        let access_key = access_key
+            .or_else(|| {
+                let path = access_key_file.as_ref()?;
+                std::fs::read_to_string(path).ok()
+            })
+            .unwrap_or_else(|| {
+                // neither argument was specified ... using default
+                rustfs_credentials::DEFAULT_ACCESS_KEY.to_string()
+            });
+
+        let secret_key = secret_key
+            .or_else(|| {
+                let path = secret_key_file.as_ref()?;
+                std::fs::read_to_string(path).ok()
+            })
+            .unwrap_or_else(|| {
+                // neither argument was specified ... using default
+                rustfs_credentials::DEFAULT_SECRET_KEY.to_string()
+            });
 
         Config {
             volumes,
