@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::ecfs::RUSTFS_OWNER;
+use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::store_api::ListPartsInfo;
-use s3s::dto::{Initiator, ListPartsOutput, Part, Timestamp};
+use s3s::dto::{ListPartsOutput, Part, Timestamp};
 
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
+    let owner = rustfs_owner();
+    let initiator = rustfs_initiator();
+
     ListPartsOutput {
         bucket: Some(res.bucket),
         key: Some(res.object),
@@ -28,17 +31,14 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
                 .map(|p| Part {
                     e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
                     last_modified: p.last_mod.map(Timestamp::from),
-                    part_number: Some(p.part_num as i32),
-                    size: Some(p.size as i64),
+                    part_number: p.part_num.try_into().ok(),
+                    size: p.size.try_into().ok(),
                     ..Default::default()
                 })
                 .collect(),
         ),
-        owner: Some(RUSTFS_OWNER.to_owned()),
-        initiator: Some(Initiator {
-            id: RUSTFS_OWNER.id.clone(),
-            display_name: RUSTFS_OWNER.display_name.clone(),
-        }),
+        owner: Some(owner),
+        initiator: Some(initiator),
         is_truncated: Some(res.is_truncated),
         next_part_number_marker: res.next_part_number_marker.try_into().ok(),
         max_parts: res.max_parts.try_into().ok(),
@@ -104,14 +104,23 @@ mod tests {
             part_number_marker: usize::MAX,
             next_part_number_marker: usize::MAX,
             max_parts: usize::MAX,
+            parts: vec![PartInfo {
+                part_num: usize::MAX,
+                size: usize::MAX,
+                ..Default::default()
+            }],
             ..Default::default()
         };
 
         let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
 
         assert_eq!(output.storage_class, None);
         assert_eq!(output.part_number_marker, None);
         assert_eq!(output.next_part_number_marker, None);
         assert_eq!(output.max_parts, None);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_number, None);
+        assert_eq!(parts[0].size, None);
     }
 }

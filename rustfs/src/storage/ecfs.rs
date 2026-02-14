@@ -24,6 +24,7 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
 use crate::storage::s3_api::bucket::{build_list_objects_output, build_list_objects_v2_output};
+use crate::storage::s3_api::common::rustfs_owner;
 use crate::storage::s3_api::multipart::build_list_parts_output;
 use crate::storage::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
@@ -165,10 +166,7 @@ macro_rules! try_ {
     };
 }
 
-pub(crate) static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
-    display_name: Some("rustfs".to_owned()),
-    id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
-});
+pub(crate) static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(rustfs_owner);
 
 #[derive(Debug, Clone)]
 pub struct FS {
