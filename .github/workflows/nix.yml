@@ -52,9 +52,10 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Setup Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+        
       - name: Setup Flake Checker
-        uses: DeterminateSystems/flake-checker-action@main
+        uses: DeterminateSystems/flake-checker-action@v12
 
       - name: Verify Flake
         run: |
