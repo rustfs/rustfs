@@ -523,4 +523,72 @@ mod tests {
         assert_eq!(opt.server_domains[1], "127.0.0.1:9000");
         assert_eq!(opt.server_domains[2], "localhost");
     }
+
+    #[test]
+    fn test_access_key_arguments_mutually_exclusive() {
+        // Test that CLI args configuration fails on conflict
+        let args = vec![
+            "rustfs",
+            "/test/volume",
+            "--access-key",
+            "foobar",
+            "--access-key-file",
+            "/foo/bar",
+        ];
+        let opt_res = Opt::try_parse_from(args);
+
+        // can't specify both access-key and access-key-file at once
+        assert!(opt_res.is_err());
+        let err = opt_res.err().unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        // Test that env var args configuration fails on conflict
+        with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {
+            with_env_var("RUSTFS_ACCESS_KEY", "foo", || {
+                with_env_var("RUSTFS_ACCESS_KEY_FILE", "/foo/bar", || {
+                    let args = vec!["rustfs"];
+                    let opt_res = Opt::try_parse_from(args);
+
+                    // can't specify both RUSTFS_ACCESS_KEY and RUSTFS_ACCESS_KEY_FILE at once
+                    assert!(opt_res.is_err());
+                    let err = opt_res.err().unwrap();
+                    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn test_secret_key_arguments_mutually_exclusive() {
+        // Test that CLI args configuration fails on conflict
+        let args = vec![
+            "rustfs",
+            "/test/volume",
+            "--secret-key",
+            "foobar",
+            "--secret-key-file",
+            "/foo/bar",
+        ];
+        let opt_res = Opt::try_parse_from(args);
+
+        // can't specify both secret-key and secret-key-file at once
+        assert!(opt_res.is_err());
+        let err = opt_res.err().unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        // Test that env var args configuration fails on conflict
+        with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {
+            with_env_var("RUSTFS_SECRET_KEY", "foo", || {
+                with_env_var("RUSTFS_SECRET_KEY_FILE", "/foo/bar", || {
+                    let args = vec!["rustfs"];
+                    let opt_res = Opt::try_parse_from(args);
+
+                    // can't specify both RUSTFS_SECRET_KEY and RUSTFS_SECRET_KEY_FILE at once
+                    assert!(opt_res.is_err());
+                    let err = opt_res.err().unwrap();
+                    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+                });
+            });
+        });
+    }
 }
