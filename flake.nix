@@ -11,27 +11,40 @@
 {
   description = "RustFS - High-performance S3-compatible object storage";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    fenix.url = "github:nix-community/fenix";
+    flake-parts.url = "github:hercules-ci/flake-parts";
+  };
 
   outputs =
-    { nixpkgs, ... }:
-    let
+    inputs@{ flake-parts, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "x86_64-linux"
         "aarch64-linux"
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-      forAllSystems = nixpkgs.lib.genAttrs systems;
-    in
-    {
-      packages = forAllSystems (
-        system:
+
+      perSystem =
+        {
+          self',
+          pkgs,
+          system,
+          ...
+        }:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          # access to fenix packages
+          fnx = inputs.fenix.packages.${system};
+          # create custom rust toolchain with latest fenix cargo/rustc
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = fnx.stable.cargo;
+            rustc = fnx.stable.rustc;
+          };
         in
         {
-          default = pkgs.rustPlatform.buildRustPackage {
+          packages.default = rustPlatform.buildRustPackage {
             pname = "rustfs";
             version = "0.0.5";
 
@@ -42,12 +55,12 @@
               allowBuiltinFetchGit = true;
             };
 
-            nativeBuildInputs = with pkgs; [
-              pkg-config
-              protobuf
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.protobuf
             ];
 
-            buildInputs = with pkgs; [ openssl ];
+            buildInputs = [ pkgs.openssl ];
 
             cargoBuildFlags = [
               "--package"
@@ -63,7 +76,20 @@
               mainProgram = "rustfs";
             };
           };
-        }
-      );
+
+          devShells.default = pkgs.mkShell {
+            inputsFrom = [ self'.packages.default ];
+            packages = [
+              # this is required else manual compilation will fail
+              pkgs.rust-jemalloc-sys-unprefixed
+
+              # other rust tooling necessary for development
+              fnx.stable.clippy
+              fnx.stable.rust-analyzer
+              fnx.stable.rust-src
+              fnx.complete.rustfmt
+            ];
+          };
+        };
     };
 }
