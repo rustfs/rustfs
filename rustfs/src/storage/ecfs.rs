@@ -23,7 +23,7 @@ use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_ha
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
-use crate::storage::s3_api::bucket::build_list_objects_output;
+use crate::storage::s3_api::bucket::{build_list_objects_output, build_list_objects_v2_output};
 use crate::storage::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
     sse_prepare_encryption, strip_managed_encryption_metadata,
@@ -151,7 +151,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
-use urlencoding::encode;
 use uuid::Uuid;
 
 macro_rules! try_ {
@@ -3801,84 +3800,18 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        // warn!("object_infos objects {:?}", object_infos.objects);
-
-        // Apply URL encoding if encoding_type is "url"
-        // Note: S3 URL encoding should encode special characters but preserve path separators (/)
-        let should_encode = encoding_type.as_ref().map(|e| e.as_str() == "url").unwrap_or(false);
-
-        // Helper function to encode S3 keys/prefixes (preserving /)
-        // S3 URL encoding encodes special characters but keeps '/' unencoded
-        let encode_s3_name = |name: &str| -> String {
-            name.split('/')
-                .map(|part| encode(part).to_string())
-                .collect::<Vec<_>>()
-                .join("/")
-        };
-
-        let objects: Vec<Object> = object_infos
-            .objects
-            .iter()
-            .filter(|v| !v.name.is_empty())
-            .map(|v| {
-                let key = if should_encode {
-                    encode_s3_name(&v.name)
-                } else {
-                    v.name.to_owned()
-                };
-                let mut obj = Object {
-                    key: Some(key),
-                    last_modified: v.mod_time.map(Timestamp::from),
-                    size: Some(v.get_actual_size().unwrap_or_default()),
-                    e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                    storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
-                    ..Default::default()
-                };
-
-                if fetch_owner.is_some_and(|v| v) {
-                    obj.owner = Some(Owner {
-                        display_name: Some("rustfs".to_owned()),
-                        id: Some("v0.1".to_owned()),
-                    });
-                }
-                obj
-            })
-            .collect();
-
-        let common_prefixes: Vec<CommonPrefix> = object_infos
-            .prefixes
-            .into_iter()
-            .map(|v| {
-                let prefix = if should_encode { encode_s3_name(&v) } else { v };
-                CommonPrefix { prefix: Some(prefix) }
-            })
-            .collect();
-
-        // KeyCount should include both objects and common prefixes per S3 API spec
-        let key_count = (objects.len() + common_prefixes.len()) as i32;
-
-        // Encode next_continuation_token to base64
-        let next_continuation_token = object_infos
-            .next_continuation_token
-            .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
-
-        let output = ListObjectsV2Output {
-            is_truncated: Some(object_infos.is_truncated),
-            continuation_token: response_continuation_token,
-            next_continuation_token,
-            start_after: response_start_after,
-            key_count: Some(key_count),
-            max_keys: Some(max_keys),
-            contents: Some(objects),
+        let output = build_list_objects_v2_output(
+            object_infos,
+            fetch_owner.unwrap_or_default(),
+            max_keys,
+            bucket,
+            prefix,
             delimiter,
-            encoding_type: encoding_type.clone(),
-            name: Some(bucket),
-            prefix: Some(prefix),
-            common_prefixes: Some(common_prefixes),
-            ..Default::default()
-        };
+            encoding_type,
+            response_continuation_token,
+            response_start_after,
+        );
 
-        // let output = ListObjectsV2Output { ..Default::default() };
         Ok(S3Response::new(output))
     }
 
