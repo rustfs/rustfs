@@ -21,7 +21,12 @@ pub(crate) mod acl {}
 pub(crate) mod bucket {}
 pub(crate) mod encryption {}
 pub(crate) mod multipart {}
-pub(crate) mod object;
+/// Object helper facade placeholder.
+///
+/// Read-path helpers shared across storage components should live in neutral
+/// modules (for example, `storage::readers`) and be consumed from there.
+/// Object-specific extraction steps can be added here incrementally.
+pub(crate) mod object {}
 pub(crate) mod replication {}
 pub(crate) mod response {}
 pub(crate) mod restore {}
