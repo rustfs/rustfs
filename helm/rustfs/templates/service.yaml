@@ -3,6 +3,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "rustfs.fullname" . }}-headless
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
     {{- with .Values.commonLabels }}
@@ -27,6 +28,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "rustfs.fullname" . }}-svc
+  namespace: {{ .Release.Namespace }}
   {{- if and .Values.mode.distributed.enabled (eq .Values.ingress.className "traefik")}}
   annotations:
     {{- toYaml .Values.ingress.traefikAnnotations | nindent 4 }}

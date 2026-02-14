@@ -3,6 +3,7 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: {{ include "rustfs.fullname" . }}-gateway
+  namespace: {{ .Release.Namespace }}
 spec:
   gatewayClassName: {{ .Values.gatewayApi.gatewayClass }}
   {{- with .Values.gatewayApi.listeners }}
