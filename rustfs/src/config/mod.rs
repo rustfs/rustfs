@@ -162,32 +162,6 @@ pub struct Opt {
     pub buffer_profile: String,
 }
 
-impl std::fmt::Debug for Opt {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Opt")
-            .field("volumes", &self.volumes)
-            .field("address", &self.address)
-            .field("server_domains", &self.server_domains)
-            .field("access_key", &self.access_key)
-            .field("secret_key", &rustfs_credentials::Masked(self.secret_key.as_ref().map(|s| s.as_str()))) // Hide sensitive values
-            .field("console_enable", &self.console_enable)
-            .field("console_address", &self.console_address)
-            .field("obs_endpoint", &self.obs_endpoint)
-            .field("tls_path", &self.tls_path)
-            .field("license", &rustfs_credentials::Masked(self.license.as_deref()))
-            .field("region", &self.region)
-            .field("kms_enable", &self.kms_enable)
-            .field("kms_backend", &self.kms_backend)
-            .field("kms_key_dir", &self.kms_key_dir)
-            .field("kms_vault_address", &self.kms_vault_address)
-            .field("kms_vault_token", &rustfs_credentials::Masked(self.kms_vault_token.as_deref()))
-            .field("kms_default_key_id", &self.kms_default_key_id)
-            .field("buffer_profile_disable", &self.buffer_profile_disable)
-            .field("buffer_profile", &self.buffer_profile)
-            .finish()
-    }
-}
-
 #[derive(Clone)]
 pub struct Config {
     /// DIR points to a directory on a filesystem.
@@ -319,6 +293,32 @@ impl Config {
             buffer_profile_disable,
             buffer_profile,
         }
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("volumes", &self.volumes)
+            .field("address", &self.address)
+            .field("server_domains", &self.server_domains)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &rustfs_credentials::Masked(Some(&self.secret_key))) // Hide sensitive values
+            .field("console_enable", &self.console_enable)
+            .field("console_address", &self.console_address)
+            .field("obs_endpoint", &self.obs_endpoint)
+            .field("tls_path", &self.tls_path)
+            .field("license", &rustfs_credentials::Masked(self.license.as_deref()))
+            .field("region", &self.region)
+            .field("kms_enable", &self.kms_enable)
+            .field("kms_backend", &self.kms_backend)
+            .field("kms_key_dir", &self.kms_key_dir)
+            .field("kms_vault_address", &self.kms_vault_address)
+            .field("kms_vault_token", &rustfs_credentials::Masked(self.kms_vault_token.as_deref()))
+            .field("kms_default_key_id", &self.kms_default_key_id)
+            .field("buffer_profile_disable", &self.buffer_profile_disable)
+            .field("buffer_profile", &self.buffer_profile)
+            .finish()
     }
 }
 
