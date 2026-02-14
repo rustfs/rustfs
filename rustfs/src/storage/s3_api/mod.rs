@@ -19,8 +19,9 @@
 
 pub(crate) mod acl {}
 pub(crate) mod bucket;
+pub(crate) mod common;
 pub(crate) mod encryption {}
-pub(crate) mod multipart {}
+pub(crate) mod multipart;
 /// Object helper facade placeholder.
 ///
 /// Read-path helpers shared across storage components should live in neutral
