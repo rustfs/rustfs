@@ -14,6 +14,10 @@
 
 use s3s::dto::{Initiator, Owner};
 
+// Stable owner identity used in S3 response payloads (for example ACL, ListBuckets, and multipart listings).
+// RustFS currently does not maintain a persistent per-tenant canonical owner ID, so we keep a deterministic
+// placeholder to preserve response compatibility and test stability.
+// This value is metadata-only and must not be used for authentication/authorization decisions.
 pub(crate) const RUSTFS_OWNER_DISPLAY_NAME: &str = "rustfs";
 pub(crate) const RUSTFS_OWNER_ID: &str = "c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66";
 

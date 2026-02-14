@@ -166,6 +166,7 @@ macro_rules! try_ {
     };
 }
 
+// Shared owner metadata source for S3 response compatibility.
 pub(crate) static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(rustfs_owner);
 
 #[derive(Debug, Clone)]
