@@ -198,11 +198,19 @@ pub fn check_format_erasure_values(
         check_format_erasure_value(f)?;
 
         if formats.len() != f.erasure.sets.len() * f.erasure.sets[0].len() {
-            return Err(Error::other("formats length for erasure.sets not mtach"));
+            return Err(Error::other(format!(
+                "formats length mismatch: got {}, expected {}",
+                formats.len(),
+                f.erasure.sets.len() * f.erasure.sets[0].len()
+            )));
         }
 
         if f.erasure.sets[0].len() != set_drive_count {
-            return Err(Error::other("erasure set length not match set_drive_count"));
+            return Err(Error::other(format!(
+                "erasure set length mismatch: got {}, expected {}",
+                f.erasure.sets[0].len(),
+                set_drive_count
+            )));
         }
     }
     Ok(())
