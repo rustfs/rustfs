@@ -14,7 +14,7 @@
 
 //! Quota admin handlers for HTTP API
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
@@ -215,20 +215,21 @@ impl Operation for GetBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
+        let bucket = params.get("bucket").unwrap_or("").to_string();
+        if bucket.is_empty() {
+            return Err(s3_error!(InvalidRequest, "bucket name is required"));
+        }
+
+        validate_admin_request_with_bucket(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
             None,
+            &bucket,
         )
         .await?;
-
-        let bucket = params.get("bucket").unwrap_or("").to_string();
-        if bucket.is_empty() {
-            return Err(s3_error!(InvalidRequest, "bucket name is required"));
-        }
 
         let metadata_sys_lock = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys
             .get()
@@ -343,20 +344,21 @@ impl Operation for GetBucketQuotaStatsHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
+        let bucket = params.get("bucket").unwrap_or("").to_string();
+        if bucket.is_empty() {
+            return Err(s3_error!(InvalidRequest, "bucket name is required"));
+        }
+
+        validate_admin_request_with_bucket(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
             None,
+            &bucket,
         )
         .await?;
-
-        let bucket = params.get("bucket").unwrap_or("").to_string();
-        if bucket.is_empty() {
-            return Err(s3_error!(InvalidRequest, "bucket name is required"));
-        }
 
         let metadata_sys_lock = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys
             .get()
@@ -410,20 +412,21 @@ impl Operation for CheckBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
+        let bucket = params.get("bucket").unwrap_or("").to_string();
+        if bucket.is_empty() {
+            return Err(s3_error!(InvalidRequest, "bucket name is required"));
+        }
+
+        validate_admin_request_with_bucket(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
             None,
+            &bucket,
         )
         .await?;
-
-        let bucket = params.get("bucket").unwrap_or("").to_string();
-        if bucket.is_empty() {
-            return Err(s3_error!(InvalidRequest, "bucket name is required"));
-        }
 
         let body = req
             .input
