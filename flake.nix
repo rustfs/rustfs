@@ -29,6 +29,7 @@
 
       perSystem =
         {
+          self',
           pkgs,
           system,
           ...
@@ -74,6 +75,20 @@
               license = pkgs.lib.licenses.asl20;
               mainProgram = "rustfs";
             };
+          };
+
+          devShells.default = pkgs.mkShell {
+            inputsFrom = [ self'.packages.default ];
+            packages = [
+              # this is required else manual compilation will fail
+              pkgs.rust-jemalloc-sys-unprefixed
+
+              # other rust tooling necessary for development
+              fnx.stable.clippy
+              fnx.stable.rust-analyzer
+              fnx.stable.rust-src
+              fnx.complete.rustfmt
+            ];
           };
         };
     };
