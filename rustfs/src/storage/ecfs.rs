@@ -22,6 +22,10 @@ use crate::storage::concurrency::{
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
+use crate::storage::readers::InMemoryAsyncReader;
+use crate::storage::s3_api::bucket::{build_list_objects_output, build_list_objects_v2_output};
+use crate::storage::s3_api::common::rustfs_owner;
+use crate::storage::s3_api::multipart::{build_list_multipart_uploads_output, build_list_parts_output};
 use crate::storage::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
     sse_prepare_encryption, strip_managed_encryption_metadata,
@@ -144,15 +148,11 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{
-    io::{AsyncRead, AsyncSeek},
-    sync::mpsc,
-};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
-use urlencoding::encode;
 use uuid::Uuid;
 
 macro_rules! try_ {
@@ -166,10 +166,8 @@ macro_rules! try_ {
     };
 }
 
-pub(crate) static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
-    display_name: Some("rustfs".to_owned()),
-    id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
-});
+// Shared owner metadata source for S3 response compatibility.
+pub(crate) static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(rustfs_owner);
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -180,44 +178,6 @@ pub struct FS {
 pub(crate) struct ListObjectUnorderedQuery {
     #[serde(rename = "allow-unordered")]
     pub(crate) allow_unordered: Option<String>,
-}
-
-pub(crate) struct InMemoryAsyncReader {
-    cursor: std::io::Cursor<Vec<u8>>,
-}
-
-impl InMemoryAsyncReader {
-    pub(crate) fn new(data: Vec<u8>) -> Self {
-        Self {
-            cursor: std::io::Cursor::new(data),
-        }
-    }
-}
-
-impl AsyncRead for InMemoryAsyncReader {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let unfilled = buf.initialize_unfilled();
-        let bytes_read = std::io::Read::read(&mut self.cursor, unfilled)?;
-        buf.advance(bytes_read);
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncSeek for InMemoryAsyncReader {
-    fn start_seek(mut self: std::pin::Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
-        // std::io::Cursor natively supports negative SeekCurrent offsets
-        // It will automatically handle validation and return an error if the final position would be negative
-        std::io::Seek::seek(&mut self.cursor, position)?;
-        Ok(())
-    }
-
-    fn poll_complete(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<u64>> {
-        std::task::Poll::Ready(Ok(self.cursor.position()))
-    }
 }
 
 impl FS {
@@ -3627,36 +3587,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let output = ListMultipartUploadsOutput {
-            bucket: Some(bucket),
-            prefix: Some(prefix),
-            delimiter: result.delimiter,
-            key_marker: result.key_marker,
-            upload_id_marker: result.upload_id_marker,
-            max_uploads: Some(result.max_uploads as i32),
-            is_truncated: Some(result.is_truncated),
-            uploads: Some(
-                result
-                    .uploads
-                    .into_iter()
-                    .map(|u| MultipartUpload {
-                        key: Some(u.object),
-                        upload_id: Some(u.upload_id),
-                        initiated: u.initiated.map(Timestamp::from),
-
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            common_prefixes: Some(
-                result
-                    .common_prefixes
-                    .into_iter()
-                    .map(|c| CommonPrefix { prefix: Some(c) })
-                    .collect(),
-            ),
-            ..Default::default()
-        };
+        let output = build_list_multipart_uploads_output(bucket, prefix, result);
 
         Ok(S3Response::new(output))
     }
@@ -3764,58 +3695,7 @@ impl S3 for FS {
             }))
             .await?;
 
-        Ok(v2_resp.map_output(|v2| {
-            // For ListObjects (v1) API, NextMarker should be the last item returned when truncated
-            // When both Contents and CommonPrefixes are present, NextMarker should be the
-            // lexicographically last item (either last key or last prefix)
-            let next_marker = if v2.is_truncated.unwrap_or(false) {
-                let last_key = v2
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.last())
-                    .and_then(|obj| obj.key.as_ref())
-                    .cloned();
-
-                let last_prefix = v2
-                    .common_prefixes
-                    .as_ref()
-                    .and_then(|prefixes| prefixes.last())
-                    .and_then(|prefix| prefix.prefix.as_ref())
-                    .cloned();
-
-                // NextMarker should be the lexicographically last item
-                // This matches S3 standard behavior
-                match (last_key, last_prefix) {
-                    (Some(k), Some(p)) => {
-                        // Return the lexicographically greater one
-                        if k > p { Some(k) } else { Some(p) }
-                    }
-                    (Some(k), None) => Some(k),
-                    (None, Some(p)) => Some(p),
-                    (None, None) => None,
-                }
-            } else {
-                None
-            };
-
-            // S3 API requires marker field in response, echoing back the request marker
-            // If no marker was provided in request, return empty string per S3 standard
-            let marker = Some(request_marker.unwrap_or_default());
-
-            ListObjectsOutput {
-                contents: v2.contents,
-                delimiter: v2.delimiter,
-                encoding_type: v2.encoding_type,
-                name: v2.name,
-                prefix: v2.prefix,
-                max_keys: v2.max_keys,
-                common_prefixes: v2.common_prefixes,
-                is_truncated: v2.is_truncated,
-                marker,
-                next_marker,
-                ..Default::default()
-            }
-        }))
+        Ok(v2_resp.map_output(move |v2| build_list_objects_output(v2, request_marker.clone())))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -3891,84 +3771,18 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        // warn!("object_infos objects {:?}", object_infos.objects);
-
-        // Apply URL encoding if encoding_type is "url"
-        // Note: S3 URL encoding should encode special characters but preserve path separators (/)
-        let should_encode = encoding_type.as_ref().map(|e| e.as_str() == "url").unwrap_or(false);
-
-        // Helper function to encode S3 keys/prefixes (preserving /)
-        // S3 URL encoding encodes special characters but keeps '/' unencoded
-        let encode_s3_name = |name: &str| -> String {
-            name.split('/')
-                .map(|part| encode(part).to_string())
-                .collect::<Vec<_>>()
-                .join("/")
-        };
-
-        let objects: Vec<Object> = object_infos
-            .objects
-            .iter()
-            .filter(|v| !v.name.is_empty())
-            .map(|v| {
-                let key = if should_encode {
-                    encode_s3_name(&v.name)
-                } else {
-                    v.name.to_owned()
-                };
-                let mut obj = Object {
-                    key: Some(key),
-                    last_modified: v.mod_time.map(Timestamp::from),
-                    size: Some(v.get_actual_size().unwrap_or_default()),
-                    e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                    storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
-                    ..Default::default()
-                };
-
-                if fetch_owner.is_some_and(|v| v) {
-                    obj.owner = Some(Owner {
-                        display_name: Some("rustfs".to_owned()),
-                        id: Some("v0.1".to_owned()),
-                    });
-                }
-                obj
-            })
-            .collect();
-
-        let common_prefixes: Vec<CommonPrefix> = object_infos
-            .prefixes
-            .into_iter()
-            .map(|v| {
-                let prefix = if should_encode { encode_s3_name(&v) } else { v };
-                CommonPrefix { prefix: Some(prefix) }
-            })
-            .collect();
-
-        // KeyCount should include both objects and common prefixes per S3 API spec
-        let key_count = (objects.len() + common_prefixes.len()) as i32;
-
-        // Encode next_continuation_token to base64
-        let next_continuation_token = object_infos
-            .next_continuation_token
-            .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
-
-        let output = ListObjectsV2Output {
-            is_truncated: Some(object_infos.is_truncated),
-            continuation_token: response_continuation_token,
-            next_continuation_token,
-            start_after: response_start_after,
-            key_count: Some(key_count),
-            max_keys: Some(max_keys),
-            contents: Some(objects),
+        let output = build_list_objects_v2_output(
+            object_infos,
+            fetch_owner.unwrap_or_default(),
+            max_keys,
+            bucket,
+            prefix,
             delimiter,
-            encoding_type: encoding_type.clone(),
-            name: Some(bucket),
-            prefix: Some(prefix),
-            common_prefixes: Some(common_prefixes),
-            ..Default::default()
-        };
+            encoding_type,
+            response_continuation_token,
+            response_start_after,
+        );
 
-        // let output = ListObjectsV2Output { ..Default::default() };
         Ok(S3Response::new(output))
     }
 
@@ -4003,38 +3817,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let output = ListPartsOutput {
-            bucket: Some(res.bucket),
-            key: Some(res.object),
-            upload_id: Some(res.upload_id),
-            parts: Some(
-                res.parts
-                    .into_iter()
-                    .map(|p| Part {
-                        e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
-                        last_modified: p.last_mod.map(Timestamp::from),
-                        part_number: Some(p.part_num as i32),
-                        size: Some(p.size as i64),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            initiator: Some(Initiator {
-                id: RUSTFS_OWNER.id.clone(),
-                display_name: RUSTFS_OWNER.display_name.clone(),
-            }),
-            is_truncated: Some(res.is_truncated),
-            next_part_number_marker: res.next_part_number_marker.try_into().ok(),
-            max_parts: res.max_parts.try_into().ok(),
-            part_number_marker: res.part_number_marker.try_into().ok(),
-            storage_class: if res.storage_class.is_empty() {
-                None
-            } else {
-                Some(res.storage_class.into())
-            },
-            ..Default::default()
-        };
+        let output = build_list_parts_output(res);
         Ok(S3Response::new(output))
     }
 

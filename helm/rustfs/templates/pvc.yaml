@@ -6,6 +6,7 @@ metadata:
   annotations:
     helm.sh/resource-policy: keep
   name: {{ include "rustfs.fullname" $ }}-data
+  namespace: {{ $.Release.Namespace }}
   labels:
     {{- toYaml $.Values.commonLabels | nindent 4 }}
 spec:
@@ -25,6 +26,7 @@ metadata:
   annotations:
     helm.sh/resource-policy: keep
   name: {{ include "rustfs.fullname" $ }}-logs
+  namespace: {{ $.Release.Namespace }}
   labels:
     {{- toYaml $.Values.commonLabels | nindent 4 }}
 spec:
