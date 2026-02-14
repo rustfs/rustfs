@@ -25,7 +25,7 @@ use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
 use crate::storage::s3_api::bucket::{build_list_objects_output, build_list_objects_v2_output};
 use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::s3_api::multipart::build_list_parts_output;
+use crate::storage::s3_api::multipart::{build_list_multipart_uploads_output, build_list_parts_output};
 use crate::storage::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
     sse_prepare_encryption, strip_managed_encryption_metadata,
@@ -3587,36 +3587,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let output = ListMultipartUploadsOutput {
-            bucket: Some(bucket),
-            prefix: Some(prefix),
-            delimiter: result.delimiter,
-            key_marker: result.key_marker,
-            upload_id_marker: result.upload_id_marker,
-            max_uploads: Some(result.max_uploads as i32),
-            is_truncated: Some(result.is_truncated),
-            uploads: Some(
-                result
-                    .uploads
-                    .into_iter()
-                    .map(|u| MultipartUpload {
-                        key: Some(u.object),
-                        upload_id: Some(u.upload_id),
-                        initiated: u.initiated.map(Timestamp::from),
-
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            common_prefixes: Some(
-                result
-                    .common_prefixes
-                    .into_iter()
-                    .map(|c| CommonPrefix { prefix: Some(c) })
-                    .collect(),
-            ),
-            ..Default::default()
-        };
+        let output = build_list_multipart_uploads_output(bucket, prefix, result);
 
         Ok(S3Response::new(output))
     }
