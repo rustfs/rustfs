@@ -229,7 +229,7 @@ impl ECStore {
                         Ok(fm) => break Ok(fm),
                         // Wrap the final error if we are giving up
                         Err(e) if times >= 10 => {
-                            break Err(Error::other(format!("can not get formats after {} retries, last error: {e}", times + 1)));
+                            break Err(Error::other(format!("can not get formats after {} retries, last error: {e}", times)));
                         }
                         // Retrying so just drop the error
                         Err(_) => {}
