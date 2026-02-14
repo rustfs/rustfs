@@ -14,8 +14,8 @@
 
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::store_api::ListPartsInfo;
-use s3s::dto::{ListPartsOutput, Part, Timestamp};
+use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo};
+use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
 
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
     let owner = rustfs_owner();
@@ -52,11 +52,49 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
     }
 }
 
+pub(crate) fn build_list_multipart_uploads_output(
+    bucket: String,
+    prefix: String,
+    result: ListMultipartsInfo,
+) -> ListMultipartUploadsOutput {
+    ListMultipartUploadsOutput {
+        bucket: Some(bucket),
+        prefix: Some(prefix),
+        delimiter: result.delimiter,
+        key_marker: result.key_marker,
+        upload_id_marker: result.upload_id_marker,
+        max_uploads: Some(result.max_uploads as i32),
+        is_truncated: Some(result.is_truncated),
+        uploads: Some(
+            result
+                .uploads
+                .into_iter()
+                .map(|u| MultipartUpload {
+                    key: Some(u.object),
+                    upload_id: Some(u.upload_id),
+                    initiated: u.initiated.map(Timestamp::from),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        common_prefixes: Some(
+            result
+                .common_prefixes
+                .into_iter()
+                .map(|c| CommonPrefix { prefix: Some(c) })
+                .collect(),
+        ),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::build_list_parts_output;
+    use super::{build_list_multipart_uploads_output, build_list_parts_output};
     use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-    use rustfs_ecstore::store_api::{ListPartsInfo, PartInfo};
+    use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
+    use s3s::dto::Timestamp;
+    use time::OffsetDateTime;
 
     #[test]
     fn test_list_parts_output_maps_parts_and_owner() {
@@ -122,5 +160,46 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part_number, None);
         assert_eq!(parts[0].size, None);
+    }
+
+    #[test]
+    fn test_list_multipart_uploads_output_maps_uploads_and_prefixes() {
+        let result = ListMultipartsInfo {
+            delimiter: Some("/".to_string()),
+            key_marker: Some("key-marker".to_string()),
+            upload_id_marker: Some("upload-id-marker".to_string()),
+            max_uploads: 1000,
+            is_truncated: true,
+            uploads: vec![MultipartInfo {
+                object: "obj-a".to_string(),
+                upload_id: "upload-a".to_string(),
+                initiated: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            }],
+            common_prefixes: vec!["prefix-a/".to_string(), "prefix-b/".to_string()],
+            ..Default::default()
+        };
+
+        let output = build_list_multipart_uploads_output("bucket-a".to_string(), "root/".to_string(), result);
+
+        let uploads = output.uploads.as_ref().expect("uploads should be present");
+        let common_prefixes = output.common_prefixes.as_ref().expect("common prefixes should be present");
+
+        assert_eq!(output.bucket.as_deref(), Some("bucket-a"));
+        assert_eq!(output.prefix.as_deref(), Some("root/"));
+        assert_eq!(output.delimiter.as_deref(), Some("/"));
+        assert_eq!(output.key_marker.as_deref(), Some("key-marker"));
+        assert_eq!(output.upload_id_marker.as_deref(), Some("upload-id-marker"));
+        assert_eq!(output.max_uploads, Some(1000));
+        assert_eq!(output.is_truncated, Some(true));
+
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].key.as_deref(), Some("obj-a"));
+        assert_eq!(uploads[0].upload_id.as_deref(), Some("upload-a"));
+        assert_eq!(uploads[0].initiated, Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
+
+        assert_eq!(common_prefixes.len(), 2);
+        assert_eq!(common_prefixes[0].prefix.as_deref(), Some("prefix-a/"));
+        assert_eq!(common_prefixes[1].prefix.as_deref(), Some("prefix-b/"));
     }
 }
