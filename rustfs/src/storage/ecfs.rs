@@ -22,6 +22,13 @@ use crate::storage::concurrency::{
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
+use crate::storage::readers::InMemoryAsyncReader;
+use crate::storage::s3_api::bucket::{build_list_objects_output, build_list_objects_v2_output};
+use crate::storage::s3_api::common::rustfs_owner;
+use crate::storage::s3_api::multipart::{build_list_multipart_uploads_output, build_list_parts_output, parse_list_parts_params};
+use crate::storage::s3_api::response::{
+    access_denied_error, map_abort_multipart_upload_error, not_initialized_error, s3_response,
+};
 use crate::storage::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
     sse_prepare_encryption, strip_managed_encryption_metadata,
@@ -144,15 +151,11 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{
-    io::{AsyncRead, AsyncSeek},
-    sync::mpsc,
-};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
-use urlencoding::encode;
 use uuid::Uuid;
 
 macro_rules! try_ {
@@ -166,10 +169,8 @@ macro_rules! try_ {
     };
 }
 
-pub(crate) static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
-    display_name: Some("rustfs".to_owned()),
-    id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
-});
+// Shared owner metadata source for S3 response compatibility.
+pub(crate) static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(rustfs_owner);
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -180,44 +181,6 @@ pub struct FS {
 pub(crate) struct ListObjectUnorderedQuery {
     #[serde(rename = "allow-unordered")]
     pub(crate) allow_unordered: Option<String>,
-}
-
-pub(crate) struct InMemoryAsyncReader {
-    cursor: std::io::Cursor<Vec<u8>>,
-}
-
-impl InMemoryAsyncReader {
-    pub(crate) fn new(data: Vec<u8>) -> Self {
-        Self {
-            cursor: std::io::Cursor::new(data),
-        }
-    }
-}
-
-impl AsyncRead for InMemoryAsyncReader {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let unfilled = buf.initialize_unfilled();
-        let bytes_read = std::io::Read::read(&mut self.cursor, unfilled)?;
-        buf.advance(bytes_read);
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncSeek for InMemoryAsyncReader {
-    fn start_seek(mut self: std::pin::Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
-        // std::io::Cursor natively supports negative SeekCurrent offsets
-        // It will automatically handle validation and return an error if the final position would be negative
-        std::io::Seek::seek(&mut self.cursor, position)?;
-        Ok(())
-    }
-
-    fn poll_complete(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<u64>> {
-        std::task::Poll::Ready(Ok(self.cursor.position()))
-    }
 }
 
 impl FS {
@@ -307,7 +270,7 @@ impl FS {
         })?;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let prefix = req
@@ -392,7 +355,7 @@ impl FS {
                     bucket_name: bucket.clone(),
                     object: _obj_info.clone(),
                     req_params: extract_params_header(&req.headers),
-                    resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
+                    resp_elements: extract_resp_elements(&s3_response(output.clone())),
                     version_id: version_id.clone(),
                     host: get_request_host(&req.headers),
                     port: get_request_port(&req.headers),
@@ -468,7 +431,7 @@ impl FS {
             checksum_crc64nvme,
             ..Default::default()
         };
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -505,7 +468,7 @@ impl S3 for FS {
         } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let opts = &ObjectOptions::default();
@@ -520,14 +483,8 @@ impl S3 for FS {
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
             .await
         {
-            Ok(_) => Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() })),
-            Err(err) => {
-                // Convert MalformedUploadID to NoSuchUpload for S3 API compatibility
-                if matches!(err, StorageError::MalformedUploadID(_)) {
-                    return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
-                }
-                Err(ApiError::from(err).into())
-            }
+            Ok(_) => Ok(s3_response(AbortMultipartUploadOutput { ..Default::default() })),
+            Err(err) => Err(map_abort_multipart_upload_error(err)),
         }
     }
 
@@ -551,7 +508,7 @@ impl S3 for FS {
 
         if if_match.is_some() || if_none_match.is_some() {
             let Some(store) = new_object_layer_fn() else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+                return Err(not_initialized_error());
             };
 
             match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
@@ -622,7 +579,7 @@ impl S3 for FS {
         // TODO: check object lock
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         // TDD: Get multipart info to extract encryption configuration before completing
@@ -804,9 +761,9 @@ impl S3 for FS {
             helper = helper.version_id(version_id.clone());
         }
 
-        let helper_result = Ok(S3Response::new(helper_output));
+        let helper_result = Ok(s3_response(helper_output));
         let _ = helper.complete(&helper_result);
-        Ok(S3Response::new(output))
+        Ok(s3_response(output))
     }
 
     /// Copy an object from one location to another
@@ -879,7 +836,7 @@ impl S3 for FS {
         }
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let h = HeaderMap::new();
@@ -1115,7 +1072,7 @@ impl S3 for FS {
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(object_info).version_id(version_id);
 
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -1134,7 +1091,7 @@ impl S3 for FS {
         } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         counter!("rustfs_create_bucket_total").increment(1);
@@ -1153,7 +1110,7 @@ impl S3 for FS {
 
         let output = CreateBucketOutput::default();
 
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -1189,7 +1146,7 @@ impl S3 for FS {
         // debug!("create_multipart_upload meta {:?}", &metadata);
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let mut metadata = extract_metadata(&req.headers);
@@ -1264,7 +1221,7 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -1276,7 +1233,7 @@ impl S3 for FS {
         let input = req.input.clone();
         // TODO: DeleteBucketInput doesn't have force parameter?
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         // get value from header, support mc style
@@ -1308,7 +1265,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let result = Ok(S3Response::new(DeleteBucketOutput {}));
+        let result = Ok(s3_response(DeleteBucketOutput {}));
         let _ = helper.complete(&result);
         result
     }
@@ -1318,7 +1275,7 @@ impl S3 for FS {
         let DeleteBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -1330,7 +1287,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketCorsOutput {}))
+        Ok(s3_response(DeleteBucketCorsOutput {}))
     }
 
     async fn delete_bucket_encryption(
@@ -1340,7 +1297,7 @@ impl S3 for FS {
         let DeleteBucketEncryptionInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -1351,7 +1308,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
+        Ok(s3_response(DeleteBucketEncryptionOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1362,7 +1319,7 @@ impl S3 for FS {
         let DeleteBucketLifecycleInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -1374,7 +1331,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
+        Ok(s3_response(DeleteBucketLifecycleOutput::default()))
     }
 
     async fn delete_bucket_policy(
@@ -1384,7 +1341,7 @@ impl S3 for FS {
         let DeleteBucketPolicyInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -1396,7 +1353,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketPolicyOutput {}))
+        Ok(s3_response(DeleteBucketPolicyOutput {}))
     }
 
     async fn delete_bucket_replication(
@@ -1406,7 +1363,7 @@ impl S3 for FS {
         let DeleteBucketReplicationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -1420,7 +1377,7 @@ impl S3 for FS {
         // TODO: remove targets
         error!("delete bucket");
 
-        Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
+        Ok(s3_response(DeleteBucketReplicationOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1434,7 +1391,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
+        Ok(s3_response(DeleteBucketTaggingOutput {}))
     }
 
     /// Delete an object
@@ -1485,7 +1442,7 @@ impl S3 for FS {
         }
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         // Check Object Lock retention before deletion
@@ -1592,7 +1549,7 @@ impl S3 for FS {
             .object(obj_info)
             .version_id(version_id.map(|v| v.to_string()).unwrap_or_default());
 
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -1613,7 +1570,7 @@ impl S3 for FS {
 
         let Some(store) = new_object_layer_fn() else {
             error!("Store not initialized");
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         // Support versioned objects
@@ -1648,7 +1605,7 @@ impl S3 for FS {
         let version_id_resp = version_id.clone().unwrap_or_default();
         helper = helper.version_id(version_id_resp);
 
-        let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
+        let result = Ok(s3_response(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
         let duration = start_time.elapsed();
         histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "delete").record(duration.as_secs_f64());
@@ -1686,7 +1643,7 @@ impl S3 for FS {
         .await;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
@@ -1968,7 +1925,7 @@ impl S3 for FS {
                     )
                     .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
                     .req_params(extract_params_header(&req_headers))
-                    .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
+                    .resp_elements(extract_resp_elements(&s3_response(DeleteObjectsOutput::default())))
                     .host(get_request_host(&req_headers))
                     .user_agent(get_request_user_agent(&req_headers))
                     .build();
@@ -1978,7 +1935,7 @@ impl S3 for FS {
             }
         });
 
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -1987,7 +1944,7 @@ impl S3 for FS {
         let GetBucketAclInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -2006,7 +1963,7 @@ impl S3 for FS {
             permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
         }];
 
-        Ok(S3Response::new(GetBucketAclOutput {
+        Ok(s3_response(GetBucketAclOutput {
             grants: Some(grants),
             owner: Some(RUSTFS_OWNER.to_owned()),
         }))
@@ -2037,7 +1994,7 @@ impl S3 for FS {
             }
         };
 
-        Ok(S3Response::new(GetBucketCorsOutput {
+        Ok(s3_response(GetBucketCorsOutput {
             cors_rules: Some(cors_configuration.cors_rules),
         }))
     }
@@ -2049,7 +2006,7 @@ impl S3 for FS {
         let GetBucketEncryptionInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -2068,7 +2025,7 @@ impl S3 for FS {
             }
         };
 
-        Ok(S3Response::new(GetBucketEncryptionOutput {
+        Ok(s3_response(GetBucketEncryptionOutput {
             server_side_encryption_configuration,
         }))
     }
@@ -2081,7 +2038,7 @@ impl S3 for FS {
         let GetBucketLifecycleConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -2098,7 +2055,7 @@ impl S3 for FS {
             }
         };
 
-        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
+        Ok(s3_response(GetBucketLifecycleConfigurationOutput {
             rules: Some(rules),
             ..Default::default()
         }))
@@ -2111,7 +2068,7 @@ impl S3 for FS {
         let input = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -2120,13 +2077,13 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         if let Some(region) = rustfs_ecstore::global::get_global_region() {
-            return Ok(S3Response::new(GetBucketLocationOutput {
+            return Ok(s3_response(GetBucketLocationOutput {
                 location_constraint: Some(BucketLocationConstraint::from(region)),
             }));
         }
 
         let output = GetBucketLocationOutput::default();
-        Ok(S3Response::new(output))
+        Ok(s3_response(output))
     }
 
     async fn get_bucket_notification_configuration(
@@ -2136,7 +2093,7 @@ impl S3 for FS {
         let GetBucketNotificationConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -2158,14 +2115,14 @@ impl S3 for FS {
             topic_configurations,
         }) = has_notification_config
         {
-            Ok(S3Response::new(GetBucketNotificationConfigurationOutput {
+            Ok(s3_response(GetBucketNotificationConfigurationOutput {
                 event_bridge_configuration,
                 lambda_function_configurations,
                 queue_configurations,
                 topic_configurations,
             }))
         } else {
-            Ok(S3Response::new(GetBucketNotificationConfigurationOutput::default()))
+            Ok(s3_response(GetBucketNotificationConfigurationOutput::default()))
         }
     }
 
@@ -2173,7 +2130,7 @@ impl S3 for FS {
         let GetBucketPolicyInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -2193,7 +2150,7 @@ impl S3 for FS {
             }
         };
 
-        Ok(S3Response::new(GetBucketPolicyOutput {
+        Ok(s3_response(GetBucketPolicyOutput {
             policy: Some(policy_str),
         }))
     }
@@ -2205,7 +2162,7 @@ impl S3 for FS {
         let GetBucketPolicyStatusInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -2246,7 +2203,7 @@ impl S3 for FS {
             }),
         };
 
-        Ok(S3Response::new(output))
+        Ok(s3_response(output))
     }
 
     async fn get_bucket_replication(
@@ -2256,7 +2213,7 @@ impl S3 for FS {
         let GetBucketReplicationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -2285,12 +2242,12 @@ impl S3 for FS {
             ));
         }
 
-        // Ok(S3Response::new(GetBucketReplicationOutput {
+        // Ok(s3_response(GetBucketReplicationOutput {
         //     replication_configuration: rcfg,
         // }))
 
         if rcfg.is_some() {
-            Ok(S3Response::new(GetBucketReplicationOutput {
+            Ok(s3_response(GetBucketReplicationOutput {
                 replication_configuration: rcfg,
             }))
         } else {
@@ -2298,7 +2255,7 @@ impl S3 for FS {
                 role: "".to_string(),
                 rules: vec![],
             };
-            Ok(S3Response::new(GetBucketReplicationOutput {
+            Ok(s3_response(GetBucketReplicationOutput {
                 replication_configuration: Some(rep),
             }))
         }
@@ -2326,7 +2283,7 @@ impl S3 for FS {
             }
         };
 
-        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
+        Ok(s3_response(GetBucketTaggingOutput { tag_set }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2336,7 +2293,7 @@ impl S3 for FS {
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
         let GetBucketVersioningInput { bucket, .. } = req.input;
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -2346,7 +2303,7 @@ impl S3 for FS {
 
         let VersioningConfiguration { status, .. } = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
 
-        Ok(S3Response::new(GetBucketVersioningOutput {
+        Ok(s3_response(GetBucketVersioningOutput {
             status,
             ..Default::default()
         }))
@@ -2484,7 +2441,7 @@ impl S3 for FS {
             // S3 bucket notifications (s3:GetObject events) are triggered.
             // This ensures event-driven workflows (Lambda, SNS) work correctly
             // for both cache hits and misses.
-            let result = Ok(S3Response::new(output));
+            let result = Ok(s3_response(output));
             let _ = helper.complete(&result);
             return result;
         }
@@ -2931,7 +2888,7 @@ impl S3 for FS {
         let GetObjectAclInput { bucket, key, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
@@ -2949,7 +2906,7 @@ impl S3 for FS {
             permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
         }];
 
-        Ok(S3Response::new(GetObjectAclOutput {
+        Ok(s3_response(GetObjectAclOutput {
             grants: Some(grants),
             owner: Some(RUSTFS_OWNER.to_owned()),
             ..Default::default()
@@ -2964,7 +2921,7 @@ impl S3 for FS {
         let GetObjectAttributesInput { bucket, key, .. } = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         if let Err(e) = store
@@ -2989,7 +2946,7 @@ impl S3 for FS {
             })
             .version_id(version_id);
 
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -3004,7 +2961,7 @@ impl S3 for FS {
         } = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let _ = store
@@ -3044,7 +3001,7 @@ impl S3 for FS {
         let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
         helper = helper.object(object_info).version_id(version_id);
 
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -3075,7 +3032,7 @@ impl S3 for FS {
 
         // warn!("object_lock_configuration {:?}", &object_lock_configuration);
 
-        Ok(S3Response::new(GetObjectLockConfigurationOutput {
+        Ok(s3_response(GetObjectLockConfigurationOutput {
             object_lock_configuration,
         }))
     }
@@ -3090,7 +3047,7 @@ impl S3 for FS {
         } = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         // check object lock
@@ -3122,7 +3079,7 @@ impl S3 for FS {
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(object_info).version_id(version_id);
 
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -3136,7 +3093,7 @@ impl S3 for FS {
 
         let Some(store) = new_object_layer_fn() else {
             error!("Store not initialized");
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         // Support versioned objects
@@ -3162,7 +3119,7 @@ impl S3 for FS {
         counter!("rustfs.get_object_tagging.success").increment(1);
         let duration = start_time.elapsed();
         histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
-        Ok(S3Response::new(GetObjectTaggingOutput {
+        Ok(s3_response(GetObjectTaggingOutput {
             tag_set,
             version_id: req.input.version_id.clone(),
         }))
@@ -3181,7 +3138,7 @@ impl S3 for FS {
         let input = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -3190,7 +3147,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
         // mc cp step 2 GetBucketInfo
 
-        Ok(S3Response::new(HeadBucketOutput::default()))
+        Ok(s3_response(HeadBucketOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -3237,7 +3194,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
         // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
         let info = match store.get_object_info(&bucket, &key, &opts).await {
@@ -3532,13 +3489,13 @@ impl S3 for FS {
         // mc ls
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let mut req = req;
 
         if req.credentials.as_ref().is_none_or(|cred| cred.access_key.is_empty()) {
-            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+            return Err(access_denied_error());
         }
 
         let bucket_infos = if let Err(e) = authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction)).await {
@@ -3570,7 +3527,7 @@ impl S3 for FS {
                 .await;
 
             if list_bucket_infos.is_empty() {
-                return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+                return Err(access_denied_error());
             }
             list_bucket_infos
         } else {
@@ -3591,7 +3548,7 @@ impl S3 for FS {
             owner: Some(RUSTFS_OWNER.to_owned()),
             ..Default::default()
         };
-        Ok(S3Response::new(output))
+        Ok(s3_response(output))
     }
 
     async fn list_multipart_uploads(
@@ -3609,7 +3566,7 @@ impl S3 for FS {
         } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let prefix = prefix.unwrap_or_default();
@@ -3627,38 +3584,9 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let output = ListMultipartUploadsOutput {
-            bucket: Some(bucket),
-            prefix: Some(prefix),
-            delimiter: result.delimiter,
-            key_marker: result.key_marker,
-            upload_id_marker: result.upload_id_marker,
-            max_uploads: Some(result.max_uploads as i32),
-            is_truncated: Some(result.is_truncated),
-            uploads: Some(
-                result
-                    .uploads
-                    .into_iter()
-                    .map(|u| MultipartUpload {
-                        key: Some(u.object),
-                        upload_id: Some(u.upload_id),
-                        initiated: u.initiated.map(Timestamp::from),
+        let output = build_list_multipart_uploads_output(bucket, prefix, result);
 
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            common_prefixes: Some(
-                result
-                    .common_prefixes
-                    .into_iter()
-                    .map(|c| CommonPrefix { prefix: Some(c) })
-                    .collect(),
-            ),
-            ..Default::default()
-        };
-
-        Ok(S3Response::new(output))
+        Ok(s3_response(output))
     }
 
     async fn list_object_versions(
@@ -3747,7 +3675,7 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        Ok(S3Response::new(output))
+        Ok(s3_response(output))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -3764,58 +3692,7 @@ impl S3 for FS {
             }))
             .await?;
 
-        Ok(v2_resp.map_output(|v2| {
-            // For ListObjects (v1) API, NextMarker should be the last item returned when truncated
-            // When both Contents and CommonPrefixes are present, NextMarker should be the
-            // lexicographically last item (either last key or last prefix)
-            let next_marker = if v2.is_truncated.unwrap_or(false) {
-                let last_key = v2
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.last())
-                    .and_then(|obj| obj.key.as_ref())
-                    .cloned();
-
-                let last_prefix = v2
-                    .common_prefixes
-                    .as_ref()
-                    .and_then(|prefixes| prefixes.last())
-                    .and_then(|prefix| prefix.prefix.as_ref())
-                    .cloned();
-
-                // NextMarker should be the lexicographically last item
-                // This matches S3 standard behavior
-                match (last_key, last_prefix) {
-                    (Some(k), Some(p)) => {
-                        // Return the lexicographically greater one
-                        if k > p { Some(k) } else { Some(p) }
-                    }
-                    (Some(k), None) => Some(k),
-                    (None, Some(p)) => Some(p),
-                    (None, None) => None,
-                }
-            } else {
-                None
-            };
-
-            // S3 API requires marker field in response, echoing back the request marker
-            // If no marker was provided in request, return empty string per S3 standard
-            let marker = Some(request_marker.unwrap_or_default());
-
-            ListObjectsOutput {
-                contents: v2.contents,
-                delimiter: v2.delimiter,
-                encoding_type: v2.encoding_type,
-                name: v2.name,
-                prefix: v2.prefix,
-                max_keys: v2.max_keys,
-                common_prefixes: v2.common_prefixes,
-                is_truncated: v2.is_truncated,
-                marker,
-                next_marker,
-                ..Default::default()
-            }
-        }))
+        Ok(v2_resp.map_output(move |v2| build_list_objects_output(v2, request_marker.clone())))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -3891,85 +3768,19 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        // warn!("object_infos objects {:?}", object_infos.objects);
-
-        // Apply URL encoding if encoding_type is "url"
-        // Note: S3 URL encoding should encode special characters but preserve path separators (/)
-        let should_encode = encoding_type.as_ref().map(|e| e.as_str() == "url").unwrap_or(false);
-
-        // Helper function to encode S3 keys/prefixes (preserving /)
-        // S3 URL encoding encodes special characters but keeps '/' unencoded
-        let encode_s3_name = |name: &str| -> String {
-            name.split('/')
-                .map(|part| encode(part).to_string())
-                .collect::<Vec<_>>()
-                .join("/")
-        };
-
-        let objects: Vec<Object> = object_infos
-            .objects
-            .iter()
-            .filter(|v| !v.name.is_empty())
-            .map(|v| {
-                let key = if should_encode {
-                    encode_s3_name(&v.name)
-                } else {
-                    v.name.to_owned()
-                };
-                let mut obj = Object {
-                    key: Some(key),
-                    last_modified: v.mod_time.map(Timestamp::from),
-                    size: Some(v.get_actual_size().unwrap_or_default()),
-                    e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                    storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
-                    ..Default::default()
-                };
-
-                if fetch_owner.is_some_and(|v| v) {
-                    obj.owner = Some(Owner {
-                        display_name: Some("rustfs".to_owned()),
-                        id: Some("v0.1".to_owned()),
-                    });
-                }
-                obj
-            })
-            .collect();
-
-        let common_prefixes: Vec<CommonPrefix> = object_infos
-            .prefixes
-            .into_iter()
-            .map(|v| {
-                let prefix = if should_encode { encode_s3_name(&v) } else { v };
-                CommonPrefix { prefix: Some(prefix) }
-            })
-            .collect();
-
-        // KeyCount should include both objects and common prefixes per S3 API spec
-        let key_count = (objects.len() + common_prefixes.len()) as i32;
-
-        // Encode next_continuation_token to base64
-        let next_continuation_token = object_infos
-            .next_continuation_token
-            .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
-
-        let output = ListObjectsV2Output {
-            is_truncated: Some(object_infos.is_truncated),
-            continuation_token: response_continuation_token,
-            next_continuation_token,
-            start_after: response_start_after,
-            key_count: Some(key_count),
-            max_keys: Some(max_keys),
-            contents: Some(objects),
+        let output = build_list_objects_v2_output(
+            object_infos,
+            fetch_owner.unwrap_or_default(),
+            max_keys,
+            bucket,
+            prefix,
             delimiter,
-            encoding_type: encoding_type.clone(),
-            name: Some(bucket),
-            prefix: Some(prefix),
-            common_prefixes: Some(common_prefixes),
-            ..Default::default()
-        };
+            encoding_type,
+            response_continuation_token,
+            response_start_after,
+        );
 
-        // let output = ListObjectsV2Output { ..Default::default() };
-        Ok(S3Response::new(output))
+        Ok(s3_response(output))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -3984,58 +3795,18 @@ impl S3 for FS {
         } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
-        let part_number_marker = part_number_marker.map(|x| x as usize);
-        let max_parts = match max_parts {
-            Some(parts) => {
-                if !(1..=1000).contains(&parts) {
-                    return Err(s3_error!(InvalidArgument, "max-parts must be between 1 and 1000"));
-                }
-                parts as usize
-            }
-            None => 1000,
-        };
+        let (part_number_marker, max_parts) = parse_list_parts_params(part_number_marker, max_parts)?;
 
         let res = store
             .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let output = ListPartsOutput {
-            bucket: Some(res.bucket),
-            key: Some(res.object),
-            upload_id: Some(res.upload_id),
-            parts: Some(
-                res.parts
-                    .into_iter()
-                    .map(|p| Part {
-                        e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
-                        last_modified: p.last_mod.map(Timestamp::from),
-                        part_number: Some(p.part_num as i32),
-                        size: Some(p.size as i64),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            initiator: Some(Initiator {
-                id: RUSTFS_OWNER.id.clone(),
-                display_name: RUSTFS_OWNER.display_name.clone(),
-            }),
-            is_truncated: Some(res.is_truncated),
-            next_part_number_marker: res.next_part_number_marker.try_into().ok(),
-            max_parts: res.max_parts.try_into().ok(),
-            part_number_marker: res.part_number_marker.try_into().ok(),
-            storage_class: if res.storage_class.is_empty() {
-                None
-            } else {
-                Some(res.storage_class.into())
-            },
-            ..Default::default()
-        };
-        Ok(S3Response::new(output))
+        let output = build_list_parts_output(res);
+        Ok(s3_response(output))
     }
 
     async fn put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
@@ -4049,7 +3820,7 @@ impl S3 for FS {
         // TODO:checkRequestAuthType
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -4078,7 +3849,7 @@ impl S3 for FS {
                 return Err(s3_error!(NotImplemented));
             }
         }
-        Ok(S3Response::new(PutBucketAclOutput::default()))
+        Ok(s3_response(PutBucketAclOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -4090,7 +3861,7 @@ impl S3 for FS {
         } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -4104,7 +3875,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(PutBucketCorsOutput::default()))
+        Ok(s3_response(PutBucketCorsOutput::default()))
     }
 
     async fn put_bucket_encryption(
@@ -4120,7 +3891,7 @@ impl S3 for FS {
         info!("sse_config {:?}", &server_side_encryption_configuration);
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -4134,7 +3905,7 @@ impl S3 for FS {
         metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
             .await
             .map_err(ApiError::from)?;
-        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
+        Ok(s3_response(PutBucketEncryptionOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -4168,7 +3939,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
+        Ok(s3_response(PutBucketLifecycleConfigurationOutput::default()))
     }
 
     async fn put_bucket_notification_configuration(
@@ -4182,7 +3953,7 @@ impl S3 for FS {
         } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         //  Verify that the bucket exists
@@ -4240,14 +4011,14 @@ impl S3 for FS {
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
 
-        Ok(S3Response::new(PutBucketNotificationConfigurationOutput {}))
+        Ok(s3_response(PutBucketNotificationConfigurationOutput {}))
     }
 
     async fn put_bucket_policy(&self, req: S3Request<PutBucketPolicyInput>) -> S3Result<S3Response<PutBucketPolicyOutput>> {
         let PutBucketPolicyInput { bucket, policy, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -4265,13 +4036,15 @@ impl S3 for FS {
             return Err(s3_error!(MalformedPolicy));
         }
 
-        let data = serde_json::to_vec(&cfg).map_err(|e| s3_error!(InternalError, "parse policy failed {:?}", e))?;
+        // Preserve the original JSON text so GetBucketPolicy can return byte-for-byte content.
+        // s3-tests expects exact string round-trip equality.
+        let data = policy.into_bytes();
 
         metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(PutBucketPolicyOutput {}))
+        Ok(s3_response(PutBucketPolicyOutput {}))
     }
 
     async fn put_bucket_replication(
@@ -4286,7 +4059,7 @@ impl S3 for FS {
         warn!("put bucket replication");
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -4301,7 +4074,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(PutBucketReplicationOutput::default()))
+        Ok(s3_response(PutBucketReplicationOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -4309,7 +4082,7 @@ impl S3 for FS {
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -4323,7 +4096,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(Default::default()))
+        Ok(s3_response(Default::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -4350,7 +4123,7 @@ impl S3 for FS {
 
         // TODO: globalSiteReplicationSys.BucketMetaHook
 
-        Ok(S3Response::new(PutBucketVersioningOutput {}))
+        Ok(s3_response(PutBucketVersioningOutput {}))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -4368,7 +4141,7 @@ impl S3 for FS {
         } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
@@ -4396,7 +4169,7 @@ impl S3 for FS {
                 return Err(s3_error!(NotImplemented));
             }
         }
-        Ok(S3Response::new(PutObjectAclOutput::default()))
+        Ok(s3_response(PutObjectAclOutput::default()))
     }
 
     async fn put_object_legal_hold(
@@ -4413,7 +4186,7 @@ impl S3 for FS {
         } = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let _ = store
@@ -4447,7 +4220,7 @@ impl S3 for FS {
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(info).version_id(version_id);
 
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -4466,7 +4239,7 @@ impl S3 for FS {
         let Some(input_cfg) = object_lock_configuration else { return Err(s3_error!(InvalidArgument)) };
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         store
@@ -4511,7 +4284,7 @@ impl S3 for FS {
                 .map_err(ApiError::from)?;
         }
 
-        Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
+        Ok(s3_response(PutObjectLockConfigurationOutput::default()))
     }
 
     async fn put_object_retention(
@@ -4528,7 +4301,7 @@ impl S3 for FS {
         } = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         // check object lock
@@ -4589,7 +4362,7 @@ impl S3 for FS {
         let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
         helper = helper.object(object_info).version_id(version_id);
 
-        let result = Ok(S3Response::new(output));
+        let result = Ok(s3_response(output));
         let _ = helper.complete(&result);
         result
     }
@@ -4615,7 +4388,7 @@ impl S3 for FS {
         }
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
@@ -4682,7 +4455,7 @@ impl S3 for FS {
         let version_id_resp = req.input.version_id.clone().unwrap_or_default();
         helper = helper.version_id(version_id_resp);
 
-        let result = Ok(S3Response::new(PutObjectTaggingOutput {
+        let result = Ok(s3_response(PutObjectTaggingOutput {
             version_id: req.input.version_id.clone(),
         }));
         let _ = helper.complete(&result);
@@ -4705,7 +4478,7 @@ impl S3 for FS {
         })?;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let version_id_str = version_id.clone().unwrap_or_default();
@@ -4807,7 +4580,7 @@ impl S3 for FS {
                     request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
                     restore_output_path: None,
                 };
-                return Ok(S3Response::new(output));
+                return Ok(s3_response(output));
             }
         }
 
@@ -4930,7 +4703,7 @@ impl S3 for FS {
             drop(tx);
         });
 
-        Ok(S3Response::new(SelectObjectContentOutput {
+        Ok(s3_response(SelectObjectContentOutput {
             payload: Some(SelectObjectContentEventStream::new(stream)),
         }))
     }
@@ -4988,7 +4761,7 @@ impl S3 for FS {
 
         // Get multipart info early to check if managed encryption will be applied
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         let opts = ObjectOptions::default();
@@ -5178,7 +4951,7 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        Ok(S3Response::new(output))
+        Ok(s3_response(output))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -5220,7 +4993,7 @@ impl S3 for FS {
         // Note: In a real implementation, you would properly validate access
         // For now, we'll skip the detailed authorization check
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(not_initialized_error());
         };
 
         // Check if multipart upload exists and get its info
@@ -5441,6 +5214,6 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        Ok(S3Response::new(output))
+        Ok(s3_response(output))
     }
 }

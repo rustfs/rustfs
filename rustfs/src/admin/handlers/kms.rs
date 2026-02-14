@@ -14,8 +14,9 @@
 
 //! KMS admin handlers for HTTP API
 
-use super::Operation;
+use super::{kms_dynamic, kms_keys, kms_management};
 use crate::admin::auth::validate_admin_request;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;
 use base64::Engine;
@@ -107,6 +108,14 @@ fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
         });
     }
     params
+}
+
+pub fn register_kms_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    kms_management::register_kms_management_route(r)?;
+    kms_dynamic::register_kms_dynamic_route(r)?;
+    kms_keys::register_kms_key_route(r)?;
+
+    Ok(())
 }
 
 /// Create a new KMS master key

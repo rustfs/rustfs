@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::{account_info, group, service_account, user_iam, user_lifecycle, user_policy_binding};
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation, utils::has_space_be},
+    admin::{
+        auth::validate_admin_request,
+        router::{AdminOperation, Operation, S3Router},
+        utils::has_space_be,
+    },
     auth::{check_key_valid, constant_time_eq, get_session_token},
     server::RemoteAddr,
 };
@@ -48,6 +53,17 @@ pub struct AddUserQuery {
     #[serde(rename = "accessKey")]
     pub access_key: Option<String>,
     pub status: Option<String>,
+}
+
+pub fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    account_info::register_account_info_route(r)?;
+    user_lifecycle::register_user_lifecycle_route(r)?;
+    group::register_group_management_route(r)?;
+    service_account::register_service_account_route(r)?;
+    user_iam::register_user_iam_route(r)?;
+    user_policy_binding::register_user_policy_binding_route(r)?;
+
+    Ok(())
 }
 
 pub struct AddUser {}

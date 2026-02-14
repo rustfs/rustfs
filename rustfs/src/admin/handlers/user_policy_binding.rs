@@ -12,23 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod access;
-pub mod concurrency;
-#[cfg(test)]
-mod concurrent_get_object_test;
-pub mod ecfs;
-mod ecfs_extend;
-pub(crate) mod entity;
-pub(crate) mod helper;
-pub mod options;
-pub(crate) mod readers;
-pub(crate) mod s3_api;
-pub mod tonic_service;
-pub(crate) use ecfs_extend::*;
-#[cfg(test)]
-mod ecfs_test;
-pub(crate) mod head_prefix;
-mod objects;
-mod sse;
-#[cfg(test)]
-mod sse_test;
+use super::{event, policies};
+use crate::admin::router::{AdminOperation, S3Router};
+
+pub fn register_user_policy_binding_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    policies::register_iam_policy_route(r)?;
+    event::register_notification_target_route(r)?;
+    Ok(())
+}

@@ -1,0 +1,36 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use s3s::dto::{Initiator, Owner};
+
+// Stable owner identity used in S3 response payloads (for example ACL, ListBuckets, and multipart listings).
+// RustFS currently does not maintain a persistent per-tenant canonical owner ID, so we keep a deterministic
+// placeholder to preserve response compatibility and test stability.
+// This value is metadata-only and must not be used for authentication/authorization decisions.
+pub(crate) const RUSTFS_OWNER_DISPLAY_NAME: &str = "rustfs";
+pub(crate) const RUSTFS_OWNER_ID: &str = "c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66";
+
+pub(crate) fn rustfs_owner() -> Owner {
+    Owner {
+        display_name: Some(RUSTFS_OWNER_DISPLAY_NAME.to_owned()),
+        id: Some(RUSTFS_OWNER_ID.to_owned()),
+    }
+}
+
+pub(crate) fn rustfs_initiator() -> Initiator {
+    Initiator {
+        id: Some(RUSTFS_OWNER_ID.to_owned()),
+        display_name: Some(RUSTFS_OWNER_DISPLAY_NAME.to_owned()),
+    }
+}
