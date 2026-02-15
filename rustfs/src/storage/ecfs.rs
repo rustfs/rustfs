@@ -25,7 +25,9 @@ use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
 use crate::storage::s3_api::bucket::{build_list_objects_output, build_list_objects_v2_output};
 use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::s3_api::multipart::{build_list_multipart_uploads_output, build_list_parts_output, parse_list_parts_params};
+use crate::storage::s3_api::multipart::{
+    build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
+};
 use crate::storage::s3_api::response::{
     access_denied_error, map_abort_multipart_upload_error, not_initialized_error, s3_response,
 };
@@ -86,7 +88,7 @@ use rustfs_ecstore::{
     disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
     error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
-    set_disk::{MAX_PARTS_COUNT, is_valid_storage_class},
+    set_disk::is_valid_storage_class,
     store_api::{
         BucketOptions,
         CompletePart,
@@ -3569,15 +3571,7 @@ impl S3 for FS {
             return Err(not_initialized_error());
         };
 
-        let prefix = prefix.unwrap_or_default();
-
-        let max_uploads = max_uploads.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
-
-        if let Some(key_marker) = &key_marker
-            && !key_marker.starts_with(prefix.as_str())
-        {
-            return Err(s3_error!(NotImplemented, "Invalid key marker"));
-        }
+        let (prefix, key_marker, max_uploads) = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
 
         let result = store
             .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
