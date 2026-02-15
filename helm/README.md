@@ -119,6 +119,10 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | tolerations | list | `[]` |  |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
 | gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
+| gatewayApi.listeners.http.name | string | `web` | Gateway API http listener name. |
+| gatewayApi.listeners.http.port| int | `8000` | Gateway API http listener port. |
+| gatewayApi.listeners.https.name | string | `websecure` | Gateway API https listener name. |
+| gatewayApi.listeners.https.port| int | `8443` | Gateway API https listener port. |
 | gatewayApi.hostname | string | Hostname to access RustFS via gateway api. |
 | gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
 | gatewayApi.existingGateway.name | string | `""` |  The existing gateway name, instead of creating a new one. |

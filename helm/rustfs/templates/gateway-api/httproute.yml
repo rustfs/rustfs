@@ -10,16 +10,16 @@ metadata:
     {{- end }}
 spec:
   parentRefs:
-  {{- if .Values.gatewayApi.existingGateway.name }}
+    {{- if .Values.gatewayApi.existingGateway.name }}
     - name: {{ .Values.gatewayApi.existingGateway.name }}
       {{- if .Values.gatewayApi.existingGateway.namespace }}
       namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
       {{- end }}
-      sectionName: https
-  {{- else }}
+      sectionName: {{ .Values.gatewayApi.listeners.https.name | default "websecure"}}
+    {{- else }}
     - name: {{ include "rustfs.fullname" $ }}-gateway
-      sectionName: https
-  {{- end }}
+      sectionName: {{ .Values.gatewayApi.listeners.https.name | default "websecure"}}
+    {{- end }}
   hostnames:
     - {{ .Values.gatewayApi.hostname }}
   rules:
@@ -46,16 +46,16 @@ metadata:
   namespace: {{ .Release.Namespace }}
 spec:
   parentRefs:
-  {{- if .Values.gatewayApi.existingGateway.name }}
+    {{- if .Values.gatewayApi.existingGateway.name }}
     - name: {{ .Values.gatewayApi.existingGateway.name }}
       {{- if .Values.gatewayApi.existingGateway.namespace }}
       namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
       {{- end }}
-      sectionName: http
-  {{- else }}
+      sectionName: {{ .Values.gatewayApi.listeners.http.name | default "web" }}
+    {{- else }}
     - name: {{ include "rustfs.fullname" $ }}-gateway
-      sectionName: http
-  {{- end }}
+      sectionName: {{ .Values.gatewayApi.listeners.http.name | default "web" }}
+    {{- end }}
   rules:
     - filters:
         - type: RequestRedirect
