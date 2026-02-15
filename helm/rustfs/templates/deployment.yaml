@@ -127,8 +127,8 @@ spec:
       volumes:
         - name: logs
           persistentVolumeClaim:
-            claimName: {{ include "rustfs.fullname" . }}-logs
+            claimName: {{- with .Values.mode.standalone.existingClaim }}{{ .logsClaim | quote }}{{ else }}{{ include "rustfs.fullname" $ }}-logs{{ end }}
         - name: data
           persistentVolumeClaim:
-            claimName: {{ include "rustfs.fullname" . }}-data
+            claimName: {{- with .Values.mode.standalone.existingClaim }}{{ .dataClaim | quote }}{{ else }}{{ include "rustfs.fullname" $ }}-data{{ end }}
 {{- end }}
