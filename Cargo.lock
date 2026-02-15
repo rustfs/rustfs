@@ -6960,6 +6960,7 @@ version = "0.0.5"
 dependencies = [
  "async-trait",
  "chrono",
+ "metrics",
  "path-clean",
  "rmp-serde",
  "rustfs-filemeta",
