@@ -8,17 +8,17 @@ spec:
   gatewayClassName: {{ .Values.gatewayApi.gatewayClass }}
   {{- with .Values.gatewayApi.listeners }}
   listeners:
-  {{- if .web }}
-    - name: http
-      port: {{ .web.port }}
+  {{- if .http }}
+    - name: {{ .http.name }}
+      port: {{ .http.port }}
       protocol: HTTP
       allowedRoutes:
         namespaces:
           from: Same
   {{- end }}
-  {{- if .websecure }}
-    - name: https
-      port: {{ .websecure.port }}
+  {{- if .https }}
+    - name: {{ .https.name }}
+      port: {{ .https.port }}
       protocol: HTTPS
       tls:
         mode: Terminate
