@@ -24,8 +24,7 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
 use crate::storage::s3_api::bucket::{
-    build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
-    normalize_list_object_versions_params,
+    build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
 };
 use crate::storage::s3_api::common::rustfs_owner;
 use crate::storage::s3_api::multipart::{
@@ -3601,7 +3600,7 @@ impl S3 for FS {
         } = req.input;
 
         let (prefix, delimiter, key_marker, version_id_marker, max_keys) =
-            normalize_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys);
+            parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
 

@@ -18,7 +18,10 @@ use s3s::dto::{
     CommonPrefix, DeleteMarkerEntry, EncodingType, ListObjectVersionsOutput, ListObjectsOutput, ListObjectsV2Output, Object,
     ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Owner, Timestamp,
 };
+use s3s::{S3Error, S3ErrorCode};
 use urlencoding::encode;
+
+pub(crate) type ListObjectVersionsParams = (String, Option<String>, Option<String>, Option<String>, i32);
 
 pub(crate) fn build_list_objects_output(v2: ListObjectsV2Output, request_marker: Option<String>) -> ListObjectsOutput {
     let next_marker = calculate_next_marker(&v2);
@@ -42,20 +45,23 @@ pub(crate) fn build_list_objects_output(v2: ListObjectsV2Output, request_marker:
     }
 }
 
-pub(crate) fn normalize_list_object_versions_params(
+pub(crate) fn parse_list_object_versions_params(
     prefix: Option<String>,
     delimiter: Option<String>,
     key_marker: Option<String>,
     version_id_marker: Option<String>,
     max_keys: Option<i32>,
-) -> (String, Option<String>, Option<String>, Option<String>, i32) {
+) -> Result<ListObjectVersionsParams, S3Error> {
     let prefix = prefix.unwrap_or_default();
     let delimiter = delimiter.filter(|v| !v.is_empty());
     let key_marker = key_marker.filter(|v| !v.is_empty());
     let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
     let max_keys = max_keys.unwrap_or(1000);
+    if max_keys < 0 {
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
+    }
 
-    (prefix, delimiter, key_marker, version_id_marker, max_keys)
+    Ok((prefix, delimiter, key_marker, version_id_marker, max_keys))
 }
 
 pub(crate) fn build_list_object_versions_output(
@@ -248,9 +254,10 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
 mod tests {
     use super::{
         build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
-        normalize_list_object_versions_params,
+        parse_list_object_versions_params,
     };
     use rustfs_ecstore::store_api::{ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo};
+    use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};
     use uuid::Uuid;
 
@@ -381,15 +388,24 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_list_object_versions_params_defaults_and_filters_empty_values() {
+    fn test_parse_list_object_versions_params_defaults_and_filters_empty_values() {
         let (prefix, delimiter, key_marker, version_id_marker, max_keys) =
-            normalize_list_object_versions_params(None, Some(String::new()), Some(String::new()), None, None);
+            parse_list_object_versions_params(None, Some(String::new()), Some(String::new()), None, None)
+                .expect("parse should succeed");
 
         assert_eq!(prefix, String::new());
         assert_eq!(delimiter, None);
         assert_eq!(key_marker, None);
         assert_eq!(version_id_marker, None);
         assert_eq!(max_keys, 1000);
+    }
+
+    #[test]
+    fn test_parse_list_object_versions_params_rejects_negative_max_keys() {
+        let err = parse_list_object_versions_params(None, None, None, None, Some(-1))
+            .expect_err("negative max_keys should be rejected");
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
     }
 
     #[test]
