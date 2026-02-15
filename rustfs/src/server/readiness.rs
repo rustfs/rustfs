@@ -96,6 +96,7 @@ where
                 crate::server::PROFILE_MEMORY_PATH
                     | crate::server::PROFILE_CPU_PATH
                     | crate::server::HEALTH_PREFIX
+                    | crate::server::HEALTH_READY_PATH
                     | crate::server::FAVICON_PATH
             );
 
