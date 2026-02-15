@@ -40,6 +40,9 @@ mode:
       rollingUpdate:
         maxSurge: 0
         maxUnavailable: 1
+    existingClaim:
+      dataClaim: ""
+      logsClaim: ""
   distributed:
     enabled: true
 
