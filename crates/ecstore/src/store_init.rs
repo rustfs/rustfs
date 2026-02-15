@@ -27,7 +27,7 @@ use crate::{
 };
 use futures::future::join_all;
 use std::collections::{HashMap, hash_map::Entry};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
@@ -272,7 +272,7 @@ pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) ->
         *err_counts.entry(format!("{err}")).or_default() += 1;
     }
     if !err_counts.is_empty() {
-        warn!(
+        debug!(
             disks_ok = ok_count,
             disks_err = err_count,
             disks_total = disks.len(),
