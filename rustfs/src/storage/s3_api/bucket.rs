@@ -19,9 +19,27 @@ use s3s::dto::{
     ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Owner, Timestamp,
 };
 use s3s::{S3Error, S3ErrorCode};
+use tracing::debug;
 use urlencoding::encode;
 
-pub(crate) type ListObjectVersionsParams = (String, Option<String>, Option<String>, Option<String>, i32);
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ListObjectVersionsParams {
+    pub prefix: String,
+    pub delimiter: Option<String>,
+    pub key_marker: Option<String>,
+    pub version_id_marker: Option<String>,
+    pub max_keys: i32,
+}
+#[derive(Debug)]
+pub(crate) struct ListObjectsV2Params {
+    pub prefix: String,
+    pub max_keys: i32,
+    pub delimiter: Option<String>,
+    pub response_start_after: Option<String>,
+    pub start_after_for_query: Option<String>,
+    pub response_continuation_token: Option<String>,
+    pub decoded_continuation_token: Option<String>,
+}
 
 pub(crate) fn build_list_objects_output(v2: ListObjectsV2Output, request_marker: Option<String>) -> ListObjectsOutput {
     let next_marker = calculate_next_marker(&v2);
@@ -61,7 +79,68 @@ pub(crate) fn parse_list_object_versions_params(
         return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
     }
 
-    Ok((prefix, delimiter, key_marker, version_id_marker, max_keys))
+    Ok(ListObjectVersionsParams {
+        prefix,
+        delimiter,
+        key_marker,
+        version_id_marker,
+        max_keys,
+    })
+}
+
+pub(crate) fn parse_list_objects_v2_params(
+    prefix: Option<String>,
+    delimiter: Option<String>,
+    max_keys: Option<i32>,
+    continuation_token: Option<String>,
+    start_after: Option<String>,
+) -> Result<ListObjectsV2Params, S3Error> {
+    let prefix = prefix.unwrap_or_default();
+
+    // Log debug info for prefixes with special characters to help diagnose encoding issues
+    if prefix.contains([' ', '+', '%', '\n', '\r', '\0']) {
+        debug!("LIST objects with special characters in prefix: {:?}", prefix);
+    }
+
+    let max_keys = max_keys.unwrap_or(1000);
+    if max_keys < 0 {
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
+    }
+
+    let delimiter = delimiter.filter(|v| !v.is_empty());
+
+    // Save original start_after for response (per S3 API spec, must echo back if provided)
+    let response_start_after = start_after.clone();
+    let start_after_for_query = start_after.filter(|v| !v.is_empty());
+
+    // Save original continuation_token for response (per S3 API spec, must echo back if provided)
+    // Note: empty string should still be echoed back in the response
+    let response_continuation_token = continuation_token.clone();
+    let continuation_token_for_query = continuation_token.filter(|v| !v.is_empty());
+
+    // Decode continuation_token from base64 for internal use
+    let decoded_continuation_token = continuation_token_for_query
+        .map(|token| {
+            base64_simd::STANDARD
+                .decode_to_vec(token.as_bytes())
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid continuation token".to_string()))
+                .and_then(|bytes| {
+                    String::from_utf8(bytes).map_err(|_| {
+                        S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid continuation token".to_string())
+                    })
+                })
+        })
+        .transpose()?;
+
+    Ok(ListObjectsV2Params {
+        prefix,
+        max_keys,
+        delimiter,
+        response_start_after,
+        start_after_for_query,
+        response_continuation_token,
+        decoded_continuation_token,
+    })
 }
 
 pub(crate) fn build_list_object_versions_output(
@@ -254,7 +333,7 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
 mod tests {
     use super::{
         build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
-        parse_list_object_versions_params,
+        parse_list_object_versions_params, parse_list_objects_v2_params,
     };
     use rustfs_ecstore::store_api::{ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo};
     use s3s::S3ErrorCode;
@@ -389,21 +468,71 @@ mod tests {
 
     #[test]
     fn test_parse_list_object_versions_params_defaults_and_filters_empty_values() {
-        let (prefix, delimiter, key_marker, version_id_marker, max_keys) =
-            parse_list_object_versions_params(None, Some(String::new()), Some(String::new()), None, None)
-                .expect("parse should succeed");
+        let parsed = parse_list_object_versions_params(None, Some(String::new()), Some(String::new()), None, None)
+            .expect("parse should succeed");
 
-        assert_eq!(prefix, String::new());
-        assert_eq!(delimiter, None);
-        assert_eq!(key_marker, None);
-        assert_eq!(version_id_marker, None);
-        assert_eq!(max_keys, 1000);
+        assert_eq!(parsed.prefix, String::new());
+        assert_eq!(parsed.delimiter, None);
+        assert_eq!(parsed.key_marker, None);
+        assert_eq!(parsed.version_id_marker, None);
+        assert_eq!(parsed.max_keys, 1000);
     }
 
     #[test]
     fn test_parse_list_object_versions_params_rejects_negative_max_keys() {
         let err = parse_list_object_versions_params(None, None, None, None, Some(-1))
             .expect_err("negative max_keys should be rejected");
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_parse_list_objects_v2_params_defaults_and_echo_behavior() {
+        let parsed = parse_list_objects_v2_params(None, Some(String::new()), None, Some(String::new()), Some(String::new()))
+            .expect("parse should succeed");
+
+        assert_eq!(parsed.prefix, String::new());
+        assert_eq!(parsed.max_keys, 1000);
+        assert_eq!(parsed.delimiter, None);
+        assert_eq!(parsed.response_start_after, Some(String::new()));
+        assert_eq!(parsed.start_after_for_query, None);
+        assert_eq!(parsed.response_continuation_token, Some(String::new()));
+        assert_eq!(parsed.decoded_continuation_token, None);
+    }
+
+    #[test]
+    fn test_parse_list_objects_v2_params_rejects_negative_max_keys() {
+        let err =
+            parse_list_objects_v2_params(None, None, Some(-1), None, None).expect_err("negative max_keys should be rejected");
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_parse_list_objects_v2_params_decodes_continuation_token() {
+        let raw = "token-123";
+        let encoded = base64_simd::STANDARD.encode_to_string(raw.as_bytes());
+
+        let parsed =
+            parse_list_objects_v2_params(None, None, Some(1000), Some(encoded.clone()), None).expect("parse should succeed");
+
+        assert_eq!(parsed.response_continuation_token, Some(encoded));
+        assert_eq!(parsed.decoded_continuation_token, Some(raw.to_string()));
+    }
+
+    #[test]
+    fn test_parse_list_objects_v2_params_rejects_invalid_continuation_token() {
+        let err = parse_list_objects_v2_params(None, None, Some(1000), Some("%%%".to_string()), None)
+            .expect_err("invalid base64 token should be rejected");
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_parse_list_objects_v2_params_rejects_non_utf8_continuation_token() {
+        let invalid_utf8 = base64_simd::STANDARD.encode_to_string([0xff, 0xfe, 0xfd]);
+        let err = parse_list_objects_v2_params(None, None, Some(1000), Some(invalid_utf8), None)
+            .expect_err("non-utf8 token should be rejected");
 
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
     }
