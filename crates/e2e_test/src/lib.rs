@@ -29,6 +29,10 @@ mod data_usage_test;
 #[cfg(test)]
 mod kms;
 
+// Regression test for issue #1797
+#[cfg(test)]
+mod list_objects_duplicates_test;
+
 // Quota tests
 #[cfg(test)]
 mod quota_test;

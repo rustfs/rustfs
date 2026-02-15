@@ -347,16 +347,14 @@ impl ECStore {
 
         let mut objects = Vec::with_capacity(get_objects.len());
         for obj in get_objects.into_iter() {
-            if let Some(delimiter) = &delimiter {
+            if delimiter.is_some() {
                 if obj.is_dir && obj.mod_time.is_none() {
                     let mut found = false;
-                    if delimiter != SLASH_SEPARATOR {
-                        for p in prefixes.iter() {
-                            if found {
-                                break;
-                            }
-                            found = p == &obj.name;
+                    for p in prefixes.iter() {
+                        if found {
+                            break;
                         }
+                        found = p == &obj.name;
                     }
                     if !found {
                         prefixes.push(obj.name.clone());
@@ -474,16 +472,14 @@ impl ECStore {
 
         let mut objects = Vec::with_capacity(get_objects.len());
         for obj in get_objects.into_iter() {
-            if let Some(delimiter) = &delimiter {
+            if delimiter.is_some() {
                 if obj.is_dir && obj.mod_time.is_none() {
                     let mut found = false;
-                    if delimiter != SLASH_SEPARATOR {
-                        for p in prefixes.iter() {
-                            if found {
-                                break;
-                            }
-                            found = p == &obj.name;
+                    for p in prefixes.iter() {
+                        if found {
+                            break;
                         }
+                        found = p == &obj.name;
                     }
                     if !found {
                         prefixes.push(obj.name.clone());
