@@ -108,10 +108,7 @@ mod tests {
         info!("CommonPrefixes: {:?}", prefixes);
 
         // Should contain "folder/" exactly once
-        let folder_prefixes: Vec<_> = prefixes
-            .iter()
-            .filter(|p| p.prefix() == Some("folder/"))
-            .collect();
+        let folder_prefixes: Vec<_> = prefixes.iter().filter(|p| p.prefix() == Some("folder/")).collect();
 
         assert_eq!(
             folder_prefixes.len(),
@@ -125,5 +122,12 @@ mod tests {
         // Actually, for "folder/", it is the prefix itself.
         // In this specific fix, we rely on duplicate removal in CommonPrefixes.
         // We implicitly assume it was added to CommonPrefixes twice (once from file, once from object).
+
+        // Ensure "folder/" is NOT in contents (Contents)
+        let folder_in_contents = result.contents().iter().any(|o| o.key() == Some("folder/"));
+        assert!(
+            !folder_in_contents,
+            "Expected 'folder/' to be rolled up into CommonPrefixes, but found it in Contents"
+        );
     }
 }

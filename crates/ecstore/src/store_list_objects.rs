@@ -349,14 +349,8 @@ impl ECStore {
         for obj in get_objects.into_iter() {
             if delimiter.is_some() {
                 if obj.is_dir && obj.mod_time.is_none() {
-                    let mut found = false;
-                    for p in prefixes.iter() {
-                        if found {
-                            break;
-                        }
-                        found = p == &obj.name;
-                    }
-                    if !found {
+                    // Check if prefix already exists to avoid duplicates
+                    if !prefixes.iter().any(|p| p == &obj.name) {
                         prefixes.push(obj.name.clone());
                     }
                 } else {
@@ -474,14 +468,8 @@ impl ECStore {
         for obj in get_objects.into_iter() {
             if delimiter.is_some() {
                 if obj.is_dir && obj.mod_time.is_none() {
-                    let mut found = false;
-                    for p in prefixes.iter() {
-                        if found {
-                            break;
-                        }
-                        found = p == &obj.name;
-                    }
-                    if !found {
+                    // Check if prefix already exists to avoid duplicates
+                    if !prefixes.iter().any(|p| p == &obj.name) {
                         prefixes.push(obj.name.clone());
                     }
                 } else {
