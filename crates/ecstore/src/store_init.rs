@@ -197,24 +197,27 @@ pub fn check_format_erasure_values(
 
         check_format_erasure_value(f)?;
 
-        if formats.len() != f.erasure.sets.len() * f.erasure.sets[0].len() {
+        let first_set = f.erasure.sets.first().ok_or_else(|| Error::other("erasure.sets is empty"))?;
+
+        if formats.len() != f.erasure.sets.len() * first_set.len() {
             return Err(Error::other(format!(
                 "formats length for erasure.sets does not match: got {}, expected {}",
                 formats.len(),
-                f.erasure.sets.len() * f.erasure.sets[0].len()
+                f.erasure.sets.len() * first_set.len()
             )));
         }
 
-        if f.erasure.sets[0].len() != set_drive_count {
+        if first_set.len() != set_drive_count {
             return Err(Error::other(format!(
                 "erasure set length for set_drive_count does not match: got {}, expected {}",
-                f.erasure.sets[0].len(),
+                first_set.len(),
                 set_drive_count
             )));
         }
     }
     Ok(())
 }
+
 fn check_format_erasure_value(format: &FormatV3) -> Result<()> {
     if format.version != FormatMetaVersion::V1 {
         return Err(Error::other("invalid FormatMetaVersion"));
