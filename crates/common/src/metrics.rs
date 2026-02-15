@@ -65,9 +65,7 @@ impl IlmAction {
             || *self == Self::DeleteAllVersionsAction
             || *self == Self::DelMarkerDeleteAllVersionsAction
     }
-}
 
-impl IlmAction {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::NoneAction => "none",
