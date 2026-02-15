@@ -15,6 +15,7 @@
 use clap::Parser;
 use clap::builder::NonEmptyStringValueParser;
 use const_str::concat;
+use std::path::PathBuf;
 use std::string::ToString;
 shadow_rs::shadow!(build);
 
@@ -77,20 +78,20 @@ pub struct Opt {
     pub server_domains: Vec<String>,
 
     /// Access key used for authentication.
-    #[arg(
-        long,
-        default_value_t = rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(),
-        env = "RUSTFS_ACCESS_KEY"
-    )]
-    pub access_key: String,
+    #[arg(long, env = "RUSTFS_ACCESS_KEY", group = "access-key")]
+    pub access_key: Option<String>,
+
+    /// Access key stored in a file used for authentication.
+    #[arg(long, env = "RUSTFS_ACCESS_KEY_FILE", group = "access-key")]
+    pub access_key_file: Option<PathBuf>,
 
     /// Secret key used for authentication.
-    #[arg(
-        long,
-        default_value_t = rustfs_credentials::DEFAULT_SECRET_KEY.to_string(),
-        env = "RUSTFS_SECRET_KEY"
-    )]
-    pub secret_key: String,
+    #[arg(long, env = "RUSTFS_SECRET_KEY", group = "secret-key")]
+    pub secret_key: Option<String>,
+
+    /// Secret key stored in a file used for authentication.
+    #[arg(long, env = "RUSTFS_SECRET_KEY_FILE", group = "secret-key")]
+    pub secret_key_file: Option<PathBuf>,
 
     /// Enable console server
     #[arg(
@@ -161,9 +162,151 @@ pub struct Opt {
     pub buffer_profile: String,
 }
 
-impl std::fmt::Debug for Opt {
+#[derive(Clone)]
+pub struct Config {
+    /// DIR points to a directory on a filesystem.
+    pub volumes: Vec<String>,
+
+    /// bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname
+    pub address: String,
+
+    /// Domain name used for virtual-hosted-style requests.
+    pub server_domains: Vec<String>,
+
+    /// Access key used for authentication.
+    pub access_key: String,
+
+    /// Secret key used for authentication.
+    pub secret_key: String,
+
+    /// Enable console server
+    pub console_enable: bool,
+
+    /// Console server bind address
+    pub console_address: String,
+
+    /// Observability endpoint for trace, metrics and logs,only support grpc mode.
+    pub obs_endpoint: String,
+
+    /// tls path for rustfs API and console.
+    pub tls_path: Option<String>,
+
+    pub license: Option<String>,
+
+    pub region: Option<String>,
+
+    /// Enable KMS encryption for server-side encryption
+    pub kms_enable: bool,
+
+    /// KMS backend type (local or vault)
+    pub kms_backend: String,
+
+    /// KMS key directory for local backend
+    pub kms_key_dir: Option<String>,
+
+    /// Vault address for vault backend
+    pub kms_vault_address: Option<String>,
+
+    /// Vault token for vault backend
+    pub kms_vault_token: Option<String>,
+
+    /// Default KMS key ID for encryption
+    pub kms_default_key_id: Option<String>,
+
+    /// Disable adaptive buffer sizing with workload profiles
+    /// Set this flag to use legacy fixed-size buffer behavior from PR #869
+    pub buffer_profile_disable: bool,
+
+    /// Workload profile for adaptive buffer sizing
+    /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
+    pub buffer_profile: String,
+}
+
+impl Config {
+    /// parse the command line arguments and environment arguments from [`Opt`] and convert them
+    /// into a ready to use [`Config`]
+    ///
+    /// This includes some intermediate checks for mutually exclusive options
+    pub fn parse() -> std::io::Result<Self> {
+        let Opt {
+            volumes,
+            address,
+            server_domains,
+            access_key,
+            access_key_file,
+            secret_key,
+            secret_key_file,
+            console_enable,
+            console_address,
+            obs_endpoint,
+            tls_path,
+            license,
+            region,
+            kms_enable,
+            kms_backend,
+            kms_key_dir,
+            kms_vault_address,
+            kms_vault_token,
+            kms_default_key_id,
+            buffer_profile_disable,
+            buffer_profile,
+        } = Opt::parse();
+
+        let access_key = access_key
+            .map(Ok)
+            .or_else(|| {
+                let path = access_key_file.as_ref()?;
+                Some(std::fs::read_to_string(path))
+            })
+            .transpose()?
+            .unwrap_or_else(|| {
+                // neither argument was specified ... using default
+                rustfs_credentials::DEFAULT_ACCESS_KEY.to_string()
+            })
+            .trim()
+            .to_string();
+
+        let secret_key = secret_key
+            .map(Ok)
+            .or_else(|| {
+                let path = secret_key_file.as_ref()?;
+                Some(std::fs::read_to_string(path))
+            })
+            .transpose()?
+            .unwrap_or_else(|| {
+                // neither argument was specified ... using default
+                rustfs_credentials::DEFAULT_SECRET_KEY.to_string()
+            })
+            .trim()
+            .to_string();
+
+        Ok(Config {
+            volumes,
+            address,
+            server_domains,
+            access_key,
+            secret_key,
+            console_enable,
+            console_address,
+            obs_endpoint,
+            tls_path,
+            license,
+            region,
+            kms_enable,
+            kms_backend,
+            kms_key_dir,
+            kms_vault_address,
+            kms_vault_token,
+            kms_default_key_id,
+            buffer_profile_disable,
+            buffer_profile,
+        })
+    }
+}
+
+impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Opt")
+        f.debug_struct("Config")
             .field("volumes", &self.volumes)
             .field("address", &self.address)
             .field("server_domains", &self.server_domains)
