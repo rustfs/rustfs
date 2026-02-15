@@ -157,10 +157,11 @@ pub fn has_pattern(patterns: &[&str], match_str: &str) -> bool {
 /// assert!(has_string_suffix_in_slice("document.TXT", &suffixes));
 /// assert!(!has_string_suffix_in_slice("image.png", &suffixes));
 /// ```
-pub fn has_string_suffix_in_slice(str: &str, list: &[&str]) -> bool {
+pub fn has_string_suffix_in_slice(str: &str, list: &[impl AsRef<str>]) -> bool {
     let str = str.to_lowercase();
     for v in list {
-        if *v == "*" {
+        let v = v.as_ref();
+        if v == "*" {
             return true;
         }
 
