@@ -23,9 +23,14 @@ use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_ha
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
-use crate::storage::s3_api::bucket::{build_list_objects_output, build_list_objects_v2_output};
+use crate::storage::s3_api::bucket::{
+    build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
+    parse_list_object_versions_params, parse_list_objects_v2_params,
+};
 use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::s3_api::multipart::{build_list_multipart_uploads_output, build_list_parts_output, parse_list_parts_params};
+use crate::storage::s3_api::multipart::{
+    build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
+};
 use crate::storage::s3_api::response::{
     access_denied_error, map_abort_multipart_upload_error, not_initialized_error, s3_response,
 };
@@ -86,7 +91,7 @@ use rustfs_ecstore::{
     disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
     error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
-    set_disk::{MAX_PARTS_COUNT, is_valid_storage_class},
+    set_disk::is_valid_storage_class,
     store_api::{
         BucketOptions,
         CompletePart,
@@ -3569,15 +3574,7 @@ impl S3 for FS {
             return Err(not_initialized_error());
         };
 
-        let prefix = prefix.unwrap_or_default();
-
-        let max_uploads = max_uploads.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
-
-        if let Some(key_marker) = &key_marker
-            && !key_marker.starts_with(prefix.as_str())
-        {
-            return Err(s3_error!(NotImplemented, "Invalid key marker"));
-        }
+        let (prefix, key_marker, max_uploads) = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
 
         let result = store
             .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
@@ -3603,77 +3600,23 @@ impl S3 for FS {
             ..
         } = req.input;
 
-        let prefix = prefix.unwrap_or_default();
-        let max_keys = max_keys.unwrap_or(1000);
-
-        let key_marker = key_marker.filter(|v| !v.is_empty());
-        let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
-        let delimiter = delimiter.filter(|v| !v.is_empty());
+        let parsed = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
-            .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
+            .list_object_versions(
+                &bucket,
+                &parsed.prefix,
+                parsed.key_marker,
+                parsed.version_id_marker,
+                parsed.delimiter.clone(),
+                parsed.max_keys,
+            )
             .await
             .map_err(ApiError::from)?;
 
-        let objects: Vec<ObjectVersion> = object_infos
-            .objects
-            .iter()
-            .filter(|v| !v.name.is_empty() && !v.delete_marker)
-            .map(|v| {
-                ObjectVersion {
-                    key: Some(v.name.to_owned()),
-                    last_modified: v.mod_time.map(Timestamp::from),
-                    size: Some(v.size),
-                    version_id: Some(v.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
-                    is_latest: Some(v.is_latest),
-                    e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                    storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
-                    ..Default::default() // TODO: another fields
-                }
-            })
-            .collect();
-
-        let common_prefixes = object_infos
-            .prefixes
-            .into_iter()
-            .map(|v| CommonPrefix { prefix: Some(v) })
-            .collect();
-
-        let delete_markers = object_infos
-            .objects
-            .iter()
-            .filter(|o| o.delete_marker)
-            .map(|o| DeleteMarkerEntry {
-                key: Some(o.name.clone()),
-                version_id: Some(o.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
-                is_latest: Some(o.is_latest),
-                last_modified: o.mod_time.map(Timestamp::from),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-
-        // Only set next_key_marker and next_version_id_marker if they have values, per AWS S3 API spec
-        // boto3 expects them to be strings or omitted, not None or empty strings
-        let next_key_marker = object_infos.next_marker.filter(|v| !v.is_empty());
-        let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
-
-        let output = ListObjectVersionsOutput {
-            is_truncated: Some(object_infos.is_truncated),
-            // max_keys should be the requested maximum number of keys, not the actual count returned
-            // Per AWS S3 API spec, this field represents the maximum number of keys that can be returned in the response
-            max_keys: Some(max_keys),
-            delimiter,
-            name: Some(bucket),
-            prefix: Some(prefix),
-            common_prefixes: Some(common_prefixes),
-            versions: Some(objects),
-            delete_markers: Some(delete_markers),
-            next_key_marker,
-            next_version_id_marker,
-            ..Default::default()
-        };
+        let output = build_list_object_versions_output(object_infos, bucket, parsed.prefix, parsed.delimiter, parsed.max_keys);
 
         Ok(s3_response(output))
     }
@@ -3710,44 +3653,11 @@ impl S3 for FS {
             ..
         } = req.input;
 
-        let prefix = prefix.unwrap_or_default();
-
-        // Log debug info for prefixes with special characters to help diagnose encoding issues
-        if prefix.contains([' ', '+', '%', '\n', '\r', '\0']) {
-            debug!("LIST objects with special characters in prefix: {:?}", prefix);
-        }
-
-        let max_keys = max_keys.unwrap_or(1000);
-        if max_keys < 0 {
-            return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
-        }
-
-        let delimiter = delimiter.filter(|v| !v.is_empty());
-
-        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
-
-        // Save original start_after for response (per S3 API spec, must echo back if provided)
-        let response_start_after = start_after.clone();
-        let start_after_for_query = start_after.filter(|v| !v.is_empty());
-
-        // Save original continuation_token for response (per S3 API spec, must echo back if provided)
-        // Note: empty string should still be echoed back in the response
-        let response_continuation_token = continuation_token.clone();
-        let continuation_token_for_query = continuation_token.filter(|v| !v.is_empty());
-
-        // Decode continuation_token from base64 for internal use
-        let decoded_continuation_token = continuation_token_for_query
-            .map(|token| {
-                base64_simd::STANDARD
-                    .decode_to_vec(token.as_bytes())
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes).map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
-                    })
-            })
-            .transpose()?;
+        let parsed = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
+        validate_list_object_unordered_with_delimiter(parsed.delimiter.as_ref(), req.uri.query())?;
 
         let store = get_validated_store(&bucket).await?;
+        let fetch_owner = fetch_owner.unwrap_or_default();
 
         let incl_deleted = req
             .headers
@@ -3757,12 +3667,12 @@ impl S3 for FS {
         let object_infos = store
             .list_objects_v2(
                 &bucket,
-                &prefix,
-                decoded_continuation_token,
-                delimiter.clone(),
-                max_keys,
-                fetch_owner.unwrap_or_default(),
-                start_after_for_query,
+                &parsed.prefix,
+                parsed.decoded_continuation_token,
+                parsed.delimiter.clone(),
+                parsed.max_keys,
+                fetch_owner,
+                parsed.start_after_for_query,
                 incl_deleted,
             )
             .await
@@ -3770,14 +3680,14 @@ impl S3 for FS {
 
         let output = build_list_objects_v2_output(
             object_infos,
-            fetch_owner.unwrap_or_default(),
-            max_keys,
+            fetch_owner,
+            parsed.max_keys,
             bucket,
-            prefix,
-            delimiter,
+            parsed.prefix,
+            parsed.delimiter,
             encoding_type,
-            response_continuation_token,
-            response_start_after,
+            parsed.response_continuation_token,
+            parsed.response_start_after,
         );
 
         Ok(s3_response(output))
