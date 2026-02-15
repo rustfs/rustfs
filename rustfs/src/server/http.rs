@@ -60,11 +60,11 @@ use tracing::{Span, debug, error, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub async fn start_http_server(
-    opt: &config::Opt,
+    config: &config::Config,
     worker_state_manager: ServiceStateManager,
     readiness: Arc<GlobalReadiness>,
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
-    let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
+    let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
 
     // The listening address and port are obtained from the parameters
@@ -150,7 +150,7 @@ pub async fn start_http_server(
         TcpListener::from_std(socket.into())?
     };
 
-    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
+    let tls_acceptor = setup_tls_acceptor(config.tls_path.as_deref().unwrap_or_default()).await?;
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
     // Obtain the listener address
@@ -173,7 +173,7 @@ pub async fn start_http_server(
     let api_endpoints = format!("{protocol}://{local_ip_str}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
     let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
-    if opt.console_enable {
+    if config.console_enable {
         admin::console::init_console_cfg(local_ip, server_port);
 
         info!(
@@ -193,8 +193,8 @@ pub async fn start_http_server(
         info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Start Time: {now_time}");
-        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&opt.access_key)
-            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&opt.secret_key)
+        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key)
+            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
         {
             warn!(
                 "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
@@ -212,20 +212,20 @@ pub async fn start_http_server(
         let store = storage::ecfs::FS::new();
         let mut b = S3ServiceBuilder::new(store.clone());
 
-        let access_key = opt.access_key.clone();
-        let secret_key = opt.secret_key.clone();
+        let access_key = config.access_key.clone();
+        let secret_key = config.secret_key.clone();
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
-        b.set_route(admin::make_admin_route(opt.console_enable)?);
+        b.set_route(admin::make_admin_route(config.console_enable)?);
 
         // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
-        if !opt.server_domains.is_empty() && !opt.console_enable {
-            MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
+        if !config.server_domains.is_empty() && !config.console_enable {
+            MultiDomain::new(&config.server_domains).map_err(Error::other)?; // validate domains
 
             // add the default port number to the given server domains
             let mut domain_sets = std::collections::HashSet::new();
-            for domain in &opt.server_domains {
+            for domain in &config.server_domains {
                 domain_sets.insert(domain.to_string());
                 if let Some((host, _)) = domain.split_once(':') {
                     domain_sets.insert(format!("{host}:{server_port}"));
@@ -256,7 +256,7 @@ pub async fn start_http_server(
         debug!("HTTP response compression is disabled");
     }
 
-    let is_console = opt.console_enable;
+    let is_console = config.console_enable;
     tokio::spawn(async move {
         // Note: CORS layer is removed from global middleware stack
         // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()

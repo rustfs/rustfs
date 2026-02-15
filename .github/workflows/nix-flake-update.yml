@@ -20,7 +20,8 @@ on:
     - cron: '0 0 * * 0' # Weekly on Sundays
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,9 +32,6 @@ jobs:
     name: Update flake.lock
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -52,7 +50,10 @@ jobs:
           pr-labels: |
             dependencies
             nix
+            automated
           commit-msg: "chore(deps): update flake.lock"
+          pr-reviewers: houseme, heihutu
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log PR details
         if: steps.update.outputs.pull-request-number
