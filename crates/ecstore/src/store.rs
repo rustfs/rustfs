@@ -217,7 +217,7 @@ impl ECStore {
                 let mut times = 0;
                 let mut interval = 1;
                 loop {
-                    if let Ok(fm) = store_init::connect_load_init_formats(
+                    match store_init::connect_load_init_formats(
                         first_is_local,
                         &disks,
                         pool_eps.set_count,
@@ -226,14 +226,17 @@ impl ECStore {
                     )
                     .await
                     {
-                        break fm;
+                        Ok(fm) => break Ok(fm),
+                        // Wrap the final error if we are giving up
+                        Err(e) if times >= 10 => {
+                            break Err(Error::other(format!("can not get formats after {} retries, last error: {e}", times)));
+                        }
+                        // Retrying so just drop the error
+                        Err(_) => {}
                     }
                     times += 1;
                     if interval < 16 {
                         interval *= 2;
-                    }
-                    if times > 10 {
-                        return Err(Error::other("can not get formats"));
                     }
                     info!("retrying get formats after {:?}", interval);
                     select! {
@@ -245,7 +248,7 @@ impl ECStore {
                         }
                     }
                 }
-            };
+            }?;
 
             if deployment_id.is_none() {
                 deployment_id = Some(fm.id);

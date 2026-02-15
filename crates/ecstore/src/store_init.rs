@@ -27,7 +27,7 @@ use crate::{
 };
 use futures::future::join_all;
 use std::collections::{HashMap, hash_map::Entry};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
@@ -65,8 +65,6 @@ pub async fn connect_load_init_formats(
     deployment_id: Option<Uuid>,
 ) -> Result<FormatV3> {
     let (formats, errs) = load_format_erasure_all(disks, false).await;
-
-    // debug!("load_format_erasure_all errs {:?}", &errs);
 
     check_disk_fatal_errs(&errs)?;
 
@@ -199,16 +197,27 @@ pub fn check_format_erasure_values(
 
         check_format_erasure_value(f)?;
 
-        if formats.len() != f.erasure.sets.len() * f.erasure.sets[0].len() {
-            return Err(Error::other("formats length for erasure.sets not mtach"));
+        let first_set = f.erasure.sets.first().ok_or_else(|| Error::other("erasure.sets is empty"))?;
+
+        if formats.len() != f.erasure.sets.len() * first_set.len() {
+            return Err(Error::other(format!(
+                "formats length for erasure.sets does not match: got {}, expected {}",
+                formats.len(),
+                f.erasure.sets.len() * first_set.len()
+            )));
         }
 
-        if f.erasure.sets[0].len() != set_drive_count {
-            return Err(Error::other("erasure set length not match set_drive_count"));
+        if first_set.len() != set_drive_count {
+            return Err(Error::other(format!(
+                "erasure set length for set_drive_count does not match: got {}, expected {}",
+                first_set.len(),
+                set_drive_count
+            )));
         }
     }
     Ok(())
 }
+
 fn check_format_erasure_value(format: &FormatV3) -> Result<()> {
     if format.version != FormatMetaVersion::V1 {
         return Err(Error::other("invalid FormatMetaVersion"));
@@ -252,6 +261,24 @@ pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) ->
                 errors.push(Some(e));
             }
         }
+    }
+
+    // Log aggregation summary of format load results
+    let ok_count = errors.iter().filter(|e| e.is_none()).count();
+    let err_count = errors.iter().filter(|e| e.is_some()).count();
+    // Count occurrences of each unique error
+    let mut err_counts: HashMap<String, usize> = HashMap::new();
+    for err in errors.iter().flatten() {
+        *err_counts.entry(format!("{err}")).or_default() += 1;
+    }
+    if !err_counts.is_empty() {
+        debug!(
+            disks_ok = ok_count,
+            disks_err = err_count,
+            disks_total = disks.len(),
+            "load format erasure all errors: {:?}",
+            err_counts
+        );
     }
 
     (datas, errors)
