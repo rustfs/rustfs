@@ -151,9 +151,11 @@ gatewayApi:
   enabled: false
   gatewayClass: traefik
   listeners: # Specify which listeners to create on the Gateway. Only support for traefik gatewayClass at the moment.
-    web:
+    http:
+      name: web
       port: 8000
-    websecure:
+    https:
+      name: websecure
       port: 8443
   hostname: example.rustfs.com
   existingGateway:
