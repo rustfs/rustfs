@@ -71,7 +71,18 @@ pub(crate) fn parse_list_parts_params(
     part_number_marker: Option<i32>,
     max_parts: Option<i32>,
 ) -> Result<ListPartsParams, S3Error> {
-    let part_number_marker = part_number_marker.map(|x| x as usize);
+    let part_number_marker = match part_number_marker {
+        Some(marker) => {
+            if marker < 0 {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "part-number-marker must be non-negative".to_string(),
+                ));
+            }
+            Some(marker as usize)
+        }
+        None => None,
+    };
     let max_parts = match max_parts {
         Some(parts) => {
             if !(1..=1000).contains(&parts) {
