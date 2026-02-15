@@ -326,12 +326,12 @@ impl CurrentCycle {
 }
 
 /// OTEL metric name constants for scanner metrics
-const OTEL_SCANNER_OBJECTS_SCANNED: &str = "rustfs.scanner.objects_scanned_total";
-const OTEL_SCANNER_DIRECTORIES_SCANNED: &str = "rustfs.scanner.directories_scanned_total";
-const OTEL_SCANNER_BUCKETS_SCANNED: &str = "rustfs.scanner.buckets_scanned_total";
-const OTEL_SCANNER_CYCLES: &str = "rustfs.scanner.cycles_total";
-const OTEL_SCANNER_CYCLE_DURATION_SECONDS: &str = "rustfs.scanner.cycle_duration_seconds";
-const OTEL_SCANNER_BUCKET_DRIVE_DURATION_SECONDS: &str = "rustfs.scanner.bucket_drive_duration_seconds";
+const OTEL_SCANNER_OBJECTS_SCANNED: &str = "rustfs_scanner_objects_scanned_total";
+const OTEL_SCANNER_DIRECTORIES_SCANNED: &str = "rustfs_scanner_directories_scanned_total";
+const OTEL_SCANNER_BUCKETS_SCANNED: &str = "rustfs_scanner_buckets_scanned_total";
+const OTEL_SCANNER_CYCLES: &str = "rustfs_scanner_cycles_total";
+const OTEL_SCANNER_CYCLE_DURATION_SECONDS: &str = "rustfs_scanner_cycle_duration_seconds";
+const OTEL_SCANNER_BUCKET_DRIVE_DURATION_SECONDS: &str = "rustfs_scanner_bucket_drive_duration_seconds";
 
 /// Emit an OTEL counter increment for the given scanner metric.
 /// ScanCycle and ScanBucketDrive are handled by dedicated emit functions with labels.
