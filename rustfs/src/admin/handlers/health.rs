@@ -86,6 +86,43 @@ pub(crate) fn build_component_details(storage_ready: bool, iam_ready: bool) -> V
     })
 }
 
+pub(crate) fn probe_from_path(path: &str) -> HealthProbe {
+    if path == HEALTH_READY_PATH {
+        HealthProbe::Readiness
+    } else {
+        HealthProbe::Liveness
+    }
+}
+
+pub(crate) fn build_health_response(
+    method: Method,
+    probe: HealthProbe,
+    storage_ready: bool,
+    iam_ready: bool,
+) -> S3Response<(StatusCode, Body)> {
+    let health = health_check_state(storage_ready, iam_ready, probe);
+    let health_info = json!({
+        "status": health.status,
+        "ready": health.ready,
+        "service": "rustfs-endpoint",
+        "timestamp": jiff::Zoned::now().to_string(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "details": build_component_details(storage_ready, iam_ready)
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+    if method == Method::HEAD {
+        return S3Response::with_headers((health.status_code, Body::empty()), headers);
+    }
+
+    let body_str = serde_json::to_string(&health_info).unwrap_or_else(|_| "{}".to_string());
+    let body = Body::from(body_str);
+
+    S3Response::with_headers((health.status_code, body), headers)
+}
+
 #[async_trait::async_trait]
 impl Operation for HealthCheckHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -103,36 +140,10 @@ impl Operation for HealthCheckHandler {
             ));
         }
 
-        let probe = if req.uri.path() == HEALTH_READY_PATH {
-            HealthProbe::Readiness
-        } else {
-            HealthProbe::Liveness
-        };
+        let probe = probe_from_path(req.uri.path());
         let (storage_ready, iam_ready) = collect_dependency_readiness();
-        let health = health_check_state(storage_ready, iam_ready, probe);
 
-        let health_info = json!({
-            "status": health.status,
-            "ready": health.ready,
-            "service": "rustfs-endpoint",
-            "timestamp": jiff::Zoned::now().to_string(),
-            "version": env!("CARGO_PKG_VERSION"),
-            "details": build_component_details(storage_ready, iam_ready)
-        });
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        if method == http::Method::HEAD {
-            // HEAD: only returns the header and status code, not the body
-            return Ok(S3Response::with_headers((health.status_code, Body::empty()), headers));
-        }
-
-        // GET: Return JSON body normally
-        let body_str = serde_json::to_string(&health_info).unwrap_or_else(|_| "{}".to_string());
-        let body = Body::from(body_str);
-
-        Ok(S3Response::with_headers((health.status_code, body), headers))
+        Ok(build_health_response(method, probe, storage_ready, iam_ready))
     }
 }
 
@@ -180,5 +191,40 @@ mod tests {
         assert_eq!(details["storage"]["ready"], true);
         assert_eq!(details["iam"]["status"], "disconnected");
         assert_eq!(details["iam"]["ready"], false);
+    }
+
+    #[test]
+    fn test_probe_from_path_readiness() {
+        assert_eq!(probe_from_path(HEALTH_READY_PATH), HealthProbe::Readiness);
+    }
+
+    #[test]
+    fn test_probe_from_path_liveness() {
+        assert_eq!(probe_from_path(HEALTH_PREFIX), HealthProbe::Liveness);
+        assert_eq!(probe_from_path("/random"), HealthProbe::Liveness);
+    }
+
+    #[test]
+    fn test_build_health_response_readiness_returns_503_when_deps_not_ready() {
+        let resp = build_health_response(Method::GET, HealthProbe::Readiness, false, true);
+        assert_eq!(resp.output.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_build_health_response_readiness_returns_200_when_deps_ready() {
+        let resp = build_health_response(Method::GET, HealthProbe::Readiness, true, true);
+        assert_eq!(resp.output.0, StatusCode::OK);
+    }
+
+    #[test]
+    fn test_build_health_response_liveness_returns_200_when_deps_not_ready() {
+        let resp = build_health_response(Method::GET, HealthProbe::Liveness, false, false);
+        assert_eq!(resp.output.0, StatusCode::OK);
+    }
+
+    #[test]
+    fn test_build_health_response_head_returns_empty_body() {
+        let resp = build_health_response(Method::HEAD, HealthProbe::Readiness, false, false);
+        assert_eq!(resp.output.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 }
