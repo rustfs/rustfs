@@ -15,10 +15,10 @@ spec:
       {{- if .Values.gatewayApi.existingGateway.namespace }}
       namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
       {{- end }}
-      sectionName: {{ .Values.gatewayApi.listeners.https.name }}
+      sectionName: {{ .Values.gatewayApi.listeners.https.name | default "websecure"}}
     {{- else }}
     - name: {{ include "rustfs.fullname" $ }}-gateway
-      sectionName: {{ .Values.gatewayApi.listeners.https.name }}
+      sectionName: {{ .Values.gatewayApi.listeners.https.name | default "websecure"}}
     {{- end }}
   hostnames:
     - {{ .Values.gatewayApi.hostname }}
@@ -51,10 +51,10 @@ spec:
       {{- if .Values.gatewayApi.existingGateway.namespace }}
       namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
       {{- end }}
-      sectionName: {{ .Values.gatewayApi.listeners.http.name }}
+      sectionName: {{ .Values.gatewayApi.listeners.http.name | default "web" }}
     {{- else }}
     - name: {{ include "rustfs.fullname" $ }}-gateway
-      sectionName: {{ .Values.gatewayApi.listeners.http.name }}
+      sectionName: {{ .Values.gatewayApi.listeners.http.name | default "web" }}
     {{- end }}
   rules:
     - filters:
