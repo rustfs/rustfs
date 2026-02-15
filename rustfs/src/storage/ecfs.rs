@@ -3600,17 +3600,23 @@ impl S3 for FS {
             ..
         } = req.input;
 
-        let (prefix, delimiter, key_marker, version_id_marker, max_keys) =
-            parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
+        let parsed = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
-            .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
+            .list_object_versions(
+                &bucket,
+                &parsed.prefix,
+                parsed.key_marker,
+                parsed.version_id_marker,
+                parsed.delimiter.clone(),
+                parsed.max_keys,
+            )
             .await
             .map_err(ApiError::from)?;
 
-        let output = build_list_object_versions_output(object_infos, bucket, prefix, delimiter, max_keys);
+        let output = build_list_object_versions_output(object_infos, bucket, parsed.prefix, parsed.delimiter, parsed.max_keys);
 
         Ok(s3_response(output))
     }

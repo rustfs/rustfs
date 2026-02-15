@@ -22,7 +22,14 @@ use s3s::{S3Error, S3ErrorCode};
 use tracing::debug;
 use urlencoding::encode;
 
-pub(crate) type ListObjectVersionsParams = (String, Option<String>, Option<String>, Option<String>, i32);
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ListObjectVersionsParams {
+    pub prefix: String,
+    pub delimiter: Option<String>,
+    pub key_marker: Option<String>,
+    pub version_id_marker: Option<String>,
+    pub max_keys: i32,
+}
 #[derive(Debug)]
 pub(crate) struct ListObjectsV2Params {
     pub prefix: String,
@@ -72,7 +79,13 @@ pub(crate) fn parse_list_object_versions_params(
         return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
     }
 
-    Ok((prefix, delimiter, key_marker, version_id_marker, max_keys))
+    Ok(ListObjectVersionsParams {
+        prefix,
+        delimiter,
+        key_marker,
+        version_id_marker,
+        max_keys,
+    })
 }
 
 pub(crate) fn parse_list_objects_v2_params(
@@ -455,15 +468,14 @@ mod tests {
 
     #[test]
     fn test_parse_list_object_versions_params_defaults_and_filters_empty_values() {
-        let (prefix, delimiter, key_marker, version_id_marker, max_keys) =
-            parse_list_object_versions_params(None, Some(String::new()), Some(String::new()), None, None)
-                .expect("parse should succeed");
+        let parsed = parse_list_object_versions_params(None, Some(String::new()), Some(String::new()), None, None)
+            .expect("parse should succeed");
 
-        assert_eq!(prefix, String::new());
-        assert_eq!(delimiter, None);
-        assert_eq!(key_marker, None);
-        assert_eq!(version_id_marker, None);
-        assert_eq!(max_keys, 1000);
+        assert_eq!(parsed.prefix, String::new());
+        assert_eq!(parsed.delimiter, None);
+        assert_eq!(parsed.key_marker, None);
+        assert_eq!(parsed.version_id_marker, None);
+        assert_eq!(parsed.max_keys, 1000);
     }
 
     #[test]
