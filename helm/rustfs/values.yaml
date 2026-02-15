@@ -190,7 +190,7 @@ livenessProbe:
 
 readinessProbe:
   httpGet:
-    path: /health
+    path: /health/ready
     port: endpoint
   initialDelaySeconds: 30
   periodSeconds: 5
