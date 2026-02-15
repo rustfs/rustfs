@@ -23,7 +23,6 @@
 pub mod data_usage_define;
 pub mod error;
 pub mod last_minute;
-pub mod metrics;
 pub mod scanner;
 pub mod scanner_folder;
 pub mod scanner_io;

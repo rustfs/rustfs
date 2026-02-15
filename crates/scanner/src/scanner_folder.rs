@@ -20,10 +20,9 @@ use std::time::{Duration, SystemTime};
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, SizeSummary, hash_path};
 use crate::error::ScannerError;
-use crate::metrics::{UpdateCurrentPathFn, current_path_updater};
 use crate::scanner_io::ScannerIODisk as _;
 use rustfs_common::heal_channel::{HEAL_DELETE_DANGLING, HealChannelRequest, HealOpts, HealScanMode, send_heal_request};
-use rustfs_common::metrics::IlmAction;
+use rustfs_common::metrics::{IlmAction, Metric, Metrics, UpdateCurrentPathFn, current_path_updater};
 use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_rule;
@@ -202,11 +201,13 @@ impl ScannerItem {
 
                 let mut size = actual_size;
 
+                let done_ilm = Metrics::time_ilm(event.action);
                 match event.action {
                     IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
                         remaining_versions = 0;
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        done_ilm(1)();
                         break 'eventLoop;
                     }
 
@@ -218,6 +219,7 @@ impl ScannerItem {
 
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        done_ilm(1)();
                     }
                     IlmAction::DeleteVersionAction => {
                         remaining_versions -= 1;
@@ -230,10 +232,12 @@ impl ScannerItem {
                             });
                         }
                         noncurrent_events.push(event.clone());
+                        done_ilm(1)();
                     }
                     IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                         debug!("apply_actions: applying transition rule for object: {} {}", oi.name, event.action);
                         apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
+                        done_ilm(1)();
                     }
 
                     IlmAction::NoneAction | IlmAction::ActionCount => {
@@ -324,6 +328,7 @@ impl ScannerItem {
     }
 
     async fn apply_heal<S: StorageAPI>(&mut self, store: Arc<S>, oi: &ObjectInfo) -> i64 {
+        let done_heal = Metrics::time(Metric::HealAbandonedObject);
         debug!(
             "apply_heal: bucket: {}, object_path: {}, version_id: {}",
             self.bucket,
@@ -337,7 +342,7 @@ impl ScannerItem {
             HealScanMode::Normal
         };
 
-        match store
+        let result = match store
             .clone()
             .heal_object(
                 self.bucket.as_str(),
@@ -364,7 +369,9 @@ impl ScannerItem {
                 warn!("apply_heal: failed to heal object: {}", e);
                 0
             }
-        }
+        };
+        done_heal();
+        result
     }
 
     fn alert_excessive_versions(&self, _object_infos_length: usize, _cumulative_size: i64) {
@@ -465,6 +472,8 @@ impl FolderScanner {
         folder: CachedFolder,
         into: &mut DataUsageEntry,
     ) -> Result<(), ScannerError> {
+        let done_folder = Metrics::time(Metric::ScanFolder);
+
         if ctx.is_cancelled() {
             return Err(ScannerError::Other("Operation cancelled".to_string()));
         }
@@ -1031,11 +1040,13 @@ impl FolderScanner {
 
         // Compact if too many children...
         if !into.compacted {
+            let done_compact = Metrics::time(Metric::CompactFolder);
             self.new_cache.reduce_children_of(
                 &this_hash,
                 DATA_SCANNER_COMPACT_AT_CHILDREN,
                 self.new_cache.info.name != folder.name,
             );
+            done_compact();
         }
 
         if self.update_cache.cache.contains_key(&this_hash.key()) && !was_compacted {
@@ -1045,6 +1056,8 @@ impl FolderScanner {
                 self.update_cache.replace_hashed(&this_hash, &folder.parent, &flat);
             }
         }
+
+        done_folder();
 
         Ok(())
     }

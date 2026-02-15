@@ -40,6 +40,9 @@ mode:
       rollingUpdate:
         maxSurge: 0
         maxUnavailable: 1
+    existingClaim:
+      dataClaim: ""
+      logsClaim: ""
   distributed:
     enabled: true
 
@@ -151,9 +154,11 @@ gatewayApi:
   enabled: false
   gatewayClass: traefik
   listeners: # Specify which listeners to create on the Gateway. Only support for traefik gatewayClass at the moment.
-    web:
+    http:
+      name: web
       port: 8000
-    websecure:
+    https:
+      name: websecure
       port: 8443
   hostname: example.rustfs.com
   existingGateway:
@@ -190,7 +195,7 @@ livenessProbe:
 
 readinessProbe:
   httpGet:
-    path: /health
+    path: /health/ready
     port: endpoint
   initialDelaySeconds: 30
   periodSeconds: 5

@@ -14,7 +14,8 @@
 
 use crate::last_minute::{AccElem, LastMinuteLatency};
 use chrono::{DateTime, Utc};
-use rustfs_madmin::metrics::ScannerMetrics as M_ScannerMetrics;
+use rustfs_madmin::metrics::{ScannerMetrics as M_ScannerMetrics, TimedAction};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt::Display,
@@ -63,6 +64,37 @@ impl IlmAction {
             || *self == Self::DeleteAction
             || *self == Self::DeleteAllVersionsAction
             || *self == Self::DelMarkerDeleteAllVersionsAction
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoneAction => "none",
+            Self::DeleteAction => "delete",
+            Self::DeleteVersionAction => "delete_version",
+            Self::TransitionAction => "transition",
+            Self::TransitionVersionAction => "transition_version",
+            Self::DeleteRestoredAction => "delete_restored",
+            Self::DeleteRestoredVersionAction => "delete_restored_version",
+            Self::DeleteAllVersionsAction => "delete_all_versions",
+            Self::DelMarkerDeleteAllVersionsAction => "del_marker_delete_all_versions",
+            Self::ActionCount => "action_count",
+        }
+    }
+
+    pub fn from_index(i: usize) -> Option<Self> {
+        match i {
+            0 => Some(Self::NoneAction),
+            1 => Some(Self::DeleteAction),
+            2 => Some(Self::DeleteVersionAction),
+            3 => Some(Self::TransitionAction),
+            4 => Some(Self::TransitionVersionAction),
+            5 => Some(Self::DeleteRestoredAction),
+            6 => Some(Self::DeleteRestoredVersionAction),
+            7 => Some(Self::DeleteAllVersionsAction),
+            8 => Some(Self::DelMarkerDeleteAllVersionsAction),
+            9 => Some(Self::ActionCount),
+            _ => None,
+        }
     }
 }
 
@@ -272,12 +304,74 @@ pub struct Metrics {
     cycle_info: Arc<RwLock<Option<CurrentCycle>>>,
 }
 
-// This is a placeholder. We'll need to define this struct.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CurrentCycle {
     pub current: u64,
+    pub next: u64,
     pub cycle_completed: Vec<DateTime<Utc>>,
     pub started: DateTime<Utc>,
+}
+
+impl CurrentCycle {
+    pub fn unmarshal(&mut self, buf: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        *self = rmp_serde::from_slice(buf)?;
+        Ok(())
+    }
+
+    pub fn marshal(&self) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(rmp_serde::to_vec(self)?)
+    }
+}
+
+/// OTEL metric name constants for scanner metrics
+const OTEL_SCANNER_OBJECTS_SCANNED: &str = "rustfs_scanner_objects_scanned_total";
+const OTEL_SCANNER_DIRECTORIES_SCANNED: &str = "rustfs_scanner_directories_scanned_total";
+const OTEL_SCANNER_BUCKETS_SCANNED: &str = "rustfs_scanner_buckets_scanned_total";
+const OTEL_SCANNER_CYCLES: &str = "rustfs_scanner_cycles_total";
+const OTEL_SCANNER_CYCLE_DURATION_SECONDS: &str = "rustfs_scanner_cycle_duration_seconds";
+const OTEL_SCANNER_BUCKET_DRIVE_DURATION_SECONDS: &str = "rustfs_scanner_bucket_drive_duration_seconds";
+
+/// Emit an OTEL counter increment for the given scanner metric.
+/// ScanCycle and ScanBucketDrive are handled by dedicated emit functions with labels.
+fn emit_otel_counter(metric: usize, count: u64) {
+    match Metric::from_index(metric) {
+        Some(Metric::ScanObject) => {
+            metrics::counter!(OTEL_SCANNER_OBJECTS_SCANNED).increment(count);
+        }
+        Some(Metric::ScanFolder) => {
+            metrics::counter!(OTEL_SCANNER_DIRECTORIES_SCANNED).increment(count);
+        }
+        _ => {}
+    }
+}
+
+/// Emit OTel metrics for a completed scan cycle.
+/// Counter with result label + gauge for last successful cycle duration.
+pub fn emit_scan_cycle_complete(success: bool, duration: Duration) {
+    let result = if success { "success" } else { "error" };
+    metrics::counter!(OTEL_SCANNER_CYCLES, "result" => result).increment(1);
+    if success {
+        metrics::gauge!(OTEL_SCANNER_CYCLE_DURATION_SECONDS).set(duration.as_secs_f64());
+    }
+}
+
+/// Emit OTel metrics for a completed bucket-drive scan.
+/// Counter with result/bucket/disk labels + histogram for duration.
+pub fn emit_scan_bucket_drive_complete(success: bool, bucket: &str, disk: &str, duration: Duration) {
+    let result = if success { "success" } else { "error" };
+    metrics::counter!(
+        OTEL_SCANNER_BUCKETS_SCANNED,
+        "result" => result,
+        "bucket" => bucket.to_owned(),
+        "disk" => disk.to_owned()
+    )
+    .increment(1);
+    metrics::histogram!(
+        OTEL_SCANNER_BUCKET_DRIVE_DURATION_SECONDS,
+        "bucket" => bucket.to_owned(),
+        "disk" => disk.to_owned()
+    )
+    .record(duration.as_secs_f64());
 }
 
 impl Metrics {
@@ -307,6 +401,7 @@ impl Metrics {
 
             // Update operation count
             global_metrics().operations[metric].fetch_add(1, Ordering::Relaxed);
+            emit_otel_counter(metric, 1);
 
             // Update latency for realtime metrics (spawn async task for this)
             if (metric) < Metric::LastRealtime as usize {
@@ -332,6 +427,7 @@ impl Metrics {
 
             // Update operation count
             global_metrics().operations[metric].fetch_add(1, Ordering::Relaxed);
+            emit_otel_counter(metric, 1);
 
             // Update latency for realtime metrics with size (spawn async task)
             if (metric) < Metric::LastRealtime as usize {
@@ -352,6 +448,7 @@ impl Metrics {
 
             // Update operation count
             global_metrics().operations[metric].fetch_add(1, Ordering::Relaxed);
+            emit_otel_counter(metric, 1);
 
             // Update latency for realtime metrics (spawn async task)
             if (metric) < Metric::LastRealtime as usize {
@@ -373,6 +470,7 @@ impl Metrics {
 
                 // Update operation count
                 global_metrics().operations[metric].fetch_add(count as u64, Ordering::Relaxed);
+                emit_otel_counter(metric, count as u64);
 
                 // Update latency for realtime metrics (spawn async task)
                 if (metric) < Metric::LastRealtime as usize {
@@ -408,6 +506,7 @@ impl Metrics {
         let metric = metric as usize;
         // Update operation count
         global_metrics().operations[metric].fetch_add(1, Ordering::Relaxed);
+        emit_otel_counter(metric, 1);
 
         // Update latency for realtime metrics
         if (metric) < Metric::LastRealtime as usize {
@@ -494,10 +593,43 @@ impl Metrics {
         for i in 0..Metric::LastRealtime as usize {
             let last_min = self.latency[i].total().await;
             if last_min.n > 0
-                && let Some(_metric) = Metric::from_index(i)
+                && let Some(metric) = Metric::from_index(i)
             {
-                // Convert to madmin TimedAction format if needed
-                // This would require implementing the conversion
+                metrics.last_minute.actions.insert(
+                    metric.as_str().to_string(),
+                    TimedAction {
+                        count: last_min.n,
+                        acc_time: last_min.total,
+                        bytes: last_min.size,
+                    },
+                );
+            }
+        }
+
+        // Lifetime ILM operations
+        for i in 0..IlmAction::ActionCount as usize {
+            let count = self.actions[i].load(Ordering::Relaxed);
+            if count > 0
+                && let Some(action) = IlmAction::from_index(i)
+            {
+                metrics.life_time_ilm.insert(action.as_str().to_string(), count);
+            }
+        }
+
+        // Last minute ILM latency
+        for i in 0..IlmAction::ActionCount as usize {
+            let last_min = self.actions_latency[i].total().await;
+            if last_min.n > 0
+                && let Some(action) = IlmAction::from_index(i)
+            {
+                metrics.last_minute.ilm.insert(
+                    action.as_str().to_string(),
+                    TimedAction {
+                        count: last_min.n,
+                        acc_time: last_min.total,
+                        bytes: last_min.size,
+                    },
+                );
             }
         }
 
@@ -548,5 +680,33 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub struct CloseDiskGuard(CloseDiskFn);
+
+impl CloseDiskGuard {
+    pub fn new(close_disk: CloseDiskFn) -> Self {
+        Self(close_disk)
+    }
+
+    pub async fn close(&self) {
+        self.0().await;
+    }
+}
+
+impl Drop for CloseDiskGuard {
+    fn drop(&mut self) {
+        // Drop cannot be async, so we spawn the async cleanup task
+        // The task will run in the background and complete asynchronously
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let close_fn = self.0.clone();
+            handle.spawn(async move {
+                close_fn().await;
+            });
+        } else {
+            // If we're not in a tokio runtime context, we can't spawn
+            // This is a best-effort cleanup, so we just skip it
+        }
     }
 }

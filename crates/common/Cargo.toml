@@ -32,6 +32,7 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+metrics = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-filemeta = { workspace = true }
 serde = { workspace = true }

@@ -14,7 +14,7 @@
 
 use crate::admin::console::is_console_path;
 use crate::admin::console::make_console_server;
-use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX};
+use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX};
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -37,6 +37,10 @@ pub struct S3Router<T> {
     router: Router<T>,
     console_enabled: bool,
     console_router: Option<axum::routing::RouterIntoService<Body>>,
+}
+
+fn is_public_health_path(path: &str) -> bool {
+    path == HEALTH_PREFIX || path == HEALTH_READY_PATH
 }
 
 impl<T: Operation> S3Router<T> {
@@ -99,7 +103,7 @@ where
         }
 
         // Health check
-        if (method == Method::HEAD || method == Method::GET) && path == HEALTH_PREFIX {
+        if (method == Method::HEAD || method == Method::GET) && is_public_health_path(path) {
             return true;
         }
 
@@ -130,7 +134,7 @@ where
         }
 
         // Health check
-        if (req.method == Method::HEAD || req.method == Method::GET) && path == HEALTH_PREFIX {
+        if (req.method == Method::HEAD || req.method == Method::GET) && is_public_health_path(path) {
             return Ok(());
         }
 

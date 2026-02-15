@@ -60,10 +60,6 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- if .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
-      {{- end }}
       initContainers:
         - name: init-step
           image: "{{ .Values.image.initImage.repository }}:{{ .Values.image.initImage.tag }}"
@@ -111,7 +107,7 @@ spec:
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /health
+              path: /health/ready
               port: 9000
             initialDelaySeconds: 30
             periodSeconds: 5
@@ -127,8 +123,16 @@ spec:
       volumes:
         - name: logs
           persistentVolumeClaim:
-            claimName: {{ include "rustfs.fullname" . }}-logs
+            {{- if .Values.mode.standalone.existingClaim.logsClaim }}
+            claimName: {{ .Values.mode.standalone.existingClaim.logsClaim }}
+            {{- else }}
+            claimName: {{ include "rustfs.fullname" $ }}-logs
+            {{- end }}
         - name: data
           persistentVolumeClaim:
-            claimName: {{ include "rustfs.fullname" . }}-data
+            {{- if .Values.mode.standalone.existingClaim.dataClaim }}
+            claimName: {{ .Values.mode.standalone.existingClaim.dataClaim }}
+            {{- else }}
+            claimName: {{ include "rustfs.fullname" $ }}-data
+            {{- end }}
 {{- end }}

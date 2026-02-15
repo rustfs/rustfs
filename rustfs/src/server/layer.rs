@@ -109,7 +109,7 @@ impl ConditionalCorsLayer {
     }
 
     /// Exact paths that should be excluded from being treated as S3 paths.
-    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &["/health", "/profile/cpu", "/profile/memory"];
+    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &["/health", "/health/ready", "/profile/cpu", "/profile/memory"];
 
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths

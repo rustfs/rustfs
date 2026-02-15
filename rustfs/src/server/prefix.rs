@@ -27,6 +27,10 @@ pub(crate) const FAVICON_PATH: &str = "/favicon.ico";
 /// This path is used to check the health status of the server.
 pub(crate) const HEALTH_PREFIX: &str = "/health";
 
+/// Predefined readiness check path for RustFS server.
+/// This path is used to check dependency readiness and may return 503.
+pub(crate) const HEALTH_READY_PATH: &str = "/health/ready";
+
 /// Predefined administrative prefix for RustFS server routes.
 /// This prefix is used for endpoints that handle administrative tasks
 /// such as configuration, monitoring, and management.

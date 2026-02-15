@@ -40,3 +40,6 @@ PR_DESCRIPTION.md
 IMPLEMENTATION_PLAN.md
 scripts/s3-tests/selected_tests.txt
 docs
+
+# nix stuff
+result*
