@@ -25,6 +25,13 @@ pub const ENV_COMPRESSION_ENABLED: &str = "RUSTFS_COMPRESSION_ENABLED";
 // Environment variable for additional extensions to exclude from compression (comma-separated, e.g. ".foo,.bar")
 pub const ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS: &str = "RUSTFS_ADDED_EXCLUDE_COMPRESS_EXTENSIONS";
 
+/// Parses RUSTFS_COMPRESSION_ENABLED. Called once at first use via OnceLock.
+fn parse_compression_enabled() -> bool {
+    env::var(ENV_COMPRESSION_ENABLED)
+        .map(|s| s.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
 /// Parses RUSTFS_ADDED_EXCLUDE_COMPRESS_EXTENSIONS (comma-separated). Called once at first use via OnceLock.
 pub(crate) fn parse_added_exclude_extensions() -> Vec<String> {
     env::var(ENV_ADDED_EXCLUDE_COMPRESS_EXTENSIONS)
@@ -48,6 +55,7 @@ pub(crate) fn parse_added_exclude_extensions() -> Vec<String> {
 }
 
 // Parsed once at first use, then reused for all is_compressible() checks.
+static COMPRESSION_ENABLED: OnceLock<bool> = OnceLock::new();
 static ADDED_EXCLUDE_COMPRESS_EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
 
 // Some standard object extensions which we strictly dis-allow for compression.
@@ -90,14 +98,9 @@ pub const STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES: &[&str] = &[
 ];
 
 pub fn is_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
-    // Check if compression is enabled via environment variable, default disabled
-    if let Ok(compression_enabled) = env::var(ENV_COMPRESSION_ENABLED) {
-        if compression_enabled.to_lowercase() != "true" {
-            debug!("Compression is disabled by environment variable");
-            return false;
-        }
-    } else {
-        // Default disabled when environment variable is not set
+    // Check if compression is enabled (read once at first use, then fixed for process lifetime)
+    if !*COMPRESSION_ENABLED.get_or_init(parse_compression_enabled) {
+        debug!("Compression is disabled by environment variable");
         return false;
     }
 
@@ -131,22 +134,31 @@ mod tests {
     use temp_env;
 
     #[test]
+    fn test_parse_compression_enabled() {
+        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
+            assert!(parse_compression_enabled());
+        });
+        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("false"), || {
+            assert!(!parse_compression_enabled());
+        });
+        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("FALSE"), || {
+            assert!(!parse_compression_enabled());
+        });
+        temp_env::with_var_unset(ENV_COMPRESSION_ENABLED, || {
+            assert!(!parse_compression_enabled());
+        });
+    }
+
+    #[test]
     fn test_is_compressible() {
         use http::HeaderMap;
 
         let headers = HeaderMap::new();
 
-        // Test environment variable control
-        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("false"), || {
-            assert!(!is_compressible(&headers, "file.txt"));
-        });
-
+        // COMPRESSION_ENABLED is cached in OnceLock at first use; test with "true" so extension/content-type logic is exercised.
+        // For env false/unset behavior see test_parse_compression_enabled.
         temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
             assert!(is_compressible(&headers, "file.txt"));
-        });
-
-        temp_env::with_var_unset(ENV_COMPRESSION_ENABLED, || {
-            assert!(!is_compressible(&headers, "file.txt"));
         });
 
         temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
