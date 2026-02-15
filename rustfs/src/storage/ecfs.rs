@@ -24,7 +24,8 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
 use crate::storage::s3_api::bucket::{
-    build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
+    build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
+    parse_list_object_versions_params, parse_list_objects_v2_params,
 };
 use crate::storage::s3_api::common::rustfs_owner;
 use crate::storage::s3_api::multipart::{
@@ -3646,44 +3647,11 @@ impl S3 for FS {
             ..
         } = req.input;
 
-        let prefix = prefix.unwrap_or_default();
-
-        // Log debug info for prefixes with special characters to help diagnose encoding issues
-        if prefix.contains([' ', '+', '%', '\n', '\r', '\0']) {
-            debug!("LIST objects with special characters in prefix: {:?}", prefix);
-        }
-
-        let max_keys = max_keys.unwrap_or(1000);
-        if max_keys < 0 {
-            return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
-        }
-
-        let delimiter = delimiter.filter(|v| !v.is_empty());
-
-        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
-
-        // Save original start_after for response (per S3 API spec, must echo back if provided)
-        let response_start_after = start_after.clone();
-        let start_after_for_query = start_after.filter(|v| !v.is_empty());
-
-        // Save original continuation_token for response (per S3 API spec, must echo back if provided)
-        // Note: empty string should still be echoed back in the response
-        let response_continuation_token = continuation_token.clone();
-        let continuation_token_for_query = continuation_token.filter(|v| !v.is_empty());
-
-        // Decode continuation_token from base64 for internal use
-        let decoded_continuation_token = continuation_token_for_query
-            .map(|token| {
-                base64_simd::STANDARD
-                    .decode_to_vec(token.as_bytes())
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes).map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
-                    })
-            })
-            .transpose()?;
+        let parsed = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
+        validate_list_object_unordered_with_delimiter(parsed.delimiter.as_ref(), req.uri.query())?;
 
         let store = get_validated_store(&bucket).await?;
+        let fetch_owner = fetch_owner.unwrap_or_default();
 
         let incl_deleted = req
             .headers
@@ -3693,12 +3661,12 @@ impl S3 for FS {
         let object_infos = store
             .list_objects_v2(
                 &bucket,
-                &prefix,
-                decoded_continuation_token,
-                delimiter.clone(),
-                max_keys,
-                fetch_owner.unwrap_or_default(),
-                start_after_for_query,
+                &parsed.prefix,
+                parsed.decoded_continuation_token,
+                parsed.delimiter.clone(),
+                parsed.max_keys,
+                fetch_owner,
+                parsed.start_after_for_query,
                 incl_deleted,
             )
             .await
@@ -3706,14 +3674,14 @@ impl S3 for FS {
 
         let output = build_list_objects_v2_output(
             object_infos,
-            fetch_owner.unwrap_or_default(),
-            max_keys,
+            fetch_owner,
+            parsed.max_keys,
             bucket,
-            prefix,
-            delimiter,
+            parsed.prefix,
+            parsed.delimiter,
             encoding_type,
-            response_continuation_token,
-            response_start_after,
+            parsed.response_continuation_token,
+            parsed.response_start_after,
         );
 
         Ok(s3_response(output))
