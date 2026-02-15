@@ -76,9 +76,9 @@
 
             buildInputs = with pkgs; [
               openssl
-            ] ++ lib.optionals stdenv.isDarwin [
-              darwin.apple_sdk.frameworks.Security
-              darwin.apple_sdk.frameworks.SystemConfiguration
+            ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.darwin.apple_sdk.frameworks.Security
+              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
             ];
 
             cargoBuildFlags = [
@@ -97,6 +97,37 @@
               license = pkgs.lib.licenses.asl20;
               mainProgram = "rustfs";
             };
+          };
+        }
+      );
+
+      devShells = forAllSystems (
+        system:
+        let
+          overlays = [ (import rust-overlay) ];
+          pkgs = import nixpkgs { inherit system overlays; };
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [
+              "rust-src"
+              "rust-analyzer"
+              "clippy"
+              "rustfmt"
+            ];
+          };
+        in
+        {
+          default = pkgs.mkShell {
+            packages = [
+              rustToolchain
+              pkgs.pkg-config
+              pkgs.protobuf
+              pkgs.openssl
+            ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.darwin.apple_sdk.frameworks.Security
+              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            ];
+
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
           };
         }
       );
