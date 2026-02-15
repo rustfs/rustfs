@@ -782,8 +782,9 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
         mod_time: oi.mod_time,
         ..Default::default()
     };
-    time_ilm(1);
-    api.transition_object(&oi.bucket, &oi.name, &opts).await
+    let result = api.transition_object(&oi.bucket, &oi.name, &opts).await;
+    time_ilm(1)();
+    result
 }
 
 pub fn audit_tier_actions(_api: ECStore, _tier: &str, _bytes: i64) -> TimeFn {
@@ -1082,11 +1083,11 @@ pub async fn apply_expiry_on_transitioned_object(
     lc_event: &lifecycle::Event,
     src: &LcEventSrc,
 ) -> bool {
-    // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
+    let time_ilm = Metrics::time_ilm(lc_event.action);
     if let Err(_err) = expire_transitioned_object(api, oi, lc_event, src).await {
         return false;
     }
-    // let _ = time_ilm(1);
+    time_ilm(1)();
 
     true
 }
@@ -1114,7 +1115,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         opts.delete_prefix_object = true;
     }
 
-    // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
+    let time_ilm = Metrics::time_ilm(lc_event.action);
 
     //debug!("lc_event.action: {:?}", lc_event.action);
     //debug!("opts: {:?}", opts);
@@ -1152,11 +1153,11 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     });
 
     if lc_event.action != lifecycle::IlmAction::NoneAction {
-        // let mut num_versions = 1_u64;
-        // if lc_event.action.delete_all() {
-        //     num_versions = oi.num_versions as u64;
-        // }
-        // let _ = time_ilm(num_versions);
+        let mut num_versions = 1_u64;
+        if lc_event.action.delete_all() {
+            num_versions = oi.num_versions as u64;
+        }
+        time_ilm(num_versions)();
     }
 
     true
