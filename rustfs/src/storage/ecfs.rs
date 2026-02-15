@@ -23,7 +23,9 @@ use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_ha
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
-use crate::storage::s3_api::bucket::{build_list_objects_output, build_list_objects_v2_output};
+use crate::storage::s3_api::bucket::{
+    build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
+};
 use crate::storage::s3_api::common::rustfs_owner;
 use crate::storage::s3_api::multipart::{
     build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
@@ -3597,12 +3599,8 @@ impl S3 for FS {
             ..
         } = req.input;
 
-        let prefix = prefix.unwrap_or_default();
-        let max_keys = max_keys.unwrap_or(1000);
-
-        let key_marker = key_marker.filter(|v| !v.is_empty());
-        let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
-        let delimiter = delimiter.filter(|v| !v.is_empty());
+        let (prefix, delimiter, key_marker, version_id_marker, max_keys) =
+            parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
 
@@ -3611,63 +3609,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let objects: Vec<ObjectVersion> = object_infos
-            .objects
-            .iter()
-            .filter(|v| !v.name.is_empty() && !v.delete_marker)
-            .map(|v| {
-                ObjectVersion {
-                    key: Some(v.name.to_owned()),
-                    last_modified: v.mod_time.map(Timestamp::from),
-                    size: Some(v.size),
-                    version_id: Some(v.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
-                    is_latest: Some(v.is_latest),
-                    e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                    storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
-                    ..Default::default() // TODO: another fields
-                }
-            })
-            .collect();
-
-        let common_prefixes = object_infos
-            .prefixes
-            .into_iter()
-            .map(|v| CommonPrefix { prefix: Some(v) })
-            .collect();
-
-        let delete_markers = object_infos
-            .objects
-            .iter()
-            .filter(|o| o.delete_marker)
-            .map(|o| DeleteMarkerEntry {
-                key: Some(o.name.clone()),
-                version_id: Some(o.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
-                is_latest: Some(o.is_latest),
-                last_modified: o.mod_time.map(Timestamp::from),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-
-        // Only set next_key_marker and next_version_id_marker if they have values, per AWS S3 API spec
-        // boto3 expects them to be strings or omitted, not None or empty strings
-        let next_key_marker = object_infos.next_marker.filter(|v| !v.is_empty());
-        let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
-
-        let output = ListObjectVersionsOutput {
-            is_truncated: Some(object_infos.is_truncated),
-            // max_keys should be the requested maximum number of keys, not the actual count returned
-            // Per AWS S3 API spec, this field represents the maximum number of keys that can be returned in the response
-            max_keys: Some(max_keys),
-            delimiter,
-            name: Some(bucket),
-            prefix: Some(prefix),
-            common_prefixes: Some(common_prefixes),
-            versions: Some(objects),
-            delete_markers: Some(delete_markers),
-            next_key_marker,
-            next_version_id_marker,
-            ..Default::default()
-        };
+        let output = build_list_object_versions_output(object_infos, bucket, prefix, delimiter, max_keys);
 
         Ok(s3_response(output))
     }
