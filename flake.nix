@@ -13,38 +13,52 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    fenix.url = "github:nix-community/fenix";
-    flake-parts.url = "github:hercules-ci/flake-parts";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    inputs@{ flake-parts, ... }:
-    flake-parts.lib.mkFlake { inherit inputs; } {
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      ...
+    }:
+    let
       systems = [
         "x86_64-linux"
         "aarch64-linux"
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-
-      perSystem =
-        {
-          self',
-          pkgs,
-          system,
-          ...
-        }:
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+    in
+    {
+      packages = forAllSystems (
+        system:
         let
-          # access to fenix packages
-          fnx = inputs.fenix.packages.${system};
-          # create custom rust toolchain with latest fenix cargo/rustc
+          overlays = [ (import rust-overlay) ];
+          pkgs = import nixpkgs { inherit system overlays; };
+
+          # Use the latest stable rust toolchain
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [
+              "rust-src"
+              "rust-analyzer"
+              "clippy"
+              "rustfmt"
+            ];
+          };
+
           rustPlatform = pkgs.makeRustPlatform {
-            cargo = fnx.stable.cargo;
-            rustc = fnx.stable.rustc;
+            cargo = rustToolchain;
+            rustc = rustToolchain;
           };
         in
         {
-          packages.default = rustPlatform.buildRustPackage {
+          default = rustPlatform.buildRustPackage {
             pname = "rustfs";
             version = "0.0.5";
 
@@ -55,17 +69,25 @@
               allowBuiltinFetchGit = true;
             };
 
-            nativeBuildInputs = [
-              pkgs.pkg-config
-              pkgs.protobuf
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              protobuf
             ];
 
-            buildInputs = [ pkgs.openssl ];
+            buildInputs = with pkgs; [
+              openssl
+            ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.darwin.apple_sdk.frameworks.Security
+              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            ];
 
             cargoBuildFlags = [
               "--package"
               "rustfs"
             ];
+
+            # Set environment variables for build
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
 
             doCheck = false;
 
@@ -76,20 +98,38 @@
               mainProgram = "rustfs";
             };
           };
+        }
+      );
 
-          devShells.default = pkgs.mkShell {
-            inputsFrom = [ self'.packages.default ];
-            packages = [
-              # this is required else manual compilation will fail
-              pkgs.rust-jemalloc-sys-unprefixed
-
-              # other rust tooling necessary for development
-              fnx.stable.clippy
-              fnx.stable.rust-analyzer
-              fnx.stable.rust-src
-              fnx.complete.rustfmt
+      devShells = forAllSystems (
+        system:
+        let
+          overlays = [ (import rust-overlay) ];
+          pkgs = import nixpkgs { inherit system overlays; };
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [
+              "rust-src"
+              "rust-analyzer"
+              "clippy"
+              "rustfmt"
             ];
           };
-        };
+        in
+        {
+          default = pkgs.mkShell {
+            packages = [
+              rustToolchain
+              pkgs.pkg-config
+              pkgs.protobuf
+              pkgs.openssl
+            ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.darwin.apple_sdk.frameworks.Security
+              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            ];
+
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
+          };
+        }
+      );
     };
 }

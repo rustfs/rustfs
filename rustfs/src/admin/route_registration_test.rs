@@ -16,7 +16,7 @@ use crate::admin::{
     handlers::{bucket_meta, heal, health, kms, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user},
     router::{AdminOperation, S3Router},
 };
-use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
+use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use hyper::Method;
 
 fn admin_path(path: &str) -> String {
@@ -52,6 +52,8 @@ fn test_register_routes_cover_representative_admin_paths() {
 
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
+    assert_route(&router, Method::GET, HEALTH_READY_PATH);
+    assert_route(&router, Method::HEAD, HEALTH_READY_PATH);
     assert_route(&router, Method::GET, PROFILE_CPU_PATH);
     assert_route(&router, Method::GET, PROFILE_MEMORY_PATH);
 

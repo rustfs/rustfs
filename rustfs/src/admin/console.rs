@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::handlers::health::{HealthProbe, build_component_details, collect_dependency_readiness, health_check_state};
 use crate::config::build;
 use crate::license::get_license;
-use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, RUSTFS_ADMIN_PREFIX};
+use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, RUSTFS_ADMIN_PREFIX};
 use axum::{
     Router,
     body::Body,
@@ -23,20 +24,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use axum_server::tls_rustls::RustlsConfig;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
-use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use serde::Serialize;
 use serde_json::json;
 use std::{
-    io::Result,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, OnceLock},
+    sync::OnceLock,
     time::Duration,
 };
-use tokio_rustls::rustls::ServerConfig;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -101,24 +98,25 @@ pub(crate) struct Config {
 
 impl Config {
     fn new(local_ip: IpAddr, port: u16, version: &str, date: &str) -> Self {
+        let http_prefix = rustfs_config::RUSTFS_HTTP_PREFIX;
         Config {
             port,
             api: Api {
-                base_url: format!("http://{local_ip}:{port}/{RUSTFS_ADMIN_PREFIX}"),
+                base_url: format!("{http_prefix}{local_ip}:{port}/{RUSTFS_ADMIN_PREFIX}"),
             },
             s3: S3 {
-                endpoint: format!("http://{local_ip}:{port}"),
-                region: "cn-east-1".to_owned(),
+                endpoint: format!("{http_prefix}{local_ip}:{port}"),
+                region: rustfs_config::RUSTFS_REGION.to_string(),
             },
             release: Release {
                 version: version.to_string(),
                 date: date.to_string(),
             },
             license: License {
-                name: "Apache-2.0".to_string(),
-                url: "https://www.apache.org/licenses/LICENSE-2.0".to_string(),
+                name: rustfs_config::RUSTFS_LICENSE.to_string(),
+                url: rustfs_config::RUSTFS_LICENSE_URL.to_string(),
             },
-            doc: "https://rustfs.com/docs/".to_string(),
+            doc: rustfs_config::RUSTFS_DOCS_URL.to_string(),
         }
     }
 
@@ -349,78 +347,6 @@ async fn console_logging_middleware(req: Request, next: middleware::Next) -> Res
     response
 }
 
-/// Setup TLS configuration for console using axum-server, following endpoint TLS implementation logic
-#[instrument(skip(tls_path))]
-async fn _setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<RustlsConfig>> {
-    let tls_path = match tls_path {
-        Some(path) if !path.is_empty() => path,
-        _ => {
-            debug!("TLS path is not provided, console starting with HTTP");
-            return Ok(None);
-        }
-    };
-
-    if tokio::fs::metadata(tls_path).await.is_err() {
-        debug!("TLS path does not exist, console starting with HTTP");
-        return Ok(None);
-    }
-
-    debug!("Found TLS directory for console, checking for certificates");
-
-    // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-    // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
-    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path)
-        && !cert_key_pairs.is_empty()
-    {
-        debug!(
-            "Found {} certificates for console, creating SNI-aware multi-cert resolver",
-            cert_key_pairs.len()
-        );
-
-        // Create an SNI-enabled certificate resolver
-        let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
-
-        // Configure the server to enable SNI support
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(resolver));
-
-        // Configure ALPN protocol priority
-        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-
-        // Log SNI requests
-        if rustfs_utils::tls_key_log() {
-            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
-        }
-
-        info!(target: "rustfs::console::tls", "Console TLS enabled with multi-certificate SNI support");
-        return Ok(Some(RustlsConfig::from_config(Arc::new(server_config))));
-    }
-
-    // 2. Revert to the traditional single-certificate mode
-    let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
-    let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
-    if tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok() {
-        debug!("Found legacy single TLS certificate for console, starting with HTTPS");
-
-        return match RustlsConfig::from_pem_file(cert_path, key_path).await {
-            Ok(config) => {
-                info!(target: "rustfs::console::tls", "Console TLS enabled with single certificate");
-                Ok(Some(config))
-            }
-            Err(e) => {
-                error!(target: "rustfs::console::error", error = %e, "Failed to create TLS config for console");
-                Err(std::io::Error::other(e))
-            }
-        };
-    }
-
-    debug!("No valid TLS certificates found in the directory for console, starting with HTTP");
-    Ok(None)
-}
-
 /// Get console configuration from environment variables
 /// Returns a tuple containing console configuration values from environment variables.
 ///
@@ -485,6 +411,7 @@ fn setup_console_middleware_stack(
         .route(&format!("{CONSOLE_PREFIX}/license"), get(license_handler))
         .route(&format!("{CONSOLE_PREFIX}/version"), get(version_handler))
         .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
+        .route(&format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"), get(health_check).head(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
 
@@ -523,41 +450,29 @@ fn setup_console_middleware_stack(
 /// # Returns:
 /// - A `Response` containing the health check result.
 #[instrument]
-async fn health_check(method: Method) -> Response {
+async fn health_check(method: Method, uri: Uri) -> Response {
+    let probe = if uri.path().strip_prefix(CONSOLE_PREFIX) == Some(HEALTH_READY_PATH) {
+        HealthProbe::Readiness
+    } else {
+        HealthProbe::Liveness
+    };
+    let (storage_ready, iam_ready) = collect_dependency_readiness();
+    let health = health_check_state(storage_ready, iam_ready, probe);
+
     let builder = Response::builder()
-        .status(StatusCode::OK)
+        .status(health.status_code)
         .header("content-type", "application/json");
+
     match method {
         // GET: Returns complete JSON
         Method::GET => {
-            let mut health_status = "ok";
-            let mut details = json!({});
-
-            // Check storage backend health
-            if let Some(_store) = rustfs_ecstore::new_object_layer_fn() {
-                details["storage"] = json!({"status": "connected"});
-            } else {
-                health_status = "degraded";
-                details["storage"] = json!({"status": "disconnected"});
-            }
-
-            // Check IAM system health
-            match rustfs_iam::get() {
-                Ok(_) => {
-                    details["iam"] = json!({"status": "connected"});
-                }
-                Err(_) => {
-                    health_status = "degraded";
-                    details["iam"] = json!({"status": "disconnected"});
-                }
-            }
-
             let body_json = json!({
-                "status": health_status,
+                "status": health.status,
+                "ready": health.ready,
                 "service": "rustfs-console",
                 "timestamp": jiff::Zoned::now().to_string(),
                 "version": env!("CARGO_PKG_VERSION"),
-                "details": details,
+                "details": build_component_details(storage_ready, iam_ready),
                 "uptime": std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
