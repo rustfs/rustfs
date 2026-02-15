@@ -20,6 +20,7 @@ use crate::{
 use futures::future::join_all;
 use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
+use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete};
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
 use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_object_lock_config, get_replication_config};
@@ -483,6 +484,8 @@ impl ScannerIOCache for SetDisks {
 #[async_trait::async_trait]
 impl ScannerIODisk for Disk {
     async fn get_size(&self, mut item: ScannerItem) -> Result<SizeSummary> {
+        let done_object = Metrics::time(Metric::ScanObject);
+
         if !item.path.ends_with(&format!("{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}")) {
             return Err(StorageError::other("skip file".to_string()));
         }
@@ -554,6 +557,8 @@ impl ScannerIODisk for Disk {
         item.apply_actions(ecstore, object_infos, lock_config, &mut size_summary)
             .await;
 
+        done_object();
+
         // TODO: enqueueFreeVersion
 
         Ok(size_summary)
@@ -565,6 +570,10 @@ impl ScannerIODisk for Disk {
         updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache> {
+        let done_drive = Metrics::time(Metric::ScanBucketDrive);
+        let drive_start = std::time::Instant::now();
+        let bucket = cache.info.name.clone();
+        let disk_path = self.path().to_string_lossy().to_string();
         let _guard = self.start_scan();
 
         let mut cache = cache;
@@ -631,10 +640,15 @@ impl ScannerIODisk for Disk {
 
         match result {
             Ok(mut data_usage_info) => {
+                done_drive();
+                emit_scan_bucket_drive_complete(true, &bucket, &disk_path, drive_start.elapsed());
                 data_usage_info.info.last_update = Some(SystemTime::now());
                 Ok(data_usage_info)
             }
-            Err(e) => Err(StorageError::other(format!("Failed to scan data folder: {e}"))),
+            Err(e) => {
+                emit_scan_bucket_drive_complete(false, &bucket, &disk_path, drive_start.elapsed());
+                Err(StorageError::other(format!("Failed to scan data folder: {e}")))
+            }
         }
     }
 }
