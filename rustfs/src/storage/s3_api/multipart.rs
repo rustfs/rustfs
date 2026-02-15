@@ -19,6 +19,19 @@ use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo};
 use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ListPartsParams {
+    pub part_number_marker: Option<usize>,
+    pub max_parts: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ListMultipartUploadsParams {
+    pub prefix: String,
+    pub key_marker: Option<String>,
+    pub max_uploads: usize,
+}
+
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
     let owner = rustfs_owner();
     let initiator = rustfs_initiator();
@@ -57,7 +70,7 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
 pub(crate) fn parse_list_parts_params(
     part_number_marker: Option<i32>,
     max_parts: Option<i32>,
-) -> Result<(Option<usize>, usize), S3Error> {
+) -> Result<ListPartsParams, S3Error> {
     let part_number_marker = part_number_marker.map(|x| x as usize);
     let max_parts = match max_parts {
         Some(parts) => {
@@ -72,14 +85,17 @@ pub(crate) fn parse_list_parts_params(
         None => 1000,
     };
 
-    Ok((part_number_marker, max_parts))
+    Ok(ListPartsParams {
+        part_number_marker,
+        max_parts,
+    })
 }
 
 pub(crate) fn parse_list_multipart_uploads_params(
     prefix: Option<String>,
     key_marker: Option<String>,
     max_uploads: Option<i32>,
-) -> Result<(String, Option<String>, usize), S3Error> {
+) -> Result<ListMultipartUploadsParams, S3Error> {
     let prefix = prefix.unwrap_or_default();
     let max_uploads = match max_uploads {
         Some(value) => {
@@ -108,7 +124,11 @@ pub(crate) fn parse_list_multipart_uploads_params(
         return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "Invalid key marker".to_string()));
     }
 
-    Ok((prefix, key_marker, max_uploads))
+    Ok(ListMultipartUploadsParams {
+        prefix,
+        key_marker,
+        max_uploads,
+    })
 }
 
 pub(crate) fn build_list_multipart_uploads_output(
@@ -269,13 +289,13 @@ mod tests {
 
     #[test]
     fn test_parse_list_parts_params_defaults_and_valid_values() {
-        let (part_number_marker, max_parts) = parse_list_parts_params(Some(5), Some(100)).expect("expected valid params");
-        assert_eq!(part_number_marker, Some(5));
-        assert_eq!(max_parts, 100);
+        let parsed = parse_list_parts_params(Some(5), Some(100)).expect("expected valid params");
+        assert_eq!(parsed.part_number_marker, Some(5));
+        assert_eq!(parsed.max_parts, 100);
 
-        let (part_number_marker, max_parts) = parse_list_parts_params(None, None).expect("expected default params");
-        assert_eq!(part_number_marker, None);
-        assert_eq!(max_parts, 1000);
+        let parsed = parse_list_parts_params(None, None).expect("expected default params");
+        assert_eq!(parsed.part_number_marker, None);
+        assert_eq!(parsed.max_parts, 1000);
     }
 
     #[test]
@@ -289,18 +309,17 @@ mod tests {
 
     #[test]
     fn test_parse_list_multipart_uploads_params_defaults_and_valid_values() {
-        let (prefix, key_marker, max_uploads) =
+        let parsed =
             parse_list_multipart_uploads_params(Some("prefix/".to_string()), Some("prefix/key-marker".to_string()), Some(100))
                 .expect("expected valid params");
-        assert_eq!(prefix, "prefix/");
-        assert_eq!(key_marker.as_deref(), Some("prefix/key-marker"));
-        assert_eq!(max_uploads, 100);
+        assert_eq!(parsed.prefix, "prefix/");
+        assert_eq!(parsed.key_marker.as_deref(), Some("prefix/key-marker"));
+        assert_eq!(parsed.max_uploads, 100);
 
-        let (prefix, key_marker, max_uploads) =
-            parse_list_multipart_uploads_params(None, None, None).expect("expected default params");
-        assert_eq!(prefix, "");
-        assert_eq!(key_marker, None);
-        assert_eq!(max_uploads, MAX_PARTS_COUNT);
+        let parsed = parse_list_multipart_uploads_params(None, None, None).expect("expected default params");
+        assert_eq!(parsed.prefix, "");
+        assert_eq!(parsed.key_marker, None);
+        assert_eq!(parsed.max_uploads, MAX_PARTS_COUNT);
     }
 
     #[test]

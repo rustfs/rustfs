@@ -3574,14 +3574,21 @@ impl S3 for FS {
             return Err(not_initialized_error());
         };
 
-        let (prefix, key_marker, max_uploads) = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
+        let parsed = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
 
         let result = store
-            .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
+            .list_multipart_uploads(
+                &bucket,
+                &parsed.prefix,
+                delimiter,
+                parsed.key_marker,
+                upload_id_marker,
+                parsed.max_uploads,
+            )
             .await
             .map_err(ApiError::from)?;
 
-        let output = build_list_multipart_uploads_output(bucket, prefix, result);
+        let output = build_list_multipart_uploads_output(bucket, parsed.prefix, result);
 
         Ok(s3_response(output))
     }
@@ -3708,10 +3715,17 @@ impl S3 for FS {
             return Err(not_initialized_error());
         };
 
-        let (part_number_marker, max_parts) = parse_list_parts_params(part_number_marker, max_parts)?;
+        let parsed = parse_list_parts_params(part_number_marker, max_parts)?;
 
         let res = store
-            .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
+            .list_object_parts(
+                &bucket,
+                &key,
+                &upload_id,
+                parsed.part_number_marker,
+                parsed.max_parts,
+                &ObjectOptions::default(),
+            )
             .await
             .map_err(ApiError::from)?;
 
