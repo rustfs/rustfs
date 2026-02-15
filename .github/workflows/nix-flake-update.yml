@@ -19,6 +19,8 @@ on:
   schedule:
     - cron: '0 0 * * 0' # Weekly on Sundays
 
+permissions:
+  contents: read
 jobs:
   update-flake:
     name: Update flake.lock
