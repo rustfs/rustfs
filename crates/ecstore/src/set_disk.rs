@@ -138,6 +138,7 @@ pub struct SetDisks {
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
     pub lockers: Vec<Arc<dyn LockClient>>,
+    local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +181,7 @@ impl SetDisks {
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
             lockers,
+            local_lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
         })
     }
 
@@ -4022,7 +4024,7 @@ impl StorageAPI for SetDisks {
         } else {
             NamespaceLock::Local(LocalLock::new(
                 format!("set-{}-{}", self.pool_index, self.set_index),
-                Arc::new(rustfs_lock::GlobalLockManager::new()),
+                self.local_lock_manager.clone(),
             ))
         };
 
