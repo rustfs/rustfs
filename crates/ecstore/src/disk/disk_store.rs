@@ -216,6 +216,24 @@ impl LocalDiskWrapper {
         }
     }
 
+    /// Enable health monitoring after disk creation.
+    /// Used to defer health checks until after startup format loading completes.
+    pub fn enable_health_check(&self) {
+        let env_health_check = std::env::var(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING)
+            .map(|v| parse_bool_with_default(&v, true))
+            .unwrap_or(true);
+
+        if env_health_check {
+            let health = Arc::clone(&self.health);
+            let cancel_token = self.cancel_token.clone();
+            let disk = Arc::clone(&self.disk);
+
+            tokio::spawn(async move {
+                Self::monitor_disk_writable(disk, health, cancel_token).await;
+            });
+        }
+    }
+
     /// Stop the disk monitoring
     pub async fn stop_monitoring(&self) {
         self.cancel_token.cancel();

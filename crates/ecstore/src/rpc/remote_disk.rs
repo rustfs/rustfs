@@ -100,14 +100,32 @@ impl RemoteDisk {
     /// Start health monitoring for the remote disk
     fn start_health_monitoring(&self) {
         if self.health_check {
-            let health = Arc::clone(&self.health);
-            let cancel_token = self.cancel_token.clone();
-            let addr = self.addr.clone();
-
-            tokio::spawn(async move {
-                Self::monitor_remote_disk_health(addr, health, cancel_token).await;
-            });
+            self.spawn_health_monitoring();
         }
+    }
+
+    /// Enable health monitoring after disk creation.
+    /// Used to defer health checks until after startup format loading completes,
+    /// so that remote peers have time to come online.
+    pub fn enable_health_check(&self) {
+        let env_health_check = std::env::var(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING)
+            .map(|v| parse_bool_with_default(&v, true))
+            .unwrap_or(true);
+
+        if env_health_check {
+            self.spawn_health_monitoring();
+        }
+    }
+
+    /// Spawn the health monitoring task
+    fn spawn_health_monitoring(&self) {
+        let health = Arc::clone(&self.health);
+        let cancel_token = self.cancel_token.clone();
+        let addr = self.addr.clone();
+
+        tokio::spawn(async move {
+            Self::monitor_remote_disk_health(addr, health, cancel_token).await;
+        });
     }
 
     /// Monitor remote disk health periodically
