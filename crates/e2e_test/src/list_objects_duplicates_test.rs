@@ -130,6 +130,6 @@ mod tests {
         );
 
         // Stop the RustFS server to ensure proper cleanup
-        env.stop_server().await.expect("Failed to stop RustFS");
+        env.stop_server();
     }
 }
