@@ -181,7 +181,7 @@ impl SetDisks {
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
             lockers,
-            local_lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
+            local_lock_manager: rustfs_lock::get_global_lock_manager(),
         })
     }
 
