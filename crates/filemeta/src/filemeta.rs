@@ -1849,7 +1849,6 @@ impl MetaObject {
                 continue;
             }
 
-
             if lower_k == AMZ_STORAGE_CLASS.to_lowercase() && v == b"STANDARD" {
                 continue;
             }
