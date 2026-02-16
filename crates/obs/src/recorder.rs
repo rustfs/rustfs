@@ -24,7 +24,7 @@ use std::{
     collections::HashMap,
     ops::Deref,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -72,6 +72,9 @@ impl Builder {
             Recorder {
                 meter,
                 metrics_metadata: Arc::new(Mutex::new(HashMap::new())),
+                cached_counters: Arc::new(RwLock::new(HashMap::new())),
+                cached_gauges: Arc::new(RwLock::new(HashMap::new())),
+                cached_histograms: Arc::new(RwLock::new(HashMap::new())),
             },
         )
     }
@@ -113,6 +116,10 @@ struct MetricMetadata {
 pub struct Recorder {
     meter: Meter,
     metrics_metadata: Arc<Mutex<HashMap<KeyName, MetricMetadata>>>,
+    // cache metric handlers as to not reregister on each call
+    cached_counters: Arc<RwLock<HashMap<Key, Counter>>>,
+    cached_gauges: Arc<RwLock<HashMap<Key, Gauge>>>,
+    cached_histograms: Arc<RwLock<HashMap<Key, Histogram>>>,
 }
 
 impl Recorder {
@@ -129,6 +136,9 @@ impl Recorder {
         Recorder {
             meter,
             metrics_metadata: Arc::new(Mutex::new(HashMap::new())),
+            cached_counters: Arc::new(RwLock::new(HashMap::new())),
+            cached_gauges: Arc::new(RwLock::new(HashMap::new())),
+            cached_histograms: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -158,8 +168,17 @@ impl metrics::Recorder for Recorder {
     }
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+        if let Some(cached) = self.cached_counters.read().unwrap().get(key) {
+            return cached.clone();
+        }
+
+        let mut cache = self.cached_counters.write().unwrap();
+        if let Some(cached) = cache.get(key) {
+            return cached.clone();
+        }
+
         let mut builder = self.meter.u64_counter(key.name().to_owned());
-        if let Some(metadata) = self.metrics_metadata.lock().unwrap().remove(key.name()) {
+        if let Some(metadata) = self.metrics_metadata.lock().unwrap().get(key.name()) {
             if let Some(unit) = metadata.unit {
                 builder = builder.with_unit(unit.as_canonical_label());
             }
@@ -172,16 +191,27 @@ impl metrics::Recorder for Recorder {
             .map(|label| KeyValue::new(label.key().to_owned(), label.value().to_owned()))
             .collect();
 
-        Counter::from_arc(Arc::new(WrappedCounter {
+        let handle = Counter::from_arc(Arc::new(WrappedCounter {
             counter,
             labels,
             value: AtomicU64::new(0),
-        }))
+        }));
+        cache.insert(key.clone(), handle.clone());
+        handle
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+        if let Some(cached) = self.cached_gauges.read().unwrap().get(key) {
+            return cached.clone();
+        }
+
+        let mut cache = self.cached_gauges.write().unwrap();
+        if let Some(cached) = cache.get(key) {
+            return cached.clone();
+        }
+
         let mut builder = self.meter.f64_gauge(key.name().to_owned());
-        if let Some(metadata) = self.metrics_metadata.lock().unwrap().remove(key.name()) {
+        if let Some(metadata) = self.metrics_metadata.lock().unwrap().get(key.name()) {
             if let Some(unit) = metadata.unit {
                 builder = builder.with_unit(unit.as_canonical_label());
             }
@@ -194,16 +224,27 @@ impl metrics::Recorder for Recorder {
             .map(|label| KeyValue::new(label.key().to_owned(), label.value().to_owned()))
             .collect();
 
-        Gauge::from_arc(Arc::new(WrappedGauge {
+        let handle = Gauge::from_arc(Arc::new(WrappedGauge {
             gauge,
             labels,
             value: AtomicU64::new(0),
-        }))
+        }));
+        cache.insert(key.clone(), handle.clone());
+        handle
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+        if let Some(cached) = self.cached_histograms.read().unwrap().get(key) {
+            return cached.clone();
+        }
+
+        let mut cache = self.cached_histograms.write().unwrap();
+        if let Some(cached) = cache.get(key) {
+            return cached.clone();
+        }
+
         let mut builder = self.meter.f64_histogram(key.name().to_owned());
-        if let Some(metadata) = self.metrics_metadata.lock().unwrap().remove(key.name()) {
+        if let Some(metadata) = self.metrics_metadata.lock().unwrap().get(key.name()) {
             if let Some(unit) = metadata.unit {
                 builder = builder.with_unit(unit.as_canonical_label());
             }
@@ -216,7 +257,9 @@ impl metrics::Recorder for Recorder {
             .map(|label| KeyValue::new(label.key().to_owned(), label.value().to_owned()))
             .collect();
 
-        Histogram::from_arc(Arc::new(WrappedHistogram { histogram, labels }))
+        let handle = Histogram::from_arc(Arc::new(WrappedHistogram { histogram, labels }));
+        cache.insert(key.clone(), handle.clone());
+        handle
     }
 }
 
