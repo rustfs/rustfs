@@ -117,11 +117,10 @@ mod tests {
             folder_prefixes.len()
         );
 
-        // Verify that "folder/" is NOT in contents (objects)
-        // Standard S3: if it's rolled up into CommonPrefixes, it shouldn't be in Contents unless it doesn't match the rollup logic?
-        // Actually, for "folder/", it is the prefix itself.
-        // In this specific fix, we rely on duplicate removal in CommonPrefixes.
-        // We implicitly assume it was added to CommonPrefixes twice (once from file, once from object).
+        // Verify that "folder/" is NOT returned as an object in Contents.
+        // For this regression test, we expect "folder/" to be represented only as a CommonPrefix
+        // (rolled up from "folder/file.txt" and the explicit "folder/" object), and to appear there
+        // exactly once. It must not appear in Contents at all.
 
         // Ensure "folder/" is NOT in contents (Contents)
         let folder_in_contents = result.contents().iter().any(|o| o.key() == Some("folder/"));
