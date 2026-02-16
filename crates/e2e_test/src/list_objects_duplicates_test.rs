@@ -128,5 +128,8 @@ mod tests {
             !folder_in_contents,
             "Expected 'folder/' to be rolled up into CommonPrefixes, but found it in Contents"
         );
+
+        // Stop the RustFS server to ensure proper cleanup
+        env.stop_server().await.expect("Failed to stop RustFS");
     }
 }
