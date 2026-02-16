@@ -2662,7 +2662,7 @@ impl SetDisks {
     }
 
     #[tracing::instrument(skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
-    async fn heal_object(
+    async fn heal_object_inner(
         &self,
         bucket: &str,
         object: &str,
@@ -6218,14 +6218,14 @@ impl StorageAPI for SetDisks {
         // Pass no_lock=true since we already obtained write lock (or are already called with no_lock=true)
         let mut inner_opts = *opts;
         inner_opts.no_lock = true;
-        let (result, err) = self.heal_object(bucket, object, version_id, &inner_opts).await?;
+        let (result, err) = self.heal_object_inner(bucket, object, version_id, &inner_opts).await?;
         if let Some(err) = err.as_ref() {
             match err {
                 &DiskError::FileCorrupt if opts.scan_mode != HealScanMode::Deep => {
                     // Instead of returning an error when a bitrot error is detected
                     // during a normal heal scan, heal again with bitrot flag enabled.
                     inner_opts.scan_mode = HealScanMode::Deep;
-                    let (result, err) = self.heal_object(bucket, object, version_id, &inner_opts).await?;
+                    let (result, err) = self.heal_object_inner(bucket, object, version_id, &inner_opts).await?;
                     return Ok((result, err.map(|e| e.into())));
                 }
                 _ => {}
