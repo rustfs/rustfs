@@ -2712,7 +2712,8 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
 
                 if minor < 2 {
                     read_more(reader, &mut buf, size, want, has_full).await?;
-                    return Ok(buf[..want].to_vec());
+                    buf.truncate(want);
+                    return Ok(buf);
                 }
 
                 let want_max = usize::min(want + MSGP_UINT32_SIZE, size);
@@ -2728,7 +2729,8 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
 
                 want += tmp.len() - other_size;
 
-                Ok(buf[..want].to_vec())
+                buf.truncate(want);
+                Ok(buf)
             }
             _ => Err(Error::other(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
