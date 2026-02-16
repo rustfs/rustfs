@@ -1849,9 +1849,6 @@ impl MetaObject {
                 continue;
             }
 
-            if lower_k == VERSION_PURGE_STATUS_KEY.to_lowercase() {
-                continue;
-            }
 
             if lower_k == AMZ_STORAGE_CLASS.to_lowercase() && v == b"STANDARD" {
                 continue;

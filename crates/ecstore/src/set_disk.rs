@@ -4507,10 +4507,10 @@ impl StorageAPI for SetDisks {
             .delete_replication
             .as_ref()
             .map(|v| v.replica_status == ReplicationStatusType::Replica)
-            == Some(true)
+            == Some(true) || opts.version_purge_status() == VersionPurgeStatusType::Complete
         {
             ReplicateDecision::default()
-        } else {
+        }  else {
             check_replicate_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await
         };
 
