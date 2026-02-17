@@ -15,13 +15,15 @@
 use rustfs_config::observability::{
     DEFAULT_OBS_ENVIRONMENT_PRODUCTION, ENV_OBS_ENDPOINT, ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_ENDPOINT,
     ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_ROTATION_SIZE_MB, ENV_OBS_LOG_ROTATION_TIME,
-    ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOGGER_LEVEL, ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_SAMPLE_RATIO,
-    ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_TRACE_ENDPOINT, ENV_OBS_USE_STDOUT,
+    ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOGGER_LEVEL, ENV_OBS_LOGS_EXPORT_ENABLED, ENV_OBS_METER_INTERVAL,
+    ENV_OBS_METRIC_ENDPOINT, ENV_OBS_METRICS_EXPORT_ENABLED, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION,
+    ENV_OBS_TRACE_ENDPOINT, ENV_OBS_TRACES_EXPORT_ENABLED, ENV_OBS_USE_STDOUT,
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_TIME,
-    DEFAULT_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION,
-    USE_STDOUT,
+    DEFAULT_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
+    DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
+    SERVICE_VERSION, USE_STDOUT,
 };
 use rustfs_utils::dirs::get_log_directory_to_string;
 use rustfs_utils::{get_env_bool, get_env_f64, get_env_opt_str, get_env_str, get_env_u64, get_env_usize};
@@ -56,18 +58,21 @@ use std::env;
 /// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OtelConfig {
-    pub endpoint: String,                 // Endpoint for metric collection
-    pub trace_endpoint: Option<String>,   // Endpoint for trace collection
-    pub metric_endpoint: Option<String>,  // Endpoint for metric collection
-    pub log_endpoint: Option<String>,     // Endpoint for log collection
-    pub use_stdout: Option<bool>,         // Output to stdout
-    pub sample_ratio: Option<f64>,        // Trace sampling ratio
-    pub meter_interval: Option<u64>,      // Metric collection interval
-    pub service_name: Option<String>,     // Service name
-    pub service_version: Option<String>,  // Service version
-    pub environment: Option<String>,      // Environment
-    pub logger_level: Option<String>,     // Logger level
-    pub log_stdout_enabled: Option<bool>, // Stdout logging enabled
+    pub endpoint: String,                     // Endpoint for otel collection
+    pub trace_endpoint: Option<String>,       // Endpoint for trace collection
+    pub metric_endpoint: Option<String>,      // Endpoint for metric collection
+    pub log_endpoint: Option<String>,         // Endpoint for log collection
+    pub traces_export_enabled: Option<bool>,  // Enable/disable trace export
+    pub metrics_export_enabled: Option<bool>, // Enable/disable metric export
+    pub logs_export_enabled: Option<bool>,    // Enable/disable log export
+    pub use_stdout: Option<bool>,             // Output to stdout
+    pub sample_ratio: Option<f64>,            // Trace sampling ratio
+    pub meter_interval: Option<u64>,          // Metric collection interval
+    pub service_name: Option<String>,         // Service name
+    pub service_version: Option<String>,      // Service version
+    pub environment: Option<String>,          // Environment
+    pub logger_level: Option<String>,         // Logger level
+    pub log_stdout_enabled: Option<bool>,     // Stdout logging enabled
     // Added flexi_logger related configurations
     pub log_directory: Option<String>,     // LOG FILE DIRECTORY
     pub log_filename: Option<String>,      // The name of the log file
@@ -98,6 +103,9 @@ impl OtelConfig {
             trace_endpoint: get_env_opt_str(ENV_OBS_TRACE_ENDPOINT),
             metric_endpoint: get_env_opt_str(ENV_OBS_METRIC_ENDPOINT),
             log_endpoint: get_env_opt_str(ENV_OBS_LOG_ENDPOINT),
+            traces_export_enabled: Some(get_env_bool(ENV_OBS_TRACES_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED)),
+            metrics_export_enabled: Some(get_env_bool(ENV_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED)),
+            logs_export_enabled: Some(get_env_bool(ENV_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED)),
             use_stdout: Some(use_stdout),
             sample_ratio: Some(get_env_f64(ENV_OBS_SAMPLE_RATIO, SAMPLE_RATIO)),
             meter_interval: Some(get_env_u64(ENV_OBS_METER_INTERVAL, METER_INTERVAL)),
