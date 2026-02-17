@@ -352,7 +352,24 @@ impl HistogramFn for WrappedHistogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics::Recorder as _;
     use opentelemetry_sdk::metrics::Temporality;
+
+    fn test_recorder() -> Recorder {
+        let exporter = opentelemetry_stdout::MetricExporterBuilder::default()
+            .with_temporality(Temporality::Cumulative)
+            .build();
+
+        let (_provider, recorder) = Recorder::builder("test")
+            .with_meter_provider(|b| b.with_periodic_exporter(exporter))
+            .build();
+
+        recorder
+    }
+
+    fn test_metadata() -> Metadata<'static> {
+        Metadata::new(module_path!(), metrics::Level::INFO, None)
+    }
 
     #[test]
     fn standard_usage() {
@@ -371,5 +388,71 @@ mod tests {
         counter.increment(1);
 
         provider.force_flush().unwrap();
+    }
+
+    #[test]
+    fn counter_cached_on_repeated_registration() {
+        let recorder = test_recorder();
+        let key = Key::from_name("requests_total");
+        let meta = test_metadata();
+
+        let _first = recorder.register_counter(&key, &meta);
+        let _second = recorder.register_counter(&key, &meta);
+
+        let cache = recorder.cached_counters.read().unwrap();
+        assert_eq!(cache.len(), 1, "counter should be cached and inserted only once");
+    }
+
+    #[test]
+    fn gauge_cached_on_repeated_registration() {
+        let recorder = test_recorder();
+        let key = Key::from_name("active_connections");
+        let meta = test_metadata();
+
+        let _first = recorder.register_gauge(&key, &meta);
+        let _second = recorder.register_gauge(&key, &meta);
+
+        let cache = recorder.cached_gauges.read().unwrap();
+        assert_eq!(cache.len(), 1, "gauge should be cached and inserted only once");
+    }
+
+    #[test]
+    fn histogram_cached_on_repeated_registration() {
+        let recorder = test_recorder();
+        let key = Key::from_name("request_duration");
+        let meta = test_metadata();
+
+        let _first = recorder.register_histogram(&key, &meta);
+        let _second = recorder.register_histogram(&key, &meta);
+
+        let cache = recorder.cached_histograms.read().unwrap();
+        assert_eq!(cache.len(), 1, "histogram should be cached and inserted only once");
+    }
+
+    #[test]
+    fn concurrent_register_counter_inserts_once() {
+        let recorder = test_recorder();
+        let key = Key::from_name("concurrent_counter");
+        let shared = Arc::new(recorder);
+        let barrier = Arc::new(std::sync::Barrier::new(10));
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let r = Arc::clone(&shared);
+                let k = key.clone();
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    let _ = r.register_counter(&k, &test_metadata());
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let cache = shared.cached_counters.read().unwrap();
+        assert_eq!(cache.len(), 1, "concurrent registrations should produce exactly one cache entry");
     }
 }
