@@ -253,7 +253,7 @@ impl ECStore {
                 }
             }?;
 
-            // Format loading succeeded -- enable health monitoring on all disks.
+            // Format loading succeeded, enable health monitoring on all disks
             for disk in disks.iter().flatten() {
                 disk.enable_health_check();
             }
