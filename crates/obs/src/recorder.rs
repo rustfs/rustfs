@@ -30,6 +30,19 @@ use std::{
 };
 use tracing::error;
 
+macro_rules! configure_builder {
+    ($builder:expr, $metadata:expr) => {{
+        let mut builder = $builder;
+        if let Some(metadata) = $metadata {
+            if let Some(unit) = metadata.unit {
+                builder = builder.with_unit(unit.as_canonical_label());
+            }
+            builder = builder.with_description(metadata.description.to_string());
+        }
+        builder
+    }};
+}
+
 /// A builder for constructing a [`Recorder`].
 #[derive(Debug)]
 pub struct Builder {
@@ -165,13 +178,10 @@ impl Recorder {
     where
         F: FnOnce(&mut HashMap<KeyName, MetricMetadata>) -> R,
     {
-        let mut guard = match self.metrics_metadata.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                error!("metrics_metadata lock poisoned: {}", e);
-                e.into_inner()
-            }
-        };
+        let mut guard = self.metrics_metadata.lock().unwrap_or_else(|e| {
+            error!("metrics_metadata lock poisoned: {}", e);
+            e.into_inner()
+        });
         f(&mut guard)
     }
 
@@ -212,13 +222,9 @@ impl metrics::Recorder for Recorder {
             return counter;
         }
 
-        let mut builder = self.meter.u64_counter(key.name().to_owned());
-        if let Some(metadata) = self.get_metadata_for_builder(key.name()) {
-            if let Some(unit) = metadata.unit {
-                builder = builder.with_unit(unit.as_canonical_label());
-            }
-            builder = builder.with_description(metadata.description.to_string());
-        }
+        let builder = self.meter.u64_counter(key.name().to_owned());
+        let metadata = self.get_metadata_for_builder(key.name());
+        let builder = configure_builder!(builder, metadata);
 
         let counter = builder.build();
         let labels = key
@@ -240,13 +246,9 @@ impl metrics::Recorder for Recorder {
             return gauge;
         }
 
-        let mut builder = self.meter.f64_gauge(key.name().to_owned());
-        if let Some(metadata) = self.get_metadata_for_builder(key.name()) {
-            if let Some(unit) = metadata.unit {
-                builder = builder.with_unit(unit.as_canonical_label());
-            }
-            builder = builder.with_description(metadata.description.to_string());
-        }
+        let builder = self.meter.f64_gauge(key.name().to_owned());
+        let metadata = self.get_metadata_for_builder(key.name());
+        let builder = configure_builder!(builder, metadata);
 
         let gauge = builder.build();
         let labels = key
@@ -268,13 +270,9 @@ impl metrics::Recorder for Recorder {
             return histogram;
         }
 
-        let mut builder = self.meter.f64_histogram(key.name().to_owned());
-        if let Some(metadata) = self.get_metadata_for_builder(key.name()) {
-            if let Some(unit) = metadata.unit {
-                builder = builder.with_unit(unit.as_canonical_label());
-            }
-            builder = builder.with_description(metadata.description.to_string());
-        }
+        let builder = self.meter.f64_histogram(key.name().to_owned());
+        let metadata = self.get_metadata_for_builder(key.name());
+        let builder = configure_builder!(builder, metadata);
 
         let histogram = builder.build();
         let labels = key
