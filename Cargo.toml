@@ -182,13 +182,13 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.8.14" }
 aws-credential-types = { version = "1.2.12" }
 aws-sdk-s3 = { version = "1.123.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
-aws-smithy-types = { version = "1.4.4" }
+aws-smithy-types = { version = "1.4.5" }
 backtrace = "0.3.76"
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"
 cfg-if = "1.0.4"
-clap = { version = "4.5.58", features = ["derive", "env"] }
+clap = { version = "4.5.59", features = ["derive", "env"] }
 const-str = { version = "1.1.0", features = ["std", "proc"] }
 convert_case = "0.11.0"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -263,7 +263,7 @@ walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
 windows = { version = "0.62.2" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
-zip = "8.0.0"
+zip = "8.1.0"
 zstd = "0.13.3"
 
 # Observability and Metrics
