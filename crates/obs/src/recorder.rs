@@ -28,6 +28,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+use tracing::error;
 
 /// A builder for constructing a [`Recorder`].
 #[derive(Debug)]
@@ -67,16 +68,7 @@ impl Builder {
         let provider = self.builder.build();
         let meter = provider.meter_with_scope(self.scope.build());
 
-        (
-            provider,
-            Recorder {
-                meter,
-                metrics_metadata: Arc::new(Mutex::new(HashMap::new())),
-                cached_counters: Arc::new(RwLock::new(HashMap::new())),
-                cached_gauges: Arc::new(RwLock::new(HashMap::new())),
-                cached_histograms: Arc::new(RwLock::new(HashMap::new())),
-            },
-        )
+        (provider, Recorder::with_meter(meter))
     }
 
     /// Builds a [`Recorder`] and sets it as the global recorder for the [`metrics`]
@@ -135,11 +127,62 @@ impl Recorder {
     pub fn with_meter(meter: Meter) -> Self {
         Recorder {
             meter,
-            metrics_metadata: Arc::new(Mutex::new(HashMap::new())),
-            cached_counters: Arc::new(RwLock::new(HashMap::new())),
-            cached_gauges: Arc::new(RwLock::new(HashMap::new())),
-            cached_histograms: Arc::new(RwLock::new(HashMap::new())),
+            metrics_metadata: Default::default(),
+            cached_counters: Default::default(),
+            cached_gauges: Default::default(),
+            cached_histograms: Default::default(),
         }
+    }
+
+    fn get_cached_metric<T: Clone>(lock: &RwLock<HashMap<Key, T>>, key: &Key, metric_type: &str) -> Option<T> {
+        let cache = match lock.read() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("{} cache read lock poisoned: {}", metric_type, e);
+                e.into_inner()
+            }
+        };
+        cache.get(key).cloned()
+    }
+
+    fn insert_cached_metric<T: Clone>(lock: &RwLock<HashMap<Key, T>>, key: Key, value: T, metric_type: &str) -> T {
+        let mut cache = match lock.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("{} cache write lock poisoned: {}", metric_type, e);
+                e.into_inner()
+            }
+        };
+
+        if let Some(v) = cache.get(&key) {
+            return v.clone();
+        }
+        cache.insert(key, value.clone());
+        value
+    }
+
+    fn with_metadata_lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut HashMap<KeyName, MetricMetadata>) -> R,
+    {
+        let mut guard = match self.metrics_metadata.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("metrics_metadata lock poisoned: {}", e);
+                e.into_inner()
+            }
+        };
+        f(&mut guard)
+    }
+
+    fn describe_metric(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        self.with_metadata_lock(|metadata| {
+            metadata.insert(key, MetricMetadata { unit, description });
+        });
+    }
+
+    fn get_metadata_for_builder(&self, key_name: &str) -> Option<MetricMetadata> {
+        self.with_metadata_lock(|metadata| metadata.remove(key_name))
     }
 }
 
@@ -153,29 +196,24 @@ impl Deref for Recorder {
 
 impl metrics::Recorder for Recorder {
     fn describe_counter(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        let mut metrics_metadata = self.metrics_metadata.lock().unwrap();
-        metrics_metadata.insert(key, MetricMetadata { unit, description });
+        self.describe_metric(key, unit, description);
     }
 
     fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        let mut metrics_metadata = self.metrics_metadata.lock().unwrap();
-        metrics_metadata.insert(key, MetricMetadata { unit, description });
+        self.describe_metric(key, unit, description);
     }
 
     fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        let mut metrics_metadata = self.metrics_metadata.lock().unwrap();
-        metrics_metadata.insert(key, MetricMetadata { unit, description });
+        self.describe_metric(key, unit, description);
     }
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
-        if let Ok(cache) = self.cached_counters.read() {
-            if let Some(counter) = cache.get(key) {
-                return counter.clone();
-            }
+        if let Some(counter) = Self::get_cached_metric(&self.cached_counters, key, "counter") {
+            return counter;
         }
 
         let mut builder = self.meter.u64_counter(key.name().to_owned());
-        if let Some(metadata) = self.metrics_metadata.lock().unwrap().get(key.name()) {
+        if let Some(metadata) = self.get_metadata_for_builder(key.name()) {
             if let Some(unit) = metadata.unit {
                 builder = builder.with_unit(unit.as_canonical_label());
             }
@@ -194,26 +232,16 @@ impl metrics::Recorder for Recorder {
             value: AtomicU64::new(0),
         }));
 
-        if let Ok(mut cache) = self.cached_counters.write() {
-            // Double-check pattern to avoid race condition
-            if let Some(counter) = cache.get(key) {
-                return counter.clone();
-            }
-            cache.insert(key.clone(), handle.clone());
-        }
-
-        handle
+        Self::insert_cached_metric(&self.cached_counters, key.clone(), handle, "counter")
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-        if let Ok(cache) = self.cached_gauges.read() {
-            if let Some(gauge) = cache.get(key) {
-                return gauge.clone();
-            }
+        if let Some(gauge) = Self::get_cached_metric(&self.cached_gauges, key, "gauge") {
+            return gauge;
         }
 
         let mut builder = self.meter.f64_gauge(key.name().to_owned());
-        if let Some(metadata) = self.metrics_metadata.lock().unwrap().get(key.name()) {
+        if let Some(metadata) = self.get_metadata_for_builder(key.name()) {
             if let Some(unit) = metadata.unit {
                 builder = builder.with_unit(unit.as_canonical_label());
             }
@@ -232,26 +260,16 @@ impl metrics::Recorder for Recorder {
             value: AtomicU64::new(0),
         }));
 
-        if let Ok(mut cache) = self.cached_gauges.write() {
-            // Double-check pattern to avoid race condition
-            if let Some(gauge) = cache.get(key) {
-                return gauge.clone();
-            }
-            cache.insert(key.clone(), handle.clone());
-        }
-
-        handle
+        Self::insert_cached_metric(&self.cached_gauges, key.clone(), handle, "gauge")
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
-        if let Ok(cache) = self.cached_histograms.read() {
-            if let Some(histogram) = cache.get(key) {
-                return histogram.clone();
-            }
+        if let Some(histogram) = Self::get_cached_metric(&self.cached_histograms, key, "histogram") {
+            return histogram;
         }
 
         let mut builder = self.meter.f64_histogram(key.name().to_owned());
-        if let Some(metadata) = self.metrics_metadata.lock().unwrap().get(key.name()) {
+        if let Some(metadata) = self.get_metadata_for_builder(key.name()) {
             if let Some(unit) = metadata.unit {
                 builder = builder.with_unit(unit.as_canonical_label());
             }
@@ -266,15 +284,7 @@ impl metrics::Recorder for Recorder {
 
         let handle = Histogram::from_arc(Arc::new(WrappedHistogram { histogram, labels }));
 
-        if let Ok(mut cache) = self.cached_histograms.write() {
-            // Double-check pattern to avoid race condition
-            if let Some(histogram) = cache.get(key) {
-                return histogram.clone();
-            }
-            cache.insert(key.clone(), handle.clone());
-        }
-
-        handle
+        Self::insert_cached_metric(&self.cached_histograms, key.clone(), handle, "histogram")
     }
 }
 
