@@ -35,7 +35,7 @@ use rustfs_filemeta::{
     merge_file_meta_versions,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -344,22 +344,15 @@ impl ECStore {
         };
 
         let mut prefixes: Vec<String> = Vec::new();
+        let mut prefix_set: HashSet<String> = HashSet::new();
 
         let mut objects = Vec::with_capacity(get_objects.len());
         for obj in get_objects.into_iter() {
-            if let Some(delimiter) = &delimiter {
+            if delimiter.is_some() {
                 if obj.is_dir && obj.mod_time.is_none() {
-                    let mut found = false;
-                    if delimiter != SLASH_SEPARATOR {
-                        for p in prefixes.iter() {
-                            if found {
-                                break;
-                            }
-                            found = p == &obj.name;
-                        }
-                    }
-                    if !found {
-                        prefixes.push(obj.name.clone());
+                    // Check if prefix already exists to avoid duplicates
+                    if prefix_set.insert(obj.name.clone()) {
+                        prefixes.push(obj.name);
                     }
                 } else {
                     objects.push(obj);
@@ -471,22 +464,15 @@ impl ECStore {
         };
 
         let mut prefixes: Vec<String> = Vec::new();
+        let mut prefix_set: HashSet<String> = HashSet::new();
 
         let mut objects = Vec::with_capacity(get_objects.len());
         for obj in get_objects.into_iter() {
-            if let Some(delimiter) = &delimiter {
+            if delimiter.is_some() {
                 if obj.is_dir && obj.mod_time.is_none() {
-                    let mut found = false;
-                    if delimiter != SLASH_SEPARATOR {
-                        for p in prefixes.iter() {
-                            if found {
-                                break;
-                            }
-                            found = p == &obj.name;
-                        }
-                    }
-                    if !found {
-                        prefixes.push(obj.name.clone());
+                    // Check if prefix already exists to avoid duplicates
+                    if prefix_set.insert(obj.name.clone()) {
+                        prefixes.push(obj.name);
                     }
                 } else {
                     objects.push(obj);
