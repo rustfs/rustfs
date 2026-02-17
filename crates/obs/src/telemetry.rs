@@ -477,6 +477,7 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
                 .build();
             global::set_meter_provider(provider.clone());
             metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
+            OBSERVABILITY_METRIC_ENABLED.set(true).ok();
             Some(provider)
         }
     };
@@ -544,7 +545,6 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
         .with(metrics_layer)
         .init();
 
-    OBSERVABILITY_METRIC_ENABLED.set(true).ok();
     counter!("rustfs.start.total").increment(1);
     info!(
         "Init observability (HTTP): trace='{}', metric='{}', log='{}'",
