@@ -172,11 +172,6 @@ impl metrics::Recorder for Recorder {
             return cached.clone();
         }
 
-        let mut cache = self.cached_counters.write().unwrap();
-        if let Some(cached) = cache.get(key) {
-            return cached.clone();
-        }
-
         let mut builder = self.meter.u64_counter(key.name().to_owned());
         if let Some(metadata) = self.metrics_metadata.lock().unwrap().get(key.name()) {
             if let Some(unit) = metadata.unit {
@@ -196,17 +191,20 @@ impl metrics::Recorder for Recorder {
             labels,
             value: AtomicU64::new(0),
         }));
+
+        // Take write lock only after building
+        let mut cache = self.cached_counters.write().unwrap();
+        // Quick check it wasn't created between last read and finish building
+        if let Some(cached) = cache.get(key) {
+            return cached.clone();
+        }
+
         cache.insert(key.clone(), handle.clone());
         handle
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
         if let Some(cached) = self.cached_gauges.read().unwrap().get(key) {
-            return cached.clone();
-        }
-
-        let mut cache = self.cached_gauges.write().unwrap();
-        if let Some(cached) = cache.get(key) {
             return cached.clone();
         }
 
@@ -229,17 +227,20 @@ impl metrics::Recorder for Recorder {
             labels,
             value: AtomicU64::new(0),
         }));
+
+        // Take write lock only after building
+        let mut cache = self.cached_gauges.write().unwrap();
+        // Quick check it wasn't created between last read and finish building
+        if let Some(cached) = cache.get(key) {
+            return cached.clone();
+        }
+
         cache.insert(key.clone(), handle.clone());
         handle
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
         if let Some(cached) = self.cached_histograms.read().unwrap().get(key) {
-            return cached.clone();
-        }
-
-        let mut cache = self.cached_histograms.write().unwrap();
-        if let Some(cached) = cache.get(key) {
             return cached.clone();
         }
 
@@ -258,6 +259,14 @@ impl metrics::Recorder for Recorder {
             .collect();
 
         let handle = Histogram::from_arc(Arc::new(WrappedHistogram { histogram, labels }));
+
+        // Take write lock only after building
+        let mut cache = self.cached_histograms.write().unwrap();
+        // Quick check it wasn't created between last read and finish building
+        if let Some(cached) = cache.get(key) {
+            return cached.clone();
+        }
+
         cache.insert(key.clone(), handle.clone());
         handle
     }
