@@ -57,7 +57,7 @@ use std::env;
 /// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OtelConfig {
-    pub endpoint: String,                     // Endpoint for metric collection
+    pub endpoint: String,                     // Endpoint for otel collection
     pub trace_endpoint: Option<String>,       // Endpoint for trace collection
     pub metric_endpoint: Option<String>,      // Endpoint for metric collection
     pub log_endpoint: Option<String>,         // Endpoint for log collection
