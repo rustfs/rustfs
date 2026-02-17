@@ -625,17 +625,21 @@ impl FolderScanner {
                 let sz = match self.local_disk.get_size(item.clone()).await {
                     Ok(sz) => sz,
                     Err(e) => {
-                        warn!("scan_folder: failed to get size for item {}: {}", item.path, e);
-                        // TODO: check error type
+                        // Track failed objects to prevent infinite retry loops
+                        into.failed_objects += 1;
+
+                        // Only log non-skip errors to avoid noise
+                        if e != StorageError::other("skip file".to_string()) {
+                            warn!("scan_folder: failed to get size for item {}: {}", item.path, e);
+                        }
+
+                        // Apply sleep if configured
                         if let Some(t) = wait
                             && let Ok(elapsed) = t.elapsed()
                         {
                             tokio::time::sleep(elapsed).await;
                         }
 
-                        if e != StorageError::other("skip file".to_string()) {
-                            warn!("scan_folder: failed to get size for item {}: {}", item.path, e);
-                        }
                         continue;
                     }
                 };

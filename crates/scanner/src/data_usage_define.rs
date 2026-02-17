@@ -504,6 +504,8 @@ pub struct DataUsageEntry {
     pub obj_versions: VersionsHistogram,
     pub replication_stats: Option<ReplicationAllStats>,
     pub compacted: bool,
+    /// Number of objects that failed to scan (e.g., IO errors)
+    pub failed_objects: usize,
 }
 
 impl DataUsageEntry {
@@ -541,6 +543,7 @@ impl DataUsageEntry {
         self.versions += other.versions;
         self.delete_markers += other.delete_markers;
         self.size += other.size;
+        self.failed_objects += other.failed_objects;
 
         if let Some(o_rep) = &other.replication_stats {
             if self.replication_stats.is_none() {
