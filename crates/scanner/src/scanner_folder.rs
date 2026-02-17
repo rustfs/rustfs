@@ -60,6 +60,10 @@ const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
 const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
 const ENV_DATA_USAGE_UPDATE_DIR_CYCLES: &str = "RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES";
 const ENV_HEAL_OBJECT_SELECT_PROB: &str = "RUSTFS_HEAL_OBJECT_SELECT_PROB";
+const ENV_FAILED_OBJECT_TTL_SECS: &str = "RUSTFS_DATA_USAGE_FAILED_OBJECT_TTL_SECS";
+const ENV_FAILED_OBJECTS_MAX: &str = "RUSTFS_DATA_USAGE_FAILED_OBJECTS_MAX";
+const DEFAULT_FAILED_OBJECT_TTL_SECS: u32 = 86_400;
+const DEFAULT_FAILED_OBJECTS_MAX: u32 = 10_000;
 
 pub fn data_usage_update_dir_cycles() -> u32 {
     rustfs_utils::get_env_u32(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, DATA_USAGE_UPDATE_DIR_CYCLES)
@@ -67,6 +71,14 @@ pub fn data_usage_update_dir_cycles() -> u32 {
 
 pub fn heal_object_select_prob() -> u32 {
     rustfs_utils::get_env_u32(ENV_HEAL_OBJECT_SELECT_PROB, DEFAULT_HEAL_OBJECT_SELECT_PROB)
+}
+
+fn failed_object_ttl_secs() -> u64 {
+    rustfs_utils::get_env_u32(ENV_FAILED_OBJECT_TTL_SECS, DEFAULT_FAILED_OBJECT_TTL_SECS) as u64
+}
+
+fn failed_objects_max() -> usize {
+    rustfs_utils::get_env_u32(ENV_FAILED_OBJECTS_MAX, DEFAULT_FAILED_OBJECTS_MAX) as usize
 }
 
 /// Cached folder information for scanning
@@ -405,6 +417,60 @@ pub struct FolderScanner {
 }
 
 impl FolderScanner {
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn should_skip_failed(&self, path: &str) -> bool {
+        let ttl = failed_object_ttl_secs();
+        if ttl == 0 {
+            return false;
+        }
+
+        let Some(last_failed) = self.new_cache.info.failed_objects.get(path) else {
+            return false;
+        };
+
+        let now = Self::now_secs();
+        now.saturating_sub(*last_failed) < ttl
+    }
+
+    fn record_failed(&mut self, path: &str) {
+        let ttl = failed_object_ttl_secs();
+        if ttl == 0 {
+            return;
+        }
+
+        let now = Self::now_secs();
+        self.new_cache.info.failed_objects.insert(path.to_string(), now);
+        self.prune_failed_objects(now, ttl);
+    }
+
+    fn prune_failed_objects(&mut self, now: u64, ttl: u64) {
+        let max_entries = failed_objects_max();
+        let failed = &mut self.new_cache.info.failed_objects;
+        if failed.is_empty() {
+            return;
+        }
+
+        failed.retain(|_, ts| now.saturating_sub(*ts) < ttl);
+
+        if failed.len() <= max_entries {
+            return;
+        }
+
+        let mut entries: Vec<(String, u64)> = failed.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_by_key(|(_, ts)| *ts);
+
+        let remove_count = failed.len().saturating_sub(max_entries);
+        for (key, _) in entries.into_iter().take(remove_count) {
+            failed.remove(&key);
+        }
+    }
+
     pub async fn should_heal(&self) -> bool {
         if self.skip_heal.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
@@ -622,11 +688,17 @@ impl FolderScanner {
                     file_type: entry_type,
                 };
 
+                if self.should_skip_failed(&item.path) {
+                    into.failed_objects += 1;
+                    continue;
+                }
+
                 let sz = match self.local_disk.get_size(item.clone()).await {
                     Ok(sz) => sz,
                     Err(e) => {
                         // Track failed objects to prevent infinite retry loops
                         into.failed_objects += 1;
+                        self.record_failed(&item.path);
 
                         // Only log non-skip errors to avoid noise
                         if e != StorageError::other("skip file".to_string()) {

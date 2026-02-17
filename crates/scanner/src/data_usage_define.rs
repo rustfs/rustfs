@@ -505,6 +505,7 @@ pub struct DataUsageEntry {
     pub replication_stats: Option<ReplicationAllStats>,
     pub compacted: bool,
     /// Number of objects that failed to scan (e.g., IO errors)
+    #[serde(default)]
     pub failed_objects: usize,
 }
 
@@ -593,6 +594,8 @@ pub struct DataUsageCacheInfo {
     pub skip_healing: bool,
     pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
     pub replication: Option<Arc<ReplicationConfig>>,
+    #[serde(default)]
+    pub failed_objects: HashMap<String, u64>,
 }
 
 /// Data usage cache
