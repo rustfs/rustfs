@@ -21,8 +21,9 @@ use rustfs_config::observability::{
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB, DEFAULT_LOG_ROTATION_TIME,
-    DEFAULT_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION,
-    USE_STDOUT,
+    DEFAULT_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
+    DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
+    SERVICE_VERSION, USE_STDOUT,
 };
 use rustfs_utils::dirs::get_log_directory_to_string;
 use rustfs_utils::{get_env_bool, get_env_f64, get_env_opt_str, get_env_str, get_env_u64, get_env_usize};
@@ -102,9 +103,9 @@ impl OtelConfig {
             trace_endpoint: get_env_opt_str(ENV_OBS_TRACE_ENDPOINT),
             metric_endpoint: get_env_opt_str(ENV_OBS_METRIC_ENDPOINT),
             log_endpoint: get_env_opt_str(ENV_OBS_LOG_ENDPOINT),
-            traces_export_enabled: Some(get_env_bool(ENV_OBS_TRACES_EXPORT_ENABLED, true)),
-            metrics_export_enabled: Some(get_env_bool(ENV_OBS_METRICS_EXPORT_ENABLED, true)),
-            logs_export_enabled: Some(get_env_bool(ENV_OBS_LOGS_EXPORT_ENABLED, true)),
+            traces_export_enabled: Some(get_env_bool(ENV_OBS_TRACES_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED)),
+            metrics_export_enabled: Some(get_env_bool(ENV_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED)),
+            logs_export_enabled: Some(get_env_bool(ENV_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED)),
             use_stdout: Some(use_stdout),
             sample_ratio: Some(get_env_f64(ENV_OBS_SAMPLE_RATIO, SAMPLE_RATIO)),
             meter_interval: Some(get_env_u64(ENV_OBS_METER_INTERVAL, METER_INTERVAL)),
