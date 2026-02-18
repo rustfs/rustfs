@@ -449,6 +449,16 @@ impl FolderScanner {
         self.prune_failed_objects(now, ttl);
     }
 
+    fn prune_failed_objects_cache(&mut self) {
+        let ttl = failed_object_ttl_secs();
+        if ttl == 0 {
+            return;
+        }
+
+        let now = Self::now_secs();
+        self.prune_failed_objects(now, ttl);
+    }
+
     fn prune_failed_objects(&mut self, now: u64, ttl: u64) {
         let max_entries = failed_objects_max();
         let failed = &mut self.new_cache.info.failed_objects;
@@ -554,6 +564,8 @@ impl FolderScanner {
             if ctx.is_cancelled() {
                 return Err(ScannerError::Other("Operation cancelled".to_string()));
             }
+
+            self.prune_failed_objects_cache();
 
             let mut abandoned_children: DataUsageHashMap = HashSet::new();
             if !into.compacted {

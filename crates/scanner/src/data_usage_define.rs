@@ -1547,6 +1547,7 @@ impl SizeSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn test_data_usage_info_creation() {
@@ -1592,5 +1593,37 @@ mod tests {
 
         assert_eq!(summary1.total_size, 300);
         assert_eq!(summary1.versions, 15);
+    }
+
+    #[test]
+    fn test_data_usage_entry_merge_sums_failed_objects() {
+        let mut left = DataUsageEntry {
+            failed_objects: 2,
+            ..Default::default()
+        };
+
+        let right = DataUsageEntry {
+            failed_objects: 3,
+            ..Default::default()
+        };
+
+        left.merge(&right);
+
+        assert_eq!(left.failed_objects, 5);
+    }
+
+    #[test]
+    fn test_data_usage_entry_deserialize_defaults_failed_objects() {
+        let entry = DataUsageEntry::default();
+        let mut value = serde_json::to_value(&entry).expect("Failed to serialize entry");
+
+        let Value::Object(ref mut map) = value else {
+            panic!("Expected entry to serialize into an object");
+        };
+
+        map.remove("failed_objects");
+
+        let decoded: DataUsageEntry = serde_json::from_value(value).expect("Failed to deserialize entry");
+        assert_eq!(decoded.failed_objects, 0);
     }
 }
