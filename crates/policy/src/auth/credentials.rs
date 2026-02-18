@@ -24,7 +24,7 @@ use time::OffsetDateTime;
 use tracing::warn;
 
 const ACCESS_KEY_MIN_LEN: usize = 3;
-const ACCESS_KEY_MAX_LEN: usize = 20;
+const ACCESS_KEY_MAX_LEN: usize = 128;
 const SECRET_KEY_MIN_LEN: usize = 8;
 const SECRET_KEY_MAX_LEN: usize = 40;
 
