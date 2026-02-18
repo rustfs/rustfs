@@ -696,20 +696,23 @@ impl FolderScanner {
                 let sz = match self.local_disk.get_size(item.clone()).await {
                     Ok(sz) => sz,
                     Err(e) => {
-                        // Track failed objects to prevent infinite retry loops
-                        into.failed_objects += 1;
-                        self.record_failed(&item.path);
+                        // Treat the "skip file" sentinel as normal control flow, not a failure.
+                        let is_skip_file = e.to_string() == "skip file";
 
-                        // Only log non-skip errors to avoid noise
-                        if e != StorageError::other("skip file".to_string()) {
+                        if !is_skip_file {
+                            // Track failed objects to prevent infinite retry loops
+                            into.failed_objects += 1;
+                            self.record_failed(&item.path);
+
+                            // Only log non-skip errors to avoid noise
                             warn!("scan_folder: failed to get size for item {}: {}", item.path, e);
-                        }
 
-                        // Apply sleep if configured
-                        if let Some(t) = wait
-                            && let Ok(elapsed) = t.elapsed()
-                        {
-                            tokio::time::sleep(elapsed).await;
+                            // Apply sleep if configured
+                            if let Some(t) = wait
+                                && let Ok(elapsed) = t.elapsed()
+                            {
+                                tokio::time::sleep(elapsed).await;
+                            }
                         }
 
                         continue;
