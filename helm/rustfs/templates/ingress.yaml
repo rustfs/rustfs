@@ -2,6 +2,8 @@
 {{- $ingressAnnotations := dict }}
 {{- if eq .Values.ingress.className "nginx" }}
 {{- $ingressAnnotations = .Values.ingress.nginxAnnotations }}
+{{- else if eq .Values.ingress.className "traefik" }}
+{{- $ingressAnnotations = .Values.ingress.traefikAnnotations }}
 {{- else if eq .Values.ingress.className "" }}
 {{- $ingressAnnotations = .Values.ingress.customAnnotations }}
 {{- end }}
