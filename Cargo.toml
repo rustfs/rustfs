@@ -105,7 +105,7 @@ rustfs-protocols = { path = "crates/protocols", version = "0.0.5" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
-async-compression = { version = "0.4.39" }
+async-compression = { version = "0.4.40" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
 axum = "0.8.8"
@@ -141,7 +141,7 @@ flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.3"
 quick-xml = "0.39.1"
-rmcp = { version = "0.15.0" }
+rmcp = { version = "0.16.0" }
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -180,8 +180,8 @@ astral-tokio-tar = "0.5.6"
 atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.14" }
-aws-credential-types = { version = "1.2.12" }
-aws-sdk-s3 = { version = "1.123.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-credential-types = { version = "1.2.13" }
+aws-sdk-s3 = { version = "1.124.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-types = { version = "1.4.5" }
 backtrace = "0.3.76"
 base64 = "0.22.1"
@@ -290,6 +290,11 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profilin
 jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
+
+# metadata
+ferntree = { version = "0.1.0", features = ["loom"], git = "https://github.com/surrealdb/ferntree.git", rev = "2cc6c3e06d4bbe314e78b82342f457cc661b274b" }
+surrealkv = "0.20.2"
+surrealmx = "0.17.0"
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rustfs-mcp"]

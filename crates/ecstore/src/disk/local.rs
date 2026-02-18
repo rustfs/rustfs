@@ -2994,7 +2994,7 @@ mod test {
 
     #[tokio::test]
     async fn test_scan_dir_lists_nested_child_when_parent_has_xlmeta() {
-        let test_dir = format!("./test_scan_dir_nested_{}", uuid::Uuid::new_v4());
+        let test_dir = format!("./test_scan_dir_nested_{}", Uuid::new_v4());
         fs::create_dir_all(&test_dir).await.unwrap();
 
         let endpoint = Endpoint::try_from(test_dir.as_str()).unwrap();
@@ -3059,7 +3059,7 @@ mod test {
 
     #[tokio::test]
     async fn test_scan_dir_lists_parent_and_child_from_bucket_root() {
-        let test_dir = format!("./test_scan_dir_root_nested_{}", uuid::Uuid::new_v4());
+        let test_dir = format!("./test_scan_dir_root_nested_{}", Uuid::new_v4());
         fs::create_dir_all(&test_dir).await.unwrap();
 
         let endpoint = Endpoint::try_from(test_dir.as_str()).unwrap();

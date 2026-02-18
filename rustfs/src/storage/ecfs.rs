@@ -21,6 +21,7 @@ use crate::storage::concurrency::{
 };
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::OperationHelper;
+use crate::storage::metadata::{get_metadata_engine, is_new_metadata_engine_enabled};
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
 use crate::storage::s3_api::acl::{build_get_bucket_acl_output, build_get_object_acl_output};
@@ -2463,6 +2464,36 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
+        if is_new_metadata_engine_enabled() {
+            if let Some(engine) = get_metadata_engine() {
+                if let Ok(reader) = engine.get_object_reader(&bucket, &key, opts).await {
+                    let info = reader.object_info.clone();
+                    let content_length = info.size;
+                    let last_modified = info.mod_time.map(Timestamp::from);
+                    let content_type = info.content_type.as_deref().and_then(|ct| ContentType::from_str(ct).ok());
+                    let etag = info.etag.clone().map(|etag| to_s3s_etag(&etag));
+
+                    let body = Some(StreamingBlob::wrap(bytes_stream(
+                        ReaderStream::new(reader.stream),
+                        content_length as usize,
+                    )));
+
+                    let output = GetObjectOutput {
+                        body,
+                        content_length: Some(content_length),
+                        last_modified,
+                        content_type,
+                        e_tag: etag,
+                        metadata: filter_object_metadata(&info.user_defined),
+                        ..Default::default()
+                    };
+
+                    let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                    return Ok(response);
+                }
+            }
+        }
+
         let store = get_validated_store(&bucket).await?;
 
         // ============================================
@@ -3597,6 +3628,32 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
         // warn!("list_objects_v2 req {:?}", &req.input);
+        if is_new_metadata_engine_enabled() {
+            if let Some(engine) = get_metadata_engine() {
+                let input = &req.input;
+                let bucket = &input.bucket;
+                let prefix = input.prefix.as_deref().unwrap_or_default();
+                let marker = input.continuation_token.clone(); // V2 uses continuation_token as marker
+                let delimiter = input.delimiter.clone();
+                let max_keys = input.max_keys.unwrap_or(1000) as usize;
+
+                if let Ok(res) = engine.list_objects(bucket, prefix, marker, delimiter.clone(), max_keys).await {
+                    let output = build_list_objects_v2_output(
+                        res,
+                        input.fetch_owner.unwrap_or_default(),
+                        max_keys as i32,
+                        bucket.clone(),
+                        prefix.to_string(),
+                        delimiter,
+                        input.encoding_type.clone(),
+                        None, // response_continuation_token handled inside build_list_objects_v2_output logic usually, but here we pass None or adapt
+                        input.start_after.clone(),
+                    );
+                    return Ok(s3_response(output));
+                }
+            }
+        }
+
         let ListObjectsV2Input {
             bucket,
             continuation_token,
@@ -4848,10 +4905,10 @@ impl S3 for FS {
         let (src_bucket, src_key, src_version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket {
-                bucket: ref src_bucket,
-                key: ref src_key,
+                ref bucket,
+                ref key,
                 version_id,
-            } => (src_bucket.to_string(), src_key.to_string(), version_id.map(|v| v.to_string())),
+            } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
         };
 
         // Parse range if provided (format: "bytes=start-end")

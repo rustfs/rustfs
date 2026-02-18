@@ -12,24 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod access;
-pub mod concurrency;
-#[cfg(test)]
-mod concurrent_get_object_test;
-pub mod ecfs;
-mod ecfs_extend;
-pub(crate) mod entity;
-pub(crate) mod helper;
-pub mod options;
-pub(crate) mod readers;
-pub(crate) mod s3_api;
-pub mod tonic_service;
-pub(crate) use ecfs_extend::*;
-#[cfg(test)]
-mod ecfs_test;
-pub(crate) mod head_prefix;
-pub(crate) mod metadata;
-mod objects;
-mod sse;
-#[cfg(test)]
-mod sse_test;
+use bytes::Bytes;
+use ferntree::Tree;
+use rustfs_ecstore::error::Result;
+
+pub async fn new_index_tree() -> Result<Tree<String, Bytes>> {
+    let tree = Tree::new();
+    Ok(tree)
+}

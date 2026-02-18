@@ -38,9 +38,15 @@ use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
+use crate::storage::metadata::ferntree::new_index_tree;
+use crate::storage::metadata::is_new_metadata_engine_enabled;
+use crate::storage::metadata::kv::new_kv_store;
+use crate::storage::metadata::mx::MxStorageManager;
+use crate::storage::metadata::{GLOBAL_METADATA_ENGINE, LocalMetadataEngine};
 use license::init_license;
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
+use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
     StorageAPI,
@@ -208,6 +214,55 @@ async fn run(config: config::Config) -> Result<()> {
     init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
     // Initialize the lock clients
     init_lock_clients(endpoint_pools.clone());
+
+    // Initialize new metadata engine if enabled
+    if is_new_metadata_engine_enabled() {
+        info!(target: "rustfs::main::run", "Initializing new metadata engine...");
+
+        // Get legacy_fs from GLOBAL_LOCAL_DISK
+        let disks = rustfs_ecstore::global::GLOBAL_LOCAL_DISK.read().await;
+        let mut legacy_fs = None;
+
+        for disk_opt in disks.iter() {
+            if let Some(disk) = disk_opt {
+                if let rustfs_ecstore::disk::Disk::Local(wrapper) = disk.as_ref() {
+                    legacy_fs = Some(wrapper.get_disk());
+                    break;
+                }
+            }
+        }
+
+        if let Some(legacy_fs) = legacy_fs {
+            let root_path = legacy_fs.path();
+            let meta_path = root_path.join(".rustfs.sys/metadata");
+            if let Err(e) = tokio::fs::create_dir_all(&meta_path).await {
+                error!(target: "rustfs::main::run", "Failed to create metadata directory: {}", e);
+            } else {
+                match new_kv_store(&meta_path.join("kv")).await {
+                    Ok(kv_store) => match new_index_tree().await {
+                        Ok(index_tree) => match MxStorageManager::new(&meta_path.join("mx")) {
+                            Ok(storage_manager) => {
+                                let engine = Arc::new(LocalMetadataEngine::new(
+                                    Arc::new(kv_store),
+                                    Arc::new(index_tree),
+                                    Arc::new(storage_manager),
+                                    legacy_fs,
+                                ));
+
+                                let _ = GLOBAL_METADATA_ENGINE.set(engine);
+                                info!(target: "rustfs::main::run", "New metadata engine initialized successfully.");
+                            }
+                            Err(e) => error!(target: "rustfs::main::run", "Failed to init storage manager: {}", e),
+                        },
+                        Err(e) => error!(target: "rustfs::main::run", "Failed to init index tree: {}", e),
+                    },
+                    Err(e) => error!(target: "rustfs::main::run", "Failed to init kv store: {}", e),
+                }
+            }
+        } else {
+            warn!(target: "rustfs::main::run", "No local disk found, skipping new metadata engine initialization.");
+        }
+    }
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(

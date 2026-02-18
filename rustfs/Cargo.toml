@@ -138,6 +138,12 @@ metrics = { workspace = true }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
+# metadata
+ferntree = { workspace = true }
+surrealkv = { workspace = true }
+surrealmx = { workspace = true }
+blake3 = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 

@@ -15,7 +15,7 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
 use serde::{Serialize, de::DeserializeOwned};
 
-pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> std::result::Result<String, jsonwebtoken::errors::Error> {
+pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let header = Header::new(Algorithm::HS512);
     jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(secret.as_bytes()))
 }
@@ -23,7 +23,7 @@ pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> std::result::Resu
 pub fn extract_claims<T: DeserializeOwned + Clone>(
     token: &str,
     secret: &str,
-) -> std::result::Result<jsonwebtoken::TokenData<T>, jsonwebtoken::errors::Error> {
+) -> Result<jsonwebtoken::TokenData<T>, jsonwebtoken::errors::Error> {
     jsonwebtoken::decode::<T>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
