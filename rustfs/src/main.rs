@@ -39,6 +39,7 @@ use crate::server::{
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use crate::storage::metadata::ferntree::new_index_tree;
+use crate::storage::metadata::gc::GarbageCollector;
 use crate::storage::metadata::is_new_metadata_engine_enabled;
 use crate::storage::metadata::kv::new_kv_store;
 use crate::storage::metadata::mx::MxStorageManager;
@@ -242,14 +243,24 @@ async fn run(config: config::Config) -> Result<()> {
                     Ok(kv_store) => match new_index_tree().await {
                         Ok(index_tree) => match MxStorageManager::new(&meta_path.join("mx")) {
                             Ok(storage_manager) => {
+                                let kv_store = Arc::new(kv_store);
+                                let storage_manager = Arc::new(storage_manager);
+
                                 let engine = Arc::new(LocalMetadataEngine::new(
-                                    Arc::new(kv_store),
+                                    kv_store.clone(),
                                     Arc::new(index_tree),
-                                    Arc::new(storage_manager),
+                                    storage_manager.clone(),
                                     legacy_fs,
                                 ));
 
                                 let _ = GLOBAL_METADATA_ENGINE.set(engine);
+
+                                // Start GC
+                                let gc = Arc::new(GarbageCollector::new(kv_store, storage_manager));
+                                tokio::spawn(async move {
+                                    gc.start().await;
+                                });
+
                                 info!(target: "rustfs::main::run", "New metadata engine initialized successfully.");
                             }
                             Err(e) => error!(target: "rustfs::main::run", "Failed to init storage manager: {}", e),

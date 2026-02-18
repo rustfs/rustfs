@@ -19,6 +19,7 @@
 
 pub mod engine;
 pub mod ferntree;
+pub(crate) mod gc;
 pub mod kv;
 pub mod mx;
 pub(crate) mod reader;

@@ -15,6 +15,7 @@
 use crate::storage::metadata::mx::StorageManager;
 use crate::storage::metadata::reader::new_chunked_reader;
 use crate::storage::metadata::types::{ChunkInfo, IndexMetadata, ObjectMetadata};
+use crate::storage::metadata::writer::ChunkedWriter;
 use bytes::Bytes;
 use ferntree::Tree as IndexTree;
 use rustfs_ecstore::disk::{DiskAPI, ReadOptions};
@@ -27,7 +28,7 @@ use std::io::Cursor;
 use std::ops::Bound::{Included, Unbounded};
 use std::sync::Arc;
 use surrealkv::Tree as KvStore;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 /// LocalMetadataEngine manages object metadata, indexing, and data placement.
 /// It serves as the unified entry point for local storage operations.
@@ -76,7 +77,7 @@ impl LocalMetadataEngine {
         _opts: ObjectOptions,
     ) -> Result<ObjectInfo> {
         let is_inline = size < 128 * 1024; // 128KB threshold
-        let mut content_hash = String::new();
+        let content_hash;
         let mut inline_data = None;
         let mut chunks = None;
 
@@ -90,57 +91,24 @@ impl LocalMetadataEngine {
             content_hash = blake3::hash(&data).to_hex().to_string();
             inline_data = Some(data);
         } else {
-            // Chunking logic
+            // Use ChunkedWriter for streaming write
             let chunk_size = 5 * 1024 * 1024; // 5MB chunks
-            let mut chunk_infos = Vec::new();
-            let mut buffer = vec![0u8; chunk_size];
-            let mut offset = 0;
-            let mut hasher = blake3::Hasher::new();
+            let mut writer = ChunkedWriter::new(self.storage_manager.clone(), chunk_size);
 
-            loop {
-                let mut bytes_read = 0;
-                while bytes_read < chunk_size {
-                    let n = reader
-                        .read(&mut buffer[bytes_read..])
-                        .await
-                        .map_err(|e| Error::other(e.to_string()))?;
-                    if n == 0 {
-                        break;
-                    }
-                    bytes_read += n;
-                }
+            tokio::io::copy(&mut reader, &mut writer)
+                .await
+                .map_err(|e| Error::other(e.to_string()))?;
+            writer.shutdown().await.map_err(|e| Error::other(e.to_string()))?;
 
-                if bytes_read == 0 {
-                    break;
-                }
+            content_hash = writer.content_hash();
+            let chunk_infos = writer.chunks();
 
-                let chunk_data = Bytes::copy_from_slice(&buffer[..bytes_read]);
-                let chunk_hash = blake3::hash(&chunk_data).to_hex().to_string();
-
-                // Update global hash
-                hasher.update(&chunk_data);
-
-                if !self.storage_manager.exists(&chunk_hash).await {
-                    self.storage_manager.write_data(&chunk_hash, chunk_data).await?;
-                }
-
-                // Increment ref count
-                self.inc_ref(&mut tx, &chunk_hash).await?;
-
-                chunk_infos.push(ChunkInfo {
-                    hash: chunk_hash,
-                    size: bytes_read as u64,
-                    offset,
-                });
-
-                offset += bytes_read as u64;
+            // Increment ref counts for all chunks
+            for chunk in &chunk_infos {
+                self.inc_ref(&mut tx, &chunk.hash).await?;
             }
 
-            content_hash = hasher.finalize().to_hex().to_string();
             chunks = Some(chunk_infos);
-
-            // If not chunked (legacy path or single large chunk), we might want to ref count the whole content hash too
-            // But here we use chunks.
         }
 
         // 2. Prepare Metadata
@@ -184,7 +152,7 @@ impl LocalMetadataEngine {
         })
     }
 
-    pub async fn get_object_reader(&self, bucket: &str, key: &str, _opts: ObjectOptions) -> Result<GetObjectReader> {
+    pub async fn get_object_reader(&self, bucket: &str, key: &str, _opts: &ObjectOptions) -> Result<GetObjectReader> {
         // 1. KV Lookup
         let meta_key = format!("buckets/{}/objects/{}/meta", bucket, key);
         let tx = self.kv_store.begin().map_err(|e| Error::other(e.to_string()))?;
@@ -192,7 +160,7 @@ impl LocalMetadataEngine {
         if let Some(val) = tx.get(meta_key.as_bytes()).map_err(|e| Error::other(e.to_string()))? {
             let meta: ObjectMetadata = serde_json::from_slice(&val).map_err(|e| Error::other(e.to_string()))?;
 
-            let reader: Box<dyn AsyncRead + Send + Unpin> = if meta.is_inline {
+            let reader: Box<dyn AsyncRead + Send + Sync + Unpin> = if meta.is_inline {
                 let data = meta.inline_data.unwrap_or_default();
                 Box::new(WarpReader::new(Cursor::new(data)))
             } else if let Some(chunks) = meta.chunks {
@@ -348,14 +316,14 @@ impl LocalMetadataEngine {
         // Note: Ferntree operations are synchronous (in-memory).
         // We can run this directly.
 
-        let range = self.index_tree.range(Included(&start_key), Unbounded);
+        let mut range = self.index_tree.range(Included(&start_key), Unbounded);
 
         let mut objects = Vec::new();
         let mut common_prefixes = HashSet::new();
         let mut next_marker = None;
         let mut count = 0;
 
-        for (k, v) in range {
+        while let Some((k, v)) = range.next() {
             if !k.starts_with(&scan_prefix) {
                 break;
             }
@@ -508,7 +476,7 @@ impl LocalMetadataEngine {
 
         let new_count = count - 1;
         if new_count == 0 {
-            tx.del(key.as_bytes()).map_err(|e| Error::other(e.to_string()))?;
+            tx.delete(key.as_bytes()).map_err(|e| Error::other(e.to_string()))?;
         } else {
             tx.set(key.as_bytes(), &new_count.to_be_bytes())
                 .map_err(|e| Error::other(e.to_string()))?;

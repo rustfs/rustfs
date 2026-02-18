@@ -30,11 +30,12 @@ pub fn new_chunked_reader(
         }
 
         let chunk = &chunks[idx];
+        let len = chunks.len();
         match mgr.read_data(&chunk.hash).await {
             Ok(data) => Some((Ok(data), (mgr, chunks, idx + 1))),
             Err(e) => Some((
                 Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
-                (mgr, chunks, chunks.len()), // Stop iteration on error
+                (mgr, chunks, len), // Stop iteration on error
             )),
         }
     });
