@@ -353,6 +353,7 @@ mod tests {
         build_list_buckets_output, build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
         parse_list_object_versions_params, parse_list_objects_v2_params,
     };
+    use crate::storage::s3_api::common::rustfs_owner;
     use rustfs_ecstore::store_api::{BucketInfo, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo};
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};
@@ -383,8 +384,10 @@ mod tests {
         assert_eq!(buckets[0].creation_date, Some(s3s::dto::Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
         assert_eq!(buckets[1].name.as_deref(), Some("bucket-b"));
         assert_eq!(buckets[1].creation_date, None);
-        assert_eq!(owner.display_name.as_deref(), Some("rustfs"));
-        assert!(owner.id.as_ref().is_some_and(|id| !id.is_empty()));
+
+        let expected_owner = rustfs_owner();
+        assert_eq!(owner.display_name, expected_owner.display_name);
+        assert_eq!(owner.id, expected_owner.id);
     }
 
     #[test]
