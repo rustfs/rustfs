@@ -181,11 +181,10 @@ pub struct LocalDiskWrapper {
 impl LocalDiskWrapper {
     /// Create a new LocalDiskWrapper
     pub fn new(disk: Arc<LocalDisk>, health_check: bool) -> Self {
-        // Check environment variable for health check override
-        // Default to true if not set, but only enable if both param and env are true
-        let env_health_check = std::env::var(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING)
-            .map(|v| parse_bool_with_default(&v, true))
-            .unwrap_or(true);
+        // Check environment variable for health check override.
+        // Only enable if both param and env are true.
+        let env_health_check =
+            rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
 
         let ret = Self {
             disk,
@@ -220,11 +219,7 @@ impl LocalDiskWrapper {
     /// Enable health monitoring after disk creation.
     /// Used to defer health checks until after startup format loading completes.
     pub fn enable_health_check(&self) {
-        let env_health_check = std::env::var(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING)
-            .map(|v| parse_bool_with_default(&v, true))
-            .unwrap_or(true);
-
-        if env_health_check {
+        if self.health_check {
             let health = Arc::clone(&self.health);
             let cancel_token = self.cancel_token.clone();
             let disk = Arc::clone(&self.disk);
