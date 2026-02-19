@@ -21,6 +21,7 @@ use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::global::get_global_bucket_monitor;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -668,8 +669,15 @@ impl BucketTargetSys {
     }
 
     fn update_bandwidth_limit(&self, _bucket: &str, _arn: &str, _limit: i64) {
-        // Implementation for bandwidth limit update
-        // This would interact with the global bucket monitor
+        if let Some(bucket_monitor) = get_global_bucket_monitor() {
+            if _limit == 0 {
+                bucket_monitor.delete_bucket_throttle(_bucket, _arn);
+                return;
+            }
+            bucket_monitor.set_bandwidth_limit(_bucket, _arn, _limit);
+        } else {
+            error!("Global bucket monitor uninitialized");
+        }
     }
 
     pub async fn get_remote_target_client_by_arn(&self, _bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {

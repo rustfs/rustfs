@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::bandwidth::monitor::Monitor;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
@@ -58,6 +59,15 @@ lazy_static! {
     pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
     pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn rustfs_lock::client::LockClient>> = OnceLock::new();
     pub static ref GLOBAL_LOCK_CLIENTS: OnceLock<HashMap<String, Arc<dyn LockClient>>> = OnceLock::new();
+    pub static ref GLOBAL_BUCKET_MONITOR: OnceLock<Arc<Monitor>> = OnceLock::new();
+}
+
+pub fn init_global_bucket_monitor(num_nodes: u64) {
+    let _ = GLOBAL_BUCKET_MONITOR.set(Monitor::new(num_nodes));
+}
+
+pub fn get_global_bucket_monitor() -> Option<Arc<Monitor>> {
+    GLOBAL_BUCKET_MONITOR.get().cloned()
 }
 
 /// Global cancellation token for background services (data scanner and auto heal)

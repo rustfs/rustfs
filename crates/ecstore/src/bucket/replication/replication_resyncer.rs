@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::bandwidth::reader::{BucketOptions, MonitorReaderOptions, MonitoredReader};
 use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, BucketTargetSys, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
@@ -28,6 +29,7 @@ use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_fo
 use crate::event::name::EventName;
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
+use crate::global::get_global_bucket_monitor;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::store_api::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
@@ -1890,7 +1892,27 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
-        // TODO:bandwidth
+        let mut header_size: usize = 0;
+        for (key, value) in put_opts.header().iter() {
+            header_size += key.as_str().len();
+            header_size += value.as_bytes().len();
+        }
+
+        if let Some(monitor) = get_global_bucket_monitor() {
+            gr.stream = Box::new(MonitoredReader::new(
+                monitor,
+                gr.stream,
+                MonitorReaderOptions {
+                    bucket_options: BucketOptions {
+                        name: bucket.clone(),
+                        replication_arn: rinfo.arn.clone(),
+                    },
+                    header_size: header_size as i32,
+                },
+            ));
+        } else {
+            error!("Global bucket monitor uninitialized");
+        }
 
         if let Some(err) = if is_multipart {
             replicate_object_with_multipart(tgt_client.clone(), &tgt_client.bucket, &object, gr.stream, &object_info, put_opts)
@@ -2182,6 +2204,29 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     return rinfo;
                 }
             };
+
+            let mut header_size: usize = 0;
+            for (key, value) in put_opts.header().iter() {
+                header_size += key.as_str().len();
+                header_size += value.as_bytes().len();
+            }
+
+            if let Some(monitor) = get_global_bucket_monitor() {
+                gr.stream = Box::new(MonitoredReader::new(
+                    monitor,
+                    gr.stream,
+                    MonitorReaderOptions {
+                        bucket_options: BucketOptions {
+                            name: bucket.clone(),
+                            replication_arn: rinfo.arn.clone(),
+                        },
+                        header_size: header_size as i32,
+                    },
+                ));
+            } else {
+                error!("Global bucket monitor uninitialized");
+            }
+
             if let Some(err) = if is_multipart {
                 replicate_object_with_multipart(
                     tgt_client.clone(),

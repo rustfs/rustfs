@@ -1530,6 +1530,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
+name = "clocksource"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "129026dd5a8a9592d96916258f3a5379589e513ea5e86aeb0bd2530286e44e9e"
+dependencies = [
+ "libc",
+ "time",
+ "winapi",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6375,6 +6386,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c8d0fd677905edcbeedbf2edb6494d676f0e98d54d5cf9bda0b061cb8fb8aba"
 
 [[package]]
+name = "ratelimit"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36ea961700fd7260e7fa3701c8287d901b2172c51f9c1421fa0f21d7f7e184b7"
+dependencies = [
+ "clocksource",
+ "parking_lot",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rayon"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7050,6 +7072,7 @@ dependencies = [
  "pin-project-lite",
  "quick-xml 0.39.1",
  "rand 0.10.0",
+ "ratelimit",
  "reed-solomon-simd",
  "regex",
  "reqwest 0.13.2",
