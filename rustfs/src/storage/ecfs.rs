@@ -24,7 +24,7 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
 use crate::storage::s3_api::bucket::{
-    build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
+    build_list_buckets_output, build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
     parse_list_object_versions_params, parse_list_objects_v2_params,
 };
 use crate::storage::s3_api::common::rustfs_owner;
@@ -3539,20 +3539,7 @@ impl S3 for FS {
             store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?
         };
 
-        let buckets: Vec<Bucket> = bucket_infos
-            .iter()
-            .map(|v| Bucket {
-                creation_date: v.created.map(Timestamp::from),
-                name: Some(v.name.clone()),
-                ..Default::default()
-            })
-            .collect();
-
-        let output = ListBucketsOutput {
-            buckets: Some(buckets),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            ..Default::default()
-        };
+        let output = build_list_buckets_output(&bucket_infos);
         Ok(s3_response(output))
     }
 
