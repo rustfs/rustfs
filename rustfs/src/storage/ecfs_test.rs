@@ -1256,4 +1256,46 @@ mod tests {
         assert!(result.is_ok(), "Should succeed with valid ARN");
         assert_eq!(event_rules.len(), 1, "Should add one rule");
     }
+
+    // --- Object tag conditions for bucket policy (s3:ExistingObjectTag) ---
+
+    /// Verifies that object tags are formatted as ExistingObjectTag/<key> condition keys
+    /// with a single-element vec value, matching the format expected by policy evaluation.
+    #[test]
+    fn test_object_tag_condition_key_format() {
+        use rustfs_ecstore::bucket::tagging::decode_tags_to_map;
+        use std::collections::HashMap;
+
+        let tags_str = "security=public&project=webapp&env=prod";
+        let map = decode_tags_to_map(tags_str);
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for (k, v) in map {
+            out.insert(format!("ExistingObjectTag/{}", k), vec![v]);
+        }
+
+        assert_eq!(out.get("ExistingObjectTag/security"), Some(&vec!["public".to_string()]));
+        assert_eq!(out.get("ExistingObjectTag/project"), Some(&vec!["webapp".to_string()]));
+        assert_eq!(out.get("ExistingObjectTag/env"), Some(&vec!["prod".to_string()]));
+        assert_eq!(out.len(), 3);
+    }
+
+    /// When no object store is available (e.g. unit test env), get_object_tag_conditions_for_policy
+    /// returns Ok(empty map) so authorization can proceed without tag conditions.
+    #[tokio::test]
+    async fn test_get_object_tag_conditions_for_policy_returns_empty_without_store() {
+        let fs = FS::new();
+        let out = fs.get_object_tag_conditions_for_policy("bucket", "key", None).await.unwrap();
+        assert!(out.is_empty(), "without store should return empty tag conditions");
+    }
+
+    /// With version_id specified, the same no-store path returns Ok(empty) (versioned object path).
+    #[tokio::test]
+    async fn test_get_object_tag_conditions_for_policy_version_id_returns_empty_without_store() {
+        let fs = FS::new();
+        let out = fs
+            .get_object_tag_conditions_for_policy("bucket", "key", Some("v1"))
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+    }
 }
