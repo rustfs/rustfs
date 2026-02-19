@@ -16,7 +16,7 @@
 mod tests {
     use crate::config::workload_profiles::WorkloadProfile;
     use crate::storage::ecfs::FS;
-    use crate::storage::ecfs::RUSTFS_OWNER;
+    use crate::storage::s3_api::common::rustfs_owner;
     use crate::storage::{
         apply_cors_headers, check_preconditions, get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal,
         matches_origin_pattern, parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention,
@@ -67,11 +67,12 @@ mod tests {
     }
 
     #[test]
-    fn test_rustfs_owner_constant() {
-        // Test that RUSTFS_OWNER constant is properly defined
-        assert!(!RUSTFS_OWNER.display_name.as_ref().unwrap().is_empty());
-        assert!(!RUSTFS_OWNER.id.as_ref().unwrap().is_empty());
-        assert_eq!(RUSTFS_OWNER.display_name.as_ref().unwrap(), "rustfs");
+    fn test_rustfs_owner_helper() {
+        // Test that rustfs owner metadata remains stable for S3 compatibility.
+        let owner = rustfs_owner();
+        assert!(!owner.display_name.as_ref().unwrap().is_empty());
+        assert!(!owner.id.as_ref().unwrap().is_empty());
+        assert_eq!(owner.display_name.as_ref().unwrap(), "rustfs");
     }
 
     // Note: Most S3 API methods require complex setup with global state, storage backend,
