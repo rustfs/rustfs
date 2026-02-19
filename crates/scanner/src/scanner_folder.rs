@@ -496,7 +496,7 @@ impl FolderScanner {
         }
 
         let mut entries: Vec<(String, u64)> = failed.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        entries.sort_by_key(|(_, ts)| *ts);
+        entries.sort_by(|(k1, ts1), (k2, ts2)| ts1.cmp(ts2).then_with(|| k1.cmp(k2)));
 
         let remove_count = failed.len().saturating_sub(max_entries);
         for (key, _) in entries.into_iter().take(remove_count) {
