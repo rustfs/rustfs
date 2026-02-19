@@ -446,7 +446,11 @@ impl FolderScanner {
 
         let now = Self::now_secs();
         self.new_cache.info.failed_objects.insert(path.to_string(), now);
-        self.prune_failed_objects(now, ttl);
+
+        let max_entries = failed_objects_max();
+        if max_entries > 0 && self.new_cache.info.failed_objects.len() > max_entries {
+            self.prune_failed_objects(now, ttl);
+        }
     }
 
     fn prune_failed_objects_cache(&mut self) {
