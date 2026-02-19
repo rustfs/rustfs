@@ -16,7 +16,8 @@ use crate::disk::{
     CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader,
     FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     disk_store::{
-        CHECK_EVERY, CHECK_TIMEOUT_DURATION, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE, get_max_timeout_duration,
+        CHECK_EVERY, CHECK_TIMEOUT_DURATION, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING,
+        SKIP_IF_SUCCESS_BEFORE, get_max_timeout_duration,
     },
     endpoint::Endpoint,
 };
@@ -77,9 +78,8 @@ impl RemoteDisk {
             format!("{}://{}", ep.url.scheme(), ep.url.host_str().unwrap())
         };
 
-        let env_health_check = std::env::var(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING)
-            .map(|v| parse_bool_with_default(&v, true))
-            .unwrap_or(true);
+        let env_health_check =
+            rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
 
         let disk = Self {
             id: Mutex::new(None),
@@ -108,11 +108,7 @@ impl RemoteDisk {
     /// Used to defer health checks until after startup format loading completes,
     /// so that remote peers have time to come online.
     pub fn enable_health_check(&self) {
-        let env_health_check = std::env::var(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING)
-            .map(|v| parse_bool_with_default(&v, true))
-            .unwrap_or(true);
-
-        if env_health_check {
+        if self.health_check {
             self.spawn_health_monitoring();
         }
     }

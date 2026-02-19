@@ -39,6 +39,7 @@ const DISK_HEALTH_OK: u32 = 0;
 const DISK_HEALTH_FAULTY: u32 = 1;
 
 pub const ENV_RUSTFS_DRIVE_ACTIVE_MONITORING: &str = "RUSTFS_DRIVE_ACTIVE_MONITORING";
+pub const DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING: bool = true;
 pub const ENV_RUSTFS_DRIVE_MAX_TIMEOUT_DURATION: &str = "RUSTFS_DRIVE_MAX_TIMEOUT_DURATION";
 pub const CHECK_EVERY: Duration = Duration::from_secs(15);
 pub const SKIP_IF_SUCCESS_BEFORE: Duration = Duration::from_secs(5);
