@@ -4508,6 +4508,7 @@ impl StorageAPI for SetDisks {
             .as_ref()
             .map(|v| v.replica_status == ReplicationStatusType::Replica)
             == Some(true)
+            || opts.version_purge_status() == VersionPurgeStatusType::Complete
         {
             ReplicateDecision::default()
         } else {
