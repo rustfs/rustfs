@@ -34,7 +34,7 @@ fullnameOverride: ""
 
 mode:
   standalone:
-    enabled: true
+    enabled: false
     strategy:
       type: RollingUpdate
       rollingUpdate:
