@@ -24,6 +24,7 @@ pub mod kv;
 pub mod mx;
 pub(crate) mod reader;
 pub mod types;
+pub(crate) mod writer;
 
 pub use engine::LocalMetadataEngine;
 

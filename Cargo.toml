@@ -294,7 +294,7 @@ pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 # metadata
 ferntree = { version = "0.1.0", features = ["loom"], git = "https://github.com/surrealdb/ferntree.git", rev = "2cc6c3e06d4bbe314e78b82342f457cc661b274b" }
 surrealkv = "0.20.2"
-surrealmx = "0.17.0"
+surrealmx = "0.18.0"
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rustfs-mcp"]

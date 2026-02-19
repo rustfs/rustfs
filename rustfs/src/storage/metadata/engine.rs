@@ -14,7 +14,7 @@
 
 use crate::storage::metadata::mx::StorageManager;
 use crate::storage::metadata::reader::new_chunked_reader;
-use crate::storage::metadata::types::{ChunkInfo, IndexMetadata, ObjectMetadata};
+use crate::storage::metadata::types::{IndexMetadata, ObjectMetadata};
 use crate::storage::metadata::writer::ChunkedWriter;
 use bytes::Bytes;
 use ferntree::Tree as IndexTree;
@@ -97,8 +97,11 @@ impl LocalMetadataEngine {
 
             tokio::io::copy(&mut reader, &mut writer)
                 .await
-                .map_err(|e| Error::other(e.to_string()))?;
-            writer.shutdown().await.map_err(|e| Error::other(e.to_string()))?;
+                .map_err(|e: std::io::Error| Error::other(e.to_string()))?;
+            writer
+                .shutdown()
+                .await
+                .map_err(|e: std::io::Error| Error::other(e.to_string()))?;
 
             content_hash = writer.content_hash();
             let chunk_infos = writer.chunks();

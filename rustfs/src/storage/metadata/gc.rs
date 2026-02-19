@@ -45,16 +45,16 @@ impl GarbageCollector {
 
     async fn run_gc(&self) -> Result<(), String> {
         info!("Starting GC...");
-
+        use surrealkv::LSMIterator;
         let mut candidates = Vec::new();
 
         {
-            let mut tx = self.kv_store.begin().map_err(|e| e.to_string())?;
+            let tx = self.kv_store.begin().map_err(|e| e.to_string())?;
             let mut iter = tx.range("refs/".as_bytes(), "refs0".as_bytes()).map_err(|e| e.to_string())?;
 
             while iter.valid() {
                 let key = iter.key();
-                let val = iter.value().map_err(|e| e.to_string())?;
+                let val = iter.value().map_err(|e: surrealkv::Error| e.to_string())?;
 
                 if val.len() == 8 {
                     let mut buf = [0u8; 8];
@@ -71,7 +71,7 @@ impl GarbageCollector {
                     }
                 }
 
-                iter.next().map_err(|e| e.to_string())?;
+                iter.next().map_err(|e: surrealkv::Error| e.to_string())?;
             }
         }
 

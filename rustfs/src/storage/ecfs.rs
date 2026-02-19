@@ -2466,7 +2466,7 @@ impl S3 for FS {
 
         if is_new_metadata_engine_enabled() {
             if let Some(engine) = get_metadata_engine() {
-                if let Ok(reader) = engine.get_object_reader(&bucket, &key, opts).await {
+                if let Ok(reader) = engine.get_object_reader(&bucket, &key, &opts).await {
                     let info = reader.object_info.clone();
                     let content_length = info.size;
                     let last_modified = info.mod_time.map(Timestamp::from);
