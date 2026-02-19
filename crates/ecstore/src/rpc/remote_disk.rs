@@ -1535,6 +1535,7 @@ mod tests {
         };
 
         let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        remote_disk.enable_health_check();
 
         // wait for health check connect timeout
         tokio::time::sleep(Duration::from_secs(6)).await;
