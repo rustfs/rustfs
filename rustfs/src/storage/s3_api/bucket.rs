@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage::s3_api::common::rustfs_owner;
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::store_api::{ListObjectVersionsInfo, ListObjectsV2Info};
+use rustfs_ecstore::store_api::{BucketInfo, ListObjectVersionsInfo, ListObjectsV2Info};
 use s3s::dto::{
-    CommonPrefix, DeleteMarkerEntry, EncodingType, ListObjectVersionsOutput, ListObjectsOutput, ListObjectsV2Output, Object,
-    ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Owner, Timestamp,
+    Bucket, CommonPrefix, DeleteMarkerEntry, EncodingType, ListBucketsOutput, ListObjectVersionsOutput, ListObjectsOutput,
+    ListObjectsV2Output, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Owner, Timestamp,
 };
 use s3s::{S3Error, S3ErrorCode};
 use tracing::debug;
@@ -59,6 +60,23 @@ pub(crate) fn build_list_objects_output(v2: ListObjectsV2Output, request_marker:
         is_truncated: v2.is_truncated,
         marker,
         next_marker,
+        ..Default::default()
+    }
+}
+
+pub(crate) fn build_list_buckets_output(bucket_infos: &[BucketInfo]) -> ListBucketsOutput {
+    let buckets: Vec<Bucket> = bucket_infos
+        .iter()
+        .map(|bucket_info| Bucket {
+            creation_date: bucket_info.created.map(Timestamp::from),
+            name: Some(bucket_info.name.clone()),
+            ..Default::default()
+        })
+        .collect();
+
+    ListBucketsOutput {
+        buckets: Some(buckets),
+        owner: Some(rustfs_owner()),
         ..Default::default()
     }
 }
@@ -332,13 +350,45 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
+        build_list_buckets_output, build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
         parse_list_object_versions_params, parse_list_objects_v2_params,
     };
-    use rustfs_ecstore::store_api::{ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo};
+    use crate::storage::s3_api::common::rustfs_owner;
+    use rustfs_ecstore::store_api::{BucketInfo, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo};
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};
+    use time::OffsetDateTime;
     use uuid::Uuid;
+
+    #[test]
+    fn test_build_list_buckets_output_maps_bucket_infos_and_owner() {
+        let bucket_infos = vec![
+            BucketInfo {
+                name: "bucket-a".to_string(),
+                created: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            },
+            BucketInfo {
+                name: "bucket-b".to_string(),
+                created: None,
+                ..Default::default()
+            },
+        ];
+
+        let output = build_list_buckets_output(&bucket_infos);
+        let buckets = output.buckets.as_ref().expect("buckets should be present");
+        let owner = output.owner.as_ref().expect("owner should be present");
+
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].name.as_deref(), Some("bucket-a"));
+        assert_eq!(buckets[0].creation_date, Some(s3s::dto::Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
+        assert_eq!(buckets[1].name.as_deref(), Some("bucket-b"));
+        assert_eq!(buckets[1].creation_date, None);
+
+        let expected_owner = rustfs_owner();
+        assert_eq!(owner.display_name, expected_owner.display_name);
+        assert_eq!(owner.id, expected_owner.id);
+    }
 
     #[test]
     fn test_list_objects_marker_echoes_request_value() {
