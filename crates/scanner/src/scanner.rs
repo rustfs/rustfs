@@ -17,11 +17,12 @@ use std::sync::Arc;
 use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
 use crate::scanner_folder::data_usage_update_dir_cycles;
 use crate::scanner_io::ScannerIO;
+use crate::sleeper::SCANNER_SLEEPER;
 use crate::{DataUsageInfo, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
-use rustfs_config::{DEFAULT_DATA_SCANNER_START_DELAY_SECS, ENV_DATA_SCANNER_START_DELAY_SECS};
+use rustfs_config::{DEFAULT_SCANNER_SPEED, ENV_DATA_SCANNER_START_DELAY_SECS, ENV_SCANNER_SPEED, ScannerSpeed};
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
@@ -34,12 +35,28 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-fn data_scanner_start_delay() -> Duration {
-    let secs = rustfs_utils::get_env_u64(ENV_DATA_SCANNER_START_DELAY_SECS, DEFAULT_DATA_SCANNER_START_DELAY_SECS);
-    Duration::from_secs(secs)
+/// Returns the base cycle interval. If `RUSTFS_DATA_SCANNER_START_DELAY_SECS`
+/// is set, it takes precedence; otherwise the value is derived from the
+/// `RUSTFS_SCANNER_SPEED` preset.
+fn cycle_interval() -> Duration {
+    if let Some(secs) = rustfs_utils::get_env_opt_u64(ENV_DATA_SCANNER_START_DELAY_SECS) {
+        return Duration::from_secs(secs);
+    }
+    let speed_str = rustfs_utils::get_env_str(ENV_SCANNER_SPEED, DEFAULT_SCANNER_SPEED);
+    ScannerSpeed::from_env_str(&speed_str).cycle_interval()
+}
+
+/// Compute a randomized inter-cycle sleep with a floor of 1 second.
+fn randomized_cycle_delay() -> Duration {
+    let interval = cycle_interval();
+    let jitter = Duration::from_secs_f64(rand::random::<f64>() * interval.as_secs_f64());
+    jitter.max(Duration::from_secs(1))
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
+    // Force init global sleeper so config is read once at startup.
+    let _ = &*SCANNER_SLEEPER;
+
     let ctx_clone = ctx.clone();
     let storeapi_clone = storeapi.clone();
     tokio::spawn(async move {
@@ -54,7 +71,8 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
             if let Err(e) = run_data_scanner(ctx_clone.clone(), storeapi_clone.clone()).await {
                 error!("Failed to run data scanner: {e}");
             }
-            tokio::time::sleep(data_scanner_start_delay()).await;
+            // Sleep if couldn't aquire lock or scan failed
+            tokio::time::sleep(randomized_cycle_delay()).await;
         }
     });
 }
@@ -160,82 +178,83 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
         }
     }
 
-    let mut ticker = tokio::time::interval(data_scanner_start_delay());
     loop {
+        if ctx.is_cancelled() {
+            break;
+        }
+
+        cycle_info.current = cycle_info.next;
+        cycle_info.started = Utc::now();
+
+        global_metrics().set_cycle(Some(cycle_info.clone())).await;
+
+        let background_heal_info = read_background_heal_info(storeapi.clone()).await;
+
+        let scan_mode = get_cycle_scan_mode(
+            cycle_info.current,
+            background_heal_info.bitrot_start_cycle,
+            background_heal_info.bitrot_start_time,
+        );
+        if background_heal_info.current_scan_mode != scan_mode {
+            let mut new_heal_info = background_heal_info.clone();
+            new_heal_info.current_scan_mode = scan_mode;
+
+            if scan_mode == HealScanMode::Deep {
+                new_heal_info.bitrot_start_cycle = cycle_info.current;
+                new_heal_info.bitrot_start_time = Some(Utc::now());
+            }
+
+            save_background_heal_info(storeapi.clone(), new_heal_info).await;
+        }
+
+        let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
+        let storeapi_clone = storeapi.clone();
+        let ctx_clone = ctx.clone();
+        tokio::spawn(async move {
+            store_data_usage_in_backend(ctx_clone, storeapi_clone, receiver).await;
+        });
+
+        let done_cycle = Metrics::time(Metric::ScanCycle);
+        let cycle_start = std::time::Instant::now();
+        if let Err(e) = storeapi
+            .clone()
+            .nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode)
+            .await
+        {
+            error!("Failed to scan namespace: {e}");
+            emit_scan_cycle_complete(false, cycle_start.elapsed());
+        } else {
+            done_cycle();
+            emit_scan_cycle_complete(true, cycle_start.elapsed());
+            info!("Namespace scanned successfully");
+
+            cycle_info.next += 1;
+            cycle_info.current = 0;
+            cycle_info.cycle_completed.push(Utc::now());
+
+            if cycle_info.cycle_completed.len() >= data_usage_update_dir_cycles() as usize {
+                cycle_info.cycle_completed = cycle_info.cycle_completed.split_off(data_usage_update_dir_cycles() as usize);
+            }
+
+            global_metrics().set_cycle(Some(cycle_info.clone())).await;
+
+            let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
+
+            let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
+            buf.extend_from_slice(&cycle_info.next.to_le_bytes());
+            buf.extend_from_slice(&cycle_info_buf);
+
+            if let Err(e) = save_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
+                error!("Failed to save data usage bloom name to {}: {}", &*DATA_USAGE_BLOOM_NAME_PATH, e);
+            } else {
+                info!("Data usage bloom name saved successfully");
+            }
+        }
+
+        // Randomized inter-cycle delay
         tokio::select! {
-            _ = ctx.cancelled() => {
-                break;
-            }
-            _ = ticker.tick() => {
-
-                cycle_info.current = cycle_info.next;
-                cycle_info.started = Utc::now();
-
-                global_metrics().set_cycle(Some(cycle_info.clone())).await;
-
-                let background_heal_info = read_background_heal_info(storeapi.clone()).await;
-
-                let scan_mode = get_cycle_scan_mode(cycle_info.current, background_heal_info.bitrot_start_cycle, background_heal_info.bitrot_start_time);
-                if background_heal_info.current_scan_mode != scan_mode {
-                    let mut new_heal_info = background_heal_info.clone();
-                    new_heal_info.current_scan_mode = scan_mode;
-
-                    if scan_mode == HealScanMode::Deep {
-                        new_heal_info.bitrot_start_cycle = cycle_info.current;
-                        new_heal_info.bitrot_start_time = Some(Utc::now());
-                    }
-
-                    save_background_heal_info(storeapi.clone(), new_heal_info).await;
-                }
-
-
-
-                let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
-                let storeapi_clone = storeapi.clone();
-                let ctx_clone = ctx.clone();
-                tokio::spawn(async move {
-                    store_data_usage_in_backend(ctx_clone, storeapi_clone, receiver).await;
-                });
-
-
-               let done_cycle = Metrics::time(Metric::ScanCycle);
-               let cycle_start = std::time::Instant::now();
-               if let Err(e) = storeapi.clone().nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode).await {
-                error!("Failed to scan namespace: {e}");
-                emit_scan_cycle_complete(false, cycle_start.elapsed());
-               } else {
-                done_cycle();
-                emit_scan_cycle_complete(true, cycle_start.elapsed());
-                info!("Namespace scanned successfully");
-
-                cycle_info.next +=1;
-                cycle_info.current = 0;
-                cycle_info.cycle_completed.push(Utc::now());
-
-                if cycle_info.cycle_completed.len() >= data_usage_update_dir_cycles() as usize {
-                    cycle_info.cycle_completed = cycle_info.cycle_completed.split_off(data_usage_update_dir_cycles() as usize);
-                }
-
-                global_metrics().set_cycle(Some(cycle_info.clone())).await;
-
-                let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
-
-                let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
-                buf.extend_from_slice(&cycle_info.next.to_le_bytes());
-                buf.extend_from_slice(&cycle_info_buf);
-
-
-                if let Err(e) = save_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
-                    error!("Failed to save data usage bloom name to {}: {}", &*DATA_USAGE_BLOOM_NAME_PATH, e);
-                } else {
-                    info!("Data usage bloom name saved successfully");
-                }
-
-
-               }
-
-                ticker.reset();
-            }
+            _ = ctx.cancelled() => break,
+            _ = tokio::time::sleep(randomized_cycle_delay()) => {},
         }
     }
 
