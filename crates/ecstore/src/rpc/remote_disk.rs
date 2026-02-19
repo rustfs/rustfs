@@ -91,30 +91,16 @@ impl RemoteDisk {
             cancel_token: CancellationToken::new(),
         };
 
-        // Start health monitoring
-        disk.start_health_monitoring();
-
         Ok(disk)
-    }
-
-    /// Start health monitoring for the remote disk
-    fn start_health_monitoring(&self) {
-        if self.health_check {
-            self.spawn_health_monitoring();
-        }
     }
 
     /// Enable health monitoring after disk creation.
     /// Used to defer health checks until after startup format loading completes,
     /// so that remote peers have time to come online.
     pub fn enable_health_check(&self) {
-        if self.health_check {
-            self.spawn_health_monitoring();
+        if !self.health_check {
+            return;
         }
-    }
-
-    /// Spawn the health monitoring task
-    fn spawn_health_monitoring(&self) {
         let health = Arc::clone(&self.health);
         let cancel_token = self.cancel_token.clone();
         let addr = self.addr.clone();

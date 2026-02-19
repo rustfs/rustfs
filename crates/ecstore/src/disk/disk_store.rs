@@ -186,34 +186,17 @@ impl LocalDiskWrapper {
         let env_health_check =
             rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
 
-        let ret = Self {
+        Self {
             disk,
             health: Arc::new(DiskHealthTracker::new()),
             health_check: health_check && env_health_check,
             cancel_token: CancellationToken::new(),
             disk_id: Arc::new(RwLock::new(None)),
-        };
-
-        ret.start_monitoring();
-
-        ret
+        }
     }
 
     pub fn get_disk(&self) -> Arc<LocalDisk> {
         self.disk.clone()
-    }
-
-    /// Start the disk monitoring if health_check is enabled
-    pub fn start_monitoring(&self) {
-        if self.health_check {
-            let health = Arc::clone(&self.health);
-            let cancel_token = self.cancel_token.clone();
-            let disk = Arc::clone(&self.disk);
-
-            tokio::spawn(async move {
-                Self::monitor_disk_writable(disk, health, cancel_token).await;
-            });
-        }
     }
 
     /// Enable health monitoring after disk creation.
