@@ -73,11 +73,30 @@ pub fn heal_object_select_prob() -> u32 {
     rustfs_utils::get_env_u32(ENV_HEAL_OBJECT_SELECT_PROB, DEFAULT_HEAL_OBJECT_SELECT_PROB)
 }
 
+#[cfg(test)]
+static TEST_FAILED_OBJECT_TTL_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+#[cfg(test)]
+static TEST_FAILED_OBJECTS_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
 fn failed_object_ttl_secs() -> u64 {
+    #[cfg(test)]
+    {
+        let v = TEST_FAILED_OBJECT_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        if v != u64::MAX {
+            return v;
+        }
+    }
     rustfs_utils::get_env_u32(ENV_FAILED_OBJECT_TTL_SECS, DEFAULT_FAILED_OBJECT_TTL_SECS) as u64
 }
 
 fn failed_objects_max() -> usize {
+    #[cfg(test)]
+    {
+        let v = TEST_FAILED_OBJECTS_MAX.load(std::sync::atomic::Ordering::Relaxed);
+        if v != usize::MAX {
+            return v;
+        }
+    }
     rustfs_utils::get_env_u32(ENV_FAILED_OBJECTS_MAX, DEFAULT_FAILED_OBJECTS_MAX) as usize
 }
 
@@ -1261,5 +1280,186 @@ pub async fn scan_data_folder(
             // No useful information, return original cache
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
+    use serial_test::serial;
+    use std::sync::atomic::AtomicBool;
+    use uuid::Uuid;
+
+    async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
+        let temp_dir = std::env::temp_dir().join(format!("rustfs-scanner-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir)
+            .await
+            .expect("failed to create test directory");
+
+        let endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("failed to create disk");
+
+        let update_current_path: UpdateCurrentPathFn = Arc::new(|_: &str| Box::pin(async {}));
+
+        let scanner = FolderScanner {
+            root: temp_dir.to_string_lossy().to_string(),
+            old_cache: DataUsageCache::default(),
+            new_cache: DataUsageCache::default(),
+            update_cache: DataUsageCache::default(),
+            data_usage_scanner_debug: false,
+            heal_object_select: 0,
+            scan_mode: HealScanMode::Normal,
+            we_sleep: Box::new(|| false),
+            disks: Vec::new(),
+            disks_quorum: 0,
+            updates: None,
+            last_update: SystemTime::UNIX_EPOCH,
+            update_current_path,
+            skip_heal: Arc::new(AtomicBool::new(false)),
+            local_disk: disk,
+        };
+
+        (scanner, temp_dir)
+    }
+
+    fn set_test_ttl(ttl: u64) -> u64 {
+        TEST_FAILED_OBJECT_TTL_SECS.swap(ttl, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn restore_test_ttl(prev: u64) {
+        TEST_FAILED_OBJECT_TTL_SECS.store(prev, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn set_test_max(max: usize) -> usize {
+        TEST_FAILED_OBJECTS_MAX.swap(max, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn restore_test_max(prev: usize) {
+        TEST_FAILED_OBJECTS_MAX.store(prev, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_should_skip_failed_respects_ttl() {
+        let prev_ttl = set_test_ttl(60);
+        let prev_max = set_test_max(100);
+
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let now = FolderScanner::now_secs();
+
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("recent".to_string(), now.saturating_sub(10));
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("expired".to_string(), now.saturating_sub(120));
+
+        assert!(scanner.should_skip_failed("recent"));
+        assert!(!scanner.should_skip_failed("expired"));
+
+        restore_test_ttl(prev_ttl);
+        restore_test_max(prev_max);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_record_failed_ttl_zero_noop() {
+        let prev_ttl = set_test_ttl(0);
+        let prev_max = set_test_max(100);
+
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+
+        scanner.record_failed("path1");
+        assert!(scanner.new_cache.info.failed_objects.is_empty());
+
+        let now = FolderScanner::now_secs();
+        scanner.new_cache.info.failed_objects.insert("path2".to_string(), now);
+        assert!(!scanner.should_skip_failed("path2"));
+
+        restore_test_ttl(prev_ttl);
+        restore_test_max(prev_max);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_record_failed_prunes_to_max_entries() {
+        let prev_ttl = set_test_ttl(1000);
+        let prev_max = set_test_max(2);
+
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let now = FolderScanner::now_secs();
+
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("old1".to_string(), now.saturating_sub(50));
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("old2".to_string(), now.saturating_sub(40));
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("old3".to_string(), now.saturating_sub(30));
+
+        scanner.record_failed("new");
+
+        assert_eq!(scanner.new_cache.info.failed_objects.len(), 2);
+        assert!(scanner.new_cache.info.failed_objects.contains_key("new"));
+        assert!(scanner.new_cache.info.failed_objects.contains_key("old3"));
+        assert!(!scanner.new_cache.info.failed_objects.contains_key("old1"));
+        assert!(!scanner.new_cache.info.failed_objects.contains_key("old2"));
+
+        restore_test_ttl(prev_ttl);
+        restore_test_max(prev_max);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_prune_failed_objects_cache_drops_expired() {
+        let prev_ttl = set_test_ttl(5);
+        let prev_max = set_test_max(10);
+
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let now = FolderScanner::now_secs();
+
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("expired".to_string(), now.saturating_sub(10));
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("fresh".to_string(), now.saturating_sub(2));
+
+        scanner.prune_failed_objects_cache();
+
+        assert_eq!(scanner.new_cache.info.failed_objects.len(), 1);
+        assert!(scanner.new_cache.info.failed_objects.contains_key("fresh"));
+
+        restore_test_ttl(prev_ttl);
+        restore_test_max(prev_max);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }
