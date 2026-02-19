@@ -14,6 +14,7 @@
 
 use crate::admin::console::is_console_path;
 use crate::admin::console::make_console_server;
+use crate::admin::handlers::oidc::is_oidc_path;
 use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX};
 use hyper::HeaderMap;
 use hyper::Method;
@@ -143,6 +144,11 @@ where
             return Ok(());
         }
 
+        // Allow unauthenticated access to OIDC endpoints (user not yet authenticated)
+        if is_oidc_path(path) {
+            return Ok(());
+        }
+
         // Check RPC signature verification
         if req.uri.path().starts_with(RPC_PREFIX) {
             // Skip signature verification for HEAD requests (health checks)
@@ -152,6 +158,30 @@ where
                     s3_error!(AccessDenied, "{}", e)
                 })?;
             }
+            return Ok(());
+        }
+
+        // Allow unauthenticated STS requests to POST / (AssumeRoleWithWebIdentity
+        // doesn't use SigV4 — the JWT token in the request body is the authentication).
+        // The handler dispatches on the Action parameter: AssumeRole will reject if
+        // credentials are missing, AssumeRoleWithWebIdentity will validate the JWT.
+        // Require application/x-www-form-urlencoded Content-Type to narrow the bypass.
+        if req.method == Method::POST
+            && path == "/"
+            && req.credentials.is_none()
+            && req
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| {
+                    ct.split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+                })
+                .unwrap_or(false)
+        {
             return Ok(());
         }
 
