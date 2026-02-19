@@ -40,7 +40,6 @@ use rustfs_protos::proto_gen::node_service::{
     node_service_client::NodeServiceClient,
 };
 use rustfs_rio::{HttpReader, HttpWriter};
-use rustfs_utils::string::parse_bool_with_default;
 use std::{
     path::PathBuf,
     sync::{

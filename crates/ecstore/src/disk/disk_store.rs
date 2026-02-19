@@ -20,7 +20,6 @@ use crate::disk::{
 };
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
-use rustfs_utils::string::parse_bool_with_default;
 use std::{
     path::PathBuf,
     sync::{
@@ -202,15 +201,16 @@ impl LocalDiskWrapper {
     /// Enable health monitoring after disk creation.
     /// Used to defer health checks until after startup format loading completes.
     pub fn enable_health_check(&self) {
-        if self.health_check {
-            let health = Arc::clone(&self.health);
-            let cancel_token = self.cancel_token.clone();
-            let disk = Arc::clone(&self.disk);
-
-            tokio::spawn(async move {
-                Self::monitor_disk_writable(disk, health, cancel_token).await;
-            });
+        if !self.health_check {
+            return;
         }
+        let health = Arc::clone(&self.health);
+        let cancel_token = self.cancel_token.clone();
+        let disk = Arc::clone(&self.disk);
+
+        tokio::spawn(async move {
+            Self::monitor_disk_writable(disk, health, cancel_token).await;
+        });
     }
 
     /// Stop the disk monitoring
