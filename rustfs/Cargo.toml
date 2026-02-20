@@ -71,7 +71,6 @@ rustfs-scanner = { workspace = true }
 # Async Runtime and Networking
 async-trait = { workspace = true }
 axum.workspace = true
-axum-server = { workspace = true }
 futures.workspace = true
 futures-util.workspace = true
 hyper.workspace = true

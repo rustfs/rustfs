@@ -109,7 +109,6 @@ async-compression = { version = "0.4.40" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
 axum = "0.8.8"
-axum-server = { version = "0.8.0", features = ["tls-rustls"], default-features = false }
 futures = "0.3.32"
 futures-core = "0.3.32"
 futures-util = "0.3.32"
@@ -127,9 +126,9 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 tokio-stream = { version = "0.1.18" }
 tokio-test = "0.4.5"
 tokio-util = { version = "0.7.18", features = ["io", "compat"] }
-tonic = { version = "0.14.4", features = ["gzip"] }
-tonic-prost = { version = "0.14.4" }
-tonic-prost-build = { version = "0.14.4" }
+tonic = { version = "0.14.5", features = ["gzip"] }
+tonic-prost = { version = "0.14.5" }
+tonic-prost-build = { version = "0.14.5" }
 tower = { version = "0.5.3", features = ["timeout"] }
 tower-http = { version = "0.6.8", features = ["cors"] }
 
@@ -174,7 +173,7 @@ jiff = { version = "0.2.20", features = ["serde"] }
 time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Utilities and Tools
-anyhow = "1.0.101"
+anyhow = "1.0.102"
 arc-swap = "1.8.2"
 astral-tokio-tar = "0.5.6"
 atoi = "2.0.0"
@@ -188,7 +187,7 @@ base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"
 cfg-if = "1.0.4"
-clap = { version = "4.5.59", features = ["derive", "env"] }
+clap = { version = "4.5.60", features = ["derive", "env"] }
 const-str = { version = "1.1.0", features = ["std", "proc"] }
 convert_case = "0.11.0"
 criterion = { version = "0.8", features = ["html_reports"] }
