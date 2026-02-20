@@ -2170,8 +2170,10 @@ impl DiskAPI for LocalDisk {
             return Err(err);
         }
 
-        // Invalidate cache for the destination xl.meta so that reads after rename_data
-        // (e.g. immediately after put_object) see the new version rather than stale cached data.
+        // Invalidate cache entries for both source and destination xl.meta so that reads
+        // after rename_data (e.g. immediately after put_object) see the new version rather
+        // than stale cached data, and cannot obtain data via the old source path.
+        get_global_file_cache().invalidate(&src_file_path).await;
         get_global_file_cache().invalidate(&dst_file_path).await;
 
         if let Some(src_file_path_parent) = src_file_path.parent() {
