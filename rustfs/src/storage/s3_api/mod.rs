@@ -17,7 +17,7 @@
 //! This file intentionally starts as skeleton-only. Behavior remains in place
 //! until each helper is moved with dedicated small refactor steps.
 
-pub(crate) mod acl {}
+pub(crate) mod acl;
 pub(crate) mod bucket;
 pub(crate) mod common;
 pub(crate) mod encryption {}
