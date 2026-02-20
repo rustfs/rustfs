@@ -1907,11 +1907,13 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         name: bucket.clone(),
                         replication_arn: rinfo.arn.clone(),
                     },
-                    header_size: header_size as i32,
+                    header_size,
                 },
             ));
         } else {
-            error!("Global bucket monitor uninitialized");
+            warn!(
+                "Global bucket monitor uninitialized; proceeding with unthrottled replication (bandwidth limits will be ignored)"
+            );
         }
 
         if let Some(err) = if is_multipart {
@@ -2220,11 +2222,13 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                             name: bucket.clone(),
                             replication_arn: rinfo.arn.clone(),
                         },
-                        header_size: header_size as i32,
+                        header_size,
                     },
                 ));
             } else {
-                error!("Global bucket monitor uninitialized");
+                warn!(
+                    "Global bucket monitor uninitialized; proceeding with unthrottled replication (bandwidth limits will be ignored)"
+                );
             }
 
             if let Some(err) = if is_multipart {

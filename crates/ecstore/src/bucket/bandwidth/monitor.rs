@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct BucketThrottle {
@@ -124,6 +125,15 @@ impl Monitor {
 
     pub fn set_bandwidth_limit(&self, bucket: &str, arn: &str, limit: i64) {
         let limit_bytes = limit / self.node_count as i64;
+        if limit_bytes == 0 && limit > 0 {
+            warn!(
+                bucket = bucket,
+                arn = arn,
+                limit = limit,
+                node_count = self.node_count,
+                "bandwidth limit too small for cluster size, per-node limit will clamp to 1 byte/s"
+            );
+        }
         let opts = BucketOptions {
             name: bucket.to_string(),
             replication_arn: arn.to_string(),
@@ -183,5 +193,89 @@ mod tests {
         assert!(!monitor.is_throttled("b1", "arn1"));
         assert!(!monitor.is_throttled("b1", "arn2"));
         assert!(monitor.is_throttled("b2", "arn3"));
+    }
+
+    #[test]
+    fn test_consume_returns_deficit_when_tokens_exhausted() {
+        let throttle = BucketThrottle::new(100);
+
+        let (deficit, rate) = throttle.consume(200);
+
+        assert!(deficit > 0);
+        assert!(rate > 0.0);
+    }
+
+    #[test]
+    fn test_consume_no_deficit_when_tokens_sufficient() {
+        let throttle = BucketThrottle::new(10000);
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let (deficit, _rate) = throttle.consume(5000);
+        assert_eq!(deficit, 0);
+    }
+
+    #[test]
+    fn test_burst_equals_bandwidth() {
+        let throttle = BucketThrottle::new(500);
+        assert_eq!(throttle.burst(), 500);
+    }
+
+    #[test]
+    fn test_wait_n_zero_returns_immediately() {
+        let throttle = BucketThrottle::new(1);
+        let start = std::time::Instant::now();
+        throttle.wait_n(0).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_wait_n_blocks_on_deficit() {
+        let throttle = BucketThrottle::new(100);
+
+        let _ = throttle.consume(200);
+
+        let start = std::time::Instant::now();
+        throttle.wait_n(100).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(elapsed >= std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_concurrent_consume() {
+        let throttle = BucketThrottle::new(10000);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let t = throttle.clone();
+            handles.push(std::thread::spawn(move || t.consume(100)));
+        }
+
+        let mut total_deficit = 0u64;
+        let mut total_consumed = 0u64;
+        for h in handles {
+            let (deficit, _) = h.join().unwrap();
+            total_consumed += 100 - deficit;
+            total_deficit += deficit;
+        }
+
+        assert_eq!(total_consumed + total_deficit, 1000);
+        assert!(total_consumed <= 10000);
+    }
+
+    #[test]
+    fn test_zero_bandwidth_clamped_to_one() {
+        let throttle = BucketThrottle::new(0);
+        assert_eq!(throttle.burst(), 1);
+        assert_eq!(throttle.node_bandwidth_per_sec, 1);
+    }
+
+    #[test]
+    fn test_negative_bandwidth_clamped_to_one() {
+        let throttle = BucketThrottle::new(-100);
+        assert_eq!(throttle.burst(), 1);
+        assert_eq!(throttle.node_bandwidth_per_sec, 1);
     }
 }

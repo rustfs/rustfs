@@ -28,7 +28,7 @@ pub struct BucketOptions {
 
 pub struct MonitorReaderOptions {
     pub bucket_options: BucketOptions,
-    pub header_size: i32,
+    pub header_size: usize,
 }
 
 struct WaitState {
@@ -44,6 +44,7 @@ pub struct MonitoredReader<R> {
     m: Arc<Monitor>,
     opts: MonitorReaderOptions,
     wait_state: std::sync::Mutex<Option<WaitState>>,
+    temp_buf: Vec<u8>,
 }
 
 impl<R> MonitoredReader<R> {
@@ -64,53 +65,7 @@ impl<R> MonitoredReader<R> {
             m,
             opts,
             wait_state: std::sync::Mutex::new(None),
-        }
-    }
-}
-
-impl<R: std::io::Read> std::io::Read for MonitoredReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let throttle = match &self.throttle {
-            Some(t) => t.clone(),
-            None => return self.r.read(buf),
-        };
-        if let Some(ref e) = self.last_err {
-            return Err(std::io::Error::new(e.kind(), e.to_string()));
-        }
-
-        let b = throttle.burst();
-        let mut need = buf.len();
-        let hdr = self.opts.header_size;
-        let tokens: u64 = if hdr > 0 {
-            if (hdr as u64) < b {
-                self.opts.header_size = 0;
-                need = ((b - hdr as u64) as usize).min(need);
-                need as u64 + hdr as u64
-            } else {
-                self.opts.header_size -= b as i32 - 1;
-                need = 1;
-                b
-            }
-        } else {
-            need = need.min(b as usize);
-            need as u64
-        };
-
-        let av = throttle.tokens();
-        let tokens = if av < tokens && av > 0 {
-            need = need.min(av as usize);
-            av
-        } else {
-            tokens
-        };
-
-        throttle.wait_n(tokens)?;
-        match self.r.read(&mut buf[..need]) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                self.last_err = Some(std::io::Error::new(e.kind(), e.to_string()));
-                Err(e)
-            }
+            temp_buf: Vec::new(),
         }
     }
 }
@@ -128,7 +83,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
                         let need = ws.need;
                         *guard = None;
                         drop(guard);
-                        return poll_limited_read(&mut this.r, cx, buf, need, &mut this.last_err);
+                        return poll_limited_read(&mut this.r, cx, buf, need, &mut this.last_err, &mut this.temp_buf);
                     }
                 }
             }
@@ -144,31 +99,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
         }
 
         let b = throttle.burst();
-        let mut need = buf.remaining();
-        let hdr = this.opts.header_size;
-        let tokens: u64 = if hdr > 0 {
-            if (hdr as u64) < b {
-                this.opts.header_size = 0;
-                need = ((b - hdr as u64) as usize).min(need);
-                need as u64 + hdr as u64
-            } else {
-                this.opts.header_size -= b as i32 - 1;
-                need = 1;
-                b
-            }
-        } else {
-            need = need.min(b as usize);
-            need as u64
-        };
-
-        let av = throttle.tokens();
-        let tokens = if av < tokens && av > 0 {
-            need = need.min(av as usize);
-            av
-        } else {
-            tokens
-        };
-
+        debug_assert!(b >= 1, "burst must be at least 1");
+        let (need, tokens) = calc_need_and_tokens(b, buf.remaining(), &mut this.opts.header_size);
+        let (need, tokens) = adjust_by_available(throttle, need, tokens);
         let (deficit, rate) = throttle.consume(tokens);
 
         if deficit > 0 && rate > 0.0 {
@@ -190,7 +123,36 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
             }
         }
 
-        poll_limited_read(&mut this.r, cx, buf, need, &mut this.last_err)
+        poll_limited_read(&mut this.r, cx, buf, need, &mut this.last_err, &mut this.temp_buf)
+    }
+}
+
+fn calc_need_and_tokens(burst: u64, need_upper: usize, header_size: &mut usize) -> (usize, u64) {
+    let hdr = *header_size;
+    let mut need = need_upper;
+    let tokens: u64 = if hdr > 0 {
+        if (hdr as u64) < burst {
+            *header_size = 0;
+            need = ((burst - hdr as u64) as usize).min(need);
+            need as u64 + hdr as u64
+        } else {
+            *header_size -= burst as usize - 1;
+            need = 1;
+            burst
+        }
+    } else {
+        need = need.min(burst as usize);
+        need as u64
+    };
+    (need, tokens)
+}
+
+fn adjust_by_available(throttle: &BucketThrottle, need: usize, tokens: u64) -> (usize, u64) {
+    let av = throttle.tokens();
+    if av < tokens && av > 0 {
+        (need.min(av as usize), av)
+    } else {
+        (need, tokens)
     }
 }
 
@@ -200,6 +162,7 @@ fn poll_limited_read<R: AsyncRead + Unpin>(
     buf: &mut ReadBuf<'_>,
     limit: usize,
     last_err: &mut Option<std::io::Error>,
+    reusable_buf: &mut Vec<u8>,
 ) -> Poll<std::io::Result<()>> {
     let remaining = buf.remaining();
     if limit == 0 || remaining == 0 {
@@ -216,8 +179,8 @@ fn poll_limited_read<R: AsyncRead + Unpin>(
         };
     }
 
-    let mut temp = vec![0u8; limit];
-    let mut temp_buf = ReadBuf::new(&mut temp);
+    reusable_buf.resize(limit, 0);
+    let mut temp_buf = ReadBuf::new(&mut reusable_buf[..limit]);
     match Pin::new(r).poll_read(cx, &mut temp_buf) {
         Poll::Ready(Ok(())) => {
             buf.put_slice(temp_buf.filled());
@@ -291,18 +254,84 @@ mod tests {
         let mut inner = TestAsyncReader::new(b"abcdef");
         let mut out = [0u8; 8];
         let mut last_err = None;
+        let mut reusable = Vec::new();
         let waker = noop_waker_ref();
         let mut cx = Context::from_waker(waker);
 
         let mut read_buf = ReadBuf::new(&mut out);
-        let first = poll_limited_read(&mut inner, &mut cx, &mut read_buf, 3, &mut last_err);
+        let first = poll_limited_read(&mut inner, &mut cx, &mut read_buf, 3, &mut last_err, &mut reusable);
         assert!(matches!(first, Poll::Ready(Ok(()))));
         assert_eq!(read_buf.filled(), b"abc");
         assert!(last_err.is_none());
 
-        let second = poll_limited_read(&mut inner, &mut cx, &mut read_buf, 3, &mut last_err);
+        let second = poll_limited_read(&mut inner, &mut cx, &mut read_buf, 3, &mut last_err, &mut reusable);
         assert!(matches!(second, Poll::Ready(Ok(()))));
         assert_eq!(read_buf.filled(), b"abcdef");
         assert!(last_err.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_monitored_reader_with_throttle_reads_all_data() {
+        let monitor = Monitor::new(1);
+        monitor.set_bandwidth_limit("b1", "arn1", 1024);
+
+        let data = vec![0xABu8; 4096];
+        let inner = TestAsyncReader::new(&data);
+        let opts = MonitorReaderOptions {
+            bucket_options: BucketOptions {
+                name: "b1".to_string(),
+                replication_arn: "arn1".to_string(),
+            },
+            header_size: 0,
+        };
+        let mut reader = MonitoredReader::new(monitor, inner, opts);
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out.len(), 4096);
+        assert!(out.iter().all(|&b| b == 0xAB));
+    }
+
+    #[tokio::test]
+    async fn test_monitored_reader_header_size_accounting() {
+        let monitor = Monitor::new(1);
+        monitor.set_bandwidth_limit("b1", "arn1", 100);
+
+        let data = vec![0u8; 200];
+        let inner = TestAsyncReader::new(&data);
+        let opts = MonitorReaderOptions {
+            bucket_options: BucketOptions {
+                name: "b1".to_string(),
+                replication_arn: "arn1".to_string(),
+            },
+            header_size: 50,
+        };
+        let mut reader = MonitoredReader::new(monitor, inner, opts);
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out.len(), 200);
+        assert_eq!(reader.opts.header_size, 0);
+    }
+
+    #[tokio::test]
+    async fn test_monitored_reader_very_small_limit() {
+        let monitor = Monitor::new(1);
+        monitor.set_bandwidth_limit("b1", "arn1", 1);
+
+        let data = vec![0xFFu8; 10];
+        let inner = TestAsyncReader::new(&data);
+        let opts = MonitorReaderOptions {
+            bucket_options: BucketOptions {
+                name: "b1".to_string(),
+                replication_arn: "arn1".to_string(),
+            },
+            header_size: 0,
+        };
+        let mut reader = MonitoredReader::new(monitor, inner, opts);
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out.len(), 10);
     }
 }
