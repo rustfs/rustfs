@@ -668,13 +668,13 @@ impl BucketTargetSys {
         Ok(true)
     }
 
-    fn update_bandwidth_limit(&self, _bucket: &str, _arn: &str, _limit: i64) {
+    fn update_bandwidth_limit(&self, bucket: &str, arn: &str, limit: i64) {
         if let Some(bucket_monitor) = get_global_bucket_monitor() {
-            if _limit == 0 {
-                bucket_monitor.delete_bucket_throttle(_bucket, _arn);
+            if limit == 0 {
+                bucket_monitor.delete_bucket_throttle(bucket, arn);
                 return;
             }
-            bucket_monitor.set_bandwidth_limit(_bucket, _arn, _limit);
+            bucket_monitor.set_bandwidth_limit(bucket, arn, limit);
         } else {
             error!("Global bucket monitor uninitialized");
             debug_assert!(false, "Global bucket monitor must be initialized before setting bandwidth limits");

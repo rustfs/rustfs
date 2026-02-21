@@ -76,6 +76,8 @@ const RESYNC_META_FORMAT: u16 = 1;
 const RESYNC_META_VERSION: u16 = 1;
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 
+static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
+
 #[derive(Debug, Clone, Default)]
 pub struct ResyncOpts {
     pub bucket: String,
@@ -2080,31 +2082,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
-        let mut header_size: usize = 0;
-        for (key, value) in put_opts.header().iter() {
-            header_size += key.as_str().len();
-            header_size += value.as_bytes().len();
-            // Account for HTTP header formatting: ": " (2 bytes) and "\r\n" (2 bytes)
-            header_size += 4;
-        }
-
-        if let Some(monitor) = get_global_bucket_monitor() {
-            gr.stream = Box::new(MonitoredReader::new(
-                monitor,
-                gr.stream,
-                MonitorReaderOptions {
-                    bucket_options: BucketOptions {
-                        name: bucket.clone(),
-                        replication_arn: rinfo.arn.clone(),
-                    },
-                    header_size,
-                },
-            ));
-        } else {
-            warn!(
-                "Global bucket monitor uninitialized; proceeding with unthrottled replication (bandwidth limits will be ignored)"
-            );
-        }
+        gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
 
         if let Some(err) = if is_multipart {
             replicate_object_with_multipart(tgt_client.clone(), &tgt_client.bucket, &object, gr.stream, &object_info, put_opts)
@@ -2512,7 +2490,11 @@ fn wrap_with_bandwidth_monitor(
             },
         ))
     } else {
-        warn!("Global bucket monitor uninitialized; proceeding with unthrottled replication (bandwidth limits will be ignored)");
+        WARNED_MONITOR_UNINIT.call_once(|| {
+            warn!(
+                "Global bucket monitor uninitialized; proceeding with unthrottled replication (bandwidth limits will be ignored)"
+            )
+        });
         stream
     }
 }

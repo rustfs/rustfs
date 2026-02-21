@@ -13,11 +13,10 @@
 // limitations under the License.
 
 use crate::bucket::bandwidth::reader::BucketOptions;
-use ratelimit::Ratelimiter;
+use ratelimit::{Error as RatelimitError, Ratelimiter};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use tokio::time::sleep;
 use tracing::warn;
 
 #[derive(Clone)]
@@ -27,27 +26,27 @@ pub struct BucketThrottle {
 }
 
 impl BucketThrottle {
-    fn new(node_bandwidth_per_sec: i64) -> Self {
+    fn new(node_bandwidth_per_sec: i64) -> Result<Self, RatelimitError> {
         let node_bandwidth_per_sec = node_bandwidth_per_sec.max(1);
         let amount = node_bandwidth_per_sec as u64;
-        let limiter = Arc::new(Mutex::new(
-            Ratelimiter::builder(amount, Duration::from_secs(1))
-                .max_tokens(amount)
-                .build()
-                .unwrap(),
-        ));
-        Self {
-            limiter,
+        let limiter_inner = Ratelimiter::builder(amount, Duration::from_secs(1))
+            .max_tokens(amount)
+            .build()?;
+        Ok(Self {
+            limiter: Arc::new(Mutex::new(limiter_inner)),
             node_bandwidth_per_sec,
-        }
+        })
     }
 
     pub fn burst(&self) -> u64 {
-        self.limiter.lock().unwrap().max_tokens()
+        self.limiter.lock().unwrap_or_else(|e| e.into_inner()).max_tokens()
     }
 
     pub fn tokens(&self) -> u64 {
-        let guard = self.limiter.lock().unwrap();
+        let guard = self.limiter.lock().unwrap_or_else(|e| {
+            warn!("bucket throttle mutex poisoned, recovering");
+            e.into_inner()
+        });
         let _ = guard.try_wait();
         guard.available()
     }
@@ -63,22 +62,15 @@ impl BucketThrottle {
         Ok(())
     }
 
-    pub async fn wait_n_async(&self, n: u64) {
-        if n == 0 {
-            return;
-        }
-        let (deficit, rate) = self.consume(n);
-        if deficit > 0 && rate > 0.0 {
-            sleep(Duration::from_secs_f64(deficit as f64 / rate)).await;
-        }
-    }
-
     /// The ratelimit crate (0.10.0) does not provide a bulk token consumption API.
     /// try_wait() first to consume 1 token AND trigger the internal refill
     /// mechanism (tokens are only refilled during try_wait/wait calls).
     /// directly adjust available tokens via set_available() to consume the remaining amount.
     pub(crate) fn consume(&self, n: u64) -> (u64, f64) {
-        let guard = self.limiter.lock().unwrap();
+        let guard = self.limiter.lock().unwrap_or_else(|e| {
+            warn!("bucket throttle mutex poisoned, recovering");
+            e.into_inner()
+        });
         let mut consumed = 0u64;
         if guard.try_wait().is_ok() {
             consumed = 1;
@@ -114,7 +106,10 @@ impl Monitor {
     pub fn delete_bucket(&self, bucket: &str) {
         self.t_lock
             .write()
-            .expect("bandwidth monitor lock poisoned")
+            .unwrap_or_else(|e| {
+                warn!("bucket monitor rwlock write poisoned, recovering");
+                e.into_inner()
+            })
             .retain(|opts, _| opts.name != bucket);
     }
 
@@ -123,13 +118,22 @@ impl Monitor {
             name: bucket.to_string(),
             replication_arn: arn.to_string(),
         };
-        self.t_lock.write().expect("bandwidth monitor lock poisoned").remove(&opts);
+        self.t_lock
+            .write()
+            .unwrap_or_else(|e| {
+                warn!("bucket monitor rwlock write poisoned, recovering");
+                e.into_inner()
+            })
+            .remove(&opts);
     }
 
     pub fn throttle(&self, opts: &BucketOptions) -> Option<BucketThrottle> {
         self.t_lock
             .read()
-            .expect("bandwidth monitor lock poisoned")
+            .unwrap_or_else(|e| {
+                warn!("bucket monitor rwlock read poisoned, recovering");
+                e.into_inner()
+            })
             .get(opts)
             .cloned()
     }
@@ -149,10 +153,25 @@ impl Monitor {
             name: bucket.to_string(),
             replication_arn: arn.to_string(),
         };
-        let throttle = BucketThrottle::new(limit_bytes);
+        let throttle = match BucketThrottle::new(limit_bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    bucket = bucket,
+                    arn = arn,
+                    limit_bytes = limit_bytes,
+                    err = %e,
+                    "failed to build bandwidth throttle, throttling disabled for this target"
+                );
+                return;
+            }
+        };
         self.t_lock
             .write()
-            .expect("bandwidth monitor lock poisoned")
+            .unwrap_or_else(|e| {
+                warn!("bucket monitor rwlock write poisoned, recovering");
+                e.into_inner()
+            })
             .insert(opts, throttle);
     }
 
@@ -163,7 +182,10 @@ impl Monitor {
         };
         self.t_lock
             .read()
-            .expect("bandwidth monitor lock poisoned")
+            .unwrap_or_else(|e| {
+                warn!("bucket monitor rwlock read poisoned, recovering");
+                e.into_inner()
+            })
             .contains_key(&opt)
     }
 }
@@ -214,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_consume_returns_deficit_when_tokens_exhausted() {
-        let throttle = BucketThrottle::new(100);
+        let throttle = BucketThrottle::new(100).expect("test");
 
         let (deficit, rate) = throttle.consume(200);
 
@@ -224,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_consume_no_deficit_when_tokens_sufficient() {
-        let throttle = BucketThrottle::new(10000);
+        let throttle = BucketThrottle::new(10000).expect("test");
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
@@ -234,13 +256,13 @@ mod tests {
 
     #[test]
     fn test_burst_equals_bandwidth() {
-        let throttle = BucketThrottle::new(500);
+        let throttle = BucketThrottle::new(500).expect("test");
         assert_eq!(throttle.burst(), 500);
     }
 
     #[test]
     fn test_wait_n_zero_returns_immediately() {
-        let throttle = BucketThrottle::new(1);
+        let throttle = BucketThrottle::new(1).expect("test");
         let start = std::time::Instant::now();
         throttle.wait_n(0).unwrap();
         assert!(start.elapsed() < std::time::Duration::from_millis(10));
@@ -248,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_wait_n_blocks_on_deficit() {
-        let throttle = BucketThrottle::new(100);
+        let throttle = BucketThrottle::new(100).expect("test");
 
         let _ = throttle.consume(200);
 
@@ -261,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_consume() {
-        let throttle = BucketThrottle::new(10000);
+        let throttle = BucketThrottle::new(10000).expect("test");
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
         let mut handles = vec![];
@@ -284,15 +306,35 @@ mod tests {
 
     #[test]
     fn test_zero_bandwidth_clamped_to_one() {
-        let throttle = BucketThrottle::new(0);
+        let throttle = BucketThrottle::new(0).expect("test");
         assert_eq!(throttle.burst(), 1);
         assert_eq!(throttle.node_bandwidth_per_sec, 1);
     }
 
     #[test]
     fn test_negative_bandwidth_clamped_to_one() {
-        let throttle = BucketThrottle::new(-100);
+        let throttle = BucketThrottle::new(-100).expect("test");
         assert_eq!(throttle.burst(), 1);
         assert_eq!(throttle.node_bandwidth_per_sec, 1);
+    }
+
+    #[test]
+    fn test_update_bandwidth_limit_overrides_previous() {
+        let monitor = Monitor::new(1);
+        monitor.set_bandwidth_limit("b1", "arn1", 1000);
+
+        let opts = BucketOptions {
+            name: "b1".to_string(),
+            replication_arn: "arn1".to_string(),
+        };
+        let t1 = monitor.throttle(&opts).expect("throttle should exist");
+        assert_eq!(t1.burst(), 1000);
+        assert_eq!(t1.node_bandwidth_per_sec, 1000);
+
+        monitor.set_bandwidth_limit("b1", "arn1", 500);
+
+        let t2 = monitor.throttle(&opts).expect("throttle should exist after update");
+        assert_eq!(t2.burst(), 500);
+        assert_eq!(t2.node_bandwidth_per_sec, 500);
     }
 }

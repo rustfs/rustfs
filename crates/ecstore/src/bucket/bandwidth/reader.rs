@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::time::Sleep;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BucketOptions {
@@ -75,7 +75,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
         let this = self.get_mut();
 
         {
-            let mut guard = this.wait_state.lock().unwrap();
+            let mut guard = this.wait_state.lock().unwrap_or_else(|e| {
+                warn!("MonitoredReader wait_state mutex poisoned, recovering");
+                e.into_inner()
+            });
             if let Some(ref mut ws) = *guard {
                 match ws.sleep.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
@@ -116,7 +119,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
             let mut sleep = Box::pin(tokio::time::sleep(duration));
             match sleep.as_mut().poll(cx) {
                 Poll::Pending => {
-                    *this.wait_state.lock().unwrap() = Some(WaitState { sleep, need });
+                    *this.wait_state.lock().unwrap_or_else(|e| {
+                        warn!("MonitoredReader wait_state mutex poisoned, recovering");
+                        e.into_inner()
+                    }) = Some(WaitState { sleep, need });
                     return Poll::Pending;
                 }
                 Poll::Ready(()) => {}
