@@ -184,6 +184,7 @@ resources: {}
 
 # This is to setup the liveness and readiness probes more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
 livenessProbe:
+  enabled: true # omitted
   httpGet:
     path: /health
     port: endpoint
@@ -194,6 +195,7 @@ livenessProbe:
   failureThreshold: 3
 
 readinessProbe:
+  enabled: true # omitted
   httpGet:
     path: /health/ready
     port: endpoint

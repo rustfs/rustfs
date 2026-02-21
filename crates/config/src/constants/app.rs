@@ -194,6 +194,24 @@ pub const DEFAULT_LOG_ROTATION_TIME: &str = "hour";
 /// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
 pub const DEFAULT_LOG_KEEP_FILES: usize = 30;
 
+/// Default trace export enabled
+/// It is used to enable or disable exporting traces
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_TRACES_EXPORT_ENABLED
+pub const DEFAULT_OBS_TRACES_EXPORT_ENABLED: bool = true;
+
+/// Default metrics export enabled
+/// It is used to enable or disable exporting metrics
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_METRICS_EXPORT_ENABLED
+pub const DEFAULT_OBS_METRICS_EXPORT_ENABLED: bool = true;
+
+/// Default logs export enabled
+/// It is used to enable or disable exporting logs
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_LOGS_EXPORT_ENABLED
+pub const DEFAULT_OBS_LOGS_EXPORT_ENABLED: bool = true;
+
 /// Default log local logging enabled for rustfs
 /// This is the default log local logging enabled for rustfs.
 /// It is used to enable or disable local logging of the application.

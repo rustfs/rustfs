@@ -29,6 +29,10 @@ mod data_usage_test;
 #[cfg(test)]
 mod kms;
 
+// Regression test for issue #1797
+#[cfg(test)]
+mod list_objects_duplicates_test;
+
 // Quota tests
 #[cfg(test)]
 mod quota_test;
@@ -54,6 +58,10 @@ mod policy;
 
 #[cfg(test)]
 mod compression_test;
+
+// Regression test for Issue #1878: DeleteMarkers not visible immediately after delete_objects
+#[cfg(test)]
+mod delete_objects_versioning_test;
 #[cfg(test)]
 mod protocols;
 

@@ -76,9 +76,6 @@
 
             buildInputs = with pkgs; [
               openssl
-            ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-              pkgs.darwin.apple_sdk.frameworks.Security
-              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
             ];
 
             cargoBuildFlags = [
@@ -122,9 +119,6 @@
               pkgs.pkg-config
               pkgs.protobuf
               pkgs.openssl
-            ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-              pkgs.darwin.apple_sdk.frameworks.Security
-              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
             ];
 
             PROTOC = "${pkgs.protobuf}/bin/protoc";

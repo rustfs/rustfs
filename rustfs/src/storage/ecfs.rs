@@ -23,11 +23,11 @@ use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_ha
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::readers::InMemoryAsyncReader;
+use crate::storage::s3_api::acl::{build_get_bucket_acl_output, build_get_object_acl_output};
 use crate::storage::s3_api::bucket::{
-    build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
+    build_list_buckets_output, build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
     parse_list_object_versions_params, parse_list_objects_v2_params,
 };
-use crate::storage::s3_api::common::rustfs_owner;
 use crate::storage::s3_api::multipart::{
     build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
 };
@@ -78,8 +78,8 @@ use rustfs_ecstore::{
         policy_sys::PolicySys,
         quota::QuotaOperation,
         replication::{
-            DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate,
-            schedule_replication, schedule_replication_delete,
+            DeletedObjectReplicationInfo, ObjectOpts, ReplicationConfigurationExt, check_replicate_delete,
+            get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
         },
         tagging::{decode_tags, encode_tags},
         utils::serialize,
@@ -148,13 +148,7 @@ use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::convert::Infallible;
 use std::ops::Add;
-use std::{
-    collections::HashMap,
-    fmt::Debug,
-    path::Path,
-    str::FromStr,
-    sync::{Arc, LazyLock},
-};
+use std::{collections::HashMap, fmt::Debug, path::Path, str::FromStr, sync::Arc};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -173,9 +167,6 @@ macro_rules! try_ {
         }
     };
 }
-
-// Shared owner metadata source for S3 response compatibility.
-pub(crate) static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(rustfs_owner);
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -1446,6 +1437,8 @@ impl S3 for FS {
             // }
         }
 
+        let is_force_delete = opts.delete_prefix;
+
         let Some(store) = new_object_layer_fn() else {
             return Err(not_initialized_error());
         };
@@ -1509,6 +1502,30 @@ impl S3 for FS {
                 .invalidate_cache_versioned(&del_bucket, &del_key, del_version.as_deref())
                 .await;
         });
+
+        if is_force_delete
+            && !replica
+            && let Ok((rcfg, _)) = metadata_sys::get_replication_config(&bucket).await
+        {
+            let tgt_arns = rcfg.filter_target_arns(&ObjectOpts {
+                name: key.clone(),
+                ..Default::default()
+            });
+            for arn in tgt_arns {
+                schedule_replication_delete(DeletedObjectReplicationInfo {
+                    delete_object: rustfs_ecstore::store_api::DeletedObject {
+                        object_name: key.clone(),
+                        force_delete: true,
+                        ..Default::default()
+                    },
+                    bucket: bucket.clone(),
+                    target_arn: arn,
+                    event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                    ..Default::default()
+                })
+                .await;
+            }
+        }
 
         if obj_info.name.is_empty() {
             return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
@@ -1957,21 +1974,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let grants = vec![Grant {
-            grantee: Some(Grantee {
-                type_: Type::from_static(Type::CANONICAL_USER),
-                display_name: None,
-                email_address: None,
-                id: None,
-                uri: None,
-            }),
-            permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
-        }];
-
-        Ok(s3_response(GetBucketAclOutput {
-            grants: Some(grants),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-        }))
+        Ok(s3_response(build_get_bucket_acl_output()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2900,22 +2903,7 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
         }
 
-        let grants = vec![Grant {
-            grantee: Some(Grantee {
-                type_: Type::from_static(Type::CANONICAL_USER),
-                display_name: None,
-                email_address: None,
-                id: None,
-                uri: None,
-            }),
-            permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
-        }];
-
-        Ok(s3_response(GetObjectAclOutput {
-            grants: Some(grants),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            ..Default::default()
-        }))
+        Ok(s3_response(build_get_object_acl_output()))
     }
 
     async fn get_object_attributes(
@@ -3539,20 +3527,7 @@ impl S3 for FS {
             store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?
         };
 
-        let buckets: Vec<Bucket> = bucket_infos
-            .iter()
-            .map(|v| Bucket {
-                creation_date: v.created.map(Timestamp::from),
-                name: Some(v.name.clone()),
-                ..Default::default()
-            })
-            .collect();
-
-        let output = ListBucketsOutput {
-            buckets: Some(buckets),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            ..Default::default()
-        };
+        let output = build_list_buckets_output(&bucket_infos);
         Ok(s3_response(output))
     }
 
