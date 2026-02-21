@@ -1287,6 +1287,7 @@ pub struct DeletedObject {
     // to support delete marker replication
     pub replication_state: Option<ReplicationState>,
     pub found: bool,
+    pub force_delete: bool,
 }
 
 impl DeletedObject {

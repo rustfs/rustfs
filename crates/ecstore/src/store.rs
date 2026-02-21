@@ -202,11 +202,14 @@ impl ECStore {
 
             // validate_parity(parity_count, pool_eps.drives_per_set)?;
 
+            // Initialize disks without health monitoring so that remote peers
+            // are not immediately marked as faulty before they have a chance to
+            // start up. Health monitoring is enabled after format loading succeeds.
             let (disks, errs) = store_init::init_disks(
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
-                    health_check: true,
+                    health_check: false,
                 },
             )
             .await;
@@ -249,6 +252,11 @@ impl ECStore {
                     }
                 }
             }?;
+
+            // Format loading succeeded, enable health monitoring on all disks
+            for disk in disks.iter().flatten() {
+                disk.enable_health_check();
+            }
 
             if deployment_id.is_none() {
                 deployment_id = Some(fm.id);
