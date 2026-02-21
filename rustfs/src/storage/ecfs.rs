@@ -78,8 +78,8 @@ use rustfs_ecstore::{
         policy_sys::PolicySys,
         quota::QuotaOperation,
         replication::{
-            DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate,
-            schedule_replication, schedule_replication_delete,
+            DeletedObjectReplicationInfo, ObjectOpts, ReplicationConfigurationExt, check_replicate_delete,
+            get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
         },
         tagging::{decode_tags, encode_tags},
         utils::serialize,
@@ -1437,6 +1437,8 @@ impl S3 for FS {
             // }
         }
 
+        let is_force_delete = opts.delete_prefix;
+
         let Some(store) = new_object_layer_fn() else {
             return Err(not_initialized_error());
         };
@@ -1500,6 +1502,30 @@ impl S3 for FS {
                 .invalidate_cache_versioned(&del_bucket, &del_key, del_version.as_deref())
                 .await;
         });
+
+        if is_force_delete
+            && !replica
+            && let Ok((rcfg, _)) = metadata_sys::get_replication_config(&bucket).await
+        {
+            let tgt_arns = rcfg.filter_target_arns(&ObjectOpts {
+                name: key.clone(),
+                ..Default::default()
+            });
+            for arn in tgt_arns {
+                schedule_replication_delete(DeletedObjectReplicationInfo {
+                    delete_object: rustfs_ecstore::store_api::DeletedObject {
+                        object_name: key.clone(),
+                        force_delete: true,
+                        ..Default::default()
+                    },
+                    bucket: bucket.clone(),
+                    target_arn: arn,
+                    event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                    ..Default::default()
+                })
+                .await;
+            }
+        }
 
         if obj_info.name.is_empty() {
             return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));

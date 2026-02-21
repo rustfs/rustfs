@@ -1193,6 +1193,11 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
 }
 
 pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
+    if dobj.delete_object.force_delete {
+        replicate_force_delete_to_targets(&dobj, storage).await;
+        return;
+    }
+
     let bucket = dobj.bucket.clone();
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         Some(version_id.to_owned())
@@ -1477,6 +1482,189 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
                 },
                 ..Default::default()
             });
+        }
+    }
+}
+
+async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectReplicationInfo, storage: Arc<S>) {
+    let bucket = &dobj.bucket;
+    let object_name = &dobj.delete_object.object_name;
+
+    let rcfg = match get_replication_config(bucket).await {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            warn!("replicate force-delete: no replication config for bucket:{}", bucket);
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: object_name.clone(),
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+            return;
+        }
+        Err(err) => {
+            warn!("replicate force-delete: replication config error bucket:{} error:{}", bucket, err);
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: object_name.clone(),
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+            return;
+        }
+    };
+
+    let ns_lock = match storage
+        .new_ns_lock(bucket, format!("/[replicate]/{}", object_name).as_str())
+        .await
+    {
+        Ok(ns_lock) => ns_lock,
+        Err(e) => {
+            warn!(
+                "replicate force-delete: failed to get ns lock bucket:{} object:{} error:{}",
+                bucket, object_name, e
+            );
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: object_name.clone(),
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+            return;
+        }
+    };
+
+    let _lock_guard = match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            warn!(
+                "replicate force-delete: failed to get write lock bucket:{} object:{} error:{}",
+                bucket, object_name, e
+            );
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: object_name.clone(),
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+            return;
+        }
+    };
+
+    let tgt_arns = if !dobj.target_arn.is_empty() {
+        vec![dobj.target_arn.clone()]
+    } else {
+        rcfg.filter_target_arns(&ObjectOpts {
+            name: object_name.clone(),
+            ..Default::default()
+        })
+    };
+
+    let mut join_set = JoinSet::new();
+
+    for arn in tgt_arns {
+        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(bucket, &arn).await else {
+            warn!("replicate force-delete: failed to get target client bucket:{} arn:{}", bucket, arn);
+            send_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: object_name.clone(),
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+            continue;
+        };
+
+        let bucket = bucket.clone();
+        let object_name = object_name.clone();
+
+        join_set.spawn(async move {
+            if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
+                error!("replicate force-delete: target offline bucket:{} arn:{}", bucket, tgt_client.arn);
+                send_event(EventArgs {
+                    event_name: EventName::ObjectReplicationFailed.as_ref().to_string(),
+                    bucket_name: bucket.clone(),
+                    object: ObjectInfo {
+                        bucket: bucket.clone(),
+                        name: object_name.clone(),
+                        ..Default::default()
+                    },
+                    user_agent: "Internal: [Replication]".to_string(),
+                    host: GLOBAL_LocalNodeName.to_string(),
+                    ..Default::default()
+                });
+                return;
+            }
+
+            if let Err(e) = tgt_client
+                .remove_object(
+                    &tgt_client.bucket,
+                    &object_name,
+                    None,
+                    RemoveObjectOptions {
+                        force_delete: true,
+                        governance_bypass: false,
+                        replication_delete_marker: false,
+                        replication_mtime: None,
+                        replication_status: ReplicationStatusType::Replica,
+                        replication_request: true,
+                        replication_validity_check: false,
+                    },
+                )
+                .await
+            {
+                error!(
+                    "replicate force-delete failed bucket:{} object:{} arn:{} error:{}",
+                    bucket, object_name, tgt_client.arn, e
+                );
+                send_event(EventArgs {
+                    event_name: EventName::ObjectReplicationFailed.as_ref().to_string(),
+                    bucket_name: bucket.clone(),
+                    object: ObjectInfo {
+                        bucket: bucket.clone(),
+                        name: object_name.clone(),
+                        ..Default::default()
+                    },
+                    user_agent: "Internal: [Replication]".to_string(),
+                    host: GLOBAL_LocalNodeName.to_string(),
+                    ..Default::default()
+                });
+            }
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        if let Err(e) = result {
+            error!("replicate force-delete task panicked: {}", e);
         }
     }
 }
