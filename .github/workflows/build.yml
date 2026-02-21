@@ -161,42 +161,52 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
-      RUSTFLAGS: ${{ matrix.cross == 'false' && '-C target-cpu=native' || '' }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
         include:
           # Linux builds
+          # Use x86-64-v2 (SSE4.2 baseline) instead of native to ensure distributed
+          # binaries run on older x86_64 CPUs (e.g. Intel Celeron/Atom, Synology NAS).
+          # See: https://github.com/rustfs/rustfs/issues/1838
           - os: ubicloud-standard-2
             target: x86_64-unknown-linux-musl
             cross: false
             platform: linux
+            rustflags: '-C target-cpu=x86-64-v2'
           - os: ubicloud-standard-2
             target: aarch64-unknown-linux-musl
             cross: true
             platform: linux
+            rustflags: ''
           - os: ubicloud-standard-2
             target: x86_64-unknown-linux-gnu
             cross: false
             platform: linux
+            rustflags: '-C target-cpu=x86-64-v2'
           - os: ubicloud-standard-2
             target: aarch64-unknown-linux-gnu
             cross: true
             platform: linux
+            rustflags: ''
           # macOS builds
           - os: macos-latest
             target: aarch64-apple-darwin
             cross: false
             platform: macos
+            rustflags: ''
           - os: macos-latest
             target: x86_64-apple-darwin
             cross: false
             platform: macos
+            rustflags: '-C target-cpu=x86-64-v2'
           # Windows builds (temporarily disabled)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
             platform: windows
+            rustflags: '-C target-cpu=x86-64-v2'
           #- os: windows-latest
           #  target: aarch64-pc-windows-msvc
           #  cross: true

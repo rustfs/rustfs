@@ -58,6 +58,10 @@ mod policy;
 
 #[cfg(test)]
 mod compression_test;
+
+// Regression test for Issue #1878: DeleteMarkers not visible immediately after delete_objects
+#[cfg(test)]
+mod delete_objects_versioning_test;
 #[cfg(test)]
 mod protocols;
 
