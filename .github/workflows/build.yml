@@ -200,7 +200,7 @@ jobs:
             target: x86_64-apple-darwin
             cross: false
             platform: macos
-            rustflags: '-C target-cpu=native'
+            rustflags: '-C target-cpu=x86-64-v2'
           # Windows builds (temporarily disabled)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
