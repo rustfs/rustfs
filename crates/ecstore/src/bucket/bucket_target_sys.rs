@@ -700,6 +700,7 @@ impl BucketTargetSys {
         if let Some(existing_targets) = targets_map.remove(bucket) {
             for target in existing_targets {
                 arn_remotes_map.remove(&target.arn);
+                self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
 

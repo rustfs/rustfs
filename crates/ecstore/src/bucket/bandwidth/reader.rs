@@ -94,8 +94,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
             None => return Pin::new(&mut this.r).poll_read(cx, buf),
         };
 
-        if let Some(ref e) = this.last_err {
-            return Poll::Ready(Err(std::io::Error::new(e.kind(), e.to_string())));
+        if let Some(e) = this.last_err.take() {
+            return Poll::Ready(Err(e));
         }
 
         let b = throttle.burst();
@@ -136,7 +136,7 @@ fn calc_need_and_tokens(burst: u64, need_upper: usize, header_size: &mut usize) 
             need = ((burst - hdr as u64) as usize).min(need);
             need as u64 + hdr as u64
         } else {
-            *header_size -= burst as usize - 1;
+            *header_size -= burst as usize;
             need = 1;
             burst
         }

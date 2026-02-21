@@ -73,6 +73,10 @@ impl BucketThrottle {
         }
     }
 
+    /// The ratelimit crate (0.10.0) does not provide a bulk token consumption API.
+    /// try_wait() first to consume 1 token AND trigger the internal refill
+    /// mechanism (tokens are only refilled during try_wait/wait calls).
+    /// directly adjust available tokens via set_available() to consume the remaining amount.
     pub(crate) fn consume(&self, n: u64) -> (u64, f64) {
         let guard = self.limiter.lock().unwrap();
         let mut consumed = 0u64;
@@ -108,7 +112,10 @@ impl Monitor {
     }
 
     pub fn delete_bucket(&self, bucket: &str) {
-        self.t_lock.write().unwrap().retain(|opts, _| opts.name != bucket);
+        self.t_lock
+            .write()
+            .expect("bandwidth monitor lock poisoned")
+            .retain(|opts, _| opts.name != bucket);
     }
 
     pub fn delete_bucket_throttle(&self, bucket: &str, arn: &str) {
@@ -116,11 +123,15 @@ impl Monitor {
             name: bucket.to_string(),
             replication_arn: arn.to_string(),
         };
-        self.t_lock.write().unwrap().remove(&opts);
+        self.t_lock.write().expect("bandwidth monitor lock poisoned").remove(&opts);
     }
 
     pub fn throttle(&self, opts: &BucketOptions) -> Option<BucketThrottle> {
-        self.t_lock.read().unwrap().get(opts).cloned()
+        self.t_lock
+            .read()
+            .expect("bandwidth monitor lock poisoned")
+            .get(opts)
+            .cloned()
     }
 
     pub fn set_bandwidth_limit(&self, bucket: &str, arn: &str, limit: i64) {
@@ -139,7 +150,10 @@ impl Monitor {
             replication_arn: arn.to_string(),
         };
         let throttle = BucketThrottle::new(limit_bytes);
-        self.t_lock.write().unwrap().insert(opts, throttle);
+        self.t_lock
+            .write()
+            .expect("bandwidth monitor lock poisoned")
+            .insert(opts, throttle);
     }
 
     pub fn is_throttled(&self, bucket: &str, arn: &str) -> bool {
@@ -147,7 +161,10 @@ impl Monitor {
             name: bucket.to_string(),
             replication_arn: arn.to_string(),
         };
-        self.t_lock.read().unwrap().contains_key(&opt)
+        self.t_lock
+            .read()
+            .expect("bandwidth monitor lock poisoned")
+            .contains_key(&opt)
     }
 }
 

@@ -1896,6 +1896,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         for (key, value) in put_opts.header().iter() {
             header_size += key.as_str().len();
             header_size += value.as_bytes().len();
+            // Account for HTTP header formatting: ": " (2 bytes) and "\r\n" (2 bytes)
+            header_size += 4;
         }
 
         if let Some(monitor) = get_global_bucket_monitor() {
@@ -2207,29 +2209,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             };
 
-            let mut header_size: usize = 0;
-            for (key, value) in put_opts.header().iter() {
-                header_size += key.as_str().len();
-                header_size += value.as_bytes().len();
-            }
-
-            if let Some(monitor) = get_global_bucket_monitor() {
-                gr.stream = Box::new(MonitoredReader::new(
-                    monitor,
-                    gr.stream,
-                    MonitorReaderOptions {
-                        bucket_options: BucketOptions {
-                            name: bucket.clone(),
-                            replication_arn: rinfo.arn.clone(),
-                        },
-                        header_size,
-                    },
-                ));
-            } else {
-                warn!(
-                    "Global bucket monitor uninitialized; proceeding with unthrottled replication (bandwidth limits will be ignored)"
-                );
-            }
+            gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
 
             if let Some(err) = if is_multipart {
                 replicate_object_with_multipart(
@@ -2316,6 +2296,38 @@ static STANDARD_HEADERS: &[&str] = &[
     headers::AMZ_TAG_COUNT,
     headers::AMZ_SERVER_SIDE_ENCRYPTION,
 ];
+
+fn wrap_with_bandwidth_monitor(
+    stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    put_opts: &PutObjectOptions,
+    bucket: &str,
+    arn: &str,
+) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
+    let mut header_size: usize = 0;
+    for (key, value) in put_opts.header().iter() {
+        header_size += key.as_str().len();
+        header_size += value.as_bytes().len();
+        // Account for HTTP header formatting: ": " (2 bytes) and "\r\n" (2 bytes)
+        header_size += 4;
+    }
+
+    if let Some(monitor) = get_global_bucket_monitor() {
+        Box::new(MonitoredReader::new(
+            monitor,
+            stream,
+            MonitorReaderOptions {
+                bucket_options: BucketOptions {
+                    name: bucket.to_string(),
+                    replication_arn: arn.to_string(),
+                },
+                header_size,
+            },
+        ))
+    } else {
+        warn!("Global bucket monitor uninitialized; proceeding with unthrottled replication (bandwidth limits will be ignored)");
+        stream
+    }
+}
 
 fn is_standard_header(k: &str) -> bool {
     STANDARD_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(k))
