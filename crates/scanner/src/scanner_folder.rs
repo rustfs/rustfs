@@ -491,6 +491,10 @@ impl FolderScanner {
 
         failed.retain(|_, ts| now.saturating_sub(*ts) < ttl);
 
+        if max_entries == 0 {
+            return;
+        }
+
         if failed.len() <= max_entries {
             return;
         }
@@ -1457,6 +1461,43 @@ mod tests {
 
         assert_eq!(scanner.new_cache.info.failed_objects.len(), 1);
         assert!(scanner.new_cache.info.failed_objects.contains_key("fresh"));
+
+        restore_test_ttl(prev_ttl);
+        restore_test_max(prev_max);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_prune_failed_objects_max_zero_keeps_fresh() {
+        let prev_ttl = set_test_ttl(60);
+        let prev_max = set_test_max(0);
+
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let now = FolderScanner::now_secs();
+
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("fresh1".to_string(), now.saturating_sub(5));
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("fresh2".to_string(), now.saturating_sub(10));
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("expired".to_string(), now.saturating_sub(120));
+
+        scanner.prune_failed_objects_cache();
+
+        assert_eq!(scanner.new_cache.info.failed_objects.len(), 2);
+        assert!(scanner.new_cache.info.failed_objects.contains_key("fresh1"));
+        assert!(scanner.new_cache.info.failed_objects.contains_key("fresh2"));
+        assert!(!scanner.new_cache.info.failed_objects.contains_key("expired"));
 
         restore_test_ttl(prev_ttl);
         restore_test_max(prev_max);
