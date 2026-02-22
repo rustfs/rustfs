@@ -223,7 +223,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
-                is_owner: req_info.is_owner,
+                // Run this early check in deny-only mode so ACL/IAM fallbacks can still grant access.
+                is_owner: true,
                 account: &cred.access_key,
                 groups: &cred.groups,
                 conditions: &conditions,
@@ -360,7 +361,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
-                is_owner: req_info.is_owner,
+                // Run this early check in deny-only mode so ACL checks are not bypassed.
+                is_owner: true,
                 account: "",
                 groups: &None,
                 conditions: &conditions,
