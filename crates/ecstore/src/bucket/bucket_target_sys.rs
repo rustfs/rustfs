@@ -676,8 +676,10 @@ impl BucketTargetSys {
             }
             bucket_monitor.set_bandwidth_limit(bucket, arn, limit);
         } else {
-            error!("Global bucket monitor uninitialized");
-            debug_assert!(false, "Global bucket monitor must be initialized before setting bandwidth limits");
+            error!(
+                "Global bucket monitor uninitialized; skipping bandwidth limit update for bucket '{}' and ARN '{}'",
+                bucket, arn
+            );
         }
     }
 

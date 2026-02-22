@@ -30,6 +30,7 @@ use std::{
 };
 use tokio::sync::{OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
 pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;
@@ -63,7 +64,12 @@ lazy_static! {
 }
 
 pub fn init_global_bucket_monitor(num_nodes: u64) {
-    let _ = GLOBAL_BUCKET_MONITOR.set(Monitor::new(num_nodes));
+    if GLOBAL_BUCKET_MONITOR.set(Monitor::new(num_nodes)).is_err() {
+        warn!(
+            "global bucket monitor already initialized, ignoring re-initialization with num_nodes={}",
+            num_nodes
+        );
+    }
 }
 
 pub fn get_global_bucket_monitor() -> Option<Arc<Monitor>> {
