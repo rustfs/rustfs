@@ -18,31 +18,28 @@ use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::concurrency::{ConcurrencyManager, get_concurrency_manager};
-use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
+use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
-use crate::storage::options::{filter_object_metadata, get_content_sha256};
+use crate::storage::options::get_content_sha256;
 use crate::storage::{
     access::{ReqInfo, authorize_request, has_bypass_governance_header},
-    ecfs_extend::RFC1123,
     options::{
-        copy_dst_opts, copy_src_opts, del_opts, extract_metadata, get_complete_multipart_upload_opts, get_opts,
-        parse_copy_source_range, put_opts,
+        copy_src_opts, del_opts, extract_metadata, get_complete_multipart_upload_opts, get_opts, parse_copy_source_range,
+        put_opts,
     },
 };
 use crate::storage::{
     create_managed_encryption_material, decrypt_managed_encryption_key, derive_part_nonce, get_buffer_size_opt_in,
     get_validated_store, has_replication_rules, is_managed_sse, parse_object_lock_legal_hold, parse_object_lock_retention,
-    process_lambda_configurations, process_queue_configurations, process_topic_configurations, strip_managed_encryption_metadata,
-    validate_bucket_object_lock_enabled, validate_object_key, wrap_response_with_cors,
+    process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+    validate_bucket_object_lock_enabled,
 };
-use crate::storage::{entity, parse_part_number_i32_to_usize};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use datafusion::arrow::{
     csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
 use futures::StreamExt;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, StatusCode};
 use metrics::{counter, histogram};
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::{
@@ -58,7 +55,7 @@ use rustfs_ecstore::{
         },
         metadata_sys,
         metadata_sys::get_replication_config,
-        object_lock::objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, check_retention_for_modification},
+        object_lock::objectlock_sys::{check_object_lock_for_deletion, check_retention_for_modification},
         policy_sys::PolicySys,
         quota::QuotaOperation,
         replication::{
@@ -73,14 +70,13 @@ use rustfs_ecstore::{
     client::object_api_utils::to_s3s_etag,
     compress::{MIN_COMPRESSIBLE_SIZE, is_compressible},
     disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
-    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
+    error::{StorageError, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
     set_disk::{MAX_PARTS_COUNT, is_valid_storage_class},
     store_api::{
         BucketOptions,
         CompletePart,
         DeleteBucketOptions,
-        HTTPRangeSpec,
         MakeBucketOptions,
         MultipartUploadResult,
         ObjectIO,
@@ -93,15 +89,15 @@ use rustfs_ecstore::{
     },
 };
 use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
+use rustfs_filemeta::RestoreStatusOps;
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
-use rustfs_filemeta::{RestoreStatusOps, parse_restore_obj_status};
 use rustfs_kms::DataKey;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
 };
-use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, EtagReader, HashReader, Reader, WarpReader};
+use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, HashReader, Reader, WarpReader};
 use rustfs_s3select_api::query::{Context, Query};
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::{
@@ -114,26 +110,19 @@ use rustfs_utils::{
     CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
     get_request_user_agent,
     http::{
-        AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE,
-        headers::{
-            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
-            AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-            AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT, RESERVED_METADATA_PREFIX,
-            RESERVED_METADATA_PREFIX_LOWER,
-        },
+        AMZ_CHECKSUM_TYPE, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
+        headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
     },
-    path::{is_dir_object, path_join_buf},
+    path::is_dir_object,
 };
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use serde::{Deserialize, Serialize};
-use std::ops::Add;
 use std::{
     collections::HashMap,
     fmt::Debug,
     path::Path,
-    str::FromStr,
     sync::{Arc, LazyLock},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -1334,358 +1323,8 @@ impl S3 for FS {
     /// Copy an object from one location to another
     #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedCopy, "s3:CopyObject");
-        let CopyObjectInput {
-            copy_source,
-            bucket,
-            key,
-            server_side_encryption: requested_sse,
-            ssekms_key_id: requested_kms_key_id,
-            sse_customer_algorithm,
-            sse_customer_key,
-            sse_customer_key_md5,
-            metadata_directive,
-            metadata,
-            copy_source_if_match,
-            copy_source_if_none_match,
-            content_type,
-            ..
-        } = req.input.clone();
-        let (src_bucket, src_key, version_id) = match copy_source {
-            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket {
-                ref bucket,
-                ref key,
-                version_id,
-            } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
-        };
-
-        // Validate both source and destination keys
-        validate_object_key(&src_key, "COPY (source)")?;
-        validate_object_key(&key, "COPY (dest)")?;
-
-        // AWS S3 allows self-copy when metadata directive is REPLACE (used to update metadata in-place).
-        // Reject only when the directive is not REPLACE.
-        if metadata_directive.as_ref().map(|d| d.as_str()) != Some(MetadataDirective::REPLACE)
-            && src_bucket == bucket
-            && src_key == key
-        {
-            error!("Rejected self-copy operation: bucket={}, key={}", bucket, key);
-            return Err(s3_error!(
-                InvalidRequest,
-                "Cannot copy an object to itself. Source and destination must be different."
-            ));
-        }
-
-        // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
-
-        let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
-
-        src_opts.version_id = version_id.clone();
-
-        let mut get_opts = ObjectOptions {
-            version_id: src_opts.version_id.clone(),
-            versioned: src_opts.versioned,
-            version_suspended: src_opts.version_suspended,
-            ..Default::default()
-        };
-
-        let dst_opts = copy_dst_opts(&bucket, &key, version_id, &req.headers, HashMap::new())
-            .await
-            .map_err(ApiError::from)?;
-
-        let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
-
-        if cp_src_dst_same {
-            get_opts.no_lock = true;
-        }
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-        let effective_sse = requested_sse.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| match sse.sse_algorithm.as_str() {
-                            "AES256" => Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-                            "aws:kms" => Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
-                            _ => None,
-                        })
-                })
-            })
-        });
-        let mut effective_kms_key_id = requested_kms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
-
-        let h = HeaderMap::new();
-
-        let gr = store
-            .get_object_reader(&src_bucket, &src_key, None, h, &get_opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        let mut src_info = gr.object_info.clone();
-
-        // Validate copy source conditions
-        if let Some(if_match) = copy_source_if_match {
-            if let Some(ref etag) = src_info.etag {
-                if let Some(strong_etag) = if_match.into_etag() {
-                    if ETag::Strong(etag.clone()) != strong_etag {
-                        return Err(s3_error!(PreconditionFailed));
-                    }
-                } else {
-                    // Weak ETag or Any (*) in If-Match should fail per RFC 9110
-                    return Err(s3_error!(PreconditionFailed));
-                }
-            } else {
-                return Err(s3_error!(PreconditionFailed));
-            }
-        }
-
-        if let Some(if_none_match) = copy_source_if_none_match
-            && let Some(ref etag) = src_info.etag
-            && let Some(strong_etag) = if_none_match.into_etag()
-            && ETag::Strong(etag.clone()) == strong_etag
-        {
-            return Err(s3_error!(PreconditionFailed));
-        }
-
-        if cp_src_dst_same {
-            src_info.metadata_only = true;
-        }
-
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(gr.stream));
-
-        if let Some((key_bytes, nonce, original_size_opt)) =
-            decrypt_managed_encryption_key(&src_bucket, &src_key, &src_info.user_defined).await?
-        {
-            reader = Box::new(DecryptReader::new(reader, key_bytes, nonce));
-            if let Some(original) = original_size_opt {
-                src_info.actual_size = original;
-            }
-        }
-
-        strip_managed_encryption_metadata(&mut src_info.user_defined);
-
-        let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
-
-        let mut length = actual_size;
-
-        let mut compress_metadata = HashMap::new();
-
-        if is_compressible(&req.headers, &key) && actual_size > MIN_COMPRESSIBLE_SIZE as i64 {
-            compress_metadata.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
-                CompressionAlgorithm::default().to_string(),
-            );
-            compress_metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), actual_size.to_string());
-
-            let hrd = EtagReader::new(reader, None);
-
-            // let hrd = HashReader::new(reader, length, actual_size, None, false).map_err(ApiError::from)?;
-
-            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-            length = HashReader::SIZE_PRESERVE_LAYER;
-        } else {
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"));
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX}compression"));
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"));
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX}actual-size"));
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"));
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX}compression-size"));
-        }
-
-        // Handle MetadataDirective REPLACE: replace user metadata while preserving system metadata.
-        // System metadata (compression, encryption) is added after this block to ensure
-        // it's not cleared by the REPLACE operation.
-        if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
-            src_info.user_defined.clear();
-            if let Some(metadata) = metadata {
-                src_info.user_defined.extend(metadata);
-            }
-            if let Some(ct) = content_type {
-                src_info.content_type = Some(ct.clone());
-                src_info.user_defined.insert("content-type".to_string(), ct);
-            }
-        }
-
-        let mut reader = HashReader::new(reader, length, actual_size, None, None, false).map_err(ApiError::from)?;
-
-        if let Some(ref sse_alg) = effective_sse
-            && is_managed_sse(sse_alg)
-        {
-            let material =
-                create_managed_encryption_material(&bucket, &key, sse_alg, effective_kms_key_id.clone(), actual_size).await?;
-
-            let ManagedEncryptionMaterial {
-                data_key,
-                headers,
-                kms_key_id: kms_key_used,
-            } = material;
-
-            let key_bytes = data_key.plaintext_key;
-            let nonce = data_key.nonce;
-
-            src_info.user_defined.extend(headers.into_iter());
-            effective_kms_key_id = Some(kms_key_used.clone());
-
-            let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
-        }
-
-        // Apply SSE-C encryption if customer-provided key is specified
-        if let (Some(sse_alg), Some(sse_key), Some(sse_md5)) = (&sse_customer_algorithm, &sse_customer_key, &sse_customer_key_md5)
-            && sse_alg.as_str() == "AES256"
-        {
-            let key_bytes = BASE64_STANDARD.decode(sse_key.as_str()).map_err(|e| {
-                error!("Failed to decode SSE-C key: {}", e);
-                ApiError::from(StorageError::other("Invalid SSE-C key"))
-            })?;
-
-            if key_bytes.len() != 32 {
-                return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
-            }
-
-            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
-            if computed_md5 != sse_md5.as_str() {
-                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
-            }
-
-            // Store original size before encryption
-            src_info
-                .user_defined
-                .insert("x-amz-server-side-encryption-customer-original-size".to_string(), actual_size.to_string());
-
-            // SAFETY: The length of `key_bytes` is checked to be 32 bytes above,
-            // so this conversion cannot fail.
-            let key_array: [u8; 32] = key_bytes.try_into().expect("key length already checked");
-            // Generate deterministic nonce from bucket-key
-            let nonce_source = format!("{bucket}-{key}");
-            let nonce_hash = md5::compute(nonce_source.as_bytes());
-            let nonce: [u8; 12] = nonce_hash.0[..12]
-                .try_into()
-                .expect("MD5 hash is always 16 bytes; taking first 12 bytes for nonce is safe");
-
-            let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
-        }
-
-        src_info.put_object_reader = Some(PutObjReader::new(reader));
-
-        // check quota
-
-        for (k, v) in compress_metadata {
-            src_info.user_defined.insert(k, v);
-        }
-
-        // Store SSE-C metadata for GET responses
-        if let Some(ref sse_alg) = sse_customer_algorithm {
-            src_info.user_defined.insert(
-                "x-amz-server-side-encryption-customer-algorithm".to_string(),
-                sse_alg.as_str().to_string(),
-            );
-        }
-        if let Some(ref sse_md5) = sse_customer_key_md5 {
-            src_info
-                .user_defined
-                .insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
-        }
-
-        // check quota for copy operation
-        if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
-
-            match quota_checker
-                .check_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
-                .await
-            {
-                Ok(check_result) => {
-                    if !check_result.allowed {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidRequest,
-                            format!(
-                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage.unwrap_or(0),
-                                check_result.quota_limit.unwrap_or(0)
-                            ),
-                        ));
-                    }
-                }
-                Err(e) => {
-                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
-                }
-            }
-        }
-
-        let oi = store
-            .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        // Update quota tracking after successful copy
-        if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
-            rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
-        }
-
-        // Invalidate cache for the destination object to prevent stale data
-        let manager = get_concurrency_manager();
-        let dest_bucket = bucket.clone();
-        let dest_key = key.clone();
-        let dest_version = oi.version_id.map(|v| v.to_string());
-        let dest_version_clone = dest_version.clone();
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&dest_bucket, &dest_key, dest_version_clone.as_deref())
-                .await;
-        });
-
-        // warn!("copy_object oi {:?}", &oi);
-        let object_info = oi.clone();
-        let copy_object_result = CopyObjectResult {
-            e_tag: oi.etag.map(|etag| to_s3s_etag(&etag)),
-            last_modified: oi.mod_time.map(Timestamp::from),
-            ..Default::default()
-        };
-
-        let output = CopyObjectOutput {
-            copy_object_result: Some(copy_object_result),
-            server_side_encryption: effective_sse,
-            ssekms_key_id: effective_kms_key_id,
-            sse_customer_algorithm,
-            sse_customer_key_md5,
-            version_id: dest_version,
-            ..Default::default()
-        };
-
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.object(object_info).version_id(version_id);
-
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
+        let usecase = DefaultObjectUsecase::from_global();
+        usecase.execute_copy_object(req).await
     }
 
     #[instrument(
@@ -2101,162 +1740,9 @@ impl S3 for FS {
 
     /// Delete an object
     #[instrument(level = "debug", skip(self, req))]
-    async fn delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, "s3:DeleteObject");
-        let DeleteObjectInput {
-            bucket, key, version_id, ..
-        } = req.input.clone();
-
-        // Validate object key
-        validate_object_key(&key, "DELETE")?;
-
-        let replica = req
-            .headers
-            .get(AMZ_BUCKET_REPLICATION_STATUS)
-            .map(|v| v.to_str().unwrap_or_default() == ReplicationStatusType::Replica.as_str())
-            .unwrap_or_default();
-
-        if replica {
-            authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
-        }
-
-        let metadata = extract_metadata(&req.headers);
-        // Clone version_id before it's moved
-        let version_id_clone = version_id.clone();
-
-        let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
-            .await
-            .map_err(ApiError::from)?;
-
-        let lock_cfg = BucketObjectLockSys::get(&bucket).await;
-        if lock_cfg.is_some() && opts.delete_prefix {
-            return Err(S3Error::with_message(
-                S3ErrorCode::Custom("force-delete is forbidden on Object Locking enabled buckets".into()),
-                "force-delete is forbidden on Object Locking enabled buckets",
-            ));
-        }
-
-        // let mut vid = opts.version_id.clone();
-
-        if replica {
-            opts.set_replica_status(ReplicationStatusType::Replica);
-
-            // if opts.version_purge_status().is_empty() {
-            //     vid = None;
-            // }
-        }
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        // Check Object Lock retention before deletion
-        // TODO: Future optimization (separate PR) - If performance becomes critical under high delete load:
-        // 1. Integrate OptimizedFileCache (file_cache.rs) into the read_version() path
-        // 2. Or add a lightweight get_object_lock_info() that only fetches retention metadata
-        // 3. Or use combined get-and-delete in storage layer with retention check callback
-        // Note: The project has OptimizedFileCache with moka, but get_object_info doesn't use it yet
-        let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-
-        match store.get_object_info(&bucket, &key, &get_opts).await {
-            Ok(obj_info) => {
-                // Check for bypass governance retention header (permission already verified in access.rs)
-                let bypass_governance = has_bypass_governance_header(&req.headers);
-
-                if let Some(block_reason) = check_object_lock_for_deletion(&bucket, &obj_info, bypass_governance).await {
-                    return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
-                }
-            }
-            Err(err) => {
-                // If object not found, allow deletion to proceed (will return 204 No Content)
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
-                }
-            }
-        }
-
-        let obj_info = {
-            match store.delete_object(&bucket, &key, opts).await {
-                Ok(obj) => obj,
-                Err(err) => {
-                    if is_err_bucket_not_found(&err) {
-                        return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
-                    }
-
-                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
-                        // TODO: send event
-
-                        return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
-                    }
-
-                    return Err(ApiError::from(err).into());
-                }
-            }
-        };
-
-        // Fast in-memory update for immediate quota consistency
-        rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, obj_info.size as u64).await;
-
-        // Invalidate cache for the deleted object
-        let manager = get_concurrency_manager();
-        let del_bucket = bucket.clone();
-        let del_key = key.clone();
-        let del_version = obj_info.version_id.map(|v| v.to_string());
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&del_bucket, &del_key, del_version.as_deref())
-                .await;
-        });
-
-        if obj_info.name.is_empty() {
-            return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
-        }
-
-        if obj_info.replication_status == ReplicationStatusType::Replica
-            || obj_info.version_purge_status == VersionPurgeStatusType::Pending
-        {
-            schedule_replication_delete(DeletedObjectReplicationInfo {
-                delete_object: rustfs_ecstore::store_api::DeletedObject {
-                    delete_marker: obj_info.delete_marker,
-                    delete_marker_version_id: if obj_info.delete_marker { obj_info.version_id } else { None },
-                    object_name: key.clone(),
-                    version_id: if obj_info.delete_marker { None } else { obj_info.version_id },
-                    delete_marker_mtime: obj_info.mod_time,
-                    replication_state: Some(obj_info.replication_state()),
-                    ..Default::default()
-                },
-                bucket: bucket.clone(),
-                event_type: REPLICATE_INCOMING_DELETE.to_string(),
-                ..Default::default()
-            })
-            .await;
-        }
-
-        let delete_marker = obj_info.delete_marker;
-        let version_id = obj_info.version_id;
-
-        let output = DeleteObjectOutput {
-            delete_marker: Some(delete_marker),
-            version_id: version_id.map(|v| v.to_string()),
-            ..Default::default()
-        };
-
-        let event_name = if delete_marker {
-            EventName::ObjectRemovedDeleteMarkerCreated
-        } else {
-            EventName::ObjectRemovedDelete
-        };
-
-        helper = helper.event_name(event_name);
-        helper = helper
-            .object(obj_info)
-            .version_id(version_id.map(|v| v.to_string()).unwrap_or_default());
-
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
+    async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let usecase = DefaultObjectUsecase::from_global();
+        usecase.execute_delete_object(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -3373,312 +2859,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, "s3:HeadObject");
-        // mc get 2
-        let HeadObjectInput {
-            bucket,
-            key,
-            version_id,
-            part_number,
-            range,
-            if_none_match,
-            if_match,
-            if_modified_since,
-            if_unmodified_since,
-            ..
-        } = req.input.clone();
-
-        // Validate object key
-        validate_object_key(&key, "HEAD")?;
-        // Parse part number from Option<i32> to Option<usize> with validation
-        let part_number: Option<usize> = parse_part_number_i32_to_usize(part_number, "HEAD")?;
-
-        let rs = range.map(|v| match v {
-            Range::Int { first, last } => HTTPRangeSpec {
-                is_suffix_length: false,
-                start: first as i64,
-                end: if let Some(last) = last { last as i64 } else { -1 },
-            },
-            Range::Suffix { length } => HTTPRangeSpec {
-                is_suffix_length: true,
-                start: length as i64,
-                end: -1,
-            },
-        });
-
-        if rs.is_some() && part_number.is_some() {
-            return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
-        }
-
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-        // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
-        let info = match store.get_object_info(&bucket, &key, &opts).await {
-            Ok(info) => info,
-            Err(err) => {
-                // If the error indicates the object or its version was not found, return 404 (NoSuchKey)
-                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
-                    if is_dir_object(&key) {
-                        let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
-                            Ok(has_children) => has_children,
-                            Err(e) => {
-                                error!("Failed to probe children for prefix (bucket: {}, key: {}): {}", bucket, key, e);
-                                false
-                            }
-                        };
-                        let msg = head_prefix_not_found_message(&bucket, &key, has_children);
-                        return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
-                    }
-                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
-                }
-                // Other errors, such as insufficient permissions, still return the original error
-                return Err(ApiError::from(err).into());
-            }
-        };
-        if info.delete_marker {
-            if opts.version_id.is_none() {
-                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
-            }
-            return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
-        }
-        if let Some(match_etag) = if_none_match
-            && let Some(strong_etag) = match_etag.into_etag()
-            && info
-                .etag
-                .as_ref()
-                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
-        {
-            return Err(S3Error::new(S3ErrorCode::NotModified));
-        }
-        if let Some(modified_since) = if_modified_since {
-            // obj_time < givenTime + 1s
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = modified_since.into();
-                mod_time < give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-        if let Some(match_etag) = if_match {
-            if let Some(strong_etag) = match_etag.into_etag()
-                && info
-                    .etag
-                    .as_ref()
-                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
-            {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        } else if let Some(unmodified_since) = if_unmodified_since
-            && info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = unmodified_since.into();
-                mod_time > give_time.add(time::Duration::seconds(1))
-            })
-        {
-            return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-        }
-        let event_info = info.clone();
-        let content_type = {
-            if let Some(content_type) = &info.content_type {
-                match ContentType::from_str(content_type) {
-                    Ok(res) => Some(res),
-                    Err(err) => {
-                        error!("parse content-type err {} {:?}", &content_type, err);
-                        //
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        };
-        let last_modified = info.mod_time.map(Timestamp::from);
-
-        // TODO: range download
-
-        let content_length = info.get_actual_size().map_err(|e| {
-            error!("get_actual_size error: {}", e);
-            ApiError::from(e)
-        })?;
-
-        let metadata_map = info.user_defined.clone();
-        let server_side_encryption = metadata_map
-            .get("x-amz-server-side-encryption")
-            .map(|v| ServerSideEncryption::from(v.clone()));
-        let sse_customer_algorithm = metadata_map
-            .get("x-amz-server-side-encryption-customer-algorithm")
-            .map(|v| SSECustomerAlgorithm::from(v.clone()));
-        let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
-        let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
-        // Prefer explicit storage_class from object info; fall back to persisted metadata header.
-        let storage_class = info
-            .storage_class
-            .clone()
-            .or_else(|| metadata_map.get("x-amz-storage-class").cloned())
-            .filter(|s| !s.is_empty())
-            .map(StorageClass::from);
-        let mut checksum_crc32 = None;
-        let mut checksum_crc32c = None;
-        let mut checksum_sha1 = None;
-        let mut checksum_sha256 = None;
-        let mut checksum_crc64nvme = None;
-        let mut checksum_type = None;
-
-        // checksum
-        if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
-            && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
-            && rs.is_none()
-        {
-            let (checksums, _is_multipart) = info
-                .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
-                .map_err(ApiError::from)?;
-
-            for (key, checksum) in checksums {
-                if key == AMZ_CHECKSUM_TYPE {
-                    checksum_type = Some(ChecksumType::from(checksum));
-                    continue;
-                }
-
-                match rustfs_rio::ChecksumType::from_string(key.as_str()) {
-                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
-                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
-                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
-                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
-                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
-                    _ => (),
-                }
-            }
-        }
-        // Extract standard HTTP headers from user_defined metadata
-        // Note: These headers are stored with lowercase keys by extract_metadata_from_mime
-        let cache_control = metadata_map.get("cache-control").cloned();
-        let content_disposition = metadata_map.get("content-disposition").cloned();
-        let content_language = metadata_map.get("content-language").cloned();
-        let expires = info.expires.map(Timestamp::from);
-
-        // Calculate tag count from user_tags already in ObjectInfo
-        // This avoids an additional API call since user_tags is already populated by get_object_info
-        let tag_count = if !info.user_tags.is_empty() {
-            let tag_set = decode_tags(&info.user_tags);
-            tag_set.len()
-        } else {
-            0
-        };
-        let output = HeadObjectOutput {
-            content_length: Some(content_length),
-            content_type,
-            content_encoding: info.content_encoding.clone(),
-            cache_control,
-            content_disposition,
-            content_language,
-            expires,
-            last_modified,
-            e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: filter_object_metadata(&metadata_map),
-            version_id: info.version_id.map(|v| v.to_string()),
-            server_side_encryption,
-            sse_customer_algorithm,
-            sse_customer_key_md5,
-            ssekms_key_id: sse_kms_key_id,
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
-            checksum_type,
-            storage_class,
-            // metadata: object_metadata,
-            ..Default::default()
-        };
-
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.object(event_info).version_id(version_id);
-
-        // NOTE ON CORS:
-        // Bucket-level CORS headers are intentionally applied only for object retrieval
-        // operations (GET/HEAD) via `wrap_response_with_cors`. Other S3 operations that
-        // interact with objects (PUT/POST/DELETE/LIST, etc.) rely on the system-level
-        // CORS layer instead. In case both are applicable, this bucket-level CORS logic
-        // takes precedence for these read operations.
-        let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
-
-        // Add x-amz-tagging-count header if object has tags
-        // Per S3 API spec, this header should be present in HEAD object response when tags exist
-        if tag_count > 0 {
-            let header_name = http::HeaderName::from_static(AMZ_TAG_COUNT);
-            if let Ok(header_value) = tag_count.to_string().parse::<HeaderValue>() {
-                response.headers.insert(header_name, header_value);
-            } else {
-                warn!("Failed to parse x-amz-tagging-count header value, skipping");
-            }
-        }
-        if let Some(retain_date) = metadata_map
-            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
-            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE))
-            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.as_bytes())
-            && let Ok(header_value) = HeaderValue::from_str(retain_date)
-        {
-            response.headers.insert(header_name, header_value);
-        }
-        if let Some(mode) = metadata_map
-            .get(AMZ_OBJECT_LOCK_MODE_LOWER)
-            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_MODE))
-            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_MODE_LOWER.as_bytes())
-            && let Ok(header_value) = HeaderValue::from_str(mode)
-        {
-            response.headers.insert(header_name, header_value);
-        }
-        if let Some(legal_hold) = metadata_map
-            .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
-            .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_LEGAL_HOLD))
-            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.as_bytes())
-            && let Ok(header_value) = HeaderValue::from_str(legal_hold)
-        {
-            response.headers.insert(header_name, header_value);
-        }
-
-        if let Some(amz_restore) = metadata_map.get(X_AMZ_RESTORE.as_str()) {
-            let Ok(restore_status) = parse_restore_obj_status(amz_restore) else {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "parse amz_restore failed."));
-            };
-            if let Ok(header_value) = HeaderValue::from_str(restore_status.to_string2().as_str()) {
-                response.headers.insert(X_AMZ_RESTORE, header_value);
-            }
-        }
-        if let Some(amz_restore_request_date) = metadata_map.get(AMZ_RESTORE_REQUEST_DATE)
-            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_RESTORE_REQUEST_DATE.as_bytes())
-        {
-            let Ok(amz_restore_request_date) = OffsetDateTime::parse(amz_restore_request_date, &Rfc3339) else {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("ErrMeta".into()),
-                    "parse amz_restore_request_date failed.",
-                ));
-            };
-            let Ok(amz_restore_request_date) = amz_restore_request_date.format(&RFC1123) else {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("ErrMeta".into()),
-                    "format amz_restore_request_date failed.",
-                ));
-            };
-            if let Ok(header_value) = HeaderValue::from_str(&amz_restore_request_date) {
-                response.headers.insert(header_name, header_value);
-            }
-        }
-        if let Some(amz_restore_expiry_days) = metadata_map.get(AMZ_RESTORE_EXPIRY_DAYS)
-            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_RESTORE_EXPIRY_DAYS.as_bytes())
-            && let Ok(header_value) = HeaderValue::from_str(amz_restore_expiry_days)
-        {
-            response.headers.insert(header_name, header_value);
-        }
-
-        let result = Ok(response);
-        let _ = helper.complete(&result);
-
-        result
+        let usecase = DefaultObjectUsecase::from_global();
+        usecase.execute_head_object(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
