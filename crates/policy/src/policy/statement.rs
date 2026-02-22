@@ -194,7 +194,7 @@ pub struct BPStatement {
     pub effect: Effect,
     #[serde(rename = "Principal")]
     pub principal: Principal,
-    #[serde(rename = "Action", default)]
+    #[serde(rename = "Action", default, skip_serializing_if = "ActionSet::is_empty")]
     pub actions: ActionSet,
     #[serde(rename = "NotAction", default, skip_serializing_if = "ActionSet::is_empty")]
     pub not_actions: ActionSet,
