@@ -13,12 +13,16 @@
 // limitations under the License.
 
 use s3s::dto::{DeleteObjectTaggingOutput, GetBucketTaggingOutput, GetObjectTaggingOutput, PutObjectTaggingOutput, Tag};
-use s3s::{S3Result, s3_error};
+use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::collections::HashSet;
+
+fn invalid_tag_error(message: &str) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InvalidTag, message.to_string())
+}
 
 pub(crate) fn validate_object_tag_set(tag_set: &[Tag]) -> S3Result<()> {
     if tag_set.len() > 10 {
-        return Err(s3_error!(InvalidTag, "Cannot have more than 10 tags per object"));
+        return Err(invalid_tag_error("Cannot have more than 10 tags per object"));
     }
 
     let mut tag_keys = HashSet::with_capacity(tag_set.len());
@@ -27,23 +31,23 @@ pub(crate) fn validate_object_tag_set(tag_set: &[Tag]) -> S3Result<()> {
             .key
             .as_deref()
             .filter(|key| !key.is_empty())
-            .ok_or_else(|| s3_error!(InvalidTag, "Tag key cannot be empty"))?;
+            .ok_or_else(|| invalid_tag_error("Tag key cannot be empty"))?;
 
         if key.len() > 128 {
-            return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
+            return Err(invalid_tag_error("Tag key is too long, maximum allowed length is 128 characters"));
         }
 
         let value = tag
             .value
             .as_deref()
-            .ok_or_else(|| s3_error!(InvalidTag, "Tag value cannot be null"))?;
+            .ok_or_else(|| invalid_tag_error("Tag value cannot be null"))?;
 
         if value.len() > 256 {
-            return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
+            return Err(invalid_tag_error("Tag value is too long, maximum allowed length is 256 characters"));
         }
 
         if !tag_keys.insert(key) {
-            return Err(s3_error!(InvalidTag, "Cannot provide multiple Tags with the same key"));
+            return Err(invalid_tag_error("Cannot provide multiple Tags with the same key"));
         }
     }
 

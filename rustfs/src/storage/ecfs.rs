@@ -3084,7 +3084,12 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
         let start_time = std::time::Instant::now();
-        let GetObjectTaggingInput { bucket, key: object, .. } = req.input;
+        let GetObjectTaggingInput {
+            bucket,
+            key: object,
+            version_id,
+            ..
+        } = req.input;
 
         info!("Starting get_object_tagging for bucket: {}, object: {}", bucket, object);
 
@@ -3094,9 +3099,8 @@ impl S3 for FS {
         };
 
         // Support versioned objects
-        let version_id = req.input.version_id.clone();
         let opts = ObjectOptions {
-            version_id: self.parse_version_id(version_id)?.map(Into::into),
+            version_id: self.parse_version_id(version_id.clone())?.map(Into::into),
             ..Default::default()
         };
 
@@ -3116,7 +3120,7 @@ impl S3 for FS {
         counter!("rustfs.get_object_tagging.success").increment(1);
         let duration = start_time.elapsed();
         histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
-        Ok(s3_response(build_get_object_tagging_output(tag_set, req.input.version_id.clone())))
+        Ok(s3_response(build_get_object_tagging_output(tag_set, version_id)))
     }
 
     #[instrument(level = "debug", skip(self, _req))]
@@ -4278,7 +4282,10 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
-        validate_object_tag_set(&tagging.tag_set)?;
+        if let Err(err) = validate_object_tag_set(&tagging.tag_set) {
+            error!("Invalid object tags for bucket: {}, object: {}: {}", bucket, object, err);
+            return Err(err);
+        }
 
         let Some(store) = new_object_layer_fn() else {
             return Err(not_initialized_error());
