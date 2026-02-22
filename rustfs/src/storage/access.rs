@@ -223,7 +223,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
-                is_owner: true,
+                is_owner: req_info.is_owner,
                 account: &cred.access_key,
                 groups: &cred.groups,
                 conditions: &conditions,
@@ -360,7 +360,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
-                is_owner: true,
+                is_owner: req_info.is_owner,
                 account: "",
                 groups: &None,
                 conditions: &conditions,

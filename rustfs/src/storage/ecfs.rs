@@ -2883,7 +2883,7 @@ impl S3 for FS {
         let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None, remote_addr);
 
-        let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
+        let read_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
             action: Action::S3Action(S3Action::ListBucketAction),
             is_owner: false,
@@ -2894,7 +2894,7 @@ impl S3 for FS {
         })
         .await;
 
-        let write_only = PolicySys::is_allowed(&BucketPolicyArgs {
+        let write_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
             action: Action::S3Action(S3Action::PutObjectAction),
             is_owner: false,
@@ -2905,7 +2905,7 @@ impl S3 for FS {
         })
         .await;
 
-        let mut is_public = read_only && write_only;
+        let mut is_public = read_allowed || write_allowed;
         let ignore_public_acls = match metadata_sys::get_public_access_block_config(&bucket).await {
             Ok((config, _)) => config.ignore_public_acls.unwrap_or(false),
             Err(_) => false,
@@ -2918,7 +2918,7 @@ impl S3 for FS {
                 stored_acl
                     .grants
                     .iter()
-                    .any(|grant| is_public_grant(grant) && !ignore_public_acls && grant.permission == Permission::READ)
+                    .any(|grant| is_public_grant(grant) && !ignore_public_acls)
             }
             Err(_) => false,
         };
@@ -3801,7 +3801,7 @@ impl S3 for FS {
             .get(INTERNAL_ACL_METADATA_KEY)
             .and_then(|acl| serde_json::from_str::<StoredAcl>(acl).ok())
             .map(|acl| acl.owner)
-            .unwrap_or_else(|| owner_from_access_key(bucket_owner.id.as_str()));
+            .unwrap_or_else(default_owner);
 
         let stored_acl = info
             .user_defined
@@ -5743,7 +5743,7 @@ impl S3 for FS {
             .get(INTERNAL_ACL_METADATA_KEY)
             .and_then(|acl| serde_json::from_str::<StoredAcl>(acl).ok())
             .map(|acl| acl.owner)
-            .unwrap_or_else(|| owner_from_access_key(bucket_owner.id.as_str()));
+            .unwrap_or_else(|| bucket_owner.clone());
 
         let mut stored_acl = access_control_policy
             .as_ref()

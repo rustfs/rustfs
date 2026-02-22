@@ -99,6 +99,8 @@ impl Statement {
                 }
 
                 resource.push_str(args.object);
+            } else {
+                resource.push('/');
             }
 
             if self.is_kms() && (resource == "/" || self.resources.is_empty()) {

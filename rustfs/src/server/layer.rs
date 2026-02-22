@@ -246,12 +246,7 @@ where
         }
 
         if method == Method::OPTIONS && ConditionalCorsLayer::is_s3_path(&path) {
-            return Box::pin(async move {
-                Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(ResBody::default())
-                    .unwrap())
-            });
+            return Box::pin(async move { Ok(Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap()) });
         }
 
         let mut inner = self.inner.clone();

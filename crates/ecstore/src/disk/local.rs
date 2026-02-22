@@ -1071,6 +1071,10 @@ impl LocalDisk {
             *item = "".to_owned();
 
             if entry.ends_with(STORAGE_FORMAT_FILE) {
+                if skip_current_dir_object {
+                    continue;
+                }
+
                 let metadata = self
                     .read_metadata(bucket, format!("{}/{}", &current, &entry).as_str())
                     .await?;
@@ -1078,10 +1082,6 @@ impl LocalDisk {
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
-
-                if skip_current_dir_object {
-                    continue;
-                }
 
                 // if opts.limit > 0
                 //     && let Ok(meta) = FileMeta::load(&metadata)
