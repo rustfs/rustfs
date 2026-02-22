@@ -15,4 +15,8 @@
 //! Application layer module entry.
 //! Concrete use-case modules will be introduced incrementally in Phase 3.
 
+pub mod admin_usecase;
+pub mod bucket_usecase;
 pub mod context;
+pub mod multipart_usecase;
+pub mod object_usecase;
