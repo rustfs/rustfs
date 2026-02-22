@@ -31,6 +31,10 @@ use crate::storage::s3_api::bucket::{
 use crate::storage::s3_api::multipart::{
     build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
 };
+use crate::storage::s3_api::object_lock::{
+    build_get_object_legal_hold_output, build_get_object_lock_configuration_output, build_get_object_retention_output,
+    build_put_object_legal_hold_output, build_put_object_retention_output,
+};
 use crate::storage::s3_api::response::{
     access_denied_error, map_abort_multipart_upload_error, not_initialized_error, s3_response,
 };
@@ -2978,22 +2982,12 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        let legal_hold = object_info
+        let legal_hold_status = object_info
             .user_defined
             .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
             .map(|v| v.as_str().to_string());
 
-        let status = if let Some(v) = legal_hold {
-            v
-        } else {
-            ObjectLockLegalHoldStatus::OFF.to_string()
-        };
-
-        let output = GetObjectLegalHoldOutput {
-            legal_hold: Some(ObjectLockLegalHold {
-                status: Some(ObjectLockLegalHoldStatus::from(status)),
-            }),
-        };
+        let output = build_get_object_legal_hold_output(legal_hold_status);
 
         let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
         helper = helper.object(object_info).version_id(version_id);
@@ -3029,9 +3023,7 @@ impl S3 for FS {
 
         // warn!("object_lock_configuration {:?}", &object_lock_configuration);
 
-        Ok(s3_response(GetObjectLockConfigurationOutput {
-            object_lock_configuration,
-        }))
+        Ok(s3_response(build_get_object_lock_configuration_output(object_lock_configuration)))
     }
 
     async fn get_object_retention(
@@ -3070,9 +3062,7 @@ impl S3 for FS {
             .and_then(|v| OffsetDateTime::parse(v.as_str(), &Rfc3339).ok())
             .map(Timestamp::from);
 
-        let output = GetObjectRetentionOutput {
-            retention: Some(ObjectLockRetention { mode, retain_until_date }),
-        };
+        let output = build_get_object_retention_output(mode, retain_until_date);
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(object_info).version_id(version_id);
 
@@ -4118,9 +4108,7 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        let output = PutObjectLegalHoldOutput {
-            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
-        };
+        let output = build_put_object_legal_hold_output();
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(info).version_id(version_id);
 
@@ -4259,9 +4247,7 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        let output = PutObjectRetentionOutput {
-            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
-        };
+        let output = build_put_object_retention_output();
 
         let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
         helper = helper.object(object_info).version_id(version_id);
