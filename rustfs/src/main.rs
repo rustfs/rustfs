@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod admin;
+mod app;
 mod auth;
 mod config;
 mod error;
