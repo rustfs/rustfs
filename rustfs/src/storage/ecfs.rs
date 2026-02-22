@@ -31,8 +31,16 @@ use crate::storage::s3_api::bucket::{
 use crate::storage::s3_api::multipart::{
     build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
 };
+use crate::storage::s3_api::object_lock::{
+    build_get_object_legal_hold_output, build_get_object_lock_configuration_output, build_get_object_retention_output,
+    build_put_object_legal_hold_output, build_put_object_retention_output,
+};
 use crate::storage::s3_api::response::{
     access_denied_error, map_abort_multipart_upload_error, not_initialized_error, s3_response,
+};
+use crate::storage::s3_api::tagging::{
+    build_delete_object_tagging_output, build_get_bucket_tagging_output, build_get_object_tagging_output,
+    build_put_object_tagging_output, validate_object_tag_set,
 };
 use crate::storage::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
@@ -78,8 +86,8 @@ use rustfs_ecstore::{
         policy_sys::PolicySys,
         quota::QuotaOperation,
         replication::{
-            DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate,
-            schedule_replication, schedule_replication_delete,
+            DeletedObjectReplicationInfo, ObjectOpts, ReplicationConfigurationExt, check_replicate_delete,
+            get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
         },
         tagging::{decode_tags, encode_tags},
         utils::serialize,
@@ -1437,6 +1445,8 @@ impl S3 for FS {
             // }
         }
 
+        let is_force_delete = opts.delete_prefix;
+
         let Some(store) = new_object_layer_fn() else {
             return Err(not_initialized_error());
         };
@@ -1500,6 +1510,30 @@ impl S3 for FS {
                 .invalidate_cache_versioned(&del_bucket, &del_key, del_version.as_deref())
                 .await;
         });
+
+        if is_force_delete
+            && !replica
+            && let Ok((rcfg, _)) = metadata_sys::get_replication_config(&bucket).await
+        {
+            let tgt_arns = rcfg.filter_target_arns(&ObjectOpts {
+                name: key.clone(),
+                ..Default::default()
+            });
+            for arn in tgt_arns {
+                schedule_replication_delete(DeletedObjectReplicationInfo {
+                    delete_object: rustfs_ecstore::store_api::DeletedObject {
+                        object_name: key.clone(),
+                        force_delete: true,
+                        ..Default::default()
+                    },
+                    bucket: bucket.clone(),
+                    target_arn: arn,
+                    event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                    ..Default::default()
+                })
+                .await;
+            }
+        }
 
         if obj_info.name.is_empty() {
             return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
@@ -1601,7 +1635,7 @@ impl S3 for FS {
         let version_id_resp = version_id.clone().unwrap_or_default();
         helper = helper.version_id(version_id_resp);
 
-        let result = Ok(s3_response(DeleteObjectTaggingOutput { version_id }));
+        let result = Ok(s3_response(build_delete_object_tagging_output(version_id)));
         let _ = helper.complete(&result);
         let duration = start_time.elapsed();
         histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "delete").record(duration.as_secs_f64());
@@ -2265,7 +2299,7 @@ impl S3 for FS {
             }
         };
 
-        Ok(s3_response(GetBucketTaggingOutput { tag_set }))
+        Ok(s3_response(build_get_bucket_tagging_output(tag_set)))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2948,22 +2982,12 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        let legal_hold = object_info
+        let legal_hold_status = object_info
             .user_defined
             .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
             .map(|v| v.as_str().to_string());
 
-        let status = if let Some(v) = legal_hold {
-            v
-        } else {
-            ObjectLockLegalHoldStatus::OFF.to_string()
-        };
-
-        let output = GetObjectLegalHoldOutput {
-            legal_hold: Some(ObjectLockLegalHold {
-                status: Some(ObjectLockLegalHoldStatus::from(status)),
-            }),
-        };
+        let output = build_get_object_legal_hold_output(legal_hold_status);
 
         let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
         helper = helper.object(object_info).version_id(version_id);
@@ -2999,9 +3023,7 @@ impl S3 for FS {
 
         // warn!("object_lock_configuration {:?}", &object_lock_configuration);
 
-        Ok(s3_response(GetObjectLockConfigurationOutput {
-            object_lock_configuration,
-        }))
+        Ok(s3_response(build_get_object_lock_configuration_output(object_lock_configuration)))
     }
 
     async fn get_object_retention(
@@ -3040,9 +3062,7 @@ impl S3 for FS {
             .and_then(|v| OffsetDateTime::parse(v.as_str(), &Rfc3339).ok())
             .map(Timestamp::from);
 
-        let output = GetObjectRetentionOutput {
-            retention: Some(ObjectLockRetention { mode, retain_until_date }),
-        };
+        let output = build_get_object_retention_output(mode, retain_until_date);
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(object_info).version_id(version_id);
 
@@ -3054,7 +3074,12 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
         let start_time = std::time::Instant::now();
-        let GetObjectTaggingInput { bucket, key: object, .. } = req.input;
+        let GetObjectTaggingInput {
+            bucket,
+            key: object,
+            version_id,
+            ..
+        } = req.input;
 
         info!("Starting get_object_tagging for bucket: {}, object: {}", bucket, object);
 
@@ -3064,9 +3089,8 @@ impl S3 for FS {
         };
 
         // Support versioned objects
-        let version_id = req.input.version_id.clone();
         let opts = ObjectOptions {
-            version_id: self.parse_version_id(version_id)?.map(Into::into),
+            version_id: self.parse_version_id(version_id.clone())?.map(Into::into),
             ..Default::default()
         };
 
@@ -3086,10 +3110,7 @@ impl S3 for FS {
         counter!("rustfs.get_object_tagging.success").increment(1);
         let duration = start_time.elapsed();
         histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
-        Ok(s3_response(GetObjectTaggingOutput {
-            tag_set,
-            version_id: req.input.version_id.clone(),
-        }))
+        Ok(s3_response(build_get_object_tagging_output(tag_set, version_id)))
     }
 
     #[instrument(level = "debug", skip(self, _req))]
@@ -4087,9 +4108,7 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        let output = PutObjectLegalHoldOutput {
-            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
-        };
+        let output = build_put_object_legal_hold_output();
         let version_id = req.input.version_id.clone().unwrap_or_default();
         helper = helper.object(info).version_id(version_id);
 
@@ -4228,9 +4247,7 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        let output = PutObjectRetentionOutput {
-            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
-        };
+        let output = build_put_object_retention_output();
 
         let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
         helper = helper.object(object_info).version_id(version_id);
@@ -4251,48 +4268,14 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
-        if tagging.tag_set.len() > 10 {
-            // TOTO: Note that Amazon S3 limits the maximum number of tags to 10 tags per object.
-            // Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html
-            // Reference: https://docs.aws.amazon.com/zh_cn/AmazonS3/latest/API/API_PutObjectTagging.html
-            // https://github.com/minio/mint/blob/master/run/core/aws-sdk-go-v2/main.go#L1647
-            error!("Tag set exceeds maximum of 10 tags: {}", tagging.tag_set.len());
-            return Err(s3_error!(InvalidTag, "Cannot have more than 10 tags per object"));
+        if let Err(err) = validate_object_tag_set(&tagging.tag_set) {
+            error!("Invalid object tags for bucket: {}, object: {}: {}", bucket, object, err);
+            return Err(err);
         }
 
         let Some(store) = new_object_layer_fn() else {
             return Err(not_initialized_error());
         };
-
-        let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
-        for tag in &tagging.tag_set {
-            let key = tag.key.as_ref().filter(|k| !k.is_empty()).ok_or_else(|| {
-                error!("Empty tag key");
-                s3_error!(InvalidTag, "Tag key cannot be empty")
-            })?;
-
-            if key.len() > 128 {
-                error!("Tag key too long: {} bytes", key.len());
-                return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
-            }
-
-            // allow to set the value of a tag to an empty string, but cannot set it to a null value.
-            // Reference：https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/UserGuide/Using_Tags.html#tag-restrictions
-            let value = tag.value.as_ref().ok_or_else(|| {
-                error!("Null tag value");
-                s3_error!(InvalidTag, "Tag value cannot be null")
-            })?;
-
-            if value.len() > 256 {
-                error!("Tag value too long: {} bytes", value.len());
-                return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
-            }
-
-            if !tag_keys.insert(key) {
-                error!("Duplicate tag key: {}", key);
-                return Err(s3_error!(InvalidTag, "Cannot provide multiple Tags with the same key"));
-            }
-        }
 
         let tags = encode_tags(tagging.tag_set);
         debug!("Encoded tags: {}", tags);
@@ -4328,9 +4311,7 @@ impl S3 for FS {
         let version_id_resp = req.input.version_id.clone().unwrap_or_default();
         helper = helper.version_id(version_id_resp);
 
-        let result = Ok(s3_response(PutObjectTaggingOutput {
-            version_id: req.input.version_id.clone(),
-        }));
+        let result = Ok(s3_response(build_put_object_tagging_output(req.input.version_id.clone())));
         let _ = helper.complete(&result);
         let duration = start_time.elapsed();
         histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
