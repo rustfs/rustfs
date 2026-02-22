@@ -110,7 +110,7 @@ impl Index {
                 io::ErrorKind::InvalidData,
                 format!(
                     "internal error: Earlier compressed received ({} > {})",
-                    latest.uncompressed_offset, uncompressed_offset
+                    latest.compressed_offset, compressed_offset
                 ),
             ));
         }

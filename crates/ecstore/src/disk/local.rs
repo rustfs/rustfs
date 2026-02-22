@@ -894,7 +894,13 @@ impl LocalDisk {
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         self.write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
-            .await
+            .await?;
+
+        // Invalidate file cache after successful write to ensure listing and other readers
+        // see the updated metadata immediately (e.g. delete markers created via delete_objects).
+        get_global_file_cache().invalidate(&file_path).await;
+
+        Ok(())
     }
     // write_all_internal do write file
     async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {
@@ -2163,6 +2169,12 @@ impl DiskAPI for LocalDisk {
             info!("rename all failed err: {:?}", err);
             return Err(err);
         }
+
+        // Invalidate cache entries for both source and destination xl.meta so that reads
+        // after rename_data (e.g. immediately after put_object) see the new version rather
+        // than stale cached data, and cannot obtain data via the old source path.
+        get_global_file_cache().invalidate(&src_file_path).await;
+        get_global_file_cache().invalidate(&dst_file_path).await;
 
         if let Some(src_file_path_parent) = src_file_path.parent() {
             if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
