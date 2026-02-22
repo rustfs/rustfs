@@ -19,6 +19,7 @@ use crate::app::context::{AppContext, get_global_app_context};
 use crate::error::ApiError;
 use crate::storage::*;
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
+use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::store_api::StorageAPI;
 use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -64,7 +65,7 @@ pub struct ListObjectsV2Request {
     pub start_after: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListObjectsV2Item {
     pub key: String,
     pub etag: Option<String>,
@@ -272,6 +273,37 @@ impl DefaultBucketUsecase {
 
         // let output = ListObjectsV2Output { ..Default::default() };
         Ok(S3Response::new(output))
+    }
+}
+
+#[async_trait::async_trait]
+impl BucketUsecase for DefaultBucketUsecase {
+    async fn create_bucket(&self, req: CreateBucketRequest) -> BucketUsecaseResult<CreateBucketResponse> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultBucketUsecase::create_bucket DTO path is not implemented yet",
+        )))
+    }
+
+    async fn delete_bucket(&self, req: DeleteBucketRequest) -> BucketUsecaseResult<DeleteBucketResponse> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultBucketUsecase::delete_bucket DTO path is not implemented yet",
+        )))
+    }
+
+    async fn head_bucket(&self, req: HeadBucketRequest) -> BucketUsecaseResult<HeadBucketResponse> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultBucketUsecase::head_bucket DTO path is not implemented yet",
+        )))
+    }
+
+    async fn list_objects_v2(&self, req: ListObjectsV2Request) -> BucketUsecaseResult<ListObjectsV2Response> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultBucketUsecase::list_objects_v2 DTO path is not implemented yet",
+        )))
     }
 }
 

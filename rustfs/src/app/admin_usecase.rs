@@ -32,6 +32,12 @@ pub struct QueryServerInfoResponse {
     pub info: InfoMessage,
 }
 
+impl std::fmt::Debug for QueryServerInfoResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryServerInfoResponse").finish_non_exhaustive()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait AdminUsecase: Send + Sync {
     async fn query_server_info(&self, req: QueryServerInfoRequest) -> AdminUsecaseResult<QueryServerInfoResponse>;
@@ -55,7 +61,6 @@ impl DefaultAdminUsecase {
 #[async_trait::async_trait]
 impl AdminUsecase for DefaultAdminUsecase {
     async fn query_server_info(&self, req: QueryServerInfoRequest) -> AdminUsecaseResult<QueryServerInfoResponse> {
-        let _ = self.context.object_store();
         let info = get_server_info(req.include_pools).await;
         Ok(QueryServerInfoResponse { info })
     }

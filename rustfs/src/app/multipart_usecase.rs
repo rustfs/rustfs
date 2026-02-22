@@ -17,6 +17,7 @@
 
 use crate::app::context::AppContext;
 use crate::error::ApiError;
+use rustfs_ecstore::error::StorageError;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ pub struct CreateMultipartUploadRequest {
     pub content_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateMultipartUploadResponse {
     pub upload_id: String,
 }
@@ -44,12 +45,12 @@ pub struct UploadPartRequest {
     pub content_length: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadPartResponse {
     pub etag: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompleteMultipartUploadPart {
     pub part_number: i32,
     pub etag: String,
@@ -111,5 +112,45 @@ impl DefaultMultipartUsecase {
 
     pub fn context(&self) -> Arc<AppContext> {
         self.context.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl MultipartUsecase for DefaultMultipartUsecase {
+    async fn create_multipart_upload(
+        &self,
+        req: CreateMultipartUploadRequest,
+    ) -> MultipartUsecaseResult<CreateMultipartUploadResponse> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultMultipartUsecase::create_multipart_upload is not implemented yet",
+        )))
+    }
+
+    async fn upload_part(&self, req: UploadPartRequest) -> MultipartUsecaseResult<UploadPartResponse> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultMultipartUsecase::upload_part is not implemented yet",
+        )))
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: CompleteMultipartUploadRequest,
+    ) -> MultipartUsecaseResult<CompleteMultipartUploadResponse> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultMultipartUsecase::complete_multipart_upload is not implemented yet",
+        )))
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        req: AbortMultipartUploadRequest,
+    ) -> MultipartUsecaseResult<AbortMultipartUploadResponse> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultMultipartUsecase::abort_multipart_upload is not implemented yet",
+        )))
     }
 }

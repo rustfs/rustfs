@@ -74,7 +74,7 @@ pub struct PutObjectRequest {
     pub version_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutObjectResponse {
     pub etag: String,
     pub version_id: Option<String>,
@@ -1290,6 +1290,30 @@ impl DefaultObjectUsecase {
         let result = Ok(response);
         let _ = helper.complete(&result);
         result
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectUsecase for DefaultObjectUsecase {
+    async fn put_object(&self, req: PutObjectRequest) -> ObjectUsecaseResult<PutObjectResponse> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultObjectUsecase::put_object DTO path is not implemented yet",
+        )))
+    }
+
+    async fn get_object(&self, req: GetObjectRequest) -> ObjectUsecaseResult<GetObjectResponse> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultObjectUsecase::get_object DTO path is not implemented yet",
+        )))
+    }
+
+    async fn delete_object(&self, req: DeleteObjectRequest) -> ObjectUsecaseResult<DeleteObjectResponse> {
+        let _ = req;
+        Err(ApiError::from(StorageError::other(
+            "DefaultObjectUsecase::delete_object DTO path is not implemented yet",
+        )))
     }
 }
 
