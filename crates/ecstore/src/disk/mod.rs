@@ -412,6 +412,18 @@ impl DiskAPI for Disk {
     }
 }
 
+impl Disk {
+    /// Enable health monitoring on this disk.
+    /// Called after startup format loading completes so that remote peers
+    /// have time to come online before being marked as faulty.
+    pub fn enable_health_check(&self) {
+        match self {
+            Disk::Local(local_disk) => local_disk.enable_health_check(),
+            Disk::Remote(remote_disk) => remote_disk.enable_health_check(),
+        }
+    }
+}
+
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
     if ep.is_local {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
