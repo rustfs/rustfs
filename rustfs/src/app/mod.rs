@@ -12,19 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod access;
-pub mod concurrency;
-pub mod ecfs;
-pub(crate) mod entity;
-pub(crate) mod helper;
-pub mod options;
-pub mod tonic_service;
+//! Application layer module entry.
+//! Concrete use-case modules will be introduced incrementally in Phase 3.
 
-#[cfg(test)]
-mod concurrent_get_object_test;
-mod ecfs_extend;
-#[cfg(test)]
-mod ecfs_test;
-pub(crate) mod head_prefix;
-
-pub(crate) use ecfs_extend::*;
+pub mod admin_usecase;
+pub mod bucket_usecase;
+pub mod context;
+pub mod multipart_usecase;
+pub mod object_usecase;
