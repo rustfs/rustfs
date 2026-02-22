@@ -339,9 +339,7 @@ impl LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn check_format_json(&self) -> Result<Metadata> {
-        let md = tokio::fs::metadata(&self.format_path)
-            .await
-            .map_err(to_unformatted_disk_error)?;
+        let md = std::fs::metadata(&self.format_path).map_err(to_unformatted_disk_error)?;
         Ok(md)
     }
     async fn make_meta_volumes(&self) -> Result<()> {
@@ -894,13 +892,7 @@ impl LocalDisk {
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         self.write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
-            .await?;
-
-        // Invalidate file cache after successful write to ensure listing and other readers
-        // see the updated metadata immediately (e.g. delete markers created via delete_objects).
-        get_global_file_cache().invalidate(&file_path).await;
-
-        Ok(())
+            .await
     }
     // write_all_internal do write file
     async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {
@@ -982,7 +974,7 @@ impl LocalDisk {
         opts: &WalkDirOptions,
         out: &mut MetacacheWriter<W>,
         objs_returned: &mut i32,
-        emit_current_object: bool,
+        skip_current_dir_object: bool,
     ) -> Result<()>
     where
         W: AsyncWrite + Unpin + Send,
@@ -1043,7 +1035,6 @@ impl LocalDisk {
         let bucket = opts.bucket.as_str();
 
         let mut dir_objes = HashSet::new();
-        let mut object_data_dirs = HashSet::new();
 
         // First-level filtering
         for item in entries.iter_mut() {
@@ -1080,6 +1071,10 @@ impl LocalDisk {
             *item = "".to_owned();
 
             if entry.ends_with(STORAGE_FORMAT_FILE) {
+                if skip_current_dir_object {
+                    continue;
+                }
+
                 let metadata = self
                     .read_metadata(bucket, format!("{}/{}", &current, &entry).as_str())
                     .await?;
@@ -1088,39 +1083,19 @@ impl LocalDisk {
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
 
-                if emit_current_object {
-                    // if opts.limit > 0
-                    //     && let Ok(meta) = FileMeta::load(&metadata)
-                    //     && !meta.all_hidden(true)
-                    // {
-                    *objs_returned += 1;
-                    // }
+                // if opts.limit > 0
+                //     && let Ok(meta) = FileMeta::load(&metadata)
+                //     && !meta.all_hidden(true)
+                // {
+                *objs_returned += 1;
+                // }
 
-                    out.write_obj(&MetaCacheEntry {
-                        name: name.clone(),
-                        metadata: metadata.to_vec(),
-                        ..Default::default()
-                    })
-                    .await?;
-                }
-
-                // Keep scanning this directory so nested children like
-                // "foo/bar/xyzzy" are still discoverable when "foo/bar" exists.
-                if opts.recursive
-                    && let Ok(fi) = get_file_info(
-                        &metadata,
-                        bucket,
-                        &name,
-                        "",
-                        FileInfoOpts {
-                            data: false,
-                            include_free_versions: false,
-                        },
-                    )
-                    && let Some(data_dir) = fi.data_dir
-                {
-                    object_data_dirs.insert(data_dir.to_string());
-                }
+                out.write_obj(&MetaCacheEntry {
+                    name: name.clone(),
+                    metadata: metadata.to_vec(),
+                    ..Default::default()
+                })
+                .await?;
 
                 continue;
             }
@@ -1137,7 +1112,7 @@ impl LocalDisk {
             }
         }
 
-        let mut dir_stack: Vec<String> = Vec::with_capacity(5);
+        let mut dir_stack: Vec<(String, bool)> = Vec::with_capacity(5);
         prefix = "".to_owned();
 
         for entry in entries.iter() {
@@ -1149,15 +1124,9 @@ impl LocalDisk {
                 continue;
             }
 
-            // Skip object data directories. They are internal storage layout, not user objects.
-            if opts.recursive && object_data_dirs.contains(entry) {
-                continue;
-            }
-
             let name = path_join_buf(&[current.as_str(), entry.as_str()]);
-            let object_dir_name = name.clone();
 
-            while let Some(pop) = dir_stack.last().cloned()
+            while let Some((pop, skip_object)) = dir_stack.last().cloned()
                 && pop < name
             {
                 out.write_obj(&MetaCacheEntry {
@@ -1167,7 +1136,7 @@ impl LocalDisk {
                 .await?;
 
                 if opts.recursive
-                    && let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, true)).await
+                    && let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object)).await
                 {
                     error!("scan_dir err {:?}", er);
                 }
@@ -1207,20 +1176,12 @@ impl LocalDisk {
                     *objs_returned += 1;
                     // }
 
-                    // This object directory can also contain nested children objects.
-                    // Recurse, but do not emit the current object again.
-                    if opts.recursive
-                        && let Err(er) = Box::pin(self.scan_dir(
-                            format!("{object_dir_name}{SLASH_SEPARATOR}"),
-                            prefix.clone(),
-                            opts,
-                            out,
-                            objs_returned,
-                            false,
-                        ))
-                        .await
-                    {
-                        warn!("scan_dir err {:?}", &er);
+                    if opts.recursive {
+                        let mut dir_name = meta.name.clone();
+                        if !dir_name.ends_with(SLASH_SEPARATOR) {
+                            dir_name.push_str(SLASH_SEPARATOR);
+                        }
+                        dir_stack.push((dir_name, true));
                     }
                 }
                 Err(err) => {
@@ -1229,7 +1190,7 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            dir_stack.push(meta.name);
+                            dir_stack.push((meta.name, false));
                         }
                     }
 
@@ -1238,7 +1199,7 @@ impl LocalDisk {
             };
         }
 
-        while let Some(dir) = dir_stack.pop() {
+        while let Some((dir, skip_object)) = dir_stack.pop() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
             }
@@ -1250,7 +1211,7 @@ impl LocalDisk {
             .await?;
 
             if opts.recursive
-                && let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, true)).await
+                && let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object)).await
             {
                 warn!("scan_dir err {:?}", &er);
             }
@@ -1417,43 +1378,36 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
-        let (id, last_check, file_info) = {
+        let format_info = {
             let format_info = self.format_info.read().await;
-            (format_info.id, format_info.last_check, format_info.file_info.clone())
+            format_info.clone()
         };
 
-        // Check if we can use cached value without doing any I/O
-        // If we checked recently (within 1 second) and have valid cache, return immediately
-        if let (Some(id), Some(last_check)) = (id, last_check)
-            && last_check.unix_timestamp() + 1 >= OffsetDateTime::now_utc().unix_timestamp()
-        {
-            return Ok(Some(id));
+        let id = format_info.id;
+
+        // if format_info.last_check_valid() {
+        //     return Ok(id);
+        // }
+
+        if format_info.file_info.is_some() && id.is_some() {
+            // check last check time
+            if let Some(last_check) = format_info.last_check
+                && last_check.unix_timestamp() + 1 < OffsetDateTime::now_utc().unix_timestamp()
+            {
+                return Ok(id);
+            }
         }
 
-        // Get current file metadata (async I/O)
-        let file_meta = match self.check_format_json().await {
-            Ok(meta) => meta,
-            Err(e) => {
-                // file does not exist or cannot be accessed, clear cached format info
-                if matches!(e, DiskError::UnformattedDisk | DiskError::DiskNotFound) {
-                    let mut format_info = self.format_info.write().await;
-                    format_info.id = None;
-                    format_info.file_info = None;
-                    format_info.data = Bytes::new();
-                    format_info.last_check = None;
-                }
-                return Err(e);
-            }
-        };
+        let file_meta = self.check_format_json().await?;
 
-        // Validate cache against current file metadata
-        if let (Some(cached_file_info), Some(id)) = (&file_info, id)
-            && super::fs::same_file(&file_meta, cached_file_info)
+        if let Some(file_info) = &format_info.file_info
+            && super::fs::same_file(&file_meta, file_info)
         {
-            // Cache is still valid, update last_check and return
             let mut format_info = self.format_info.write().await;
             format_info.last_check = Some(OffsetDateTime::now_utc());
-            return Ok(Some(id));
+            drop(format_info);
+
+            return Ok(id);
         }
 
         debug!("get_disk_id: read format.json");
@@ -1462,7 +1416,7 @@ impl DiskAPI for LocalDisk {
 
         let fm = FormatV3::try_from(b.as_slice()).map_err(|e| {
             warn!("decode format.json  err {:?}", e);
-            DiskError::UnformattedDisk
+            DiskError::CorruptedBackend
         })?;
 
         let (m, n) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
@@ -2008,7 +1962,7 @@ impl DiskAPI for LocalDisk {
             &opts,
             &mut out,
             &mut objs_returned,
-            true,
+            false,
         )
         .await?;
 
@@ -2169,12 +2123,6 @@ impl DiskAPI for LocalDisk {
             info!("rename all failed err: {:?}", err);
             return Err(err);
         }
-
-        // Invalidate cache entries for both source and destination xl.meta so that reads
-        // after rename_data (e.g. immediately after put_object) see the new version rather
-        // than stale cached data, and cannot obtain data via the old source path.
-        get_global_file_cache().invalidate(&src_file_path).await;
-        get_global_file_cache().invalidate(&dst_file_path).await;
 
         if let Some(src_file_path_parent) = src_file_path.parent() {
             if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
@@ -2487,12 +2435,11 @@ impl DiskAPI for LocalDisk {
                     return self.write_metadata("", volume, path, fi).await;
                 }
 
-                let ret_err = if fi.version_id.is_some() {
-                    DiskError::FileVersionNotFound
+                return if fi.version_id.is_some() {
+                    Err(DiskError::FileVersionNotFound)
                 } else {
-                    DiskError::FileNotFound
+                    Err(DiskError::FileNotFound)
                 };
-                return Err(ret_err);
             }
         };
 
@@ -2692,7 +2639,6 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
 #[cfg(test)]
 mod test {
     use super::*;
-    use rustfs_filemeta::MetacacheReader;
 
     #[tokio::test]
     async fn test_skip_access_checks() {
@@ -2710,6 +2656,56 @@ mod test {
         for p in paths.iter() {
             assert!(skip_access_checks(p.to_str().unwrap()));
         }
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_includes_nested_object_dirs() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join("foo/bar/xyzzy")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("quux/thud")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("asdf")).await.unwrap();
+
+        fs::write(bucket_dir.join("foo/bar/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("foo/bar/xyzzy/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("quux/thud/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("asdf/xl.meta"), b"meta").await.unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.unwrap();
+        let names: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name)
+            .collect();
+
+        assert!(names.contains(&"asdf".to_string()));
+        assert!(names.contains(&"foo/bar".to_string()));
+        assert!(names.contains(&"foo/bar/xyzzy".to_string()));
+        assert!(names.contains(&"quux/thud".to_string()));
     }
 
     #[tokio::test]
@@ -2990,134 +2986,6 @@ mod test {
 
         // Clean up
         let _ = fs::remove_file(test_file).await;
-    }
-
-    #[tokio::test]
-    async fn test_scan_dir_lists_nested_child_when_parent_has_xlmeta() {
-        let test_dir = format!("./test_scan_dir_nested_{}", uuid::Uuid::new_v4());
-        fs::create_dir_all(&test_dir).await.unwrap();
-
-        let endpoint = Endpoint::try_from(test_dir.as_str()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
-
-        let bucket = "test-volume";
-        disk.make_volume(bucket).await.unwrap();
-
-        // Parent object metadata: foo/bar
-        let parent_meta = disk.get_object_path(bucket, "foo/bar/xl.meta").unwrap();
-        if let Some(parent) = parent_meta.parent() {
-            fs::create_dir_all(parent).await.unwrap();
-        }
-        fs::write(&parent_meta, b"parent-object").await.unwrap();
-
-        // Child object metadata: foo/bar/xyzzy
-        let child_meta = disk.get_object_path(bucket, "foo/bar/xyzzy/xl.meta").unwrap();
-        if let Some(parent) = child_meta.parent() {
-            fs::create_dir_all(parent).await.unwrap();
-        }
-        fs::write(&child_meta, b"child-object").await.unwrap();
-
-        let (rd, mut wr) = tokio::io::duplex(16 * 1024);
-        let mut out = MetacacheWriter::new(&mut wr);
-        let mut objs_returned = 0;
-        let opts = WalkDirOptions {
-            bucket: bucket.to_string(),
-            base_dir: "foo/bar".to_string(),
-            recursive: true,
-            ..Default::default()
-        };
-
-        disk.scan_dir("foo/bar".to_string(), String::new(), &opts, &mut out, &mut objs_returned, true)
-            .await
-            .unwrap();
-        out.close().await.unwrap();
-
-        let mut reader = MetacacheReader::new(rd);
-        let entries = reader.read_all().await.unwrap();
-
-        let object_names = entries
-            .iter()
-            .filter(|entry| !entry.metadata.is_empty())
-            .map(|entry| entry.name.clone())
-            .collect::<Vec<_>>();
-
-        assert!(
-            object_names.iter().any(|name| name == "foo/bar" || name == "foo/bar/"),
-            "expected parent object in scan result, got: {:?}",
-            object_names
-        );
-        assert!(
-            object_names
-                .iter()
-                .any(|name| name == "foo/bar/xyzzy" || name == "foo/bar/xyzzy/"),
-            "expected nested child object in scan result, got: {:?}",
-            object_names
-        );
-
-        let _ = fs::remove_dir_all(&test_dir).await;
-    }
-
-    #[tokio::test]
-    async fn test_scan_dir_lists_parent_and_child_from_bucket_root() {
-        let test_dir = format!("./test_scan_dir_root_nested_{}", uuid::Uuid::new_v4());
-        fs::create_dir_all(&test_dir).await.unwrap();
-
-        let endpoint = Endpoint::try_from(test_dir.as_str()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
-
-        let bucket = "test-volume";
-        disk.make_volume(bucket).await.unwrap();
-
-        // Parent object metadata: foo/bar
-        let parent_meta = disk.get_object_path(bucket, "foo/bar/xl.meta").unwrap();
-        if let Some(parent) = parent_meta.parent() {
-            fs::create_dir_all(parent).await.unwrap();
-        }
-        fs::write(&parent_meta, b"parent-object").await.unwrap();
-
-        // Child object metadata: foo/bar/xyzzy
-        let child_meta = disk.get_object_path(bucket, "foo/bar/xyzzy/xl.meta").unwrap();
-        if let Some(parent) = child_meta.parent() {
-            fs::create_dir_all(parent).await.unwrap();
-        }
-        fs::write(&child_meta, b"child-object").await.unwrap();
-
-        let (rd, mut wr) = tokio::io::duplex(16 * 1024);
-        let mut out = MetacacheWriter::new(&mut wr);
-        let mut objs_returned = 0;
-        let opts = WalkDirOptions {
-            bucket: bucket.to_string(),
-            base_dir: String::new(),
-            recursive: true,
-            ..Default::default()
-        };
-
-        disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objs_returned, true)
-            .await
-            .unwrap();
-        out.close().await.unwrap();
-
-        let mut reader = MetacacheReader::new(rd);
-        let entries = reader.read_all().await.unwrap();
-
-        let object_names = entries
-            .iter()
-            .filter(|entry| !entry.metadata.is_empty())
-            .map(|entry| entry.name.trim_start_matches('/').trim_end_matches('/').to_string())
-            .collect::<Vec<_>>();
-
-        assert!(
-            object_names.iter().any(|name| name == "foo/bar"),
-            "expected parent object in root scan result, got: {:?}",
-            object_names
-        );
-        assert!(
-            object_names.iter().any(|name| name == "foo/bar/xyzzy"),
-            "expected child object in root scan result, got: {:?}",
-            object_names
-        );
-
-        let _ = fs::remove_dir_all(&test_dir).await;
     }
 
     #[test]
