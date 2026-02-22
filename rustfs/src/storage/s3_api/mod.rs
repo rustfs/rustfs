@@ -32,4 +32,5 @@ pub(crate) mod replication {}
 pub(crate) mod response;
 pub(crate) mod restore {}
 pub(crate) mod select {}
+pub(crate) mod tagging;
 pub(crate) mod validation {}
