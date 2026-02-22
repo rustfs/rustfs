@@ -14,7 +14,7 @@
 
 use crate::storage::metadata::mx::StorageManager;
 use crate::storage::metadata::reader::new_chunked_reader;
-use crate::storage::metadata::types::{IndexMetadata, ObjectMetadata};
+use crate::storage::metadata::types::{ChunkInfo, IndexMetadata, ObjectMetadata};
 use crate::storage::metadata::writer::ChunkedWriter;
 use bytes::Bytes;
 use ferntree::Tree as IndexTree;
@@ -95,13 +95,8 @@ impl LocalMetadataEngine {
             let chunk_size = 5 * 1024 * 1024; // 5MB chunks
             let mut writer = ChunkedWriter::new(self.storage_manager.clone(), chunk_size);
 
-            tokio::io::copy(&mut reader, &mut writer)
-                .await
-                .map_err(|e: std::io::Error| Error::other(e.to_string()))?;
-            writer
-                .shutdown()
-                .await
-                .map_err(|e: std::io::Error| Error::other(e.to_string()))?;
+            tokio::io::copy(&mut reader, &mut writer).await.map_err(|e| Error::other(e.to_string()))?;
+            writer.shutdown().await.map_err(|e| Error::other(e.to_string()))?;
 
             content_hash = writer.content_hash();
             let chunk_infos = writer.chunks();
@@ -130,8 +125,7 @@ impl LocalMetadataEngine {
         let meta_key = format!("buckets/{}/objects/{}/meta", bucket, key);
         let meta_bytes = serde_json::to_vec(&meta).map_err(|e| Error::other(e.to_string()))?;
 
-        tx.set(meta_key.as_bytes(), &meta_bytes)
-            .map_err(|e| Error::other(e.to_string()))?;
+        tx.set(meta_key.as_bytes(), &meta_bytes).map_err(|e| Error::other(e.to_string()))?;
 
         // Update Index
         let index_key = format!("{}/{}", bucket, key);
@@ -155,37 +149,42 @@ impl LocalMetadataEngine {
         })
     }
 
-    pub async fn get_object_reader(&self, bucket: &str, key: &str, _opts: &ObjectOptions) -> Result<GetObjectReader> {
+    pub async fn get_object_reader(
+        &self,
+        bucket: &str,
+        key: &str,
+        _opts: &ObjectOptions,
+    ) -> Result<GetObjectReader> {
         // 1. KV Lookup
         let meta_key = format!("buckets/{}/objects/{}/meta", bucket, key);
         let tx = self.kv_store.begin().map_err(|e| Error::other(e.to_string()))?;
 
         if let Some(val) = tx.get(meta_key.as_bytes()).map_err(|e| Error::other(e.to_string()))? {
-            let meta: ObjectMetadata = serde_json::from_slice(&val).map_err(|e| Error::other(e.to_string()))?;
+             let meta: ObjectMetadata = serde_json::from_slice(&val).map_err(|e| Error::other(e.to_string()))?;
 
-            let reader: Box<dyn AsyncRead + Send + Sync + Unpin> = if meta.is_inline {
-                let data = meta.inline_data.unwrap_or_default();
-                Box::new(WarpReader::new(Cursor::new(data)))
-            } else if let Some(chunks) = meta.chunks {
-                Box::new(new_chunked_reader(self.storage_manager.clone(), chunks))
-            } else {
-                // Fallback for legacy non-chunked data (if any)
-                let data = self.storage_manager.read_data(&meta.content_hash).await?;
-                Box::new(WarpReader::new(Cursor::new(data)))
-            };
+             let reader: Box<dyn AsyncRead + Send + Sync + Unpin> = if meta.is_inline {
+                 let data = meta.inline_data.unwrap_or_default();
+                 Box::new(WarpReader::new(Cursor::new(data)))
+             } else if let Some(chunks) = meta.chunks {
+                 Box::new(new_chunked_reader(self.storage_manager.clone(), chunks))
+             } else {
+                 // Fallback for legacy non-chunked data (if any)
+                 let data = self.storage_manager.read_data(&meta.content_hash).await?;
+                 Box::new(WarpReader::new(Cursor::new(data)))
+             };
 
-            let info = ObjectInfo {
+             let info = ObjectInfo {
                 bucket: meta.bucket,
                 name: meta.key,
                 size: meta.size as i64,
                 etag: Some(meta.content_hash),
                 ..Default::default()
-            };
+             };
 
-            return Ok(GetObjectReader {
-                stream: reader,
-                object_info: info,
-            });
+             return Ok(GetObjectReader {
+                 stream: reader,
+                 object_info: info,
+             });
         }
 
         // 2. Miss (Fallback & Migrate)
@@ -194,10 +193,7 @@ impl LocalMetadataEngine {
             Ok(_raw_fi) => {
                 // Found in legacy!
                 // Get full info
-                let fi = self
-                    .legacy_fs
-                    .read_version(bucket, bucket, key, "", &ReadOptions::default())
-                    .await?;
+                let fi = self.legacy_fs.read_version(bucket, bucket, key, "", &ReadOptions::default()).await?;
 
                 // Convert FileInfo to ObjectInfo
                 let object_info = ObjectInfo::from_file_info(&fi, bucket, key, false);
@@ -223,25 +219,32 @@ impl LocalMetadataEngine {
                     object_info,
                 })
             }
-            Err(_) => Err(Error::other("Object not found in new engine or legacy")),
+            Err(_) => {
+                 Err(Error::other("Object not found in new engine or legacy"))
+            }
         }
     }
 
-    pub async fn get_object(&self, bucket: &str, key: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
+    pub async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        _opts: ObjectOptions,
+    ) -> Result<ObjectInfo> {
         // 1. KV Lookup
         let meta_key = format!("buckets/{}/objects/{}/meta", bucket, key);
         let tx = self.kv_store.begin().map_err(|e| Error::other(e.to_string()))?;
 
         if let Some(val) = tx.get(meta_key.as_bytes()).map_err(|e| Error::other(e.to_string()))? {
-            let meta: ObjectMetadata = serde_json::from_slice(&val).map_err(|e| Error::other(e.to_string()))?;
+             let meta: ObjectMetadata = serde_json::from_slice(&val).map_err(|e| Error::other(e.to_string()))?;
 
-            return Ok(ObjectInfo {
+             return Ok(ObjectInfo {
                 bucket: meta.bucket,
                 name: meta.key,
                 size: meta.size as i64,
                 etag: Some(meta.content_hash),
                 ..Default::default()
-            });
+             });
         }
 
         Err(Error::other("Object not found in new engine"))
@@ -363,9 +366,7 @@ impl LocalMetadataEngine {
                     bucket: bucket.to_string(),
                     name: object_key.to_string(),
                     size: meta.size as i64,
-                    mod_time: Some(
-                        time::OffsetDateTime::from_unix_timestamp(meta.mod_time).unwrap_or(time::OffsetDateTime::now_utc()),
-                    ),
+                    mod_time: Some(time::OffsetDateTime::from_unix_timestamp(meta.mod_time).unwrap_or(time::OffsetDateTime::now_utc())),
                     etag: Some(meta.etag),
                     is_dir: false,
                     ..Default::default()
@@ -429,8 +430,7 @@ impl LocalMetadataEngine {
         // Commit to KV
         let meta_key = format!("buckets/{}/objects/{}/meta", bucket, key);
         let meta_bytes = serde_json::to_vec(&meta).map_err(|e| Error::other(e.to_string()))?;
-        tx.set(meta_key.as_bytes(), &meta_bytes)
-            .map_err(|e| Error::other(e.to_string()))?;
+        tx.set(meta_key.as_bytes(), &meta_bytes).map_err(|e| Error::other(e.to_string()))?;
 
         // Update Index
         let index_key = format!("{}/{}", bucket, key);
@@ -458,8 +458,7 @@ impl LocalMetadataEngine {
         };
 
         let new_count = count + 1;
-        tx.set(key.as_bytes(), &new_count.to_be_bytes())
-            .map_err(|e| Error::other(e.to_string()))?;
+        tx.set(key.as_bytes(), &new_count.to_be_bytes()).map_err(|e| Error::other(e.to_string()))?;
         Ok(())
     }
 
@@ -481,8 +480,7 @@ impl LocalMetadataEngine {
         if new_count == 0 {
             tx.delete(key.as_bytes()).map_err(|e| Error::other(e.to_string()))?;
         } else {
-            tx.set(key.as_bytes(), &new_count.to_be_bytes())
-                .map_err(|e| Error::other(e.to_string()))?;
+            tx.set(key.as_bytes(), &new_count.to_be_bytes()).map_err(|e| Error::other(e.to_string()))?;
         }
 
         Ok(new_count)
