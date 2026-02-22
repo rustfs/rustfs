@@ -14,10 +14,13 @@
 
 use crate::admin::utils::has_space_be;
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
-use crate::server::RemoteAddr;
-use crate::{admin::router::Operation, auth::check_key_valid};
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::{
+    admin::router::{AdminOperation, Operation, S3Router},
+    auth::check_key_valid,
+};
 use http::HeaderMap;
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
@@ -36,6 +39,40 @@ use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use tracing::{debug, warn};
+
+pub fn register_service_account_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/update-service-account").as_str(),
+        AdminOperation(&UpdateServiceAccount {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/info-service-account").as_str(),
+        AdminOperation(&InfoServiceAccount {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/list-service-accounts").as_str(),
+        AdminOperation(&ListServiceAccount {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/delete-service-accounts").as_str(),
+        AdminOperation(&DeleteServiceAccount {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/add-service-accounts").as_str(),
+        AdminOperation(&AddServiceAccount {}),
+    )?;
+
+    Ok(())
+}
 
 pub struct AddServiceAccount {}
 #[async_trait::async_trait]

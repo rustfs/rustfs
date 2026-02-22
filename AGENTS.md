@@ -18,8 +18,8 @@ Or simply run `make pre-commit` which covers all checks. **DO NOT commit if any 
 
 ## Communication Rules
 
-- Respond to the user in Chinese; use English in all other contexts.
-- Code and documentation must be written in English only. Chinese text is allowed solely as test data/fixtures when a case explicitly requires Chinese-language content for validation.
+- Respond to the user in the same language used by the user.
+- Code and documentation must be written in English only.
 - **Pull Request titles and descriptions must be written in English** to ensure consistency and accessibility for all contributors.
 
 ## Project Structure

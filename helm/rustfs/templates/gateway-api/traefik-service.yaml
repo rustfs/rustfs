@@ -3,6 +3,7 @@ apiVersion: traefik.io/v1alpha1
 kind: TraefikService
 metadata:
   name: {{ include "rustfs.fullname" . }}-sticky-svc
+  namespace: {{ .Release.Namespace }}
 spec:
   weighted:
     services:
@@ -14,6 +15,6 @@ spec:
           cookie:
             name: rustfs
             httpOnly: true
-            secure: true
-            sameSite: none
+            secure: {{ .Values.ingress.tls.enabled | default false }}
+            sameSite: {{ if .Values.ingress.tls.enabled }}none{{ else }}lax{{ end }}
 {{- end }}

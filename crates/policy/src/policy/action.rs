@@ -340,6 +340,9 @@ pub enum S3Action {
     ResetBucketReplicationStateAction,
     #[strum(serialize = "s3:PutObjectFanOut")]
     PutObjectFanOutAction,
+    /// Allow non-admin users to read bucket quota configuration.
+    #[strum(serialize = "s3:GetBucketQuota")]
+    GetBucketQuotaAction,
 }
 
 // #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
@@ -483,8 +486,6 @@ pub enum AdminAction {
     ListUserPoliciesAdminAction,
     #[strum(serialize = "admin:SetBucketQuota")]
     SetBucketQuotaAdminAction,
-    #[strum(serialize = "admin:GetBucketQuota")]
-    GetBucketQuotaAdminAction,
     #[strum(serialize = "admin:SetBucketTarget")]
     SetBucketTargetAction,
     #[strum(serialize = "admin:GetBucketTarget")]
@@ -573,7 +574,6 @@ impl AdminAction {
                 | AdminAction::UpdatePolicyAssociationAction
                 | AdminAction::ListUserPoliciesAdminAction
                 | AdminAction::SetBucketQuotaAdminAction
-                | AdminAction::GetBucketQuotaAdminAction
                 | AdminAction::SetBucketTargetAction
                 | AdminAction::GetBucketTargetAction
                 | AdminAction::ReplicationDiff

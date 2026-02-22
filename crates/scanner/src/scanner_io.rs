@@ -1,3 +1,17 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::scanner_folder::{ScannerItem, scan_data_folder};
 use crate::{
     DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo,
@@ -6,6 +20,7 @@ use crate::{
 use futures::future::join_all;
 use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
+use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete};
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
 use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_object_lock_config, get_replication_config};
@@ -114,7 +129,7 @@ impl ScannerIO for ECStore {
                 let results_mutex_clone = results_mutex.clone();
                 let first_err_mutex_clone = first_err_mutex.clone();
 
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<DataUsageCache>(1);
+                let (tx, mut rx) = mpsc::channel::<DataUsageCache>(1);
 
                 // Spawn task to receive and store results
                 let receiver_fut = tokio::spawn(async move {
@@ -469,6 +484,8 @@ impl ScannerIOCache for SetDisks {
 #[async_trait::async_trait]
 impl ScannerIODisk for Disk {
     async fn get_size(&self, mut item: ScannerItem) -> Result<SizeSummary> {
+        let done_object = Metrics::time(Metric::ScanObject);
+
         if !item.path.ends_with(&format!("{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}")) {
             return Err(StorageError::other("skip file".to_string()));
         }
@@ -540,6 +557,8 @@ impl ScannerIODisk for Disk {
         item.apply_actions(ecstore, object_infos, lock_config, &mut size_summary)
             .await;
 
+        done_object();
+
         // TODO: enqueueFreeVersion
 
         Ok(size_summary)
@@ -551,6 +570,10 @@ impl ScannerIODisk for Disk {
         updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache> {
+        let done_drive = Metrics::time(Metric::ScanBucketDrive);
+        let drive_start = std::time::Instant::now();
+        let bucket = cache.info.name.clone();
+        let disk_path = self.path().to_string_lossy().to_string();
         let _guard = self.start_scan();
 
         let mut cache = cache;
@@ -617,10 +640,15 @@ impl ScannerIODisk for Disk {
 
         match result {
             Ok(mut data_usage_info) => {
+                done_drive();
+                emit_scan_bucket_drive_complete(true, &bucket, &disk_path, drive_start.elapsed());
                 data_usage_info.info.last_update = Some(SystemTime::now());
                 Ok(data_usage_info)
             }
-            Err(e) => Err(StorageError::other(format!("Failed to scan data folder: {e}"))),
+            Err(e) => {
+                emit_scan_bucket_drive_complete(false, &bucket, &disk_path, drive_start.elapsed());
+                Err(StorageError::other(format!("Failed to scan data folder: {e}")))
+            }
         }
     }
 }

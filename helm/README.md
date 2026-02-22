@@ -28,6 +28,9 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.region | string | `"us-east-1"` |  |
 | config.rustfs.rust_log | string | `"debug"` |  |
 | config.rustfs.volumes | string | `""` |  |
+| config.rustfs.log_rotation.size | int | `"100"` | Default log rotation size mb for rustfs. |
+| config.rustfs.log_rotation.time | string | `"hour"` | Default log rotation time for rustfs. |
+| config.rustfs.log_rotation.keep_files | int | `"30"` | Default log keep files for rustfs.  |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
@@ -72,6 +75,10 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | livenessProbe.timeoutSeconds | int | `3` |  |
 | mode.distributed.enabled | bool | `true` | RustFS distributed mode support, namely multiple pod multiple pvc. |
 | mode.standalone.enabled | bool | `false` | RustFS standalone mode support, namely one pod one pvc.  |
+| mode.standalone.existingClaim.dataClaim |string |`""` |Whether to use existing pvc claim for data storage. |
+| mode.standalone.existingClaim.logsClaim |string |`""` |Whether to use existing pvc claim for logs storage. |
+| mtls.enabled | bool | `false` | Enable mtls betweens pods. |
+| mtls.serverOnly | bool | `false` | Only enable server https. |
 | nameOverride | string | `""` |  |
 | nodeSelector | object | `{}` |  |
 | pdb.create | bool | `false` | Enable/disable a Pod Disruption Budget creation |
@@ -112,6 +119,10 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | tolerations | list | `[]` |  |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
 | gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
+| gatewayApi.listeners.http.name | string | `web` | Gateway API http listener name. |
+| gatewayApi.listeners.http.port| int | `8000` | Gateway API http listener port. |
+| gatewayApi.listeners.https.name | string | `websecure` | Gateway API https listener name. |
+| gatewayApi.listeners.https.port| int | `8443` | Gateway API https listener port. |
 | gatewayApi.hostname | string | Hostname to access RustFS via gateway api. |
 | gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
 | gatewayApi.existingGateway.name | string | `""` |  The existing gateway name, instead of creating a new one. |

@@ -2,23 +2,44 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "rustfs.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- toYaml .Values.commonLabels | nindent 4 }}
 data:
-  RUSTFS_ADDRESS: {{ .Values.config.rustfs.address | quote }}
-  RUSTFS_CONSOLE_ADDRESS: {{ .Values.config.rustfs.console_address | quote }}
-  RUSTFS_CONSOLE_ENABLE: {{ .Values.config.rustfs.console_enable | quote }}
-  RUSTFS_OBS_LOG_DIRECTORY: {{ .Values.config.rustfs.obs_log_directory | quote }}
-  RUSTFS_OBS_LOGGER_LEVEL: {{ .Values.config.rustfs.log_level | quote }}
-  RUSTFS_OBS_ENVIRONMENT: {{ .Values.config.rustfs.obs_environment | quote }}
-  {{- if .Values.config.rustfs.region }}
-  RUSTFS_REGION: {{ .Values.config.rustfs.region | quote }}
+  {{- with .Values.config.rustfs }}
+  RUSTFS_ADDRESS: {{ .address | quote }}
+  RUSTFS_CONSOLE_ADDRESS: {{ .console_address | quote }}
+  RUSTFS_CONSOLE_ENABLE: {{ .console_enable | quote }}
+  RUSTFS_OBS_LOG_DIRECTORY: {{ .obs_log_directory | quote }}
+  RUSTFS_OBS_LOGGER_LEVEL: {{ .log_level | quote }}
+  RUSTFS_OBS_ENVIRONMENT: {{ .obs_environment | quote }}
+  {{- if .region }}
+  RUSTFS_REGION: {{ .region | quote }}
+  {{- end }}
+  {{- if .domains }}
+  RUSTFS_SERVER_DOMAINS: {{ include "rustfs.serverDomains" $ | quote }}
+  {{- end }}
+  {{- with .log_rotation }}
+    {{- if .size }}
+  RUSTFS_OBS_LOG_ROTATION_SIZE_MB: {{ .size | quote }}
+    {{- end }}
+    {{- if .time }}
+  RUSTFS_OBS_LOG_ROTATION_TIME: {{ .time | quote }}
+    {{- end }}
+    {{- if .keep_files }}
+  RUSTFS_OBS_LOG_KEEP_FILES: {{ .keep_files | quote }}
+    {{- end }}
+  {{- end }}
   {{- end }}
   {{- if .Values.mode.distributed.enabled }}
-  RUSTFS_VOLUMES: {{ .Values.config.rustfs.volumes | default (include "rustfs.volumes" .) }}
+  RUSTFS_VOLUMES: {{ .Values.config.rustfs.volumes | default (include "rustfs.volumes" .) | quote }}
   {{- else }}
   RUSTFS_VOLUMES: "/data"
   {{- end }}
-  {{- if .Values.config.rustfs.domains }}
-  RUSTFS_SERVER_DOMAINS: {{ include "rustfs.serverDomains" . | quote }}
+  {{- if .Values.mtls.enabled }}
+  RUSTFS_SERVER_MTLS_ENABLE: "1"
+  RUSTFS_TLS_KEYLOG: "1"
+  RUSTFS_TLS_PATH: "/opt/tls"
   {{- end }}
+  # RUSTFS_MTLS_CLIENT_CERT: "/opt/tls/client_cert.pem"
+  # RUSTFS_MTLS_CLIENT_KEY: "/opt/tls/client_key.pem"

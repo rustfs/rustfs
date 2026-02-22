@@ -80,7 +80,8 @@ impl BucketQuota {
 #[derive(Debug)]
 pub struct QuotaCheckResult {
     pub allowed: bool,
-    pub current_usage: u64,
+    /// current_usage: None when skipped for performance (no quota configured)
+    pub current_usage: Option<u64>,
     /// quota_limit: None means unlimited
     pub quota_limit: Option<u64>,
     pub operation_size: u64,
@@ -90,6 +91,7 @@ pub struct QuotaCheckResult {
 #[derive(Debug)]
 pub enum QuotaOperation {
     PutObject,
+    PostObject,
     CopyObject,
     DeleteObject,
 }

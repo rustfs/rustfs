@@ -81,6 +81,14 @@ fn build_rustfs_binary() {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&workspace).args(["build", "--bin", "rustfs"]);
 
+    // Read features from environment variable for e2e tests
+    if let Ok(features) = std::env::var("RUSTFS_BUILD_FEATURES")
+        && !features.is_empty()
+    {
+        cmd.arg("--features").arg(&features);
+        info!("Building with features: {}", features);
+    }
+
     if !cfg!(debug_assertions) {
         cmd.arg("--release");
     }
@@ -373,4 +381,277 @@ pub async fn awscurl_delete(
     secret_key: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     execute_awscurl(url, "DELETE", None, access_key, secret_key).await
+}
+
+/// Represents a single RustFS server instance in a test cluster.
+///
+/// Each `ClusterNode` tracks the node's network address, base URL for
+/// S3-compatible requests, on-disk data directory, and the underlying
+/// child process handle when the node is running.
+pub struct ClusterNode {
+    pub address: String,
+    pub url: String,
+    pub data_dir: String,
+    pub process: Option<Child>,
+}
+
+/// Test environment for managing a multi-node RustFS cluster.
+///
+/// `RustFSTestClusterEnvironment` is responsible for starting and stopping
+/// a group of `ClusterNode`s, managing their temporary storage directory,
+/// and providing the shared access and secret keys used by tests to
+/// interact with the cluster.
+pub struct RustFSTestClusterEnvironment {
+    pub nodes: Vec<ClusterNode>,
+    pub temp_dir: String,
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+impl RustFSTestClusterEnvironment {
+    /// Create a new RustFS test cluster environment with the specified number of nodes.
+    ///
+    /// Generates a unique temporary root directory for the cluster, allocates an available TCP port
+    /// for each node, creates an independent data directory for every node, and initializes basic
+    /// cluster node configurations (node processes are not started at this stage).
+    ///
+    /// # Arguments
+    ///
+    /// * `node_count` - The number of nodes to create in the cluster, must be a positive integer
+    ///   (an empty cluster will cause errors in subsequent startup operations).
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Self)` - A new instance of `RustFSTestClusterEnvironment` with initialized node
+    ///   configurations and temporary directory info on success.
+    /// * `Err(Box<dyn Error + Send + Sync>)` - An error if any step fails, such as temporary
+    ///   directory creation failure or available port lookup failure.
+    pub async fn new(node_count: usize) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if node_count == 0 {
+            return Err("Node count must be greater than zero".into());
+        }
+        let temp_dir = format!("/tmp/rustfs_cluster_test_{}", Uuid::new_v4());
+        fs::create_dir_all(&temp_dir).await?;
+
+        let mut nodes = Vec::with_capacity(node_count);
+        for i in 0..node_count {
+            let port = RustFSTestEnvironment::find_available_port().await?;
+            let address = format!("127.0.0.1:{}", port);
+            let url = format!("http://{}", address);
+            let data_dir = format!("{}/node{}", temp_dir, i);
+            fs::create_dir_all(&data_dir).await?;
+
+            nodes.push(ClusterNode {
+                address,
+                url,
+                data_dir,
+                process: None,
+            });
+        }
+
+        Ok(Self {
+            nodes,
+            temp_dir,
+            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            secret_key: DEFAULT_SECRET_KEY.to_string(),
+        })
+    }
+
+    /// Build the volumes argument string for RustFS binary (internal helper method).
+    ///
+    /// Concatenates the address and data directory of all cluster nodes into a single string
+    /// used as the `RUSTFS_VOLUMES` environment variable for RustFS node processes.
+    fn build_volumes_arg(&self) -> String {
+        self.nodes
+            .iter()
+            .map(|n| format!("http://{}{}", n.address, n.data_dir))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Start all node processes in the RustFS cluster and wait for the cluster service to be ready.
+    ///
+    /// Spawns a RustFS binary process for each node with necessary environment variable configurations,
+    /// first waits for each node's TCP port to be reachable, then verifies the cluster's S3-compatible
+    /// service availability via the S3 API.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - All nodes start successfully and the cluster S3 service is ready for requests.
+    /// * `Err(Box<dyn Error + Send + Sync>)` - An error if process spawning fails, TCP port readiness
+    ///   times out, or cluster service readiness times out.
+    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        let volumes_arg = self.build_volumes_arg();
+
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            info!("Starting cluster node {} on {}", i, node.address);
+
+            let process = Command::new(&binary_path)
+                .env("RUSTFS_VOLUMES", &volumes_arg)
+                .env("RUSTFS_ADDRESS", &node.address)
+                .env("RUSTFS_ACCESS_KEY", &self.access_key)
+                .env("RUSTFS_SECRET_KEY", &self.secret_key)
+                .env("RUSTFS_CONSOLE_ENABLE", "false")
+                .current_dir(&node.data_dir)
+                .spawn()?;
+
+            node.process = Some(process);
+        }
+
+        for (i, node) in self.nodes.iter().enumerate() {
+            self.wait_for_node_ready(&node.address, i).await?;
+        }
+
+        self.wait_for_service_ready().await?;
+
+        Ok(())
+    }
+
+    /// Wait for a single cluster node's TCP port to become reachable (internal helper method).
+    ///
+    /// Attempts to establish a TCP connection to the node's address, retries up to 60 times
+    /// with a 1-second interval between attempts. Fails if the port is unreachable after all retries.
+    async fn wait_for_node_ready(&self, address: &str, idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for attempt in 0..60 {
+            if TcpStream::connect(address).await.is_ok() {
+                info!("Node {} ({}) TCP ready after {} attempts", idx, address, attempt + 1);
+                return Ok(());
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        Err(format!("Node {} failed to become ready", idx).into())
+    }
+
+    /// Wait for the entire cluster's S3-compatible service to be ready (internal helper method).
+    ///
+    /// Verifies service availability by calling the S3 `list_buckets` API, retries up to 120 times
+    /// with a 1-second interval between attempts. Fails if the API call remains unsuccessful after all retries.
+    async fn wait_for_service_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.create_s3_client(0)?;
+
+        for attempt in 0..120 {
+            match client.list_buckets().send().await {
+                Ok(_) => {
+                    info!("Cluster service ready after {} attempts", attempt + 1);
+                    return Ok(());
+                }
+                Err(_) => {
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+        Err("Cluster service failed to become ready".into())
+    }
+
+    /// Create an S3 client configured to communicate with a specific cluster node.
+    ///
+    /// Configures the S3 client with the cluster's authentication credentials, a fixed `us-east-1` region,
+    /// the target node's endpoint URL, and enforces path-style access (required for RustFS S3 compatibility).
+    /// Performs a validity check on the node index before creating the client to avoid out-of-bounds errors.
+    ///
+    /// # Arguments
+    ///
+    /// * `node_idx` - The zero-based index of the target cluster node. Must be in the range `[0, total_nodes - 1]`.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Client)` - A fully configured AWS S3 `Client` instance for the specified node on success.
+    /// * `Err(Box<dyn Error + Send + Sync>)` - An error if the node index is invalid, or if the S3 client configuration fails.
+    pub fn create_s3_client(&self, node_idx: usize) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
+        if node_idx >= self.nodes.len() {
+            return Err("node_idx is invalid".into());
+        }
+        let credentials = Credentials::new(&self.access_key, &self.secret_key, None, None, "cluster-test");
+        let config = Config::builder()
+            .credentials_provider(credentials)
+            .region(Region::new("us-east-1"))
+            .endpoint_url(&self.nodes[node_idx].url)
+            .force_path_style(true)
+            .behavior_version_latest()
+            .build();
+        Ok(Client::from_conf(config))
+    }
+
+    /// Create S3 clients for all nodes in the RustFS cluster and collect them into a vector.
+    ///
+    /// Iterates over all cluster node indices, calls `create_s3_client` for each index, and aggregates
+    /// the resulting clients into a pre-allocated vector. Terminates immediately and returns an error
+    /// if any single node's S3 client creation fails (fails fast behavior).
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Vec<Client>)` - A vector of configured S3 `Client` instances (one per cluster node) on full success.
+    /// * `Err(Box<dyn Error + Send + Sync>)` - An error with a descriptive message if any client creation fails,
+    ///   including the underlying error from `create_s3_client`.
+    pub fn create_all_clients(&self) -> Result<Vec<Client>, Box<dyn std::error::Error + Send + Sync>> {
+        (0..self.nodes.len()).map(|i| self.create_s3_client(i)).try_fold(
+            Vec::with_capacity(self.nodes.len()),
+            |mut clients, result| match result {
+                Ok(client) => {
+                    clients.push(client);
+                    Ok(clients)
+                }
+                Err(e) => Err(format!("Failed to create S3 client for node: {}", e).into()),
+            },
+        )
+    }
+
+    /// Create a test S3 bucket in the RustFS cluster.
+    ///
+    /// Uses the S3 client of the first cluster node to call the S3 `create_bucket` API and
+    /// create a bucket with the specified name (follows S3 bucket naming conventions).
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket_name` - The name of the bucket to create, must comply with S3 bucket naming
+    ///   rules (lowercase, no spaces, valid characters only).
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - The test bucket is created successfully via the S3 API.
+    /// * `Err(Box<dyn Error + Send + Sync>)` - An error if the S3 `create_bucket` API call fails,
+    ///   such as invalid bucket name, insufficient permissions, or an unready cluster.
+    pub async fn create_test_bucket(&self, bucket_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.create_s3_client(0)?;
+        client.create_bucket().bucket(bucket_name).send().await?;
+        info!("Created test bucket: {}", bucket_name);
+        Ok(())
+    }
+
+    /// Stop all running node processes in the RustFS cluster.
+    ///
+    /// Iterates over all cluster nodes, attempts to kill the spawned RustFS process (if running),
+    /// and waits for the process to exit. Logs an error if process termination or waiting fails,
+    /// but does not panic (fails gracefully).
+    ///
+    /// This method is automatically called by the `Drop` trait when the cluster environment
+    /// is destroyed, and can also be called manually to stop the cluster early.
+    pub fn stop(&mut self) {
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            if let Some(mut process) = node.process.take() {
+                info!("Stopping cluster node {}", i);
+                if let Err(e) = process.kill() {
+                    error!("Failed to kill cluster node {}: {}", i, e);
+                }
+                if let Err(e) = process.wait() {
+                    error!("Failed to wait for cluster node {} to exit: {}", i, e);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RustFSTestClusterEnvironment {
+    /// Clean up the RustFS test cluster environment when the instance is dropped.
+    ///
+    /// Automatically calls the `stop` method to terminate all running node processes, then
+    /// attempts to delete the cluster's temporary root directory and all its contents.
+    /// Logs a warning if directory deletion fails (does not affect program exit).
+    fn drop(&mut self) {
+        self.stop();
+        if let Err(e) = std::fs::remove_dir_all(&self.temp_dir) {
+            warn!("Failed to clean up cluster temp directory {}: {}", self.temp_dir, e);
+        }
+    }
 }

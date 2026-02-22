@@ -33,6 +33,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
+use opentelemetry::global;
 use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
@@ -56,13 +57,14 @@ use tower_http::compression::CompressionLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub async fn start_http_server(
-    opt: &config::Opt,
+    config: &config::Config,
     worker_state_manager: ServiceStateManager,
     readiness: Arc<GlobalReadiness>,
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
-    let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
+    let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
 
     // The listening address and port are obtained from the parameters
@@ -148,7 +150,7 @@ pub async fn start_http_server(
         TcpListener::from_std(socket.into())?
     };
 
-    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
+    let tls_acceptor = setup_tls_acceptor(config.tls_path.as_deref().unwrap_or_default()).await?;
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
     // Obtain the listener address
@@ -171,7 +173,7 @@ pub async fn start_http_server(
     let api_endpoints = format!("{protocol}://{local_ip_str}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
     let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
-    if opt.console_enable {
+    if config.console_enable {
         admin::console::init_console_cfg(local_ip, server_port);
 
         info!(
@@ -191,8 +193,8 @@ pub async fn start_http_server(
         info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Start Time: {now_time}");
-        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&opt.access_key)
-            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&opt.secret_key)
+        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key)
+            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
         {
             warn!(
                 "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
@@ -210,20 +212,20 @@ pub async fn start_http_server(
         let store = storage::ecfs::FS::new();
         let mut b = S3ServiceBuilder::new(store.clone());
 
-        let access_key = opt.access_key.clone();
-        let secret_key = opt.secret_key.clone();
+        let access_key = config.access_key.clone();
+        let secret_key = config.secret_key.clone();
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
-        b.set_route(admin::make_admin_route(opt.console_enable)?);
+        b.set_route(admin::make_admin_route(config.console_enable)?);
 
         // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
-        if !opt.server_domains.is_empty() && !opt.console_enable {
-            MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
+        if !config.server_domains.is_empty() && !config.console_enable {
+            MultiDomain::new(&config.server_domains).map_err(Error::other)?; // validate domains
 
             // add the default port number to the given server domains
             let mut domain_sets = std::collections::HashSet::new();
-            for domain in &opt.server_domains {
+            for domain in &config.server_domains {
                 domain_sets.insert(domain.to_string());
                 if let Some((host, _)) = domain.split_once(':') {
                     domain_sets.insert(format!("{host}:{server_port}"));
@@ -254,7 +256,7 @@ pub async fn start_http_server(
         debug!("HTTP response compression is disabled");
     }
 
-    let is_console = opt.console_enable;
+    let is_console = config.console_enable;
     tokio::spawn(async move {
         // Note: CORS layer is removed from global middleware stack
         // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
@@ -524,6 +526,40 @@ struct ConnectionContext {
     readiness: Arc<GlobalReadiness>,
 }
 
+/// Adapter that implements the OpenTelemetry [`Extractor`] trait for Hyper's
+/// [`HeaderMap`], enabling trace context propagation by extracting
+/// OpenTelemetry headers from incoming HTTP requests.
+pub struct HeaderMapCarrier<'a> {
+    headers: &'a HeaderMap,
+}
+
+impl<'a> HeaderMapCarrier<'a> {
+    pub fn new(headers: &'a HeaderMap) -> Self {
+        Self { headers }
+    }
+}
+
+impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.headers.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.headers.keys().map(|k| k.as_str()).collect()
+    }
+
+    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
+        let headers = self
+            .headers
+            .get_all(key)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+
+        if headers.is_empty() { None } else { Some(headers) }
+    }
+}
+
 /// Process a single incoming TCP connection.
 ///
 /// This function is executed in a new Tokio task, and it will:
@@ -593,6 +629,10 @@ fn process_connection(
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("unknown");
 
+                        let parent_context = global::get_text_map_propagator(|propagator| {
+                            propagator.extract(&HeaderMapCarrier::new(request.headers()))
+                        });
+
                         // Extract real client IP from trusted proxy middleware if available
                         let client_info = request.extensions().get::<ClientInfo>();
                         let real_ip = client_info
@@ -607,6 +647,9 @@ fn process_connection(
                             uri = %request.uri(),
                             version = ?request.version(),
                         );
+                        if let Err(e) = span.set_parent(parent_context) {
+                            warn!("Failed to propagate tracing context: `{:?}`", e);
+                        }
                         for (header_name, header_value) in request.headers() {
                             if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length" {
                                 span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
@@ -833,5 +876,86 @@ fn get_default_tcp_keepalive() -> TcpKeepalive {
             .with_time(Duration::from_secs(60))
             .with_interval(Duration::from_secs(5))
             .with_retries(3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderMap;
+    use opentelemetry::propagation::Extractor;
+
+    #[test]
+    fn test_headermap_carrier_new() {
+        let headers = HeaderMap::new();
+        let carrier = HeaderMapCarrier::new(&headers);
+        assert_eq!(carrier.keys().len(), 0);
+    }
+
+    #[test]
+    fn test_headermap_carrier_get() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", "test-agent".parse().unwrap());
+        headers.insert("x-request-id", "12345".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+
+        assert_eq!(carrier.get("user-agent"), Some("test-agent"));
+        assert_eq!(carrier.get("x-request-id"), Some("12345"));
+        assert_eq!(carrier.get("content-type"), None);
+    }
+
+    #[test]
+    fn test_headermap_carrier_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", "test-agent".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+        let keys = carrier.keys();
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"user-agent"));
+        assert!(keys.contains(&"content-type"));
+    }
+
+    #[test]
+    fn test_headermap_carrier_get_all() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-custom-header", "value1".parse().unwrap());
+        headers.append("x-custom-header", "value2".parse().unwrap());
+        headers.insert("user-agent", "test-agent".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+
+        // Test multi-value header
+        let values = carrier.get_all("x-custom-header");
+        assert!(values.is_some());
+        let v = values.unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v.contains(&"value1"));
+        assert!(v.contains(&"value2"));
+
+        // Test single value header
+        let values = carrier.get_all("user-agent");
+        assert!(values.is_some());
+        let v = values.unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], "test-agent");
+
+        // Test missing header
+        assert_eq!(carrier.get_all("missing-header"), None);
+    }
+
+    #[test]
+    fn test_headermap_carrier_case_insensitivity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+
+        // HeaderMap::get is case insensitive
+        assert_eq!(carrier.get("Content-Type"), Some("application/json"));
+        assert_eq!(carrier.get("CONTENT-TYPE"), Some("application/json"));
     }
 }

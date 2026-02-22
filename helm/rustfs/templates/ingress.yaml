@@ -1,8 +1,9 @@
 {{- if .Values.ingress.enabled -}}
-{{- $secretName := .Values.ingress.tls.secretName }}
 {{- $ingressAnnotations := dict }}
 {{- if eq .Values.ingress.className "nginx" }}
 {{- $ingressAnnotations = .Values.ingress.nginxAnnotations }}
+{{- else if eq .Values.ingress.className "traefik" }}
+{{- $ingressAnnotations = .Values.ingress.traefikAnnotations }}
 {{- else if eq .Values.ingress.className "" }}
 {{- $ingressAnnotations = .Values.ingress.customAnnotations }}
 {{- end }}
@@ -10,6 +11,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ include "rustfs.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
     {{- with .Values.commonLabels }}
@@ -29,7 +31,7 @@ spec:
         {{- range .Values.ingress.hosts }}
         - {{ .host | quote }}
         {{- end }}
-      secretName: {{ $secretName }}
+      secretName: {{ include "rustfs.fullname" $ }}-tls
   {{- end }}
   rules:
     {{- range .Values.ingress.hosts }}

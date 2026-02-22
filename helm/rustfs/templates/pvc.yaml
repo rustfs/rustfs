@@ -1,4 +1,4 @@
-{{- if .Values.mode.standalone.enabled }}
+{{- if and .Values.mode.standalone.enabled (not .Values.mode.standalone.existingClaim.dataClaim) }}
 {{- with .Values.storageclass }}
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -6,6 +6,7 @@ metadata:
   annotations:
     helm.sh/resource-policy: keep
   name: {{ include "rustfs.fullname" $ }}-data
+  namespace: {{ $.Release.Namespace }}
   labels:
     {{- toYaml $.Values.commonLabels | nindent 4 }}
 spec:
@@ -16,15 +17,19 @@ spec:
   resources:
     requests:
       storage: {{ .dataStorageSize }}
+{{- end }}
+{{- end }}
 
+{{- if and .Values.mode.standalone.enabled (not .Values.mode.standalone.existingClaim.logsClaim) }}
+{{- with .Values.storageclass }}
 ---
-
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   annotations:
     helm.sh/resource-policy: keep
   name: {{ include "rustfs.fullname" $ }}-logs
+  namespace: {{ $.Release.Namespace }}
   labels:
     {{- toYaml $.Values.commonLabels | nindent 4 }}
 spec:

@@ -37,13 +37,29 @@ impl QuotaChecker {
         operation: QuotaOperation,
         operation_size: u64,
     ) -> Result<QuotaCheckResult, QuotaError> {
+        self.check_quota_with_usage_reporting(bucket, operation, operation_size, false)
+            .await
+    }
+
+    /// Check quota with option to force usage calculation even when no quota is configured
+    pub async fn check_quota_with_usage_reporting(
+        &self,
+        bucket: &str,
+        operation: QuotaOperation,
+        operation_size: u64,
+        force_usage_calculation: bool,
+    ) -> Result<QuotaCheckResult, QuotaError> {
         let start_time = Instant::now();
         let quota_config = self.get_quota_config(bucket).await?;
 
         // If no quota limit is set, allow operation
         let quota_limit = match quota_config.quota {
             None => {
-                let current_usage = self.get_real_time_usage(bucket).await?;
+                let current_usage = if force_usage_calculation {
+                    Some(self.get_real_time_usage(bucket).await?)
+                } else {
+                    None // Skip expensive usage calculation when no quota and not forced for performance
+                };
                 return Ok(QuotaCheckResult {
                     allowed: true,
                     current_usage,
@@ -58,12 +74,12 @@ impl QuotaChecker {
         let current_usage = self.get_real_time_usage(bucket).await?;
 
         let expected_usage = match operation {
-            QuotaOperation::PutObject | QuotaOperation::CopyObject => current_usage + operation_size,
+            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => current_usage + operation_size,
             QuotaOperation::DeleteObject => current_usage.saturating_sub(operation_size),
         };
 
         let allowed = match operation {
-            QuotaOperation::PutObject | QuotaOperation::CopyObject => {
+            QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => {
                 quota_config.check_operation_allowed(current_usage, operation_size)
             }
             QuotaOperation::DeleteObject => true,
@@ -84,7 +100,7 @@ impl QuotaChecker {
 
         let result = QuotaCheckResult {
             allowed,
-            current_usage,
+            current_usage: Some(current_usage),
             quota_limit: Some(quota_limit),
             operation_size,
             remaining,
@@ -165,7 +181,7 @@ mod tests {
     async fn test_quota_check_no_limit() {
         let result = QuotaCheckResult {
             allowed: true,
-            current_usage: 0,
+            current_usage: None,
             quota_limit: None,
             operation_size: 1024,
             remaining: None,

@@ -18,11 +18,11 @@ use crate::config::workload_profiles::{
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::{InMemoryAsyncReader, ListObjectUnorderedQuery};
-use axum::body::Body;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
+use rustfs_ecstore::bucket::object_lock::objectlock_sys;
 use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::store_api::{BucketOptions, ObjectInfo, ObjectToDelete};
@@ -37,9 +37,9 @@ use rustfs_utils::http::{
     RESERVED_METADATA_PREFIX_LOWER,
 };
 use s3s::dto::{
-    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockEnabled, ObjectLockLegalHold,
-    ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, ServerSideEncryption,
-    TopicConfiguration,
+    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
+    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration,
+    ServerSideEncryption, TopicConfiguration,
 };
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 use serde_urlencoded::from_bytes;
@@ -55,137 +55,43 @@ use tracing::{debug, warn};
 pub const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
-/// =======================
-/// Presigned POST helpers
-/// =======================
+/// Apply bucket default Object Lock retention to object metadata if no explicit retention is set.
 ///
-/// AWS S3 RESTObjectPOST (HTML form upload) semantics:
-/// - Default success response is 204 (No Content)
-/// - If `success_action_status` is specified, it may be 200, 201, or 204
-/// - If `success_action_redirect` is specified, respond with 303 and Location header.
-///
-/// Reference:
-/// https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectPOST.html
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) enum PostObjectSuccessAction {
-    #[default]
-    NoContent204,
-    Ok200,
-    Created201,
-    Redirect303 {
-        location: String,
-    },
-}
-
-/// Parse success action from Presigned POST form fields.
-///
-/// Integration point (manual):
-/// - In the PostPolicy handler, after parsing form fields, call this function to determine the desired success action.
+/// This function implements S3-compatible behavior where objects uploaded to a bucket with
+/// default retention configuration automatically inherit the bucket's default retention policy.
+/// The retention is only applied if:
+/// 1. The bucket has Object Lock enabled
+/// 2. The bucket has a default retention rule configured
+/// 3. The object metadata does not already contain explicit retention headers
 ///
 /// # Arguments
-/// * `fields` - HashMap of form fields from the POST request
-///
-/// # Returns
-/// * `S3Result<PostObjectSuccessAction>` - Parsed success action or error
-///
-/// Notes:
-/// - Follows AWS S3 behavior: `success_action_redirect` takes precedence over `success_action_status`.
-/// - Validates `success_action_status` values; invalid values result in MalformedPOSTRequest error.
-///
+/// * `object_lock_config` - Optional bucket Object Lock configuration. If None, no retention is applied.
+/// * `metadata` - Mutable reference to object metadata HashMap. Retention headers are inserted here.
 #[allow(dead_code)]
-pub(crate) fn parse_success_action_from_form_fields(fields: &HashMap<String, String>) -> S3Result<PostObjectSuccessAction> {
-    // 1) success_action_redirect wins over success_action_status (AWS compatible behavior).
-    if let Some(loc) = fields
-        .get("success_action_redirect")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        return Ok(PostObjectSuccessAction::Redirect303 {
-            location: loc.to_string(),
-        });
+pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
+    if metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER) || metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER) {
+        return;
     }
 
-    // 2) success_action_status is optional; default is 204.
-    let Some(status_str) = fields
-        .get("success_action_status")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(PostObjectSuccessAction::NoContent204);
+    let Some(config) = object_lock_config else { return };
+
+    if config.object_lock_enabled.as_ref().map(|e| e.as_str()) != Some(ObjectLockEnabled::ENABLED) {
+        return;
+    }
+
+    let Some(default_retention) = config.rule.and_then(|r| r.default_retention) else { return };
+    let Some(mode) = default_retention.mode else { return };
+
+    let now = OffsetDateTime::now_utc();
+    let retain_until = match (default_retention.days, default_retention.years) {
+        (Some(days), _) => now.saturating_add(time::Duration::days(days as i64)),
+        (None, Some(years)) => objectlock_sys::add_years(now, years),
+        _ => return,
     };
 
-    // AWS allows only 200/201/204 for POST form success_action_status.
-    // Treat invalid values as MalformedPOSTRequest to match S3 strictness.
-    match status_str {
-        "200" => Ok(PostObjectSuccessAction::Ok200),
-        "201" => Ok(PostObjectSuccessAction::Created201),
-        "204" => Ok(PostObjectSuccessAction::NoContent204),
-        _ => Err(S3Error::with_message(
-            S3ErrorCode::MalformedPOSTRequest,
-            format!("Invalid success_action_status: {status_str}. Allowed values are 200, 201, 204."),
-        )),
-    }
-}
-
-/// Build the final S3Response for a successful Presigned POST upload.
-///
-/// Integration point (manual):
-/// - After `put_object` succeeds in the PostPolicy handler, call this function
-///   with parsed form fields + object info to produce the correct HTTP status.
-///
-/// Notes:
-/// - For 204: empty body
-/// - For 303: empty body + Location header
-/// - For 200: empty body (some clients accept this); you may optionally return XML/HTML body if you already implement it.
-/// - For 201: prefer returning PostResponse XML; if not available, empty body still satisfies most clients, but strict tests may require XML. If you have a PostResponse serializer already, plug it in here.
-#[allow(dead_code)]
-pub(crate) fn build_post_object_success_response(
-    form_fields: &HashMap<String, String>,
-    // These are optional; used if you want to return richer responses for 200/201.
-    bucket: &str,
-    key: &str,
-    etag: Option<&str>,
-    location: Option<&str>,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let action = parse_success_action_from_form_fields(form_fields)?;
-
-    match action {
-        PostObjectSuccessAction::NoContent204 => Ok(S3Response::new((StatusCode::NO_CONTENT, Body::empty()))),
-
-        PostObjectSuccessAction::Redirect303 { location } => {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                http::header::LOCATION,
-                HeaderValue::from_str(&location)
-                    .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid success_action_redirect URL"))?,
-            );
-            Ok(S3Response::with_headers((StatusCode::SEE_OTHER, Body::empty()), headers))
-        }
-
-        PostObjectSuccessAction::Ok200 => {
-            // AWS may return 200 with an HTML/redirect response for browser workflows.
-            // For compatibility, returning empty body is acceptable unless strict clients require content.
-            // Keep Content-Length implicit; Body::empty() -> 0.
-            Ok(S3Response::new((StatusCode::OK, Body::empty())))
-        }
-
-        PostObjectSuccessAction::Created201 => {
-            // AWS 201 response is XML:
-            // <PostResponse>
-            //   <Location>...</Location>
-            //   <Bucket>...</Bucket>
-            //   <Key>...</Key>
-            //   <ETag>...</ETag>
-            // </PostResponse>
-            //
-            // If RustFS already has a DTO for this, switch to it here.
-            // To keep this patch minimal and safe, return empty body with 201 by default.
-            //
-            // IMPORTANT: If you run strict s3-tests for POST Object, you may need to implement XML body.
-            let _ = (bucket, key, etag, location);
-            Ok(S3Response::new((StatusCode::CREATED, Body::empty())))
-        }
+    if let Ok(date_str) = retain_until.format(&Rfc3339) {
+        metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode.as_str().to_string());
+        metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), date_str);
     }
 }
 
@@ -444,18 +350,6 @@ pub(crate) fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, S
     }
 }
 
-/// Check if the given server-side encryption algorithm is a managed SSE type
-///
-/// This function checks if the provided ServerSideEncryption algorithm
-/// corresponds to a managed server-side encryption method, specifically
-/// "AES256" or "aws:kms".
-///
-/// # Arguments
-/// * `algorithm` - A reference to the ServerSideEncryption enum to check.
-///
-/// # Returns
-/// * `true` if the algorithm is "AES256" or "aws:kms", otherwise `false`.
-///
 pub(crate) fn is_managed_sse(algorithm: &ServerSideEncryption) -> bool {
     matches!(algorithm.as_str(), "AES256" | "aws:kms")
 }

@@ -744,21 +744,31 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn is_allowed_sts(&self, args: &Args<'_>, parent_user: &str) -> bool {
-        let is_owner = parent_user == get_global_action_cred().unwrap().access_key;
+        let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
         let role_arn = args.get_role_arn();
-        let policies = {
-            if is_owner {
-                Vec::new()
-            } else if role_arn.is_some() {
-                let Ok(arn) = ARN::parse(role_arn.unwrap_or_default()) else { return false };
 
-                MappedPolicy::new(self.roles_map.get(&arn).map_or_else(String::default, |v| v.clone()).as_str()).to_slice()
-            } else {
-                let Ok(p) = self.policy_db_get(parent_user, args.groups).await else { return false };
-
-                p
-                //TODO: FROM JWT
-            }
+        let (effective_groups, groups_source, policies) = if is_owner {
+            (None, "owner", Vec::new())
+        } else if let Some(arn_str) = role_arn {
+            let Ok(arn) = ARN::parse(arn_str) else { return false };
+            let p = MappedPolicy::new(self.roles_map.get(&arn).map_or_else(String::default, |v| v.clone()).as_str()).to_slice();
+            (None, "role", p)
+        } else {
+            let (effective_groups, groups_source) = match args.groups.as_ref() {
+                Some(g) if !g.is_empty() => (args.groups.clone(), "args"),
+                _ => match self.store.get_user(parent_user).await {
+                    Some(u) => (u.credentials.groups.clone(), "parent_user_credentials"),
+                    None => {
+                        tracing::warn!(
+                            parent_user = %parent_user,
+                            "is_allowed_sts: groups fallback failed — parent user not found; policy evaluation will use no groups"
+                        );
+                        (None, "parent_user_credentials")
+                    }
+                },
+            };
+            let Ok(p) = self.policy_db_get(parent_user, &effective_groups).await else { return false };
+            (effective_groups, groups_source, p)
         };
 
         if !is_owner && policies.is_empty() {
@@ -778,6 +788,16 @@ impl<T: Store> IamSys<T> {
         };
 
         let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
+        tracing::debug!(
+            "is_allowed_sts: action={:?}, has_session_policy={}, is_allowed_sp={}, is_owner={}, parent_user={}, groups_source={}, effective_groups={:?}",
+            args.action,
+            has_session_policy,
+            is_allowed_sp,
+            is_owner,
+            parent_user,
+            groups_source,
+            effective_groups
+        );
         if has_session_policy {
             return is_allowed_sp && (is_owner || combined_policy.is_allowed(args).await);
         }
@@ -794,7 +814,7 @@ impl<T: Store> IamSys<T> {
             return false;
         }
 
-        let is_owner = parent_user == get_global_action_cred().unwrap().access_key;
+        let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
 
         let role_arn = args.get_role_arn();
 
@@ -977,4 +997,225 @@ pub fn get_claims_from_token_with_secret(token: &str, secret: &str) -> Result<Ha
         );
     }
     Ok(ms.claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::{Cache, CacheEntity};
+    use crate::error::Error;
+    use crate::manager::get_default_policyes;
+    use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
+    use rustfs_credentials::Credentials;
+    use rustfs_policy::auth::UserIdentity;
+    use rustfs_policy::policy::Args;
+    use rustfs_policy::policy::action::{Action, S3Action};
+    use std::collections::HashMap;
+    use time::OffsetDateTime;
+
+    /// Mock Store that populates cache in load_all so STS temp credentials
+    /// without args.groups still get group-attached policies via parent user (groups fallback).
+    #[derive(Clone)]
+    struct StsGroupsFallbackMockStore;
+
+    #[async_trait::async_trait]
+    impl Store for StsGroupsFallbackMockStore {
+        fn has_watcher(&self) -> bool {
+            false
+        }
+
+        async fn save_iam_config<Item: serde::Serialize + Send>(&self, _item: Item, _path: impl AsRef<str> + Send) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_iam_config<Item: serde::de::DeserializeOwned>(&self, _path: impl AsRef<str> + Send) -> Result<Item> {
+            Err(Error::ConfigNotFound)
+        }
+
+        async fn delete_iam_config(&self, _path: impl AsRef<str> + Send) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_user_identity(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _item: UserIdentity,
+            _ttl: Option<usize>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_user_identity(&self, _name: &str, _user_type: UserType) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_user_identity(&self, _name: &str, _user_type: UserType) -> Result<UserIdentity> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_user(&self, _name: &str, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_users(&self, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_secret_key(&self, _name: &str, _user_type: UserType) -> Result<String> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_group_info(&self, _name: &str) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_group(&self, _name: &str, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_groups(&self, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_policy_doc(&self, _name: &str, _item: rustfs_policy::policy::PolicyDoc) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_policy_doc(&self, _name: &str) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy(&self, _name: &str) -> Result<rustfs_policy::policy::PolicyDoc> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy_doc(&self, _name: &str, _m: &mut HashMap<String, rustfs_policy::policy::PolicyDoc>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy_docs(&self, _m: &mut HashMap<String, rustfs_policy::policy::PolicyDoc>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _item: MappedPolicy,
+            _ttl: Option<usize>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_mapped_policy(&self, _name: &str, _user_type: UserType, _is_group: bool) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_mapped_policies(
+            &self,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_all(&self, cache: &Cache) -> Result<()> {
+            const PARENT_USER: &str = "sts-fallback-test-parent";
+            const GROUP_NAME: &str = "testgroup";
+
+            let policy_docs = get_default_policyes();
+            cache
+                .policy_docs
+                .store(Arc::new(CacheEntity::new(policy_docs).update_load_time()));
+
+            let creds = Credentials {
+                access_key: PARENT_USER.to_string(),
+                secret_key: "longenoughsecret".to_string(),
+                session_token: String::new(),
+                expiration: None,
+                status: "on".to_string(),
+                parent_user: String::new(),
+                groups: Some(vec![GROUP_NAME.to_string()]),
+                claims: None,
+                name: None,
+                description: None,
+            };
+            let parent_identity = UserIdentity {
+                version: 1,
+                credentials: creds,
+                update_at: Some(OffsetDateTime::now_utc()),
+            };
+            let mut users = HashMap::new();
+            users.insert(PARENT_USER.to_string(), parent_identity);
+            cache.users.store(Arc::new(CacheEntity::new(users).update_load_time()));
+
+            let group = GroupInfo::new(vec![PARENT_USER.to_string()]);
+            let mut groups = HashMap::new();
+            groups.insert(GROUP_NAME.to_string(), group);
+            cache.groups.store(Arc::new(CacheEntity::new(groups).update_load_time()));
+
+            let group_policy = MappedPolicy::new("readwrite");
+            let mut group_policies = HashMap::new();
+            group_policies.insert(GROUP_NAME.to_string(), group_policy);
+            cache
+                .group_policies
+                .store(Arc::new(CacheEntity::new(group_policies).update_load_time()));
+
+            cache.user_policies.store(Arc::new(CacheEntity::default().update_load_time()));
+            cache.sts_accounts.store(Arc::new(CacheEntity::default().update_load_time()));
+            cache.sts_policies.store(Arc::new(CacheEntity::default().update_load_time()));
+            cache.build_user_group_memberships();
+
+            Ok(())
+        }
+    }
+
+    /// Regression test: temp credentials without groups in args still receive group-attached
+    /// policies via the parent user (groups fallback). Without the fallback, policy_db_get
+    /// would get None for groups and the user would have no group policies, so the action
+    /// would be denied.
+    #[tokio::test]
+    async fn test_sts_groups_fallback_temp_creds_receive_parent_group_policies() {
+        let store = StsGroupsFallbackMockStore;
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-fallback-test-parent";
+        let claims = HashMap::new();
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: parent_user,
+            groups: &groups,
+            action: Action::S3Action(S3Action::ListBucketAction),
+            bucket: "mybucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        assert!(
+            allowed,
+            "STS temp credentials with no groups in args should still be allowed via parent user's group policy (readwrite)"
+        );
+    }
 }

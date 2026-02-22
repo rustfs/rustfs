@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::Operation;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
+use crate::server::ADMIN_PREFIX;
 use futures::stream::{FuturesUnordered, StreamExt};
 use http::{HeaderMap, StatusCode};
+use hyper::Method;
 use matchit::Params;
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
 use rustfs_config::{ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
@@ -33,6 +35,34 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{Span, info, warn};
 use url::Url;
+
+pub fn register_notification_target_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/list").as_str(),
+        AdminOperation(&ListNotificationTargets {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}").as_str(),
+        AdminOperation(&NotificationTarget {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/{target_type}/{target_name}/reset").as_str(),
+        AdminOperation(&RemoveNotificationTarget {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target/arns").as_str(),
+        AdminOperation(&ListTargetsArns {}),
+    )?;
+
+    Ok(())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct KeyValue {

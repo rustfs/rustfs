@@ -13,11 +13,15 @@
 // limitations under the License.
 
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation},
+    admin::{
+        auth::validate_admin_request,
+        router::{AdminOperation, Operation, S3Router},
+    },
     auth::{check_key_valid, get_session_token},
-    server::RemoteAddr,
+    server::{ADMIN_PREFIX, RemoteAddr},
 };
 use http::{HeaderMap, StatusCode};
+use hyper::Method;
 use matchit::Params;
 use rustfs_ecstore::rebalance::RebalanceMeta;
 use rustfs_ecstore::{
@@ -38,6 +42,28 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tracing::warn;
+
+pub fn register_rebalance_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/rebalance/start").as_str(),
+        AdminOperation(&RebalanceStart {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/rebalance/status").as_str(),
+        AdminOperation(&RebalanceStatus {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/rebalance/stop").as_str(),
+        AdminOperation(&RebalanceStop {}),
+    )?;
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RebalanceResp {

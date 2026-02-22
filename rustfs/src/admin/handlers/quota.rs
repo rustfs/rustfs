@@ -14,14 +14,15 @@
 
 //! Quota admin handlers for HTTP API
 
-use super::Operation;
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
-use hyper::StatusCode;
+use crate::server::ADMIN_PREFIX;
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
-use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -79,6 +80,40 @@ pub struct GetBucketQuotaHandler;
 pub struct ClearBucketQuotaHandler;
 pub struct GetBucketQuotaStatsHandler;
 pub struct CheckBucketQuotaHandler;
+
+pub fn register_quota_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota/{bucket}").as_str(),
+        AdminOperation(&SetBucketQuotaHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota/{bucket}").as_str(),
+        AdminOperation(&GetBucketQuotaHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota/{bucket}").as_str(),
+        AdminOperation(&ClearBucketQuotaHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota-stats/{bucket}").as_str(),
+        AdminOperation(&GetBucketQuotaStatsHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/quota-check/{bucket}").as_str(),
+        AdminOperation(&CheckBucketQuotaHandler {}),
+    )?;
+
+    Ok(())
+}
 
 #[async_trait::async_trait]
 impl Operation for SetBucketQuotaHandler {
@@ -180,20 +215,21 @@ impl Operation for GetBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::GetBucketQuotaAdminAction)],
-            None,
-        )
-        .await?;
-
         let bucket = params.get("bucket").unwrap_or("").to_string();
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
+
+        validate_admin_request_with_bucket(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
+            None,
+            &bucket,
+        )
+        .await?;
 
         let metadata_sys_lock = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys
             .get()
@@ -308,20 +344,21 @@ impl Operation for GetBucketQuotaStatsHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::GetBucketQuotaAdminAction)],
-            None,
-        )
-        .await?;
-
         let bucket = params.get("bucket").unwrap_or("").to_string();
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
+
+        validate_admin_request_with_bucket(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
+            None,
+            &bucket,
+        )
+        .await?;
 
         let metadata_sys_lock = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys
             .get()
@@ -375,20 +412,21 @@ impl Operation for CheckBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::GetBucketQuotaAdminAction)],
-            None,
-        )
-        .await?;
-
         let bucket = params.get("bucket").unwrap_or("").to_string();
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
+
+        validate_admin_request_with_bucket(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
+            None,
+            &bucket,
+        )
+        .await?;
 
         let body = req
             .input
@@ -415,13 +453,14 @@ impl Operation for CheckBucketQuotaHandler {
 
         let operation: QuotaOperation = match request.operation_type.to_uppercase().as_str() {
             "PUT" | "PUTOBJECT" => QuotaOperation::PutObject,
+            "POST" | "POSTOBJECT" => QuotaOperation::PostObject,
             "COPY" | "COPYOBJECT" => QuotaOperation::CopyObject,
             "DELETE" | "DELETEOBJECT" => QuotaOperation::DeleteObject,
             _ => QuotaOperation::PutObject, // Default to PUT operation
         };
 
         let result = quota_checker
-            .check_quota(&bucket, operation, request.operation_size)
+            .check_quota_with_usage_reporting(&bucket, operation, request.operation_size, true)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to check quota: {}", e))?;
 
@@ -430,7 +469,7 @@ impl Operation for CheckBucketQuotaHandler {
             operation_type: request.operation_type,
             operation_size: request.operation_size,
             allowed: result.allowed,
-            current_usage: result.current_usage,
+            current_usage: result.current_usage.unwrap_or(0),
             quota_limit: result.quota_limit,
             remaining_quota: result.remaining,
         };
@@ -455,6 +494,7 @@ mod tests {
     fn test_quota_operation_parsing() {
         let parse_operation = |operation: &str| match operation.to_uppercase().as_str() {
             "PUT" | "PUTOBJECT" => QuotaOperation::PutObject,
+            "POST" | "POSTOBJECT" => QuotaOperation::PostObject,
             "COPY" | "COPYOBJECT" => QuotaOperation::CopyObject,
             "DELETE" | "DELETEOBJECT" => QuotaOperation::DeleteObject,
             _ => QuotaOperation::PutObject,
@@ -463,6 +503,9 @@ mod tests {
         assert!(matches!(parse_operation("put"), QuotaOperation::PutObject));
         assert!(matches!(parse_operation("PUT"), QuotaOperation::PutObject));
         assert!(matches!(parse_operation("PutObject"), QuotaOperation::PutObject));
+        assert!(matches!(parse_operation("post"), QuotaOperation::PostObject));
+        assert!(matches!(parse_operation("POST"), QuotaOperation::PostObject));
+        assert!(matches!(parse_operation("PostObject"), QuotaOperation::PostObject));
         assert!(matches!(parse_operation("copy"), QuotaOperation::CopyObject));
         assert!(matches!(parse_operation("DELETE"), QuotaOperation::DeleteObject));
         assert!(matches!(parse_operation("unknown"), QuotaOperation::PutObject));

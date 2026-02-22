@@ -66,7 +66,7 @@ use crate::{
 use futures::future::join_all;
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use rand::Rng as _;
+use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
@@ -202,11 +202,14 @@ impl ECStore {
 
             // validate_parity(parity_count, pool_eps.drives_per_set)?;
 
+            // Initialize disks without health monitoring so that remote peers
+            // are not immediately marked as faulty before they have a chance to
+            // start up. Health monitoring is enabled after format loading succeeds.
             let (disks, errs) = store_init::init_disks(
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
-                    health_check: true,
+                    health_check: false,
                 },
             )
             .await;
@@ -217,7 +220,7 @@ impl ECStore {
                 let mut times = 0;
                 let mut interval = 1;
                 loop {
-                    if let Ok(fm) = store_init::connect_load_init_formats(
+                    match store_init::connect_load_init_formats(
                         first_is_local,
                         &disks,
                         pool_eps.set_count,
@@ -226,14 +229,17 @@ impl ECStore {
                     )
                     .await
                     {
-                        break fm;
+                        Ok(fm) => break Ok(fm),
+                        // Wrap the final error if we are giving up
+                        Err(e) if times >= 10 => {
+                            break Err(Error::other(format!("can not get formats after {} retries, last error: {e}", times)));
+                        }
+                        // Retrying so just drop the error
+                        Err(_) => {}
                     }
                     times += 1;
                     if interval < 16 {
                         interval *= 2;
-                    }
-                    if times > 10 {
-                        return Err(Error::other("can not get formats"));
                     }
                     info!("retrying get formats after {:?}", interval);
                     select! {
@@ -245,7 +251,12 @@ impl ECStore {
                         }
                     }
                 }
-            };
+            }?;
+
+            // Format loading succeeded, enable health monitoring on all disks
+            for disk in disks.iter().flatten() {
+                disk.enable_health_check();
+            }
 
             if deployment_id.is_none() {
                 deployment_id = Some(fm.id);

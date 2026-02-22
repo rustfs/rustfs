@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use serde::{Serialize, de::DeserializeOwned};
 use std::io::{Error, Result};
 

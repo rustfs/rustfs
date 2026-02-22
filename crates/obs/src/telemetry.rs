@@ -21,6 +21,7 @@ use nu_ansi_term::Color;
 use opentelemetry::{KeyValue, global, trace::TracerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::{
     Resource,
     logs::SdkLoggerProvider,
@@ -32,8 +33,9 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
 };
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_OBS_LOG_STDOUT_ENABLED, ENVIRONMENT, METER_INTERVAL,
-    SAMPLE_RATIO, SERVICE_VERSION,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
+    DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
+    SERVICE_VERSION,
     observability::{
         DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_OBS_LOG_FLUSH_MS, DEFAULT_OBS_LOG_MESSAGE_CAPA, DEFAULT_OBS_LOG_POOL_CAPA,
         ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_FLUSH_MS, ENV_OBS_LOG_MESSAGE_CAPA, ENV_OBS_LOG_POOL_CAPA,
@@ -416,7 +418,7 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
 
     // Tracer（HTTP）
     let tracer_provider = {
-        if trace_ep.is_empty() {
+        if trace_ep.is_empty() || !config.traces_export_enabled.unwrap_or(DEFAULT_OBS_TRACES_EXPORT_ENABLED) {
             None
         } else {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -439,13 +441,14 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
 
             let provider = builder.build();
             global::set_tracer_provider(provider.clone());
+            global::set_text_map_propagator(TraceContextPropagator::new());
             Some(provider)
         }
     };
 
     // Meter（HTTP）
     let meter_provider = {
-        if metric_ep.is_empty() {
+        if metric_ep.is_empty() || !config.metrics_export_enabled.unwrap_or(DEFAULT_OBS_METRICS_EXPORT_ENABLED) {
             None
         } else {
             let exporter = opentelemetry_otlp::MetricExporter::builder()
@@ -474,13 +477,14 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
                 .build();
             global::set_meter_provider(provider.clone());
             metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
+            OBSERVABILITY_METRIC_ENABLED.set(true).ok();
             Some(provider)
         }
     };
 
     // Logger（HTTP）
     let logger_provider = {
-        if log_ep.is_empty() {
+        if log_ep.is_empty() || !config.logs_export_enabled.unwrap_or(DEFAULT_OBS_LOGS_EXPORT_ENABLED) {
             None
         } else {
             let exporter = opentelemetry_otlp::LogExporter::builder()
@@ -541,7 +545,6 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
         .with(metrics_layer)
         .init();
 
-    OBSERVABILITY_METRIC_ENABLED.set(true).ok();
     counter!("rustfs.start.total").increment(1);
     info!(
         "Init observability (HTTP): trace='{}', metric='{}', log='{}'",

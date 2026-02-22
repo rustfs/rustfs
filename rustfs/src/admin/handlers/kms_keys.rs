@@ -14,11 +14,11 @@
 
 //! KMS key management admin API handlers
 
-use super::Operation;
 use crate::admin::auth::validate_admin_request;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::RemoteAddr;
-use hyper::{HeaderMap, StatusCode};
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{KmsError, get_global_kms_service_manager, types::*};
@@ -59,6 +59,40 @@ fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
         });
     }
     params
+}
+
+pub fn register_kms_key_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&CreateKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/delete").as_str(),
+        AdminOperation(&DeleteKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/cancel-deletion").as_str(),
+        AdminOperation(&CancelKmsKeyDeletionHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&ListKmsKeysHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/{key_id}").as_str(),
+        AdminOperation(&DescribeKmsKeyHandler {}),
+    )?;
+
+    Ok(())
 }
 
 /// Create a new KMS key

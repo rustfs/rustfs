@@ -29,6 +29,10 @@ mod data_usage_test;
 #[cfg(test)]
 mod kms;
 
+// Regression test for issue #1797
+#[cfg(test)]
+mod list_objects_duplicates_test;
+
 // Quota tests
 #[cfg(test)]
 mod quota_test;
@@ -54,12 +58,19 @@ mod policy;
 
 #[cfg(test)]
 mod compression_test;
+
+// Regression test for Issue #1878: DeleteMarkers not visible immediately after delete_objects
+#[cfg(test)]
+mod delete_objects_versioning_test;
 #[cfg(test)]
 mod protocols;
 
 // Object Lock tests
 #[cfg(test)]
 mod object_lock;
+
+#[cfg(test)]
+mod cluster_concurrency_test;
 
 // PutObject / MultipartUpload with checksum (Content-MD5, x-amz-checksum-*)
 #[cfg(test)]

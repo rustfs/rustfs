@@ -266,6 +266,17 @@ jobs:
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ubicloud-standard-2
     timeout-minutes: 60
+    strategy:
+          fail-fast: false
+          matrix:
+            include:
+              - variant: musl
+                file: Dockerfile
+                suffix: ""
+              - variant: glibc
+                file: Dockerfile.glibc
+                suffix: "-glibc"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -296,6 +307,7 @@ jobs:
           VERSION="${{ needs.build-check.outputs.version }}"
           SHORT_SHA="${{ needs.build-check.outputs.short_sha }}"
           CREATE_LATEST="${{ needs.build-check.outputs.create_latest }}"
+          VARIANT_SUFFIX="${{ matrix.suffix }}"
 
           # Convert version format for Dockerfile compatibility
           case "$VERSION" in
@@ -326,14 +338,14 @@ jobs:
 
           # Generate tags based on build type
           # Only support release and prerelease builds (no development builds)
-          TAGS="${{ env.REGISTRY_DOCKERHUB }}:${VERSION}"
+          TAGS="${{ env.REGISTRY_DOCKERHUB }}:${VERSION}${VARIANT_SUFFIX}"
 
           # Add channel tags for prereleases and latest for stable
           if [[ "$CREATE_LATEST" == "true" ]]; then
             # TODO: Temporary change - the current alpha version will also create the latest tag
             # After the version is stabilized, the logic here remains unchanged, but the upstream CREATE_LATEST setting needs to be restored.
             # Stable release (and temporary alpha versions)
-            TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest"
+            TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest${VARIANT_SUFFIX}"
           elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Prerelease channel tags (alpha, beta, rc)
             if [[ "$VERSION" == *"alpha"* ]]; then
@@ -345,7 +357,7 @@ jobs:
             fi
 
             if [[ -n "$CHANNEL" ]]; then
-              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}"
+              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}${VARIANT_SUFFIX}"
             fi
           fi
 
@@ -372,15 +384,15 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: ${{ matrix.file }}
           platforms: ${{ env.DOCKER_PLATFORMS }}
           push: ${{ needs.build-check.outputs.should_push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: |
-            type=gha,scope=docker-binary
+            type=gha,scope=docker-${{ matrix.variant }}
           cache-to: |
-            type=gha,mode=max,scope=docker-binary
+            type=gha,mode=max,scope=docker-${{ matrix.variant }}
           build-args: |
             BUILDTIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
             VERSION=${{ needs.build-check.outputs.version }}

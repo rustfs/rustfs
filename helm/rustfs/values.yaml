@@ -40,6 +40,9 @@ mode:
       rollingUpdate:
         maxSurge: 0
         maxUnavailable: 1
+    existingClaim:
+      dataClaim: ""
+      logsClaim: ""
   distributed:
     enabled: true
 
@@ -65,6 +68,10 @@ config:
     # Optionally enable support for virtual-hosted-style requests.
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"
+    log_rotation: # Specify log rotation settings
+      # size: 100 # Default value: 100 MB
+      # time: hour # Default value: hour, eg: day,hour,minute,second
+      # keep_files: 30 # number of rotated log files to keep
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
@@ -146,10 +153,22 @@ ingress:
 gatewayApi:
   enabled: false
   gatewayClass: traefik
+  listeners: # Specify which listeners to create on the Gateway. Only support for traefik gatewayClass at the moment.
+    http:
+      name: web
+      port: 8000
+    https:
+      name: websecure
+      port: 8443
   hostname: example.rustfs.com
   existingGateway:
     name: ""
     namespace: ""
+
+mtls:
+  enabled: false
+  serverOnly: false # If true, only server side TLS will be enabled. If false, both server and client side TLS will be enabled.
+  # This is for setting up mTLS for ingress.
 
 resources: {}
   # We usually recommend not to specify default resources and to leave this as a conscious
@@ -165,6 +184,7 @@ resources: {}
 
 # This is to setup the liveness and readiness probes more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
 livenessProbe:
+  enabled: true # omitted
   httpGet:
     path: /health
     port: endpoint
@@ -175,8 +195,9 @@ livenessProbe:
   failureThreshold: 3
 
 readinessProbe:
+  enabled: true # omitted
   httpGet:
-    path: /health
+    path: /health/ready
     port: endpoint
   initialDelaySeconds: 30
   periodSeconds: 5

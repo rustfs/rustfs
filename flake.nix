@@ -11,10 +11,21 @@
 {
   description = "RustFS - High-performance S3-compatible object storage";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      ...
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -28,10 +39,26 @@
       packages = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          overlays = [ (import rust-overlay) ];
+          pkgs = import nixpkgs { inherit system overlays; };
+
+          # Use the latest stable rust toolchain
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [
+              "rust-src"
+              "rust-analyzer"
+              "clippy"
+              "rustfmt"
+            ];
+          };
+
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
         in
         {
-          default = pkgs.rustPlatform.buildRustPackage {
+          default = rustPlatform.buildRustPackage {
             pname = "rustfs";
             version = "0.0.5";
 
@@ -47,12 +74,17 @@
               protobuf
             ];
 
-            buildInputs = with pkgs; [ openssl ];
+            buildInputs = with pkgs; [
+              openssl
+            ];
 
             cargoBuildFlags = [
               "--package"
               "rustfs"
             ];
+
+            # Set environment variables for build
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
 
             doCheck = false;
 
@@ -62,6 +94,34 @@
               license = pkgs.lib.licenses.asl20;
               mainProgram = "rustfs";
             };
+          };
+        }
+      );
+
+      devShells = forAllSystems (
+        system:
+        let
+          overlays = [ (import rust-overlay) ];
+          pkgs = import nixpkgs { inherit system overlays; };
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [
+              "rust-src"
+              "rust-analyzer"
+              "clippy"
+              "rustfmt"
+            ];
+          };
+        in
+        {
+          default = pkgs.mkShell {
+            packages = [
+              rustToolchain
+              pkgs.pkg-config
+              pkgs.protobuf
+              pkgs.openssl
+            ];
+
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
           };
         }
       );
