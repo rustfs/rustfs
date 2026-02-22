@@ -14,3 +14,5 @@
 
 //! Application layer module entry.
 //! Concrete use-case modules will be introduced incrementally in Phase 3.
+
+pub mod context;

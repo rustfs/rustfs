@@ -28,6 +28,7 @@ mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
+use crate::app::context::{AppContext, init_global_app_context};
 use crate::init::{
     add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
 };
@@ -364,6 +365,11 @@ async fn run(config: config::Config) -> Result<()> {
     // This ensures data is in memory before moving forward
     init_iam_sys(store.clone()).await.map_err(Error::other)?;
     readiness.mark_stage(SystemStage::IamReady);
+
+    let iam_interface =
+        rustfs_iam::get().map_err(|e| Error::other(format!("initialize app context IAM dependency failed: {e}")))?;
+    let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
+    let _app_context = init_global_app_context(AppContext::with_default_interfaces(store.clone(), iam_interface, kms_interface));
 
     add_bucket_notification_configuration(buckets.clone()).await;
 
