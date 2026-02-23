@@ -13,23 +13,19 @@
 // limitations under the License.
 
 use crate::app::bucket_usecase::DefaultBucketUsecase;
+use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::error::ApiError;
 use crate::storage::concurrency::{ConcurrencyManager, get_concurrency_manager};
-use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_content_sha256;
 use crate::storage::{
     access::{ReqInfo, authorize_request, has_bypass_governance_header},
-    options::{
-        copy_src_opts, del_opts, extract_metadata, get_complete_multipart_upload_opts, get_opts, parse_copy_source_range,
-        put_opts,
-    },
+    options::{copy_src_opts, del_opts, extract_metadata, get_opts, parse_copy_source_range},
 };
 use crate::storage::{
-    create_managed_encryption_material, decrypt_managed_encryption_key, derive_part_nonce, get_buffer_size_opt_in,
-    get_validated_store, has_replication_rules, is_managed_sse, parse_object_lock_legal_hold, parse_object_lock_retention,
-    validate_bucket_object_lock_enabled,
+    decrypt_managed_encryption_key, derive_part_nonce, get_buffer_size_opt_in, get_validated_store, has_replication_rules,
+    parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
 };
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -38,7 +34,6 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
 use metrics::{counter, histogram};
-use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::{
     bucket::{
         lifecycle::{
@@ -52,11 +47,7 @@ use rustfs_ecstore::{
         metadata_sys,
         metadata_sys::get_replication_config,
         object_lock::objectlock_sys::{check_object_lock_for_deletion, check_retention_for_modification},
-        quota::QuotaOperation,
-        replication::{
-            DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate,
-            schedule_replication, schedule_replication_delete,
-        },
+        replication::{DeletedObjectReplicationInfo, check_replicate_delete, schedule_replication_delete},
         tagging::{decode_tags, encode_tags},
         utils::serialize,
         versioning::VersioningApi,
@@ -67,11 +58,9 @@ use rustfs_ecstore::{
     disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
     error::{StorageError, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
-    set_disk::{MAX_PARTS_COUNT, is_valid_storage_class},
+    set_disk::MAX_PARTS_COUNT,
     store_api::{
         BucketOptions,
-        CompletePart,
-        MultipartUploadResult,
         ObjectIO,
         ObjectInfo,
         ObjectOptions,
@@ -83,7 +72,7 @@ use rustfs_ecstore::{
 };
 use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
 use rustfs_filemeta::RestoreStatusOps;
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
+use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use rustfs_kms::DataKey;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -95,8 +84,8 @@ use rustfs_utils::{
     CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
     get_request_user_agent,
     http::{
-        AMZ_CHECKSUM_TYPE, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
-        headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
+        headers::{AMZ_DECODED_CONTENT_LENGTH, RESERVED_METADATA_PREFIX_LOWER},
     },
     path::is_dir_object,
 };
@@ -997,35 +986,8 @@ impl S3 for FS {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let AbortMultipartUploadInput {
-            bucket, key, upload_id, ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let opts = &ObjectOptions::default();
-
-        // Special handling for abort_multipart_upload: Per AWS S3 API specification, this operation
-        // should return NoSuchUpload (404) when the upload_id doesn't exist, even if the format
-        // appears invalid. This differs from other multipart operations (upload_part, list_parts,
-        // complete_multipart_upload) which return InvalidArgument for malformed upload_ids.
-        // The lenient validation matches AWS S3 behavior where format validation is relaxed for
-        // abort operations to avoid leaking information about upload_id format requirements.
-        match store
-            .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
-            .await
-        {
-            Ok(_) => Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() })),
-            Err(err) => {
-                // Convert MalformedUploadID to NoSuchUpload for S3 API compatibility
-                if matches!(err, StorageError::MalformedUploadID(_)) {
-                    return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
-                }
-                Err(ApiError::from(err).into())
-            }
-        }
+        let usecase = DefaultMultipartUsecase::from_global();
+        usecase.execute_abort_multipart_upload(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1033,276 +995,8 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let mut helper =
-            OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
-        let input = req.input;
-        let CompleteMultipartUploadInput {
-            multipart_upload,
-            bucket,
-            key,
-            upload_id,
-            if_match,
-            if_none_match,
-            ..
-        } = input;
-
-        if if_match.is_some() || if_none_match.is_some() {
-            let Some(store) = new_object_layer_fn() else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-            };
-
-            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-                Ok(info) => {
-                    if !info.delete_marker {
-                        if let Some(ifmatch) = if_match
-                            && let Some(strong_etag) = ifmatch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                        if let Some(ifnonematch) = if_none_match
-                            && let Some(strong_etag) = ifnonematch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
-                        {
-                            return Err(s3_error!(PreconditionFailed));
-                        }
-                    }
-                }
-                Err(err) => {
-                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                        return Err(ApiError::from(err).into());
-                    }
-
-                    if if_match.is_some() && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
-                        return Err(ApiError::from(err).into());
-                    }
-                }
-            }
-        }
-
-        let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
-
-        let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
-
-        let uploaded_parts_vec = multipart_upload
-            .parts
-            .unwrap_or_default()
-            .into_iter()
-            .map(CompletePart::from)
-            .collect::<Vec<_>>();
-
-        // is part number sorted?
-        if !uploaded_parts_vec.is_sorted_by_key(|p| p.part_num) {
-            return Err(s3_error!(InvalidPart, "Part numbers must be sorted"));
-        }
-
-        // Handle duplicate part numbers: according to S3 specification, when the same part number
-        // is uploaded multiple times, the last uploaded part (in the list order) should be used.
-        // This can happen in concurrent upload scenarios where a part is re-uploaded before completion.
-        // We deduplicate by keeping the last occurrence of each part number using a HashMap.
-        use std::collections::HashMap;
-        let mut part_map: HashMap<usize, CompletePart> = HashMap::new();
-        for part in uploaded_parts_vec {
-            part_map.insert(part.part_num, part);
-        }
-
-        // Reconstruct the parts list in sorted order, keeping only the last occurrence of each part number
-        let mut uploaded_parts: Vec<CompletePart> = part_map.into_values().collect();
-        uploaded_parts.sort_by_key(|p| p.part_num);
-
-        // TODO: check object lock
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        // TDD: Get multipart info to extract encryption configuration before completing
-        info!(
-            "TDD: Attempting to get multipart info for bucket={}, key={}, upload_id={}",
-            bucket, key, upload_id
-        );
-
-        let multipart_info = store
-            .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        info!("TDD: Got multipart info successfully");
-        info!("TDD: Multipart info metadata: {:?}", multipart_info.user_defined);
-
-        // TDD: Extract encryption information from multipart upload metadata
-        let server_side_encryption = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption")
-            .map(|s| ServerSideEncryption::from(s.clone()));
-        info!(
-            "TDD: Raw encryption from metadata: {:?} -> parsed: {:?}",
-            multipart_info.user_defined.get("x-amz-server-side-encryption"),
-            server_side_encryption
-        );
-
-        let ssekms_key_id = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .cloned();
-
-        info!(
-            "TDD: Extracted encryption info - SSE: {:?}, KMS Key: {:?}",
-            server_side_encryption, ssekms_key_id
-        );
-
-        let obj_info = store
-            .clone()
-            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        // check quota after completing multipart upload
-        if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
-
-            match quota_checker
-                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
-                .await
-            {
-                Ok(check_result) => {
-                    if !check_result.allowed {
-                        // Quota exceeded, delete the completed object
-                        let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidRequest,
-                            format!(
-                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage.unwrap_or(0),
-                                check_result.quota_limit.unwrap_or(0)
-                            ),
-                        ));
-                    }
-                    // Update quota tracking after successful multipart upload
-                    if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
-                        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
-                    }
-                }
-                Err(e) => {
-                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
-                }
-            }
-        }
-
-        // Invalidate cache for the completed multipart object
-        let manager = get_concurrency_manager();
-        let mpu_bucket = bucket.clone();
-        let mpu_key = key.clone();
-        let mpu_version = obj_info.version_id.map(|v| v.to_string());
-        let mpu_version_clone = mpu_version.clone();
-        let mpu_version_for_event = mpu_version.clone();
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
-                .await;
-        });
-
-        info!(
-            "TDD: Creating output with SSE: {:?}, KMS Key: {:?}",
-            server_side_encryption, ssekms_key_id
-        );
-
-        let mut checksum_crc32 = input.checksum_crc32;
-        let mut checksum_crc32c = input.checksum_crc32c;
-        let mut checksum_sha1 = input.checksum_sha1;
-        let mut checksum_sha256 = input.checksum_sha256;
-        let mut checksum_crc64nvme = input.checksum_crc64nvme;
-        let mut checksum_type = input.checksum_type;
-
-        // checksum
-        let (checksums, _is_multipart) = obj_info
-            .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
-            .map_err(ApiError::from)?;
-
-        for (key, checksum) in checksums {
-            if key == AMZ_CHECKSUM_TYPE {
-                checksum_type = Some(ChecksumType::from(checksum));
-                continue;
-            }
-
-            match rustfs_rio::ChecksumType::from_string(key.as_str()) {
-                rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
-                rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
-                rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
-                rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
-                rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
-                _ => (),
-            }
-        }
-
-        let region = rustfs_ecstore::global::get_global_region().unwrap_or_else(|| "us-east-1".to_string());
-        let output = CompleteMultipartUploadOutput {
-            bucket: Some(bucket.clone()),
-            key: Some(key.clone()),
-            e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(region.clone()),
-            server_side_encryption: server_side_encryption.clone(), // TDD: Return encryption info
-            ssekms_key_id: ssekms_key_id.clone(),                   // TDD: Return KMS key ID if present
-            checksum_crc32: checksum_crc32.clone(),
-            checksum_crc32c: checksum_crc32c.clone(),
-            checksum_sha1: checksum_sha1.clone(),
-            checksum_sha256: checksum_sha256.clone(),
-            checksum_crc64nvme: checksum_crc64nvme.clone(),
-            checksum_type: checksum_type.clone(),
-            version_id: mpu_version,
-            ..Default::default()
-        };
-        info!(
-            "TDD: Created output: SSE={:?}, KMS={:?}",
-            output.server_side_encryption, output.ssekms_key_id
-        );
-
-        let helper_output = entity::CompleteMultipartUploadOutput {
-            bucket: Some(bucket.clone()),
-            key: Some(key.clone()),
-            e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(region),
-            server_side_encryption, // TDD: Return encryption info
-            ssekms_key_id,          // TDD: Return KMS key ID if present
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
-            checksum_type,
-            ..Default::default()
-        };
-
-        let mt2 = HashMap::new();
-        let replicate_options =
-            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
-
-        let dsc = must_replicate(&bucket, &key, replicate_options).await;
-
-        if dsc.replicate_any() {
-            warn!("need multipart replication");
-            schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
-        }
-        info!(
-            "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
-            output.server_side_encryption, output.ssekms_key_id
-        );
-
-        // Set object info for event notification
-        helper = helper.object(obj_info);
-        if let Some(version_id) = &mpu_version_for_event {
-            helper = helper.version_id(version_id.clone());
-        }
-
-        let helper_result = Ok(S3Response::new(helper_output));
-        let _ = helper.complete(&helper_result);
-        Ok(S3Response::new(output))
+        let usecase = DefaultMultipartUsecase::from_global();
+        usecase.execute_complete_multipart_upload(req).await
     }
 
     /// Copy an object from one location to another
@@ -1327,153 +1021,8 @@ impl S3 for FS {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:CreateMultipartUpload");
-        let CreateMultipartUploadInput {
-            bucket,
-            key,
-            tagging,
-            version_id,
-            storage_class,
-            server_side_encryption,
-            sse_customer_algorithm,
-            sse_customer_key_md5,
-            ssekms_key_id,
-            ..
-        } = req.input.clone();
-
-        // Validate storage class if provided
-        if let Some(ref storage_class) = storage_class
-            && !is_valid_storage_class(storage_class.as_str())
-        {
-            return Err(s3_error!(InvalidStorageClass));
-        }
-
-        // mc cp step 3
-
-        // debug!("create_multipart_upload meta {:?}", &metadata);
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let mut metadata = extract_metadata(&req.headers);
-
-        if let Some(tags) = tagging {
-            metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
-        }
-
-        // TDD: Get bucket SSE configuration for multipart upload
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-        debug!("TDD: Got bucket SSE config for multipart: {:?}", bucket_sse_config);
-
-        // TDD: Determine effective encryption (request parameters override bucket defaults)
-        let original_sse = server_side_encryption.clone();
-        let effective_sse = server_side_encryption.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                debug!("TDD: Processing bucket SSE config for multipart: {:?}", config);
-                config.rules.first().and_then(|rule| {
-                    debug!("TDD: Processing SSE rule for multipart: {:?}", rule);
-                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                        debug!("TDD: Found SSE default for multipart: {:?}", sse);
-                        match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
-                        }
-                    })
-                })
-            })
-        });
-        debug!("TDD: effective_sse for multipart={:?} (original={:?})", effective_sse, original_sse);
-
-        let _original_kms_key_id = ssekms_key_id.clone();
-        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
-
-        // Store effective SSE information in metadata for multipart upload
-        if let Some(sse_alg) = &sse_customer_algorithm {
-            metadata.insert(
-                "x-amz-server-side-encryption-customer-algorithm".to_string(),
-                sse_alg.as_str().to_string(),
-            );
-        }
-        if let Some(sse_md5) = &sse_customer_key_md5 {
-            metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
-        }
-
-        if let Some(sse) = &effective_sse {
-            if is_managed_sse(sse) {
-                let material = create_managed_encryption_material(&bucket, &key, sse, effective_kms_key_id.clone(), 0).await?;
-
-                let ManagedEncryptionMaterial {
-                    data_key: _,
-                    headers,
-                    kms_key_id: kms_key_used,
-                } = material;
-
-                metadata.extend(headers.into_iter());
-                effective_kms_key_id = Some(kms_key_used.clone());
-            } else {
-                metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
-            }
-        }
-
-        if let Some(kms_key_id) = &effective_kms_key_id {
-            metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
-        }
-
-        if is_compressible(&req.headers, &key) {
-            metadata.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
-                CompressionAlgorithm::default().to_string(),
-            );
-        }
-
-        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
-            .await
-            .map_err(ApiError::from)?;
-
-        let checksum_type = rustfs_rio::ChecksumType::from_header(&req.headers);
-        if checksum_type.is(rustfs_rio::ChecksumType::INVALID) {
-            return Err(s3_error!(InvalidArgument, "Invalid checksum type"));
-        } else if checksum_type.is_set() && !checksum_type.is(rustfs_rio::ChecksumType::TRAILING) {
-            opts.want_checksum = Some(rustfs_rio::Checksum {
-                checksum_type,
-                ..Default::default()
-            });
-        }
-
-        let MultipartUploadResult {
-            upload_id,
-            checksum_algo,
-            checksum_type,
-        } = store
-            .new_multipart_upload(&bucket, &key, &opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        let output = CreateMultipartUploadOutput {
-            bucket: Some(bucket),
-            key: Some(key),
-            upload_id: Some(upload_id),
-            server_side_encryption: effective_sse, // TDD: Return effective encryption config
-            sse_customer_algorithm,
-            ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
-            checksum_algorithm: checksum_algo.map(ChecksumAlgorithm::from),
-            checksum_type: checksum_type.map(ChecksumType::from),
-            ..Default::default()
-        };
-
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
+        let usecase = DefaultMultipartUsecase::from_global();
+        usecase.execute_create_multipart_upload(req).await
     }
 
     /// Delete a bucket
@@ -3659,242 +3208,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
-        let input = req.input;
-        let UploadPartInput {
-            body,
-            bucket,
-            key,
-            upload_id,
-            part_number,
-            content_length,
-            sse_customer_algorithm: _sse_customer_algorithm,
-            sse_customer_key: _sse_customer_key,
-            sse_customer_key_md5: _sse_customer_key_md5,
-            // content_md5,
-            ..
-        } = input;
-
-        let part_id = part_number as usize;
-
-        // let upload_id =
-
-        let mut size = content_length;
-        let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
-
-        if size.is_none() {
-            if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH)
-                && let Some(x) = atoi::atoi::<i64>(val.as_bytes())
-            {
-                size = Some(x);
-            }
-
-            if size.is_none() {
-                let mut total = 0i64;
-                let mut buffer = bytes::BytesMut::new();
-                while let Some(chunk) = body_stream.next().await {
-                    let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
-                    total += chunk.len() as i64;
-                    buffer.extend_from_slice(&chunk);
-                }
-
-                if total <= 0 {
-                    return Err(s3_error!(UnexpectedContent));
-                }
-
-                size = Some(total);
-                let combined = buffer.freeze();
-                let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
-                body_stream = StreamingBlob::wrap(stream);
-            }
-        }
-
-        // Get multipart info early to check if managed encryption will be applied
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let opts = ObjectOptions::default();
-        let fi = store
-            .get_multipart_info(&bucket, &key, &upload_id, &opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        // Check if managed encryption will be applied
-        let will_apply_managed_encryption = decrypt_managed_encryption_key(&bucket, &key, &fi.user_defined)
-            .await?
-            .is_some();
-
-        // If managed encryption will be applied, and we have Content-Length, buffer the entire body
-        // This is necessary because encryption changes the data size, which causes Content-Length mismatches
-        if will_apply_managed_encryption && size.is_some() {
-            let mut total = 0i64;
-            let mut buffer = bytes::BytesMut::new();
-            while let Some(chunk) = body_stream.next().await {
-                let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
-                total += chunk.len() as i64;
-                buffer.extend_from_slice(&chunk);
-            }
-
-            if total <= 0 {
-                return Err(s3_error!(UnexpectedContent));
-            }
-
-            size = Some(total);
-            let combined = buffer.freeze();
-            let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
-            body_stream = StreamingBlob::wrap(stream);
-        }
-
-        let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
-
-        // Apply adaptive buffer sizing based on part size for optimal streaming performance.
-        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
-        // Buffer sizes range from 32KB to 4MB depending on part size and configured workload profile.
-        let buffer_size = get_buffer_size_opt_in(size);
-        let body = tokio::io::BufReader::with_capacity(
-            buffer_size,
-            StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
-        );
-
-        // mc cp step 4
-
-        let is_compressible = fi
-            .user_defined
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}compression").as_str());
-
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
-
-        let actual_size = size;
-
-        // TODO: Apply SSE-C encryption for upload_part if needed
-        // Temporarily commented out to debug multipart issues
-        /*
-        // Apply SSE-C encryption if customer provided key before any other processing
-        if let (Some(_), Some(sse_key), Some(sse_key_md5_provided)) =
-            (&_sse_customer_algorithm, &_sse_customer_key, &_sse_customer_key_md5) {
-
-            // Decode the base64 key
-            let key_bytes = BASE64_STANDARD.decode(sse_key)
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid SSE-C key: {}", e))))?;
-
-            // Verify key length (should be 32 bytes for AES-256)
-            if key_bytes.len() != 32 {
-                return Err(ApiError::from(StorageError::other("SSE-C key must be 32 bytes")).into());
-            }
-
-            // Convert Vec<u8> to [u8; 32]
-            let mut key_array = [0u8; 32];
-            key_array.copy_from_slice(&key_bytes[..32]);
-
-            // Verify MD5 hash of the key matches what the client claims
-            let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
-            if computed_md5 != *sse_key_md5_provided {
-                return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")).into());
-            }
-
-            // Generate a deterministic nonce from object key for consistency
-            let mut nonce = [0u8; 12];
-            let nonce_source = format!("{}-{}", bucket, key);
-            let nonce_hash = md5::compute(nonce_source.as_bytes());
-            nonce.copy_from_slice(&nonce_hash.0[..12]);
-
-            // Apply encryption - this will change the size so we need to handle it
-            let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
-            reader = Box::new(encrypt_reader);
-            // When encrypting, size becomes unknown since encryption adds authentication tags
-            size = -1;
-        }
-        */
-
-        let mut md5hex = if let Some(base64_md5) = input.content_md5 {
-            let md5 = base64_simd::STANDARD
-                .decode_to_vec(base64_md5.as_bytes())
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
-            Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
-        } else {
-            None
-        };
-
-        let mut sha256hex = get_content_sha256(&req.headers);
-
-        if is_compressible {
-            let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
-
-            if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
-                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
-            }
-
-            let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
-            reader = Box::new(compress_reader);
-            size = HashReader::SIZE_PRESERVE_LAYER;
-            md5hex = None;
-            sha256hex = None;
-        }
-
-        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
-
-        if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
-            return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
-        }
-
-        if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &fi.user_defined).await? {
-            let part_nonce = derive_part_nonce(base_nonce, part_id);
-            let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                .map_err(ApiError::from)?;
-        }
-
-        let mut reader = PutObjReader::new(reader);
-
-        let info = store
-            .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        let mut checksum_crc32 = input.checksum_crc32;
-        let mut checksum_crc32c = input.checksum_crc32c;
-        let mut checksum_sha1 = input.checksum_sha1;
-        let mut checksum_sha256 = input.checksum_sha256;
-        let mut checksum_crc64nvme = input.checksum_crc64nvme;
-
-        if let Some(alg) = &input.checksum_algorithm
-            && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
-                let key = match alg.as_str() {
-                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
-                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
-                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
-                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
-                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
-                    _ => return None,
-                };
-                trailer.read(|headers| {
-                    headers
-                        .get(key.unwrap_or_default())
-                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
-                })
-            })
-        {
-            match alg.as_str() {
-                ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
-                ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
-                ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
-                ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
-                ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
-                _ => (),
-            }
-        }
-
-        let output = UploadPartOutput {
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
-            e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            ..Default::default()
-        };
-
-        Ok(S3Response::new(output))
+        let usecase = DefaultMultipartUsecase::from_global();
+        usecase.execute_upload_part(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
