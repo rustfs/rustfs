@@ -14,6 +14,7 @@
 
 use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::server::{HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
@@ -51,9 +52,9 @@ pub(crate) enum HealthProbe {
 }
 
 pub(crate) fn collect_dependency_readiness() -> (bool, bool) {
-    let storage_ready = rustfs_ecstore::new_object_layer_fn().is_some();
-    let iam_ready = rustfs_iam::get().is_ok();
-    (storage_ready, iam_ready)
+    let usecase = DefaultAdminUsecase::from_global();
+    let readiness = usecase.execute_collect_dependency_readiness();
+    (readiness.storage_ready, readiness.iam_ready)
 }
 
 pub(crate) fn health_check_state(storage_ready: bool, iam_ready: bool, probe: HealthProbe) -> HealthCheckState {
