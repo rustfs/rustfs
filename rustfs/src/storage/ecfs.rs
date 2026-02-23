@@ -16,7 +16,7 @@ use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::error::ApiError;
-use crate::storage::concurrency::{ConcurrencyManager, get_concurrency_manager};
+use crate::storage::concurrency::get_concurrency_manager;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_content_sha256;
 use crate::storage::{
@@ -29,14 +29,12 @@ use crate::storage::{
 };
 use futures::StreamExt;
 use http::HeaderMap;
-use metrics::{counter, histogram};
 use rustfs_ecstore::{
     bucket::{
         metadata::{BUCKET_ACL_CONFIG, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG},
         metadata_sys,
         object_lock::objectlock_sys::{check_object_lock_for_deletion, check_retention_for_modification},
         replication::{DeletedObjectReplicationInfo, check_replicate_delete, schedule_replication_delete},
-        tagging::{decode_tags, encode_tags},
         utils::serialize,
         versioning::VersioningApi,
         versioning_sys::BucketVersioningSys,
@@ -82,7 +80,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, AsyncSeek};
 use tokio_tar::Archive;
 use tokio_util::io::StreamReader;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 macro_rules! try_ {
@@ -468,7 +466,7 @@ fn grantee_from_grant(grantee: &Grantee) -> Result<StoredGrantee, S3Error> {
     }
 }
 
-fn stored_acl_from_policy(policy: &AccessControlPolicy, owner_fallback: &StoredOwner) -> Result<StoredAcl, S3Error> {
+pub(crate) fn stored_acl_from_policy(policy: &AccessControlPolicy, owner_fallback: &StoredOwner) -> Result<StoredAcl, S3Error> {
     let owner = policy
         .owner
         .as_ref()
@@ -909,25 +907,6 @@ impl FS {
         result
     }
 
-    /// Auxiliary functions: parse version ID
-    ///
-    /// # Arguments
-    /// * `version_id` - An optional string representing the version ID to be parsed.
-    ///
-    /// # Returns
-    /// * `S3Result<Option<Uuid>>` - A result containing an optional UUID if parsing is successful, or an S3 error if parsing fails.
-    fn parse_version_id(&self, version_id: Option<String>) -> S3Result<Option<Uuid>> {
-        if let Some(vid) = version_id {
-            let uuid = Uuid::parse_str(&vid).map_err(|e| {
-                error!("Invalid version ID: {}", e);
-                s3_error!(InvalidArgument, "Invalid version ID")
-            })?;
-            Ok(Some(uuid))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub(crate) fn normalize_delete_objects_version_id(
         &self,
         version_id: Option<String>,
@@ -952,6 +931,18 @@ pub(crate) const ACL_GROUP_AUTHENTICATED_USERS: &str = "http://acs.amazonaws.com
 
 pub(crate) fn is_public_canned_acl(acl: &str) -> bool {
     matches!(acl, "public-read" | "public-read-write" | "authenticated-read")
+}
+
+pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<Uuid>> {
+    if let Some(vid) = version_id {
+        let uuid = Uuid::parse_str(&vid).map_err(|e| {
+            error!("Invalid version ID: {}", e);
+            s3_error!(InvalidArgument, "Invalid version ID")
+        })?;
+        Ok(Some(uuid))
+    } else {
+        Ok(None)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1076,57 +1067,8 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedDeleteTagging, "s3:DeleteObjectTagging");
-        let DeleteObjectTaggingInput {
-            bucket,
-            key: object,
-            version_id,
-            ..
-        } = req.input.clone();
-
-        let Some(store) = new_object_layer_fn() else {
-            error!("Store not initialized");
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        // Support versioned objects
-        let version_id_for_parse = version_id.clone();
-        let opts = ObjectOptions {
-            version_id: self.parse_version_id(version_id_for_parse)?.map(Into::into),
-            ..Default::default()
-        };
-
-        // TODO: Replicate (keep the original TODO, if further replication logic is needed)
-        store.delete_object_tags(&bucket, &object, &opts).await.map_err(|e| {
-            error!("Failed to delete object tags: {}", e);
-            ApiError::from(e)
-        })?;
-
-        // Invalidate cache for the deleted tagged object
-        let manager = get_concurrency_manager();
-        let version_id_clone = version_id.clone();
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&bucket, &object, version_id_clone.as_deref())
-                .await;
-            debug!(
-                "Cache invalidated for deleted tagged object: bucket={}, object={}, version_id={:?}",
-                bucket, object, version_id_clone
-            );
-        });
-
-        // Add metrics
-        counter!("rustfs.delete_object_tagging.success").increment(1);
-
-        let version_id_resp = version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id_resp);
-
-        let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
-        let _ = helper.complete(&result);
-        let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "delete").record(duration.as_secs_f64());
-        result
+        let usecase = DefaultObjectUsecase::from_global();
+        usecase.execute_delete_object_tagging(req).await
     }
 
     /// Delete multiple objects
@@ -1597,42 +1539,8 @@ impl S3 for FS {
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
-        let GetObjectAclInput {
-            bucket, key, version_id, ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
-
-        let bucket_owner = default_owner();
-        let object_owner = info
-            .user_defined
-            .get(INTERNAL_ACL_METADATA_KEY)
-            .and_then(|acl| serde_json::from_str::<StoredAcl>(acl).ok())
-            .map(|acl| acl.owner)
-            .unwrap_or_else(default_owner);
-
-        let stored_acl = info
-            .user_defined
-            .get(INTERNAL_ACL_METADATA_KEY)
-            .map(|acl| parse_acl_json_or_canned_object(acl, &bucket_owner, &object_owner))
-            .unwrap_or_else(|| stored_acl_from_canned_object(ObjectCannedACL::PRIVATE, &bucket_owner, &object_owner));
-
-        let mut sorted_grants = stored_acl.grants.clone();
-        sorted_grants.sort_by_key(|grant| grant.grantee.grantee_type != "Group");
-        let grants = sorted_grants.iter().map(stored_grant_to_dto).collect();
-
-        Ok(S3Response::new(GetObjectAclOutput {
-            grants: Some(grants),
-            owner: Some(stored_owner_to_dto(&stored_acl.owner)),
-            ..Default::default()
-        }))
+        let usecase = DefaultObjectUsecase::from_global();
+        usecase.execute_get_object_acl(req).await
     }
 
     async fn get_object_attributes(
@@ -1808,43 +1716,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
-        let start_time = std::time::Instant::now();
-        let GetObjectTaggingInput { bucket, key: object, .. } = req.input;
-
-        info!("Starting get_object_tagging for bucket: {}, object: {}", bucket, object);
-
-        let Some(store) = new_object_layer_fn() else {
-            error!("Store not initialized");
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        // Support versioned objects
-        let version_id = req.input.version_id.clone();
-        let opts = ObjectOptions {
-            version_id: self.parse_version_id(version_id)?.map(Into::into),
-            ..Default::default()
-        };
-
-        let tags = store.get_object_tags(&bucket, &object, &opts).await.map_err(|e| {
-            if is_err_object_not_found(&e) {
-                error!("Object not found: {}", e);
-                return s3_error!(NoSuchKey);
-            }
-            error!("Failed to get object tags: {}", e);
-            ApiError::from(e).into()
-        })?;
-
-        let tag_set = decode_tags(tags.as_str());
-        debug!("Decoded tag set: {:?}", tag_set);
-
-        // Add metrics
-        counter!("rustfs.get_object_tagging.success").increment(1);
-        let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
-        Ok(S3Response::new(GetObjectTaggingOutput {
-            tag_set,
-            version_id: req.input.version_id.clone(),
-        }))
+        let usecase = DefaultObjectUsecase::from_global();
+        usecase.execute_get_object_tagging(req).await
     }
 
     #[instrument(level = "debug", skip(self, _req))]
@@ -2363,86 +2236,8 @@ impl S3 for FS {
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
-        let PutObjectAclInput {
-            bucket,
-            key,
-            acl,
-            access_control_policy,
-            grant_full_control,
-            grant_read,
-            grant_read_acp,
-            grant_write,
-            grant_write_acp,
-            version_id,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
-
-        let bucket_owner = default_owner();
-        let existing_owner = info
-            .user_defined
-            .get(INTERNAL_ACL_METADATA_KEY)
-            .and_then(|acl| serde_json::from_str::<StoredAcl>(acl).ok())
-            .map(|acl| acl.owner)
-            .unwrap_or_else(|| bucket_owner.clone());
-
-        let mut stored_acl = access_control_policy
-            .as_ref()
-            .map(|policy| stored_acl_from_policy(policy, &existing_owner))
-            .transpose()?;
-
-        if stored_acl.is_none() {
-            stored_acl = stored_acl_from_grant_headers(
-                &existing_owner,
-                grant_read.map(|v| v.to_string()),
-                grant_write.map(|v| v.to_string()),
-                grant_read_acp.map(|v| v.to_string()),
-                grant_write_acp.map(|v| v.to_string()),
-                grant_full_control.map(|v| v.to_string()),
-            )?;
-        }
-
-        if stored_acl.is_none()
-            && let Some(canned) = acl
-        {
-            stored_acl = Some(stored_acl_from_canned_object(canned.as_str(), &bucket_owner, &existing_owner));
-        }
-
-        let stored_acl =
-            stored_acl.unwrap_or_else(|| stored_acl_from_canned_object(ObjectCannedACL::PRIVATE, &bucket_owner, &existing_owner));
-
-        if let Ok((config, _)) = metadata_sys::get_public_access_block_config(&bucket).await
-            && config.block_public_acls.unwrap_or(false)
-            && stored_acl.grants.iter().any(is_public_grant)
-        {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
-        }
-
-        let acl_data = serialize_acl(&stored_acl)?;
-        let mut eval_metadata = HashMap::new();
-        eval_metadata.insert(INTERNAL_ACL_METADATA_KEY.to_string(), String::from_utf8_lossy(&acl_data).to_string());
-
-        let popts = ObjectOptions {
-            mod_time: info.mod_time,
-            version_id: opts.version_id,
-            eval_metadata: Some(eval_metadata),
-            ..Default::default()
-        };
-
-        store.put_object_metadata(&bucket, &key, &popts).await.map_err(|e| {
-            error!("put_object_metadata failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
-
-        Ok(S3Response::new(PutObjectAclOutput::default()))
+        let usecase = DefaultObjectUsecase::from_global();
+        usecase.execute_put_object_acl(req).await
     }
 
     async fn put_object_legal_hold(
@@ -2642,99 +2437,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, "s3:PutObjectTagging");
-        let PutObjectTaggingInput {
-            bucket,
-            key: object,
-            tagging,
-            ..
-        } = req.input.clone();
-
-        if tagging.tag_set.len() > 10 {
-            // TOTO: Note that Amazon S3 limits the maximum number of tags to 10 tags per object.
-            // Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html
-            // Reference: https://docs.aws.amazon.com/zh_cn/AmazonS3/latest/API/API_PutObjectTagging.html
-            // https://github.com/minio/mint/blob/master/run/core/aws-sdk-go-v2/main.go#L1647
-            error!("Tag set exceeds maximum of 10 tags: {}", tagging.tag_set.len());
-            return Err(s3_error!(InvalidTag, "Cannot have more than 10 tags per object"));
-        }
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
-        for tag in &tagging.tag_set {
-            let key = tag.key.as_ref().filter(|k| !k.is_empty()).ok_or_else(|| {
-                error!("Empty tag key");
-                s3_error!(InvalidTag, "Tag key cannot be empty")
-            })?;
-
-            if key.len() > 128 {
-                error!("Tag key too long: {} bytes", key.len());
-                return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
-            }
-
-            // allow to set the value of a tag to an empty string, but cannot set it to a null value.
-            // Reference：https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/UserGuide/Using_Tags.html#tag-restrictions
-            let value = tag.value.as_ref().ok_or_else(|| {
-                error!("Null tag value");
-                s3_error!(InvalidTag, "Tag value cannot be null")
-            })?;
-
-            if value.len() > 256 {
-                error!("Tag value too long: {} bytes", value.len());
-                return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
-            }
-
-            if !tag_keys.insert(key) {
-                error!("Duplicate tag key: {}", key);
-                return Err(s3_error!(InvalidTag, "Cannot provide multiple Tags with the same key"));
-            }
-        }
-
-        let tags = encode_tags(tagging.tag_set);
-        debug!("Encoded tags: {}", tags);
-
-        // TODO: getOpts, Replicate
-        // Support versioned objects
-        let version_id = req.input.version_id.clone();
-        let opts = ObjectOptions {
-            version_id: self.parse_version_id(version_id)?.map(Into::into),
-            ..Default::default()
-        };
-
-        store.put_object_tags(&bucket, &object, &tags, &opts).await.map_err(|e| {
-            error!("Failed to put object tags: {}", e);
-            counter!("rustfs.put_object_tagging.failure").increment(1);
-            ApiError::from(e)
-        })?;
-
-        // Invalidate cache for the tagged object
-        let manager = get_concurrency_manager();
-        let version_id = req.input.version_id.clone();
-        let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&bucket, &object, version_id.as_deref())
-                .await;
-            debug!("Cache invalidated for tagged object: {}", cache_key);
-        });
-
-        // Add metrics
-        counter!("rustfs.put_object_tagging.success").increment(1);
-
-        let version_id_resp = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id_resp);
-
-        let result = Ok(S3Response::new(PutObjectTaggingOutput {
-            version_id: req.input.version_id.clone(),
-        }));
-        let _ = helper.complete(&result);
-        let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
-        result
+        let usecase = DefaultObjectUsecase::from_global();
+        usecase.execute_put_object_tagging(req).await
     }
 
     async fn restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
