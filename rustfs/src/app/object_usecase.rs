@@ -32,11 +32,18 @@ use crate::storage::options::{
 use crate::storage::*;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
+use datafusion::arrow::{
+    csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
+};
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
+    lifecycle::{
+        bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts},
+        lifecycle::{self, TransitionOptions},
+    },
     metadata_sys,
     object_lock::objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion},
     quota::QuotaOperation,
@@ -59,7 +66,11 @@ use rustfs_filemeta::{
 };
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, EtagReader, HardLimitReader, HashReader, Reader, WarpReader};
-use rustfs_s3select_api::object_store::bytes_stream;
+use rustfs_s3select_api::{
+    object_store::bytes_stream,
+    query::{Context, Query},
+};
+use rustfs_s3select_query::get_global_db;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
@@ -72,7 +83,7 @@ use rustfs_utils::http::{
 };
 use rustfs_utils::path::{is_dir_object, path_join_buf};
 use s3s::dto::*;
-use s3s::header::X_AMZ_RESTORE;
+use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -80,6 +91,8 @@ use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
@@ -2149,6 +2162,267 @@ impl DefaultObjectUsecase {
 
         result
     }
+
+    #[instrument(level = "debug", skip(self, req))]
+    pub async fn execute_restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let RestoreObjectInput {
+            bucket,
+            key: object,
+            restore_request: rreq,
+            version_id,
+            ..
+        } = req.input.clone();
+
+        let rreq = rreq.ok_or_else(|| {
+            S3Error::with_message(S3ErrorCode::Custom("ErrValidRestoreObject".into()), "restore request is required")
+        })?;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let version_id_str = version_id.clone().unwrap_or_default();
+        let opts = post_restore_opts(&version_id_str, &bucket, &object)
+            .await
+            .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?;
+
+        let mut obj_info = store
+            .get_object_info(&bucket, &object, &opts)
+            .await
+            .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "restore object failed."))?;
+
+        // Check if object is in a transitioned state
+        if obj_info.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrInvalidTransitionedState".into()),
+                "restore object failed.",
+            ));
+        }
+
+        // Validate restore request
+        if let Err(e) = rreq.validate(store.clone()) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrValidRestoreObject".into()),
+                format!("Restore object validation failed: {}", e),
+            ));
+        }
+
+        // Check if restore is already in progress
+        if obj_info.restore_ongoing && (rreq.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT")) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrObjectRestoreAlreadyInProgress".into()),
+                "restore object failed.",
+            ));
+        }
+
+        let mut already_restored = false;
+        if let Some(restore_expires) = obj_info.restore_expires
+            && !obj_info.restore_ongoing
+            && restore_expires.unix_timestamp() != 0
+        {
+            already_restored = true;
+        }
+
+        let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), *rreq.days.as_ref().unwrap_or(&1));
+        let mut metadata = obj_info.user_defined.clone();
+
+        let mut header = HeaderMap::new();
+
+        let obj_info_ = obj_info.clone();
+        if rreq.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT") {
+            obj_info.metadata_only = true;
+            metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), rreq.days.unwrap_or(1).to_string());
+            let request_date = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {
+                S3Error::with_message(S3ErrorCode::InternalError, format!("format restore request date failed: {}", e))
+            })?;
+            metadata.insert(AMZ_RESTORE_REQUEST_DATE.to_string(), request_date);
+            if already_restored {
+                metadata.insert(
+                    X_AMZ_RESTORE.as_str().to_string(),
+                    RestoreStatus {
+                        is_restore_in_progress: Some(false),
+                        restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+                    }
+                    .to_string(),
+                );
+            } else {
+                metadata.insert(
+                    X_AMZ_RESTORE.as_str().to_string(),
+                    RestoreStatus {
+                        is_restore_in_progress: Some(true),
+                        restore_expiry_date: Some(Timestamp::from(OffsetDateTime::now_utc())),
+                    }
+                    .to_string(),
+                );
+            }
+            obj_info.user_defined = metadata;
+
+            store
+                .clone()
+                .copy_object(
+                    &bucket,
+                    &object,
+                    &bucket,
+                    &object,
+                    &mut obj_info,
+                    &ObjectOptions {
+                        version_id: obj_info_.version_id.map(|v| v.to_string()),
+                        ..Default::default()
+                    },
+                    &ObjectOptions {
+                        version_id: obj_info_.version_id.map(|v| v.to_string()),
+                        mod_time: obj_info_.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed."))?;
+
+            if already_restored {
+                let output = RestoreObjectOutput {
+                    request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+                    restore_output_path: None,
+                };
+                return Ok(S3Response::new(output));
+            }
+        }
+
+        // Handle output location for SELECT requests
+        if let Some(output_location) = &rreq.output_location
+            && let Some(s3) = &output_location.s3
+            && !s3.bucket_name.is_empty()
+        {
+            let restore_object = Uuid::new_v4().to_string();
+            if let Ok(header_value) = format!("{}{}{}", s3.bucket_name, s3.prefix, restore_object).parse() {
+                header.insert(X_AMZ_RESTORE_OUTPUT_PATH, header_value);
+            }
+        }
+
+        // Spawn restoration task in the background
+        let store_clone = store.clone();
+        let bucket_clone = bucket.clone();
+        let object_clone = object.clone();
+        let rreq_clone = rreq.clone();
+        let version_id_clone = version_id.clone();
+
+        tokio::spawn(async move {
+            let opts = ObjectOptions {
+                transition: TransitionOptions {
+                    restore_request: rreq_clone,
+                    restore_expiry,
+                    ..Default::default()
+                },
+                version_id: version_id_clone,
+                ..Default::default()
+            };
+
+            if let Err(err) = store_clone
+                .restore_transitioned_object(&bucket_clone, &object_clone, &opts)
+                .await
+            {
+                warn!(
+                    "unable to restore transitioned bucket/object {}/{}: {}",
+                    bucket_clone,
+                    object_clone,
+                    err.to_string()
+                );
+                // Note: Errors from background tasks cannot be returned to client
+                // Consider adding to monitoring/metrics system
+            } else {
+                info!("successfully restored transitioned object: {}/{}", bucket_clone, object_clone);
+            }
+        });
+
+        let output = RestoreObjectOutput {
+            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+            restore_output_path: None,
+        };
+
+        Ok(S3Response::with_headers(output, header))
+    }
+
+    #[instrument(level = "debug", skip(self, req))]
+    pub async fn execute_select_object_content(
+        &self,
+        req: S3Request<SelectObjectContentInput>,
+    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        info!("handle select_object_content");
+
+        let input = Arc::new(req.input);
+        info!("{:?}", input);
+
+        let db = get_global_db((*input).clone(), false).await.map_err(|e| {
+            error!("get global db failed, {}", e.to_string());
+            s3_error!(InternalError, "{}", e.to_string())
+        })?;
+        let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
+        let result = db
+            .execute(&query)
+            .await
+            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
+
+        let results = result
+            .result()
+            .chunk_result()
+            .await
+            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?
+            .to_vec();
+
+        let mut buffer = Vec::new();
+        if input.request.output_serialization.csv.is_some() {
+            let mut csv_writer = CsvWriterBuilder::new().with_header(false).build(&mut buffer);
+            for batch in results {
+                csv_writer
+                    .write(&batch)
+                    .map_err(|e| s3_error!(InternalError, "can't encode output to csv. e: {}", e.to_string()))?;
+            }
+        } else if input.request.output_serialization.json.is_some() {
+            let mut json_writer = JsonWriterBuilder::new()
+                .with_explicit_nulls(true)
+                .build::<_, JsonArray>(&mut buffer);
+            for batch in results {
+                json_writer
+                    .write(&batch)
+                    .map_err(|e| s3_error!(InternalError, "can't encode output to json. e: {}", e.to_string()))?;
+            }
+            json_writer
+                .finish()
+                .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
+        } else {
+            return Err(s3_error!(
+                InvalidArgument,
+                "Unsupported output format. Supported formats are CSV and JSON"
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
+        let stream = ReceiverStream::new(rx);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
+                .await;
+            let _ = tx
+                .send(Ok(SelectObjectContentEvent::Records(RecordsEvent {
+                    payload: Some(Bytes::from(buffer)),
+                })))
+                .await;
+            let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
+
+            drop(tx);
+        });
+
+        Ok(S3Response::new(SelectObjectContentOutput {
+            payload: Some(SelectObjectContentEventStream::new(stream)),
+        }))
+    }
 }
 
 #[async_trait::async_trait]
@@ -2277,5 +2551,48 @@ mod tests {
 
         let err = usecase.execute_head_object(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn execute_restore_object_rejects_missing_restore_request() {
+        let input = RestoreObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::POST);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = usecase.execute_restore_object(req).await.unwrap_err();
+        match err.code() {
+            S3ErrorCode::Custom(code) => assert_eq!(code, "ErrValidRestoreObject"),
+            code => panic!("unexpected error code: {:?}", code),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_restore_object_returns_internal_error_when_store_uninitialized() {
+        let restore_request = RestoreRequest {
+            days: Some(1),
+            description: None,
+            glacier_job_parameters: None,
+            output_location: None,
+            select_parameters: None,
+            tier: None,
+            type_: None,
+        };
+        let input = RestoreObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .restore_request(Some(restore_request))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::POST);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = usecase.execute_restore_object(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 }
