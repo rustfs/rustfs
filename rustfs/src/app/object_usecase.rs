@@ -835,10 +835,10 @@ impl DefaultObjectUsecase {
             histogram!("rustfs.disk.permit.wait.duration.seconds").record(permit_wait_duration.as_secs_f64());
             // Record current load level as gauge (0=Low, 1=Medium, 2=High, 3=Critical)
             let load_level_value = match io_strategy.load_level {
-                crate::storage::concurrency::IoLoadLevel::Low => 0.0,
-                crate::storage::concurrency::IoLoadLevel::Medium => 1.0,
-                crate::storage::concurrency::IoLoadLevel::High => 2.0,
-                crate::storage::concurrency::IoLoadLevel::Critical => 3.0,
+                concurrency::IoLoadLevel::Low => 0.0,
+                concurrency::IoLoadLevel::Medium => 1.0,
+                concurrency::IoLoadLevel::High => 2.0,
+                concurrency::IoLoadLevel::Critical => 3.0,
             };
             gauge!("rustfs.io.load.level").set(load_level_value);
             // Record buffer multiplier as gauge
