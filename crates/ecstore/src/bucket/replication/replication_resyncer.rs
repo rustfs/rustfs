@@ -37,9 +37,13 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
+use aws_smithy_types::body::SdkBody;
 use byteorder::ByteOrder;
 use futures::future::join_all;
+use futures::stream::StreamExt;
 use http::HeaderMap;
+use http_body::Frame;
+use http_body_util::StreamBody;
 use regex::Regex;
 use rustfs_filemeta::{
     MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateDecision, ReplicateObjectInfo,
@@ -67,6 +71,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
+use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -2089,27 +2094,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 .await
                 .err()
         } else {
-            // TODO: use stream
-            let body = match gr.read_all().await {
-                Ok(body) => body,
-                Err(e) => {
-                    rinfo.replication_status = ReplicationStatusType::Failed;
-                    rinfo.error = Some(e.to_string());
-                    warn!("failed to read object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
-                    send_event(EventArgs {
-                        event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
-                        bucket_name: bucket.clone(),
-                        object: object_info.clone(),
-                        host: GLOBAL_LocalNodeName.to_string(),
-                        user_agent: "Internal: [Replication]".to_string(),
-                        ..Default::default()
-                    });
-                    return rinfo;
-                }
-            };
-            let reader = ByteStream::from(body);
+            let byte_stream = async_read_to_bytestream(gr.stream);
             tgt_client
-                .put_object(&tgt_client.bucket, &object, size, reader, &put_opts)
+                .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))
                 .err()
@@ -2389,27 +2376,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 .await
                 .err()
             } else {
-                let body = match gr.read_all().await {
-                    Ok(body) => body,
-                    Err(e) => {
-                        rinfo.replication_status = ReplicationStatusType::Failed;
-                        rinfo.error = Some(e.to_string());
-                        warn!("failed to read object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
-                        send_event(EventArgs {
-                            event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
-                            bucket_name: bucket.clone(),
-                            object: object_info,
-                            host: GLOBAL_LocalNodeName.to_string(),
-                            user_agent: "Internal: [Replication]".to_string(),
-                            ..Default::default()
-                        });
-                        rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
-                        return rinfo;
-                    }
-                };
-                let reader = ByteStream::from(body);
+                let byte_stream = async_read_to_bytestream(gr.stream);
                 tgt_client
-                    .put_object(&tgt_client.bucket, &object, size, reader, &put_opts)
+                    .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))
                     .err()
@@ -2497,6 +2466,12 @@ fn wrap_with_bandwidth_monitor(
         });
         stream
     }
+}
+
+fn async_read_to_bytestream(reader: impl AsyncRead + Send + Sync + Unpin + 'static) -> ByteStream {
+    let stream = ReaderStream::new(reader);
+    let body = StreamBody::new(stream.map(|r| r.map(Frame::data)));
+    ByteStream::new(SdkBody::from_body_1_x(body))
 }
 
 fn is_standard_header(k: &str) -> bool {

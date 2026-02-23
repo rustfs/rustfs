@@ -51,17 +51,6 @@ impl BucketThrottle {
         guard.available()
     }
 
-    pub fn wait_n(&self, n: u64) -> std::io::Result<()> {
-        if n == 0 {
-            return Ok(());
-        }
-        let (deficit, rate) = self.consume(n);
-        if deficit > 0 && rate > 0.0 {
-            std::thread::sleep(Duration::from_secs_f64(deficit as f64 / rate));
-        }
-        Ok(())
-    }
-
     /// The ratelimit crate (0.10.0) does not provide a bulk token consumption API.
     /// try_wait() first to consume 1 token AND trigger the internal refill
     /// mechanism (tokens are only refilled during try_wait/wait calls).
@@ -258,27 +247,6 @@ mod tests {
     fn test_burst_equals_bandwidth() {
         let throttle = BucketThrottle::new(500).expect("test");
         assert_eq!(throttle.burst(), 500);
-    }
-
-    #[test]
-    fn test_wait_n_zero_returns_immediately() {
-        let throttle = BucketThrottle::new(1).expect("test");
-        let start = std::time::Instant::now();
-        throttle.wait_n(0).unwrap();
-        assert!(start.elapsed() < std::time::Duration::from_millis(10));
-    }
-
-    #[test]
-    fn test_wait_n_blocks_on_deficit() {
-        let throttle = BucketThrottle::new(100).expect("test");
-
-        let _ = throttle.consume(200);
-
-        let start = std::time::Instant::now();
-        throttle.wait_n(100).unwrap();
-        let elapsed = start.elapsed();
-
-        assert!(elapsed >= std::time::Duration::from_millis(500));
     }
 
     #[test]

@@ -33,7 +33,6 @@ pub struct MonitorReaderOptions {
 
 struct WaitState {
     sleep: Pin<Box<Sleep>>,
-    need: usize,
 }
 
 pub struct MonitoredReader<R> {
@@ -83,10 +82,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
                 match ws.sleep.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(()) => {
-                        let need = ws.need;
                         *guard = None;
                         drop(guard);
-                        return poll_limited_read(&mut this.r, cx, buf, need, &mut this.last_err, &mut this.temp_buf);
                     }
                 }
             }
@@ -122,7 +119,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
                     *this.wait_state.lock().unwrap_or_else(|e| {
                         warn!("MonitoredReader wait_state mutex poisoned, recovering");
                         e.into_inner()
-                    }) = Some(WaitState { sleep, need });
+                    }) = Some(WaitState { sleep });
                     return Poll::Pending;
                 }
                 Poll::Ready(()) => {}
