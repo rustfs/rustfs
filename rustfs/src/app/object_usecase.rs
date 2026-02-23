@@ -830,6 +830,8 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        // When Object Lock is enabled, automatically enable versioning if not already enabled.
+        // This matches AWS S3 and MinIO behavior.
         let versioning_config = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
         if !versioning_config.enabled() {
             let enable_versioning_config = VersioningConfiguration {
@@ -874,6 +876,31 @@ impl DefaultObjectUsecase {
             .and_then(|r| r.retain_until_date.as_ref())
             .map(|d| OffsetDateTime::from(d.clone()));
 
+        // TODO(security): Known TOCTOU race condition (fix in future PR).
+        //
+        // There is a time-of-check-time-of-use (TOCTOU) window between the retention
+        // check below (using get_object_info + check_retention_for_modification) and
+        // the actual update performed later in put_object_metadata.
+        //
+        // In theory:
+        //   * Thread A reads retention mode = GOVERNANCE and checks the bypass header.
+        //   * Thread B updates retention to COMPLIANCE mode.
+        //   * Thread A then proceeds to modify retention, still assuming GOVERNANCE,
+        //     and effectively bypasses what is now COMPLIANCE mode.
+        //
+        // This would violate the S3 spec, which states that COMPLIANCE-mode retention
+        // cannot be modified even with a bypass header.
+        //
+        // Possible fixes (to be implemented in a future change):
+        //   1. Pass the expected retention mode down to the storage layer and verify
+        //      it has not changed immediately before the update.
+        //   2. Use optimistic concurrency (e.g., version/etag) so that the update
+        //      fails if the object changed between check and update.
+        //   3. Perform the retention check inside the same lock/transaction scope as
+        //      the metadata update within the storage layer.
+        //
+        // Current mitigation: the storage layer provides a fast_lock_manager, which
+        // offers some protection, but it does not fully eliminate this race.
         let check_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
