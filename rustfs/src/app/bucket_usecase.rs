@@ -430,7 +430,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         // TODO: remove targets
-        error!("delete bucket");
+        info!(bucket = %bucket, "deleted bucket replication config");
 
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
@@ -771,8 +771,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let rcfg = match metadata_sys::get_replication_config(&bucket).await {
-            Ok((cfg, _created)) => Some(cfg),
+        let replication_configuration = match metadata_sys::get_replication_config(&bucket).await {
+            Ok((cfg, _created)) => cfg,
             Err(err) => {
                 error!("get_replication_config err {:?}", err);
                 if err == StorageError::ConfigNotFound {
@@ -785,26 +785,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        if rcfg.is_none() {
-            return Err(S3Error::with_message(
-                S3ErrorCode::ReplicationConfigurationNotFoundError,
-                "replication not found".to_string(),
-            ));
-        }
-
-        if rcfg.is_some() {
-            Ok(S3Response::new(GetBucketReplicationOutput {
-                replication_configuration: rcfg,
-            }))
-        } else {
-            let rep = ReplicationConfiguration {
-                role: "".to_string(),
-                rules: vec![],
-            };
-            Ok(S3Response::new(GetBucketReplicationOutput {
-                replication_configuration: Some(rep),
-            }))
-        }
+        Ok(S3Response::new(GetBucketReplicationOutput {
+            replication_configuration: Some(replication_configuration),
+        }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1144,7 +1127,7 @@ impl DefaultBucketUsecase {
             replication_configuration,
             ..
         } = req.input;
-        warn!("put bucket replication");
+        info!(bucket = %bucket, "updating bucket replication config");
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -1505,6 +1488,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_delete_bucket_cors_returns_internal_error_when_store_uninitialized() {
+        let input = DeleteBucketCorsInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::DELETE);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_delete_bucket_cors(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_delete_bucket_replication_returns_internal_error_when_store_uninitialized() {
+        let input = DeleteBucketReplicationInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::DELETE);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_delete_bucket_replication(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn execute_head_bucket_returns_internal_error_when_store_uninitialized() {
         let input = HeadBucketInput::builder().bucket("test-bucket".to_string()).build().unwrap();
 
@@ -1558,6 +1569,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_get_bucket_replication_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketReplicationInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_replication(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_public_access_block_returns_internal_error_when_store_uninitialized() {
+        let input = GetPublicAccessBlockInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_public_access_block(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn execute_get_bucket_versioning_returns_internal_error_when_store_uninitialized() {
         let input = GetBucketVersioningInput::builder()
             .bucket("test-bucket".to_string())
@@ -1601,6 +1640,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_put_bucket_cors_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketCorsInput::builder()
+            .bucket("test-bucket".to_string())
+            .cors_configuration(CORSConfiguration::default())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_cors(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn execute_put_bucket_replication_returns_internal_error_when_store_uninitialized() {
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
@@ -1615,6 +1669,21 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_put_bucket_replication(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_public_access_block_returns_internal_error_when_store_uninitialized() {
+        let input = PutPublicAccessBlockInput::builder()
+            .bucket("test-bucket".to_string())
+            .public_access_block_configuration(PublicAccessBlockConfiguration::default())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_public_access_block(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
