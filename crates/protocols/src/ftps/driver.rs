@@ -141,6 +141,66 @@ where
 
         Ok((bucket, key))
     }
+
+    /// Recursively delete all objects in a bucket, then delete the bucket itself.
+    async fn delete_bucket_recursively(
+        &self,
+        bucket: &str,
+        session_context: &crate::common::session::SessionContext,
+    ) -> Result<()> {
+        // First, delete all objects in the bucket
+        let list_input = ListObjectsV2Input::builder()
+            .bucket(bucket.to_string())
+            .build()
+            .map_err(|e| {
+                Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
+            })?;
+
+        if let Ok(output) = self
+            .storage
+            .list_objects_v2(
+                list_input,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key,
+            )
+            .await
+        {
+            // Delete all objects
+            if let Some(objects) = output.contents {
+                for obj in objects {
+                    if let Some(obj_key) = obj.key {
+                        let _ = self
+                            .storage
+                            .delete_object(
+                                bucket,
+                                &obj_key,
+                                &session_context.principal.user_identity.credentials.access_key,
+                                &session_context.principal.user_identity.credentials.secret_key,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // Then delete the bucket
+        match self
+            .storage
+            .delete_bucket(
+                bucket,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("NoSuchBucket") => Ok(()),
+            Err(e) => {
+                error!("Failed to delete bucket '{}': {}", bucket, e);
+                Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Delete bucket failed: {}", e)))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -506,54 +566,7 @@ where
             // Delete directory (bucket)
             // If path ends with '/', treat it as bucket deletion request
             if path_str.ends_with('/') {
-                // First, delete all objects in the bucket
-                let list_input = ListObjectsV2Input::builder().bucket(bucket.clone()).build().map_err(|e| {
-                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
-                })?;
-
-                if let Ok(output) = self
-                    .storage
-                    .list_objects_v2(
-                        list_input,
-                        &session_context.principal.user_identity.credentials.access_key,
-                        &session_context.principal.user_identity.credentials.secret_key,
-                    )
-                    .await
-                {
-                    // Delete all objects
-                    if let Some(objects) = output.contents {
-                        for obj in objects {
-                            if let Some(obj_key) = obj.key {
-                                let _ = self
-                                    .storage
-                                    .delete_object(
-                                        &bucket,
-                                        &obj_key,
-                                        &session_context.principal.user_identity.credentials.access_key,
-                                        &session_context.principal.user_identity.credentials.secret_key,
-                                    )
-                                    .await;
-                            }
-                        }
-                    }
-                }
-
-                // Then delete the bucket
-                match self
-                    .storage
-                    .delete_bucket(
-                        &bucket,
-                        &session_context.principal.user_identity.credentials.access_key,
-                        &session_context.principal.user_identity.credentials.secret_key,
-                    )
-                    .await
-                {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        error!("Failed to delete bucket '{}': {}", path_str, e);
-                        Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Delete bucket failed: {}", e)))
-                    }
-                }
+                self.delete_bucket_recursively(&bucket, session_context).await
             } else {
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Directory deletion not supported"))
             }
@@ -598,60 +611,21 @@ where
             .parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
-        // First, delete all objects in the bucket
-        let list_input = ListObjectsV2Input::builder().bucket(bucket.clone()).build().map_err(|e| {
-            Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
-        })?;
-
-        if let Ok(output) = self
-            .storage
-            .list_objects_v2(
-                list_input,
-                &session_context.principal.user_identity.credentials.access_key,
-                &session_context.principal.user_identity.credentials.secret_key,
-            )
-            .await
-        {
-            // Delete all objects
-            if let Some(objects) = output.contents {
-                for obj in objects {
-                    if let Some(obj_key) = obj.key {
-                        let _ = self
-                            .storage
-                            .delete_object(
-                                &bucket,
-                                &obj_key,
-                                &session_context.principal.user_identity.credentials.access_key,
-                                &session_context.principal.user_identity.credentials.secret_key,
-                            )
-                            .await;
-                    }
-                }
-            }
-        }
-
-        // Then delete the bucket
-        match self
-            .storage
-            .delete_bucket(
-                &bucket,
-                &session_context.principal.user_identity.credentials.access_key,
-                &session_context.principal.user_identity.credentials.secret_key,
-            )
-            .await
-        {
+        // Try to delete bucket recursively
+        match self.delete_bucket_recursively(&bucket, session_context).await {
             Ok(_) => {
                 debug!("Successfully removed directory/bucket '{}'", path_str);
                 Ok(())
             }
             Err(e) => {
-                // If bucket doesn't exist, consider it successful (idempotent)
-                if e.to_string().contains("NoSuchBucket") {
+                // Check if error is NoSuchBucket - treat as success (idempotent)
+                let error_msg = e.to_string();
+                if error_msg.contains("NoSuchBucket") || error_msg.contains("does not exist") {
                     debug!("Bucket '{}' already deleted", bucket);
                     Ok(())
                 } else {
                     error!("Failed to remove directory/bucket '{}': {}", path_str, e);
-                    Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Rmdir failed: {}", e)))
+                    Err(e)
                 }
             }
         }
