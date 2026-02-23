@@ -25,6 +25,7 @@ use crate::storage::concurrency::{
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::OperationHelper;
+use crate::storage::metadata::{get_metadata_engine, is_new_metadata_engine_enabled};
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256, get_opts, put_opts,
@@ -38,7 +39,6 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use rustfs_ecstore::StorageAPI;
-use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
         bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts},
@@ -47,6 +47,7 @@ use rustfs_ecstore::bucket::{
     metadata_sys,
     object_lock::objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion},
     quota::QuotaOperation,
+    quota::checker::QuotaChecker,
     replication::{
         DeletedObjectReplicationInfo, get_must_replicate_options, must_replicate, schedule_replication,
         schedule_replication_delete,
@@ -507,6 +508,11 @@ impl DefaultObjectUsecase {
 
         let mt2 = metadata.clone();
 
+        // Dual Metadata Center Integration: Sync to new metadata engine if enabled
+        if is_new_metadata_engine_enabled() && get_metadata_engine().is_some() {
+            debug!("Dual Metadata Center: Syncing put_object for {}/{}", bucket, key);
+        }
+
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
 
@@ -523,6 +529,26 @@ impl DefaultObjectUsecase {
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
+
+        // If new metadata engine is enabled, update it with the finalized ObjectInfo
+        if is_new_metadata_engine_enabled() {
+            if let Some(engine) = get_metadata_engine() {
+                let engine_clone = engine.clone();
+                let bucket_clone = bucket.clone();
+                let key_clone = key.clone();
+                let obj_info_clone = obj_info.clone();
+
+                // Best effort async sync of metadata to the new engine
+                tokio::spawn(async move {
+                    if let Err(e) = engine_clone.update_metadata(&bucket_clone, &key_clone, obj_info_clone).await {
+                        warn!(
+                            "Dual Metadata Center: Failed to sync metadata for {}/{}: {:?}",
+                            bucket_clone, key_clone, e
+                        );
+                    }
+                });
+            }
+        }
 
         // Fast in-memory update for immediate quota consistency
         rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
@@ -810,6 +836,41 @@ impl DefaultObjectUsecase {
 
         let store = get_validated_store(&bucket).await?;
 
+        // Dual Metadata Center Integration: Try new metadata engine first if enabled
+        if is_new_metadata_engine_enabled() {
+            if let Some(engine) = get_metadata_engine() {
+                debug!(
+                    "Dual Metadata Center: Attempting get_object_reader from new engine for {}/{}",
+                    bucket, key
+                );
+                match engine.get_object_reader(&bucket, &key, &opts).await {
+                    Ok(reader) => {
+                        // Build GetObjectOutput from new engine reader
+                        let info = reader.object_info;
+                        let last_modified = info.mod_time.map(Timestamp::from);
+                        let content_length = info.size;
+
+                        let output = GetObjectOutput {
+                            body: Some(StreamingBlob::wrap(ReaderStream::new(reader.stream))),
+                            content_length: Some(content_length),
+                            last_modified,
+                            e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
+                            metadata: filter_object_metadata(&info.user_defined),
+                            accept_ranges: Some("bytes".to_string()),
+                            ..Default::default()
+                        };
+
+                        let result = Ok(S3Response::new(output));
+                        let _ = helper.complete(&result);
+                        return result;
+                    }
+                    Err(e) => {
+                        debug!("New metadata engine lookup failed, falling back to legacy: {:?}", e);
+                    }
+                }
+            }
+        }
+
         // ============================================
         // Adaptive I/O Strategy with Disk Permit
         // ============================================
@@ -863,6 +924,7 @@ impl DefaultObjectUsecase {
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
+        let metadata_map = info.user_defined.clone();
 
         check_preconditions(&req.headers, &info)?;
 
@@ -913,8 +975,8 @@ impl DefaultObjectUsecase {
 
         // Apply SSE-C decryption if customer provided key and object was encrypted with SSE-C
         let mut final_stream = reader.stream;
-        let stored_sse_algorithm = info.user_defined.get("x-amz-server-side-encryption-customer-algorithm");
-        let stored_sse_key_md5 = info.user_defined.get("x-amz-server-side-encryption-customer-key-md5");
+        let stored_sse_algorithm = metadata_map.get("x-amz-server-side-encryption-customer-algorithm");
+        let stored_sse_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5");
         let mut managed_encryption_applied = false;
         let mut managed_original_size: Option<i64> = None;
 
@@ -1208,19 +1270,14 @@ impl DefaultObjectUsecase {
         };
 
         // Extract SSE information from metadata for response
-        let server_side_encryption = info
-            .user_defined
+        let server_side_encryption = metadata_map
             .get("x-amz-server-side-encryption")
             .map(|v| ServerSideEncryption::from(v.clone()));
-        let sse_customer_algorithm = info
-            .user_defined
+        let sse_customer_algorithm = metadata_map
             .get("x-amz-server-side-encryption-customer-algorithm")
             .map(|v| SSECustomerAlgorithm::from(v.clone()));
-        let sse_customer_key_md5 = info
-            .user_defined
-            .get("x-amz-server-side-encryption-customer-key-md5")
-            .cloned();
-        let ssekms_key_id = info.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
+        let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
+        let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
 
         let mut checksum_crc32 = None;
         let mut checksum_crc32c = None;
@@ -1284,26 +1341,60 @@ impl DefaultObjectUsecase {
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: filter_object_metadata(&info.user_defined),
+            metadata: filter_object_metadata(&metadata_map),
+            version_id: output_version_id,
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
-            ssekms_key_id,
+            ssekms_key_id: sse_kms_key_id,
             checksum_crc32,
             checksum_crc32c,
             checksum_sha1,
             checksum_sha256,
             checksum_crc64nvme,
             checksum_type,
-            version_id: output_version_id,
             ..Default::default()
         };
 
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.object(event_info).version_id(version_id);
+        let ver_id = req.input.version_id.clone().unwrap_or_default();
+        helper = helper.object(event_info).version_id(ver_id);
 
+        let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+
+        if let Some(amz_restore) = metadata_map.get(X_AMZ_RESTORE.as_str()) {
+            let Ok(restore_status) = parse_restore_obj_status(amz_restore) else {
+                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "parse amz_restore failed."));
+            };
+            if let Ok(header_value) = HeaderValue::from_str(restore_status.to_string2().as_str()) {
+                response.headers.insert(X_AMZ_RESTORE, header_value);
+            }
+        }
+        if let Some(amz_restore_request_date) = metadata_map.get(AMZ_RESTORE_REQUEST_DATE)
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_RESTORE_REQUEST_DATE.as_bytes())
+        {
+            let Ok(amz_restore_request_date) = OffsetDateTime::parse(amz_restore_request_date, &Rfc3339) else {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ErrMeta".into()),
+                    "parse amz_restore_request_date failed.",
+                ));
+            };
+            let Ok(amz_restore_request_date) = amz_restore_request_date.format(&RFC1123) else {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ErrMeta".into()),
+                    "format amz_restore_request_date failed.",
+                ));
+            };
+            if let Ok(header_value) = HeaderValue::from_str(&amz_restore_request_date) {
+                response.headers.insert(header_name, header_value);
+            }
+        }
+        if let Some(amz_restore_expiry_days) = metadata_map.get(AMZ_RESTORE_EXPIRY_DAYS)
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_RESTORE_EXPIRY_DAYS.as_bytes())
+            && let Ok(header_value) = HeaderValue::from_str(amz_restore_expiry_days)
+        {
+            response.headers.insert(header_name, header_value);
+        }
         let total_duration = request_start.elapsed();
-
         #[cfg(feature = "metrics")]
         {
             use metrics::{counter, histogram};
@@ -1314,16 +1405,94 @@ impl DefaultObjectUsecase {
             // Record buffer size that was used
             histogram!("get.object.buffer.size.bytes").record(optimal_buffer_size as f64);
         }
-
         debug!(
             "GetObject completed: key={} size={} duration={:?} buffer={}",
             cache_key, response_content_length, total_duration, optimal_buffer_size
         );
 
-        let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
         let result = Ok(response);
         let _ = helper.complete(&result);
+
         result
+    }
+
+    #[instrument(level = "debug", skip(self, req))]
+    pub async fn execute_select_object_content(
+        &self,
+        req: S3Request<SelectObjectContentInput>,
+    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        info!("handle select_object_content");
+
+        let input = Arc::new(req.input);
+        info!("{:?}", input);
+
+        let db = get_global_db((*input).clone(), false).await.map_err(|e| {
+            error!("get global db failed, {}", e.to_string());
+            s3_error!(InternalError, "{}", e.to_string())
+        })?;
+        let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
+        let result = db
+            .execute(&query)
+            .await
+            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
+
+        let results = result
+            .result()
+            .chunk_result()
+            .await
+            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?
+            .to_vec();
+
+        let mut buffer = Vec::new();
+        if input.request.output_serialization.csv.is_some() {
+            let mut csv_writer = CsvWriterBuilder::new().with_header(false).build(&mut buffer);
+            for batch in results {
+                csv_writer
+                    .write(&batch)
+                    .map_err(|e| s3_error!(InternalError, "can't encode output to csv. e: {}", e.to_string()))?;
+            }
+        } else if input.request.output_serialization.json.is_some() {
+            let mut json_writer = JsonWriterBuilder::new()
+                .with_explicit_nulls(true)
+                .build::<_, JsonArray>(&mut buffer);
+            for batch in results {
+                json_writer
+                    .write(&batch)
+                    .map_err(|e| s3_error!(InternalError, "can't encode output to json. e: {}", e.to_string()))?;
+            }
+            json_writer
+                .finish()
+                .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
+        } else {
+            return Err(s3_error!(
+                InvalidArgument,
+                "Unsupported output format. Supported formats are CSV and JSON"
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
+        let stream = ReceiverStream::new(rx);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
+                .await;
+            let _ = tx
+                .send(Ok(SelectObjectContentEvent::Records(RecordsEvent {
+                    payload: Some(Bytes::from(buffer)),
+                })))
+                .await;
+            let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
+
+            drop(tx);
+        });
+
+        Ok(S3Response::new(SelectObjectContentOutput {
+            payload: Some(SelectObjectContentEventStream::new(stream)),
+        }))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1786,6 +1955,19 @@ impl DefaultObjectUsecase {
             }
         };
 
+        // Dual Metadata Center Integration: Delete from new metadata engine if enabled
+        if is_new_metadata_engine_enabled() {
+            if let Some(engine) = get_metadata_engine() {
+                let engine_clone = engine.clone();
+                let bucket_clone = bucket.clone();
+                let key_clone = key.clone();
+
+                tokio::spawn(async move {
+                    let _ = engine_clone.delete_object(&bucket_clone, &key_clone).await;
+                });
+            }
+        }
+
         // Fast in-memory update for immediate quota consistency
         rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, obj_info.size as u64).await;
 
@@ -2008,7 +2190,7 @@ impl DefaultObjectUsecase {
         let mut checksum_sha1 = None;
         let mut checksum_sha256 = None;
         let mut checksum_crc64nvme = None;
-        let mut checksum_type = None;
+        let mut ck_type_val = None;
 
         // checksum
         if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
@@ -2021,7 +2203,7 @@ impl DefaultObjectUsecase {
 
             for (key, checksum) in checksums {
                 if key == AMZ_CHECKSUM_TYPE {
-                    checksum_type = Some(ChecksumType::from(checksum));
+                    ck_type_val = Some(ChecksumType::from(checksum));
                     continue;
                 }
 
@@ -2071,7 +2253,7 @@ impl DefaultObjectUsecase {
             checksum_sha1,
             checksum_sha256,
             checksum_crc64nvme,
-            checksum_type,
+            checksum_type: ck_type_val,
             storage_class,
             // metadata: object_metadata,
             ..Default::default()
@@ -2343,85 +2525,6 @@ impl DefaultObjectUsecase {
         };
 
         Ok(S3Response::with_headers(output, header))
-    }
-
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_select_object_content(
-        &self,
-        req: S3Request<SelectObjectContentInput>,
-    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
-        info!("handle select_object_content");
-
-        let input = Arc::new(req.input);
-        info!("{:?}", input);
-
-        let db = get_global_db((*input).clone(), false).await.map_err(|e| {
-            error!("get global db failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
-        let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
-        let result = db
-            .execute(&query)
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
-
-        let results = result
-            .result()
-            .chunk_result()
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?
-            .to_vec();
-
-        let mut buffer = Vec::new();
-        if input.request.output_serialization.csv.is_some() {
-            let mut csv_writer = CsvWriterBuilder::new().with_header(false).build(&mut buffer);
-            for batch in results {
-                csv_writer
-                    .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "can't encode output to csv. e: {}", e.to_string()))?;
-            }
-        } else if input.request.output_serialization.json.is_some() {
-            let mut json_writer = JsonWriterBuilder::new()
-                .with_explicit_nulls(true)
-                .build::<_, JsonArray>(&mut buffer);
-            for batch in results {
-                json_writer
-                    .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "can't encode output to json. e: {}", e.to_string()))?;
-            }
-            json_writer
-                .finish()
-                .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
-        } else {
-            return Err(s3_error!(
-                InvalidArgument,
-                "Unsupported output format. Supported formats are CSV and JSON"
-            ));
-        }
-
-        let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
-        let stream = ReceiverStream::new(rx);
-        tokio::spawn(async move {
-            let _ = tx
-                .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
-                .await;
-            let _ = tx
-                .send(Ok(SelectObjectContentEvent::Records(RecordsEvent {
-                    payload: Some(Bytes::from(buffer)),
-                })))
-                .await;
-            let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
-
-            drop(tx);
-        });
-
-        Ok(S3Response::new(SelectObjectContentOutput {
-            payload: Some(SelectObjectContentEventStream::new(stream)),
-        }))
     }
 }
 

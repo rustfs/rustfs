@@ -18,6 +18,7 @@
 //! high-performance metadata management using SurrealKV, Ferntree, and SurrealMX.
 
 pub mod engine;
+mod error;
 pub mod ferntree;
 pub(crate) mod gc;
 pub mod kv;
@@ -26,9 +27,9 @@ pub(crate) mod reader;
 pub mod types;
 pub(crate) mod writer;
 
-pub use engine::LocalMetadataEngine;
-
 use std::sync::{Arc, OnceLock};
+
+pub use engine::LocalMetadataEngine;
 
 /// Environment variable name for enabling the new metadata engine.
 /// This allows users to switch between the old and new metadata engines without code changes,
@@ -41,9 +42,9 @@ const ENV_NEW_METADATA_ENGINE: &str = "RUSTFS_NEW_METADATA_ENGINE";
 /// while `false` will keep using the old engine until explicitly enabled.
 const DEFAULT_NEW_METADATA_ENGINE: bool = false;
 
-pub static GLOBAL_METADATA_ENGINE: OnceLock<Arc<LocalMetadataEngine>> = OnceLock::new();
+pub static GLOBAL_METADATA_ENGINE: OnceLock<Arc<dyn engine::MetadataEngine>> = OnceLock::new();
 
-pub fn get_metadata_engine() -> Option<Arc<LocalMetadataEngine>> {
+pub fn get_metadata_engine() -> Option<Arc<dyn engine::MetadataEngine>> {
     GLOBAL_METADATA_ENGINE.get().cloned()
 }
 

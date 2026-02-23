@@ -14,8 +14,9 @@
 
 use crate::storage::metadata::mx::StorageManager;
 use crate::storage::metadata::reader::new_chunked_reader;
-use crate::storage::metadata::types::{ChunkInfo, IndexMetadata, ObjectMetadata};
+use crate::storage::metadata::types::{IndexMetadata, ObjectMetadata};
 use crate::storage::metadata::writer::ChunkedWriter;
+use async_trait::async_trait;
 use bytes::Bytes;
 use ferntree::Tree as IndexTree;
 use rustfs_ecstore::disk::{DiskAPI, ReadOptions};
@@ -29,6 +30,36 @@ use std::ops::Bound::{Included, Unbounded};
 use std::sync::Arc;
 use surrealkv::Tree as KvStore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+/// MetadataEngine defines the interface for metadata operations.
+#[async_trait]
+pub trait MetadataEngine: Send + Sync {
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        reader: Box<dyn AsyncRead + Send + Unpin>,
+        size: u64,
+        opts: ObjectOptions,
+    ) -> Result<ObjectInfo>;
+
+    async fn get_object_reader(&self, bucket: &str, key: &str, opts: &ObjectOptions) -> Result<GetObjectReader>;
+
+    async fn get_object(&self, bucket: &str, key: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
+
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<()>;
+
+    async fn update_metadata(&self, bucket: &str, key: &str, info: ObjectInfo) -> Result<()>;
+
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: usize,
+    ) -> Result<ListObjectsV2Info>;
+}
 
 /// LocalMetadataEngine manages object metadata, indexing, and data placement.
 /// It serves as the unified entry point for local storage operations.
@@ -53,28 +84,15 @@ pub struct LocalMetadataEngine {
     legacy_fs: Arc<rustfs_ecstore::disk::local::LocalDisk>,
 }
 
-impl LocalMetadataEngine {
-    pub fn new(
-        kv_store: Arc<KvStore>,
-        index_tree: Arc<IndexTree<String, Bytes>>,
-        storage_manager: Arc<dyn StorageManager>,
-        legacy_fs: Arc<rustfs_ecstore::disk::local::LocalDisk>,
-    ) -> Self {
-        Self {
-            kv_store,
-            index_tree,
-            storage_manager,
-            legacy_fs,
-        }
-    }
-
-    pub async fn put_object(
+#[async_trait]
+impl MetadataEngine for LocalMetadataEngine {
+    async fn put_object(
         &self,
         bucket: &str,
         key: &str,
         mut reader: Box<dyn AsyncRead + Send + Unpin>,
         size: u64,
-        _opts: ObjectOptions,
+        opts: ObjectOptions,
     ) -> Result<ObjectInfo> {
         let is_inline = size < 128 * 1024; // 128KB threshold
         let content_hash;
@@ -112,14 +130,19 @@ impl LocalMetadataEngine {
         }
 
         // 2. Prepare Metadata
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let meta = ObjectMetadata {
             bucket: bucket.to_string(),
             key: key.to_string(),
+            version_id: opts.version_id.clone().unwrap_or_default(),
             content_hash: content_hash.clone(),
             size,
             is_inline,
             inline_data,
             chunks,
+            user_metadata: opts.user_defined.clone(),
+            mod_time: opts.mod_time.map(|t| t.unix_timestamp()).unwrap_or(now),
+            created_at: now,
             ..Default::default()
         };
 
@@ -148,11 +171,12 @@ impl LocalMetadataEngine {
             name: meta.key,
             size: meta.size as i64,
             etag: Some(meta.content_hash),
+            user_defined: meta.user_metadata,
             ..Default::default()
         })
     }
 
-    pub async fn get_object_reader(&self, bucket: &str, key: &str, _opts: &ObjectOptions) -> Result<GetObjectReader> {
+    async fn get_object_reader(&self, bucket: &str, key: &str, _opts: &ObjectOptions) -> Result<GetObjectReader> {
         // 1. KV Lookup
         let meta_key = format!("buckets/{}/objects/{}/meta", bucket, key);
         let tx = self.kv_store.begin().map_err(|e| Error::other(e.to_string()))?;
@@ -176,6 +200,7 @@ impl LocalMetadataEngine {
                 name: meta.key,
                 size: meta.size as i64,
                 etag: Some(meta.content_hash),
+                user_defined: meta.user_metadata,
                 ..Default::default()
             };
 
@@ -224,27 +249,26 @@ impl LocalMetadataEngine {
         }
     }
 
-    pub async fn get_object(&self, bucket: &str, key: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
-        // 1. KV Lookup
+    async fn get_object(&self, bucket: &str, key: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
         let meta_key = format!("buckets/{}/objects/{}/meta", bucket, key);
         let tx = self.kv_store.begin().map_err(|e| Error::other(e.to_string()))?;
 
         if let Some(val) = tx.get(meta_key.as_bytes()).map_err(|e| Error::other(e.to_string()))? {
             let meta: ObjectMetadata = serde_json::from_slice(&val).map_err(|e| Error::other(e.to_string()))?;
-
-            return Ok(ObjectInfo {
+            Ok(ObjectInfo {
                 bucket: meta.bucket,
                 name: meta.key,
                 size: meta.size as i64,
                 etag: Some(meta.content_hash),
+                user_defined: meta.user_metadata,
                 ..Default::default()
-            });
+            })
+        } else {
+            Err(Error::other("Object not found"))
         }
-
-        Err(Error::other("Object not found in new engine"))
     }
 
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         let meta_key = format!("buckets/{}/objects/{}/meta", bucket, key);
         let mut tx = self.kv_store.begin().map_err(|e| Error::other(e.to_string()))?;
 
@@ -296,7 +320,46 @@ impl LocalMetadataEngine {
         Ok(())
     }
 
-    pub async fn list_objects(
+    async fn update_metadata(&self, bucket: &str, key: &str, info: ObjectInfo) -> Result<()> {
+        let meta_key = format!("buckets/{}/objects/{}/meta", bucket, key);
+        let mut tx = self.kv_store.begin().map_err(|e| Error::other(e.to_string()))?;
+
+        let mut meta = if let Some(val) = tx.get(meta_key.as_bytes()).map_err(|e| Error::other(e.to_string()))? {
+            serde_json::from_slice::<ObjectMetadata>(&val).map_err(|e| Error::other(e.to_string()))?
+        } else {
+            ObjectMetadata {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                ..Default::default()
+            }
+        };
+
+        // Update metadata from ObjectInfo
+        meta.size = info.size as u64;
+        if let Some(etag) = info.etag {
+            meta.content_hash = etag;
+        }
+        meta.user_metadata = info.user_defined;
+
+        let meta_bytes = serde_json::to_vec(&meta).map_err(|e| Error::other(e.to_string()))?;
+        tx.set(meta_key.as_bytes(), &meta_bytes)
+            .map_err(|e| Error::other(e.to_string()))?;
+
+        // Update Index too
+        let index_key = format!("{}/{}", bucket, key);
+        let index_meta = IndexMetadata {
+            size: meta.size,
+            mod_time: meta.mod_time,
+            etag: meta.content_hash.clone(),
+        };
+        let index_bytes = serde_json::to_vec(&index_meta).map_err(|e| Error::other(e.to_string()))?;
+        self.index_tree.insert(index_key, Bytes::from(index_bytes));
+
+        tx.commit().await.map_err(|e| Error::other(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_objects(
         &self,
         bucket: &str,
         prefix: &str,
@@ -388,6 +451,22 @@ impl LocalMetadataEngine {
             objects,
             prefixes: common_prefixes.into_iter().collect(),
         })
+    }
+}
+
+impl LocalMetadataEngine {
+    pub fn new(
+        kv_store: Arc<KvStore>,
+        index_tree: Arc<IndexTree<String, Bytes>>,
+        storage_manager: Arc<dyn StorageManager>,
+        legacy_fs: Arc<rustfs_ecstore::disk::local::LocalDisk>,
+    ) -> Self {
+        Self {
+            kv_store,
+            index_tree,
+            storage_manager,
+            legacy_fs,
+        }
     }
 
     async fn migrate_object(&self, bucket: &str, key: &str, fi: FileInfo) -> Result<()> {
@@ -483,5 +562,130 @@ impl LocalMetadataEngine {
         }
 
         Ok(new_count)
+    }
+}
+
+/// DualMetadataCenter manages two metadata engines for high availability and redundancy.
+/// It implements a Primary/Secondary architecture where writes are synchronized
+/// to both centers, and reads failover from Primary to Secondary.
+#[derive(Clone)]
+pub struct DualMetadataCenter {
+    primary: Arc<dyn MetadataEngine>,
+    secondary: Arc<dyn MetadataEngine>,
+}
+
+impl DualMetadataCenter {
+    pub fn new(primary: Arc<dyn MetadataEngine>, secondary: Arc<dyn MetadataEngine>) -> Self {
+        Self { primary, secondary }
+    }
+}
+
+#[async_trait]
+impl MetadataEngine for DualMetadataCenter {
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        reader: Box<dyn AsyncRead + Send + Unpin>,
+        size: u64,
+        opts: ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        // In a dual-center setup, we must ensure metadata is consistent across both.
+        // For simplicity and to avoid complex stream splitting here, we use the primary
+        // to handle the data and metadata first.
+        let info = self.primary.put_object(bucket, key, reader, size, opts).await?;
+
+        // Shadow Write: Sync metadata to secondary efficiently using update_metadata
+        let secondary = self.secondary.clone();
+        let b = bucket.to_string();
+        let k = key.to_string();
+        let i = info.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = secondary.update_metadata(&b, &k, i).await {
+                tracing::warn!("Failed to sync metadata to secondary center: {:?}", e);
+            }
+        });
+
+        Ok(info)
+    }
+
+    async fn get_object_reader(&self, bucket: &str, key: &str, opts: &ObjectOptions) -> Result<GetObjectReader> {
+        // Try Primary first, failover to Secondary
+        match self.primary.get_object_reader(bucket, key, opts).await {
+            Ok(reader) => Ok(reader),
+            Err(e) => {
+                tracing::warn!("Primary metadata center lookup failed, falling back to secondary: {:?}", e);
+                let reader = self.secondary.get_object_reader(bucket, key, opts).await?;
+
+                // Read Repair: Repair primary from secondary
+                let primary = self.primary.clone();
+                let b = bucket.to_string();
+                let k = key.to_string();
+                let i = reader.object_info.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) = primary.update_metadata(&b, &k, i).await {
+                        tracing::error!("Read-repair failed for primary metadata center: {:?}", e);
+                    }
+                });
+
+                Ok(reader)
+            }
+        }
+    }
+
+    async fn get_object(&self, bucket: &str, key: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        match self.primary.get_object(bucket, key, opts.clone()).await {
+            Ok(info) => Ok(info),
+            Err(e) => {
+                tracing::warn!("Primary metadata center lookup failed, falling back to secondary: {:?}", e);
+                self.secondary.get_object(bucket, key, opts).await
+            }
+        }
+    }
+
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        // Delete from both centers
+        let res1 = self.primary.delete_object(bucket, key).await;
+        let res2 = self.secondary.delete_object(bucket, key).await;
+
+        if let Err(e) = &res2 {
+            tracing::warn!("Failed to delete from secondary metadata center: {:?}", e);
+        }
+
+        res1
+    }
+
+    async fn update_metadata(&self, bucket: &str, key: &str, info: ObjectInfo) -> Result<()> {
+        let res1 = self.primary.update_metadata(bucket, key, info.clone()).await;
+        let res2 = self.secondary.update_metadata(bucket, key, info).await;
+
+        if let Err(e) = &res2 {
+            tracing::warn!("Failed to update metadata in secondary center: {:?}", e);
+        }
+
+        res1
+    }
+
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: usize,
+    ) -> Result<ListObjectsV2Info> {
+        match self
+            .primary
+            .list_objects(bucket, prefix, marker.clone(), delimiter.clone(), max_keys)
+            .await
+        {
+            Ok(list) => Ok(list),
+            Err(e) => {
+                tracing::warn!("Primary metadata center listing failed, falling back to secondary: {:?}", e);
+                self.secondary.list_objects(bucket, prefix, marker, delimiter, max_keys).await
+            }
+        }
     }
 }

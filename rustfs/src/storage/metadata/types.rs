@@ -65,7 +65,7 @@ pub struct ObjectMetadata {
 
     /// Inline data content (if size < 128KB).
     /// Option: Could be stored in a separate KV key to keep metadata small.
-    #[serde(skip)]
+    // #[serde(skip)]
     pub inline_data: Option<Bytes>,
 
     /// Chunks info for large objects
