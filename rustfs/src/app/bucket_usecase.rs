@@ -70,6 +70,10 @@ fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
 }
 
+fn resolve_notification_region(global_region: Option<String>, request_region: Option<String>) -> String {
+    global_region.unwrap_or_else(|| request_region.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateBucketRequest {
     pub bucket: String,
@@ -764,6 +768,7 @@ impl DefaultBucketUsecase {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
+        let request_region = req.region.clone();
 
         let PutBucketNotificationConfigurationInput {
             bucket,
@@ -785,7 +790,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let region = rustfs_ecstore::global::get_global_region().unwrap_or_default();
+        let region = resolve_notification_region(rustfs_ecstore::global::get_global_region(), request_region);
         let clear_rules = notifier_global::clear_bucket_notification_rules(&bucket);
         let parse_rules = async {
             let mut event_rules = Vec::new();
@@ -1144,6 +1149,24 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[test]
+    fn resolve_notification_region_prefers_global_region() {
+        let region = resolve_notification_region(Some("us-east-1".to_string()), Some("ap-southeast-1".to_string()));
+        assert_eq!(region, "us-east-1");
+    }
+
+    #[test]
+    fn resolve_notification_region_falls_back_to_request_region() {
+        let region = resolve_notification_region(None, Some("ap-southeast-1".to_string()));
+        assert_eq!(region, "ap-southeast-1");
+    }
+
+    #[test]
+    fn resolve_notification_region_defaults_to_empty() {
+        let region = resolve_notification_region(None, None);
+        assert!(region.is_empty());
     }
 
     #[tokio::test]
