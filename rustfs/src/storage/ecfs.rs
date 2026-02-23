@@ -28,16 +28,12 @@ use crate::storage::{
     parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
 };
 use futures::StreamExt;
-use http::{HeaderMap, StatusCode};
+use http::HeaderMap;
 use metrics::{counter, histogram};
 use rustfs_ecstore::{
     bucket::{
-        metadata::{
-            BUCKET_ACL_CONFIG, BUCKET_CORS_CONFIG, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG,
-            BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
-        },
+        metadata::{BUCKET_ACL_CONFIG, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG},
         metadata_sys,
-        metadata_sys::get_replication_config,
         object_lock::objectlock_sys::{check_object_lock_for_deletion, check_retention_for_modification},
         replication::{DeletedObjectReplicationInfo, check_replicate_delete, schedule_replication_delete},
         tagging::{decode_tags, encode_tags},
@@ -1013,22 +1009,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn delete_bucket_cors(&self, req: S3Request<DeleteBucketCorsInput>) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
-        let DeleteBucketCorsInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        metadata_sys::delete(&bucket, BUCKET_CORS_CONFIG)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(DeleteBucketCorsOutput {}))
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_delete_bucket_cors(req).await
     }
 
     async fn delete_bucket_encryption(
@@ -1060,24 +1042,8 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
-        let DeleteBucketReplicationInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-        metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
-            .await
-            .map_err(ApiError::from)?;
-
-        // TODO: remove targets
-        error!("delete bucket");
-
-        Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_delete_bucket_replication(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1094,22 +1060,8 @@ impl S3 for FS {
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
-        let DeletePublicAccessBlockInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        metadata_sys::delete(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::with_status(DeletePublicAccessBlockOutput::default(), StatusCode::NO_CONTENT))
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_delete_public_access_block(req).await
     }
 
     /// Delete an object
@@ -1534,32 +1486,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
-        let bucket = req.input.bucket.clone();
-        // check bucket exists.
-        let _bucket = self
-            .head_bucket(req.map_input(|input| HeadBucketInput {
-                bucket: input.bucket,
-                expected_bucket_owner: None,
-            }))
-            .await?;
-
-        let cors_configuration = match metadata_sys::get_cors_config(&bucket).await {
-            Ok((config, _)) => config,
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::NoSuchCORSConfiguration,
-                        "The CORS configuration does not exist".to_string(),
-                    ));
-                }
-                warn!("get_cors_config err {:?}", &err);
-                return Err(ApiError::from(err).into());
-            }
-        };
-
-        Ok(S3Response::new(GetBucketCorsOutput {
-            cors_rules: Some(cors_configuration.cors_rules),
-        }))
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_get_bucket_cors(req).await
     }
 
     async fn get_bucket_encryption(
@@ -1629,55 +1557,8 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketReplicationInput>,
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
-        let GetBucketReplicationInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let rcfg = match get_replication_config(&bucket).await {
-            Ok((cfg, _created)) => Some(cfg),
-            Err(err) => {
-                error!("get_replication_config err {:?}", err);
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::ReplicationConfigurationNotFoundError,
-                        "replication not found".to_string(),
-                    ));
-                }
-                return Err(ApiError::from(err).into());
-            }
-        };
-
-        if rcfg.is_none() {
-            return Err(S3Error::with_message(
-                S3ErrorCode::ReplicationConfigurationNotFoundError,
-                "replication not found".to_string(),
-            ));
-        }
-
-        // Ok(S3Response::new(GetBucketReplicationOutput {
-        //     replication_configuration: rcfg,
-        // }))
-
-        if rcfg.is_some() {
-            Ok(S3Response::new(GetBucketReplicationOutput {
-                replication_configuration: rcfg,
-            }))
-        } else {
-            let rep = ReplicationConfiguration {
-                role: "".to_string(),
-                rules: vec![],
-            };
-            Ok(S3Response::new(GetBucketReplicationOutput {
-                replication_configuration: Some(rep),
-            }))
-        }
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_get_bucket_replication(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1691,31 +1572,8 @@ impl S3 for FS {
         &self,
         req: S3Request<GetPublicAccessBlockInput>,
     ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
-        let bucket = req.input.bucket.clone();
-
-        let _bucket = self
-            .head_bucket(req.map_input(|input| HeadBucketInput {
-                bucket: input.bucket,
-                expected_bucket_owner: None,
-            }))
-            .await?;
-
-        let config = match metadata_sys::get_public_access_block_config(&bucket).await {
-            Ok((config, _)) => config,
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::Custom("NoSuchPublicAccessBlockConfiguration".into()),
-                        "Public access block configuration does not exist".to_string(),
-                    ));
-                }
-                return Err(ApiError::from(err).into());
-            }
-        };
-
-        Ok(S3Response::new(GetPublicAccessBlockOutput {
-            public_access_block_configuration: Some(config),
-        }))
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_get_public_access_block(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2432,28 +2290,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
-        let PutBucketCorsInput {
-            bucket,
-            cors_configuration,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let data = try_!(serialize(&cors_configuration));
-
-        metadata_sys::update(&bucket, BUCKET_CORS_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(PutBucketCorsOutput::default()))
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_put_bucket_cors(req).await
     }
 
     async fn put_bucket_encryption(
@@ -2490,30 +2328,8 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        let PutBucketReplicationInput {
-            bucket,
-            replication_configuration,
-            ..
-        } = req.input;
-        warn!("put bucket replication");
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        // TODO: check enable, versioning enable
-        let data = try_!(serialize(&replication_configuration));
-
-        metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(PutBucketReplicationOutput::default()))
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_put_bucket_replication(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2521,28 +2337,8 @@ impl S3 for FS {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
-        let PutPublicAccessBlockInput {
-            bucket,
-            public_access_block_configuration,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let data = try_!(serialize(&public_access_block_configuration));
-
-        metadata_sys::update(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(PutPublicAccessBlockOutput::default()))
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_put_public_access_block(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
