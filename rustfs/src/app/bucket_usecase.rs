@@ -16,28 +16,59 @@
 #![allow(dead_code)]
 
 use crate::app::context::{AppContext, get_global_app_context};
+use crate::auth::get_condition_values;
 use crate::error::ApiError;
+use crate::server::RemoteAddr;
 use crate::storage::access::authorize_request;
-use crate::storage::ecfs::{default_owner, serialize_acl, stored_acl_from_canned_bucket, stored_acl_from_grant_headers};
+use crate::storage::ecfs::{
+    default_owner, is_public_grant, parse_acl_json_or_canned_bucket, serialize_acl, stored_acl_from_canned_bucket,
+    stored_acl_from_grant_headers,
+};
 use crate::storage::helper::OperationHelper;
 use crate::storage::*;
 use metrics::counter;
-use rustfs_ecstore::bucket::{metadata::BUCKET_ACL_CONFIG, metadata_sys};
+use rustfs_ecstore::bucket::{
+    lifecycle::{bucket_lifecycle_ops::validate_transition_tier, lifecycle::Lifecycle},
+    metadata::{
+        BUCKET_ACL_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_SSECONFIG,
+        BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG,
+    },
+    metadata_sys,
+    policy_sys::PolicySys,
+    utils::serialize,
+    versioning_sys::BucketVersioningSys,
+};
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI};
-use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_targets::EventName;
+use rustfs_notify::notifier_global;
+use rustfs_policy::policy::{
+    action::{Action, S3Action},
+    {BucketPolicy, BucketPolicyArgs, Effect, Validator},
+};
+use rustfs_targets::{
+    EventName,
+    arn::{ARN, TargetIDError},
+};
 use rustfs_utils::http::RUSTFS_FORCE_DELETE;
 use rustfs_utils::string::parse_bool;
 use s3s::dto::*;
+use s3s::xml;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use std::sync::Arc;
-use tracing::{debug, instrument};
+use std::{fmt::Display, sync::Arc};
+use tracing::{debug, info, instrument, warn};
 use urlencoding::encode;
 
 pub type BucketUsecaseResult<T> = Result<T, ApiError>;
+
+fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
+    serialize(value).map_err(to_internal_error)
+}
+
+fn to_internal_error(err: impl Display) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateBucketRequest {
@@ -262,6 +293,648 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         Ok(S3Response::new(HeadBucketOutput::default()))
+    }
+
+    pub async fn execute_delete_bucket_encryption(
+        &self,
+        req: S3Request<DeleteBucketEncryptionInput>,
+    ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let DeleteBucketEncryptionInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        metadata_sys::delete(&bucket, BUCKET_SSECONFIG)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_delete_bucket_lifecycle(
+        &self,
+        req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let DeleteBucketLifecycleInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        metadata_sys::delete(&bucket, BUCKET_LIFECYCLE_CONFIG)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
+    }
+
+    pub async fn execute_delete_bucket_policy(
+        &self,
+        req: S3Request<DeleteBucketPolicyInput>,
+    ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let DeleteBucketPolicyInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        metadata_sys::delete(&bucket, BUCKET_POLICY_CONFIG)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(DeleteBucketPolicyOutput {}))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_delete_bucket_tagging(
+        &self,
+        req: S3Request<DeleteBucketTaggingInput>,
+    ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let DeleteBucketTaggingInput { bucket, .. } = req.input;
+
+        metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
+    }
+
+    pub async fn execute_get_bucket_encryption(
+        &self,
+        req: S3Request<GetBucketEncryptionInput>,
+    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetBucketEncryptionInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let server_side_encryption_configuration = match metadata_sys::get_sse_config(&bucket).await {
+            Ok((cfg, _)) => Some(cfg),
+            Err(err) => {
+                warn!("get_sse_config err {:?}", err);
+                None
+            }
+        };
+
+        Ok(S3Response::new(GetBucketEncryptionOutput {
+            server_side_encryption_configuration,
+        }))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetBucketLifecycleConfigurationInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
+            Ok((cfg, _)) => cfg.rules,
+            Err(_) => {
+                return Err(s3_error!(NoSuchLifecycleConfiguration));
+            }
+        };
+
+        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
+            rules: Some(rules),
+            ..Default::default()
+        }))
+    }
+
+    pub async fn execute_get_bucket_notification_configuration(
+        &self,
+        req: S3Request<GetBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetBucketNotificationConfigurationInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let has_notification_config = metadata_sys::get_notification_config(&bucket).await.unwrap_or_else(|err| {
+            warn!("get_notification_config err {:?}", err);
+            None
+        });
+
+        if let Some(NotificationConfiguration {
+            event_bridge_configuration,
+            lambda_function_configurations,
+            queue_configurations,
+            topic_configurations,
+        }) = has_notification_config
+        {
+            Ok(S3Response::new(GetBucketNotificationConfigurationOutput {
+                event_bridge_configuration,
+                lambda_function_configurations,
+                queue_configurations,
+                topic_configurations,
+            }))
+        } else {
+            Ok(S3Response::new(GetBucketNotificationConfigurationOutput::default()))
+        }
+    }
+
+    pub async fn execute_get_bucket_policy(
+        &self,
+        req: S3Request<GetBucketPolicyInput>,
+    ) -> S3Result<S3Response<GetBucketPolicyOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetBucketPolicyInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let (policy_str, _) = match metadata_sys::get_bucket_policy_raw(&bucket).await {
+            Ok(res) => res,
+            Err(err) => {
+                if StorageError::ConfigNotFound == err {
+                    return Err(s3_error!(NoSuchBucketPolicy));
+                }
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, err.to_string()));
+            }
+        };
+
+        Ok(S3Response::new(GetBucketPolicyOutput {
+            policy: Some(policy_str),
+        }))
+    }
+
+    pub async fn execute_get_bucket_policy_status(
+        &self,
+        req: S3Request<GetBucketPolicyStatusInput>,
+    ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetBucketPolicyStatusInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None, remote_addr);
+
+        let read_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
+            bucket: &bucket,
+            action: Action::S3Action(S3Action::ListBucketAction),
+            is_owner: false,
+            account: "",
+            groups: &None,
+            conditions: &conditions,
+            object: "",
+        })
+        .await;
+
+        let write_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
+            bucket: &bucket,
+            action: Action::S3Action(S3Action::PutObjectAction),
+            is_owner: false,
+            account: "",
+            groups: &None,
+            conditions: &conditions,
+            object: "",
+        })
+        .await;
+
+        let mut is_public = read_allowed || write_allowed;
+        let ignore_public_acls = match metadata_sys::get_public_access_block_config(&bucket).await {
+            Ok((config, _)) => config.ignore_public_acls.unwrap_or(false),
+            Err(_) => false,
+        };
+
+        let owner = default_owner();
+        let acl_public = match metadata_sys::get_bucket_acl_config(&bucket).await {
+            Ok((acl, _)) => {
+                let stored_acl = parse_acl_json_or_canned_bucket(&acl, &owner);
+                stored_acl
+                    .grants
+                    .iter()
+                    .any(|grant| is_public_grant(grant) && !ignore_public_acls)
+            }
+            Err(_) => false,
+        };
+
+        if acl_public {
+            is_public = true;
+        }
+
+        let policy_public = match metadata_sys::get_bucket_policy(&bucket).await {
+            Ok((cfg, _)) => cfg.statements.iter().any(|statement| {
+                matches!(statement.effect, Effect::Allow)
+                    && statement.principal.is_match("*")
+                    && statement.conditions.is_empty()
+                    && statement.actions.is_match(&Action::S3Action(S3Action::ListBucketAction))
+            }),
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    false
+                } else {
+                    return Err(ApiError::from(err).into());
+                }
+            }
+        };
+
+        if policy_public {
+            is_public = true;
+        }
+
+        let output = GetBucketPolicyStatusOutput {
+            policy_status: Some(PolicyStatus {
+                is_public: Some(is_public),
+            }),
+        };
+
+        Ok(S3Response::new(output))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_get_bucket_tagging(
+        &self,
+        req: S3Request<GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetBucketTaggingInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let Tagging { tag_set } = match metadata_sys::get_tagging_config(&bucket).await {
+            Ok((tags, _)) => tags,
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(S3ErrorCode::NoSuchTagSet, "The TagSet does not exist".to_string()));
+                }
+                warn!("get_tagging_config err {:?}", &err);
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetBucketVersioningInput { bucket, .. } = req.input;
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let VersioningConfiguration { status, .. } = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
+
+        Ok(S3Response::new(GetBucketVersioningOutput {
+            status,
+            ..Default::default()
+        }))
+    }
+
+    pub async fn execute_put_bucket_encryption(
+        &self,
+        req: S3Request<PutBucketEncryptionInput>,
+    ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let PutBucketEncryptionInput {
+            bucket,
+            server_side_encryption_configuration,
+            ..
+        } = req.input;
+
+        info!("sse_config {:?}", &server_side_encryption_configuration);
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let data = serialize_config(&server_side_encryption_configuration)?;
+        metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let PutBucketLifecycleConfigurationInput {
+            bucket,
+            lifecycle_configuration,
+            ..
+        } = req.input;
+
+        let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
+
+        let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
+        if let Ok(rcfg) = rcfg
+            && let Err(err) = input_cfg.validate(&rcfg.0).await
+        {
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
+        }
+
+        if let Err(err) = validate_transition_tier(&input_cfg).await {
+            return Err(S3Error::with_message(S3ErrorCode::Custom("CustomError".into()), err.to_string()));
+        }
+
+        let data = serialize_config(&input_cfg)?;
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
+    }
+
+    pub async fn execute_put_bucket_notification_configuration(
+        &self,
+        req: S3Request<PutBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let PutBucketNotificationConfigurationInput {
+            bucket,
+            notification_configuration,
+            ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let data = serialize_config(&notification_configuration)?;
+        metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+
+        let region = rustfs_ecstore::global::get_global_region().unwrap_or_default();
+        let clear_rules = notifier_global::clear_bucket_notification_rules(&bucket);
+        let parse_rules = async {
+            let mut event_rules = Vec::new();
+
+            process_queue_configurations(&mut event_rules, notification_configuration.queue_configurations.clone(), |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            })?;
+            process_topic_configurations(&mut event_rules, notification_configuration.topic_configurations.clone(), |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            })?;
+            process_lambda_configurations(
+                &mut event_rules,
+                notification_configuration.lambda_function_configurations.clone(),
+                |arn_str| {
+                    ARN::parse(arn_str)
+                        .map(|arn| arn.target_id)
+                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+                },
+            )?;
+
+            Ok::<_, TargetIDError>(event_rules)
+        };
+
+        let (clear_result, event_rules_result) = tokio::join!(clear_rules, parse_rules);
+
+        clear_result.map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
+        let event_rules =
+            event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
+        warn!("notify event rules: {:?}", &event_rules);
+
+        notifier_global::add_event_specific_rules(&bucket, &region, &event_rules)
+            .await
+            .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
+
+        Ok(S3Response::new(PutBucketNotificationConfigurationOutput {}))
+    }
+
+    pub async fn execute_put_bucket_policy(
+        &self,
+        req: S3Request<PutBucketPolicyInput>,
+    ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let PutBucketPolicyInput { bucket, policy, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let cfg: BucketPolicy =
+            serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?;
+
+        if let Err(err) = cfg.is_valid() {
+            warn!("put_bucket_policy err input {:?}, {:?}", &policy, err);
+            return Err(s3_error!(MalformedPolicy));
+        }
+
+        let is_public_policy = cfg
+            .statements
+            .iter()
+            .any(|statement| matches!(statement.effect, Effect::Allow) && statement.principal.is_match("*"));
+
+        if is_public_policy {
+            match metadata_sys::get_public_access_block_config(&bucket).await {
+                Ok((config, _)) => {
+                    if config.block_public_policy.unwrap_or(false) {
+                        return Err(s3_error!(AccessDenied, "Access Denied"));
+                    }
+                }
+                Err(err) => {
+                    if err != StorageError::ConfigNotFound {
+                        warn!("get_public_access_block_config err {:?}", &err);
+                        return Err(ApiError::from(err).into());
+                    }
+                }
+            }
+        }
+
+        let data = policy.as_bytes().to_vec();
+
+        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketPolicyOutput {}))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_put_bucket_tagging(
+        &self,
+        req: S3Request<PutBucketTaggingInput>,
+    ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let data = serialize_config(&tagging)?;
+
+        metadata_sys::update(&bucket, BUCKET_TAGGING_CONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(Default::default()))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let PutBucketVersioningInput {
+            bucket,
+            versioning_configuration,
+            ..
+        } = req.input;
+
+        let data = serialize_config(&versioning_configuration)?;
+
+        metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -509,6 +1182,63 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_head_bucket(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_bucket_policy_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketPolicyInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_policy(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_bucket_versioning_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketVersioningInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_versioning(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_bucket_lifecycle_configuration_rejects_missing_configuration() {
+        let input = PutBucketLifecycleConfigurationInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_lifecycle_configuration(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn execute_put_bucket_policy_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketPolicyInput::builder()
+            .bucket("test-bucket".to_string())
+            .policy("{}".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_policy(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
