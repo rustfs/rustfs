@@ -240,9 +240,13 @@ where
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
+        let prefix_with_slash = prefix
+            .clone()
+            .map(|p| if p.ends_with('/') { p.to_string() } else { format!("{}/", p) });
+
         let list_input = ListObjectsV2Input::builder()
             .bucket(bucket)
-            .prefix(prefix.map(|p| p.to_string()))
+            .prefix(prefix_with_slash.clone())
             .delimiter(Some("/".to_string()))
             .build()
             .map_err(|e| {
@@ -265,7 +269,27 @@ where
                 if let Some(objects) = output.contents {
                     for obj in objects {
                         if let Some(key) = obj.key {
-                            let filename = PathBuf::from(key.as_str());
+                            // Filter: only show files directly in current directory
+                            // Skip files in subdirectories (they should be accessed via cd)
+                            let should_show = if prefix.is_none() {
+                                // Root directory: only show files without "/"
+                                !key.contains('/')
+                            } else {
+                                // Subdirectory: show files starting with prefix
+                                key.starts_with(&prefix_with_slash.clone().unwrap_or_default())
+                            };
+
+                            if !should_show {
+                                continue;
+                            }
+
+                            let filename = PathBuf::from(key.as_str())
+                                .file_name()
+                                .ok_or_else(|| {
+                                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("Invalid filename: {}", key))
+                                })
+                                .map(PathBuf::from)?;
+
                             let size = obj.size.unwrap_or(0) as u64;
                             let modified = obj.last_modified.map(|dt: s3s::dto::Timestamp| {
                                 // Convert s3s Timestamp to SystemTime
@@ -291,7 +315,13 @@ where
                 if let Some(common_prefixes) = output.common_prefixes {
                     for prefix in common_prefixes {
                         if let Some(prefix_str) = prefix.prefix {
-                            let dir_name = PathBuf::from(prefix_str.as_str().trim_end_matches('/'));
+                            let dir_name = PathBuf::from(prefix_str.as_str().trim_end_matches('/'))
+                                .file_name()
+                                .ok_or_else(|| {
+                                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("Invalid directory: {}", prefix_str))
+                                })
+                                .map(PathBuf::from)?;
+
                             let metadata = FtpsMetadata {
                                 size: 0,
                                 modified: Some(std::time::SystemTime::now()),
@@ -473,8 +503,60 @@ where
                 }
             }
         } else {
-            // Delete directory (bucket) - not supported in typical FTP
-            Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Directory deletion not supported"))
+            // Delete directory (bucket)
+            // If path ends with '/', treat it as bucket deletion request
+            if path_str.ends_with('/') {
+                // First, delete all objects in the bucket
+                let list_input = ListObjectsV2Input::builder().bucket(bucket.clone()).build().map_err(|e| {
+                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
+                })?;
+
+                if let Ok(output) = self
+                    .storage
+                    .list_objects_v2(
+                        list_input,
+                        &session_context.principal.user_identity.credentials.access_key,
+                        &session_context.principal.user_identity.credentials.secret_key,
+                    )
+                    .await
+                {
+                    // Delete all objects
+                    if let Some(objects) = output.contents {
+                        for obj in objects {
+                            if let Some(obj_key) = obj.key {
+                                let _ = self
+                                    .storage
+                                    .delete_object(
+                                        &bucket,
+                                        &obj_key,
+                                        &session_context.principal.user_identity.credentials.access_key,
+                                        &session_context.principal.user_identity.credentials.secret_key,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                // Then delete the bucket
+                match self
+                    .storage
+                    .delete_bucket(
+                        &bucket,
+                        &session_context.principal.user_identity.credentials.access_key,
+                        &session_context.principal.user_identity.credentials.secret_key,
+                    )
+                    .await
+                {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        error!("Failed to delete bucket '{}': {}", path_str, e);
+                        Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Delete bucket failed: {}", e)))
+                    }
+                }
+            } else {
+                Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Directory deletion not supported"))
+            }
         }
     }
 
@@ -516,7 +598,39 @@ where
             .parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
-        // Delete bucket for directory
+        // First, delete all objects in the bucket
+        let list_input = ListObjectsV2Input::builder().bucket(bucket.clone()).build().map_err(|e| {
+            Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
+        })?;
+
+        if let Ok(output) = self
+            .storage
+            .list_objects_v2(
+                list_input,
+                &session_context.principal.user_identity.credentials.access_key,
+                &session_context.principal.user_identity.credentials.secret_key,
+            )
+            .await
+        {
+            // Delete all objects
+            if let Some(objects) = output.contents {
+                for obj in objects {
+                    if let Some(obj_key) = obj.key {
+                        let _ = self
+                            .storage
+                            .delete_object(
+                                &bucket,
+                                &obj_key,
+                                &session_context.principal.user_identity.credentials.access_key,
+                                &session_context.principal.user_identity.credentials.secret_key,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // Then delete the bucket
         match self
             .storage
             .delete_bucket(
@@ -531,8 +645,14 @@ where
                 Ok(())
             }
             Err(e) => {
-                error!("Failed to remove directory/bucket '{}': {}", path_str, e);
-                Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Rmdir failed: {}", e)))
+                // If bucket doesn't exist, consider it successful (idempotent)
+                if e.to_string().contains("NoSuchBucket") {
+                    debug!("Bucket '{}' already deleted", bucket);
+                    Ok(())
+                } else {
+                    error!("Failed to remove directory/bucket '{}': {}", path_str, e);
+                    Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Rmdir failed: {}", e)))
+                }
             }
         }
     }
@@ -568,6 +688,9 @@ where
         let to_str = to.as_ref().to_string_lossy();
         debug!("FTPS rename request for user '{}' from '{}' to '{}'", user.username, from_str, to_str);
 
-        Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Atomic rename not supported in S3"))
+        Err(Error::new(
+            ErrorKind::CommandNotImplemented,
+            "Rename operation not supported in S3 backend",
+        ))
     }
 }
