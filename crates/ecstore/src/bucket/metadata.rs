@@ -26,7 +26,8 @@ use rmp_serde::Serializer as rmpSerializer;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::{
     BucketLifecycleConfiguration, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
-    ReplicationConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
+    PublicAccessBlockConfiguration, ReplicationConfiguration, ServerSideEncryptionConfiguration, Tagging,
+    VersioningConfiguration,
 };
 use serde::Serializer;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,8 @@ pub const BUCKET_VERSIONING_CONFIG: &str = "versioning.xml";
 pub const BUCKET_REPLICATION_CONFIG: &str = "replication.xml";
 pub const BUCKET_TARGETS_FILE: &str = "bucket-targets.json";
 pub const BUCKET_CORS_CONFIG: &str = "cors.xml";
+pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
+pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
@@ -69,6 +72,8 @@ pub struct BucketMetadata {
     pub bucket_targets_config_json: Vec<u8>,
     pub bucket_targets_config_meta_json: Vec<u8>,
     pub cors_config_xml: Vec<u8>,
+    pub public_access_block_config_xml: Vec<u8>,
+    pub bucket_acl_config_json: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -82,6 +87,8 @@ pub struct BucketMetadata {
     pub bucket_targets_config_updated_at: OffsetDateTime,
     pub bucket_targets_config_meta_updated_at: OffsetDateTime,
     pub cors_config_updated_at: OffsetDateTime,
+    pub public_access_block_config_updated_at: OffsetDateTime,
+    pub bucket_acl_config_updated_at: OffsetDateTime,
 
     #[serde(skip)]
     pub new_field_updated_at: OffsetDateTime,
@@ -110,6 +117,10 @@ pub struct BucketMetadata {
     pub bucket_target_config_meta: Option<HashMap<String, String>>,
     #[serde(skip)]
     pub cors_config: Option<CORSConfiguration>,
+    #[serde(skip)]
+    pub public_access_block_config: Option<PublicAccessBlockConfiguration>,
+    #[serde(skip)]
+    pub bucket_acl_config: Option<String>,
 }
 
 impl Default for BucketMetadata {
@@ -130,6 +141,8 @@ impl Default for BucketMetadata {
             bucket_targets_config_json: Default::default(),
             bucket_targets_config_meta_json: Default::default(),
             cors_config_xml: Default::default(),
+            public_access_block_config_xml: Default::default(),
+            bucket_acl_config_json: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -142,6 +155,8 @@ impl Default for BucketMetadata {
             bucket_targets_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             bucket_targets_config_meta_updated_at: OffsetDateTime::UNIX_EPOCH,
             cors_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            public_access_block_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            bucket_acl_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -155,6 +170,8 @@ impl Default for BucketMetadata {
             bucket_target_config: Default::default(),
             bucket_target_config_meta: Default::default(),
             cors_config: Default::default(),
+            public_access_block_config: Default::default(),
+            bucket_acl_config: Default::default(),
         }
     }
 }
@@ -254,6 +271,12 @@ impl BucketMetadata {
         if self.bucket_targets_config_meta_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.bucket_targets_config_meta_updated_at = self.created
         }
+        if self.public_access_block_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.public_access_block_config_updated_at = self.created
+        }
+        if self.bucket_acl_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.bucket_acl_config_updated_at = self.created
+        }
     }
 
     pub fn update_config(&mut self, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
@@ -306,6 +329,14 @@ impl BucketMetadata {
             BUCKET_CORS_CONFIG => {
                 self.cors_config_xml = data;
                 self.cors_config_updated_at = updated;
+            }
+            BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG => {
+                self.public_access_block_config_xml = data;
+                self.public_access_block_config_updated_at = updated;
+            }
+            BUCKET_ACL_CONFIG => {
+                self.bucket_acl_config_json = data;
+                self.bucket_acl_config_updated_at = updated;
             }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }
@@ -379,6 +410,15 @@ impl BucketMetadata {
         }
         if !self.cors_config_xml.is_empty() {
             self.cors_config = Some(deserialize::<CORSConfiguration>(&self.cors_config_xml)?);
+        }
+        if !self.public_access_block_config_xml.is_empty() {
+            self.public_access_block_config =
+                Some(deserialize::<PublicAccessBlockConfiguration>(&self.public_access_block_config_xml)?);
+        }
+        if !self.bucket_acl_config_json.is_empty() {
+            let acl = String::from_utf8(self.bucket_acl_config_json.clone())
+                .map_err(|e| Error::other(format!("invalid UTF-8 in bucket ACL: {}", e)))?;
+            self.bucket_acl_config = Some(acl);
         }
 
         Ok(())
@@ -530,6 +570,15 @@ mod test {
         bm.bucket_targets_config_meta_json = bucket_targets_meta_json.as_bytes().to_vec();
         bm.bucket_targets_config_meta_updated_at = OffsetDateTime::now_utc();
 
+        // Add public access block configuration
+        let public_access_block_xml = r#"<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>"#;
+        bm.public_access_block_config_xml = public_access_block_xml.as_bytes().to_vec();
+        bm.public_access_block_config_updated_at = OffsetDateTime::now_utc();
+
+        let bucket_acl = r#"{"owner":{"id":"rustfsadmin","display_name":"RustFS Tester"},"grants":[{"grantee":{"grantee_type":"CanonicalUser","id":"rustfsadmin","display_name":"RustFS Tester","uri":null,"email_address":null},"permission":"FULL_CONTROL"}]}"#;
+        bm.bucket_acl_config_json = bucket_acl.as_bytes().to_vec();
+        bm.bucket_acl_config_updated_at = OffsetDateTime::now_utc();
+
         // Test serialization
         let buf = bm.marshal_msg().unwrap();
         assert!(!buf.is_empty(), "Serialized buffer should not be empty");
@@ -549,6 +598,8 @@ mod test {
         assert_eq!(bm.encryption_config_xml, deserialized_bm.encryption_config_xml);
         assert_eq!(bm.tagging_config_xml, deserialized_bm.tagging_config_xml);
         assert_eq!(bm.quota_config_json, deserialized_bm.quota_config_json);
+        assert_eq!(bm.public_access_block_config_xml, deserialized_bm.public_access_block_config_xml);
+        assert_eq!(bm.bucket_acl_config_json, deserialized_bm.bucket_acl_config_json);
         assert_eq!(bm.object_lock_config_xml, deserialized_bm.object_lock_config_xml);
         assert_eq!(bm.notification_config_xml, deserialized_bm.notification_config_xml);
         assert_eq!(bm.replication_config_xml, deserialized_bm.replication_config_xml);
