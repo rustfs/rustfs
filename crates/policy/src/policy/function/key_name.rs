@@ -160,6 +160,9 @@ pub enum S3KeyName {
     #[strum(serialize = "s3:x-amz-content-sha256")]
     S3XAmzContentSha256,
 
+    #[strum(serialize = "s3:x-amz-acl")]
+    S3XAmzAcl,
+
     #[strum(serialize = "s3:LocationConstraint")]
     S3LocationConstraint,
 
