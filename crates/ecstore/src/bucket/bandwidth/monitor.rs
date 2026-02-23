@@ -47,8 +47,13 @@ impl BucketThrottle {
             warn!("bucket throttle mutex poisoned, recovering");
             e.into_inner()
         });
-        let _ = guard.try_wait();
-        guard.available()
+        if guard.try_wait().is_ok() {
+            let av = guard.available();
+            let _ = guard.set_available(av + 1);
+            av + 1
+        } else {
+            guard.available()
+        }
     }
 
     /// The ratelimit crate (0.10.0) does not provide a bulk token consumption API.
