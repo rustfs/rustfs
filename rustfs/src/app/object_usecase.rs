@@ -1590,7 +1590,7 @@ impl DefaultObjectUsecase {
 
         counter!("rustfs.get_object_tagging.success").increment(1);
         let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
+        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "get").record(duration.as_secs_f64());
         Ok(S3Response::new(GetObjectTaggingOutput {
             tag_set,
             version_id: req.input.version_id.clone(),
