@@ -727,12 +727,12 @@ impl FolderScanner {
                     file_type: entry_type,
                 };
 
-                // If this path is already known as failed, just bump the counter and skip.
-                // We intentionally do NOT call `record_failed` here, because the failure
-                // was recorded when the original error occurred (e.g. in the get_size error
-                // branch below). This branch only accounts for subsequent skips.
+                // If this path is already known as failed, just skip it.
+                // We intentionally do NOT call `record_failed` or bump `failed_objects` here,
+                // because the failure was recorded when the original error occurred
+                // (e.g. in the get_size error branch below). This branch only accounts
+                // for subsequent skips of already-failed paths.
                 if self.should_skip_failed(&item.path) {
-                    into.failed_objects += 1;
                     continue;
                 }
 
