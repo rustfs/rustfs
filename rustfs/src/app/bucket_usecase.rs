@@ -28,7 +28,7 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::*;
 use metrics::counter;
 use rustfs_ecstore::bucket::{
-    lifecycle::{bucket_lifecycle_ops::validate_transition_tier, lifecycle::Lifecycle},
+    lifecycle::bucket_lifecycle_ops::validate_transition_tier,
     metadata::{
         BUCKET_ACL_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_SSECONFIG,
         BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG,
@@ -744,7 +744,7 @@ impl DefaultBucketUsecase {
 
         let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
         if let Ok(rcfg) = rcfg
-            && let Err(err) = input_cfg.validate(&rcfg.0).await
+            && let Err(err) = rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg.0).await
         {
             return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
         }
