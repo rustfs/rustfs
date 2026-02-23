@@ -201,7 +201,7 @@ impl TryFrom<&str> for Action {
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
 #[cfg_attr(test, derive(Default))]
 #[serde(try_from = "&str", into = "&str")]
 pub enum S3Action {
@@ -377,7 +377,7 @@ pub enum S3Action {
 // }
 
 // AdminAction - admin policy action.
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum AdminAction {
     #[strum(serialize = "admin:Heal")]
@@ -592,11 +592,18 @@ impl AdminAction {
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum StsAction {}
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
+impl TryFrom<&str> for StsAction {
+    type Error = strum::ParseError;
+    fn try_from(_value: &str) -> std::result::Result<Self, Self::Error> {
+        Err(strum::ParseError::VariantNotFound)
+    }
+}
+
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum KmsAction {
     #[strum(serialize = "kms:*")]
