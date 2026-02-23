@@ -4767,9 +4767,9 @@ dependencies = [
 
 [[package]]
 name = "libunftp"
-version = "0.23.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9f8ff371890db2cf65a0758dba9a79f9cd965de369f6dbdc6581a22780af45e"
+checksum = "3186f219c64999ae9a2900c78ebfaf4a6b4acc3b2bbf5afe5e027e5ca5978593"
 dependencies = [
  "async-trait",
  "bitflags 2.11.0",
@@ -4780,6 +4780,8 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "lazy_static",
+ "libc",
+ "md-5 0.10.6",
  "moka",
  "nix 0.30.1",
  "prometheus",
@@ -4793,8 +4795,8 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-attributes",
- "unftp-core",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -9403,22 +9405,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42302a846dea7ab786f42dc5f519387069045acff793e1178d9368414168fe95"
 dependencies = [
  "tz-rs",
-]
-
-[[package]]
-name = "unftp-core"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79acf4b257aa56dd7f00466a81693d6c79c362c55092b3137909d6e76249ad80"
-dependencies = [
- "async-trait",
- "chrono",
- "derive_more",
- "libc",
- "md-5 0.10.6",
- "thiserror 2.0.18",
- "tokio",
- "x509-parser",
 ]
 
 [[package]]
