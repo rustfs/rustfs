@@ -228,10 +228,10 @@ pub(crate) fn stored_grant_to_dto(grant: &StoredGrant) -> Grant {
 pub(crate) fn is_public_grant(grant: &StoredGrant) -> bool {
     matches!(grant.grantee.grantee_type.as_str(), "Group")
         && grant
-        .grantee
-        .uri
-        .as_deref()
-        .is_some_and(|uri| uri == ACL_GROUP_ALL_USERS || uri == ACL_GROUP_AUTHENTICATED_USERS)
+            .grantee
+            .uri
+            .as_deref()
+            .is_some_and(|uri| uri == ACL_GROUP_ALL_USERS || uri == ACL_GROUP_AUTHENTICATED_USERS)
 }
 
 fn grants_for_canned_bucket_acl(acl: &str, owner: &StoredOwner) -> Vec<StoredGrant> {
@@ -869,20 +869,20 @@ impl FS {
 
         if let Some(alg) = &input.checksum_algorithm
             && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
-            let key = match alg.as_str() {
-                ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
-                ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
-                ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
-                ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
-                ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
-                _ => return None,
-            };
-            trailer.read(|headers| {
-                headers
-                    .get(key.unwrap_or_default())
-                    .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                let key = match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+                    _ => return None,
+                };
+                trailer.read(|headers| {
+                    headers
+                        .get(key.unwrap_or_default())
+                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                })
             })
-        })
         {
             match alg.as_str() {
                 ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
@@ -1205,7 +1205,7 @@ impl S3 for FS {
                 })
                 .collect::<Vec<ObjectToDelete>>(),
         )
-            .await;
+        .await;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -1276,8 +1276,8 @@ impl S3 for FS {
                 &req.headers,
                 metadata,
             )
-                .await
-                .map_err(ApiError::from)?;
+            .await
+            .map_err(ApiError::from)?;
 
             // Get object info to collect size for quota tracking
             let (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
@@ -1319,7 +1319,7 @@ impl S3 for FS {
                     &opts,
                     gerr.clone(),
                 )
-                    .await;
+                .await;
                 if dsc.replicate_any() {
                     if object.version_id.is_some() {
                         object.version_purge_status = Some(VersionPurgeStatusType::Pending);
@@ -1396,8 +1396,8 @@ impl S3 for FS {
 
             if err.is_none()
                 || err
-                .clone()
-                .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
+                    .clone()
+                    .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
             {
                 if replicate_deletes {
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
@@ -1447,7 +1447,7 @@ impl S3 for FS {
             if let Some(dobj) = &dobjs.delete_object
                 && replicate_deletes
                 && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
-                || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
+                    || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
             {
                 let mut dobj = dobj.clone();
                 if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
@@ -1482,12 +1482,12 @@ impl S3 for FS {
                             ..Default::default()
                         },
                     )
-                        .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
-                        .req_params(extract_params_header(&req_headers))
-                        .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
-                        .host(get_request_host(&req_headers))
-                        .user_agent(get_request_user_agent(&req_headers))
-                        .build();
+                    .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
+                    .req_params(extract_params_header(&req_headers))
+                    .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
+                    .host(get_request_host(&req_headers))
+                    .user_agent(get_request_user_agent(&req_headers))
+                    .build();
 
                     notifier_global::notify(event_args).await;
                 }
@@ -2040,8 +2040,8 @@ impl S3 for FS {
                         .await
                         .is_ok()
                         || authorize_request(&mut req_clone, Action::S3Action(S3Action::GetBucketLocationAction))
-                        .await
-                        .is_ok()
+                            .await
+                            .is_ok()
                     {
                         Some(info)
                     } else {

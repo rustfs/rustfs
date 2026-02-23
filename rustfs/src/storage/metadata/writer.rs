@@ -87,26 +87,20 @@ impl ChunkedWriter {
 }
 
 impl AsyncWrite for ChunkedWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         if let Some(err) = self.last_error.take() {
             return Poll::Ready(Err(err));
         }
 
         // Poll pending writes to keep them moving and check for errors
         let mut error = None;
-        self.write_futures.retain_mut(|fut| {
-            match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(_)) => false,
-                Poll::Ready(Err(e)) => {
-                    error = Some(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
-                    false
-                }
-                Poll::Pending => true,
+        self.write_futures.retain_mut(|fut| match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(_)) => false,
+            Poll::Ready(Err(e)) => {
+                error = Some(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+                false
             }
+            Poll::Pending => true,
         });
 
         if let Some(err) = error {
@@ -140,17 +134,15 @@ impl AsyncWrite for ChunkedWriter {
         let mut all_done = true;
         let mut error = None;
 
-        self.write_futures.retain_mut(|fut| {
-            match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(_)) => false,
-                Poll::Ready(Err(e)) => {
-                    error = Some(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
-                    false
-                }
-                Poll::Pending => {
-                    all_done = false;
-                    true
-                }
+        self.write_futures.retain_mut(|fut| match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(_)) => false,
+            Poll::Ready(Err(e)) => {
+                error = Some(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+                false
+            }
+            Poll::Pending => {
+                all_done = false;
+                true
             }
         });
 
@@ -158,11 +150,7 @@ impl AsyncWrite for ChunkedWriter {
             return Poll::Ready(Err(err));
         }
 
-        if all_done {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
+        if all_done { Poll::Ready(Ok(())) } else { Poll::Pending }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
