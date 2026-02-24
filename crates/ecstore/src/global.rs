@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::bandwidth::monitor::Monitor;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
@@ -29,6 +30,7 @@ use std::{
 };
 use tokio::sync::{OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
 pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;
@@ -58,6 +60,20 @@ lazy_static! {
     pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
     pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn rustfs_lock::client::LockClient>> = OnceLock::new();
     pub static ref GLOBAL_LOCK_CLIENTS: OnceLock<HashMap<String, Arc<dyn LockClient>>> = OnceLock::new();
+    pub static ref GLOBAL_BUCKET_MONITOR: OnceLock<Arc<Monitor>> = OnceLock::new();
+}
+
+pub fn init_global_bucket_monitor(num_nodes: u64) {
+    if GLOBAL_BUCKET_MONITOR.set(Monitor::new(num_nodes)).is_err() {
+        warn!(
+            "global bucket monitor already initialized, ignoring re-initialization with num_nodes={}",
+            num_nodes
+        );
+    }
+}
+
+pub fn get_global_bucket_monitor() -> Option<Arc<Monitor>> {
+    GLOBAL_BUCKET_MONITOR.get().cloned()
 }
 
 /// Global cancellation token for background services (data scanner and auto heal)
