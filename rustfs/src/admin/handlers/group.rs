@@ -226,7 +226,7 @@ impl Operation for DeleteGroup {
             warn!("delete group failed, e: {:?}", e);
             match e {
                 rustfs_iam::error::Error::GroupNotEmpty => {
-                    s3_error!(BucketNotEmpty, "group is not empty")
+                    s3_error!(InvalidRequest, "group is not empty")
                 }
                 rustfs_iam::error::Error::InvalidArgument => {
                     s3_error!(InvalidArgument, "{e}")
