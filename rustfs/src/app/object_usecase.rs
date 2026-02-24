@@ -50,7 +50,7 @@ use rustfs_ecstore::bucket::{
     object_lock::objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, check_retention_for_modification},
     quota::QuotaOperation,
     replication::{
-        DeletedObjectReplicationInfo, get_must_replicate_options, must_replicate, schedule_replication,
+        DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate, schedule_replication,
         schedule_replication_delete,
     },
     tagging::{decode_tags, encode_tags},
@@ -60,14 +60,18 @@ use rustfs_ecstore::bucket::{
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
+use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::is_valid_storage_class;
-use rustfs_ecstore::store_api::{BucketOptions, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
+use rustfs_ecstore::store_api::{
+    BucketOptions, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader,
+};
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
     parse_restore_obj_status,
 };
+use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, EtagReader, HardLimitReader, HashReader, Reader, WarpReader};
 use rustfs_s3select_api::{
@@ -76,7 +80,6 @@ use rustfs_s3select_api::{
 };
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::EventName;
-use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, RESERVED_METADATA_PREFIX,
     headers::{
@@ -86,6 +89,9 @@ use rustfs_utils::http::{
     },
 };
 use rustfs_utils::path::{is_dir_object, path_join_buf};
+use rustfs_utils::{
+    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
+};
 use s3s::dto::*;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -102,6 +108,21 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 pub type ObjectUsecaseResult<T> = Result<T, ApiError>;
+
+fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Option<String>, Option<Uuid>), String> {
+    let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    match version_id {
+        Some(id) => {
+            if id.eq_ignore_ascii_case("null") {
+                Ok((Some("null".to_string()), Some(Uuid::nil())))
+            } else {
+                let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+                Ok((Some(id), Some(uuid)))
+            }
+        }
+        None => Ok((None, None)),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutObjectRequest {
@@ -2358,6 +2379,308 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
+    pub async fn execute_delete_objects(
+        &self,
+        mut req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, "s3:DeleteObjects").suppress_event();
+        let (bucket, delete) = {
+            let bucket = req.input.bucket.clone();
+            let delete = req.input.delete.clone();
+            (bucket, delete)
+        };
+
+        if delete.objects.is_empty() || delete.objects.len() > 1000 {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "No objects to delete or too many objects to delete".to_string(),
+            ));
+        }
+
+        let replicate_deletes = has_replication_rules(
+            &bucket,
+            &delete
+                .objects
+                .iter()
+                .map(|v| ObjectToDelete {
+                    object_name: v.key.clone(),
+                    ..Default::default()
+                })
+                .collect::<Vec<ObjectToDelete>>(),
+        )
+        .await;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
+        let bypass_governance = has_bypass_governance_header(&req.headers);
+
+        #[derive(Default, Clone)]
+        struct DeleteResult {
+            delete_object: Option<rustfs_ecstore::store_api::DeletedObject>,
+            error: Option<Error>,
+        }
+
+        let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
+
+        let mut object_to_delete = Vec::new();
+        let mut object_to_delete_index = HashMap::new();
+        let mut object_sizes = HashMap::new();
+        for (idx, obj_id) in delete.objects.iter().enumerate() {
+            let raw_version_id = obj_id.version_id.clone();
+            let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    delete_results[idx].error = Some(Error {
+                        code: Some("NoSuchVersion".to_string()),
+                        key: Some(obj_id.key.clone()),
+                        message: Some(err),
+                        version_id: raw_version_id,
+                    });
+                    continue;
+                }
+            };
+
+            {
+                let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+                req_info.bucket = Some(bucket.clone());
+                req_info.object = Some(obj_id.key.clone());
+                req_info.version_id = version_id.clone();
+            }
+
+            let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::DeleteObjectAction)).await;
+            if let Err(e) = auth_res {
+                delete_results[idx].error = Some(Error {
+                    code: Some("AccessDenied".to_string()),
+                    key: Some(obj_id.key.clone()),
+                    message: Some(e.to_string()),
+                    version_id: version_id.clone(),
+                });
+                continue;
+            }
+
+            let mut object = ObjectToDelete {
+                object_name: obj_id.key.clone(),
+                version_id: version_uuid,
+                ..Default::default()
+            };
+
+            let metadata = extract_metadata(&req.headers);
+            let opts: ObjectOptions = del_opts(
+                &bucket,
+                &object.object_name,
+                object.version_id.map(|f| f.to_string()),
+                &req.headers,
+                metadata,
+            )
+            .await
+            .map_err(ApiError::from)?;
+
+            let (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
+                Ok(res) => (res, None),
+                Err(e) => (ObjectInfo::default(), Some(e.to_string())),
+            };
+
+            if gerr.is_none()
+                && let Some(block_reason) = check_object_lock_for_deletion(&bucket, &goi, bypass_governance).await
+            {
+                delete_results[idx].error = Some(Error {
+                    code: Some("AccessDenied".to_string()),
+                    key: Some(obj_id.key.clone()),
+                    message: Some(block_reason.error_message()),
+                    version_id: version_id.clone(),
+                });
+                continue;
+            }
+
+            object_sizes.insert(object.object_name.clone(), goi.size);
+
+            if is_dir_object(&object.object_name) && object.version_id.is_none() {
+                object.version_id = Some(Uuid::nil());
+            }
+
+            if replicate_deletes {
+                let dsc = check_replicate_delete(
+                    &bucket,
+                    &ObjectToDelete {
+                        object_name: object.object_name.clone(),
+                        version_id: object.version_id,
+                        ..Default::default()
+                    },
+                    &goi,
+                    &opts,
+                    gerr.clone(),
+                )
+                .await;
+                if dsc.replicate_any() {
+                    if object.version_id.is_some() {
+                        object.version_purge_status = Some(VersionPurgeStatusType::Pending);
+                        object.version_purge_statuses = dsc.pending_status();
+                    } else {
+                        object.delete_marker_replication_status = dsc.pending_status();
+                    }
+                    object.replicate_decision_str = Some(dsc.to_string());
+                }
+            }
+
+            object_to_delete_index.insert(object.object_name.clone(), idx);
+            object_to_delete.push(object);
+        }
+
+        let (mut dobjs, errs) = store
+            .delete_objects(
+                &bucket,
+                object_to_delete.clone(),
+                ObjectOptions {
+                    version_suspended: version_cfg.suspended(),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let manager = get_concurrency_manager();
+        let bucket_clone = bucket.clone();
+        let deleted_objects = dobjs.clone();
+        tokio::spawn(async move {
+            for dobj in deleted_objects {
+                manager
+                    .invalidate_cache_versioned(
+                        &bucket_clone,
+                        &dobj.object_name,
+                        dobj.version_id.map(|v| v.to_string()).as_deref(),
+                    )
+                    .await;
+            }
+        });
+
+        if is_all_buckets_not_found(
+            &errs
+                .iter()
+                .map(|v| v.as_ref().map(|v| v.clone().into()))
+                .collect::<Vec<Option<DiskError>>>() as &[Option<DiskError>],
+        ) {
+            let result = Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
+            let _ = helper.complete(&result);
+            return result;
+        }
+
+        for (i, err) in errs.iter().enumerate() {
+            let obj = dobjs[i].clone();
+
+            let Some(didx) = object_to_delete_index.get(&obj.object_name) else {
+                continue;
+            };
+
+            if err.is_none()
+                || err
+                    .clone()
+                    .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
+            {
+                if replicate_deletes {
+                    dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
+                }
+                delete_results[*didx].delete_object = Some(dobjs[i].clone());
+                if let Some(&size) = object_sizes.get(&obj.object_name) {
+                    rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, size as u64).await;
+                }
+                continue;
+            }
+
+            if let Some(err) = err.clone() {
+                delete_results[*didx].error = Some(Error {
+                    code: Some(err.to_string()),
+                    key: Some(object_to_delete[i].object_name.clone()),
+                    message: Some(err.to_string()),
+                    version_id: object_to_delete[i].version_id.map(|v| v.to_string()),
+                });
+            }
+        }
+
+        let deleted = delete_results
+            .iter()
+            .filter_map(|v| v.delete_object.clone())
+            .map(|v| DeletedObject {
+                delete_marker: { if v.delete_marker { Some(true) } else { None } },
+                delete_marker_version_id: v.delete_marker_version_id.map(|v| v.to_string()),
+                key: Some(v.object_name.clone()),
+                version_id: if is_dir_object(v.object_name.as_str()) && v.version_id == Some(Uuid::nil()) {
+                    None
+                } else {
+                    v.version_id.map(|v| v.to_string())
+                },
+            })
+            .collect();
+
+        let errors = delete_results.iter().filter_map(|v| v.error.clone()).collect::<Vec<Error>>();
+        let output = DeleteObjectsOutput {
+            deleted: Some(deleted),
+            errors: Some(errors),
+            ..Default::default()
+        };
+
+        for dobjs in &delete_results {
+            if let Some(dobj) = &dobjs.delete_object
+                && replicate_deletes
+                && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
+                    || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
+            {
+                let mut dobj = dobj.clone();
+                if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
+                    dobj.version_id = Some(Uuid::nil());
+                }
+
+                let deleted_object = DeletedObjectReplicationInfo {
+                    delete_object: dobj,
+                    bucket: bucket.clone(),
+                    event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                    ..Default::default()
+                };
+                schedule_replication_delete(deleted_object).await;
+            }
+        }
+
+        let req_headers = req.headers.clone();
+        tokio::spawn(async move {
+            for res in delete_results {
+                if let Some(dobj) = res.delete_object {
+                    let event_name = if dobj.delete_marker {
+                        EventName::ObjectRemovedDeleteMarkerCreated
+                    } else {
+                        EventName::ObjectRemovedDelete
+                    };
+                    let event_args = EventArgsBuilder::new(
+                        event_name,
+                        bucket.clone(),
+                        ObjectInfo {
+                            name: dobj.object_name.clone(),
+                            bucket: bucket.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .version_id(dobj.version_id.map(|v| v.to_string()).unwrap_or_default())
+                    .req_params(extract_params_header(&req_headers))
+                    .resp_elements(extract_resp_elements(&S3Response::new(DeleteObjectsOutput::default())))
+                    .host(get_request_host(&req_headers))
+                    .user_agent(get_request_user_agent(&req_headers))
+                    .build();
+
+                    notifier_global::notify(event_args).await;
+                }
+            }
+        });
+
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
+    }
+
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
@@ -3263,6 +3586,46 @@ mod tests {
 
         let err = usecase.execute_delete_object(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn execute_delete_objects_rejects_empty_object_list() {
+        let input = DeleteObjectsInput::builder()
+            .bucket("test-bucket".to_string())
+            .delete(Delete {
+                objects: vec![],
+                quiet: None,
+            })
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::POST);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = usecase.execute_delete_objects(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn execute_delete_objects_returns_internal_error_when_store_uninitialized() {
+        let input = DeleteObjectsInput::builder()
+            .bucket("test-bucket".to_string())
+            .delete(Delete {
+                objects: vec![ObjectIdentifier {
+                    key: "test-key".to_string(),
+                    version_id: None,
+                    ..Default::default()
+                }],
+                quiet: None,
+            })
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::POST);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = usecase.execute_delete_objects(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[tokio::test]

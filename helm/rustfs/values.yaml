@@ -144,9 +144,21 @@ ingress:
           pathType: Prefix
   tls:
     enabled: false # Enable tls and access rustfs via https.
+
     certManager:
       enabled: false # Enable certmanager to generate certificate for rustfs, default false.
-    secretName: secret-tls
+
+    existingSecret:
+      # To use an existing secret for tls certificates in the ingress enable this,
+      # set the name of the existing secret and make sure that the secret contains
+      # values for the keys "crt" and "key".
+      enabled: false
+      name: ""
+
+    # If the certmanager is not used and no existing secret is used to provide a tls certificate,
+    # then this certificate can be configured here. A secret will be created and used.
+    # Note: The following input will be base64 encoded during secret creation. There is no need
+    #       to provide it base64 encoded here already.
     crt: tls.crt
     key: tls.key
 
