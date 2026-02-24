@@ -258,7 +258,7 @@ mod integration_tests {
 
     // ──────────────────────────────────────────────
     // JSON-input variants of all the above tests
-    // These exercise the JSONType::DOCUMENT code path
+    // These exercise the JSONType::LINES (JSON lines) code path
     // ──────────────────────────────────────────────
 
     #[tokio::test]
