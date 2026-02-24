@@ -42,44 +42,32 @@ impl BucketThrottle {
         self.limiter.lock().unwrap_or_else(|e| e.into_inner()).max_tokens()
     }
 
-    pub fn tokens(&self) -> u64 {
-        let guard = self.limiter.lock().unwrap_or_else(|e| {
-            warn!("bucket throttle mutex poisoned, recovering");
-            e.into_inner()
-        });
-        if guard.try_wait().is_ok() {
-            let av = guard.available();
-            let _ = guard.set_available(av + 1);
-            av + 1
-        } else {
-            guard.available()
-        }
-    }
-
     /// The ratelimit crate (0.10.0) does not provide a bulk token consumption API.
     /// try_wait() first to consume 1 token AND trigger the internal refill
     /// mechanism (tokens are only refilled during try_wait/wait calls).
     /// directly adjust available tokens via set_available() to consume the remaining amount.
-    pub(crate) fn consume(&self, n: u64) -> (u64, f64) {
+    pub(crate) fn consume(&self, n: u64) -> (u64, f64, u64) {
         let guard = self.limiter.lock().unwrap_or_else(|e| {
             warn!("bucket throttle mutex poisoned, recovering");
             e.into_inner()
         });
+        if n == 0 {
+            return (0, guard.rate(), 0);
+        }
         let mut consumed = 0u64;
         if guard.try_wait().is_ok() {
             consumed = 1;
         }
-        if consumed < n {
-            let available = guard.available();
-            let batch = (n - consumed).min(available);
-            if batch > 0 {
-                let _ = guard.set_available(available - batch);
-                consumed += batch;
-            }
+        let available = guard.available();
+        let to_consume = n - consumed;
+        let batch = to_consume.min(available);
+        if batch > 0 {
+            let _ = guard.set_available(available - batch);
+            consumed += batch;
         }
         let deficit = n.saturating_sub(consumed);
         let rate = guard.rate();
-        (deficit, rate)
+        (deficit, rate, consumed)
     }
 }
 
@@ -133,6 +121,15 @@ impl Monitor {
     }
 
     pub fn set_bandwidth_limit(&self, bucket: &str, arn: &str, limit: i64) {
+        if limit <= 0 {
+            warn!(
+                bucket = bucket,
+                arn = arn,
+                limit = limit,
+                "invalid bandwidth limit, must be positive; ignoring"
+            );
+            return;
+        }
         let limit_bytes = limit / self.node_count as i64;
         if limit_bytes == 0 && limit > 0 {
             warn!(
@@ -229,10 +226,21 @@ mod tests {
     }
 
     #[test]
+    fn test_set_bandwidth_limit_ignores_non_positive() {
+        let monitor = Monitor::new(2);
+
+        monitor.set_bandwidth_limit("b1", "arn1", 0);
+        assert!(!monitor.is_throttled("b1", "arn1"));
+
+        monitor.set_bandwidth_limit("b1", "arn1", -10);
+        assert!(!monitor.is_throttled("b1", "arn1"));
+    }
+
+    #[test]
     fn test_consume_returns_deficit_when_tokens_exhausted() {
         let throttle = BucketThrottle::new(100).expect("test");
 
-        let (deficit, rate) = throttle.consume(200);
+        let (deficit, rate, _consumed) = throttle.consume(200);
 
         assert!(deficit > 0);
         assert!(rate > 0.0);
@@ -244,7 +252,7 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        let (deficit, _rate) = throttle.consume(5000);
+        let (deficit, _rate, _consumed) = throttle.consume(5000);
         assert_eq!(deficit, 0);
     }
 
@@ -268,8 +276,8 @@ mod tests {
         let mut total_deficit = 0u64;
         let mut total_consumed = 0u64;
         for h in handles {
-            let (deficit, _) = h.join().unwrap();
-            total_consumed += 100 - deficit;
+            let (deficit, _rate, consumed) = h.join().unwrap();
+            total_consumed += consumed;
             total_deficit += deficit;
         }
 

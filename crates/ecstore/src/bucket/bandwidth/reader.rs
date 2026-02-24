@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::bandwidth::monitor::{BucketThrottle, Monitor};
+use crate::bucket::bandwidth::monitor::Monitor;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -37,9 +37,6 @@ struct WaitState {
 
 pub struct MonitoredReader<R> {
     r: R,
-    throttle: Option<BucketThrottle>,
-    last_err: Option<std::io::Error>,
-    #[allow(dead_code)]
     m: Arc<Monitor>,
     opts: MonitorReaderOptions,
     wait_state: std::sync::Mutex<Option<WaitState>>,
@@ -59,8 +56,6 @@ impl<R> MonitoredReader<R> {
         );
         MonitoredReader {
             r,
-            throttle,
-            last_err: None,
             m,
             opts,
             wait_state: std::sync::Mutex::new(None),
@@ -89,20 +84,16 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
             }
         }
 
-        let throttle = match &this.throttle {
+        let throttle = match this.m.throttle(&this.opts.bucket_options) {
             Some(t) => t,
             None => return Pin::new(&mut this.r).poll_read(cx, buf),
         };
 
-        if let Some(e) = this.last_err.take() {
-            return Poll::Ready(Err(e));
-        }
-
         let b = throttle.burst();
         debug_assert!(b >= 1, "burst must be at least 1");
         let (need, tokens) = calc_need_and_tokens(b, buf.remaining(), &mut this.opts.header_size);
-        let (need, tokens) = adjust_by_available(throttle, need, tokens);
-        let (deficit, rate) = throttle.consume(tokens);
+        let (deficit, rate, consumed) = throttle.consume(tokens);
+        let need = need.min(consumed as usize);
 
         if deficit > 0 && rate > 0.0 {
             let duration = std::time::Duration::from_secs_f64(deficit as f64 / rate);
@@ -126,7 +117,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
             }
         }
 
-        poll_limited_read(&mut this.r, cx, buf, need, &mut this.last_err, &mut this.temp_buf)
+        poll_limited_read(&mut this.r, cx, buf, need, &mut this.temp_buf)
     }
 }
 
@@ -140,7 +131,7 @@ fn calc_need_and_tokens(burst: u64, need_upper: usize, header_size: &mut usize) 
             need as u64 + hdr as u64
         } else {
             *header_size -= burst as usize;
-            need = 1;
+            need = 0;
             burst
         }
     } else {
@@ -150,21 +141,11 @@ fn calc_need_and_tokens(burst: u64, need_upper: usize, header_size: &mut usize) 
     (need, tokens)
 }
 
-fn adjust_by_available(throttle: &BucketThrottle, need: usize, tokens: u64) -> (usize, u64) {
-    let av = throttle.tokens();
-    if av < tokens && av > 0 {
-        (need.min(av as usize), av)
-    } else {
-        (need, tokens)
-    }
-}
-
 fn poll_limited_read<R: AsyncRead + Unpin>(
     r: &mut R,
     cx: &mut Context<'_>,
     buf: &mut ReadBuf<'_>,
     limit: usize,
-    last_err: &mut Option<std::io::Error>,
     reusable_buf: &mut Vec<u8>,
 ) -> Poll<std::io::Result<()>> {
     let remaining = buf.remaining();
@@ -173,13 +154,7 @@ fn poll_limited_read<R: AsyncRead + Unpin>(
     }
 
     if remaining <= limit {
-        return match Pin::new(r).poll_read(cx, buf) {
-            Poll::Ready(Err(e)) => {
-                *last_err = Some(std::io::Error::new(e.kind(), e.to_string()));
-                Poll::Ready(Err(e))
-            }
-            other => other,
-        };
+        return Pin::new(r).poll_read(cx, buf);
     }
 
     reusable_buf.resize(limit, 0);
@@ -189,11 +164,7 @@ fn poll_limited_read<R: AsyncRead + Unpin>(
             buf.put_slice(temp_buf.filled());
             Poll::Ready(Ok(()))
         }
-        Poll::Ready(Err(e)) => {
-            *last_err = Some(std::io::Error::new(e.kind(), e.to_string()));
-            Poll::Ready(Err(e))
-        }
-        Poll::Pending => Poll::Pending,
+        other => other,
     }
 }
 
@@ -202,6 +173,7 @@ mod tests {
     use super::*;
     use futures_util::task::noop_waker_ref;
     use std::io;
+    use std::pin::Pin;
     use std::task::Context;
     use tokio::io::AsyncReadExt;
 
@@ -256,21 +228,45 @@ mod tests {
     fn test_poll_limited_read_honors_limit() {
         let mut inner = TestAsyncReader::new(b"abcdef");
         let mut out = [0u8; 8];
-        let mut last_err = None;
         let mut reusable = Vec::new();
         let waker = noop_waker_ref();
         let mut cx = Context::from_waker(waker);
 
         let mut read_buf = ReadBuf::new(&mut out);
-        let first = poll_limited_read(&mut inner, &mut cx, &mut read_buf, 3, &mut last_err, &mut reusable);
+        let first = poll_limited_read(&mut inner, &mut cx, &mut read_buf, 3, &mut reusable);
         assert!(matches!(first, Poll::Ready(Ok(()))));
         assert_eq!(read_buf.filled(), b"abc");
-        assert!(last_err.is_none());
 
-        let second = poll_limited_read(&mut inner, &mut cx, &mut read_buf, 3, &mut last_err, &mut reusable);
+        let second = poll_limited_read(&mut inner, &mut cx, &mut read_buf, 3, &mut reusable);
         assert!(matches!(second, Poll::Ready(Ok(()))));
         assert_eq!(read_buf.filled(), b"abcdef");
-        assert!(last_err.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_header_only_consumption_skips_io() {
+        let monitor = Monitor::new(1);
+        monitor.set_bandwidth_limit("b1", "arn1", 10);
+
+        let data = vec![0xAAu8; 20];
+        let inner = TestAsyncReader::new(&data);
+        let opts = MonitorReaderOptions {
+            bucket_options: BucketOptions {
+                name: "b1".to_string(),
+                replication_arn: "arn1".to_string(),
+            },
+            header_size: 25,
+        };
+        let mut reader = MonitoredReader::new(monitor, inner, opts);
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        let mut out = [0u8; 16];
+        let mut read_buf = ReadBuf::new(&mut out);
+
+        let poll = Pin::new(&mut reader).poll_read(&mut cx, &mut read_buf);
+        assert!(matches!(poll, Poll::Ready(Ok(())) | Poll::Pending));
+        assert!(read_buf.filled().is_empty());
+        assert_eq!(reader.opts.header_size, 15);
     }
 
     #[tokio::test]
