@@ -227,7 +227,6 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
 
     // Enforce reasonable bounds for STS credentials duration (similar to AWS STS)
     duration = duration.clamp(900, 43200);
-    
     // Generate STS credentials using the shared helper
     let new_cred = create_oidc_sts_credentials(
         &claims,
