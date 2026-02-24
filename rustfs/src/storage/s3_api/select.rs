@@ -12,20 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod access;
-pub mod concurrency;
-pub mod ecfs;
-pub(crate) mod entity;
-pub(crate) mod helper;
-pub mod options;
-pub(crate) mod s3_api;
-pub mod tonic_service;
+use s3s::dto::{SelectObjectContentEventStream, SelectObjectContentOutput};
 
-#[cfg(test)]
-mod concurrent_get_object_test;
-mod ecfs_extend;
-#[cfg(test)]
-mod ecfs_test;
-pub(crate) mod head_prefix;
-
-pub(crate) use ecfs_extend::*;
+pub(crate) fn build_select_object_content_output(payload: SelectObjectContentEventStream) -> SelectObjectContentOutput {
+    SelectObjectContentOutput { payload: Some(payload) }
+}
