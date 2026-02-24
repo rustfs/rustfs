@@ -421,6 +421,22 @@ pub fn has_bypass_governance_header(headers: &http::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+fn get_bucket_policy_authorize_action() -> Action {
+    Action::S3Action(S3Action::GetBucketPolicyAction)
+}
+
+fn get_object_acl_authorize_action() -> Action {
+    Action::S3Action(S3Action::GetObjectAclAction)
+}
+
+fn put_bucket_policy_authorize_action() -> Action {
+    Action::S3Action(S3Action::PutBucketPolicyAction)
+}
+
+fn put_object_acl_authorize_action() -> Action {
+    Action::S3Action(S3Action::PutObjectAclAction)
+}
+
 #[async_trait::async_trait]
 impl S3Access for FS {
     // /// Checks whether the current request has accesses to the resources.
@@ -865,7 +881,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::GetObjectAclAction)).await
+        authorize_request(req, get_bucket_policy_authorize_action()).await
     }
 
     /// Checks whether the GetBucketPolicyStatus request has accesses to the resources.
@@ -943,7 +959,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
+        authorize_request(req, get_object_acl_authorize_action()).await
     }
 
     /// Checks whether the GetObjectAttributes request has accesses to the resources.
@@ -1270,7 +1286,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAclAction)).await
+        authorize_request(req, put_bucket_policy_authorize_action()).await
     }
 
     /// Checks whether the PutBucketReplication request has accesses to the resources.
@@ -1340,7 +1356,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
+        authorize_request(req, put_object_acl_authorize_action()).await
     }
 
     /// Checks whether the PutObjectLegalHold request has accesses to the resources.
@@ -1450,5 +1466,30 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn write_get_object_response(&self, _req: &mut S3Request<WriteGetObjectResponseInput>) -> S3Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_bucket_policy_uses_get_bucket_policy_action() {
+        assert_eq!(get_bucket_policy_authorize_action(), Action::S3Action(S3Action::GetBucketPolicyAction));
+    }
+
+    #[test]
+    fn get_object_acl_uses_get_object_acl_action() {
+        assert_eq!(get_object_acl_authorize_action(), Action::S3Action(S3Action::GetObjectAclAction));
+    }
+
+    #[test]
+    fn put_bucket_policy_uses_put_bucket_policy_action() {
+        assert_eq!(put_bucket_policy_authorize_action(), Action::S3Action(S3Action::PutBucketPolicyAction));
+    }
+
+    #[test]
+    fn put_object_acl_uses_put_object_acl_action() {
+        assert_eq!(put_object_acl_authorize_action(), Action::S3Action(S3Action::PutObjectAclAction));
     }
 }
