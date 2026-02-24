@@ -21,11 +21,9 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_content_sha256;
 use crate::storage::{
     access::{ReqInfo, authorize_request, has_bypass_governance_header},
-    options::{copy_src_opts, del_opts, extract_metadata, parse_copy_source_range},
+    options::{del_opts, extract_metadata},
 };
-use crate::storage::{
-    decrypt_managed_encryption_key, derive_part_nonce, get_buffer_size_opt_in, get_validated_store, has_replication_rules,
-};
+use crate::storage::{get_buffer_size_opt_in, get_validated_store, has_replication_rules};
 use futures::StreamExt;
 use http::HeaderMap;
 use rustfs_ecstore::{
@@ -40,7 +38,6 @@ use rustfs_ecstore::{
     disk::{error::DiskError, error_reduce::is_all_buckets_not_found},
     error::{StorageError, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
-    set_disk::MAX_PARTS_COUNT,
     store_api::{
         ObjectIO,
         ObjectInfo,
@@ -56,7 +53,7 @@ use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use rustfs_kms::DataKey;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, HashReader, Reader, WarpReader};
+use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
 use rustfs_targets::EventName;
 use rustfs_utils::{
     CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
@@ -1546,67 +1543,8 @@ impl S3 for FS {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
-        let ListMultipartUploadsInput {
-            bucket,
-            prefix,
-            delimiter,
-            key_marker,
-            upload_id_marker,
-            max_uploads,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let prefix = prefix.unwrap_or_default();
-
-        let max_uploads = max_uploads.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
-
-        if let Some(key_marker) = &key_marker
-            && !key_marker.starts_with(prefix.as_str())
-        {
-            return Err(s3_error!(NotImplemented, "Invalid key marker"));
-        }
-
-        let result = store
-            .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
-            .await
-            .map_err(ApiError::from)?;
-
-        let output = ListMultipartUploadsOutput {
-            bucket: Some(bucket),
-            prefix: Some(prefix),
-            delimiter: result.delimiter,
-            key_marker: result.key_marker,
-            upload_id_marker: result.upload_id_marker,
-            max_uploads: Some(result.max_uploads as i32),
-            is_truncated: Some(result.is_truncated),
-            uploads: Some(
-                result
-                    .uploads
-                    .into_iter()
-                    .map(|u| MultipartUpload {
-                        key: Some(u.object),
-                        upload_id: Some(u.upload_id),
-                        initiated: u.initiated.map(Timestamp::from),
-
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            common_prefixes: Some(
-                result
-                    .common_prefixes
-                    .into_iter()
-                    .map(|c| CommonPrefix { prefix: Some(c) })
-                    .collect(),
-            ),
-            ..Default::default()
-        };
-
-        Ok(S3Response::new(output))
+        let usecase = DefaultMultipartUsecase::from_global();
+        usecase.execute_list_multipart_uploads(req).await
     }
 
     async fn list_object_versions(
@@ -1768,68 +1706,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
-        let ListPartsInput {
-            bucket,
-            key,
-            upload_id,
-            part_number_marker,
-            max_parts,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let part_number_marker = part_number_marker.map(|x| x as usize);
-        let max_parts = match max_parts {
-            Some(parts) => {
-                if !(1..=1000).contains(&parts) {
-                    return Err(s3_error!(InvalidArgument, "max-parts must be between 1 and 1000"));
-                }
-                parts as usize
-            }
-            None => 1000,
-        };
-
-        let res = store
-            .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let output = ListPartsOutput {
-            bucket: Some(res.bucket),
-            key: Some(res.object),
-            upload_id: Some(res.upload_id),
-            parts: Some(
-                res.parts
-                    .into_iter()
-                    .map(|p| Part {
-                        e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
-                        last_modified: p.last_mod.map(Timestamp::from),
-                        part_number: Some(p.part_num as i32),
-                        size: Some(p.size as i64),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            initiator: Some(Initiator {
-                id: RUSTFS_OWNER.id.clone(),
-                display_name: RUSTFS_OWNER.display_name.clone(),
-            }),
-            is_truncated: Some(res.is_truncated),
-            next_part_number_marker: res.next_part_number_marker.try_into().ok(),
-            max_parts: res.max_parts.try_into().ok(),
-            part_number_marker: res.part_number_marker.try_into().ok(),
-            storage_class: if res.storage_class.is_empty() {
-                None
-            } else {
-                Some(res.storage_class.into())
-            },
-            ..Default::default()
-        };
-        Ok(S3Response::new(output))
+        let usecase = DefaultMultipartUsecase::from_global();
+        usecase.execute_list_parts(req).await
     }
 
     async fn put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
@@ -1968,200 +1846,7 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        let UploadPartCopyInput {
-            bucket,
-            key,
-            copy_source,
-            copy_source_range,
-            part_number,
-            upload_id,
-            copy_source_if_match,
-            copy_source_if_none_match,
-            ..
-        } = req.input;
-
-        // Parse source bucket, object and version from copy_source
-        let (src_bucket, src_key, src_version_id) = match copy_source {
-            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket {
-                bucket: ref src_bucket,
-                key: ref src_key,
-                version_id,
-            } => (src_bucket.to_string(), src_key.to_string(), version_id.map(|v| v.to_string())),
-        };
-
-        // Parse range if provided (format: "bytes=start-end")
-        let rs = if let Some(range_str) = copy_source_range {
-            Some(parse_copy_source_range(&range_str)?)
-        } else {
-            None
-        };
-
-        let part_id = part_number as usize;
-
-        // Note: In a real implementation, you would properly validate access
-        // For now, we'll skip the detailed authorization check
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        // Check if multipart upload exists and get its info
-        let mp_info = store
-            .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        // Set up source options
-        let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
-        src_opts.version_id = src_version_id.clone();
-
-        // Get source object info to validate conditions
-        let h = HeaderMap::new();
-        let get_opts = ObjectOptions {
-            version_id: src_opts.version_id.clone(),
-            versioned: src_opts.versioned,
-            version_suspended: src_opts.version_suspended,
-            ..Default::default()
-        };
-
-        let src_reader = store
-            .get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        let mut src_info = src_reader.object_info;
-
-        // Validate copy conditions (simplified for now)
-        if let Some(if_match) = copy_source_if_match {
-            if let Some(ref etag) = src_info.etag {
-                if let Some(strong_etag) = if_match.into_etag() {
-                    if ETag::Strong(etag.clone()) != strong_etag {
-                        return Err(s3_error!(PreconditionFailed));
-                    }
-                } else {
-                    // Weak ETag in If-Match should fail
-                    return Err(s3_error!(PreconditionFailed));
-                }
-            } else {
-                return Err(s3_error!(PreconditionFailed));
-            }
-        }
-
-        if let Some(if_none_match) = copy_source_if_none_match
-            && let Some(ref etag) = src_info.etag
-            && let Some(strong_etag) = if_none_match.into_etag()
-            && ETag::Strong(etag.clone()) == strong_etag
-        {
-            return Err(s3_error!(PreconditionFailed));
-        }
-        // Weak ETag in If-None-Match is ignored (doesn't match)
-
-        // TODO: Implement proper time comparison for if_modified_since and if_unmodified_since
-        // For now, we'll skip these conditions
-
-        // Calculate actual range and length
-        // Note: These values are used implicitly through the range specification (rs)
-        // passed to get_object_reader, which handles the offset and length internally
-        let (_start_offset, length) = if let Some(ref range_spec) = rs {
-            // For range validation, use the actual logical size of the file
-            // For compressed files, this means using the uncompressed size
-            let validation_size = match src_info.is_compressed_ok() {
-                Ok((_, true)) => {
-                    // For compressed files, use actual uncompressed size for range validation
-                    src_info.get_actual_size().unwrap_or(src_info.size)
-                }
-                _ => {
-                    // For non-compressed files, use the stored size
-                    src_info.size
-                }
-            };
-
-            range_spec
-                .get_offset_length(validation_size)
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e.to_string()))?
-        } else {
-            (0, src_info.size)
-        };
-
-        // Create a new reader from the source data with the correct range
-        // We need to re-read from the source with the correct range specification
-        let h = HeaderMap::new();
-        let get_opts = ObjectOptions {
-            version_id: src_opts.version_id.clone(),
-            versioned: src_opts.versioned,
-            version_suspended: src_opts.version_suspended,
-            ..Default::default()
-        };
-
-        // Get the source object reader once with the validated range
-        let src_reader = store
-            .get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        // Use the same reader for streaming
-        let src_stream = src_reader.stream;
-
-        // Check if compression is enabled for this multipart upload
-        let is_compressible = mp_info
-            .user_defined
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}compression").as_str());
-
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(src_stream));
-
-        if let Some((key_bytes, nonce, original_size_opt)) =
-            decrypt_managed_encryption_key(&src_bucket, &src_key, &src_info.user_defined).await?
-        {
-            reader = Box::new(DecryptReader::new(reader, key_bytes, nonce));
-            if let Some(original) = original_size_opt {
-                src_info.actual_size = original;
-            }
-        }
-
-        let actual_size = length;
-        let mut size = length;
-
-        if is_compressible {
-            let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-            size = HashReader::SIZE_PRESERVE_LAYER;
-        }
-
-        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-
-        if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &mp_info.user_defined).await? {
-            let part_nonce = derive_part_nonce(base_nonce, part_id);
-            let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
-        }
-
-        let mut reader = PutObjReader::new(reader);
-
-        // Set up destination options (inherit from multipart upload)
-        let dst_opts = ObjectOptions {
-            user_defined: mp_info.user_defined.clone(),
-            ..Default::default()
-        };
-
-        // Write the copied data as a new part
-        let part_info = store
-            .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &dst_opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        // Create response
-        let copy_part_result = CopyPartResult {
-            e_tag: part_info.etag.map(|etag| to_s3s_etag(&etag)),
-            last_modified: part_info.last_mod.map(Timestamp::from),
-            ..Default::default()
-        };
-
-        let output = UploadPartCopyOutput {
-            copy_part_result: Some(copy_part_result),
-            copy_source_version_id: src_version_id,
-            ..Default::default()
-        };
-
-        Ok(S3Response::new(output))
+        let usecase = DefaultMultipartUsecase::from_global();
+        usecase.execute_upload_part_copy(req).await
     }
 }
