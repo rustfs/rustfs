@@ -41,7 +41,6 @@ impl SetDisks {
     ) -> disk::error::Result<(Vec<Option<DiskStore>>, Option<Vec<u8>>, Option<Uuid>)> {
         let mut futures = Vec::with_capacity(disks.len());
 
-        // let mut ress = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
 
         let src_bucket = Arc::new(src_bucket.to_string());

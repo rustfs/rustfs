@@ -20,7 +20,7 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         obj_info: &ObjectInfo,
-        opts: &ObjectOptions,
+        _opts: &ObjectOptions,
     ) -> Result<()> {
         let mut oi = obj_info.clone();
         oi.metadata_only = true;
