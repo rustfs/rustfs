@@ -865,7 +865,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::GetObjectAclAction)).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetBucketPolicyStatus request has accesses to the resources.
@@ -943,7 +943,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
+        authorize_request(req, Action::S3Action(S3Action::GetObjectAclAction)).await
     }
 
     /// Checks whether the GetObjectAttributes request has accesses to the resources.
@@ -1270,7 +1270,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAclAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketReplication request has accesses to the resources.
@@ -1340,7 +1340,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAclAction)).await
     }
 
     /// Checks whether the PutObjectLegalHold request has accesses to the resources.
