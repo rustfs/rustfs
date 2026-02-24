@@ -25,6 +25,7 @@ use crate::storage::ecfs::{
     stored_acl_from_grant_headers, stored_acl_from_policy, stored_grant_to_dto, stored_owner_to_dto,
 };
 use crate::storage::helper::OperationHelper;
+use crate::storage::s3_api::{encryption, replication, tagging};
 use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
@@ -651,7 +652,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
+        Ok(S3Response::new(tagging::build_delete_bucket_tagging_output()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -708,9 +709,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketEncryptionOutput {
+        Ok(S3Response::new(encryption::build_get_bucket_encryption_output(
             server_side_encryption_configuration,
-        }))
+        )))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -986,9 +987,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketReplicationOutput {
-            replication_configuration: Some(replication_configuration),
-        }))
+        Ok(S3Response::new(replication::build_get_bucket_replication_output(
+            replication_configuration,
+        )))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1022,7 +1023,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
+        Ok(S3Response::new(tagging::build_get_bucket_tagging_output(tag_set)))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1119,7 +1120,7 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
             .await
             .map_err(ApiError::from)?;
-        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
+        Ok(S3Response::new(encryption::build_put_bucket_encryption_output()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1345,7 +1346,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(PutBucketReplicationOutput::default()))
+        Ok(S3Response::new(replication::build_put_bucket_replication_output()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1406,7 +1407,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(Default::default()))
+        Ok(S3Response::new(tagging::build_put_bucket_tagging_output()))
     }
 
     #[instrument(level = "debug", skip(self))]

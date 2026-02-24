@@ -29,6 +29,7 @@ use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256, get_opts, put_opts,
 };
+use crate::storage::s3_api::{restore, select};
 use crate::storage::*;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
@@ -3335,10 +3336,8 @@ impl DefaultObjectUsecase {
                 .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed."))?;
 
             if already_restored {
-                let output = RestoreObjectOutput {
-                    request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
-                    restore_output_path: None,
-                };
+                let output =
+                    restore::build_restore_object_output(Some(RequestCharged::from_static(RequestCharged::REQUESTER)), None);
                 return Ok(S3Response::new(output));
             }
         }
@@ -3389,10 +3388,7 @@ impl DefaultObjectUsecase {
             }
         });
 
-        let output = RestoreObjectOutput {
-            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
-            restore_output_path: None,
-        };
+        let output = restore::build_restore_object_output(Some(RequestCharged::from_static(RequestCharged::REQUESTER)), None);
 
         Ok(S3Response::with_headers(output, header))
     }
@@ -3471,9 +3467,9 @@ impl DefaultObjectUsecase {
             drop(tx);
         });
 
-        Ok(S3Response::new(SelectObjectContentOutput {
-            payload: Some(SelectObjectContentEventStream::new(stream)),
-        }))
+        Ok(S3Response::new(select::build_select_object_content_output(
+            SelectObjectContentEventStream::new(stream),
+        )))
     }
 }
 
