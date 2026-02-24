@@ -12,18 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod bandwidth;
-pub mod bucket_target_sys;
-pub mod error;
-pub mod lifecycle;
-pub mod metadata;
-pub mod metadata_sys;
-pub mod object_lock;
-pub mod policy_sys;
-pub mod quota;
-pub mod replication;
-pub mod tagging;
-pub mod target;
-pub mod utils;
-pub mod versioning;
-pub mod versioning_sys;
+pub mod monitor;
+pub mod reader;

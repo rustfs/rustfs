@@ -39,8 +39,9 @@ use crate::error::{
 };
 use crate::global::{
     DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, get_global_deployment_id, get_global_endpoints,
-    is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer,
+    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, get_global_bucket_monitor,
+    get_global_deployment_id, get_global_endpoints, init_global_bucket_monitor, is_dist_erasure, is_erasure_sd,
+    set_global_deployment_id, set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -404,6 +405,9 @@ impl ECStore {
                 });
             }
         }
+
+        let num_nodes = get_global_endpoints().get_nodes().len() as u64;
+        init_global_bucket_monitor(num_nodes);
 
         init_background_expiry(self.clone()).await;
 
@@ -1523,6 +1527,9 @@ impl StorageAPI for ECStore {
         // Delete the metadata
         self.delete_all(RUSTFS_META_BUCKET, format!("{BUCKET_META_PREFIX}/{bucket}").as_str())
             .await?;
+        if let Some(monitor) = get_global_bucket_monitor() {
+            monitor.delete_bucket(bucket);
+        }
         Ok(())
     }
 

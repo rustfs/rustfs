@@ -21,6 +21,7 @@ use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::global::get_global_bucket_monitor;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -667,9 +668,19 @@ impl BucketTargetSys {
         Ok(true)
     }
 
-    fn update_bandwidth_limit(&self, _bucket: &str, _arn: &str, _limit: i64) {
-        // Implementation for bandwidth limit update
-        // This would interact with the global bucket monitor
+    fn update_bandwidth_limit(&self, bucket: &str, arn: &str, limit: i64) {
+        if let Some(bucket_monitor) = get_global_bucket_monitor() {
+            if limit == 0 {
+                bucket_monitor.delete_bucket_throttle(bucket, arn);
+                return;
+            }
+            bucket_monitor.set_bandwidth_limit(bucket, arn, limit);
+        } else {
+            error!(
+                "Global bucket monitor uninitialized; skipping bandwidth limit update for bucket '{}' and ARN '{}'",
+                bucket, arn
+            );
+        }
     }
 
     pub async fn get_remote_target_client_by_arn(&self, _bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
@@ -691,6 +702,7 @@ impl BucketTargetSys {
         if let Some(existing_targets) = targets_map.remove(bucket) {
             for target in existing_targets {
                 arn_remotes_map.remove(&target.arn);
+                self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
 

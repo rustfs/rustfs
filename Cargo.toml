@@ -226,6 +226,7 @@ path-clean = "1.0.1"
 pin-project-lite = "0.2.16"
 pretty_assertions = "1.4.1"
 rand = { version = "0.10.0", features = ["serde"] }
+ratelimit = "0.10.0"
 rayon = "1.11.0"
 reed-solomon-simd = { version = "3.1.0" }
 regex = { version = "1.12.3" }
