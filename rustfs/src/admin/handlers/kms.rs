@@ -14,9 +14,9 @@
 
 //! KMS admin handlers for HTTP API
 
-use super::{Operation, kms_dynamic, kms_keys, kms_management};
+use super::{kms_dynamic, kms_keys, kms_management};
 use crate::admin::auth::validate_admin_request;
-use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;
 use hyper::{HeaderMap, StatusCode};

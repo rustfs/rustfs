@@ -14,9 +14,8 @@
 
 //! KMS key management admin API handlers
 
-use super::Operation;
 use crate::admin::auth::validate_admin_request;
-use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use base64::Engine;
