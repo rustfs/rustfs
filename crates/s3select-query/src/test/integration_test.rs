@@ -69,7 +69,7 @@ mod integration_tests {
                 expression_type: ExpressionType::from_static("SQL"),
                 input_serialization: InputSerialization {
                     json: Some(JSONInput {
-                        type_: Some(JSONType::from_static(JSONType::LINES)),
+                        type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
                     }),
                     ..Default::default()
                 },
