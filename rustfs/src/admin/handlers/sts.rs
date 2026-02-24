@@ -389,11 +389,26 @@ pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str
 
 /// Escape special XML characters in a string.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    // Fast path: if there are no escapable characters, just clone the string.
+    if !s.chars()
+        .any(|c| matches!(c, '&' | '<' | '>' | '"' | '\''))
+    {
+        return s.to_owned();
+    }
+
+    // Slow path: build the escaped string in a single pass.
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
