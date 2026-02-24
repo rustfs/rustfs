@@ -148,38 +148,52 @@ where
         bucket: &str,
         session_context: &crate::common::session::SessionContext,
     ) -> Result<()> {
-        // First, delete all objects in the bucket
-        let list_input = ListObjectsV2Input::builder()
-            .bucket(bucket.to_string())
-            .build()
-            .map_err(|e| {
+        // First, delete all objects in the bucket (with pagination)
+        let mut continuation_token = None;
+        loop {
+            let mut list_input = ListObjectsV2Input::builder().bucket(bucket.to_string());
+
+            if let Some(token) = continuation_token {
+                list_input = list_input.continuation_token(token);
+            }
+
+            let list_input = list_input.build().map_err(|e| {
                 Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
             })?;
 
-        if let Ok(output) = self
-            .storage
-            .list_objects_v2(
-                list_input,
-                &session_context.principal.user_identity.credentials.access_key,
-                &session_context.principal.user_identity.credentials.secret_key,
-            )
-            .await
-        {
-            // Delete all objects
-            if let Some(objects) = output.contents {
-                for obj in objects {
-                    if let Some(obj_key) = obj.key {
-                        let _ = self
-                            .storage
-                            .delete_object(
-                                bucket,
-                                &obj_key,
-                                &session_context.principal.user_identity.credentials.access_key,
-                                &session_context.principal.user_identity.credentials.secret_key,
-                            )
-                            .await;
+            if let Ok(output) = self
+                .storage
+                .list_objects_v2(
+                    list_input,
+                    &session_context.principal.user_identity.credentials.access_key,
+                    &session_context.principal.user_identity.credentials.secret_key,
+                )
+                .await
+            {
+                // Delete all objects in this page
+                if let Some(objects) = output.contents {
+                    for obj in objects {
+                        if let Some(obj_key) = obj.key {
+                            let _ = self
+                                .storage
+                                .delete_object(
+                                    bucket,
+                                    &obj_key,
+                                    &session_context.principal.user_identity.credentials.access_key,
+                                    &session_context.principal.user_identity.credentials.secret_key,
+                                )
+                                .await;
+                        }
                     }
                 }
+
+                // Check if there are more objects
+                if !output.is_truncated.unwrap_or(false) {
+                    break;
+                }
+                continuation_token = Some(output.next_continuation_token);
+            } else {
+                break;
             }
         }
 
@@ -545,6 +559,11 @@ where
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         if let Some(key) = key {
+            // Authorize delete object
+            authorize_operation(session_context, &S3Action::DeleteObject, &bucket, Some(&key))
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
             // Delete file
             match self
                 .storage
@@ -566,6 +585,11 @@ where
             // Delete directory (bucket)
             // If path ends with '/', treat it as bucket deletion request
             if path_str.ends_with('/') {
+                // Authorize delete bucket
+                authorize_operation(session_context, &S3Action::DeleteBucket, &bucket, None)
+                    .await
+                    .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
                 self.delete_bucket_recursively(&bucket, session_context).await
             } else {
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Directory deletion not supported"))
@@ -610,6 +634,11 @@ where
         let (bucket, _key) = self
             .parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
+
+        // Authorize delete bucket
+        authorize_operation(session_context, &S3Action::DeleteBucket, &bucket, None)
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         // Try to delete bucket recursively
         match self.delete_bucket_recursively(&bucket, session_context).await {
