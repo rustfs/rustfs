@@ -73,7 +73,7 @@ impl NodeService {
         &self,
         request: Request<DeleteBucketRequest>,
     ) -> Result<Response<DeleteBucketResponse>, Status> {
-        debug!("make bucket");
+        debug!("delete bucket");
 
         let request = request.into_inner();
         match self
@@ -135,7 +135,6 @@ impl NodeService {
                 }))
             }
 
-            // println!("vuc")
             Err(err) => Ok(Response::new(GetBucketInfoResponse {
                 success: false,
                 bucket_info: String::new(),

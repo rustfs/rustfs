@@ -188,16 +188,14 @@ impl Node for NodeService {
         self.handle_rename_file(request).await
     }
 
-    async fn write(&self, _request: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
-        self.handle_write(_request).await
+    async fn write(&self, request: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
+        self.handle_write(request).await
     }
 
     type WriteStreamStream = ResponseStream<WriteResponse>;
-    async fn write_stream(
-        &self,
-        _request: Request<Streaming<WriteRequest>>,
-    ) -> Result<Response<Self::WriteStreamStream>, Status> {
+    async fn write_stream(&self, request: Request<Streaming<WriteRequest>>) -> Result<Response<Self::WriteStreamStream>, Status> {
         info!("write_stream");
+        let _ = request;
 
         unimplemented!("write_stream");
 
@@ -417,7 +415,7 @@ impl Node for NodeService {
                 let (rd, mut wr) = tokio::io::duplex(64);
                 let job1 = spawn(async move {
                     if let Err(err) = disk.walk_dir(opts, &mut wr).await {
-                        println!("walk_dir err {err:?}");
+                        error!("walk_dir failed: {err:?}");
                     }
                 });
                 let job2 = spawn(async move {
@@ -428,22 +426,34 @@ impl Node for NodeService {
                             Ok(res) => {
                                 if let Some(info) = res {
                                     match serde_json::to_string(&info) {
-                                        Ok(meta_cache_entry) => tx
-                                            .send(Ok(WalkDirResponse {
-                                                success: true,
-                                                meta_cache_entry,
-                                                error_info: None,
-                                            }))
-                                            .await
-                                            .expect("working rx"),
-                                        Err(e) => tx
-                                            .send(Ok(WalkDirResponse {
-                                                success: false,
-                                                meta_cache_entry: "".to_string(),
-                                                error_info: Some(e.to_string()),
-                                            }))
-                                            .await
-                                            .expect("working rx"),
+                                        Ok(meta_cache_entry) => {
+                                            if tx
+                                                .send(Ok(WalkDirResponse {
+                                                    success: true,
+                                                    meta_cache_entry,
+                                                    error_info: None,
+                                                }))
+                                                .await
+                                                .is_err()
+                                            {
+                                                warn!("walk_dir stream receiver dropped while sending meta cache entry");
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if tx
+                                                .send(Ok(WalkDirResponse {
+                                                    success: false,
+                                                    meta_cache_entry: "".to_string(),
+                                                    error_info: Some(e.to_string()),
+                                                }))
+                                                .await
+                                                .is_err()
+                                            {
+                                                warn!("walk_dir stream receiver dropped while sending serialization error");
+                                                break;
+                                            }
+                                        }
                                     }
                                 } else {
                                     break;
@@ -470,10 +480,11 @@ impl Node for NodeService {
                                             error_info: Some(err.to_string()),
                                         }))
                                         .await;
+
                                     break;
                                 }
 
-                                println!("get err {err:?}");
+                                warn!("walk_dir metacache read error: {err:?}");
 
                                 let _ = tx
                                     .send(Ok(WalkDirResponse {
@@ -2162,8 +2173,13 @@ mod tests {
         let request = Request::new(LoadRebalanceMetaRequest { start_rebalance: false });
 
         let response = service.load_rebalance_meta(request).await;
-        // Should return error because object layer is not initialized, or success if it's implemented
-        assert!(response.is_err() || response.is_ok());
+        assert!(response.is_ok());
+
+        let load_response = response.unwrap().into_inner();
+        // Should fail because object layer is not initialized in test
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert!(load_response.error_info.unwrap().contains("errServerNotInitialized"));
     }
 
     #[tokio::test]
