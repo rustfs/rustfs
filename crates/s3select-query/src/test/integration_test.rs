@@ -310,7 +310,6 @@ mod integration_tests {
 
         let result = db.execute(&query).await;
         // Aggregation queries may fail due to lack of actual data, which is acceptable
-        // Aggregation queries might fail due to lack of actual data, which is acceptable
         match result {
             Ok(_) => {
                 // If successful, that's great
