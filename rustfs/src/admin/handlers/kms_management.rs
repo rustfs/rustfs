@@ -14,10 +14,8 @@
 
 //! KMS management route registration.
 
-use super::kms::{
-    CreateKeyHandler, DescribeKeyHandler, GenerateDataKeyHandler, KmsClearCacheHandler, KmsConfigHandler, KmsStatusHandler,
-    ListKeysHandler,
-};
+use super::kms::{KmsClearCacheHandler, KmsConfigHandler, KmsStatusHandler};
+use super::kms_keys::{CreateKeyHandler, DescribeKeyHandler, GenerateDataKeyHandler, ListKeysHandler};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::server::ADMIN_PREFIX;
 use hyper::Method;
