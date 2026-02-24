@@ -307,10 +307,7 @@ fn extract_json_sub_path_from_expression(expression: &str) -> Option<String> {
     const S3OBJECT_LOWER: &str = "s3object";
     let mut chars = after_from.char_indices();
     for expected in S3OBJECT_LOWER.chars() {
-        let (idx, actual) = match chars.next() {
-            Some(v) => v,
-            None => return None,
-        };
+        let (idx, actual) = chars.next()?;
         if actual.to_ascii_lowercase() != expected {
             return None;
         }
@@ -330,19 +327,19 @@ fn extract_json_sub_path_from_expression(expression: &str) -> Option<String> {
 
                 // Support quoted identifiers: s3object."my.path" or s3object.'my path'
                 let mut chars = rest.chars();
-                if let Some(first) = chars.next() {
-                    if first == '"' || first == '\'' {
-                        let quote = first;
-                        let inner = &rest[first.len_utf8()..];
-                        if let Some(end) = inner.find(quote) {
-                            let path = &inner[..end];
-                            if !path.trim().is_empty() {
-                                return Some(path.to_string());
-                            }
+                if let Some(first) = chars.next()
+                    && (first == '"' || first == '\'')
+                {
+                    let quote = first;
+                    let inner = &rest[first.len_utf8()..];
+                    if let Some(end) = inner.find(quote) {
+                        let path = &inner[..end];
+                        if !path.trim().is_empty() {
+                            return Some(path.to_string());
                         }
-                        // Quoted but no closing quote or empty: treat as no sub-path.
-                        return None;
                     }
+                    // Quoted but no closing quote or empty: treat as no sub-path.
+                    return None;
                 }
 
                 // Unquoted identifier: collect characters until whitespace, '[', or ']'.
