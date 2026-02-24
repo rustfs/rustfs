@@ -195,8 +195,6 @@ impl Operation for AddCannedPolicy {
             S3Error::with_message(S3ErrorCode::InvalidRequest, e.to_string())
         })?;
 
-        // Reject policies with an empty version, since downstream IAM loading
-        // ignores policy documents whose version field is empty.
         if policy.version.is_empty() {
             return Err(s3_error!(InvalidArgument, "policy version is empty"));
         }

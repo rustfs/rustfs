@@ -1015,17 +1015,11 @@ mod test {
         let result = Policy::parse_config(data.as_bytes());
         assert!(result.is_err(), "Statement with both Resource and NotResource should be invalid");
 
-        // Verify the specific error type
-        if let Err(e) = result {
-            let error_msg = format!("{}", e);
-            assert!(
-                error_msg.contains("Resource")
-                    && error_msg.contains("NotResource")
-                    && error_msg.contains("cannot both be specified"),
-                "Error should be BothResourceAndNotResource, got: {}",
-                error_msg
-            );
-        }
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::BothResourceAndNotResource)),
+            "Error should be BothResourceAndNotResource, got: {:?}",
+            result.unwrap_err()
+        );
     }
 
     #[test]
@@ -1051,6 +1045,23 @@ mod test {
         assert_eq!(policy.statements.len(), 1);
         assert!(policy.statements[0].actions.is_empty());
         assert!(!policy.statements[0].not_actions.is_empty());
+
+        // Round-trip: serialization must omit empty Action so re-parse does not violate both-Action-and-NotAction
+        let json = serde_json::to_string(&policy).expect("Should serialize");
+        let round_tripped = Policy::parse_config(json.as_bytes());
+        assert!(
+            round_tripped.is_ok(),
+            "NotAction-only statement must round-trip without gaining Action: {}",
+            round_tripped.unwrap_err()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("JSON valid");
+        let stmt = &parsed["Statement"][0];
+        assert!(
+            !stmt
+                .get("Action")
+                .is_some_and(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(false)),
+            "Serialized JSON must not contain empty Action for NotAction-only statement"
+        );
     }
 
     #[test]
@@ -1073,14 +1084,11 @@ mod test {
         let result = Policy::parse_config(data.as_bytes());
         assert!(result.is_err(), "Statement with both Action and NotAction should be invalid");
 
-        if let Err(e) = result {
-            let error_msg = format!("{}", e);
-            assert!(
-                error_msg.contains("Action") && error_msg.contains("NotAction") && error_msg.contains("cannot both be specified"),
-                "Error should be BothActionAndNotAction, got: {}",
-                error_msg
-            );
-        }
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::BothActionAndNotAction)),
+            "Error should be BothActionAndNotAction, got: {:?}",
+            result.unwrap_err()
+        );
     }
 
     #[test]
@@ -1100,14 +1108,12 @@ mod test {
 
         let result = Policy::parse_config(data.as_bytes());
         assert!(result.is_err(), "Statement with neither Action nor NotAction should be invalid");
-        if let Err(e) = result {
-            let error_msg = format!("{}", e);
-            assert!(
-                error_msg.contains("Action") && error_msg.contains("NotAction") && error_msg.contains("empty"),
-                "Error should be NonAction, got: {}",
-                error_msg
-            );
-        }
+
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonAction)),
+            "Error should be NonAction, got: {:?}",
+            result.unwrap_err()
+        );
     }
 
     #[test]
@@ -1128,15 +1134,11 @@ mod test {
         let result = Policy::parse_config(data.as_bytes());
         assert!(result.is_err(), "Statement with neither Resource nor NotResource should be invalid");
 
-        // Verify the specific error type
-        if let Err(e) = result {
-            let error_msg = format!("{}", e);
-            assert!(
-                error_msg.contains("Resource") && error_msg.contains("empty"),
-                "Error should be NonResource, got: {}",
-                error_msg
-            );
-        }
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonResource)),
+            "Error should be NonResource, got: {:?}",
+            result.unwrap_err()
+        );
     }
 
     #[test]

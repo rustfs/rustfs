@@ -26,13 +26,13 @@ pub struct Statement {
     pub sid: ID,
     #[serde(rename = "Effect")]
     pub effect: Effect,
-    #[serde(rename = "Action", default)]
+    #[serde(rename = "Action", default, skip_serializing_if = "ActionSet::is_empty")]
     pub actions: ActionSet,
-    #[serde(rename = "NotAction", default)]
+    #[serde(rename = "NotAction", default, skip_serializing_if = "ActionSet::is_empty")]
     pub not_actions: ActionSet,
-    #[serde(rename = "Resource", default)]
+    #[serde(rename = "Resource", default, skip_serializing_if = "ResourceSet::is_empty")]
     pub resources: ResourceSet,
-    #[serde(rename = "NotResource", default)]
+    #[serde(rename = "NotResource", default, skip_serializing_if = "ResourceSet::is_empty")]
     pub not_resources: ResourceSet,
     #[serde(rename = "Condition", default)]
     pub conditions: Functions,
@@ -198,7 +198,7 @@ pub struct BPStatement {
     pub actions: ActionSet,
     #[serde(rename = "NotAction", default, skip_serializing_if = "ActionSet::is_empty")]
     pub not_actions: ActionSet,
-    #[serde(rename = "Resource", default)]
+    #[serde(rename = "Resource", default, skip_serializing_if = "ResourceSet::is_empty")]
     pub resources: ResourceSet,
     #[serde(rename = "NotResource", default, skip_serializing_if = "ResourceSet::is_empty")]
     pub not_resources: ResourceSet,
