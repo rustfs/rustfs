@@ -281,25 +281,25 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/create-key").as_str(),
-        AdminOperation(&kms::CreateKeyHandler {}),
+        AdminOperation(&kms_keys::CreateKeyHandler {}),
     )?;
 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/describe-key").as_str(),
-        AdminOperation(&kms::DescribeKeyHandler {}),
+        AdminOperation(&kms_keys::DescribeKeyHandler {}),
     )?;
 
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/list-keys").as_str(),
-        AdminOperation(&kms::ListKeysHandler {}),
+        AdminOperation(&kms_keys::ListKeysHandler {}),
     )?;
 
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/generate-data-key").as_str(),
-        AdminOperation(&kms::GenerateDataKeyHandler {}),
+        AdminOperation(&kms_keys::GenerateDataKeyHandler {}),
     )?;
 
     r.insert(
