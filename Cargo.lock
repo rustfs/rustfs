@@ -7423,6 +7423,7 @@ dependencies = [
  "rustfs-common",
  "rustfs-ecstore",
  "s3s",
+ "serde_json",
  "snafu 0.8.9",
  "tokio",
  "tokio-util",
