@@ -36,7 +36,7 @@ pub struct ChunkInfo {
 }
 
 /// Unified Metadata Structure stored in SurrealKV.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObjectMetadata {
     pub bucket: String,
     pub key: String,
@@ -70,26 +70,6 @@ pub struct ObjectMetadata {
 
     /// Chunks info for large objects
     pub chunks: Option<Vec<ChunkInfo>>,
-}
-
-impl Default for ObjectMetadata {
-    fn default() -> Self {
-        Self {
-            bucket: String::new(),
-            key: String::new(),
-            version_id: String::new(),
-            content_hash: String::new(),
-            size: 0,
-            created_at: 0,
-            mod_time: 0,
-            user_metadata: HashMap::new(),
-            system_metadata: HashMap::new(),
-            erasure_info: None,
-            is_inline: false,
-            inline_data: None,
-            chunks: None,
-        }
-    }
 }
 
 /// Minimal metadata stored in Ferntree index for fast listing.

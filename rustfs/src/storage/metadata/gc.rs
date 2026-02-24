@@ -63,6 +63,7 @@ impl GarbageCollector {
 
                     if count == 0 {
                         // Use user_key() to convert InternalKeyRef to &[u8]
+                        #[allow(clippy::collapsible_if)]
                         if let Ok(key_str) = std::str::from_utf8(key.user_key()) {
                             if let Some(hash) = key_str.strip_prefix("refs/") {
                                 candidates.push(hash.to_string());

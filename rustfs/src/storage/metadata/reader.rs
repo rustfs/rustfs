@@ -43,11 +43,11 @@ pub fn new_chunked_reader(
         match handle.await {
             Ok(Ok(data)) => Some((Ok(data), (mgr, chunks, idx + 1))),
             Ok(Err(e)) => Some((
-                Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
+                Err(io::Error::other(e.to_string())),
                 (mgr, chunks, len), // Stop iteration on error
             )),
             Err(e) => Some((
-                Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
+                Err(io::Error::other(e.to_string())),
                 (mgr, chunks, len), // Stop iteration on error
             )),
         }

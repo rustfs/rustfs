@@ -97,7 +97,7 @@ impl AsyncWrite for ChunkedWriter {
         self.write_futures.retain_mut(|fut| match fut.as_mut().poll(cx) {
             Poll::Ready(Ok(_)) => false,
             Poll::Ready(Err(e)) => {
-                error = Some(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+                error = Some(std::io::Error::other(e.to_string()));
                 false
             }
             Poll::Pending => true,
@@ -137,7 +137,7 @@ impl AsyncWrite for ChunkedWriter {
         self.write_futures.retain_mut(|fut| match fut.as_mut().poll(cx) {
             Poll::Ready(Ok(_)) => false,
             Poll::Ready(Err(e)) => {
-                error = Some(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+                error = Some(std::io::Error::other(e.to_string()));
                 false
             }
             Poll::Pending => {

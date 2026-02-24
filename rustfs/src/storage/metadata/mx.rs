@@ -77,7 +77,7 @@ impl StorageManager for MxStorageManager {
             let tx = db.transaction(false);
             let res = tx.get(&key).map_err(|e| Error::other(e.to_string()))?;
             match res {
-                Some(val) => Ok(Bytes::from(val)),
+                Some(val) => Ok(val),
                 None => Err(Error::other("Data not found in SurrealMX")),
             }
         })
@@ -91,10 +91,7 @@ impl StorageManager for MxStorageManager {
 
         tokio::task::spawn_blocking(move || {
             let tx = db.transaction(false);
-            match tx.get(&key) {
-                Ok(Some(_)) => true,
-                _ => false,
-            }
+            matches!(tx.get(&key), Ok(Some(_)))
         })
         .await
         .unwrap_or(false)

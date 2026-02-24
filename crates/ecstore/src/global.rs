@@ -56,7 +56,7 @@ lazy_static! {
     pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
     pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
     pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
-    pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn rustfs_lock::client::LockClient>> = OnceLock::new();
+    pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn LockClient>> = OnceLock::new();
     pub static ref GLOBAL_LOCK_CLIENTS: OnceLock<HashMap<String, Arc<dyn LockClient>>> = OnceLock::new();
 }
 
