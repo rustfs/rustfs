@@ -27,9 +27,19 @@ pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
 pub async fn get_disk_via_endpoint(endpoint: &Endpoint) -> Option<DiskStore> {
     let global_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.read().await;
     if global_set_drives.is_empty() {
-        return GLOBAL_LOCAL_DISK_MAP.read().await[&endpoint.to_string()].clone();
+        return GLOBAL_LOCAL_DISK_MAP
+            .read()
+            .await
+            .get(&endpoint.to_string())
+            .cloned()
+            .unwrap_or(None);
     }
-    global_set_drives[endpoint.pool_idx as usize][endpoint.set_idx as usize][endpoint.disk_idx as usize].clone()
+    global_set_drives
+        .get(endpoint.pool_idx as usize)
+        .and_then(|sets| sets.get(endpoint.set_idx as usize))
+        .and_then(|disks| disks.get(endpoint.disk_idx as usize))
+        .cloned()
+        .unwrap_or(None)
 }
 
 pub async fn all_local_disk_path() -> Vec<String> {
@@ -65,7 +75,6 @@ pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()>
     let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
 
     for pool_eps in endpoint_pools.as_ref().iter() {
-        let mut set_drives = HashMap::new();
         for ep in pool_eps.endpoints.as_ref().iter() {
             if !ep.is_local {
                 continue;
@@ -76,8 +85,6 @@ pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()>
             let path = disk.endpoint().to_string();
 
             global_local_disk_map.insert(path, Some(disk.clone()));
-
-            set_drives.insert(ep.disk_idx, Some(disk.clone()));
 
             global_set_drives[ep.pool_idx as usize][ep.set_idx as usize][ep.disk_idx as usize] = Some(disk.clone());
         }

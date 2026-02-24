@@ -166,7 +166,7 @@ impl ECStore {
         // TODO: PutObjectReader
         // self.put_object_part(dst_bucket, dst_object, upload_id, part_id, data, opts)
 
-        unimplemented!()
+        Err(StorageError::NotImplemented)
     }
 
     #[instrument(skip(self, data))]

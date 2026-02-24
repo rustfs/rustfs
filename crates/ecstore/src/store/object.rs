@@ -425,6 +425,7 @@ impl ECStore {
 
         if self.single_pool() {
             let _ = self.pools[0].add_partial(bucket, object.as_str(), version_id).await;
+            return Ok(());
         }
 
         let idx = self
@@ -540,7 +541,7 @@ impl ECStore {
                 .delete_object_version(bucket, object.as_str(), fi, force_del_marker)
                 .await;
         }
-        Ok(())
+        Err(StorageError::NotImplemented)
     }
 
     #[instrument(skip(self))]
