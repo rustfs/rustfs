@@ -12,21 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod access;
-pub mod concurrency;
-pub mod ecfs;
-pub(crate) mod entity;
-pub(crate) mod helper;
-pub mod options;
-pub mod rpc;
-pub(crate) mod s3_api;
-pub mod tonic_service;
+pub mod node_service;
 
-#[cfg(test)]
-mod concurrent_get_object_test;
-mod ecfs_extend;
-#[cfg(test)]
-mod ecfs_test;
-pub(crate) mod head_prefix;
-
-pub(crate) use ecfs_extend::*;
+pub use node_service::{NodeService, make_server};
