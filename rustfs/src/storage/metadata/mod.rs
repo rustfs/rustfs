@@ -57,7 +57,7 @@ pub fn is_new_metadata_engine_enabled() -> bool {
 /// Initialise the global metadata engine if enabled via environment variable.
 ///
 /// This is intended to be called once during server startup.  It discovers the
-/// first local disk from `GLOBAL_LOCAL_DISK`, creates the KV/Ferntree/MX
+/// first local disk from `GLOBAL_LOCAL_DISK_MAP`, creates the KV/Ferntree/MX
 /// sub-systems under `<disk_root>/.rustfs.sys/metadata/`, and spawns the
 /// background GC task.
 pub async fn init_metadata_engine() {
@@ -73,15 +73,15 @@ pub async fn init_metadata_engine() {
     }
 
     // Locate the first local disk.
-    let disks = rustfs_ecstore::global::GLOBAL_LOCAL_DISK.read().await;
+    let disk_map = rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP.read().await;
     let mut legacy_fs = None;
-    for disk in disks.iter().flatten() {
+    for disk in disk_map.values().flatten() {
         if let rustfs_ecstore::disk::Disk::Local(wrapper) = disk.as_ref() {
             legacy_fs = Some(wrapper.get_disk());
             break;
         }
     }
-    drop(disks);
+    drop(disk_map);
 
     let legacy_fs = match legacy_fs {
         Some(d) => d,
