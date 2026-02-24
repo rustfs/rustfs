@@ -102,7 +102,7 @@ impl SessionCtxFactory {
 
             df_session_state.with_object_store(&store_url, Arc::new(store)).build()
         } else {
-            let store =
+            let store: EcObjectStore =
                 EcObjectStore::new(context.input.clone()).map_err(|_| QueryError::NotImplemented { err: String::new() })?;
             df_session_state.with_object_store(&store_url, Arc::new(store)).build()
         };

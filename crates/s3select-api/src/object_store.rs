@@ -45,6 +45,21 @@ use tokio_util::io::ReaderStream;
 use tracing::info;
 use transform_stream::AsyncTryStream;
 
+/// Maximum allowed object size for JSON DOCUMENT mode.
+///
+/// JSON DOCUMENT format requires loading the entire file into memory for DOM
+/// parsing, so memory consumption grows linearly with file size.  Objects
+/// larger than this threshold are rejected with an error rather than risking
+/// an OOM condition.
+///
+/// To process larger JSON files, convert the input to **JSON LINES** (NDJSON,
+/// `type = LINES`), which supports line-by-line streaming with no memory
+/// size limit.
+///
+/// Default: 128 MiB.  This matches the AWS S3 Select limit for JSON DOCUMENT
+/// inputs.
+pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct EcObjectStore {
     input: Arc<SelectObjectContentInput>,
@@ -145,27 +160,33 @@ impl ObjectStore for EcObjectStore {
         let attributes = Attributes::default();
 
         let (payload, size) = if self.is_json_document {
-            // Buffer the entire object and flatten from a JSON DOCUMENT
-            // (multi-line formatted JSON object/array) into NDJSON so that
-            // DataFusion's Arrow JSON reader can process it line-by-line.
-            let mut all_bytes = Vec::with_capacity(original_size as usize);
-            reader
-                .stream
-                .take(original_size)
-                .read_to_end(&mut all_bytes)
-                .await
-                .map_err(|e| o_Error::Generic {
+            // JSON DOCUMENT mode: gate on object size before doing any I/O.
+            //
+            // Small files (<= MAX_JSON_DOCUMENT_BYTES): build a lazy stream
+            // that defers all I/O and JSON parsing until DataFusion first
+            // polls it.  Parsing runs inside spawn_blocking so the async
+            // runtime thread is never blocked.
+            //
+            // Large files (> MAX_JSON_DOCUMENT_BYTES): return an error
+            // immediately.  JSON DOCUMENT relies on serde_json DOM parsing
+            // which must load the whole file into memory; rejecting oversized
+            // files upfront is safer than risking OOM.  Users should convert
+            // their data to JSON LINES (NDJSON) format for large files.
+            if original_size > MAX_JSON_DOCUMENT_BYTES {
+                return Err(o_Error::Generic {
                     store: "EcObjectStore",
-                    source: Box::new(e),
-                })?;
-            let ndjson_bytes =
-                flatten_json_document_to_ndjson(&all_bytes, self.json_sub_path.as_deref()).map_err(|e| o_Error::Generic {
-                    store: "EcObjectStore",
-                    source: Box::new(e),
-                })?;
-            let ndjson_size = ndjson_bytes.len() as u64;
-            let stream = futures::stream::once(async move { Ok(ndjson_bytes) }).boxed();
-            (object_store::GetResultPayload::Stream(stream), ndjson_size)
+                    source: format!(
+                        "JSON DOCUMENT object is {original_size} bytes, which exceeds the \
+                         maximum allowed size of {MAX_JSON_DOCUMENT_BYTES} bytes \
+                         ({} MiB). Convert the input to JSON LINES (NDJSON) to process \
+                         large files.",
+                        MAX_JSON_DOCUMENT_BYTES / (1024 * 1024)
+                    )
+                    .into(),
+                });
+            }
+            let stream = json_document_ndjson_stream(reader.stream, original_size, self.json_sub_path.clone());
+            (object_store::GetResultPayload::Stream(stream), original_size)
         } else if self.need_convert {
             let stream = bytes_stream(
                 ReaderStream::with_capacity(ConvertStream::new(reader.stream, self.delimiter.clone()), DEFAULT_READ_BUFFER_SIZE),
@@ -360,24 +381,74 @@ fn extract_json_sub_path_from_expression(expression: &str) -> Option<String> {
     None
 }
 
-/// Convert a JSON DOCUMENT (single JSON object or JSON array) to NDJSON
-/// (newline-delimited JSON) so that DataFusion's Arrow reader can process
-/// it line-by-line.
+/// Build a lazy NDJSON stream from a JSON DOCUMENT reader.
 ///
-/// `json_sub_path` – when the SQL expression uses `FROM s3object.<key>`,
-/// pass `Some(key)` here so that this function navigates to the nested array
-/// before emitting rows.  For example, given the document
-/// `{"employees":[{…},{…}]}` and `json_sub_path = Some("employees")`,
-/// each element of the `employees` array becomes one NDJSON line.
+/// `get_opts` calls this and returns immediately – no I/O is performed until
+/// DataFusion begins polling the returned stream.  The pipeline is:
 ///
-/// - A JSON array `[{...}, {...}]` becomes one JSON object per line.
-/// - A single JSON object `{...}` (with no sub-path) becomes a single line.
-/// - Any other scalar value is emitted as one line.
-fn flatten_json_document_to_ndjson(bytes: &[u8], json_sub_path: Option<&str>) -> std::io::Result<Bytes> {
+/// 1. **Read** – the object bytes are read asynchronously from `stream` only
+///    when the returned stream is first polled.
+/// 2. **Parse** – JSON deserialization runs inside
+///    `tokio::task::spawn_blocking` so the async runtime is never blocked by
+///    CPU-bound work, even for very large documents.
+/// 3. **Yield** – each NDJSON line (one per array element, or one line for a
+///    scalar/object root) is yielded as a separate [`Bytes`] chunk, so
+///    DataFusion can pipeline row processing as lines arrive.
+fn json_document_ndjson_stream(
+    stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
+    original_size: u64,
+    json_sub_path: Option<String>,
+) -> futures_core::stream::BoxStream<'static, Result<Bytes>> {
+    AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
+        pin_mut!(stream);
+        // ── 1. Read phase (lazy: only runs when the stream is polled) ────
+        let mut all_bytes = Vec::with_capacity(original_size as usize);
+        stream
+            .take(original_size)
+            .read_to_end(&mut all_bytes)
+            .await
+            .map_err(|e| o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(e),
+            })?;
+
+        // ── 2. Parse phase (blocking thread pool, non-blocking runtime) ──
+        let lines = tokio::task::spawn_blocking(move || parse_json_document_to_lines(&all_bytes, json_sub_path.as_deref()))
+            .await
+            .map_err(|e| o_Error::Generic {
+                store: "EcObjectStore",
+                source: e.to_string().into(),
+            })?
+            .map_err(|e| o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(e),
+            })?;
+
+        // ── 3. Yield phase (one Bytes per NDJSON line) ───────────────────
+        for line in lines {
+            y.yield_ok(line).await;
+        }
+        Ok(())
+    })
+    .boxed()
+}
+
+/// Parse a JSON DOCUMENT (a single JSON value, possibly multi-line) into a
+/// list of NDJSON lines – one [`Bytes`] per record.
+///
+/// `json_sub_path` – when the SQL expression contains `FROM s3object.<key>`,
+/// pass `Some(key)` to navigate into that key before flattening.  For
+/// example, given `{"employees":[{…},{…}]}` and `json_sub_path =
+/// Some("employees")`, each element of the `employees` array becomes one
+/// NDJSON line.
+///
+/// - A JSON array → one line per element.
+/// - A JSON object (no sub-path match, or scalar root) → one line.
+fn parse_json_document_to_lines(bytes: &[u8], json_sub_path: Option<&str>) -> std::io::Result<Vec<Bytes>> {
     let root: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // Navigate into the sub-path when the root is a JSON object and a path was
+    // Navigate into the sub-path when the root is an object and a path was
     // extracted from the SQL FROM clause (e.g. `FROM s3object.employees`).
     let value = if let Some(path) = json_sub_path {
         if let serde_json::Value::Object(ref obj) = root {
@@ -387,27 +458,44 @@ fn flatten_json_document_to_ndjson(bytes: &[u8], json_sub_path: Option<&str>) ->
                 None => root,
             }
         } else {
-            // Root is already an array or scalar; ignore the path.
+            // Root is already an array or scalar; ignore the path hint.
             root
         }
     } else {
         root
     };
 
-    let mut output: Vec<u8> = Vec::new();
+    let mut lines: Vec<Bytes> = Vec::new();
     match value {
         serde_json::Value::Array(arr) => {
             for item in arr {
-                let line = serde_json::to_string(&item).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                output.extend_from_slice(line.as_bytes());
-                output.push(b'\n');
+                let mut line = serde_json::to_vec(&item).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                line.push(b'\n');
+                lines.push(Bytes::from(line));
             }
         }
         other => {
-            let line = serde_json::to_string(&other).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            output.extend_from_slice(line.as_bytes());
-            output.push(b'\n');
+            let mut line = serde_json::to_vec(&other).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            line.push(b'\n');
+            lines.push(Bytes::from(line));
         }
+    }
+    Ok(lines)
+}
+
+/// Convert a JSON DOCUMENT to a single concatenated NDJSON [`Bytes`] blob.
+///
+/// This is a convenience wrapper around [`parse_json_document_to_lines`] used
+/// by the unit tests.  Production code uses `json_document_ndjson_stream`
+/// instead, which streams lines lazily without constructing this intermediate
+/// blob.
+#[cfg(test)]
+fn flatten_json_document_to_ndjson(bytes: &[u8], json_sub_path: Option<&str>) -> std::io::Result<Bytes> {
+    let lines = parse_json_document_to_lines(bytes, json_sub_path)?;
+    let total = lines.iter().map(|b| b.len()).sum();
+    let mut output = Vec::with_capacity(total);
+    for line in lines {
+        output.extend_from_slice(&line);
     }
     Ok(Bytes::from(output))
 }
