@@ -219,12 +219,18 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
         claims.username, provider_id, policies, groups
     );
 
-    let duration = if body.duration_seconds > 0 {
-        body.duration_seconds.clamp(900, 43200)
+    let mut duration = if body.duration_seconds > 0 {
+        body.duration_seconds
     } else {
         3600
     };
 
+    // Enforce reasonable bounds for STS credentials duration (similar to AWS STS)
+    if duration < 900 {
+        duration = 900;
+    } else if duration > 43200 {
+        duration = 43200;
+    }
     // Generate STS credentials using the shared helper
     let new_cred = create_oidc_sts_credentials(
         &claims,
