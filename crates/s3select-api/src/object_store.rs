@@ -303,23 +303,63 @@ fn extract_json_sub_path_from_expression(expression: &str) -> Option<String> {
     let from_pos = lower.find(" from ")?;
     let after_from = expression[from_pos + 6..].trim_start();
 
-    // Must start with "s3object" (case-insensitive).
-    if !after_from.to_lowercase().starts_with("s3object") {
-        return None;
-    }
-    let after_s3object = &after_from["s3object".len()..];
+    // Must start with "s3object" (case-insensitive, ASCII-only for the prefix).
+    const S3OBJECT_LOWER: &str = "s3object";
+    let mut chars = after_from.char_indices();
+    for expected in S3OBJECT_LOWER.chars() {
+        let (idx, actual) = match chars.next() {
+            Some(v) => v,
+            None => return None,
+        };
+        if actual.to_ascii_lowercase() != expected {
+            return None;
+        }
+        // When we have consumed the full prefix, `idx` is the byte index of
+        // the current character; use it plus its UTF-8 length as the slice
+        // boundary for the remaining string.
+        if expected == 't' {
+            let end_of_prefix = idx + actual.len_utf8();
+            let after_s3object = &after_from[end_of_prefix..];
 
-    // If the very next character is '.' there is a sub-path.
-    if let Some(rest) = after_s3object.strip_prefix('.') {
-        // Collect characters until whitespace, '[', or end-of-string.
-        let end = rest
-            .find(|c: char| c.is_whitespace() || c == '[' || c == ']')
-            .unwrap_or(rest.len());
-        let path = rest[..end].trim();
-        if !path.is_empty() {
-            return Some(path.to_string());
+            // If the very next character is '.' there is a sub-path.
+            if let Some(rest) = after_s3object.strip_prefix('.') {
+                let rest = rest.trim_start();
+                if rest.is_empty() {
+                    return None;
+                }
+
+                // Support quoted identifiers: s3object."my.path" or s3object.'my path'
+                let mut chars = rest.chars();
+                if let Some(first) = chars.next() {
+                    if first == '"' || first == '\'' {
+                        let quote = first;
+                        let inner = &rest[first.len_utf8()..];
+                        if let Some(end) = inner.find(quote) {
+                            let path = &inner[..end];
+                            if !path.trim().is_empty() {
+                                return Some(path.to_string());
+                            }
+                        }
+                        // Quoted but no closing quote or empty: treat as no sub-path.
+                        return None;
+                    }
+                }
+
+                // Unquoted identifier: collect characters until whitespace, '[', or ']'.
+                let end = rest
+                    .find(|c: char| c.is_whitespace() || c == '[' || c == ']')
+                    .unwrap_or(rest.len());
+                let path = rest[..end].trim();
+                if !path.is_empty() {
+                    return Some(path.to_string());
+                }
+            }
+            return None;
         }
     }
+
+    // We only reach here if the loop completed without hitting the 't'
+    // branch above, which would be unexpected given S3OBJECT_LOWER.
     None
 }
 
