@@ -390,9 +390,7 @@ pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str
 /// Escape special XML characters in a string.
 fn xml_escape(s: &str) -> String {
     // Fast path: if there are no escapable characters, just clone the string.
-    if !s.chars()
-        .any(|c| matches!(c, '&' | '<' | '>' | '"' | '\''))
-    {
+    if !s.chars().any(|c| matches!(c, '&' | '<' | '>' | '"' | '\'')) {
         return s.to_owned();
     }
 
