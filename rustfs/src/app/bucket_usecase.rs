@@ -165,6 +165,10 @@ impl DefaultBucketUsecase {
         self.context.clone()
     }
 
+    fn global_region(&self) -> Option<String> {
+        self.context.as_ref().and_then(|context| context.region().get())
+    }
+
     #[instrument(
         level = "debug",
         skip(self, req),
@@ -425,7 +429,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        if let Some(region) = rustfs_ecstore::global::get_global_region() {
+        if let Some(region) = self.global_region() {
             return Ok(S3Response::new(GetBucketLocationOutput {
                 location_constraint: Some(BucketLocationConstraint::from(region)),
             }));
@@ -1187,7 +1191,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let region = resolve_notification_region(rustfs_ecstore::global::get_global_region(), request_region);
+        let region = resolve_notification_region(self.global_region(), request_region);
         let notify = self
             .context
             .as_ref()
