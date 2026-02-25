@@ -98,10 +98,7 @@ impl DefaultAdminUsecase {
     }
 
     fn endpoints(&self) -> Option<EndpointServerPools> {
-        self.context
-            .as_ref()
-            .and_then(|context| context.endpoints().handle())
-            .or_else(|| rustfs_ecstore::GLOBAL_Endpoints.get().cloned())
+        self.context.as_ref().and_then(|context| context.endpoints().handle())
     }
 
     fn app_error(code: S3ErrorCode, message: impl Into<String>) -> ApiError {
