@@ -17,7 +17,6 @@ use super::driver::FtpsDriver;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
 use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
-use libunftp::auth::{AuthenticationError, Authenticator, Principal, UserDetail, UserDetailError, UserDetailProvider};
 use libunftp::options::FtpsRequired;
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
@@ -25,6 +24,9 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
+use unftp_core::auth::{
+    AuthenticationError, Authenticator, Credentials, Principal, UserDetail, UserDetailError, UserDetailProvider,
+};
 
 /// FTPS user implementation
 #[derive(Debug, Clone)]
@@ -253,7 +255,7 @@ impl FtpsAuthenticator {
 #[async_trait::async_trait]
 impl Authenticator for FtpsAuthenticator {
     /// Authenticate FTP user against RustFS IAM system
-    async fn authenticate(&self, username: &str, creds: &libunftp::auth::Credentials) -> Result<Principal, AuthenticationError> {
+    async fn authenticate(&self, username: &str, creds: &Credentials) -> Result<Principal, AuthenticationError> {
         use rustfs_credentials::Credentials as S3Credentials;
         use rustfs_iam::get;
 

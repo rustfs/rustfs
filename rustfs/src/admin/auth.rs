@@ -17,10 +17,8 @@ use http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::sys::IamSys;
-use rustfs_policy::policy::Args;
-use rustfs_policy::policy::action::Action;
-use s3s::S3Result;
-use s3s::s3_error;
+use rustfs_policy::policy::{Args, action::Action};
+use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -20,9 +20,10 @@ use crate::error::ApiError;
 use rustfs_common::data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
+use rustfs_ecstore::endpoints::EndpointServerPools;
+use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::StorageAPI;
-use rustfs_ecstore::{GLOBAL_Endpoints, new_object_layer_fn};
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
 use std::sync::Arc;
@@ -94,6 +95,10 @@ impl DefaultAdminUsecase {
 
     pub fn context(&self) -> Option<Arc<AppContext>> {
         self.context.clone()
+    }
+
+    fn endpoints(&self) -> Option<EndpointServerPools> {
+        self.context.as_ref().and_then(|context| context.endpoints().handle())
     }
 
     fn app_error(code: S3ErrorCode, message: impl Into<String>) -> ApiError {
@@ -221,7 +226,7 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        let Some(endpoints) = GLOBAL_Endpoints.get() else {
+        let Some(endpoints) = self.endpoints() else {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         };
 
@@ -243,7 +248,7 @@ impl DefaultAdminUsecase {
             let _ = context.object_store();
         }
 
-        let Some(endpoints) = GLOBAL_Endpoints.get() else {
+        let Some(endpoints) = self.endpoints() else {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         };
 

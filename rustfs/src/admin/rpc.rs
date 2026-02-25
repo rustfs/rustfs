@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::router::AdminOperation;
-use super::router::Operation;
-use super::router::S3Router;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::server::RPC_PREFIX;
 use futures::StreamExt;
 use http::StatusCode;

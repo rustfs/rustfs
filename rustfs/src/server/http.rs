@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Ensure the correct path for parse_license is imported
-use super::compress::{CompressionConfig, CompressionPredicate};
+// Import HTTP server components and compression configuration
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
+    compress::{CompressionConfig, CompressionPredicate},
     hybrid::hybrid,
     layer::{ConditionalCorsLayer, RedirectLayer},
 };

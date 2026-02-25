@@ -18,12 +18,16 @@
 #![allow(dead_code)]
 
 use async_trait::async_trait;
+use rustfs_ecstore::GLOBAL_Endpoints;
+use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, GLOBAL_BucketMetadataSys};
+use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::store::ECStore;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
 use rustfs_targets::{EventName, arn::TargetID};
 use std::sync::{Arc, OnceLock};
+use tokio::sync::RwLock;
 
 /// IAM interface for application-layer use-cases.
 pub trait IamInterface: Send + Sync {
@@ -49,6 +53,16 @@ pub trait NotifyInterface: Send + Sync {
     ) -> Result<(), NotificationError>;
 
     async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError>;
+}
+
+/// Bucket metadata interface for application-layer use-cases.
+pub trait BucketMetadataInterface: Send + Sync {
+    fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>>;
+}
+
+/// Endpoints interface for application-layer use-cases.
+pub trait EndpointsInterface: Send + Sync {
+    fn handle(&self) -> Option<EndpointServerPools>;
 }
 
 /// Default IAM interface adapter.
@@ -113,6 +127,26 @@ impl NotifyInterface for NotifyHandle {
     }
 }
 
+/// Default bucket metadata interface adapter.
+#[derive(Default)]
+pub struct BucketMetadataHandle;
+
+impl BucketMetadataInterface for BucketMetadataHandle {
+    fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>> {
+        GLOBAL_BucketMetadataSys.get().cloned()
+    }
+}
+
+/// Default endpoints interface adapter.
+#[derive(Default)]
+pub struct EndpointsHandle;
+
+impl EndpointsInterface for EndpointsHandle {
+    fn handle(&self) -> Option<EndpointServerPools> {
+        GLOBAL_Endpoints.get().cloned()
+    }
+}
+
 /// Application-layer context with explicit dependencies.
 #[derive(Clone)]
 pub struct AppContext {
@@ -120,6 +154,8 @@ pub struct AppContext {
     iam: Arc<dyn IamInterface>,
     kms: Arc<dyn KmsInterface>,
     notify: Arc<dyn NotifyInterface>,
+    bucket_metadata: Arc<dyn BucketMetadataInterface>,
+    endpoints: Arc<dyn EndpointsInterface>,
 }
 
 impl AppContext {
@@ -129,6 +165,8 @@ impl AppContext {
             iam,
             kms,
             notify: default_notify_interface(),
+            bucket_metadata: default_bucket_metadata_interface(),
+            endpoints: default_endpoints_interface(),
         }
     }
 
@@ -155,10 +193,26 @@ impl AppContext {
     pub fn notify(&self) -> Arc<dyn NotifyInterface> {
         self.notify.clone()
     }
+
+    pub fn bucket_metadata(&self) -> Arc<dyn BucketMetadataInterface> {
+        self.bucket_metadata.clone()
+    }
+
+    pub fn endpoints(&self) -> Arc<dyn EndpointsInterface> {
+        self.endpoints.clone()
+    }
 }
 
 pub fn default_notify_interface() -> Arc<dyn NotifyInterface> {
     Arc::new(NotifyHandle)
+}
+
+pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
+    Arc::new(BucketMetadataHandle)
+}
+
+pub fn default_endpoints_interface() -> Arc<dyn EndpointsInterface> {
+    Arc::new(EndpointsHandle)
 }
 
 static GLOBAL_APP_CONTEXT: OnceLock<Arc<AppContext>> = OnceLock::new();

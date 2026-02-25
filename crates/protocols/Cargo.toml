@@ -27,7 +27,7 @@ categories = ["network-programming", "filesystem"]
 
 [features]
 default = []
-ftps = ["dep:libunftp", "dep:rustls"]
+ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls"]
 
 [dependencies]
 # Core RustFS dependencies
@@ -57,6 +57,7 @@ s3s = { workspace = true }
 
 # FTPS specific dependencies (optional)
 libunftp = { workspace = true, optional = true }
+unftp-core = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
