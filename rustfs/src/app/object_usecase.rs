@@ -269,7 +269,7 @@ impl DefaultObjectUsecase {
         if let Some(size) = content_length
             && let Some(metadata_sys) = self.bucket_metadata_sys()
         {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+            let quota_checker = QuotaChecker::new(metadata_sys);
 
             match quota_checker
                 .check_quota(&bucket, QuotaOperation::PutObject, size as u64)
@@ -2314,8 +2314,8 @@ impl DefaultObjectUsecase {
         }
 
         // check quota for copy operation
-        if let Some(metadata_sys) = self.bucket_metadata_sys() {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+        let has_bucket_metadata = if let Some(metadata_sys) = self.bucket_metadata_sys() {
+            let quota_checker = QuotaChecker::new(metadata_sys);
 
             match quota_checker
                 .check_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
@@ -2337,7 +2337,10 @@ impl DefaultObjectUsecase {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
                 }
             }
-        }
+            true
+        } else {
+            false
+        };
 
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
@@ -2345,7 +2348,7 @@ impl DefaultObjectUsecase {
             .map_err(ApiError::from)?;
 
         // Update quota tracking after successful copy
-        if self.bucket_metadata_sys().is_some() {
+        if has_bucket_metadata {
             rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
         }
 

@@ -346,7 +346,7 @@ impl DefaultMultipartUsecase {
 
         // check quota after completing multipart upload
         if let Some(metadata_sys) = self.bucket_metadata_sys() {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+            let quota_checker = QuotaChecker::new(metadata_sys);
 
             match quota_checker
                 .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
@@ -366,9 +366,7 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    if self.bucket_metadata_sys().is_some() {
-                        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
-                    }
+                    rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
