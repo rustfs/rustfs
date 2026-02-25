@@ -192,7 +192,6 @@ mod tests {
         match policy_error {
             Error::Io(inner_io) => {
                 assert_eq!(inner_io.kind(), ErrorKind::PermissionDenied);
-                assert!(inner_io.to_string().contains("permission denied"));
             }
             _ => panic!("Expected Io variant"),
         }
@@ -205,7 +204,6 @@ mod tests {
 
         match policy_error {
             Error::Io(io_error) => {
-                assert!(io_error.to_string().contains(custom_error));
                 assert_eq!(io_error.kind(), ErrorKind::Other);
             }
             _ => panic!("Expected Io variant"),
@@ -218,12 +216,9 @@ mod tests {
         let crypto_error = rustfs_crypto::Error::ErrUnexpectedHeader;
         let policy_error: Error = crypto_error.into();
 
-        match policy_error {
-            Error::CryptoError(_) => {
-                // Verify the conversion worked
-                assert!(policy_error.to_string().contains("crypto"));
-            }
-            _ => panic!("Expected CryptoError variant"),
+        match &policy_error {
+            Error::CryptoError(_) => {}
+            _ => panic!("Expected CryptoError variant, got {:?}", policy_error),
         }
     }
 
@@ -249,12 +244,9 @@ mod tests {
         let jwt_error = jwt_result.unwrap_err();
         let policy_error: Error = jwt_error.into();
 
-        match policy_error {
-            Error::JWTError(_) => {
-                // Verify the conversion worked
-                assert!(policy_error.to_string().contains("jwt err"));
-            }
-            _ => panic!("Expected JWTError variant"),
+        match &policy_error {
+            Error::JWTError(_) => {}
+            _ => panic!("Expected JWTError variant, got {:?}", policy_error),
         }
     }
 

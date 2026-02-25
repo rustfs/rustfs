@@ -34,7 +34,6 @@ use rustfs_ecstore::{
         // RESERVED_METADATA_PREFIX,
     },
 };
-use rustfs_kms::DataKey;
 use rustfs_notify::notifier_global;
 use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
 use rustfs_targets::EventName;
@@ -563,12 +562,6 @@ pub(crate) fn stored_acl_from_grant_headers(
 #[derive(Debug, Clone)]
 pub struct FS {
     // pub store: ECStore,
-}
-
-pub(crate) struct ManagedEncryptionMaterial {
-    pub(crate) data_key: DataKey,
-    pub(crate) headers: HashMap<String, String>,
-    pub(crate) kms_key_id: String,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
