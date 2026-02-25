@@ -15,7 +15,7 @@
 //! Bucket application use-case contracts.
 #![allow(dead_code)]
 
-use crate::app::context::{AppContext, get_global_app_context};
+use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
@@ -46,7 +46,6 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI};
-use rustfs_notify::notifier_global;
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
@@ -1189,7 +1188,12 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let region = resolve_notification_region(rustfs_ecstore::global::get_global_region(), request_region);
-        let clear_rules = notifier_global::clear_bucket_notification_rules(&bucket);
+        let notify = self
+            .context
+            .as_ref()
+            .map(|context| context.notify())
+            .unwrap_or_else(default_notify_interface);
+        let clear_rules = notify.clear_bucket_notification_rules(&bucket);
         let parse_rules = async {
             let mut event_rules = Vec::new();
 
@@ -1223,7 +1227,8 @@ impl DefaultBucketUsecase {
             event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
         warn!("notify event rules: {:?}", &event_rules);
 
-        notifier_global::add_event_specific_rules(&bucket, &region, &event_rules)
+        notify
+            .add_event_specific_rules(&bucket, &region, &event_rules)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
 
