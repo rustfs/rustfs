@@ -97,8 +97,6 @@ pub struct VersionStats {
 }
 
 impl FileMetaVersionHeader {
-    // ... existing code ...
-
     pub fn is_valid(&self) -> bool {
         // Check if version type is valid
         if !self.version_type.valid() {
@@ -121,8 +119,6 @@ impl FileMetaVersionHeader {
 
         true
     }
-
-    // ... existing code ...
 }
 
 /// Enhanced version statistics with more detailed information

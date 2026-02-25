@@ -682,10 +682,12 @@ impl MetaObject {
             format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}"),
             fi.transitioned_objname.as_bytes().to_vec(),
         );
-        self.meta_sys.insert(
-            format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}"),
-            fi.transition_version_id.unwrap().as_bytes().to_vec(),
-        );
+        if let Some(transition_version_id) = fi.transition_version_id.as_ref() {
+            self.meta_sys.insert(
+                format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}"),
+                transition_version_id.as_bytes().to_vec(),
+            );
+        }
         self.meta_sys.insert(
             format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}"),
             fi.transition_tier.as_bytes().to_vec(),
@@ -1229,7 +1231,7 @@ pub fn merge_file_meta_versions(
         let mut latest = FileMetaShallowVersion::default();
         if consistent {
             merged.push(tops[0].clone());
-            if tops[0].header.free_version() {
+            if !tops[0].header.free_version() {
                 n_versions += 1;
             }
         } else {
@@ -1268,7 +1270,7 @@ pub fn merge_file_meta_versions(
                         if !strict {
                             a_clone.header.signature = [0; 4];
                         }
-                        *x.entry(a_clone.header).or_insert(1) += 1;
+                        *x.entry(a_clone.header).or_insert(0) += 1;
                     }
                     latest_count = 0;
                     for (k, v) in x.iter() {

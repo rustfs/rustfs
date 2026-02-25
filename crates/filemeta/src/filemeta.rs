@@ -155,8 +155,6 @@ impl FileMeta {
         Err(Error::FileVersionNotFound)
     }
 
-    // shard_data_dir_count queries the count of data_dir under vid
-
     pub fn update_object_version(&mut self, fi: FileInfo) -> Result<()> {
         for version in self.versions.iter_mut() {
             match version.header.version_type {

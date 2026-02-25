@@ -51,6 +51,10 @@ impl FileMeta {
             return Ok((&[], &[]));
         }
 
+        if buf.len() < 5 {
+            return Err(Error::other("insufficient data for meta length"));
+        }
+
         let (mut size_buf, buf) = buf.split_at(5);
 
         // Get meta data, buf = crc + data
@@ -79,12 +83,16 @@ impl FileMeta {
 
     // Fixed u32
     pub fn read_bytes_header(buf: &[u8]) -> Result<(u32, &[u8])> {
-        let (mut size_buf, _) = buf.split_at(5);
+        if buf.len() < 5 {
+            return Err(Error::other("insufficient data for bytes header"));
+        }
+
+        let (mut size_buf, remaining) = buf.split_at(5);
 
         // Get meta data, buf = crc + data
         let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
 
-        Ok((bin_len, &buf[5..]))
+        Ok((bin_len, remaining))
     }
 
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
@@ -95,6 +103,14 @@ impl FileMeta {
             error!("failed to check XL2 v1 format: {}", e);
             e
         })?;
+
+        if buf.len() < 5 {
+            error!(
+                "insufficient data for metadata length prefix: expected at least 5 bytes, got {}",
+                buf.len()
+            );
+            return Err(Error::other("insufficient data for metadata length prefix"));
+        }
 
         let (mut size_buf, buf) = buf.split_at(5);
 
