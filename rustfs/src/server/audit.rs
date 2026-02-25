@@ -12,10 +12,16 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use crate::app::context::{default_server_config_interface, get_global_app_context};
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
-use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use tracing::{info, warn};
+
+fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
+    get_global_app_context()
+        .and_then(|context| context.server_config().get())
+        .or_else(|| default_server_config_interface().get())
+}
 
 /// Start the audit system.
 /// This function checks if the audit subsystem is configured in the global server configuration.
@@ -29,13 +35,13 @@ pub(crate) async fn start_audit_system() -> AuditResult<()> {
     );
 
     // 1. Get the global configuration loaded by ecstore
-    let server_config = match GLOBAL_SERVER_CONFIG.get() {
+    let server_config = match server_config_from_context() {
         Some(config) => {
             info!(
                 target: "rustfs::main::start_audit_system",
                 "Global server configuration loads successfully: {:?}", config
             );
-            config.clone()
+            config
         }
         None => {
             warn!(
