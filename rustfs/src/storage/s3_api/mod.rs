@@ -16,11 +16,12 @@
 //!
 //! This file intentionally starts as skeleton-only. Behavior remains in place
 //! until each helper is moved with dedicated small refactor steps.
+#![allow(dead_code)]
 
 pub(crate) mod acl;
 pub(crate) mod bucket;
 pub(crate) mod common;
-pub(crate) mod encryption {}
+pub(crate) mod encryption;
 pub(crate) mod multipart;
 pub(crate) mod object_lock;
 /// Object helper facade placeholder.
@@ -29,9 +30,9 @@ pub(crate) mod object_lock;
 /// modules (for example, `storage::readers`) and be consumed from there.
 /// Object-specific extraction steps can be added here incrementally.
 pub(crate) mod object {}
-pub(crate) mod replication {}
+pub(crate) mod replication;
 pub(crate) mod response;
-pub(crate) mod restore {}
-pub(crate) mod select {}
+pub(crate) mod restore;
+pub(crate) mod select;
 pub(crate) mod tagging;
 pub(crate) mod validation {}

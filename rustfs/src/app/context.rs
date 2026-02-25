@@ -17,19 +17,38 @@
 //! for storage, IAM, and KMS handles.
 #![allow(dead_code)]
 
+use async_trait::async_trait;
 use rustfs_ecstore::store::ECStore;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
+use rustfs_notify::{EventArgs, NotificationError, notifier_global};
+use rustfs_targets::{EventName, arn::TargetID};
 use std::sync::{Arc, OnceLock};
 
 /// IAM interface for application-layer use-cases.
 pub trait IamInterface: Send + Sync {
     fn handle(&self) -> Arc<IamSys<ObjectStore>>;
+    fn is_ready(&self) -> bool;
 }
 
 /// KMS interface for application-layer use-cases.
 pub trait KmsInterface: Send + Sync {
     fn handle(&self) -> Arc<KmsServiceManager>;
+}
+
+/// Notify interface for application-layer use-cases.
+#[async_trait]
+pub trait NotifyInterface: Send + Sync {
+    async fn notify(&self, args: EventArgs);
+
+    async fn add_event_specific_rules(
+        &self,
+        bucket_name: &str,
+        region: &str,
+        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
+    ) -> Result<(), NotificationError>;
+
+    async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError>;
 }
 
 /// Default IAM interface adapter.
@@ -46,6 +65,10 @@ impl IamHandle {
 impl IamInterface for IamHandle {
     fn handle(&self) -> Arc<IamSys<ObjectStore>> {
         self.iam.clone()
+    }
+
+    fn is_ready(&self) -> bool {
+        rustfs_iam::get().is_ok()
     }
 }
 
@@ -66,17 +89,47 @@ impl KmsInterface for KmsHandle {
     }
 }
 
+/// Default notify interface adapter.
+#[derive(Default)]
+pub struct NotifyHandle;
+
+#[async_trait]
+impl NotifyInterface for NotifyHandle {
+    async fn notify(&self, args: EventArgs) {
+        notifier_global::notify(args).await;
+    }
+
+    async fn add_event_specific_rules(
+        &self,
+        bucket_name: &str,
+        region: &str,
+        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
+    ) -> Result<(), NotificationError> {
+        notifier_global::add_event_specific_rules(bucket_name, region, event_rules).await
+    }
+
+    async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError> {
+        notifier_global::clear_bucket_notification_rules(bucket_name).await
+    }
+}
+
 /// Application-layer context with explicit dependencies.
 #[derive(Clone)]
 pub struct AppContext {
     object_store: Arc<ECStore>,
     iam: Arc<dyn IamInterface>,
     kms: Arc<dyn KmsInterface>,
+    notify: Arc<dyn NotifyInterface>,
 }
 
 impl AppContext {
     pub fn new(object_store: Arc<ECStore>, iam: Arc<dyn IamInterface>, kms: Arc<dyn KmsInterface>) -> Self {
-        Self { object_store, iam, kms }
+        Self {
+            object_store,
+            iam,
+            kms,
+            notify: default_notify_interface(),
+        }
     }
 
     pub fn with_default_interfaces(
@@ -98,6 +151,14 @@ impl AppContext {
     pub fn kms(&self) -> Arc<dyn KmsInterface> {
         self.kms.clone()
     }
+
+    pub fn notify(&self) -> Arc<dyn NotifyInterface> {
+        self.notify.clone()
+    }
+}
+
+pub fn default_notify_interface() -> Arc<dyn NotifyInterface> {
+    Arc::new(NotifyHandle)
 }
 
 static GLOBAL_APP_CONTEXT: OnceLock<Arc<AppContext>> = OnceLock::new();

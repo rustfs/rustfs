@@ -18,6 +18,8 @@ pub mod ecfs;
 pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod options;
+pub mod rpc;
+pub(crate) mod s3_api;
 pub mod tonic_service;
 
 #[cfg(test)]

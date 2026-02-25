@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::bandwidth::reader::{BucketOptions, MonitorReaderOptions, MonitoredReader};
 use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, BucketTargetSys, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
@@ -28,16 +29,21 @@ use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_fo
 use crate::event::name::EventName;
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
+use crate::global::get_global_bucket_monitor;
 use crate::set_disk::get_lock_acquire_timeout;
-use crate::store_api::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
+use crate::store_api::{DeletedObject, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
+use aws_smithy_types::body::SdkBody;
 use byteorder::ByteOrder;
 use futures::future::join_all;
+use futures::stream::StreamExt;
 use http::HeaderMap;
+use http_body::Frame;
+use http_body_util::StreamBody;
 use regex::Regex;
 use rustfs_filemeta::{
     MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateDecision, ReplicateObjectInfo,
@@ -61,10 +67,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
+use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -73,6 +80,8 @@ const RESYNC_FILE_NAME: &str = "resync.bin";
 const RESYNC_META_FORMAT: u16 = 1;
 const RESYNC_META_VERSION: u16 = 1;
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
+
+static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
 
 #[derive(Debug, Clone, Default)]
 pub struct ResyncOpts {
@@ -1956,20 +1965,16 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
         let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
 
+        let obj_opts = ObjectOptions {
+            version_id: self.version_id.map(|v| v.to_string()),
+            version_suspended,
+            versioned,
+            replication_request: true,
+            ..Default::default()
+        };
+
         let mut gr = match storage
-            .get_object_reader(
-                &bucket,
-                &object,
-                None,
-                HeaderMap::new(),
-                &ObjectOptions {
-                    version_id: self.version_id.map(|v| v.to_string()),
-                    version_suspended,
-                    versioned,
-                    replication_request: true,
-                    ..Default::default()
-                },
-            )
+            .get_object_reader(&bucket, &object, None, HeaderMap::new(), &obj_opts)
             .await
         {
             Ok(gr) => gr,
@@ -2078,34 +2083,26 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
-        // TODO:bandwidth
-
         if let Some(err) = if is_multipart {
-            replicate_object_with_multipart(tgt_client.clone(), &tgt_client.bucket, &object, gr.stream, &object_info, put_opts)
-                .await
-                .err()
+            drop(gr);
+            replicate_object_with_multipart(MultipartReplicationContext {
+                storage: storage.clone(),
+                cli: tgt_client.clone(),
+                src_bucket: &bucket,
+                dst_bucket: &tgt_client.bucket,
+                object: &object,
+                object_info: &object_info,
+                obj_opts: &obj_opts,
+                arn: &rinfo.arn,
+                put_opts,
+            })
+            .await
+            .err()
         } else {
-            // TODO: use stream
-            let body = match gr.read_all().await {
-                Ok(body) => body,
-                Err(e) => {
-                    rinfo.replication_status = ReplicationStatusType::Failed;
-                    rinfo.error = Some(e.to_string());
-                    warn!("failed to read object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
-                    send_event(EventArgs {
-                        event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
-                        bucket_name: bucket.clone(),
-                        object: object_info.clone(),
-                        host: GLOBAL_LocalNodeName.to_string(),
-                        user_agent: "Internal: [Replication]".to_string(),
-                        ..Default::default()
-                    });
-                    return rinfo;
-                }
-            };
-            let reader = ByteStream::from(body);
+            gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
+            let byte_stream = async_read_to_bytestream(gr.stream);
             tgt_client
-                .put_object(&tgt_client.bucket, &object, size, reader, &put_opts)
+                .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))
                 .err()
@@ -2161,20 +2158,16 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
         let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
 
+        let obj_opts = ObjectOptions {
+            version_id: self.version_id.map(|v| v.to_string()),
+            version_suspended,
+            versioned,
+            replication_request: true,
+            ..Default::default()
+        };
+
         let mut gr = match storage
-            .get_object_reader(
-                &bucket,
-                &object,
-                None,
-                HeaderMap::new(),
-                &ObjectOptions {
-                    version_id: self.version_id.map(|v| v.to_string()),
-                    version_suspended,
-                    versioned,
-                    replication_request: true,
-                    ..Default::default()
-                },
-            )
+            .get_object_reader(&bucket, &object, None, HeaderMap::new(), &obj_opts)
             .await
         {
             Ok(gr) => gr,
@@ -2370,39 +2363,27 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     return rinfo;
                 }
             };
+
             if let Some(err) = if is_multipart {
-                replicate_object_with_multipart(
-                    tgt_client.clone(),
-                    &tgt_client.bucket,
-                    &object,
-                    gr.stream,
-                    &object_info,
+                drop(gr);
+                replicate_object_with_multipart(MultipartReplicationContext {
+                    storage: storage.clone(),
+                    cli: tgt_client.clone(),
+                    src_bucket: &bucket,
+                    dst_bucket: &tgt_client.bucket,
+                    object: &object,
+                    object_info: &object_info,
+                    obj_opts: &obj_opts,
+                    arn: &rinfo.arn,
                     put_opts,
-                )
+                })
                 .await
                 .err()
             } else {
-                let body = match gr.read_all().await {
-                    Ok(body) => body,
-                    Err(e) => {
-                        rinfo.replication_status = ReplicationStatusType::Failed;
-                        rinfo.error = Some(e.to_string());
-                        warn!("failed to read object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
-                        send_event(EventArgs {
-                            event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
-                            bucket_name: bucket.clone(),
-                            object: object_info,
-                            host: GLOBAL_LocalNodeName.to_string(),
-                            user_agent: "Internal: [Replication]".to_string(),
-                            ..Default::default()
-                        });
-                        rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
-                        return rinfo;
-                    }
-                };
-                let reader = ByteStream::from(body);
+                gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
+                let byte_stream = async_read_to_bytestream(gr.stream);
                 tgt_client
-                    .put_object(&tgt_client.bucket, &object, size, reader, &put_opts)
+                    .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))
                     .err()
@@ -2455,6 +2436,63 @@ static STANDARD_HEADERS: &[&str] = &[
     headers::AMZ_TAG_COUNT,
     headers::AMZ_SERVER_SIDE_ENCRYPTION,
 ];
+
+fn calc_put_object_header_size(put_opts: &PutObjectOptions) -> usize {
+    let mut header_size: usize = 0;
+    for (key, value) in put_opts.header().iter() {
+        header_size += key.as_str().len();
+        header_size += value.as_bytes().len();
+        // Account for HTTP header formatting: ": " (2 bytes) and "\r\n" (2 bytes)
+        header_size += 4;
+    }
+    header_size
+}
+
+fn wrap_with_bandwidth_monitor_with_header(
+    stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    bucket: &str,
+    arn: &str,
+    header_size: usize,
+) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
+    if let Some(monitor) = get_global_bucket_monitor() {
+        Box::new(MonitoredReader::new(
+            monitor,
+            stream,
+            MonitorReaderOptions {
+                bucket_options: BucketOptions {
+                    name: bucket.to_string(),
+                    replication_arn: arn.to_string(),
+                },
+                header_size,
+            },
+        ))
+    } else {
+        WARNED_MONITOR_UNINIT.call_once(|| {
+            warn!(
+                "Global bucket monitor uninitialized; proceeding with unthrottled replication (bandwidth limits will be ignored)"
+            )
+        });
+        stream
+    }
+}
+
+fn wrap_with_bandwidth_monitor(
+    stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    put_opts: &PutObjectOptions,
+    bucket: &str,
+    arn: &str,
+) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
+    let header_size = calc_put_object_header_size(put_opts);
+    wrap_with_bandwidth_monitor_with_header(stream, bucket, arn, header_size)
+}
+
+fn async_read_to_bytestream(reader: impl AsyncRead + Send + Sync + Unpin + 'static) -> ByteStream {
+    // Non-retryable: SDK-level retries are not supported for streaming bodies.
+    // Replication-level retry handles failures at a higher layer.
+    let stream = ReaderStream::new(reader);
+    let body = StreamBody::new(stream.map(|r| r.map(Frame::data)));
+    ByteStream::new(SdkBody::from_body_1_x(body))
+}
 
 fn is_standard_header(k: &str) -> bool {
     STANDARD_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(k))
@@ -2679,17 +2717,56 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
     Ok((put_op, is_multipart))
 }
 
-async fn replicate_object_with_multipart(
+fn part_range_spec_from_actual_size(offset: i64, part_size: i64) -> std::io::Result<(HTTPRangeSpec, i64)> {
+    if offset < 0 {
+        return Err(std::io::Error::other("invalid part offset"));
+    }
+    if part_size <= 0 {
+        return Err(std::io::Error::other(format!("invalid part size {part_size}")));
+    }
+    let end = offset
+        .checked_add(part_size - 1)
+        .ok_or_else(|| std::io::Error::other("part range overflow"))?;
+    let next_offset = end
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("part offset overflow"))?;
+    Ok((
+        HTTPRangeSpec {
+            is_suffix_length: false,
+            start: offset,
+            end,
+        },
+        next_offset,
+    ))
+}
+
+struct MultipartReplicationContext<'a, S: StorageAPI> {
+    storage: Arc<S>,
     cli: Arc<TargetClient>,
-    bucket: &str,
-    object: &str,
-    reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
-    object_info: &ObjectInfo,
-    opts: PutObjectOptions,
-) -> std::io::Result<()> {
+    src_bucket: &'a str,
+    dst_bucket: &'a str,
+    object: &'a str,
+    object_info: &'a ObjectInfo,
+    obj_opts: &'a ObjectOptions,
+    arn: &'a str,
+    put_opts: PutObjectOptions,
+}
+
+async fn replicate_object_with_multipart<S: StorageAPI>(ctx: MultipartReplicationContext<'_, S>) -> std::io::Result<()> {
+    let MultipartReplicationContext {
+        storage,
+        cli,
+        src_bucket,
+        dst_bucket,
+        object,
+        object_info,
+        obj_opts,
+        arn,
+        put_opts,
+    } = ctx;
     let mut attempts = 1;
     let upload_id = loop {
-        match cli.create_multipart_upload(bucket, object, &opts).await {
+        match cli.create_multipart_upload(dst_bucket, object, &put_opts).await {
             Ok(id) => {
                 break id;
             }
@@ -2708,19 +2785,30 @@ async fn replicate_object_with_multipart(
 
     let mut uploaded_parts: Vec<CompletedPart> = Vec::new();
 
-    let mut reader = reader;
+    let mut header_size = calc_put_object_header_size(&put_opts);
+    let mut offset: i64 = 0;
     for part_info in object_info.parts.iter() {
-        let mut chunk = vec![0u8; part_info.actual_size as usize];
-        AsyncReadExt::read_exact(&mut *reader, &mut chunk).await?;
+        let part_size = part_info.actual_size;
+        let (range_spec, next_offset) = part_range_spec_from_actual_size(offset, part_size)?;
+        offset = next_offset;
+
+        let part_reader = storage
+            .get_object_reader(src_bucket, object, Some(range_spec), HeaderMap::new(), obj_opts)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        let part_stream = wrap_with_bandwidth_monitor_with_header(part_reader.stream, src_bucket, arn, header_size);
+        header_size = 0;
+        let byte_stream = async_read_to_bytestream(part_stream);
 
         let object_part = cli
             .put_object_part(
-                bucket,
+                dst_bucket,
                 object,
                 &upload_id,
                 part_info.number as i32,
-                part_info.actual_size,
-                ByteStream::from(chunk),
+                part_size,
+                byte_stream,
                 &PutObjectPartOptions { ..Default::default() },
             )
             .await
@@ -2748,7 +2836,7 @@ async fn replicate_object_with_multipart(
     );
 
     cli.complete_multipart_upload(
-        bucket,
+        dst_bucket,
         object,
         &upload_id,
         uploaded_parts,
@@ -2868,4 +2956,23 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
     }
 
     ReplicationAction::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_part_range_spec_from_actual_size() {
+        let (rs, next) = part_range_spec_from_actual_size(0, 10).unwrap();
+        assert_eq!(rs.start, 0);
+        assert_eq!(rs.end, 9);
+        assert_eq!(next, 10);
+    }
+
+    #[test]
+    fn test_part_range_spec_rejects_non_positive() {
+        assert!(part_range_spec_from_actual_size(0, 0).is_err());
+        assert!(part_range_spec_from_actual_size(0, -1).is_err());
+    }
 }

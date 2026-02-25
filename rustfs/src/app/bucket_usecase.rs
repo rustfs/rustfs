@@ -15,7 +15,7 @@
 //! Bucket application use-case contracts.
 #![allow(dead_code)]
 
-use crate::app::context::{AppContext, get_global_app_context};
+use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
@@ -25,6 +25,7 @@ use crate::storage::ecfs::{
     stored_acl_from_grant_headers, stored_acl_from_policy, stored_grant_to_dto, stored_owner_to_dto,
 };
 use crate::storage::helper::OperationHelper;
+use crate::storage::s3_api::{encryption, replication, tagging};
 use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
@@ -45,7 +46,6 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI};
-use rustfs_notify::notifier_global;
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
@@ -651,7 +651,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
+        Ok(S3Response::new(tagging::build_delete_bucket_tagging_output()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -708,9 +708,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketEncryptionOutput {
+        Ok(S3Response::new(encryption::build_get_bucket_encryption_output(
             server_side_encryption_configuration,
-        }))
+        )))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -986,9 +986,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketReplicationOutput {
-            replication_configuration: Some(replication_configuration),
-        }))
+        Ok(S3Response::new(replication::build_get_bucket_replication_output(
+            replication_configuration,
+        )))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1022,7 +1022,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
+        Ok(S3Response::new(tagging::build_get_bucket_tagging_output(tag_set)))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1119,7 +1119,7 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
             .await
             .map_err(ApiError::from)?;
-        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
+        Ok(S3Response::new(encryption::build_put_bucket_encryption_output()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1188,7 +1188,12 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let region = resolve_notification_region(rustfs_ecstore::global::get_global_region(), request_region);
-        let clear_rules = notifier_global::clear_bucket_notification_rules(&bucket);
+        let notify = self
+            .context
+            .as_ref()
+            .map(|context| context.notify())
+            .unwrap_or_else(default_notify_interface);
+        let clear_rules = notify.clear_bucket_notification_rules(&bucket);
         let parse_rules = async {
             let mut event_rules = Vec::new();
 
@@ -1222,7 +1227,8 @@ impl DefaultBucketUsecase {
             event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
         warn!("notify event rules: {:?}", &event_rules);
 
-        notifier_global::add_event_specific_rules(&bucket, &region, &event_rules)
+        notify
+            .add_event_specific_rules(&bucket, &region, &event_rules)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
 
@@ -1345,7 +1351,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(PutBucketReplicationOutput::default()))
+        Ok(S3Response::new(replication::build_put_bucket_replication_output()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1406,7 +1412,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(Default::default()))
+        Ok(S3Response::new(tagging::build_put_bucket_tagging_output()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1589,6 +1595,152 @@ impl DefaultBucketUsecase {
 
         // let output = ListObjectsV2Output { ..Default::default() };
         Ok(S3Response::new(output))
+    }
+
+    pub async fn execute_list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let ListObjectVersionsInput {
+            bucket,
+            delimiter,
+            key_marker,
+            version_id_marker,
+            max_keys,
+            prefix,
+            ..
+        } = req.input;
+
+        let prefix = prefix.unwrap_or_default();
+        let max_keys = max_keys.unwrap_or(1000);
+
+        let key_marker = key_marker.filter(|v| !v.is_empty());
+        let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
+        let delimiter = delimiter.filter(|v| !v.is_empty());
+
+        let store = get_validated_store(&bucket).await?;
+
+        let object_infos = store
+            .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
+            .await
+            .map_err(ApiError::from)?;
+
+        let objects: Vec<ObjectVersion> = object_infos
+            .objects
+            .iter()
+            .filter(|v| !v.name.is_empty() && !v.delete_marker)
+            .map(|v| ObjectVersion {
+                key: Some(v.name.to_owned()),
+                last_modified: v.mod_time.map(Timestamp::from),
+                size: Some(v.size),
+                version_id: Some(v.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+                is_latest: Some(v.is_latest),
+                e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
+                ..Default::default()
+            })
+            .collect();
+
+        let common_prefixes = object_infos
+            .prefixes
+            .into_iter()
+            .map(|v| CommonPrefix { prefix: Some(v) })
+            .collect();
+
+        let delete_markers = object_infos
+            .objects
+            .iter()
+            .filter(|o| o.delete_marker)
+            .map(|o| DeleteMarkerEntry {
+                key: Some(o.name.clone()),
+                version_id: Some(o.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+                is_latest: Some(o.is_latest),
+                last_modified: o.mod_time.map(Timestamp::from),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let next_key_marker = object_infos.next_marker.filter(|v| !v.is_empty());
+        let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
+
+        let output = ListObjectVersionsOutput {
+            is_truncated: Some(object_infos.is_truncated),
+            max_keys: Some(max_keys),
+            delimiter,
+            name: Some(bucket),
+            prefix: Some(prefix),
+            common_prefixes: Some(common_prefixes),
+            versions: Some(objects),
+            delete_markers: Some(delete_markers),
+            next_key_marker,
+            next_version_id_marker,
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
+    }
+
+    #[instrument(level = "debug", skip(self, req))]
+    pub async fn execute_list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let request_marker = req.input.marker.clone();
+        let v2_resp = self.execute_list_objects_v2(req.map_input(Into::into)).await?;
+
+        Ok(v2_resp.map_output(|v2| {
+            let next_marker = if v2.is_truncated.unwrap_or(false) {
+                let last_key = v2
+                    .contents
+                    .as_ref()
+                    .and_then(|contents| contents.last())
+                    .and_then(|obj| obj.key.as_ref())
+                    .cloned();
+
+                let last_prefix = v2
+                    .common_prefixes
+                    .as_ref()
+                    .and_then(|prefixes| prefixes.last())
+                    .and_then(|prefix| prefix.prefix.as_ref())
+                    .cloned();
+
+                match (last_key, last_prefix) {
+                    (Some(k), Some(p)) => {
+                        if k > p {
+                            Some(k)
+                        } else {
+                            Some(p)
+                        }
+                    }
+                    (Some(k), None) => Some(k),
+                    (None, Some(p)) => Some(p),
+                    (None, None) => None,
+                }
+            } else {
+                None
+            };
+
+            let marker = Some(request_marker.unwrap_or_default());
+
+            ListObjectsOutput {
+                contents: v2.contents,
+                delimiter: v2.delimiter,
+                encoding_type: v2.encoding_type,
+                name: v2.name,
+                prefix: v2.prefix,
+                max_keys: v2.max_keys,
+                common_prefixes: v2.common_prefixes,
+                is_truncated: v2.is_truncated,
+                marker,
+                next_marker,
+                ..Default::default()
+            }
+        }))
     }
 }
 
@@ -1847,6 +1999,31 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_list_buckets(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_list_object_versions_returns_internal_error_when_store_uninitialized() {
+        let input = ListObjectVersionsInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_object_versions(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_list_objects_returns_internal_error_when_store_uninitialized() {
+        let input = ListObjectsInput::builder().bucket("test-bucket".to_string()).build().unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_objects(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
