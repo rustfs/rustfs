@@ -1406,10 +1406,10 @@ impl DefaultObjectUsecase {
                 response_content_length as usize,
             )))
         } else if encryption_applied {
-            // For SSE-C encrypted objects, don't use bytes_stream to limit the stream
-            // because DecryptReader needs to read all encrypted data to produce decrypted output
+            // For encrypted objects (SSE-C or managed SSE), avoid bytes_stream length limiting
+            // because DecryptReader may need to consume the full encrypted stream.
             info!(
-                "Managed SSE: Using unlimited stream for decryption with buffer size {}",
+                "Encrypted object: Using unlimited stream for decryption with buffer size {}",
                 optimal_buffer_size
             );
             Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
