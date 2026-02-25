@@ -73,33 +73,6 @@ pub fn heal_object_select_prob() -> u32 {
     rustfs_utils::get_env_u32(ENV_HEAL_OBJECT_SELECT_PROB, DEFAULT_HEAL_OBJECT_SELECT_PROB)
 }
 
-#[cfg(test)]
-static TEST_FAILED_OBJECT_TTL_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-#[cfg(test)]
-static TEST_FAILED_OBJECTS_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
-
-fn failed_object_ttl_secs() -> u64 {
-    #[cfg(test)]
-    {
-        let v = TEST_FAILED_OBJECT_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
-        if v != u64::MAX {
-            return v;
-        }
-    }
-    rustfs_utils::get_env_u32(ENV_FAILED_OBJECT_TTL_SECS, DEFAULT_FAILED_OBJECT_TTL_SECS) as u64
-}
-
-fn failed_objects_max() -> usize {
-    #[cfg(test)]
-    {
-        let v = TEST_FAILED_OBJECTS_MAX.load(std::sync::atomic::Ordering::Relaxed);
-        if v != usize::MAX {
-            return v;
-        }
-    }
-    rustfs_utils::get_env_u32(ENV_FAILED_OBJECTS_MAX, DEFAULT_FAILED_OBJECTS_MAX) as usize
-}
-
 /// Cached folder information for scanning
 #[derive(Clone, Debug)]
 pub struct CachedFolder {
@@ -421,6 +394,9 @@ pub struct FolderScanner {
     heal_object_select: u32,
     scan_mode: HealScanMode,
 
+    failed_object_ttl_secs: u64,
+    failed_objects_max: usize,
+
     we_sleep: Box<dyn Fn() -> bool + Send + Sync>,
     // should_heal: Arc<dyn Fn() -> bool + Send + Sync>,
     disks: Vec<Arc<Disk>>,
@@ -444,7 +420,7 @@ impl FolderScanner {
     }
 
     fn should_skip_failed(&self, path: &str) -> bool {
-        let ttl = failed_object_ttl_secs();
+        let ttl = self.failed_object_ttl_secs;
         if ttl == 0 {
             return false;
         }
@@ -458,7 +434,7 @@ impl FolderScanner {
     }
 
     fn record_failed(&mut self, path: &str) {
-        let ttl = failed_object_ttl_secs();
+        let ttl = self.failed_object_ttl_secs;
         if ttl == 0 {
             return;
         }
@@ -466,14 +442,14 @@ impl FolderScanner {
         let now = Self::now_secs();
         self.new_cache.info.failed_objects.insert(path.to_string(), now);
 
-        let max_entries = failed_objects_max();
+        let max_entries = self.failed_objects_max;
         if max_entries > 0 && self.new_cache.info.failed_objects.len() > max_entries {
             self.prune_failed_objects(now, ttl);
         }
     }
 
     fn prune_failed_objects_cache(&mut self) {
-        let ttl = failed_object_ttl_secs();
+        let ttl = self.failed_object_ttl_secs;
         if ttl == 0 {
             return;
         }
@@ -483,7 +459,7 @@ impl FolderScanner {
     }
 
     fn prune_failed_objects(&mut self, now: u64, ttl: u64) {
-        let max_entries = failed_objects_max();
+        let max_entries = self.failed_objects_max;
         let failed = &mut self.new_cache.info.failed_objects;
         if failed.is_empty() {
             return;
@@ -739,8 +715,7 @@ impl FolderScanner {
                 let sz = match self.local_disk.get_size(item.clone()).await {
                     Ok(sz) => sz,
                     Err(e) => {
-                        // Treat the "skip file" sentinel as normal control flow, not a failure.
-                        let is_skip_file = e.to_string() == "skip file";
+                        let is_skip_file = matches!(e, StorageError::Io(ref io) if io.to_string() == "skip file");
 
                         if !is_skip_file {
                             // Track failed objects to prevent infinite retry loops
@@ -1229,6 +1204,9 @@ pub async fn scan_data_folder(
 
     let disks_quorum = disks.len() / 2;
 
+    let failed_object_ttl = rustfs_utils::get_env_u32(ENV_FAILED_OBJECT_TTL_SECS, DEFAULT_FAILED_OBJECT_TTL_SECS) as u64;
+    let failed_objects_max = rustfs_utils::get_env_u32(ENV_FAILED_OBJECTS_MAX, DEFAULT_FAILED_OBJECTS_MAX) as usize;
+
     // Create folder scanner
     let mut scanner = FolderScanner {
         root: base_path,
@@ -1244,6 +1222,8 @@ pub async fn scan_data_folder(
         data_usage_scanner_debug: false,
         heal_object_select,
         scan_mode,
+        failed_object_ttl_secs: failed_object_ttl,
+        failed_objects_max,
         we_sleep,
         disks,
         disks_quorum,
@@ -1322,6 +1302,8 @@ mod tests {
             data_usage_scanner_debug: false,
             heal_object_select: 0,
             scan_mode: HealScanMode::Normal,
+            failed_object_ttl_secs: u64::MAX,
+            failed_objects_max: usize::MAX,
             we_sleep: Box::new(|| false),
             disks: Vec::new(),
             disks_quorum: 0,
@@ -1335,29 +1317,33 @@ mod tests {
         (scanner, temp_dir)
     }
 
-    fn set_test_ttl(ttl: u64) -> u64 {
-        TEST_FAILED_OBJECT_TTL_SECS.swap(ttl, std::sync::atomic::Ordering::Relaxed)
+    struct TestGuard {
+        temp_dir: Option<std::path::PathBuf>,
     }
 
-    fn restore_test_ttl(prev: u64) {
-        TEST_FAILED_OBJECT_TTL_SECS.store(prev, std::sync::atomic::Ordering::Relaxed);
+    impl TestGuard {
+        fn new(ttl: u64, max: usize, scanner: &mut FolderScanner, temp_dir: std::path::PathBuf) -> Self {
+            scanner.failed_object_ttl_secs = ttl;
+            scanner.failed_objects_max = max;
+            Self {
+                temp_dir: Some(temp_dir),
+            }
+        }
     }
 
-    fn set_test_max(max: usize) -> usize {
-        TEST_FAILED_OBJECTS_MAX.swap(max, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn restore_test_max(prev: usize) {
-        TEST_FAILED_OBJECTS_MAX.store(prev, std::sync::atomic::Ordering::Relaxed);
+    impl Drop for TestGuard {
+        fn drop(&mut self) {
+            if let Some(temp_dir) = self.temp_dir.take() {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+            }
+        }
     }
 
     #[tokio::test]
     #[serial]
     async fn test_should_skip_failed_respects_ttl() {
-        let prev_ttl = set_test_ttl(60);
-        let prev_max = set_test_max(100);
-
         let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
         let now = FolderScanner::now_secs();
 
         scanner
@@ -1373,19 +1359,13 @@ mod tests {
 
         assert!(scanner.should_skip_failed("recent"));
         assert!(!scanner.should_skip_failed("expired"));
-
-        restore_test_ttl(prev_ttl);
-        restore_test_max(prev_max);
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[tokio::test]
     #[serial]
     async fn test_record_failed_ttl_zero_noop() {
-        let prev_ttl = set_test_ttl(0);
-        let prev_max = set_test_max(100);
-
         let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(0, 100, &mut scanner, temp_dir.clone());
 
         scanner.record_failed("path1");
         assert!(scanner.new_cache.info.failed_objects.is_empty());
@@ -1393,19 +1373,13 @@ mod tests {
         let now = FolderScanner::now_secs();
         scanner.new_cache.info.failed_objects.insert("path2".to_string(), now);
         assert!(!scanner.should_skip_failed("path2"));
-
-        restore_test_ttl(prev_ttl);
-        restore_test_max(prev_max);
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[tokio::test]
     #[serial]
     async fn test_record_failed_prunes_to_max_entries() {
-        let prev_ttl = set_test_ttl(1000);
-        let prev_max = set_test_max(2);
-
         let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(1000, 2, &mut scanner, temp_dir.clone());
         let now = FolderScanner::now_secs();
 
         scanner
@@ -1431,19 +1405,13 @@ mod tests {
         assert!(scanner.new_cache.info.failed_objects.contains_key("old3"));
         assert!(!scanner.new_cache.info.failed_objects.contains_key("old1"));
         assert!(!scanner.new_cache.info.failed_objects.contains_key("old2"));
-
-        restore_test_ttl(prev_ttl);
-        restore_test_max(prev_max);
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[tokio::test]
     #[serial]
     async fn test_prune_failed_objects_cache_drops_expired() {
-        let prev_ttl = set_test_ttl(5);
-        let prev_max = set_test_max(10);
-
         let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(5, 10, &mut scanner, temp_dir.clone());
         let now = FolderScanner::now_secs();
 
         scanner
@@ -1461,19 +1429,13 @@ mod tests {
 
         assert_eq!(scanner.new_cache.info.failed_objects.len(), 1);
         assert!(scanner.new_cache.info.failed_objects.contains_key("fresh"));
-
-        restore_test_ttl(prev_ttl);
-        restore_test_max(prev_max);
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[tokio::test]
     #[serial]
     async fn test_prune_failed_objects_max_zero_keeps_fresh() {
-        let prev_ttl = set_test_ttl(60);
-        let prev_max = set_test_max(0);
-
         let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
         let now = FolderScanner::now_secs();
 
         scanner
@@ -1498,9 +1460,5 @@ mod tests {
         assert!(scanner.new_cache.info.failed_objects.contains_key("fresh1"));
         assert!(scanner.new_cache.info.failed_objects.contains_key("fresh2"));
         assert!(!scanner.new_cache.info.failed_objects.contains_key("expired"));
-
-        restore_test_ttl(prev_ttl);
-        restore_test_max(prev_max);
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }
