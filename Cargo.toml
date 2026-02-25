@@ -277,6 +277,7 @@ opentelemetry-stdout = { version = "0.31.0" }
 
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
+unftp-core = "0.1.0"
 suppaftp = { version = "8.0.2", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.7"
 

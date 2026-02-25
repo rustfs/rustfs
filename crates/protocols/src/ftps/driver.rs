@@ -17,13 +17,13 @@ use crate::common::gateway::S3Action;
 use crate::common::gateway::authorize_operation;
 use async_trait::async_trait;
 use futures_util::stream;
-use libunftp::storage::{Error, ErrorKind, Fileinfo, Metadata, Result, StorageBackend};
 use rustfs_utils::path;
 use s3s::dto::*;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncRead;
 use tracing::{debug, error};
+use unftp_core::storage::{Error, ErrorKind, Fileinfo, Metadata, Result, StorageBackend};
 
 /// FTPS metadata implementation
 #[derive(Debug, Clone)]
@@ -89,7 +89,7 @@ where
     async fn list_buckets(
         &self,
         session_context: &crate::common::session::SessionContext,
-    ) -> Result<Vec<Fileinfo<PathBuf, <FtpsDriver<S> as libunftp::storage::StorageBackend<super::server::FtpsUser>>::Metadata>>>
+    ) -> Result<Vec<Fileinfo<PathBuf, <FtpsDriver<S> as unftp_core::storage::StorageBackend<super::server::FtpsUser>>::Metadata>>>
     {
         match authorize_operation(session_context, &S3Action::ListBuckets, "", None).await {
             Ok(_) => {}

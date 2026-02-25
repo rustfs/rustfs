@@ -7349,6 +7349,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "unftp-core",
 ]
 
 [[package]]
