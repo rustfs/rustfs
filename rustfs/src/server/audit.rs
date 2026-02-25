@@ -18,9 +18,10 @@ use rustfs_config::DEFAULT_DELIMITER;
 use tracing::{info, warn};
 
 fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
-    get_global_app_context()
-        .and_then(|context| context.server_config().get())
-        .or_else(|| default_server_config_interface().get())
+    match get_global_app_context() {
+        Some(context) => context.server_config().get(),
+        None => default_server_config_interface().get(),
+    }
 }
 
 /// Start the audit system.
