@@ -30,6 +30,7 @@ use futures::StreamExt;
 use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
+    metadata_sys,
     quota::QuotaOperation,
     replication::{get_must_replicate_options, must_replicate, schedule_replication},
 };
@@ -52,6 +53,7 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{info, instrument, warn};
 
@@ -156,6 +158,13 @@ impl DefaultMultipartUsecase {
 
     pub fn context(&self) -> Option<Arc<AppContext>> {
         self.context.clone()
+    }
+
+    fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
+        self.context
+            .as_ref()
+            .and_then(|context| context.bucket_metadata().handle())
+            .or_else(|| rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().cloned())
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -337,8 +346,8 @@ impl DefaultMultipartUsecase {
             .map_err(ApiError::from)?;
 
         // check quota after completing multipart upload
-        if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+        if let Some(metadata_sys) = self.bucket_metadata_sys() {
+            let quota_checker = QuotaChecker::new(metadata_sys);
 
             match quota_checker
                 .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
@@ -358,9 +367,7 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
-                        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
-                    }
+                    rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
