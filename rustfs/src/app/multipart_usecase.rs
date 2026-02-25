@@ -52,6 +52,7 @@ use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{debug, info, instrument, warn};
 
@@ -156,6 +157,13 @@ impl DefaultMultipartUsecase {
 
     pub fn context(&self) -> Option<Arc<AppContext>> {
         self.context.clone()
+    }
+
+    fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
+        self.context
+            .as_ref()
+            .and_then(|context| context.bucket_metadata().handle())
+            .or_else(|| rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().cloned())
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -337,7 +345,7 @@ impl DefaultMultipartUsecase {
             .map_err(ApiError::from)?;
 
         // check quota after completing multipart upload
-        if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
+        if let Some(metadata_sys) = self.bucket_metadata_sys() {
             let quota_checker = QuotaChecker::new(metadata_sys.clone());
 
             match quota_checker
@@ -358,7 +366,7 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
+                    if self.bucket_metadata_sys().is_some() {
                         rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
                     }
                 }
