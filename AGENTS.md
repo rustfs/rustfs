@@ -99,3 +99,47 @@ Do not commit secrets or cloud credentials; prefer environment variables or vaul
 - ALWAYS prefer editing an existing file to creating a new one
 - NEVER proactively create documentation files (*.md) or README files unless explicitly requested
 - NEVER commit PR description files (e.g., PR_DESCRIPTION.md): These are temporary reference files for creating pull requests and should remain local only
+
+## Cursor Cloud specific instructions
+
+### Service Overview
+
+RustFS is a single-binary S3-compatible object storage server. It exposes:
+- **S3 API** on port `9000`
+- **Web Console** on port `9001`
+
+No external databases or services are required for local development.
+
+### Running the dev server
+
+Use `scripts/run.sh` to start the server. It downloads console assets (if missing), builds the binary, creates volume directories, and starts RustFS with sensible defaults. Default credentials are `rustfsadmin` / `rustfsadmin`.
+
+Alternatively, start manually:
+```bash
+mkdir -p ./target/volume/test{1..4} ./deploy/logs
+export RUSTFS_VOLUMES="./target/volume/test{1...4}"
+export RUSTFS_ADDRESS=":9000"
+export RUSTFS_CONSOLE_ENABLE=true
+export RUSTFS_CONSOLE_ADDRESS=":9001"
+cargo run --bin rustfs
+```
+
+### Quality checks
+
+See the `## ⚠️ Pre-Commit Checklist` section above or run `make pre-commit`.
+
+### Testing caveats
+
+- The `rustfs` crate config tests (`config::config_test`) have environment variable race conditions when run in parallel. Use `--test-threads=1` for `cargo test -p rustfs` to avoid spurious failures.
+- E2E tests (`crates/e2e_test`) require a running RustFS instance on `:9000` with credentials set via `AWS_ACCESS_KEY_ID=rustfsadmin`, `AWS_SECRET_ACCESS_KEY=rustfsadmin`, `AWS_REGION=us-east-1`, `AWS_ENDPOINT_URL=http://localhost:9000`.
+
+### Console static assets
+
+The web console UI is **not** checked into the repo. It is downloaded on first run by `scripts/run.sh` or `scripts/static.sh`. If the `rustfs/static/` directory is missing the console, run:
+```bash
+curl -sL "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o tempfile.zip && unzip -qo tempfile.zip -d ./rustfs/static && rm tempfile.zip
+```
+
+### Build dependencies
+
+The Rust toolchain (stable, >=1.93.0) with `rustfmt`, `clippy`, `rust-src`, `rust-analyzer` components is required (see `rust-toolchain.toml`). System dependencies: `cmake`, `clang`/`libclang-dev`, `pkg-config`, `build-essential`. These are pre-installed in the Cloud VM.
