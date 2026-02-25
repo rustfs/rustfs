@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Ensure the correct path for parse_license is imported
+// Import HTTP server components and compression configuration
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
