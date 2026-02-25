@@ -238,10 +238,14 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     )
     .await?;
 
-    let subject = if claims.sub.is_empty() {
+    let subject = if !claims.email.is_empty() {
         claims.email.clone()
-    } else {
+    } else if !claims.username.is_empty() {
+        claims.username.clone()
+    } else if !claims.sub.is_empty() {
         claims.sub.clone()
+    } else {
+        "oidc-user-unknown".to_string()
     };
 
     // Build XML response (AssumeRoleWithWebIdentityResponse)
