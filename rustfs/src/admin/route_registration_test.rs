@@ -98,5 +98,6 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/kms/create-key"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/configure"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/keys"));
+    assert_route(&router, Method::GET, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys/test-key"));
 }
