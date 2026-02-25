@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use crate::admin::router::Operation;
+use crate::app::context::get_global_app_context;
 use http::StatusCode;
 use hyper::Uri;
 use matchit::Params;
-use rustfs_ecstore::{GLOBAL_Endpoints, rpc::PeerRestClient};
+use rustfs_ecstore::rpc::PeerRestClient;
 use rustfs_madmin::service_commands::ServiceTraceOpts;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use tracing::warn;
@@ -42,7 +43,7 @@ impl Operation for Trace {
         let _trace_opts = extract_trace_options(&req.uri)?;
 
         // let (tx, rx) = mpsc::channel(10000);
-        let _peers = match GLOBAL_Endpoints.get() {
+        let _peers = match get_global_app_context().and_then(|context| context.endpoints().handle()) {
             Some(ep) => PeerRestClient::new_clients(ep.clone()).await,
             None => (Vec::new(), Vec::new()),
         };

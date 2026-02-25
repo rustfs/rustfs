@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use rustfs_ecstore::GLOBAL_Endpoints;
 use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, GLOBAL_BucketMetadataSys};
 use rustfs_ecstore::endpoints::EndpointServerPools;
+use rustfs_ecstore::global::get_global_region;
 use rustfs_ecstore::store::ECStore;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
@@ -63,6 +64,11 @@ pub trait BucketMetadataInterface: Send + Sync {
 /// Endpoints interface for application-layer use-cases.
 pub trait EndpointsInterface: Send + Sync {
     fn handle(&self) -> Option<EndpointServerPools>;
+}
+
+/// Region interface for application-layer use-cases.
+pub trait RegionInterface: Send + Sync {
+    fn get(&self) -> Option<String>;
 }
 
 /// Default IAM interface adapter.
@@ -147,6 +153,16 @@ impl EndpointsInterface for EndpointsHandle {
     }
 }
 
+/// Default region interface adapter.
+#[derive(Default)]
+pub struct RegionHandle;
+
+impl RegionInterface for RegionHandle {
+    fn get(&self) -> Option<String> {
+        get_global_region()
+    }
+}
+
 /// Application-layer context with explicit dependencies.
 #[derive(Clone)]
 pub struct AppContext {
@@ -156,6 +172,7 @@ pub struct AppContext {
     notify: Arc<dyn NotifyInterface>,
     bucket_metadata: Arc<dyn BucketMetadataInterface>,
     endpoints: Arc<dyn EndpointsInterface>,
+    region: Arc<dyn RegionInterface>,
 }
 
 impl AppContext {
@@ -167,6 +184,7 @@ impl AppContext {
             notify: default_notify_interface(),
             bucket_metadata: default_bucket_metadata_interface(),
             endpoints: default_endpoints_interface(),
+            region: default_region_interface(),
         }
     }
 
@@ -201,6 +219,10 @@ impl AppContext {
     pub fn endpoints(&self) -> Arc<dyn EndpointsInterface> {
         self.endpoints.clone()
     }
+
+    pub fn region(&self) -> Arc<dyn RegionInterface> {
+        self.region.clone()
+    }
 }
 
 pub fn default_notify_interface() -> Arc<dyn NotifyInterface> {
@@ -213,6 +235,10 @@ pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
 
 pub fn default_endpoints_interface() -> Arc<dyn EndpointsInterface> {
     Arc::new(EndpointsHandle)
+}
+
+pub fn default_region_interface() -> Arc<dyn RegionInterface> {
+    Arc::new(RegionHandle)
 }
 
 static GLOBAL_APP_CONTEXT: OnceLock<Arc<AppContext>> = OnceLock::new();

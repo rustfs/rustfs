@@ -164,6 +164,10 @@ impl DefaultMultipartUsecase {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
     }
 
+    fn global_region(&self) -> Option<String> {
+        self.context.as_ref().and_then(|context| context.region().get())
+    }
+
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_abort_multipart_upload(
         &self,
@@ -418,7 +422,7 @@ impl DefaultMultipartUsecase {
             }
         }
 
-        let region = rustfs_ecstore::global::get_global_region().unwrap_or_else(|| "us-east-1".to_string());
+        let region = self.global_region().unwrap_or_else(|| "us-east-1".to_string());
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
