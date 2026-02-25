@@ -201,10 +201,7 @@ impl DefaultObjectUsecase {
     }
 
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
-        self.context
-            .as_ref()
-            .and_then(|context| context.bucket_metadata().handle())
-            .or_else(|| rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().cloned())
+        self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
     }
 
     #[instrument(level = "debug", skip(self, fs, req))]
