@@ -23,6 +23,7 @@ use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, GLOBAL_BucketMetad
 use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::global::get_global_region;
 use rustfs_ecstore::store::ECStore;
+use rustfs_ecstore::tier::tier::TierConfigMgr;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
@@ -69,6 +70,11 @@ pub trait EndpointsInterface: Send + Sync {
 /// Region interface for application-layer use-cases.
 pub trait RegionInterface: Send + Sync {
     fn get(&self) -> Option<String>;
+}
+
+/// Tier config interface for application-layer and admin handlers.
+pub trait TierConfigInterface: Send + Sync {
+    fn handle(&self) -> Arc<RwLock<TierConfigMgr>>;
 }
 
 /// Default IAM interface adapter.
@@ -163,6 +169,16 @@ impl RegionInterface for RegionHandle {
     }
 }
 
+/// Default tier config interface adapter.
+#[derive(Default)]
+pub struct TierConfigHandle;
+
+impl TierConfigInterface for TierConfigHandle {
+    fn handle(&self) -> Arc<RwLock<TierConfigMgr>> {
+        rustfs_ecstore::global::GLOBAL_TierConfigMgr.clone()
+    }
+}
+
 /// Application-layer context with explicit dependencies.
 #[derive(Clone)]
 pub struct AppContext {
@@ -173,6 +189,7 @@ pub struct AppContext {
     bucket_metadata: Arc<dyn BucketMetadataInterface>,
     endpoints: Arc<dyn EndpointsInterface>,
     region: Arc<dyn RegionInterface>,
+    tier_config: Arc<dyn TierConfigInterface>,
 }
 
 impl AppContext {
@@ -185,6 +202,7 @@ impl AppContext {
             bucket_metadata: default_bucket_metadata_interface(),
             endpoints: default_endpoints_interface(),
             region: default_region_interface(),
+            tier_config: default_tier_config_interface(),
         }
     }
 
@@ -223,6 +241,10 @@ impl AppContext {
     pub fn region(&self) -> Arc<dyn RegionInterface> {
         self.region.clone()
     }
+
+    pub fn tier_config(&self) -> Arc<dyn TierConfigInterface> {
+        self.tier_config.clone()
+    }
 }
 
 pub fn default_notify_interface() -> Arc<dyn NotifyInterface> {
@@ -239,6 +261,10 @@ pub fn default_endpoints_interface() -> Arc<dyn EndpointsInterface> {
 
 pub fn default_region_interface() -> Arc<dyn RegionInterface> {
     Arc::new(RegionHandle)
+}
+
+pub fn default_tier_config_interface() -> Arc<dyn TierConfigInterface> {
+    Arc::new(TierConfigHandle)
 }
 
 static GLOBAL_APP_CONTEXT: OnceLock<Arc<AppContext>> = OnceLock::new();
