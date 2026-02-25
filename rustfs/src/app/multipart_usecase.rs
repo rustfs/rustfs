@@ -650,29 +650,6 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let will_apply_encryption = check_encryption_metadata(&fi.user_defined);
-
-        // If encryption will be applied and we have Content-Length, buffer the entire body.
-        // This is necessary because encryption changes the data size, which causes Content-Length mismatches
-        if will_apply_encryption && size.is_some() {
-            let mut total = 0i64;
-            let mut buffer = bytes::BytesMut::new();
-            while let Some(chunk) = body_stream.next().await {
-                let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
-                total += chunk.len() as i64;
-                buffer.extend_from_slice(&chunk);
-            }
-
-            if total <= 0 {
-                return Err(s3_error!(UnexpectedContent));
-            }
-
-            size = Some(total);
-            let combined = buffer.freeze();
-            let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
-            body_stream = StreamingBlob::wrap(stream);
-        }
-
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
 
         // Apply adaptive buffer sizing based on part size for optimal streaming performance.
