@@ -271,14 +271,18 @@ impl DefaultAdminUsecase {
     }
 
     pub fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-            let _ = context.iam();
-        }
+        let iam_ready = self
+            .context
+            .as_ref()
+            .map(|context| {
+                let _ = context.object_store();
+                context.iam().is_ready()
+            })
+            .unwrap_or(false);
 
         DependencyReadiness {
             storage_ready: new_object_layer_fn().is_some(),
-            iam_ready: rustfs_iam::get().is_ok(),
+            iam_ready,
         }
     }
 }

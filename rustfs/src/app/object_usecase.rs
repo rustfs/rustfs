@@ -15,7 +15,7 @@
 //! Object application use-case contracts.
 #![allow(dead_code)]
 
-use crate::app::context::{AppContext, get_global_app_context};
+use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::config::workload_profiles::get_global_buffer_config;
 use crate::error::ApiError;
 use crate::storage::access::{ReqInfo, authorize_request, has_bypass_governance_header};
@@ -72,7 +72,7 @@ use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
     parse_restore_obj_status,
 };
-use rustfs_notify::{EventArgsBuilder, notifier_global};
+use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, EtagReader, HardLimitReader, HashReader, Reader, WarpReader};
 use rustfs_s3select_api::{
@@ -2647,6 +2647,11 @@ impl DefaultObjectUsecase {
         }
 
         let req_headers = req.headers.clone();
+        let notify = self
+            .context
+            .as_ref()
+            .map(|context| context.notify())
+            .unwrap_or_else(default_notify_interface);
         tokio::spawn(async move {
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
@@ -2671,7 +2676,7 @@ impl DefaultObjectUsecase {
                     .user_agent(get_request_user_agent(&req_headers))
                     .build();
 
-                    notifier_global::notify(event_args).await;
+                    notify.notify(event_args).await;
                 }
             }
         });
