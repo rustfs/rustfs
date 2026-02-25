@@ -18,8 +18,10 @@ pub mod ecfs;
 pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod options;
+pub(crate) mod readers;
 pub mod rpc;
 pub(crate) mod s3_api;
+mod sse;
 pub mod tonic_service;
 
 #[cfg(test)]
@@ -28,5 +30,11 @@ mod ecfs_extend;
 #[cfg(test)]
 mod ecfs_test;
 pub(crate) mod head_prefix;
+#[cfg(test)]
+mod sse_test;
 
 pub(crate) use ecfs_extend::*;
+pub(crate) use sse::{
+    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, check_encryption_metadata, sse_decryption, sse_encryption,
+    sse_prepare_encryption, strip_managed_encryption_metadata,
+};
