@@ -52,15 +52,14 @@ pub async fn validate_admin_request(
         remote_addr,
     };
 
-    for action in actions {
-        match check_admin_request_auth(iam_store.clone(), &ctx, action, "", "").await {
-            Ok(_) => return Ok(()),
-            Err(_) => {
-                continue;
-            }
+    for action in &actions {
+        if check_admin_request_auth(iam_store.clone(), &ctx, *action, "", "")
+            .await
+            .is_ok()
+        {
+            return Ok(());
         }
     }
-
     Err(s3_error!(AccessDenied, "Access Denied"))
 }
 
@@ -113,14 +112,13 @@ pub async fn validate_admin_request_with_bucket(
         remote_addr,
     };
 
-    for action in actions {
-        match check_admin_request_auth(iam_store.clone(), &ctx, action, bucket, "").await {
-            Ok(_) => return Ok(()),
-            Err(_) => {
-                continue;
-            }
+    for action in &actions {
+        if check_admin_request_auth(iam_store.clone(), &ctx, *action, bucket, "")
+            .await
+            .is_ok()
+        {
+            return Ok(());
         }
     }
-
     Err(s3_error!(AccessDenied, "Access Denied"))
 }
