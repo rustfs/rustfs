@@ -50,6 +50,7 @@ rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-filemeta.workspace = true
 rustfs-iam = { workspace = true }
+rustfs-keystone = { workspace = true }
 rustfs-kms = { workspace = true }
 rustfs-lock.workspace = true
 rustfs-madmin = { workspace = true }

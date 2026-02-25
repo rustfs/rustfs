@@ -155,6 +155,18 @@ impl S3Auth for IAMAuth {
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
 pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(Credentials, bool)> {
+    // KEYSTONE INTEGRATION: Check if access_key indicates Keystone authentication
+    // Keystone access keys are formatted as "keystone:user_id"
+    if access_key.starts_with("keystone:") {
+        // This is a Keystone-authenticated request
+        // The actual validation was already done during token verification
+        // We just need to pass through the credentials
+        return Err(s3_error!(
+            InvalidAccessKeyId,
+            "Keystone credentials should not reach this point - use token authentication"
+        ));
+    }
+
     let Some(mut cred) = get_global_action_cred() else {
         return Err(S3Error::with_message(
             S3ErrorCode::InternalError,
@@ -252,6 +264,36 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
     }
 
     Ok(HashMap::new())
+}
+
+/// Check for Keystone authentication headers and authenticate if present
+/// Returns Some((Credentials, is_owner)) if Keystone authentication succeeds
+/// Returns None if no Keystone headers present (fall back to standard auth)
+pub async fn try_keystone_auth(headers: &HeaderMap) -> S3Result<Option<(Credentials, bool)>> {
+    use crate::auth_keystone;
+
+    if !auth_keystone::is_keystone_enabled() {
+        return Ok(None);
+    }
+
+    match auth_keystone::authenticate_keystone(headers).await? {
+        Some(cred) => {
+            // Keystone credentials are never "owner" in the traditional sense
+            // unless they have admin role
+            let is_owner = cred
+                .groups
+                .as_ref()
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .any(|g| g.eq_ignore_ascii_case("admin") || g.eq_ignore_ascii_case("reseller_admin"))
+                })
+                .unwrap_or(false);
+
+            Ok(Some((cred, is_owner)))
+        }
+        None => Ok(None),
+    }
 }
 
 pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str> {

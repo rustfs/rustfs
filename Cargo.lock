@@ -6843,6 +6843,7 @@ dependencies = [
  "rustfs-filemeta",
  "rustfs-heal",
  "rustfs-iam",
+ "rustfs-keystone",
  "rustfs-kms",
  "rustfs-lock",
  "rustfs-madmin",
@@ -7153,6 +7154,25 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-keystone"
+version = "0.0.5"
+dependencies = [
+ "anyhow",
+ "moka",
+ "reqwest 0.13.2",
+ "rustfs-common",
+ "rustfs-credentials",
+ "rustfs-policy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

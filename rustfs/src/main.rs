@@ -15,6 +15,7 @@
 mod admin;
 mod app;
 mod auth;
+mod auth_keystone;
 mod config;
 mod error;
 mod init;
@@ -365,6 +366,18 @@ async fn run(config: config::Config) -> Result<()> {
     // This ensures data is in memory before moving forward
     init_iam_sys(store.clone()).await.map_err(Error::other)?;
     readiness.mark_stage(SystemStage::IamReady);
+
+    // Initialize Keystone authentication if enabled
+    let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
+    if keystone_config.enable {
+        match auth_keystone::init_keystone_auth(keystone_config).await {
+            Ok(_) => info!("Keystone authentication initialized successfully"),
+            Err(e) => {
+                error!("Failed to initialize Keystone authentication: {}", e);
+                // Continue without Keystone - fall back to standard auth
+            }
+        }
+    }
 
     let iam_interface =
         rustfs_iam::get().map_err(|e| Error::other(format!("initialize app context IAM dependency failed: {e}")))?;

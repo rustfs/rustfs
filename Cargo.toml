@@ -27,6 +27,7 @@ members = [
     "crates/filemeta", # File metadata management
     "crates/heal", # Erasure set and object healing
     "crates/iam", # Identity and Access Management
+    "crates/keystone", # OpenStack Keystone integration
     "crates/kms", # Key Management Service
     "crates/lock", # Distributed locking implementation
     "crates/madmin", # Management dashboard and admin API interface
@@ -82,6 +83,7 @@ rustfs-crypto = { path = "crates/crypto", version = "0.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "0.0.5" }
 rustfs-filemeta = { path = "crates/filemeta", version = "0.0.5" }
 rustfs-iam = { path = "crates/iam", version = "0.0.5" }
+rustfs-keystone = { path = "crates/keystone", version = "0.0.5" }
 rustfs-kms = { path = "crates/kms", version = "0.0.5" }
 rustfs-lock = { path = "crates/lock", version = "0.0.5" }
 rustfs-madmin = { path = "crates/madmin", version = "0.0.5" }
