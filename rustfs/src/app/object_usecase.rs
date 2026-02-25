@@ -101,6 +101,7 @@ use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -199,6 +200,13 @@ impl DefaultObjectUsecase {
         self.context.clone()
     }
 
+    fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
+        self.context
+            .as_ref()
+            .and_then(|context| context.bucket_metadata().handle())
+            .or_else(|| rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().cloned())
+    }
+
     #[instrument(level = "debug", skip(self, fs, req))]
     pub async fn execute_put_object(&self, fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         if let Some(context) = &self.context {
@@ -258,9 +266,9 @@ impl DefaultObjectUsecase {
 
         // check quota for put operation
         if let Some(size) = content_length
-            && let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get()
+            && let Some(metadata_sys) = self.bucket_metadata_sys()
         {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+            let quota_checker = QuotaChecker::new(metadata_sys);
 
             match quota_checker
                 .check_quota(&bucket, QuotaOperation::PutObject, size as u64)
@@ -2091,8 +2099,8 @@ impl DefaultObjectUsecase {
         }
 
         // check quota for copy operation
-        if let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get() {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+        let has_bucket_metadata = if let Some(metadata_sys) = self.bucket_metadata_sys() {
+            let quota_checker = QuotaChecker::new(metadata_sys);
 
             match quota_checker
                 .check_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
@@ -2114,7 +2122,10 @@ impl DefaultObjectUsecase {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
                 }
             }
-        }
+            true
+        } else {
+            false
+        };
 
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
@@ -2122,7 +2133,7 @@ impl DefaultObjectUsecase {
             .map_err(ApiError::from)?;
 
         // Update quota tracking after successful copy
-        if rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some() {
+        if has_bucket_metadata {
             rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
         }
 
