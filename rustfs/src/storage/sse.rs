@@ -322,7 +322,7 @@ impl EncryptionRequest<'_> {
             // if customer_key_md5 is provided, check if it matches the metadata
             let customer_key_md5_from_metadata = user_defined.get("x-amz-server-side-encryption-customer-key-md5");
             if let Some(customer_key_md5_from_metadata) = customer_key_md5_from_metadata
-                && !customer_key_md5_from_metadata.eq_ignore_ascii_case(customer_key_md5.as_str())
+                && customer_key_md5_from_metadata != customer_key_md5.as_str()
             {
                 return Err(ApiError::from(StorageError::other("Customer key MD5 mismatch")));
             }
@@ -1324,15 +1324,6 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
     Ok(provider)
 }
 
-// check encryption metadata
-pub fn check_encryption_metadata(metadata: &HashMap<String, String>) -> bool {
-    if !metadata.contains_key("x-rustfs-encryption-key") && !metadata.contains_key("x-amz-server-side-encryption") {
-        return false;
-    }
-
-    true
-}
-
 /// Reset the global SSE DEK provider (for testing only)
 ///
 /// Note: OnceLock doesn't support reset in stable Rust.
@@ -1640,6 +1631,57 @@ mod tests {
     fn test_verify_ssec_key_match_no_stored() {
         let result = verify_ssec_key_match("provided_md5", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_upload_part_customer_key_md5_comparison_is_case_sensitive() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "x-amz-server-side-encryption-customer-key-md5".to_string(),
+            "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/==".to_string(),
+        );
+
+        let request = EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 1,
+            part_number: Some(1),
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let mismatch = "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789+/==".to_string();
+        let result = request.check_upload_part_customer_key_md5(&metadata, Some(mismatch));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_upload_part_customer_key_md5_exact_match() {
+        let mut metadata = HashMap::new();
+        let md5 = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/==".to_string();
+        metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), md5.clone());
+
+        let request = EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 1,
+            part_number: Some(1),
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let result = request.check_upload_part_customer_key_md5(&metadata, Some(md5));
+        assert!(result.is_ok());
     }
 
     // ============================================================================

@@ -18,7 +18,7 @@
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::error::ApiError;
 use crate::storage::concurrency::get_concurrency_manager;
-use crate::storage::ecfs::{ManagedEncryptionMaterial, RUSTFS_OWNER};
+use crate::storage::ecfs::RUSTFS_OWNER;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
@@ -30,7 +30,6 @@ use futures::StreamExt;
 use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
-    metadata_sys,
     quota::QuotaOperation,
     replication::{get_must_replicate_options, must_replicate, schedule_replication},
 };
@@ -41,7 +40,7 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
 use rustfs_ecstore::store_api::{CompletePart, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
-use rustfs_rio::{CompressReader, DecryptReader, EncryptReader, HashReader, Reader, WarpReader};
+use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
@@ -51,9 +50,10 @@ use rustfs_utils::http::{
 use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio_util::io::StreamReader;
-use tracing::{debug, info, instrument, warn};
+use tracing::{info, instrument, warn};
 
 pub type MultipartUsecaseResult<T> = Result<T, ApiError>;
 
@@ -518,72 +518,26 @@ impl DefaultMultipartUsecase {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
-        // TDD: Get bucket SSE configuration for multipart upload
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-        debug!("TDD: Got bucket SSE config for multipart: {:?}", bucket_sse_config);
+        let encryption_request = PrepareEncryptionRequest {
+            bucket: &bucket,
+            key: &key,
+            server_side_encryption,
+            ssekms_key_id,
+            sse_customer_algorithm: sse_customer_algorithm.clone(),
+            sse_customer_key_md5: sse_customer_key_md5.clone(),
+        };
 
-        // TDD: Determine effective encryption (request parameters override bucket defaults)
-        let original_sse = server_side_encryption.clone();
-        let effective_sse = server_side_encryption.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                debug!("TDD: Processing bucket SSE config for multipart: {:?}", config);
-                config.rules.first().and_then(|rule| {
-                    debug!("TDD: Processing SSE rule for multipart: {:?}", rule);
-                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                        debug!("TDD: Found SSE default for multipart: {:?}", sse);
-                        match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                        }
-                    })
-                })
-            })
-        });
-        debug!("TDD: effective_sse for multipart={:?} (original={:?})", effective_sse, original_sse);
+        let (effective_sse, effective_kms_key_id) = match sse_prepare_encryption(encryption_request).await? {
+            Some(material) => {
+                let server_side_encryption = Some(material.server_side_encryption.clone());
+                let ssekms_key_id = material.kms_key_id.clone();
 
-        let _original_kms_key_id = ssekms_key_id.clone();
-        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
+                metadata.extend(material.metadata);
 
-        // Store effective SSE information in metadata for multipart upload
-        if let Some(sse_alg) = &sse_customer_algorithm {
-            metadata.insert(
-                "x-amz-server-side-encryption-customer-algorithm".to_string(),
-                sse_alg.as_str().to_string(),
-            );
-        }
-        if let Some(sse_md5) = &sse_customer_key_md5 {
-            metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_md5.clone());
-        }
-
-        if let Some(sse) = &effective_sse {
-            if is_managed_sse(sse) {
-                let material = create_managed_encryption_material(&bucket, &key, sse, effective_kms_key_id.clone(), 0).await?;
-
-                let ManagedEncryptionMaterial {
-                    data_key: _,
-                    headers,
-                    kms_key_id: kms_key_used,
-                } = material;
-
-                metadata.extend(headers.into_iter());
-                effective_kms_key_id = Some(kms_key_used.clone());
-            } else {
-                metadata.insert("x-amz-server-side-encryption".to_string(), sse.as_str().to_string());
+                (server_side_encryption, ssekms_key_id)
             }
-        }
-
-        if let Some(kms_key_id) = &effective_kms_key_id {
-            metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
-        }
+            None => (None, None),
+        };
 
         if is_compressible(&req.headers, &key) {
             metadata.insert(
@@ -646,9 +600,9 @@ impl DefaultMultipartUsecase {
             upload_id,
             part_number,
             content_length,
-            sse_customer_algorithm: _sse_customer_algorithm,
-            sse_customer_key: _sse_customer_key,
-            sse_customer_key_md5: _sse_customer_key_md5,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
             // content_md5,
             ..
         } = input;
@@ -691,36 +645,10 @@ impl DefaultMultipartUsecase {
         };
 
         let opts = ObjectOptions::default();
-        let fi = store
+        let mut fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(ApiError::from)?;
-
-        // Check if managed encryption will be applied
-        let will_apply_managed_encryption = decrypt_managed_encryption_key(&bucket, &key, &fi.user_defined)
-            .await?
-            .is_some();
-
-        // If managed encryption will be applied, and we have Content-Length, buffer the entire body
-        // This is necessary because encryption changes the data size, which causes Content-Length mismatches
-        if will_apply_managed_encryption && size.is_some() {
-            let mut total = 0i64;
-            let mut buffer = bytes::BytesMut::new();
-            while let Some(chunk) = body_stream.next().await {
-                let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
-                total += chunk.len() as i64;
-                buffer.extend_from_slice(&chunk);
-            }
-
-            if total <= 0 {
-                return Err(s3_error!(UnexpectedContent));
-            }
-
-            size = Some(total);
-            let combined = buffer.freeze();
-            let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
-            body_stream = StreamingBlob::wrap(stream);
-        }
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
 
@@ -772,12 +700,51 @@ impl DefaultMultipartUsecase {
             return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
         }
 
-        if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &fi.user_defined).await? {
-            let part_nonce = derive_part_nonce(base_nonce, part_id);
-            let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                .map_err(ApiError::from)?;
-        }
+        let server_side_encryption = fi
+            .user_defined
+            .get("x-amz-server-side-encryption")
+            .map(|s| {
+                ServerSideEncryption::from_str(s)
+                    .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
+            })
+            .transpose()?;
+        let ssekms_key_id = fi
+            .user_defined
+            .get("x-amz-server-side-encryption-aws-kms-key-id")
+            .map(|s| s.to_string());
+        let part_key = fi.user_defined.get("x-rustfs-encryption-key").cloned();
+        let part_nonce = fi.user_defined.get("x-rustfs-encryption-iv").cloned();
+        let encryption_request = EncryptionRequest {
+            bucket: &bucket,
+            key: &key,
+            server_side_encryption,
+            ssekms_key_id,
+            sse_customer_algorithm: sse_customer_algorithm.clone(),
+            sse_customer_key,
+            sse_customer_key_md5: sse_customer_key_md5.clone(),
+            content_size: actual_size,
+            part_number: Some(part_id),
+            part_key,
+            part_nonce,
+        };
+
+        encryption_request.check_upload_part_customer_key_md5(&fi.user_defined, sse_customer_key_md5.clone())?;
+
+        let (requested_sse, requested_kms_key_id) = match sse_encryption(encryption_request).await? {
+            Some(material) => {
+                let requested_sse = Some(material.server_side_encryption.clone());
+                let requested_kms_key_id = material.kms_key_id.clone();
+
+                let encrypted_reader = material.wrap_reader(reader);
+                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                    .map_err(ApiError::from)?;
+
+                fi.user_defined.extend(material.metadata);
+
+                (requested_sse, requested_kms_key_id)
+            }
+            None => (None, None),
+        };
 
         let mut reader = PutObjReader::new(reader);
 
@@ -820,6 +787,10 @@ impl DefaultMultipartUsecase {
         }
 
         let output = UploadPartOutput {
+            server_side_encryption: requested_sse,
+            ssekms_key_id: requested_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
             checksum_crc32,
             checksum_crc32c,
             checksum_sha1,
@@ -988,6 +959,11 @@ impl DefaultMultipartUsecase {
             upload_id,
             copy_source_if_match,
             copy_source_if_none_match,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
+            copy_source_sse_customer_key,
+            copy_source_sse_customer_key_md5,
             ..
         } = req.input;
 
@@ -1012,7 +988,7 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mp_info = store
+        let mut mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
             .await
             .map_err(ApiError::from)?;
@@ -1090,11 +1066,19 @@ impl DefaultMultipartUsecase {
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(src_stream));
 
-        if let Some((key_bytes, nonce, original_size_opt)) =
-            decrypt_managed_encryption_key(&src_bucket, &src_key, &src_info.user_defined).await?
-        {
-            reader = Box::new(DecryptReader::new(reader, key_bytes, nonce));
-            if let Some(original) = original_size_opt {
+        let src_decryption_request = DecryptionRequest {
+            bucket: &src_bucket,
+            key: &src_key,
+            metadata: &src_info.user_defined,
+            sse_customer_key: copy_source_sse_customer_key.as_ref(),
+            sse_customer_key_md5: copy_source_sse_customer_key_md5.as_ref(),
+            part_number: None,
+            parts: &src_info.parts,
+        };
+
+        if let Some(material) = sse_decryption(src_decryption_request).await? {
+            reader = material.wrap_single_reader(reader);
+            if let Some(original) = material.original_size {
                 src_info.actual_size = original;
             }
         }
@@ -1110,11 +1094,51 @@ impl DefaultMultipartUsecase {
 
         let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
 
-        if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &mp_info.user_defined).await? {
-            let part_nonce = derive_part_nonce(base_nonce, part_id);
-            let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
-        }
+        let server_side_encryption = mp_info
+            .user_defined
+            .get("x-amz-server-side-encryption")
+            .map(|s| {
+                ServerSideEncryption::from_str(s)
+                    .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
+            })
+            .transpose()?;
+        let ssekms_key_id = mp_info
+            .user_defined
+            .get("x-amz-server-side-encryption-aws-kms-key-id")
+            .map(|s| s.to_string());
+        let part_key = mp_info.user_defined.get("x-rustfs-encryption-key").cloned();
+        let part_nonce = mp_info.user_defined.get("x-rustfs-encryption-iv").cloned();
+        let encryption_request = EncryptionRequest {
+            bucket: &bucket,
+            key: &key,
+            server_side_encryption,
+            ssekms_key_id,
+            sse_customer_algorithm: sse_customer_algorithm.clone(),
+            sse_customer_key,
+            sse_customer_key_md5: sse_customer_key_md5.clone(),
+            content_size: actual_size,
+            part_number: Some(part_id),
+            part_key,
+            part_nonce,
+        };
+
+        encryption_request.check_upload_part_customer_key_md5(&mp_info.user_defined, sse_customer_key_md5.clone())?;
+
+        let (requested_sse, requested_kms_key_id) = match sse_encryption(encryption_request).await? {
+            Some(material) => {
+                let requested_sse = Some(material.server_side_encryption.clone());
+                let requested_kms_key_id = material.kms_key_id.clone();
+
+                let encrypted_reader = material.wrap_reader(reader);
+                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                    .map_err(ApiError::from)?;
+
+                mp_info.user_defined.extend(material.metadata);
+
+                (requested_sse, requested_kms_key_id)
+            }
+            None => (None, None),
+        };
 
         let mut reader = PutObjReader::new(reader);
 
@@ -1137,6 +1161,10 @@ impl DefaultMultipartUsecase {
         let output = UploadPartCopyOutput {
             copy_part_result: Some(copy_part_result),
             copy_source_version_id: src_version_id,
+            server_side_encryption: requested_sse,
+            ssekms_key_id: requested_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
             ..Default::default()
         };
 
