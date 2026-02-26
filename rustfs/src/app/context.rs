@@ -320,6 +320,13 @@ pub fn default_kms_runtime_interface() -> Arc<dyn KmsRuntimeInterface> {
     Arc::new(KmsRuntimeHandle)
 }
 
+/// Resolve KMS runtime service manager using AppContext-first precedence.
+pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
+    get_global_app_context()
+        .and_then(|context| context.kms_runtime().service_manager())
+        .or_else(|| default_kms_runtime_interface().service_manager())
+}
+
 pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
     Arc::new(BucketMetadataHandle)
 }

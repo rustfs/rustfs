@@ -16,7 +16,7 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::{default_kms_runtime_interface, get_global_app_context};
+use crate::app::context::resolve_kms_runtime_service_manager;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{Method, StatusCode};
@@ -36,13 +36,10 @@ use tracing::{error, info, warn};
 const KMS_CONFIG_PATH: &str = "config/kms_config.json";
 
 fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceManager> {
-    get_global_app_context()
-        .and_then(|context| context.kms_runtime().service_manager())
-        .or_else(|| default_kms_runtime_interface().service_manager())
-        .unwrap_or_else(|| {
-            warn!("KMS service manager not initialized, initializing now as fallback");
-            rustfs_kms::init_global_kms_service_manager()
-        })
+    resolve_kms_runtime_service_manager().unwrap_or_else(|| {
+        warn!("KMS service manager not initialized, initializing now as fallback");
+        rustfs_kms::init_global_kms_service_manager()
+    })
 }
 
 /// Save KMS configuration to cluster storage
