@@ -16,7 +16,7 @@
 #![allow(dead_code)]
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
-use crate::config::workload_profiles::get_global_buffer_config;
+use crate::config::workload_profiles::RustFSBufferConfig;
 use crate::error::ApiError;
 use crate::storage::access::{ReqInfo, authorize_request, has_bypass_governance_header};
 use crate::storage::concurrency::{
@@ -202,6 +202,14 @@ impl DefaultObjectUsecase {
 
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
+    }
+
+    fn base_buffer_size(&self) -> usize {
+        self.context
+            .clone()
+            .or_else(get_global_app_context)
+            .map(|context| context.buffer_config().get().base_config.default_unknown)
+            .unwrap_or_else(|| RustFSBufferConfig::default().base_config.default_unknown)
     }
 
     #[instrument(level = "debug", skip(self, fs, req))]
@@ -1194,7 +1202,7 @@ impl DefaultObjectUsecase {
         // Calculate adaptive I/O strategy from permit wait time
         // This adjusts buffer sizes, read-ahead, and caching behavior based on load
         // Use 256KB as the base buffer size for strategy calculation
-        let base_buffer_size = get_global_buffer_config().base_config.default_unknown;
+        let base_buffer_size = self.base_buffer_size();
         let io_strategy = manager.calculate_io_strategy(permit_wait_duration, base_buffer_size);
 
         // Record detailed I/O metrics for monitoring
