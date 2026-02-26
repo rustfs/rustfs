@@ -117,13 +117,25 @@ impl IAMAuth {
 #[async_trait::async_trait]
 impl S3Auth for IAMAuth {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
+        // NEW: Check if Keystone credentials are present in task-local storage
+        // This handles pure X-Auth-Token requests without Authorization header
+        use rustfs_keystone::KEYSTONE_CREDENTIALS;
+
+        if let Ok(Some(creds)) = KEYSTONE_CREDENTIALS.try_with(|c| c.clone()) {
+            tracing::debug!(
+                "IAMAuth: Keystone credentials found in task-local storage for user {}",
+                creds.parent_user
+            );
+            // Return empty secret key - Keystone uses token validation, not AWS signatures
+            return Ok(SecretKey::from(String::new()));
+        }
+
         if access_key.is_empty() {
             return Err(s3_error!(UnauthorizedAccess, "Your account is not signed up"));
         }
 
-        // NEW: Check if this is a Keystone access key
+        // Check if this is a Keystone access key (from mixed auth scenario)
         // Keystone credentials use token authentication, not signature verification
-        // Per Q3.A: Return empty secret to bypass AWS signature validation
         if access_key.starts_with("keystone:") {
             tracing::debug!(
                 "IAMAuth: Keystone access key detected ({}), returning empty secret for token-based auth",
@@ -168,29 +180,20 @@ impl S3Auth for IAMAuth {
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
 pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(Credentials, bool)> {
-    // KEYSTONE INTEGRATION: Check if access_key indicates Keystone authentication
-    // Keystone access keys are formatted as "keystone:user_id"
-    if access_key.starts_with("keystone:") {
-        use crate::auth_keystone;
-        use rustfs_keystone::KEYSTONE_CREDENTIALS;
+    // KEYSTONE INTEGRATION: Check if Keystone credentials are present in task-local storage
+    // This handles both:
+    // 1. Pure X-Auth-Token requests (access_key may be empty)
+    // 2. Keystone access keys formatted as "keystone:user_id"
+    use crate::auth_keystone;
+    use rustfs_keystone::KEYSTONE_CREDENTIALS;
 
-        tracing::debug!("check_key_valid: Keystone access key detected ({})", access_key);
+    // Try to get Keystone credentials from task-local storage first
+    if let Ok(Some(credentials)) = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()) {
+        tracing::debug!("check_key_valid: Keystone credentials found in task-local storage");
 
         if !auth_keystone::is_keystone_enabled() {
             return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
         }
-
-        // Retrieve credentials from task-local storage (set by middleware)
-        let credentials = KEYSTONE_CREDENTIALS
-            .try_with(|creds| creds.clone())
-            .map_err(|_| {
-                tracing::warn!("check_key_valid: Keystone credentials not found in task-local storage");
-                s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header")
-            })?
-            .ok_or_else(|| {
-                tracing::warn!("check_key_valid: Keystone credentials in task-local storage are None");
-                s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header")
-            })?;
 
         tracing::info!(
             "check_key_valid: Retrieved Keystone credentials for user: {} (project: {})",
@@ -198,17 +201,18 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             credentials
                 .claims
                 .as_ref()
-                .and_then(|c| c.get("project_name"))
+                .and_then(|c| c.get("keystone_project_name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
         );
 
         // Determine if user is admin (owner-level access)
         // Users with "admin" or "reseller_admin" role have owner permissions
+        // Roles are stored in claims["keystone_roles"] by the middleware
         let is_owner = credentials
             .claims
             .as_ref()
-            .and_then(|claims| claims.get("roles"))
+            .and_then(|claims| claims.get("keystone_roles"))
             .and_then(|roles| roles.as_array())
             .map(|roles| {
                 roles
@@ -224,6 +228,23 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
         );
 
         return Ok((credentials, is_owner));
+    }
+
+    // Legacy check for explicit "keystone:" prefix (for backwards compatibility)
+    if access_key.starts_with("keystone:") {
+        tracing::warn!(
+            "check_key_valid: Keystone access key detected but no credentials in task-local storage. \
+             This indicates middleware was bypassed or not configured."
+        );
+
+        if !auth_keystone::is_keystone_enabled() {
+            return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
+        }
+
+        return Err(s3_error!(
+            InvalidAccessKeyId,
+            "Keystone authentication requires X-Auth-Token header"
+        ));
     }
 
     let Some(mut cred) = get_global_action_cred() else {
