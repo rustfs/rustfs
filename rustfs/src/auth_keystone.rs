@@ -17,9 +17,9 @@
 use http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_keystone::{KeystoneAuthProvider, KeystoneClient, KeystoneConfig, KeystoneIdentityMapper};
-use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
+use s3s::{S3Result, s3_error};
 use std::sync::{Arc, OnceLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 static KEYSTONE_AUTH: OnceLock<Arc<KeystoneAuthProvider>> = OnceLock::new();
 static KEYSTONE_MAPPER: OnceLock<Arc<KeystoneIdentityMapper>> = OnceLock::new();
@@ -48,12 +48,7 @@ pub async fn init_keystone_auth(config: KeystoneConfig) -> Result<(), Box<dyn st
         config.verify_ssl,
     );
 
-    let auth_provider = KeystoneAuthProvider::new(
-        client.clone(),
-        config.cache_size,
-        config.get_cache_ttl(),
-        config.enable_cache,
-    );
+    let auth_provider = KeystoneAuthProvider::new(client.clone(), config.cache_size, config.get_cache_ttl(), config.enable_cache);
 
     let mut mapper = KeystoneIdentityMapper::new(Arc::new(client), config.enable_tenant_prefix);
 
@@ -91,11 +86,17 @@ pub fn get_keystone_auth() -> Option<Arc<KeystoneAuthProvider>> {
 }
 
 /// Get Keystone identity mapper
+///
+/// Reserved for future use (Swift API, tenant prefixing)
+#[allow(dead_code)]
 pub fn get_keystone_mapper() -> Option<Arc<KeystoneIdentityMapper>> {
     KEYSTONE_MAPPER.get().cloned()
 }
 
 /// Get Keystone configuration
+///
+/// Reserved for future use (dynamic configuration updates)
+#[allow(dead_code)]
 pub fn get_keystone_config() -> Option<&'static KeystoneConfig> {
     KEYSTONE_CONFIG.get()
 }
@@ -113,6 +114,9 @@ pub fn is_keystone_enabled() -> bool {
 ///
 /// Returns Some(Credentials) if authenticated via Keystone,
 /// None if Keystone is disabled or no Keystone headers present
+///
+/// Reserved for future use (alternative auth path, Swift API)
+#[allow(dead_code)]
 pub async fn authenticate_keystone(headers: &HeaderMap) -> S3Result<Option<Credentials>> {
     let auth_provider = match get_keystone_auth() {
         Some(provider) => provider,
@@ -156,6 +160,9 @@ pub async fn authenticate_keystone(headers: &HeaderMap) -> S3Result<Option<Crede
 }
 
 /// Apply tenant prefix to bucket name
+///
+/// Reserved for future use (multi-tenancy feature)
+#[allow(dead_code)]
 pub fn apply_tenant_prefix(bucket: &str, cred: &Credentials) -> String {
     let mapper = match get_keystone_mapper() {
         Some(m) => m,
@@ -173,6 +180,9 @@ pub fn apply_tenant_prefix(bucket: &str, cred: &Credentials) -> String {
 }
 
 /// Remove tenant prefix from bucket name
+///
+/// Reserved for future use (multi-tenancy feature)
+#[allow(dead_code)]
 pub fn remove_tenant_prefix(prefixed_bucket: &str, cred: &Credentials) -> String {
     let mapper = match get_keystone_mapper() {
         Some(m) => m,
@@ -189,6 +199,9 @@ pub fn remove_tenant_prefix(prefixed_bucket: &str, cred: &Credentials) -> String
 }
 
 /// Check if bucket belongs to user's project
+///
+/// Reserved for future use (multi-tenancy feature)
+#[allow(dead_code)]
 pub fn is_user_bucket(bucket: &str, cred: &Credentials) -> bool {
     let mapper = match get_keystone_mapper() {
         Some(m) => m,
@@ -205,6 +218,9 @@ pub fn is_user_bucket(bucket: &str, cred: &Credentials) -> bool {
 }
 
 /// Filter bucket list to only show user's project buckets
+///
+/// Reserved for future use (multi-tenancy feature)
+#[allow(dead_code)]
 pub fn filter_bucket_list(buckets: Vec<String>, cred: &Credentials) -> Vec<String> {
     let mapper = match get_keystone_mapper() {
         Some(m) => m,
@@ -235,6 +251,9 @@ pub fn filter_bucket_list(buckets: Vec<String>, cred: &Credentials) -> Vec<Strin
 }
 
 /// Check if credential is from Keystone
+///
+/// Reserved for future use (credential type detection)
+#[allow(dead_code)]
 pub fn is_keystone_credential(cred: &Credentials) -> bool {
     cred.claims
         .as_ref()

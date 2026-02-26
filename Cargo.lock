@@ -7161,6 +7161,13 @@ name = "rustfs-keystone"
 version = "0.0.5"
 dependencies = [
  "anyhow",
+ "axum",
+ "bytes",
+ "futures",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper",
  "moka",
  "reqwest 0.13.2",
  "rustfs-common",
@@ -7171,6 +7178,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]

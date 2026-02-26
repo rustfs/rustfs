@@ -39,6 +39,22 @@ rustfs-common = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-policy = { workspace = true }
 anyhow = { workspace = true }
+# Middleware dependencies
+tower = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true, features = ["util"] }
+axum = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
+serde_json = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"

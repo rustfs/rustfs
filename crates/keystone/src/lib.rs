@@ -66,12 +66,14 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod identity;
+pub mod middleware;
 
 pub use auth::KeystoneAuthProvider;
 pub use client::KeystoneClient;
 pub use config::{KeystoneConfig, RoleMapping};
 pub use error::{KeystoneError, Result};
 pub use identity::KeystoneIdentityMapper;
+pub use middleware::{KEYSTONE_CREDENTIALS, KeystoneAuthLayer};
 
 /// Keystone API version
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
