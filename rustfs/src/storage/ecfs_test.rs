@@ -360,6 +360,29 @@ mod tests {
     }
 
     #[test]
+    fn test_phase5_s3_entrypoints_delegate_to_usecases() {
+        let src = include_str!("ecfs.rs");
+
+        assert!(
+            src.contains("async fn put_object(&self, req: S3Request<PutObjectInput>)")
+                && src.contains("usecase.execute_put_object(self, req).await"),
+            "put_object must delegate to DefaultObjectUsecase::execute_put_object"
+        );
+
+        assert!(
+            src.contains("async fn get_object(&self, req: S3Request<GetObjectInput>)")
+                && src.contains("usecase.execute_get_object(req).await"),
+            "get_object must delegate to DefaultObjectUsecase::execute_get_object"
+        );
+
+        assert!(
+            src.contains("async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>)")
+                && src.contains("usecase.execute_list_objects_v2(req).await"),
+            "list_objects_v2 must delegate to DefaultBucketUsecase::execute_list_objects_v2"
+        );
+    }
+
+    #[test]
     fn test_validate_list_object_unordered_with_delimiter() {
         // [1] Normal case: No delimiter specified.
         assert!(validate_list_object_unordered_with_delimiter(None, Some("allow-unordered=true")).is_ok());
