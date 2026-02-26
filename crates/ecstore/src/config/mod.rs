@@ -67,6 +67,10 @@ impl ConfigSys {
     }
 }
 
+pub fn get_global_server_config() -> Option<Config> {
+    GLOBAL_SERVER_CONFIG.get().cloned()
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct KV {
     pub key: String,
