@@ -17,17 +17,23 @@
 use super::{kms_dynamic, kms_keys, kms_management};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_kms_runtime_service_manager;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;
 use hyper::{HeaderMap, StatusCode};
 use matchit::Params;
-use rustfs_kms::get_global_encryption_service;
+use rustfs_kms::init_global_kms_service_manager;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use tracing::{error, info, warn};
+
+async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_kms::ObjectEncryptionService>> {
+    let manager = resolve_kms_runtime_service_manager().unwrap_or_else(init_global_kms_service_manager);
+    manager.get_encryption_service().await
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KmsStatusResponse {
@@ -83,7 +89,7 @@ impl Operation for KmsStatusHandler {
         )
         .await?;
 
-        let Some(service) = get_global_encryption_service().await else {
+        let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
@@ -141,7 +147,7 @@ impl Operation for KmsConfigHandler {
         )
         .await?;
 
-        let Some(service) = get_global_encryption_service().await else {
+        let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
@@ -186,7 +192,7 @@ impl Operation for KmsClearCacheHandler {
         )
         .await?;
 
-        let Some(service) = get_global_encryption_service().await else {
+        let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
