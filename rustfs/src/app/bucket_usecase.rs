@@ -1815,10 +1815,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_notification_region_defaults_to_empty() {
+    fn resolve_notification_region_defaults_value() {
         let binding = resolve_notification_region(None, None);
         let region = binding.as_str();
-        assert!(region.is_empty());
+        assert_eq!(region, RUSTFS_REGION);
     }
 
     #[tokio::test]

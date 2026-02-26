@@ -124,7 +124,11 @@ pub struct Opt {
     #[arg(long, env = "RUSTFS_LICENSE")]
     pub license: Option<String>,
 
-    #[arg(long, env = "RUSTFS_REGION")]
+    #[arg(
+        long,
+        default_value_t = rustfs_config::RUSTFS_REGION.to_string(),
+        env = "RUSTFS_REGION"
+    )]
     pub region: Option<String>,
 
     /// Enable KMS encryption for server-side encryption
@@ -191,8 +195,10 @@ pub struct Config {
     /// tls path for rustfs API and console.
     pub tls_path: Option<String>,
 
+    /// License key for enterprise features
     pub license: Option<String>,
 
+    /// Region for the server, used for signing and other region-specific behavior
     pub region: Option<String>,
 
     /// Enable KMS encryption for server-side encryption
