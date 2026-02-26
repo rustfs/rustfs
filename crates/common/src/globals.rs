@@ -38,6 +38,14 @@ pub async fn set_global_local_node_name(name: &str) {
     *GLOBAL_LOCAL_NODE_NAME.write().await = name.to_string();
 }
 
+/// Get the global local node name.
+///
+/// # Returns
+/// * `String` - The local node name.
+pub async fn get_global_local_node_name() -> String {
+    GLOBAL_LOCAL_NODE_NAME.read().await.clone()
+}
+
 /// Set the global RustFS initialization time to the current UTC time.
 pub async fn set_global_init_time_now() {
     let now = Utc::now();
