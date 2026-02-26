@@ -1,0 +1,8 @@
+cycle|app<->infra
+cycle|infra<->interface
+dep|rustfs/src/main.rs|infra->app|crate::app::context::
+dep|rustfs/src/server/audit.rs|infra->app|crate::app::context::resolve_server_config
+dep|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_server_config
+dep|rustfs/src/server/http.rs|infra->interface|crate::admin
+dep|rustfs/src/server/layer.rs|infra->interface|crate::admin::console::is_console_path
+dep|rustfs/src/storage/objects/put_object.rs|infra->app|crate::app::context::resolve_bucket_metadata_handle

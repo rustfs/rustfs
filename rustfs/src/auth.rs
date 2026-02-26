@@ -401,7 +401,7 @@ pub fn get_condition_values(
     header: &HeaderMap,
     cred: &Credentials,
     version_id: Option<&str>,
-    region: Option<&str>,
+    region: Option<s3s::region::Region>,
     remote_addr: Option<std::net::SocketAddr>,
 ) -> HashMap<String, Vec<String>> {
     let username = if cred.is_temp() || cred.is_service_account() {
@@ -487,7 +487,7 @@ pub fn get_condition_values(
     }
 
     if let Some(lc) = region
-        && !lc.is_empty()
+        && !lc.as_str().is_empty()
     {
         args.insert("LocationConstraint".to_owned(), vec![lc.to_string()]);
     }

@@ -360,6 +360,44 @@ mod tests {
     }
 
     #[test]
+    fn test_phase5_s3_entrypoints_delegate_to_usecases() {
+        fn assert_delegates_within_method(src: &str, signature: &str, delegation_call: &str, error_msg: &str) {
+            let sig_pos = src
+                .find(signature)
+                .unwrap_or_else(|| panic!("Expected to find method signature: {signature}"));
+
+            let after_sig = &src[sig_pos + signature.len()..];
+            let method_body_end_rel = after_sig.find("async fn ").unwrap_or(after_sig.len());
+            let method_body = &after_sig[..method_body_end_rel];
+
+            assert!(method_body.contains(delegation_call), "{error_msg}");
+        }
+
+        let src = include_str!("ecfs.rs");
+
+        assert_delegates_within_method(
+            src,
+            "async fn put_object(&self, req: S3Request<PutObjectInput>)",
+            "usecase.execute_put_object(self, req).await",
+            "put_object must delegate to DefaultObjectUsecase::execute_put_object",
+        );
+
+        assert_delegates_within_method(
+            src,
+            "async fn get_object(&self, req: S3Request<GetObjectInput>)",
+            "usecase.execute_get_object(req).await",
+            "get_object must delegate to DefaultObjectUsecase::execute_get_object",
+        );
+
+        assert_delegates_within_method(
+            src,
+            "async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>)",
+            "usecase.execute_list_objects_v2(req).await",
+            "list_objects_v2 must delegate to DefaultBucketUsecase::execute_list_objects_v2",
+        );
+    }
+
+    #[test]
     fn test_validate_list_object_unordered_with_delimiter() {
         // [1] Normal case: No delimiter specified.
         assert!(validate_list_object_unordered_with_delimiter(None, Some("allow-unordered=true")).is_ok());

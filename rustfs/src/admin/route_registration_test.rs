@@ -15,6 +15,7 @@
 use crate::admin::{
     handlers::{bucket_meta, heal, health, kms, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user},
     router::{AdminOperation, S3Router},
+    rpc,
 };
 use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use hyper::Method;
@@ -49,6 +50,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     replication::register_replication_route(&mut router).expect("register replication route");
     profile_admin::register_profiling_route(&mut router).expect("register profile route");
     kms::register_kms_route(&mut router).expect("register kms route");
+    rpc::register_rpc_route(&mut router).expect("register rpc route");
 
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
@@ -100,4 +102,44 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys/test-key"));
+    assert_route(&router, Method::GET, "/rustfs/rpc/read_file_stream");
+    assert_route(&router, Method::HEAD, "/rustfs/rpc/read_file_stream");
+}
+
+#[test]
+fn test_phase5_admin_info_and_rpc_read_file_contract() {
+    let system_src = include_str!("handlers/system.rs");
+    let rpc_src = include_str!("rpc.rs");
+
+    let server_info_impl_marker = "impl Operation for ServerInfoHandler";
+    let server_info_impl_start = system_src
+        .find(server_info_impl_marker)
+        .expect("Expected impl Operation for ServerInfoHandler in handlers/system.rs");
+    let server_info_impl_block = &system_src[server_info_impl_start..];
+
+    assert!(
+        server_info_impl_block.contains("DefaultAdminUsecase::from_global()")
+            && server_info_impl_block.contains("execute_query_server_info(QueryServerInfoRequest { include_pools: true })"),
+        "admin server info path must be served through DefaultAdminUsecase::execute_query_server_info"
+    );
+
+    let register_route_marker = "pub fn register_rpc_route";
+    let register_route_start = rpc_src
+        .find(register_route_marker)
+        .expect("Expected register_rpc_route in rpc.rs");
+    let register_route_block = &rpc_src[register_route_start..];
+
+    let read_file_marker = "pub struct ReadFile {}";
+    let read_file_start = rpc_src.find(read_file_marker).expect("Expected ReadFile operation in rpc.rs");
+    let read_file_block = &rpc_src[read_file_start..];
+
+    assert!(
+        register_route_block.contains("format!(\"{}{}\", RPC_PREFIX, \"/read_file_stream\")"),
+        "rpc read_file_stream route path must remain registered with RPC_PREFIX"
+    );
+
+    assert!(
+        read_file_block.contains(".read_file_stream(&query.volume, &query.path, query.offset, query.length)"),
+        "rpc read_file_stream route must remain wired to disk.read_file_stream"
+    );
 }

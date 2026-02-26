@@ -13,65 +13,126 @@
 # limitations under the License.
 
 services:
+  # --- Observability Stack ---
+
+  tempo-init:
+    image: busybox:latest
+    command: [ "sh", "-c", "chown -R 10001:10001 /var/tempo" ]
+    volumes:
+      - tempo-data:/var/tempo
+    user: root
+    networks:
+      - rustfs-network
+    restart: "no"
+
+  tempo:
+    image: grafana/tempo:latest
+    user: "10001"
+    command: [ "-config.file=/etc/tempo.yaml" ]
+    volumes:
+      - ../../.docker/observability/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200" # tempo
+      - "4317"      # otlp grpc
+      - "4318"      # otlp http
+    restart: unless-stopped
+    networks:
+      - rustfs-network
+
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.129.1
+    image: otel/opentelemetry-collector-contrib:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ../../.docker/observability/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+      - ../../.docker/observability/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
-      - 1888:1888
-      - 8888:8888
-      - 8889:8889
-      - 13133:13133
-      - 4317:4317
-      - 4318:4318
-      - 55679:55679
+      - "1888:1888"   # pprof
+      - "8888:8888"   # Prometheus metrics for Collector
+      - "8889:8889"   # Prometheus metrics for application indicators
+      - "13133:13133" # health check
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "55679:55679" # zpages
     networks:
       - rustfs-network
+    depends_on:
+      - tempo
+      - jaeger
+      - prometheus
+      - loki
+
   jaeger:
-    image: jaegertracing/jaeger:2.8.0
+    image: jaegertracing/jaeger:latest
     environment:
       - TZ=Asia/Shanghai
+      - SPAN_STORAGE_TYPE=badger
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_DIRECTORY_KEY=/badger/key
+      - COLLECTOR_OTLP_ENABLED=true
+    volumes:
+      - jaeger-data:/badger
     ports:
-      - "16686:16686"
-      - "14317:4317"
-      - "14318:4318"
+      - "16686:16686" # Web UI
+      - "14269:14269" # Admin/Metrics
     networks:
       - rustfs-network
+
   prometheus:
-    image: prom/prometheus:v3.4.2
+    image: prom/prometheus:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ../../.docker/observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ../../.docker/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
     ports:
       - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--web.enable-otlp-receiver'
+      - '--web.enable-remote-write-receiver'
+      - '--enable-feature=promql-experimental-functions'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
     networks:
       - rustfs-network
+
   loki:
-    image: grafana/loki:3.5.1
+    image: grafana/loki:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ../../.docker/observability/loki-config.yaml:/etc/loki/local-config.yaml
+      - ../../.docker/observability/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
     ports:
       - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
     networks:
       - rustfs-network
+
   grafana:
-    image: grafana/grafana:12.0.2
+    image: grafana/grafana:latest
     ports:
       - "3000:3000" # Web UI
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
       - TZ=Asia/Shanghai
+      - GF_INSTALL_PLUGINS=grafana-pyroscope-datasource
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/home.json
     networks:
       - rustfs-network
     volumes:
       - ../../.docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../../.docker/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+
+  # --- RustFS Cluster ---
 
   node1:
     build:
@@ -86,9 +147,11 @@ services:
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
-      - "9001:9000" # Map port 9001 of the host to port 9000 of the container
+      - "9001:9000"
     networks:
       - rustfs-network
+    depends_on:
+      - otel-collector
 
   node2:
     build:
@@ -103,9 +166,11 @@ services:
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
-      - "9002:9000" # Map port 9002 of the host to port 9000 of the container
+      - "9002:9000"
     networks:
       - rustfs-network
+    depends_on:
+      - otel-collector
 
   node3:
     build:
@@ -120,9 +185,11 @@ services:
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
-      - "9003:9000" # Map port 9003 of the host to port 9000 of the container
+      - "9003:9000"
     networks:
       - rustfs-network
+    depends_on:
+      - otel-collector
 
   node4:
     build:
@@ -137,9 +204,17 @@ services:
       - RUSTFS_OBS_LOGGER_LEVEL=debug
     platform: linux/amd64
     ports:
-      - "9004:9000" # Map port 9004 of the host to port 9000 of the container
+      - "9004:9000"
     networks:
       - rustfs-network
+    depends_on:
+      - otel-collector
+
+volumes:
+  prometheus-data:
+  tempo-data:
+  loki-data:
+  jaeger-data:
 
 networks:
   rustfs-network:

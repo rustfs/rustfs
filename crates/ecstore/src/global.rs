@@ -42,7 +42,6 @@ lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
-    pub static ref GLOBAL_LOCAL_DISK: Arc<RwLock<Vec<Option<DiskStore>>>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
@@ -57,8 +56,8 @@ lazy_static! {
     pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();
     pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
     pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
-    pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
-    pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn rustfs_lock::client::LockClient>> = OnceLock::new();
+    pub static ref GLOBAL_REGION: OnceLock<s3s::region::Region> = OnceLock::new();
+    pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn LockClient>> = OnceLock::new();
     pub static ref GLOBAL_LOCK_CLIENTS: OnceLock<HashMap<String, Arc<dyn LockClient>>> = OnceLock::new();
     pub static ref GLOBAL_BUCKET_MONITOR: OnceLock<Arc<Monitor>> = OnceLock::new();
 }
@@ -243,20 +242,20 @@ type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
 /// Set the global region
 ///
 /// # Arguments
-/// * `region` - The region string to set globally
+/// * `region` - The Region instance to set globally
 ///
 /// # Returns
 /// * None
-pub fn set_global_region(region: String) {
+pub fn set_global_region(region: s3s::region::Region) {
     GLOBAL_REGION.set(region).unwrap();
 }
 
 /// Get the global region
 ///
 /// # Returns
-/// * `Option<String>` - The global region string, if set
+/// * `Option<s3s::region::Region>` - The global region, if set
 ///
-pub fn get_global_region() -> Option<String> {
+pub fn get_global_region() -> Option<s3s::region::Region> {
     GLOBAL_REGION.get().cloned()
 }
 
