@@ -226,7 +226,7 @@ impl SetDisks {
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
                             // this would end up restoring the correct readable versions.
                             return match self
-                                .delete_if_dang_ling(
+                                .delete_if_dangling(
                                     bucket,
                                     object,
                                     &parts_metadata,
@@ -548,7 +548,7 @@ impl SetDisks {
             Err(err) => {
                 let data_errs_by_part = HashMap::new();
                 match self
-                    .delete_if_dang_ling(
+                    .delete_if_dangling(
                         bucket,
                         object,
                         &parts_metadata,
@@ -605,8 +605,8 @@ impl SetDisks {
         result.after.drives = vec![HealDriveInfo::default(); disks.len()];
 
         let errs = stat_all_dirs(&disks, bucket, object).await;
-        let dang_ling_object = is_object_dir_dang_ling(&errs);
-        if dang_ling_object && !dry_run && remove {
+        let dangling_object = is_object_dir_dangling(&errs);
+        if dangling_object && !dry_run && remove {
             let mut futures = Vec::with_capacity(disks.len());
             for disk in disks.iter().flatten() {
                 let disk = disk.clone();
@@ -654,7 +654,7 @@ impl SetDisks {
             });
         }
 
-        if dang_ling_object || DiskError::is_all_not_found(&errs) {
+        if dangling_object || DiskError::is_all_not_found(&errs) {
             return Ok((result, Some(DiskError::FileNotFound)));
         }
 
