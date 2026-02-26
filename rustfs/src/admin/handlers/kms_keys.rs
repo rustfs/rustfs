@@ -16,13 +16,14 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::{default_kms_runtime_interface, get_global_app_context};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use base64::Engine;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_kms::{KmsError, get_global_encryption_service, get_global_kms_service_manager, types::*};
+use rustfs_kms::{KmsError, init_global_kms_service_manager, types::*};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -101,6 +102,17 @@ fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
     params
 }
 
+fn kms_service_manager_from_context() -> Option<std::sync::Arc<rustfs_kms::KmsServiceManager>> {
+    get_global_app_context()
+        .and_then(|context| context.kms_runtime().service_manager())
+        .or_else(|| default_kms_runtime_interface().service_manager())
+}
+
+async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_kms::ObjectEncryptionService>> {
+    let manager = kms_service_manager_from_context().unwrap_or_else(init_global_kms_service_manager);
+    manager.get_encryption_service().await
+}
+
 pub fn register_kms_key_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::POST,
@@ -174,7 +186,7 @@ impl Operation for CreateKeyHandler {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
         };
 
-        let Some(service) = get_global_encryption_service().await else {
+        let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
@@ -242,7 +254,7 @@ impl Operation for DescribeKeyHandler {
             return Err(s3_error!(InvalidRequest, "missing keyId parameter"));
         };
 
-        let Some(service) = get_global_encryption_service().await else {
+        let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
@@ -297,7 +309,7 @@ impl Operation for ListKeysHandler {
         let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
         let marker = query_params.get("marker").cloned();
 
-        let Some(service) = get_global_encryption_service().await else {
+        let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
@@ -364,7 +376,7 @@ impl Operation for GenerateDataKeyHandler {
         let request: GenerateDataKeyApiRequest =
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?;
 
-        let Some(service) = get_global_encryption_service().await else {
+        let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
@@ -437,7 +449,7 @@ impl Operation for CreateKmsKeyHandler {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
         };
 
-        let Some(service_manager) = get_global_kms_service_manager() else {
+        let Some(service_manager) = kms_service_manager_from_context() else {
             let response = CreateKmsKeyResponse {
                 success: false,
                 message: "KMS service manager not initialized".to_string(),
@@ -590,7 +602,7 @@ impl Operation for DeleteKmsKeyHandler {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
         };
 
-        let Some(service_manager) = get_global_kms_service_manager() else {
+        let Some(service_manager) = kms_service_manager_from_context() else {
             let response = DeleteKmsKeyResponse {
                 success: false,
                 message: "KMS service manager not initialized".to_string(),
@@ -730,7 +742,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
         };
 
-        let Some(service_manager) = get_global_kms_service_manager() else {
+        let Some(service_manager) = kms_service_manager_from_context() else {
             let response = CancelKmsKeyDeletionResponse {
                 success: false,
                 message: "KMS service manager not initialized".to_string(),
@@ -837,7 +849,7 @@ impl Operation for ListKmsKeysHandler {
         let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
         let marker = query_params.get("marker").cloned();
 
-        let Some(service_manager) = get_global_kms_service_manager() else {
+        let Some(service_manager) = kms_service_manager_from_context() else {
             let response = ListKmsKeysResponse {
                 success: false,
                 message: "KMS service manager not initialized".to_string(),
@@ -958,7 +970,7 @@ impl Operation for DescribeKmsKeyHandler {
             return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
         };
 
-        let Some(service_manager) = get_global_kms_service_manager() else {
+        let Some(service_manager) = kms_service_manager_from_context() else {
             let response = DescribeKmsKeyResponse {
                 success: false,
                 message: "KMS service manager not initialized".to_string(),
