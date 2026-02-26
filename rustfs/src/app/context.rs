@@ -17,6 +17,7 @@
 //! for storage, IAM, and KMS handles.
 #![allow(dead_code)]
 
+use crate::config::workload_profiles::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
 use rustfs_ecstore::GLOBAL_Endpoints;
 use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, GLOBAL_BucketMetadataSys};
@@ -81,6 +82,11 @@ pub trait TierConfigInterface: Send + Sync {
 /// Server config interface for application-layer and server modules.
 pub trait ServerConfigInterface: Send + Sync {
     fn get(&self) -> Option<Config>;
+}
+
+/// Buffer profile config interface for application-layer use-cases.
+pub trait BufferConfigInterface: Send + Sync {
+    fn get(&self) -> RustFSBufferConfig;
 }
 
 /// Default IAM interface adapter.
@@ -195,6 +201,16 @@ impl ServerConfigInterface for ServerConfigHandle {
     }
 }
 
+/// Default buffer profile config interface adapter.
+#[derive(Default)]
+pub struct BufferConfigHandle;
+
+impl BufferConfigInterface for BufferConfigHandle {
+    fn get(&self) -> RustFSBufferConfig {
+        get_global_buffer_config().clone()
+    }
+}
+
 /// Application-layer context with explicit dependencies.
 #[derive(Clone)]
 pub struct AppContext {
@@ -207,6 +223,7 @@ pub struct AppContext {
     region: Arc<dyn RegionInterface>,
     tier_config: Arc<dyn TierConfigInterface>,
     server_config: Arc<dyn ServerConfigInterface>,
+    buffer_config: Arc<dyn BufferConfigInterface>,
 }
 
 impl AppContext {
@@ -221,6 +238,7 @@ impl AppContext {
             region: default_region_interface(),
             tier_config: default_tier_config_interface(),
             server_config: default_server_config_interface(),
+            buffer_config: default_buffer_config_interface(),
         }
     }
 
@@ -267,6 +285,10 @@ impl AppContext {
     pub fn server_config(&self) -> Arc<dyn ServerConfigInterface> {
         self.server_config.clone()
     }
+
+    pub fn buffer_config(&self) -> Arc<dyn BufferConfigInterface> {
+        self.buffer_config.clone()
+    }
 }
 
 pub fn default_notify_interface() -> Arc<dyn NotifyInterface> {
@@ -291,6 +313,10 @@ pub fn default_tier_config_interface() -> Arc<dyn TierConfigInterface> {
 
 pub fn default_server_config_interface() -> Arc<dyn ServerConfigInterface> {
     Arc::new(ServerConfigHandle)
+}
+
+pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
+    Arc::new(BufferConfigHandle)
 }
 
 static GLOBAL_APP_CONTEXT: OnceLock<Arc<AppContext>> = OnceLock::new();
