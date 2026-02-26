@@ -71,6 +71,10 @@ pub fn get_global_server_config() -> Option<Config> {
     GLOBAL_SERVER_CONFIG.get().cloned()
 }
 
+pub async fn init_global_config_sys(api: Arc<ECStore>) -> Result<()> {
+    GLOBAL_CONFIG_SYS.init(api).await
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct KV {
     pub key: String,
