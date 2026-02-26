@@ -902,7 +902,7 @@ impl StorageAPI for SetDisks {
                 if err == DiskError::ErasureReadQuorum
                     && !src_bucket.starts_with(RUSTFS_META_BUCKET)
                     && self
-                        .delete_if_dang_ling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
+                        .delete_if_dangling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
                         .await
                         .is_ok()
                 {
@@ -1531,7 +1531,7 @@ impl StorageAPI for SetDisks {
                 if err == DiskError::ErasureReadQuorum
                     && !bucket.starts_with(RUSTFS_META_BUCKET)
                     && self
-                        .delete_if_dang_ling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
+                        .delete_if_dangling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
                         .await
                         .is_ok()
                 {
@@ -3058,17 +3058,17 @@ pub struct HealEntryResult {
     pub name: String,
 }
 
-fn is_object_dang_ling(
+fn is_object_dangling(
     meta_arr: &[FileInfo],
     errs: &[Option<DiskError>],
     data_errs_by_part: &HashMap<usize, Vec<usize>>,
 ) -> (FileInfo, bool) {
-    let (not_found_meta_errs, non_actionable_meta_errs) = dang_ling_meta_errs_count(errs);
+    let (not_found_meta_errs, non_actionable_meta_errs) = dangling_meta_errs_count(errs);
 
     let (mut not_found_parts_errs, mut non_actionable_parts_errs) = (0, 0);
 
     data_errs_by_part.iter().for_each(|(_, v)| {
-        let (nf, na) = dang_ling_part_errs_count(v);
+        let (nf, na) = dangling_part_errs_count(v);
         if nf > not_found_parts_errs {
             (not_found_parts_errs, non_actionable_parts_errs) = (nf, na);
         }
@@ -3112,7 +3112,7 @@ fn is_object_dang_ling(
     (valid_meta, false)
 }
 
-fn dang_ling_meta_errs_count(cerrs: &[Option<DiskError>]) -> (usize, usize) {
+fn dangling_meta_errs_count(cerrs: &[Option<DiskError>]) -> (usize, usize) {
     let (mut not_found_count, mut non_actionable_count) = (0, 0);
     cerrs.iter().for_each(|err| {
         if let Some(err) = err {
@@ -3127,7 +3127,7 @@ fn dang_ling_meta_errs_count(cerrs: &[Option<DiskError>]) -> (usize, usize) {
     (not_found_count, non_actionable_count)
 }
 
-fn dang_ling_part_errs_count(results: &[usize]) -> (usize, usize) {
+fn dangling_part_errs_count(results: &[usize]) -> (usize, usize) {
     let (mut not_found_count, mut non_actionable_count) = (0, 0);
     results.iter().for_each(|result| {
         if *result == CHECK_PART_SUCCESS {
@@ -3142,7 +3142,7 @@ fn dang_ling_part_errs_count(results: &[usize]) -> (usize, usize) {
     (not_found_count, non_actionable_count)
 }
 
-fn is_object_dir_dang_ling(errs: &[Option<DiskError>]) -> bool {
+fn is_object_dir_dangling(errs: &[Option<DiskError>]) -> bool {
     let mut found = 0;
     let mut not_found = 0;
     let mut found_not_empty = 0;
@@ -4020,33 +4020,33 @@ mod tests {
     }
 
     #[test]
-    fn test_dang_ling_meta_errs_count() {
+    fn test_dangling_meta_errs_count() {
         // Test counting dangling metadata errors
         let errs = vec![None, Some(DiskError::FileNotFound), None];
-        let (not_found_count, non_actionable_count) = dang_ling_meta_errs_count(&errs);
+        let (not_found_count, non_actionable_count) = dangling_meta_errs_count(&errs);
         assert_eq!(not_found_count, 1); // One FileNotFound error
         assert_eq!(non_actionable_count, 0); // No other errors
     }
 
     #[test]
-    fn test_dang_ling_part_errs_count() {
+    fn test_dangling_part_errs_count() {
         // Test counting dangling part errors
         let results = vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS];
-        let (not_found_count, non_actionable_count) = dang_ling_part_errs_count(&results);
+        let (not_found_count, non_actionable_count) = dangling_part_errs_count(&results);
         assert_eq!(not_found_count, 1); // One FILE_NOT_FOUND error
         assert_eq!(non_actionable_count, 0); // No other errors
     }
 
     #[test]
-    fn test_is_object_dir_dang_ling() {
+    fn test_is_object_dir_dangling() {
         // Test object directory dangling detection
         let errs = vec![Some(DiskError::FileNotFound), Some(DiskError::FileNotFound), None];
-        assert!(is_object_dir_dang_ling(&errs));
+        assert!(is_object_dir_dangling(&errs));
         let errs2 = vec![None, None, None];
-        assert!(!is_object_dir_dang_ling(&errs2));
+        assert!(!is_object_dir_dangling(&errs2));
 
         let errs3 = vec![Some(DiskError::FileCorrupt), Some(DiskError::FileNotFound)];
-        assert!(!is_object_dir_dang_ling(&errs3)); // Mixed errors, not all not found
+        assert!(!is_object_dir_dangling(&errs3)); // Mixed errors, not all not found
     }
 
     #[test]
