@@ -90,20 +90,24 @@ use rustfs_utils::http::{
 };
 use rustfs_utils::path::{is_dir_object, path_join_buf};
 use rustfs_utils::{
-    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_user_agent,
+    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
+    get_request_user_agent,
 };
+use rustfs_zip::CompressionFormat;
 use s3s::dto::*;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::ops::Add;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
@@ -212,8 +216,8 @@ impl DefaultObjectUsecase {
             .unwrap_or_else(|| RustFSBufferConfig::default().base_config.default_unknown)
     }
 
-    #[instrument(level = "debug", skip(self, fs, req))]
-    pub async fn execute_put_object(&self, fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+    #[instrument(level = "debug", skip(self, _fs, req))]
+    pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -224,7 +228,7 @@ impl DefaultObjectUsecase {
             .get("X-Amz-Meta-Snowball-Auto-Extract")
             .is_some_and(|v| v.to_str().unwrap_or_default() == "true")
         {
-            return fs.put_object_extract(req).await;
+            return self.execute_put_object_extract(req).await;
         }
 
         let input = req.input;
@@ -3276,6 +3280,235 @@ impl DefaultObjectUsecase {
         Ok(S3Response::new(select::build_select_object_content_output(
             SelectObjectContentEventStream::new(stream),
         )))
+    }
+
+    #[instrument(level = "debug", skip(self, req))]
+    pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject").suppress_event();
+        let input = req.input;
+
+        let PutObjectInput {
+            body,
+            bucket,
+            key,
+            version_id,
+            content_length,
+            content_md5,
+            ..
+        } = input;
+
+        let event_version_id = version_id;
+        let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
+
+        let size = match content_length {
+            Some(c) => c,
+            None => {
+                if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
+                    match atoi::atoi::<i64>(val.as_bytes()) {
+                        Some(x) => x,
+                        None => return Err(s3_error!(UnexpectedContent)),
+                    }
+                } else {
+                    return Err(s3_error!(UnexpectedContent));
+                }
+            }
+        };
+
+        let buffer_size = get_buffer_size_opt_in(size);
+        let body = tokio::io::BufReader::with_capacity(
+            buffer_size,
+            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+        );
+
+        let Some(ext) = Path::new(&key).extension().and_then(|s| s.to_str()) else {
+            return Err(s3_error!(InvalidArgument, "key extension not found"));
+        };
+
+        let ext = ext.to_owned();
+
+        let md5hex = if let Some(base64_md5) = content_md5 {
+            let md5 = base64_simd::STANDARD
+                .decode_to_vec(base64_md5.as_bytes())
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
+            Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
+
+        let sha256hex = get_content_sha256(&req.headers);
+        let actual_size = size;
+
+        let reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
+
+        let mut hreader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+
+        if let Err(err) = hreader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+            return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+        }
+
+        let decoder = CompressionFormat::from_extension(&ext).get_decoder(hreader).map_err(|e| {
+            error!("get_decoder err {:?}", e);
+            s3_error!(InvalidArgument, "get_decoder err")
+        })?;
+
+        let mut ar = Archive::new(decoder);
+        let mut entries = ar.entries().map_err(|e| {
+            error!("get entries err {:?}", e);
+            s3_error!(InvalidArgument, "get entries err")
+        })?;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let prefix = req
+            .headers
+            .get("X-Amz-Meta-Rustfs-Snowball-Prefix")
+            .map(|v| v.to_str().unwrap_or_default())
+            .unwrap_or_default();
+        let version_id = match event_version_id {
+            Some(v) => v.to_string(),
+            None => String::new(),
+        };
+
+        let notify = self
+            .context
+            .as_ref()
+            .map(|context| context.notify())
+            .unwrap_or_else(default_notify_interface);
+
+        while let Some(entry) = entries.next().await {
+            let f = match entry {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("Failed to read archive entry: {}", e);
+                    return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", e));
+                }
+            };
+
+            if f.header().entry_type().is_dir() {
+                continue;
+            }
+
+            if let Ok(fpath) = f.path() {
+                let mut fpath = fpath.to_string_lossy().to_string();
+
+                if !prefix.is_empty() {
+                    fpath = format!("{prefix}/{fpath}");
+                }
+
+                let mut size = f.header().size().unwrap_or_default() as i64;
+
+                debug!("Extracting file: {}, size: {} bytes", fpath, size);
+
+                let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(f));
+
+                let mut metadata = HashMap::new();
+
+                let actual_size = size;
+
+                if is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+                    metadata.insert(
+                        format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
+                        CompressionAlgorithm::default().to_string(),
+                    );
+                    metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), size.to_string());
+
+                    let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+
+                    reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
+                    size = HashReader::SIZE_PRESERVE_LAYER;
+                }
+
+                let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                let mut reader = PutObjReader::new(hrd);
+
+                let obj_info = store
+                    .put_object(&bucket, &fpath, &mut reader, &ObjectOptions::default())
+                    .await
+                    .map_err(ApiError::from)?;
+
+                let manager = get_concurrency_manager();
+                let fpath_clone = fpath.clone();
+                let bucket_clone = bucket.clone();
+                tokio::spawn(async move {
+                    manager.invalidate_cache_versioned(&bucket_clone, &fpath_clone, None).await;
+                });
+
+                let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
+
+                let output = PutObjectOutput {
+                    e_tag,
+                    ..Default::default()
+                };
+
+                let event_args = rustfs_notify::EventArgs {
+                    event_name: EventName::ObjectCreatedPut,
+                    bucket_name: bucket.clone(),
+                    object: obj_info.clone(),
+                    req_params: extract_params_header(&req.headers),
+                    resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
+                    version_id: version_id.clone(),
+                    host: get_request_host(&req.headers),
+                    port: get_request_port(&req.headers),
+                    user_agent: get_request_user_agent(&req.headers),
+                };
+
+                let notify = notify.clone();
+                tokio::spawn(async move {
+                    notify.notify(event_args).await;
+                });
+            }
+        }
+
+        let mut checksum_crc32 = input.checksum_crc32;
+        let mut checksum_crc32c = input.checksum_crc32c;
+        let mut checksum_sha1 = input.checksum_sha1;
+        let mut checksum_sha256 = input.checksum_sha256;
+        let mut checksum_crc64nvme = input.checksum_crc64nvme;
+
+        if let Some(alg) = &input.checksum_algorithm
+            && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
+                let key = match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+                    _ => return None,
+                };
+                trailer.read(|headers| {
+                    headers
+                        .get(key.unwrap_or_default())
+                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                })
+            })
+        {
+            match alg.as_str() {
+                ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
+                ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
+                ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
+                ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
+                ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
+                _ => (),
+            }
+        }
+
+        warn!(
+            "put object extract checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
+        );
+
+        let output = PutObjectOutput {
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
+            ..Default::default()
+        };
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 }
 
