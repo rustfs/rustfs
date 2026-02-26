@@ -51,7 +51,6 @@ rustfs-utils = { workspace = true, features = ["path"] }
 tokio-util.workspace = true
 pollster.workspace = true
 reqwest = { workspace = true }
-url = { workspace = true }
 moka = { workspace = true }
 openidconnect = { workspace = true }
 http = { workspace = true }
