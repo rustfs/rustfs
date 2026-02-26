@@ -19,6 +19,7 @@ use crate::{
     server::ADMIN_PREFIX,
 };
 use http::StatusCode;
+use http::header::HeaderValue;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -184,7 +185,8 @@ async fn handle_assume_role(
     };
 
     // getAssumeRoleCredentials
-    let output = serialize::<AssumeRoleOutput>(&resp).unwrap();
+    let output = serialize::<AssumeRoleOutput>(&resp)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize assume role output failed: {e}")))?;
 
     Ok(S3Response::new((StatusCode::OK, Body::from(output))))
 }
@@ -213,6 +215,10 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
 
     // Map claims to policies and groups
     let (policies, groups) = oidc_sys.map_claims_to_policies(&provider_id, &claims);
+
+    if policies.is_empty() && groups.is_empty() {
+        return Err(s3_error!(InvalidArgument, "no policies are available for this OIDC token"));
+    }
 
     info!(
         "AssumeRoleWithWebIdentity: user='{}', provider='{}', policies={:?}, groups={:?}",
@@ -278,7 +284,7 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
 
     let mut resp = S3Response::new((StatusCode::OK, Body::from(xml.into_bytes())));
     resp.headers
-        .insert(http::header::CONTENT_TYPE, "application/xml".parse().unwrap());
+        .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
     Ok(resp)
 }
 

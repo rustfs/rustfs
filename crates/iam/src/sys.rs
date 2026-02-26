@@ -778,6 +778,9 @@ impl<T: Store> IamSys<T> {
                 use rustfs_policy::policy::default::DEFAULT_POLICIES;
                 let mut resolved = Vec::new();
                 for policy_name in claim_policies.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    if !Self::is_safe_claim_policy_name(policy_name) {
+                        continue;
+                    }
                     for (name, p) in DEFAULT_POLICIES.iter() {
                         if *name == policy_name {
                             resolved.push(p.clone());
@@ -825,6 +828,10 @@ impl<T: Store> IamSys<T> {
         }
 
         is_owner || combined_policy.is_allowed(args).await
+    }
+
+    fn is_safe_claim_policy_name(policy: &str) -> bool {
+        !policy.is_empty() && policy.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
 
     pub async fn is_allowed_service_account(&self, args: &Args<'_>, parent_user: &str) -> bool {
