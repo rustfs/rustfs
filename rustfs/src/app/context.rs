@@ -384,14 +384,14 @@ pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
     Arc::new(BufferConfigHandle)
 }
 
-static GLOBAL_APP_CONTEXT: OnceLock<Arc<AppContext>> = OnceLock::new();
+static APP_CONTEXT_SINGLETON: OnceLock<Arc<AppContext>> = OnceLock::new();
 
 /// Initialize global application context once and return the canonical instance.
 pub fn init_global_app_context(context: AppContext) -> Arc<AppContext> {
-    GLOBAL_APP_CONTEXT.get_or_init(|| Arc::new(context)).clone()
+    APP_CONTEXT_SINGLETON.get_or_init(|| Arc::new(context)).clone()
 }
 
 /// Get global application context if it has been initialized.
 pub fn get_global_app_context() -> Option<Arc<AppContext>> {
-    GLOBAL_APP_CONTEXT.get().cloned()
+    APP_CONTEXT_SINGLETON.get().cloned()
 }
