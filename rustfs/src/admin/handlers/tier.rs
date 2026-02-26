@@ -18,6 +18,7 @@ use crate::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
+    app::context::{default_tier_config_interface, get_global_app_context},
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
@@ -27,7 +28,6 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::{
     config::storageclass,
-    global::GLOBAL_TierConfigMgr,
     tier::{
         tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_MISSING_CREDENTIALS},
         tier_admin::TierCreds,
@@ -45,8 +45,16 @@ use s3s::{
     s3_error,
 };
 use serde_urlencoded::from_bytes;
+use std::sync::Arc;
 use time::OffsetDateTime;
+use tokio::sync::RwLock;
 use tracing::{debug, warn};
+
+fn tier_config_mgr_from_context() -> Arc<RwLock<rustfs_ecstore::tier::tier::TierConfigMgr>> {
+    get_global_app_context()
+        .map(|context| context.tier_config().handle())
+        .unwrap_or_else(|| default_tier_config_interface().handle())
+}
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct AddTierQuery {
@@ -206,7 +214,8 @@ impl Operation for AddTier {
             &_ => (),
         }
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.add(args, force).await {
             return if err.code == ERR_TIER_ALREADY_EXISTS.code {
@@ -298,7 +307,8 @@ impl Operation for EditTier {
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.edit(&tier_name, creds).await {
             return if err.code == ERR_TIER_NOT_FOUND.code {
@@ -365,7 +375,8 @@ impl Operation for ListTiers {
         )
         .await?;
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
+        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let tier_config_mgr = tier_config_mgr_handle.read().await;
         let tiers = tier_config_mgr.list_tiers();
 
         let data = serde_json::to_vec(&tiers)
@@ -420,7 +431,8 @@ impl Operation for RemoveTier {
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.remove(&tier_name, force).await {
             return if err.code == ERR_TIER_NOT_FOUND.code {
@@ -480,7 +492,8 @@ impl Operation for VerifyTier {
         )
         .await?;
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         tier_config_mgr.verify(&query.tier.unwrap()).await;
 
         let mut header = HeaderMap::new();
@@ -521,7 +534,8 @@ impl Operation for GetTierInfo {
             }
         };
 
-        let tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
+        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let tier_config_mgr = tier_config_mgr_handle.read().await;
         let info = tier_config_mgr.get(&query.tier.unwrap());
 
         let data = serde_json::to_vec(&info)
@@ -587,7 +601,8 @@ impl Operation for ClearTier {
             return Err(s3_error!(InvalidRequest, "get rand failed"));
         };
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.clear_tier(force).await {
             warn!("tier_config_mgr clear failed, e: {:?}", err);

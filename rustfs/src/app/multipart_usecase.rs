@@ -161,10 +161,11 @@ impl DefaultMultipartUsecase {
     }
 
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
-        self.context
-            .as_ref()
-            .and_then(|context| context.bucket_metadata().handle())
-            .or_else(|| rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().cloned())
+        self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
+    }
+
+    fn global_region(&self) -> Option<String> {
+        self.context.as_ref().and_then(|context| context.region().get())
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -421,7 +422,7 @@ impl DefaultMultipartUsecase {
             }
         }
 
-        let region = rustfs_ecstore::global::get_global_region().unwrap_or_else(|| "us-east-1".to_string());
+        let region = self.global_region().unwrap_or_else(|| "us-east-1".to_string());
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),

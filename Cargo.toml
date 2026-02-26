@@ -109,7 +109,6 @@ async-compression = { version = "0.4.40" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
 axum = "0.8.8"
-axum-server = { version = "0.8.0", features = ["tls-rustls"], default-features = false }
 futures = "0.3.32"
 futures-core = "0.3.32"
 futures-util = "0.3.32"
@@ -160,7 +159,7 @@ jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 openidconnect = { version = "4.0", default-features = false }
 pbkdf2 = "0.13.0-rc.9"
 rsa = { version = "0.10.0-rc.15" }
-rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
+rustls = { version = "0.23.37", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.14.0"
 sha1 = "0.11.0-rc.5"
@@ -169,7 +168,7 @@ subtle = "2.6"
 zeroize = { version = "1.8.2", features = ["derive"] }
 
 # Time and Date
-chrono = { version = "0.4.43", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 humantime = "2.3.0"
 jiff = { version = "0.2.21", features = ["serde"] }
 time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
@@ -248,7 +247,7 @@ starshard = { version = "1.1.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.28.0", features = ["derive"] }
 sysinfo = "0.38.2"
 temp-env = "0.3.6"
-tempfile = "3.25.0"
+tempfile = "3.26.0"
 test-case = "3.3.1"
 thiserror = "2.0.18"
 tracing = { version = "0.1.44" }
@@ -278,7 +277,8 @@ opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_
 opentelemetry-stdout = { version = "0.31.0" }
 
 # FTP and SFTP
-libunftp = { version = "0.22.0", features = ["experimental"] }
+libunftp = { version = "0.23.0", features = ["experimental"] }
+unftp-core = "0.1.0"
 suppaftp = { version = "8.0.2", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.7"
 
