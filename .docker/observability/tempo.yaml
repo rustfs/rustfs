@@ -28,10 +28,6 @@ distributor:
 ingester:
   max_block_duration: 5m # cut the headblock when this much time passes. this is being set for demo purposes and should probably be left alone normally
 
-compactor:
-  compaction:
-    block_retention: 48h # overall Tempo trace retention.
-
 metrics_generator:
   registry:
     external_labels:
@@ -52,9 +48,3 @@ storage:
       path: /var/tempo/wal # where to store the wal locally
     local:
       path: /var/tempo/blocks
-
-overrides:
-  defaults:
-    metrics_generator:
-      processors: [ service-graphs, span-metrics, local-blocks ] # enables metrics generator
-      generate_native_histograms: both

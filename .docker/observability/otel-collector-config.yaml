@@ -51,6 +51,21 @@ exporters:
       num_consumers: 10
       queue_size: 5000
 
+  otlp/jaeger:
+    endpoint: "jaeger:4317"
+    tls:
+      insecure: true
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+
   prometheus:
     endpoint: "0.0.0.0:8889"
     send_timestamps: true
@@ -78,7 +93,7 @@ service:
     traces:
       receivers: [ otlp ]
       processors: [ memory_limiter, batch ]
-      exporters: [ otlp/tempo ]
+      exporters: [ otlp/tempo, otlp/jaeger ]
     metrics:
       receivers: [ otlp ]
       processors: [ batch ]

@@ -41,10 +41,11 @@ services:
     networks:
       - otel-network
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3200/ready" ]
+      test: [ "CMD-SHELL", "wget --spider -q http://localhost:3200/metrics || exit 1" ]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 40s
 
   jaeger:
     image: jaegertracing/jaeger:latest
@@ -60,13 +61,16 @@ services:
     ports:
       - "16686:16686" # Web UI
       - "14269:14269" # Admin/Metrics
+      - "4317"
+      - "4318"
     networks:
       - otel-network
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:16686" ]
+      test: [ "CMD-SHELL", "wget --spider -q http://localhost:14269 || exit 1" ]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 20s
 
   # --- Metrics ---
 
@@ -95,7 +99,7 @@ services:
     networks:
       - otel-network
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy" ]
+      test: [ "CMD-SHELL", "wget --spider -q http://localhost:9090/-/healthy || exit 1" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -115,10 +119,11 @@ services:
     networks:
       - otel-network
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3100/ready" ]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      test: [ "CMD-SHELL", "wget --spider -q http://localhost:3100/metrics || exit 1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   # --- Collection ---
 
@@ -139,17 +144,16 @@ services:
     networks:
       - otel-network
     depends_on:
-      tempo:
-        condition: service_healthy
-      prometheus:
-        condition: service_healthy
-      loki:
-        condition: service_healthy
+      - tempo
+      - jaeger
+      - prometheus
+      - loki
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:13133" ]
+      test: [ "CMD-SHELL", "wget --spider -q http://localhost:13133 || exit 1" ]
       interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 20s
 
   # --- Visualization ---
 
@@ -160,6 +164,7 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning
       - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - ./grafana-data:/var/lib/grafana
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_SECURITY_ADMIN_USER=admin
@@ -174,7 +179,7 @@ services:
       - tempo
       - loki
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health" ]
+      test: [ "CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -184,11 +189,12 @@ volumes:
   tempo-data:
   loki-data:
   jaeger-data:
+  grafana-data:
 
 networks:
   otel-network:
     driver: bridge
-    name: "network_otel_config"
+    name: "network_otel"
     ipam:
       config:
         - subnet: 172.28.0.0/16

@@ -46,7 +46,7 @@ datasources:
       tracesToLogs:
         datasourceUid: loki
         tags: [ 'job', 'instance', 'pod', 'namespace', 'service.name' ]
-        mappedTags: [{ key: 'service.name', value: 'app' }]
+        mappedTags: [ { key: 'service.name', value: 'app' } ]
         spanStartTimeShift: '1s'
         spanEndTimeShift: '-1s'
         filterByTraceID: true
@@ -67,7 +67,6 @@ datasources:
   - name: Loki
     type: loki
     uid: loki
-    access: proxy
     orgId: 1
     url: http://loki:3100
     isDefault: false
@@ -91,7 +90,7 @@ datasources:
       tracesToLogs:
         datasourceUid: loki
         tags: [ 'job', 'instance', 'pod', 'namespace', 'service.name' ]
-        mappedTags: [{ key: 'service.name', value: 'app' }]
+        mappedTags: [ { key: 'service.name', value: 'app' } ]
         spanStartTimeShift: '1s'
         spanEndTimeShift: '-1s'
         filterByTraceID: true
