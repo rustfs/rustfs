@@ -29,7 +29,7 @@ use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::ReplicationConfiguration;
 use s3s::dto::{
     BucketLifecycleConfiguration, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
-    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
+    PublicAccessBlockConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
 };
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -105,6 +105,13 @@ pub async fn get_bucket_policy_raw(bucket: &str) -> Result<(String, OffsetDateTi
     bucket_meta_sys.get_bucket_policy_raw(bucket).await
 }
 
+pub async fn get_bucket_acl_config(bucket: &str) -> Result<(String, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_bucket_acl_config(bucket).await
+}
+
 pub async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
@@ -131,6 +138,13 @@ pub async fn get_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_tagging_config(bucket).await
+}
+
+pub async fn get_public_access_block_config(bucket: &str) -> Result<(PublicAccessBlockConfiguration, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_public_access_block_config(bucket).await
 }
 
 pub async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
@@ -478,11 +492,31 @@ impl BucketMetadataSys {
         }
     }
 
+    pub async fn get_bucket_acl_config(&self, bucket: &str) -> Result<(String, OffsetDateTime)> {
+        let (bm, _) = self.get_config(bucket).await?;
+
+        if let Some(config) = &bm.bucket_acl_config {
+            Ok((config.clone(), bm.bucket_acl_config_updated_at))
+        } else {
+            Err(Error::ConfigNotFound)
+        }
+    }
+
     pub async fn get_tagging_config(&self, bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.tagging_config {
             Ok((config.clone(), bm.tagging_config_updated_at))
+        } else {
+            Err(Error::ConfigNotFound)
+        }
+    }
+
+    pub async fn get_public_access_block_config(&self, bucket: &str) -> Result<(PublicAccessBlockConfiguration, OffsetDateTime)> {
+        let (bm, _) = self.get_config(bucket).await?;
+
+        if let Some(config) = &bm.public_access_block_config {
+            Ok((config.clone(), bm.public_access_block_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
         }

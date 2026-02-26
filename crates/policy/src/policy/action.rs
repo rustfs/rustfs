@@ -218,6 +218,8 @@ pub enum S3Action {
     ForceDeleteBucketAction,
     #[strum(serialize = "s3:DeleteBucketPolicy")]
     DeleteBucketPolicyAction,
+    #[strum(serialize = "s3:DeleteBucketPublicAccessBlock")]
+    DeleteBucketPublicAccessBlockAction,
     #[strum(serialize = "s3:DeleteBucketCors")]
     DeleteBucketCorsAction,
     #[strum(serialize = "s3:DeleteObject")]
@@ -228,10 +230,18 @@ pub enum S3Action {
     GetBucketNotificationAction,
     #[strum(serialize = "s3:GetBucketPolicy")]
     GetBucketPolicyAction,
+    #[strum(serialize = "s3:GetBucketPublicAccessBlock")]
+    GetBucketPublicAccessBlockAction,
     #[strum(serialize = "s3:GetBucketCors")]
     GetBucketCorsAction,
+    #[strum(serialize = "s3:GetBucketAcl")]
+    GetBucketAclAction,
+    #[strum(serialize = "s3:PutBucketAcl")]
+    PutBucketAclAction,
     #[strum(serialize = "s3:GetObject")]
     GetObjectAction,
+    #[strum(serialize = "s3:GetObjectAcl")]
+    GetObjectAclAction,
     #[strum(serialize = "s3:GetObjectAttributes")]
     GetObjectAttributesAction,
     #[strum(serialize = "s3:HeadBucket")]
@@ -260,10 +270,14 @@ pub enum S3Action {
     PutBucketNotificationAction,
     #[strum(serialize = "s3:PutBucketPolicy")]
     PutBucketPolicyAction,
+    #[strum(serialize = "s3:PutBucketPublicAccessBlock")]
+    PutBucketPublicAccessBlockAction,
     #[strum(serialize = "s3:PutBucketCors")]
     PutBucketCorsAction,
     #[strum(serialize = "s3:PutObject")]
     PutObjectAction,
+    #[strum(serialize = "s3:PutObjectAcl")]
+    PutObjectAclAction,
     #[strum(serialize = "s3:DeleteObjectVersion")]
     DeleteObjectVersionAction,
     #[strum(serialize = "s3:DeleteObjectVersionTagging")]
