@@ -75,7 +75,7 @@ pub trait EndpointsInterface: Send + Sync {
 
 /// Region interface for application-layer use-cases.
 pub trait RegionInterface: Send + Sync {
-    fn get(&self) -> Option<String>;
+    fn get(&self) -> Option<s3s::region::Region>;
 }
 
 /// Tier config interface for application-layer and admin handlers.
@@ -190,7 +190,7 @@ impl EndpointsInterface for EndpointsHandle {
 pub struct RegionHandle;
 
 impl RegionInterface for RegionHandle {
-    fn get(&self) -> Option<String> {
+    fn get(&self) -> Option<s3s::region::Region> {
         get_global_region()
     }
 }

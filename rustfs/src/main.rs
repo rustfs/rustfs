@@ -164,7 +164,10 @@ async fn run(config: config::Config) -> Result<()> {
     let readiness = Arc::new(GlobalReadiness::new());
 
     if let Some(region) = &config.region {
-        rustfs_ecstore::global::set_global_region(region.clone());
+        let region = region
+            .parse()
+            .map_err(|e| Error::other(format!("invalid region {}: {e}", region)))?;
+        rustfs_ecstore::global::set_global_region(region);
     }
 
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
