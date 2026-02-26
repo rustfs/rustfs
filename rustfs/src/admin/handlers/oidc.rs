@@ -327,17 +327,32 @@ fn extract_request_host(req: &S3Request<Body>) -> S3Result<String> {
             let v = v.trim();
             if v.is_empty() { None } else { Some(v.to_owned()) }
         })
-        .or_else(|| req.uri.host().map(str::to_owned))
+        .or_else(|| req.uri.authority().map(|a| a.as_str().to_owned()))
         .ok_or_else(|| s3_error!(InvalidRequest, "cannot determine host for redirect URI"))?;
 
-    // Reject host injection with path separators and validate host syntax.
-    if host.contains('/') || host.contains('\\') {
+    parse_host_authority(&host)
+}
+
+fn parse_host_authority(raw_host: &str) -> S3Result<String> {
+    let host = raw_host.trim();
+    if host.is_empty() {
+        return Err(s3_error!(InvalidRequest, "invalid host header"));
+    }
+
+    // Parse as authority to normalize and validate, while rejecting URL-style
+    // constructions (userinfo, query, fragment, and explicit paths).
+    let parsed = Url::parse(&format!("http://{host}")).map_err(|_| s3_error!(InvalidRequest, "invalid host header"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(s3_error!(InvalidRequest, "invalid host header"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(s3_error!(InvalidRequest, "invalid host header"));
+    }
+    if parsed.path() != "/" {
         return Err(s3_error!(InvalidRequest, "invalid host"));
     }
 
-    Url::parse(&format!("http://{host}")).map_err(|_| s3_error!(InvalidRequest, "invalid host header"))?;
-
-    Ok(host)
+    Ok(parsed.authority().to_string())
 }
 
 #[cfg(test)]
@@ -371,6 +386,30 @@ mod tests {
     fn test_extract_query_param_encoded() {
         let uri: http::Uri = "http://localhost/callback?redirect_after=%2Fdashboard".parse().unwrap();
         assert_eq!(extract_query_param(&uri, "redirect_after"), Some("/dashboard".to_string()));
+    }
+
+    #[test]
+    fn test_parse_host_authority_rejects_userinfo() {
+        assert!(parse_host_authority("evil.com@victim.com").is_err());
+    }
+
+    #[test]
+    fn test_parse_host_authority_rejects_query_fragment() {
+        assert!(parse_host_authority("example.com?x=y").is_err());
+        assert!(parse_host_authority("example.com#fragment").is_err());
+    }
+
+    #[test]
+    fn test_parse_host_authority_rejects_path() {
+        assert!(parse_host_authority("example.com/path").is_err());
+    }
+
+    #[test]
+    fn test_parse_host_authority_accepts_valid_host_with_port() {
+        assert_eq!(
+            parse_host_authority("example.com:8443").expect("valid host should pass"),
+            "example.com:8443"
+        );
     }
 
     #[test]

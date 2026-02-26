@@ -13,12 +13,15 @@
 // limitations under the License.
 
 use moka::future::Cache;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 const OIDC_STATE_CAPACITY: u64 = 10_000;
 const OIDC_STATE_CAPACITY_WARNING: u64 = 9_000;
 const OIDC_STATE_CAPACITY_CRITICAL: u64 = 10_000;
+const OIDC_STATE_CAPACITY_LOG_INTERVAL_SECS: u64 = 60;
 
 /// Stores the PKCE verifier and nonce for an in-flight OIDC authorization flow.
 #[derive(Debug, Clone)]
@@ -34,6 +37,7 @@ pub struct OidcAuthSession {
 #[derive(Clone)]
 pub struct OidcStateStore {
     cache: Cache<String, OidcAuthSession>,
+    last_capacity_log_at: Arc<AtomicU64>,
 }
 
 impl OidcStateStore {
@@ -42,19 +46,46 @@ impl OidcStateStore {
             .max_capacity(OIDC_STATE_CAPACITY)
             .time_to_live(Duration::from_secs(300)) // 5 minute TTL
             .build();
-        Self { cache }
+        Self {
+            cache,
+            last_capacity_log_at: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Store a new auth session keyed by the OAuth2 `state` parameter.
     pub async fn insert(&self, state: String, session: OidcAuthSession) {
         self.cache.insert(state, session).await;
-        self.cache.run_pending_tasks().await;
         let size = self.cache.entry_count();
+
+        if !Self::should_log_capacity_warning(&self.last_capacity_log_at) {
+            return;
+        }
+
         if size >= OIDC_STATE_CAPACITY_CRITICAL {
+            self.cache.run_pending_tasks().await;
             warn!("OIDC state store reached configured capacity ({size}/{OIDC_STATE_CAPACITY})");
-        } else if size >= OIDC_STATE_CAPACITY_WARNING {
+            return;
+        }
+
+        if size >= OIDC_STATE_CAPACITY_WARNING {
+            self.cache.run_pending_tasks().await;
             warn!("OIDC state store approaching capacity ({size}/{OIDC_STATE_CAPACITY})");
         }
+    }
+
+    fn now_unix_secs() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    }
+
+    fn should_log_capacity_warning(last_log_at: &AtomicU64) -> bool {
+        let now = Self::now_unix_secs();
+        let last = last_log_at.load(Ordering::Acquire);
+        if now.saturating_sub(last) < OIDC_STATE_CAPACITY_LOG_INTERVAL_SECS {
+            return false;
+        }
+        last_log_at
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Retrieve and remove an auth session (single-use). Returns None if expired or not found.
