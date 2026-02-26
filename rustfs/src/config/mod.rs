@@ -15,8 +15,10 @@
 use clap::Parser;
 use clap::builder::NonEmptyStringValueParser;
 use const_str::concat;
+use rustfs_config::RUSTFS_REGION;
 use std::path::PathBuf;
 use std::string::ToString;
+
 shadow_rs::shadow!(build);
 
 pub mod workload_profiles;
@@ -124,11 +126,7 @@ pub struct Opt {
     #[arg(long, env = "RUSTFS_LICENSE")]
     pub license: Option<String>,
 
-    #[arg(
-        long,
-        default_value_t = rustfs_config::RUSTFS_REGION.to_string(),
-        env = "RUSTFS_REGION"
-    )]
+    #[arg(long, env = "RUSTFS_REGION")]
     pub region: Option<String>,
 
     /// Enable KMS encryption for server-side encryption
@@ -286,6 +284,9 @@ impl Config {
             .trim()
             .to_string();
 
+        // Region is optional, but if not set, we should default to "rustfs-global-0" for signing compatibility with AWS S3 clients
+        let region = region.or_else(|| Some(RUSTFS_REGION.to_string()));
+
         Ok(Config {
             volumes,
             address,
@@ -335,15 +336,3 @@ impl std::fmt::Debug for Config {
             .finish()
     }
 }
-
-// lazy_static::lazy_static! {
-//     pub(crate)  static ref OPT: OnceLock<Opt> = OnceLock::new();
-// }
-
-// pub fn init_config(opt: Opt) {
-//     OPT.set(opt).expect("Failed to set global config");
-// }
-
-// pub fn get_config() -> &'static Opt {
-//     OPT.get().expect("Global config not initialized")
-// }
