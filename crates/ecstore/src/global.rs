@@ -150,6 +150,14 @@ pub fn get_global_endpoints() -> EndpointServerPools {
     }
 }
 
+pub fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
+    GLOBAL_Endpoints.get().cloned()
+}
+
+pub fn get_global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
+    GLOBAL_TierConfigMgr.clone()
+}
+
 /// Create a new object layer instance
 ///
 /// # Returns

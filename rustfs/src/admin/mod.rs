@@ -24,7 +24,9 @@ mod console_test;
 #[cfg(test)]
 mod route_registration_test;
 
-use handlers::{bucket_meta, heal, health, kms, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user};
+use handlers::{
+    bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user,
+};
 use router::{AdminOperation, S3Router};
 use rpc::register_rpc_route;
 use s3s::route::S3Route;
@@ -58,6 +60,7 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
     replication::register_replication_route(&mut r)?;
     profile_admin::register_profiling_route(&mut r)?;
     kms::register_kms_route(&mut r)?;
+    oidc::register_oidc_route(&mut r)?;
 
     Ok(r)
 }

@@ -27,7 +27,7 @@ use crate::{
         router::{AdminOperation, Operation, S3Router},
     },
     app::admin_usecase::{DefaultAdminUsecase, QueryPoolStatusRequest},
-    app::context::get_global_app_context,
+    app::context::resolve_endpoints_handle,
     auth::{check_key_valid, get_session_token},
     error::ApiError,
     server::{ADMIN_PREFIX, RemoteAddr},
@@ -36,7 +36,7 @@ use hyper::Method;
 use rustfs_ecstore::new_object_layer_fn;
 
 fn endpoints_from_context() -> Option<rustfs_ecstore::endpoints::EndpointServerPools> {
-    get_global_app_context().and_then(|context| context.endpoints().handle())
+    resolve_endpoints_handle()
 }
 
 pub fn register_pool_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {

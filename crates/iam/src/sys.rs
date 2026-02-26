@@ -767,11 +767,36 @@ impl<T: Store> IamSys<T> {
                     }
                 },
             };
-            let Ok(p) = self.policy_db_get(parent_user, &effective_groups).await else { return false };
+            let p = self.policy_db_get(parent_user, &effective_groups).await.unwrap_or_default();
             (effective_groups, groups_source, p)
         };
 
         if !is_owner && policies.is_empty() {
+            // For OIDC/STS users, policies may be specified in JWT claims rather than IAM DB.
+            // Resolve claim-based policy names against built-in default policies.
+            if let Some(claim_policies) = args.claims.get("policy").and_then(|v| v.as_str()) {
+                use rustfs_policy::policy::default::DEFAULT_POLICIES;
+                let mut resolved = Vec::new();
+                for policy_name in claim_policies.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    if !Self::is_safe_claim_policy_name(policy_name) {
+                        continue;
+                    }
+                    for (name, p) in DEFAULT_POLICIES.iter() {
+                        if *name == policy_name {
+                            resolved.push(p.clone());
+                            break;
+                        }
+                    }
+                }
+                if !resolved.is_empty() {
+                    let combined = Policy::merge_policies(resolved);
+                    let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
+                    if has_session_policy {
+                        return is_allowed_sp && combined.is_allowed(args).await;
+                    }
+                    return combined.is_allowed(args).await;
+                }
+            }
             return false;
         }
 
@@ -803,6 +828,10 @@ impl<T: Store> IamSys<T> {
         }
 
         is_owner || combined_policy.is_allowed(args).await
+    }
+
+    fn is_safe_claim_policy_name(policy: &str) -> bool {
+        !policy.is_empty() && policy.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
 
     pub async fn is_allowed_service_account(&self, args: &Args<'_>, parent_user: &str) -> bool {

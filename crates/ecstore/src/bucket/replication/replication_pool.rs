@@ -977,6 +977,10 @@ pub async fn init_background_replication<S: StorageAPI>(storage: Arc<S>) {
     assert!(GLOBAL_REPLICATION_POOL.get().is_some());
 }
 
+pub fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
+    GLOBAL_REPLICATION_POOL.get().cloned()
+}
+
 pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc: ReplicateDecision, op_type: ReplicationType) {
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());

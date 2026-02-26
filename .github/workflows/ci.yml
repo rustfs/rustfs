@@ -130,6 +130,9 @@ jobs:
       - name: Run clippy lints
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Check layered dependencies
+        run: ./scripts/check_layer_dependencies.sh
+
   e2e-tests:
     name: End-to-End Tests
     needs: skip-check
