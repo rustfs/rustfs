@@ -13,14 +13,17 @@
 // limitations under the License.
 
 use crate::admin::router::Operation;
-use crate::auth::{check_key_valid, get_session_token};
+use crate::auth::{check_key_valid, constant_time_eq, get_condition_values, get_session_token};
 use http::{HeaderMap, HeaderValue};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_credentials::get_global_action_cred;
+use rustfs_policy::policy::Args;
+use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize)]
 pub struct IsAdminResponse {
@@ -43,12 +46,32 @@ impl Operation for IsAdminHandler {
 
         let access_key_to_check = input_cred.access_key.clone();
 
-        // Check if the user is admin by comparing with global credentials
+        // Check if the user is admin: root user check, then evaluate through the policy engine
         let is_admin = if let Some(sys_cred) = get_global_action_cred() {
-            crate::auth::constant_time_eq(&access_key_to_check, &sys_cred.access_key)
-                || crate::auth::constant_time_eq(&cred.parent_user, &sys_cred.access_key)
+            constant_time_eq(&access_key_to_check, &sys_cred.access_key)
+                || constant_time_eq(&cred.parent_user, &sys_cred.access_key)
         } else {
             false
+        };
+
+        let is_admin = if is_admin {
+            true
+        } else {
+            let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "iam not init"))?;
+            let conditions = get_condition_values(&req.headers, &cred, None, None, None);
+            iam_store
+                .is_allowed(&Args {
+                    account: &cred.access_key,
+                    groups: &cred.groups,
+                    action: Action::AdminAction(AdminAction::AllAdminActions),
+                    conditions: &conditions,
+                    is_owner: false,
+                    claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                    deny_only: false,
+                    bucket: "",
+                    object: "",
+                })
+                .await
         };
 
         let response = IsAdminResponse {
