@@ -15,7 +15,7 @@
 //! Multipart application use-case contracts.
 #![allow(dead_code)]
 
-use crate::app::context::{get_global_app_context, AppContext};
+use crate::app::context::{AppContext, get_global_app_context};
 use crate::error::ApiError;
 use crate::storage::concurrency::get_concurrency_manager;
 use crate::storage::ecfs::RUSTFS_OWNER;
@@ -28,6 +28,7 @@ use crate::storage::*;
 use bytes::Bytes;
 use futures::StreamExt;
 use rustfs_config::RUSTFS_REGION;
+use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     metadata_sys,
@@ -36,21 +37,20 @@ use rustfs_ecstore::bucket::{
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::is_compressible;
-use rustfs_ecstore::error::{is_err_object_not_found, is_err_version_not_found, StorageError};
+use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::set_disk::{is_valid_storage_class, MAX_PARTS_COUNT};
+use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
 use rustfs_ecstore::store_api::{CompletePart, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
-use rustfs_ecstore::StorageAPI;
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
 use rustfs_targets::EventName;
-use rustfs_utils::http::{
-    headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
-    AMZ_CHECKSUM_TYPE,
-};
 use rustfs_utils::CompressionAlgorithm;
+use rustfs_utils::http::{
+    AMZ_CHECKSUM_TYPE,
+    headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
+};
 use s3s::dto::*;
-use s3s::{s3_error, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;

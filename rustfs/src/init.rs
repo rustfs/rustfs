@@ -17,7 +17,7 @@ use crate::{admin, config, version};
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_notify::notifier_global;
-use rustfs_targets::arn::{TargetIDError, ARN};
+use rustfs_targets::arn::{ARN, TargetIDError};
 use s3s::s3_error;
 use std::env;
 use std::io::Error;
@@ -50,7 +50,7 @@ pub(crate) fn init_update_check() {
 
     // Async update check with timeout
     tokio::spawn(async {
-        use crate::update::{check_updates, UpdateCheckError};
+        use crate::update::{UpdateCheckError, check_updates};
 
         // Add timeout to prevent hanging network calls
         match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
@@ -291,7 +291,7 @@ pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<
 /// * `config` - The application configuration options
 pub(crate) fn init_buffer_profile_system(config: &config::Config) {
     use crate::config::workload_profiles::{
-        init_global_buffer_config, set_buffer_profile_enabled, RustFSBufferConfig, WorkloadProfile,
+        RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
     };
 
     if config.buffer_profile_disable {
