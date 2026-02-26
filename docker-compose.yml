@@ -106,7 +106,37 @@ services:
     profiles:
       - dev
 
-  # OpenTelemetry Collector
+  # --- Observability Stack ---
+
+  tempo-init:
+    image: busybox:latest
+    command: [ "sh", "-c", "chown -R 10001:10001 /var/tempo" ]
+    volumes:
+      - tempo_data:/var/tempo
+    user: root
+    networks:
+      - rustfs-network
+    restart: "no"
+    profiles:
+      - observability
+
+  tempo:
+    image: grafana/tempo:latest
+    user: "10001"
+    command: [ "-config.file=/etc/tempo.yaml" ]
+    volumes:
+      - ./.docker/observability/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    ports:
+      - "3200:3200" # tempo
+      - "4317"      # otlp grpc
+      - "4318"      # otlp http
+    restart: unless-stopped
+    networks:
+      - rustfs-network
+    profiles:
+      - observability
+
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
     container_name: otel-collector
@@ -115,32 +145,45 @@ services:
     volumes:
       - ./.docker/observability/otel-collector-config.yaml:/etc/otelcol-contrib/otel-collector.yml:ro
     ports:
-      - "4317:4317" # OTLP gRPC receiver
-      - "4318:4318" # OTLP HTTP receiver
-      - "8888:8888" # Prometheus metrics
-      - "8889:8889" # Prometheus exporter metrics
+      - "1888:1888"   # pprof
+      - "8888:8888"   # Prometheus metrics for Collector
+      - "8889:8889"   # Prometheus metrics for application indicators
+      - "13133:13133" # health check
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "55679:55679" # zpages
     networks:
       - rustfs-network
     restart: unless-stopped
     profiles:
       - observability
+    depends_on:
+      - tempo
+      - jaeger
+      - prometheus
+      - loki
 
-  # Jaeger for tracing
   jaeger:
-    image: jaegertracing/all-in-one:latest
+    image: jaegertracing/jaeger:latest
     container_name: jaeger
-    ports:
-      - "16686:16686" # Jaeger UI
-      - "14250:14250" # Jaeger gRPC
     environment:
+      - TZ=Asia/Shanghai
+      - SPAN_STORAGE_TYPE=badger
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_DIRECTORY_KEY=/badger/key
       - COLLECTOR_OTLP_ENABLED=true
+    volumes:
+      - jaeger_data:/badger
+    ports:
+      - "16686:16686" # Web UI
+      - "14269:14269" # Admin/Metrics
     networks:
       - rustfs-network
     restart: unless-stopped
     profiles:
       - observability
 
-  # Prometheus for metrics
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
@@ -152,17 +195,35 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
-      - "--web.console.libraries=/etc/prometheus/console_libraries"
-      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
       - "--storage.tsdb.retention.time=200h"
       - "--web.enable-lifecycle"
+      - "--web.enable-otlp-receiver"
+      - "--web.enable-remote-write-receiver"
     networks:
       - rustfs-network
     restart: unless-stopped
     profiles:
       - observability
 
-  # Grafana for visualization
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./.docker/observability/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - rustfs-network
+    restart: unless-stopped
+    profiles:
+      - observability
+
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
@@ -171,6 +232,7 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-pyroscope-datasource
     volumes:
       - grafana_data:/var/lib/grafana
       - ./.docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -180,6 +242,10 @@ services:
     restart: unless-stopped
     profiles:
       - observability
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
 
   # NGINX reverse proxy (optional)
   nginx:
@@ -227,6 +293,12 @@ volumes:
   prometheus_data:
     driver: local
   grafana_data:
+    driver: local
+  tempo_data:
+    driver: local
+  loki_data:
+    driver: local
+  jaeger_data:
     driver: local
   logs:
     driver: local
