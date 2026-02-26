@@ -12,9 +12,16 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use crate::app::context::{default_server_config_interface, get_global_app_context};
 use rustfs_config::DEFAULT_DELIMITER;
-use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use tracing::{error, info, instrument, warn};
+
+fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
+    match get_global_app_context() {
+        Some(context) => context.server_config().get(),
+        None => default_server_config_interface().get(),
+    }
+}
 
 /// Shuts down the event notifier system gracefully
 pub(crate) async fn shutdown_event_notifier() {
@@ -46,8 +53,8 @@ pub(crate) async fn init_event_notifier() {
     );
 
     // 1. Get the global configuration loaded by ecstore
-    let server_config = match GLOBAL_SERVER_CONFIG.get() {
-        Some(config) => config.clone(), // Clone the config to pass ownership
+    let server_config = match server_config_from_context() {
+        Some(config) => config,
         None => {
             warn!("Event notifier initialization failed: Global server config not loaded.");
             return;

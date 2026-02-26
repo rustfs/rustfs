@@ -17,10 +17,8 @@ use http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::sys::IamSys;
-use rustfs_policy::policy::Args;
-use rustfs_policy::policy::action::Action;
-use s3s::S3Result;
-use s3s::s3_error;
+use rustfs_policy::policy::{Args, action::Action};
+use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -52,15 +50,14 @@ pub async fn validate_admin_request(
         remote_addr,
     };
 
-    for action in actions {
-        match check_admin_request_auth(iam_store.clone(), &ctx, action, "", "").await {
-            Ok(_) => return Ok(()),
-            Err(_) => {
-                continue;
-            }
+    for action in &actions {
+        if check_admin_request_auth(iam_store.clone(), &ctx, *action, "", "")
+            .await
+            .is_ok()
+        {
+            return Ok(());
         }
     }
-
     Err(s3_error!(AccessDenied, "Access Denied"))
 }
 
@@ -113,14 +110,13 @@ pub async fn validate_admin_request_with_bucket(
         remote_addr,
     };
 
-    for action in actions {
-        match check_admin_request_auth(iam_store.clone(), &ctx, action, bucket, "").await {
-            Ok(_) => return Ok(()),
-            Err(_) => {
-                continue;
-            }
+    for action in &actions {
+        if check_admin_request_auth(iam_store.clone(), &ctx, *action, bucket, "")
+            .await
+            .is_ok()
+        {
+            return Ok(());
         }
     }
-
     Err(s3_error!(AccessDenied, "Access Denied"))
 }

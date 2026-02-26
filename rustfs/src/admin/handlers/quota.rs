@@ -16,16 +16,20 @@
 
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::get_global_app_context;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
+use rustfs_ecstore::bucket::metadata_sys::BucketMetadataSys;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +84,25 @@ pub struct GetBucketQuotaHandler;
 pub struct ClearBucketQuotaHandler;
 pub struct GetBucketQuotaStatsHandler;
 pub struct CheckBucketQuotaHandler;
+
+fn bucket_metadata_from_context() -> Option<Arc<RwLock<BucketMetadataSys>>> {
+    get_global_app_context().and_then(|context| context.bucket_metadata().handle())
+}
+
+async fn current_usage_from_context(bucket: &str) -> u64 {
+    let Some(store) = get_global_app_context().map(|context| context.object_store()) else {
+        return 0;
+    };
+
+    match rustfs_ecstore::data_usage::load_data_usage_from_backend(store).await {
+        Ok(data_usage_info) => data_usage_info
+            .buckets_usage
+            .get(bucket)
+            .map(|bucket_usage| bucket_usage.size)
+            .unwrap_or(0),
+        Err(_) => 0,
+    }
+}
 
 pub fn register_quota_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -164,8 +187,7 @@ impl Operation for SetBucketQuotaHandler {
 
         let quota = BucketQuota::new(request.quota);
 
-        let metadata_sys_lock = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys
-            .get()
+        let metadata_sys_lock = bucket_metadata_from_context()
             .ok_or_else(|| s3_error!(InternalError, "{}", rustfs_config::QUOTA_METADATA_SYSTEM_ERROR_MSG))?;
         let mut quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
@@ -175,18 +197,7 @@ impl Operation for SetBucketQuotaHandler {
             .map_err(|e| s3_error!(InternalError, "Failed to set quota: {}", e))?;
 
         // Get real-time usage from data usage system
-        let current_usage = if let Some(store) = rustfs_ecstore::global::GLOBAL_OBJECT_API.get() {
-            match rustfs_ecstore::data_usage::load_data_usage_from_backend(store.clone()).await {
-                Ok(data_usage_info) => data_usage_info
-                    .buckets_usage
-                    .get(&bucket)
-                    .map(|bucket_usage| bucket_usage.size)
-                    .unwrap_or(0),
-                Err(_) => 0,
-            }
-        } else {
-            0
-        };
+        let current_usage = current_usage_from_context(&bucket).await;
 
         let response = BucketQuotaResponse {
             bucket,
@@ -231,9 +242,8 @@ impl Operation for GetBucketQuotaHandler {
         )
         .await?;
 
-        let metadata_sys_lock = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys
-            .get()
-            .ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
+        let metadata_sys_lock =
+            bucket_metadata_from_context().ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
 
         let quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
@@ -288,9 +298,8 @@ impl Operation for ClearBucketQuotaHandler {
 
         info!("Clearing quota for bucket: {}", bucket);
 
-        let metadata_sys_lock = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys
-            .get()
-            .ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
+        let metadata_sys_lock =
+            bucket_metadata_from_context().ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
 
         let mut quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
@@ -304,18 +313,7 @@ impl Operation for ClearBucketQuotaHandler {
         info!("Successfully cleared quota for bucket: {}", bucket);
 
         // Get real-time usage from data usage system
-        let current_usage = if let Some(store) = rustfs_ecstore::global::GLOBAL_OBJECT_API.get() {
-            match rustfs_ecstore::data_usage::load_data_usage_from_backend(store.clone()).await {
-                Ok(data_usage_info) => data_usage_info
-                    .buckets_usage
-                    .get(&bucket)
-                    .map(|bucket_usage| bucket_usage.size)
-                    .unwrap_or(0),
-                Err(_) => 0,
-            }
-        } else {
-            0
-        };
+        let current_usage = current_usage_from_context(&bucket).await;
 
         let response = BucketQuotaResponse {
             bucket,
@@ -360,9 +358,8 @@ impl Operation for GetBucketQuotaStatsHandler {
         )
         .await?;
 
-        let metadata_sys_lock = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys
-            .get()
-            .ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
+        let metadata_sys_lock =
+            bucket_metadata_from_context().ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
 
         let quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
@@ -445,9 +442,8 @@ impl Operation for CheckBucketQuotaHandler {
             bucket, request.operation_type, request.operation_size
         );
 
-        let metadata_sys_lock = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys
-            .get()
-            .ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
+        let metadata_sys_lock =
+            bucket_metadata_from_context().ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
 
         let quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 

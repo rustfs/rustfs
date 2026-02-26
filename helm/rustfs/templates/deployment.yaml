@@ -100,12 +100,10 @@ spec:
           livenessProbe:
             {{- omit .Values.livenessProbe "enabled" | toYaml | nindent 12 }}
           {{- end }}
-
           {{- if .Values.readinessProbe.enabled }}
           readinessProbe:
             {{- omit .Values.readinessProbe "enabled" | toYaml | nindent 12 }}
           {{- end }}
-          
           volumeMounts:
             - name: logs
               mountPath: {{ $logDir }}

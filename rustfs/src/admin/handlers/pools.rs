@@ -14,7 +14,6 @@
 
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
-use rustfs_ecstore::{GLOBAL_Endpoints, new_object_layer_fn};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
@@ -27,11 +26,18 @@ use crate::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
+    app::admin_usecase::{DefaultAdminUsecase, QueryPoolStatusRequest},
+    app::context::get_global_app_context,
     auth::{check_key_valid, get_session_token},
     error::ApiError,
     server::{ADMIN_PREFIX, RemoteAddr},
 };
 use hyper::Method;
+use rustfs_ecstore::new_object_layer_fn;
+
+fn endpoints_from_context() -> Option<rustfs_ecstore::endpoints::EndpointServerPools> {
+    get_global_app_context().and_then(|context| context.endpoints().handle())
+}
 
 pub fn register_pool_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -90,25 +96,8 @@ impl Operation for ListPools {
         )
         .await?;
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let Some(endpoints) = GLOBAL_Endpoints.get() else {
-            return Err(s3_error!(NotImplemented));
-        };
-
-        if endpoints.legacy() {
-            return Err(s3_error!(NotImplemented));
-        }
-
-        let mut pools_status = Vec::new();
-
-        for (idx, _) in endpoints.as_ref().iter().enumerate() {
-            let state = store.status(idx).await.map_err(ApiError::from)?;
-
-            pools_status.push(state);
-        }
+        let usecase = DefaultAdminUsecase::from_global();
+        let pools_status = usecase.execute_list_pool_statuses().await.map_err(S3Error::from)?;
 
         let data = serde_json::to_vec(&pools_status)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
@@ -157,14 +146,6 @@ impl Operation for StatusPool {
         )
         .await?;
 
-        let Some(endpoints) = GLOBAL_Endpoints.get() else {
-            return Err(s3_error!(NotImplemented));
-        };
-
-        if endpoints.legacy() {
-            return Err(s3_error!(NotImplemented));
-        }
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: StatusPoolQuery =
@@ -175,27 +156,14 @@ impl Operation for StatusPool {
             }
         };
 
-        let is_byid = query.by_id.as_str() == "true";
-
-        let has_idx = {
-            if is_byid {
-                let a = query.pool.parse::<usize>().unwrap_or_default();
-                if a < endpoints.as_ref().len() { Some(a) } else { None }
-            } else {
-                endpoints.get_pool_idx(&query.pool)
-            }
-        };
-
-        let Some(idx) = has_idx else {
-            warn!("specified pool {} not found, please specify a valid pool", &query.pool);
-            return Err(s3_error!(InvalidArgument));
-        };
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let pools_status = store.status(idx).await.map_err(ApiError::from)?;
+        let usecase = DefaultAdminUsecase::from_global();
+        let pools_status = usecase
+            .execute_query_pool_status(QueryPoolStatusRequest {
+                pool: query.pool,
+                by_id: query.by_id.as_str() == "true",
+            })
+            .await
+            .map_err(S3Error::from)?;
 
         let data = serde_json::to_vec(&pools_status)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
@@ -233,7 +201,7 @@ impl Operation for StartDecommission {
         )
         .await?;
 
-        let Some(endpoints) = GLOBAL_Endpoints.get() else {
+        let Some(endpoints) = endpoints_from_context() else {
             return Err(s3_error!(NotImplemented));
         };
 
@@ -332,7 +300,7 @@ impl Operation for CancelDecommission {
         )
         .await?;
 
-        let Some(endpoints) = GLOBAL_Endpoints.get() else {
+        let Some(endpoints) = endpoints_from_context() else {
             return Err(s3_error!(NotImplemented));
         };
 

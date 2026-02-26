@@ -64,6 +64,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/add-user"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-user-status"));
     assert_route(&router, Method::GET, &admin_path("/v3/groups"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/group/test-group"));
     assert_route(&router, Method::PUT, &admin_path("/v3/update-group-members"));
     assert_route(&router, Method::PUT, &admin_path("/v3/add-service-accounts"));
     assert_route(&router, Method::GET, &admin_path("/v3/export-iam"));
@@ -97,5 +98,6 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/kms/create-key"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/configure"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/keys"));
+    assert_route(&router, Method::GET, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys/test-key"));
 }

@@ -38,6 +38,7 @@ http.workspace = true
 object_store = { workspace = true }
 pin-project-lite.workspace = true
 s3s.workspace = true
+serde_json = { workspace = true }
 snafu = { workspace = true, features = ["backtrace"] }
 parking_lot.workspace = true
 tokio.workspace = true

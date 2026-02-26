@@ -15,23 +15,27 @@
 //! Bucket application use-case contracts.
 #![allow(dead_code)]
 
-use crate::app::context::{AppContext, get_global_app_context};
+use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
-use crate::storage::access::authorize_request;
+use crate::storage::access::{ReqInfo, authorize_request};
 use crate::storage::ecfs::{
-    default_owner, is_public_grant, parse_acl_json_or_canned_bucket, serialize_acl, stored_acl_from_canned_bucket,
-    stored_acl_from_grant_headers,
+    RUSTFS_OWNER, default_owner, is_public_grant, parse_acl_json_or_canned_bucket, serialize_acl, stored_acl_from_canned_bucket,
+    stored_acl_from_grant_headers, stored_acl_from_policy, stored_grant_to_dto, stored_owner_to_dto,
 };
 use crate::storage::helper::OperationHelper;
+use crate::storage::s3_api::{encryption, replication, tagging};
 use crate::storage::*;
+use futures::StreamExt;
+use http::StatusCode;
 use metrics::counter;
 use rustfs_ecstore::bucket::{
     lifecycle::bucket_lifecycle_ops::validate_transition_tier,
     metadata::{
-        BUCKET_ACL_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_SSECONFIG,
-        BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG,
+        BUCKET_ACL_CONFIG, BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
+        BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG,
+        BUCKET_VERSIONING_CONFIG,
     },
     metadata_sys,
     policy_sys::PolicySys,
@@ -42,7 +46,6 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI};
-use rustfs_notify::notifier_global;
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
@@ -57,7 +60,7 @@ use s3s::dto::*;
 use s3s::xml;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::{fmt::Display, sync::Arc};
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use urlencoding::encode;
 
 pub type BucketUsecaseResult<T> = Result<T, ApiError>;
@@ -162,6 +165,10 @@ impl DefaultBucketUsecase {
         self.context.clone()
     }
 
+    fn global_region(&self) -> Option<String> {
+        self.context.as_ref().and_then(|context| context.region().get())
+    }
+
     #[instrument(
         level = "debug",
         skip(self, req),
@@ -232,6 +239,72 @@ impl DefaultBucketUsecase {
         result
     }
 
+    pub async fn execute_put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let PutBucketAclInput {
+            bucket,
+            acl,
+            access_control_policy,
+            grant_full_control,
+            grant_read,
+            grant_read_acp,
+            grant_write,
+            grant_write_acp,
+            ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let owner = default_owner();
+        let mut stored_acl = access_control_policy
+            .as_ref()
+            .map(|policy| stored_acl_from_policy(policy, &owner))
+            .transpose()?;
+
+        if stored_acl.is_none() {
+            stored_acl = stored_acl_from_grant_headers(
+                &owner,
+                grant_read.map(|v| v.to_string()),
+                grant_write.map(|v| v.to_string()),
+                grant_read_acp.map(|v| v.to_string()),
+                grant_write_acp.map(|v| v.to_string()),
+                grant_full_control.map(|v| v.to_string()),
+            )?;
+        }
+
+        if stored_acl.is_none()
+            && let Some(canned) = acl
+        {
+            stored_acl = Some(stored_acl_from_canned_bucket(canned.as_str(), &owner));
+        }
+
+        let stored_acl = stored_acl.unwrap_or_else(|| stored_acl_from_canned_bucket(BucketCannedACL::PRIVATE, &owner));
+
+        if let Ok((config, _)) = metadata_sys::get_public_access_block_config(&bucket).await
+            && config.block_public_acls.unwrap_or(false)
+            && stored_acl.grants.iter().any(is_public_grant)
+        {
+            return Err(s3_error!(AccessDenied, "Access Denied"));
+        }
+
+        let data = serialize_acl(&stored_acl)?;
+        metadata_sys::update(&bucket, BUCKET_ACL_CONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketAclOutput::default()))
+    }
+
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_bucket(&self, mut req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         if let Some(context) = &self.context {
@@ -299,6 +372,140 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
+    pub async fn execute_get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetBucketAclInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let owner = default_owner();
+        let stored_acl = match metadata_sys::get_bucket_acl_config(&bucket).await {
+            Ok((acl, _)) => parse_acl_json_or_canned_bucket(&acl, &owner),
+            Err(err) => {
+                if err != StorageError::ConfigNotFound {
+                    return Err(ApiError::from(err).into());
+                }
+                stored_acl_from_canned_bucket(BucketCannedACL::PRIVATE, &owner)
+            }
+        };
+
+        let mut sorted_grants = stored_acl.grants.clone();
+        sorted_grants.sort_by_key(|grant| grant.grantee.grantee_type != "Group");
+        let grants = sorted_grants.iter().map(stored_grant_to_dto).collect();
+
+        Ok(S3Response::new(GetBucketAclOutput {
+            grants: Some(grants),
+            owner: Some(stored_owner_to_dto(&stored_acl.owner)),
+        }))
+    }
+
+    #[instrument(level = "debug", skip(self, req))]
+    pub async fn execute_get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let input = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&input.bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        if let Some(region) = self.global_region() {
+            return Ok(S3Response::new(GetBucketLocationOutput {
+                location_constraint: Some(BucketLocationConstraint::from(region)),
+            }));
+        }
+
+        Ok(S3Response::new(GetBucketLocationOutput::default()))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let mut req = req;
+
+        if req.credentials.as_ref().is_none_or(|cred| cred.access_key.is_empty()) {
+            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+        }
+
+        let bucket_infos = if let Err(e) = authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction)).await {
+            if e.code() != &S3ErrorCode::AccessDenied {
+                return Err(e);
+            }
+
+            let mut list_bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
+
+            list_bucket_infos = futures::stream::iter(list_bucket_infos)
+                .filter_map(|info| async {
+                    let mut req_clone = req.clone();
+                    let req_info = req_clone.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+                    req_info.bucket = Some(info.name.clone());
+
+                    if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
+                        .await
+                        .is_ok()
+                        || authorize_request(&mut req_clone, Action::S3Action(S3Action::GetBucketLocationAction))
+                            .await
+                            .is_ok()
+                    {
+                        Some(info)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+                .await;
+
+            if list_bucket_infos.is_empty() {
+                return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+            }
+            list_bucket_infos
+        } else {
+            store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?
+        };
+
+        let buckets: Vec<Bucket> = bucket_infos
+            .iter()
+            .map(|v| Bucket {
+                creation_date: v.created.map(Timestamp::from),
+                name: Some(v.name.clone()),
+                ..Default::default()
+            })
+            .collect();
+
+        Ok(S3Response::new(ListBucketsOutput {
+            buckets: Some(buckets),
+            owner: Some(RUSTFS_OWNER.to_owned()),
+            ..Default::default()
+        }))
+    }
+
     pub async fn execute_delete_bucket_encryption(
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
@@ -323,6 +530,33 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_delete_bucket_cors(
+        &self,
+        req: S3Request<DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let DeleteBucketCorsInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        metadata_sys::delete(&bucket, BUCKET_CORS_CONFIG)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(DeleteBucketCorsOutput {}))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -378,6 +612,34 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(DeleteBucketPolicyOutput {}))
     }
 
+    pub async fn execute_delete_bucket_replication(
+        &self,
+        req: S3Request<DeleteBucketReplicationInput>,
+    ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let DeleteBucketReplicationInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+        metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
+            .await
+            .map_err(ApiError::from)?;
+
+        // TODO: remove targets
+        info!(bucket = %bucket, "deleted bucket replication config");
+
+        Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
+    }
+
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_delete_bucket_tagging(
         &self,
@@ -393,7 +655,34 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
+        Ok(S3Response::new(tagging::build_delete_bucket_tagging_output()))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_delete_public_access_block(
+        &self,
+        req: S3Request<DeletePublicAccessBlockInput>,
+    ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let DeletePublicAccessBlockInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        metadata_sys::delete(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::with_status(DeletePublicAccessBlockOutput::default(), StatusCode::NO_CONTENT))
     }
 
     pub async fn execute_get_bucket_encryption(
@@ -423,8 +712,44 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketEncryptionOutput {
+        Ok(S3Response::new(encryption::build_get_bucket_encryption_output(
             server_side_encryption_configuration,
+        )))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetBucketCorsInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let cors_configuration = match metadata_sys::get_cors_config(&bucket).await {
+            Ok((config, _)) => config,
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::NoSuchCORSConfiguration,
+                        "The CORS configuration does not exist".to_string(),
+                    ));
+                }
+                warn!("get_cors_config err {:?}", &err);
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        Ok(S3Response::new(GetBucketCorsOutput {
+            cors_rules: Some(cors_configuration.cors_rules),
         }))
     }
 
@@ -632,6 +957,44 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(output))
     }
 
+    pub async fn execute_get_bucket_replication(
+        &self,
+        req: S3Request<GetBucketReplicationInput>,
+    ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetBucketReplicationInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let replication_configuration = match metadata_sys::get_replication_config(&bucket).await {
+            Ok((cfg, _created)) => cfg,
+            Err(err) => {
+                error!("get_replication_config err {:?}", err);
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::ReplicationConfigurationNotFoundError,
+                        "replication not found".to_string(),
+                    ));
+                }
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        Ok(S3Response::new(replication::build_get_bucket_replication_output(
+            replication_configuration,
+        )))
+    }
+
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_get_bucket_tagging(
         &self,
@@ -663,7 +1026,45 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
+        Ok(S3Response::new(tagging::build_get_bucket_tagging_output(tag_set)))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_get_public_access_block(
+        &self,
+        req: S3Request<GetPublicAccessBlockInput>,
+    ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let GetPublicAccessBlockInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let config = match metadata_sys::get_public_access_block_config(&bucket).await {
+            Ok((config, _)) => config,
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::Custom("NoSuchPublicAccessBlockConfiguration".into()),
+                        "Public access block configuration does not exist".to_string(),
+                    ));
+                }
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        Ok(S3Response::new(GetPublicAccessBlockOutput {
+            public_access_block_configuration: Some(config),
+        }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -722,7 +1123,7 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
             .await
             .map_err(ApiError::from)?;
-        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
+        Ok(S3Response::new(encryption::build_put_bucket_encryption_output()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -790,8 +1191,13 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let region = resolve_notification_region(rustfs_ecstore::global::get_global_region(), request_region);
-        let clear_rules = notifier_global::clear_bucket_notification_rules(&bucket);
+        let region = resolve_notification_region(self.global_region(), request_region);
+        let notify = self
+            .context
+            .as_ref()
+            .map(|context| context.notify())
+            .unwrap_or_else(default_notify_interface);
+        let clear_rules = notify.clear_bucket_notification_rules(&bucket);
         let parse_rules = async {
             let mut event_rules = Vec::new();
 
@@ -825,7 +1231,8 @@ impl DefaultBucketUsecase {
             event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
         warn!("notify event rules: {:?}", &event_rules);
 
-        notifier_global::add_event_specific_rules(&bucket, &region, &event_rules)
+        notify
+            .add_event_specific_rules(&bucket, &region, &event_rules)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
 
@@ -890,6 +1297,100 @@ impl DefaultBucketUsecase {
     }
 
     #[instrument(level = "debug", skip(self))]
+    pub async fn execute_put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let PutBucketCorsInput {
+            bucket,
+            cors_configuration,
+            ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let data = serialize_config(&cors_configuration)?;
+        metadata_sys::update(&bucket, BUCKET_CORS_CONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketCorsOutput::default()))
+    }
+
+    pub async fn execute_put_bucket_replication(
+        &self,
+        req: S3Request<PutBucketReplicationInput>,
+    ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let PutBucketReplicationInput {
+            bucket,
+            replication_configuration,
+            ..
+        } = req.input;
+        info!(bucket = %bucket, "updating bucket replication config");
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        // TODO: check enable, versioning enable
+        let data = serialize_config(&replication_configuration)?;
+        metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(replication::build_put_bucket_replication_output()))
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub async fn execute_put_public_access_block(
+        &self,
+        req: S3Request<PutPublicAccessBlockInput>,
+    ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let PutPublicAccessBlockInput {
+            bucket,
+            public_access_block_configuration,
+            ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        let data = serialize_config(&public_access_block_configuration)?;
+        metadata_sys::update(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, data)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(PutPublicAccessBlockOutput::default()))
+    }
+
+    #[instrument(level = "debug", skip(self))]
     pub async fn execute_put_bucket_tagging(
         &self,
         req: S3Request<PutBucketTaggingInput>,
@@ -915,7 +1416,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(Default::default()))
+        Ok(S3Response::new(tagging::build_put_bucket_tagging_output()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1099,6 +1600,152 @@ impl DefaultBucketUsecase {
         // let output = ListObjectsV2Output { ..Default::default() };
         Ok(S3Response::new(output))
     }
+
+    pub async fn execute_list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let ListObjectVersionsInput {
+            bucket,
+            delimiter,
+            key_marker,
+            version_id_marker,
+            max_keys,
+            prefix,
+            ..
+        } = req.input;
+
+        let prefix = prefix.unwrap_or_default();
+        let max_keys = max_keys.unwrap_or(1000);
+
+        let key_marker = key_marker.filter(|v| !v.is_empty());
+        let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
+        let delimiter = delimiter.filter(|v| !v.is_empty());
+
+        let store = get_validated_store(&bucket).await?;
+
+        let object_infos = store
+            .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
+            .await
+            .map_err(ApiError::from)?;
+
+        let objects: Vec<ObjectVersion> = object_infos
+            .objects
+            .iter()
+            .filter(|v| !v.name.is_empty() && !v.delete_marker)
+            .map(|v| ObjectVersion {
+                key: Some(v.name.to_owned()),
+                last_modified: v.mod_time.map(Timestamp::from),
+                size: Some(v.size),
+                version_id: Some(v.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+                is_latest: Some(v.is_latest),
+                e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
+                ..Default::default()
+            })
+            .collect();
+
+        let common_prefixes = object_infos
+            .prefixes
+            .into_iter()
+            .map(|v| CommonPrefix { prefix: Some(v) })
+            .collect();
+
+        let delete_markers = object_infos
+            .objects
+            .iter()
+            .filter(|o| o.delete_marker)
+            .map(|o| DeleteMarkerEntry {
+                key: Some(o.name.clone()),
+                version_id: Some(o.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+                is_latest: Some(o.is_latest),
+                last_modified: o.mod_time.map(Timestamp::from),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let next_key_marker = object_infos.next_marker.filter(|v| !v.is_empty());
+        let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
+
+        let output = ListObjectVersionsOutput {
+            is_truncated: Some(object_infos.is_truncated),
+            max_keys: Some(max_keys),
+            delimiter,
+            name: Some(bucket),
+            prefix: Some(prefix),
+            common_prefixes: Some(common_prefixes),
+            versions: Some(objects),
+            delete_markers: Some(delete_markers),
+            next_key_marker,
+            next_version_id_marker,
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
+    }
+
+    #[instrument(level = "debug", skip(self, req))]
+    pub async fn execute_list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let request_marker = req.input.marker.clone();
+        let v2_resp = self.execute_list_objects_v2(req.map_input(Into::into)).await?;
+
+        Ok(v2_resp.map_output(|v2| {
+            let next_marker = if v2.is_truncated.unwrap_or(false) {
+                let last_key = v2
+                    .contents
+                    .as_ref()
+                    .and_then(|contents| contents.last())
+                    .and_then(|obj| obj.key.as_ref())
+                    .cloned();
+
+                let last_prefix = v2
+                    .common_prefixes
+                    .as_ref()
+                    .and_then(|prefixes| prefixes.last())
+                    .and_then(|prefix| prefix.prefix.as_ref())
+                    .cloned();
+
+                match (last_key, last_prefix) {
+                    (Some(k), Some(p)) => {
+                        if k > p {
+                            Some(k)
+                        } else {
+                            Some(p)
+                        }
+                    }
+                    (Some(k), None) => Some(k),
+                    (None, Some(p)) => Some(p),
+                    (None, None) => None,
+                }
+            } else {
+                None
+            };
+
+            let marker = Some(request_marker.unwrap_or_default());
+
+            ListObjectsOutput {
+                contents: v2.contents,
+                delimiter: v2.delimiter,
+                encoding_type: v2.encoding_type,
+                name: v2.name,
+                prefix: v2.prefix,
+                max_keys: v2.max_keys,
+                common_prefixes: v2.common_prefixes,
+                is_truncated: v2.is_truncated,
+                marker,
+                next_marker,
+                ..Default::default()
+            }
+        }))
+    }
 }
 
 #[async_trait::async_trait]
@@ -1198,6 +1845,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_delete_bucket_cors_returns_internal_error_when_store_uninitialized() {
+        let input = DeleteBucketCorsInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::DELETE);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_delete_bucket_cors(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_delete_bucket_replication_returns_internal_error_when_store_uninitialized() {
+        let input = DeleteBucketReplicationInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::DELETE);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_delete_bucket_replication(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn execute_head_bucket_returns_internal_error_when_store_uninitialized() {
         let input = HeadBucketInput::builder().bucket("test-bucket".to_string()).build().unwrap();
 
@@ -1223,6 +1898,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_get_bucket_acl_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketAclInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_acl(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_bucket_location_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketLocationInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_location(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_bucket_cors_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketCorsInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_cors(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_delete_public_access_block_returns_internal_error_when_store_uninitialized() {
+        let input = DeletePublicAccessBlockInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::DELETE);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_delete_public_access_block(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_bucket_replication_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketReplicationInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_replication(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_public_access_block_returns_internal_error_when_store_uninitialized() {
+        let input = GetPublicAccessBlockInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_public_access_block(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn execute_get_bucket_versioning_returns_internal_error_when_store_uninitialized() {
         let input = GetBucketVersioningInput::builder()
             .bucket("test-bucket".to_string())
@@ -1233,6 +1992,42 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_get_bucket_versioning(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_list_buckets_returns_internal_error_when_store_uninitialized() {
+        let input = ListBucketsInput::builder().build().unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_buckets(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_list_object_versions_returns_internal_error_when_store_uninitialized() {
+        let input = ListObjectVersionsInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_object_versions(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_list_objects_returns_internal_error_when_store_uninitialized() {
+        let input = ListObjectsInput::builder().bucket("test-bucket".to_string()).build().unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_objects(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -1262,6 +2057,68 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_put_bucket_policy(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_bucket_cors_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketCorsInput::builder()
+            .bucket("test-bucket".to_string())
+            .cors_configuration(CORSConfiguration::default())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_cors(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_bucket_replication_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketReplicationInput::builder()
+            .bucket("test-bucket".to_string())
+            .replication_configuration(ReplicationConfiguration {
+                role: "arn:aws:iam::123456789012:role/test".to_string(),
+                rules: vec![],
+            })
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_replication(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_bucket_acl_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketAclInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_acl(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_public_access_block_returns_internal_error_when_store_uninitialized() {
+        let input = PutPublicAccessBlockInput::builder()
+            .bucket("test-bucket".to_string())
+            .public_access_block_configuration(PublicAccessBlockConfiguration::default())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_public_access_block(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
