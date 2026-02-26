@@ -19,11 +19,10 @@
 
 use crate::config::workload_profiles::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
-use rustfs_ecstore::GLOBAL_Endpoints;
-use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, GLOBAL_BucketMetadataSys};
-use rustfs_ecstore::config::{Config, GLOBAL_SERVER_CONFIG};
+use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
+use rustfs_ecstore::config::{Config, get_global_server_config};
 use rustfs_ecstore::endpoints::EndpointServerPools;
-use rustfs_ecstore::global::get_global_region;
+use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::tier::tier::TierConfigMgr;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
@@ -172,7 +171,7 @@ pub struct BucketMetadataHandle;
 
 impl BucketMetadataInterface for BucketMetadataHandle {
     fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>> {
-        GLOBAL_BucketMetadataSys.get().cloned()
+        get_global_bucket_metadata_sys()
     }
 }
 
@@ -182,7 +181,7 @@ pub struct EndpointsHandle;
 
 impl EndpointsInterface for EndpointsHandle {
     fn handle(&self) -> Option<EndpointServerPools> {
-        GLOBAL_Endpoints.get().cloned()
+        get_global_endpoints_opt()
     }
 }
 
@@ -202,7 +201,7 @@ pub struct TierConfigHandle;
 
 impl TierConfigInterface for TierConfigHandle {
     fn handle(&self) -> Arc<RwLock<TierConfigMgr>> {
-        rustfs_ecstore::global::GLOBAL_TierConfigMgr.clone()
+        get_global_tier_config_mgr()
     }
 }
 
@@ -212,7 +211,7 @@ pub struct ServerConfigHandle;
 
 impl ServerConfigInterface for ServerConfigHandle {
     fn get(&self) -> Option<Config> {
-        GLOBAL_SERVER_CONFIG.get().cloned()
+        get_global_server_config()
     }
 }
 

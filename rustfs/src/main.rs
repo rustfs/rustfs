@@ -63,7 +63,7 @@ use rustfs_ecstore::{
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
-use rustfs_iam::init_iam_sys;
+use rustfs_iam::{init_iam_sys, init_oidc_sys};
 use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
@@ -367,7 +367,7 @@ async fn run(config: config::Config) -> Result<()> {
     init_iam_sys(store.clone()).await.map_err(Error::other)?;
     readiness.mark_stage(SystemStage::IamReady);
 
-    // Initialize Keystone authentication if enabled
+    // 3a. Initialize Keystone authentication if enabled
     let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
     if keystone_config.enable {
         match auth_keystone::init_keystone_auth(keystone_config).await {
@@ -377,6 +377,11 @@ async fn run(config: config::Config) -> Result<()> {
                 // Continue without Keystone - fall back to standard auth
             }
         }
+    }
+
+    // 3b. Initialize OIDC System (non-fatal if no providers configured)
+    if let Err(e) = init_oidc_sys().await {
+        warn!("OIDC initialization failed (non-fatal): {}", e);
     }
 
     let iam_interface =
