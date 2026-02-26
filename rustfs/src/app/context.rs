@@ -326,6 +326,40 @@ pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
         .or_else(|| default_kms_runtime_interface().service_manager())
 }
 
+/// Resolve bucket metadata handle using AppContext-first precedence.
+pub fn resolve_bucket_metadata_handle() -> Option<Arc<RwLock<BucketMetadataSys>>> {
+    get_global_app_context()
+        .and_then(|context| context.bucket_metadata().handle())
+        .or_else(|| default_bucket_metadata_interface().handle())
+}
+
+/// Resolve object store handle from AppContext.
+pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
+    get_global_app_context().map(|context| context.object_store())
+}
+
+/// Resolve endpoints using AppContext-first precedence.
+pub fn resolve_endpoints_handle() -> Option<EndpointServerPools> {
+    get_global_app_context()
+        .and_then(|context| context.endpoints().handle())
+        .or_else(|| default_endpoints_interface().handle())
+}
+
+/// Resolve tier config handle using AppContext-first precedence.
+pub fn resolve_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
+    get_global_app_context()
+        .map(|context| context.tier_config().handle())
+        .unwrap_or_else(|| default_tier_config_interface().handle())
+}
+
+/// Resolve server config using AppContext-first precedence.
+pub fn resolve_server_config() -> Option<Config> {
+    match get_global_app_context() {
+        Some(context) => context.server_config().get(),
+        None => default_server_config_interface().get(),
+    }
+}
+
 pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
     Arc::new(BucketMetadataHandle)
 }
