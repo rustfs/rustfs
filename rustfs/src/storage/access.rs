@@ -588,15 +588,15 @@ impl S3Access for FS {
                 }
             };
 
+            let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+            req_info.bucket = Some(src_bucket.clone());
+            req_info.object = Some(src_key.clone());
+            req_info.version_id = version_id.clone();
+
             let tag_conds = self
                 .fetch_tag_conditions(&src_bucket, &src_key, version_id.as_deref(), "copy_object_src")
                 .await?;
             req.extensions.insert(tag_conds);
-
-            let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
-            req_info.bucket = Some(src_bucket);
-            req_info.object = Some(src_key);
-            req_info.version_id = version_id;
 
             authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
         }
