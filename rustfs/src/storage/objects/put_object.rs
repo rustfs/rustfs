@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::{default_bucket_metadata_interface, get_global_app_context};
 use crate::error::ApiError;
 use crate::storage::concurrency::get_concurrency_manager;
 use crate::storage::helper::OperationHelper;
@@ -45,9 +46,17 @@ use s3s::dto::{ChecksumAlgorithm, ETag, PutObjectInput, PutObjectOutput};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio_tar::Archive;
+use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{debug, error, instrument, warn};
+
+fn bucket_metadata_for_quota() -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
+    get_global_app_context()
+        .and_then(|context| context.bucket_metadata().handle())
+        .or_else(|| default_bucket_metadata_interface().handle())
+}
 
 impl Objects {
     #[instrument(level = "debug", skip(self, req))]
@@ -135,9 +144,9 @@ impl Objects {
         // check quota for put operation
         let mut quota_usage_calculated = false;
         if let Some(size) = content_length
-            && let Some(metadata_sys) = rustfs_ecstore::bucket::metadata_sys::GLOBAL_BucketMetadataSys.get()
+            && let Some(metadata_sys) = bucket_metadata_for_quota()
         {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+            let quota_checker = QuotaChecker::new(metadata_sys);
 
             match quota_checker
                 .check_quota(&bucket, QuotaOperation::PutObject, size as u64)
