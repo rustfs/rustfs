@@ -354,9 +354,10 @@ pub fn resolve_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
 
 /// Resolve server config using AppContext-first precedence.
 pub fn resolve_server_config() -> Option<Config> {
-    get_global_app_context()
-        .and_then(|context| context.server_config().get())
-        .or_else(|| default_server_config_interface().get())
+    match get_global_app_context() {
+        Some(context) => context.server_config().get(),
+        None => default_server_config_interface().get(),
+    }
 }
 
 pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
