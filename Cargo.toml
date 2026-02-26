@@ -105,7 +105,7 @@ rustfs-protocols = { path = "crates/protocols", version = "0.0.5" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
-async-compression = { version = "0.4.40" }
+async-compression = { version = "0.4.41" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
 axum = "0.8.8"
@@ -235,7 +235,7 @@ rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { version = "0.13.0-alpha.3", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", rev = "61b96d11de81c508ba5361864676824f318ef65c" }
+s3s = { version = "0.13.0-alpha.3", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", rev = "218000387f4c3e67ad478bfc4587931f88b37006" }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.0", default-features = false }
 siphasher = "1.0.2"

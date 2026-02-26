@@ -179,7 +179,7 @@ fn format_with_color(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: 
     let binding = std::thread::current();
     let thread_name = binding.name().unwrap_or("unnamed");
     let thread_id = format!("{:?}", std::thread::current().id());
-    writeln!(
+    write!(
         w,
         "[{}] {} [{}] [{}:{}] [{}:{}] {}",
         now.now().format(flexi_logger::TS_DASHES_BLANK_COLONS_DOT_BLANK),
@@ -200,7 +200,7 @@ fn format_for_file(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &R
     let binding = std::thread::current();
     let thread_name = binding.name().unwrap_or("unnamed");
     let thread_id = format!("{:?}", std::thread::current().id());
-    writeln!(
+    write!(
         w,
         "[{}] {} [{}] [{}:{}] [{}:{}] {}",
         now.now().format(flexi_logger::TS_DASHES_BLANK_COLONS_DOT_BLANK),

@@ -242,7 +242,7 @@ impl Operation for AdminOperation {
 #[derive(Debug, Clone)]
 pub struct Extra {
     pub credentials: Option<s3s::auth::Credentials>,
-    pub region: Option<String>,
+    pub region: Option<s3s::region::Region>,
     pub service: Option<String>,
 }
 
