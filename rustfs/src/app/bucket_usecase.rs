@@ -1802,20 +1802,22 @@ mod tests {
 
     #[test]
     fn resolve_notification_region_prefers_global_region() {
-        let region =
-            resolve_notification_region(Some("us-east-1".parse().unwrap()), Some("ap-southeast-1".parse().unwrap())).as_str();
+        let binding = resolve_notification_region(Some("us-east-1".parse().unwrap()), Some("ap-southeast-1".parse().unwrap()));
+        let region = binding.as_str();
         assert_eq!(region, "us-east-1");
     }
 
     #[test]
     fn resolve_notification_region_falls_back_to_request_region() {
-        let region = resolve_notification_region(None, Some("ap-southeast-1".parse().unwrap())).as_str();
+        let binding = resolve_notification_region(None, Some("ap-southeast-1".parse().unwrap()));
+        let region = binding.as_str();
         assert_eq!(region, "ap-southeast-1");
     }
 
     #[test]
     fn resolve_notification_region_defaults_to_empty() {
-        let region = resolve_notification_region(None, None).as_str();
+        let binding = resolve_notification_region(None, None);
+        let region = binding.as_str();
         assert!(region.is_empty());
     }
 
