@@ -31,7 +31,13 @@ use serde_json;
 use tracing::{error, info, warn};
 
 async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_kms::ObjectEncryptionService>> {
-    let manager = resolve_kms_runtime_service_manager().unwrap_or_else(init_global_kms_service_manager);
+    let manager = match resolve_kms_runtime_service_manager() {
+        Some(manager) => manager,
+        None => {
+            warn!("KMS service manager not initialized, initializing now as fallback");
+            init_global_kms_service_manager()
+        }
+    };
     manager.get_encryption_service().await
 }
 
