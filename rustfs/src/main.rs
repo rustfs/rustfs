@@ -163,11 +163,11 @@ async fn run(config: config::Config) -> Result<()> {
     // 1. Initialize global readiness tracker
     let readiness = Arc::new(GlobalReadiness::new());
 
-    if let Some(region) = &config.region {
-        let region = region
+    if let Some(region_str) = &config.region {
+        region_str
             .parse()
-            .map_err(|e| Error::other(format!("invalid region {}: {e}", region)))?;
-        rustfs_ecstore::global::set_global_region(region);
+            .map(rustfs_ecstore::global::set_global_region)
+            .map_err(|e| Error::other(format!("invalid region '{}': {}", region_str, e)))?;
     }
 
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
