@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{default_bucket_metadata_interface, get_global_app_context};
+use crate::app::context::resolve_bucket_metadata_handle;
 use crate::error::ApiError;
 use crate::storage::concurrency::get_concurrency_manager;
 use crate::storage::helper::OperationHelper;
@@ -53,9 +53,7 @@ use tokio_util::io::StreamReader;
 use tracing::{debug, error, instrument, warn};
 
 fn bucket_metadata_for_quota() -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
-    get_global_app_context()
-        .and_then(|context| context.bucket_metadata().handle())
-        .or_else(|| default_bucket_metadata_interface().handle())
+    resolve_bucket_metadata_handle()
 }
 
 impl Objects {

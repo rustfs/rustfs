@@ -16,7 +16,7 @@
 
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::get_global_app_context;
+use crate::app::context::{resolve_bucket_metadata_handle, resolve_object_store_handle};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
@@ -86,11 +86,11 @@ pub struct GetBucketQuotaStatsHandler;
 pub struct CheckBucketQuotaHandler;
 
 fn bucket_metadata_from_context() -> Option<Arc<RwLock<BucketMetadataSys>>> {
-    get_global_app_context().and_then(|context| context.bucket_metadata().handle())
+    resolve_bucket_metadata_handle()
 }
 
 async fn current_usage_from_context(bucket: &str) -> u64 {
-    let Some(store) = get_global_app_context().map(|context| context.object_store()) else {
+    let Some(store) = resolve_object_store_handle() else {
         return 0;
     };
 
