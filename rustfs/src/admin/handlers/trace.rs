@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::router::Operation;
-use crate::app::context::get_global_app_context;
+use crate::app::context::resolve_endpoints_handle;
 use http::StatusCode;
 use hyper::Uri;
 use matchit::Params;
@@ -43,7 +43,7 @@ impl Operation for Trace {
         let _trace_opts = extract_trace_options(&req.uri)?;
 
         // let (tx, rx) = mpsc::channel(10000);
-        let _peers = match get_global_app_context().and_then(|context| context.endpoints().handle()) {
+        let _peers = match resolve_endpoints_handle() {
             Some(ep) => PeerRestClient::new_clients(ep.clone()).await,
             None => (Vec::new(), Vec::new()),
         };
