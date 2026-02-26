@@ -55,6 +55,7 @@ impl KeystoneClient {
         admin_user: Option<String>,
         admin_password: Option<String>,
         admin_project: Option<String>,
+        admin_domain: String,
         verify_ssl: bool,
     ) -> Self {
         let client = Client::builder()
@@ -71,7 +72,7 @@ impl KeystoneClient {
             admin_user,
             admin_password,
             admin_project,
-            admin_domain: "Default".to_string(),
+            admin_domain,
             verify_ssl,
         }
     }
@@ -426,6 +427,7 @@ mod tests {
             Some("admin".to_string()),
             Some("secret".to_string()),
             Some("admin".to_string()),
+            "Default".to_string(),
             true,
         );
 

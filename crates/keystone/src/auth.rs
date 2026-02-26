@@ -32,12 +32,12 @@ pub struct KeystoneAuthProvider {
 
 impl KeystoneAuthProvider {
     /// Create new authentication provider
-    pub fn new(client: KeystoneClient, cache_size: u64, cache_ttl: Duration) -> Self {
+    pub fn new(client: KeystoneClient, cache_size: u64, cache_ttl: Duration, enable_cache: bool) -> Self {
         Self {
             client: Arc::new(client),
             token_cache: TokenCache::new(cache_size, cache_ttl),
             ec2_cache: TokenCache::new(cache_size, cache_ttl),
-            enable_cache: true,
+            enable_cache,
         }
     }
 
@@ -228,9 +228,17 @@ mod tests {
 
     #[test]
     fn test_keystone_token_to_credentials() {
-        let client = KeystoneClient::new("http://localhost:5000".to_string(), crate::KeystoneVersion::V3, None, None, None, true);
+        let client = KeystoneClient::new(
+            "http://localhost:5000".to_string(),
+            crate::KeystoneVersion::V3,
+            None,
+            None,
+            None,
+            "Default".to_string(),
+            true,
+        );
 
-        let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60));
+        let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true);
 
         let token = KeystoneToken {
             token: "test-token".to_string(),
@@ -259,9 +267,17 @@ mod tests {
 
     #[test]
     fn test_is_admin() {
-        let client = KeystoneClient::new("http://localhost:5000".to_string(), crate::KeystoneVersion::V3, None, None, None, true);
+        let client = KeystoneClient::new(
+            "http://localhost:5000".to_string(),
+            crate::KeystoneVersion::V3,
+            None,
+            None,
+            None,
+            "Default".to_string(),
+            true,
+        );
 
-        let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60));
+        let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true);
 
         let mut cred = Credentials {
             groups: Some(vec!["Member".to_string()]),

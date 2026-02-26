@@ -44,10 +44,16 @@ pub async fn init_keystone_auth(config: KeystoneConfig) -> Result<(), Box<dyn st
         config.admin_user.clone(),
         config.admin_password.clone(),
         config.admin_project.clone(),
+        config.get_admin_domain(),
         config.verify_ssl,
     );
 
-    let auth_provider = KeystoneAuthProvider::new(client.clone(), config.cache_size, config.get_cache_ttl());
+    let auth_provider = KeystoneAuthProvider::new(
+        client.clone(),
+        config.cache_size,
+        config.get_cache_ttl(),
+        config.enable_cache,
+    );
 
     let mut mapper = KeystoneIdentityMapper::new(Arc::new(client), config.enable_tenant_prefix);
 

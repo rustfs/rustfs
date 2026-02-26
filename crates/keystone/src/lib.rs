@@ -38,6 +38,7 @@
 //!     config.admin_user.clone(),
 //!     config.admin_password.clone(),
 //!     config.admin_project.clone(),
+//!     config.get_admin_domain(),
 //!     config.verify_ssl,
 //! );
 //!
@@ -45,6 +46,7 @@
 //!     client,
 //!     config.cache_size,
 //!     config.get_cache_ttl(),
+//!     config.enable_cache,
 //! );
 //!
 //! // Authenticate with Keystone token

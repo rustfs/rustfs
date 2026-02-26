@@ -240,7 +240,15 @@ mod tests {
     use crate::KeystoneVersion;
 
     fn create_mapper() -> KeystoneIdentityMapper {
-        let client = KeystoneClient::new("http://localhost:5000".to_string(), KeystoneVersion::V3, None, None, None, true);
+        let client = KeystoneClient::new(
+            "http://localhost:5000".to_string(),
+            KeystoneVersion::V3,
+            None,
+            None,
+            None,
+            "Default".to_string(),
+            true,
+        );
         KeystoneIdentityMapper::new(Arc::new(client), true)
     }
 

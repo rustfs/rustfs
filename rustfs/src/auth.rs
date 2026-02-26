@@ -121,6 +121,13 @@ impl S3Auth for IAMAuth {
             return Err(s3_error!(UnauthorizedAccess, "Your account is not signed up"));
         }
 
+        // Check if this is a Keystone access key
+        // Keystone credentials use token authentication, not signature verification
+        if access_key.starts_with("keystone:") {
+            // Return a dummy secret key - Keystone auth uses token validation, not signatures
+            return Ok(SecretKey::from(String::new()));
+        }
+
         if let Ok(key) = self.simple_auth.get_secret_key(access_key).await {
             return Ok(key);
         }
@@ -158,12 +165,24 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     // KEYSTONE INTEGRATION: Check if access_key indicates Keystone authentication
     // Keystone access keys are formatted as "keystone:user_id"
     if access_key.starts_with("keystone:") {
-        // This is a Keystone-authenticated request
-        // The actual validation was already done during token verification
-        // We just need to pass through the credentials
+        // For Keystone authentication, the session_token contains the Keystone token
+        // We need to validate it and extract credentials
+        use crate::auth_keystone;
+
+        if !auth_keystone::is_keystone_enabled() {
+            return Err(s3_error!(
+                InvalidAccessKeyId,
+                "Keystone authentication is not enabled"
+            ));
+        }
+
+        // The session_token should contain the actual Keystone token
+        // that was used for authentication
+        // For now, return an error indicating this path needs proper implementation
+        // TODO: Store and retrieve Keystone credentials from request context
         return Err(s3_error!(
             InvalidAccessKeyId,
-            "Keystone credentials should not reach this point - use token authentication"
+            "Keystone token authentication requires X-Auth-Token header"
         ));
     }
 
