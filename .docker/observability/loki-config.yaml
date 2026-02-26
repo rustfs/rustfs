@@ -11,22 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 auth_enabled: false
 
 server:
   http_listen_port: 3100
-  grpc_listen_port: 9096
-  log_level: debug
-  grpc_server_max_concurrent_streams: 1000
+  grpc_listen_port: 9095
 
 common:
   instance_addr: 127.0.0.1
-  path_prefix: /tmp/loki
+  path_prefix: /loki
   storage:
     filesystem:
-      chunks_directory: /tmp/loki/chunks
-      rules_directory: /tmp/loki/rules
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
   replication_factor: 1
   ring:
     kvstore:
@@ -39,12 +36,6 @@ query_range:
         enabled: true
         max_size_mb: 100
 
-limits_config:
-  metric_aggregation_enabled: true
-  max_line_size: 256KB
-  max_line_size_truncate: false
-  allow_structured_metadata: true
-
 schema_config:
   configs:
     - from: 2020-10-24
@@ -54,29 +45,9 @@ schema_config:
       index:
         prefix: index_
         period: 24h
-      row_shards: 16
 
-pattern_ingester:
-  enabled: true
-  metric_aggregation:
-    loki_address: localhost:3100
-
-ruler:
-  alertmanager_url: http://localhost:9093
-
-frontend:
-  encoding: protobuf
-
-
-# By default, Loki will send anonymous, but uniquely-identifiable usage and configuration
-# analytics to Grafana Labs. These statistics are sent to https://stats.grafana.org/
-#
-# Statistics help us better understand how Loki is used, and they show us performance
-# levels for most users. This helps us prioritize features and documentation.
-# For more information on what's sent, look at
-# https://github.com/grafana/loki/blob/main/pkg/analytics/stats.go
-# Refer to the buildReport method to see what goes into a report.
-#
-# If you would like to disable reporting, uncomment the following lines:
-#analytics:
-#  reporting_enabled: false
+limits_config:
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  allow_structured_metadata: true
+  max_line_size: 256KB

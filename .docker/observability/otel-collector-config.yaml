@@ -102,10 +102,10 @@ service:
       exporters: [ otlphttp/loki ]
   telemetry:
     logs:
-      level: "debug"  # Collector log level
+      level: "info"  # Collector log level
       encoding: "json"  # Log encoding: console or json
     metrics:
-      level: "detailed" # Can be basic, normal, detailed
+      level: "basic" # Can be basic, normal, detailed
       readers:
         - periodic:
             exporter:
