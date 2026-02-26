@@ -17,7 +17,7 @@ use crate::{admin, config, version};
 use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_notify::notifier_global;
-use rustfs_targets::arn::{ARN, TargetIDError};
+use rustfs_targets::arn::{TargetIDError, ARN};
 use s3s::s3_error;
 use std::env;
 use std::io::Error;
@@ -50,7 +50,7 @@ pub(crate) fn init_update_check() {
 
     // Async update check with timeout
     tokio::spawn(async {
-        use crate::update::{UpdateCheckError, check_updates};
+        use crate::update::{check_updates, UpdateCheckError};
 
         // Add timeout to prevent hanging network calls
         match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
@@ -93,14 +93,15 @@ pub(crate) fn init_update_check() {
 /// * `buckets` - A vector of bucket names to process
 #[instrument(skip_all)]
 pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) {
-    let region_opt = rustfs_ecstore::global::get_global_region();
-    let region = match region_opt {
-        Some(ref r) if !r.is_empty() => r,
-        _ => {
+    let global_region = rustfs_ecstore::global::get_global_region();
+    let region = global_region
+        .as_ref()
+        .filter(|r| !r.as_str().is_empty())
+        .map(|r| r.as_str())
+        .unwrap_or_else(|| {
             warn!("Global region is not set; attempting notification configuration for all buckets with an empty region.");
             ""
-        }
-    };
+        });
     for bucket in buckets.iter() {
         let has_notification_config = metadata_sys::get_notification_config(bucket).await.unwrap_or_else(|err| {
             warn!("get_notification_config err {:?}", err);
@@ -290,7 +291,7 @@ pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<
 /// * `config` - The application configuration options
 pub(crate) fn init_buffer_profile_system(config: &config::Config) {
     use crate::config::workload_profiles::{
-        RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
+        init_global_buffer_config, set_buffer_profile_enabled, RustFSBufferConfig, WorkloadProfile,
     };
 
     if config.buffer_profile_disable {
@@ -368,7 +369,7 @@ pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<(
         // Create FTP server with protocol storage client
         let fs = crate::storage::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
-        let server: FtpsServer<crate::protocols::ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+        let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
 
         // Log server configuration
         info!(
@@ -451,7 +452,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
         // Create FTPS server with protocol storage client
         let fs = crate::storage::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
-        let server: FtpsServer<crate::protocols::ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+        let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
 
         // Log server configuration
         info!(

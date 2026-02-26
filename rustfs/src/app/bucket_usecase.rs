@@ -30,6 +30,7 @@ use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
 use metrics::counter;
+use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::bucket::{
     lifecycle::bucket_lifecycle_ops::validate_transition_tier,
     metadata::{
@@ -57,6 +58,7 @@ use rustfs_targets::{
 use rustfs_utils::http::RUSTFS_FORCE_DELETE;
 use rustfs_utils::string::parse_bool;
 use s3s::dto::*;
+use s3s::region::Region;
 use s3s::xml;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::{fmt::Display, sync::Arc};
@@ -73,8 +75,8 @@ fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
 }
 
-fn resolve_notification_region(global_region: Option<String>, request_region: Option<String>) -> String {
-    global_region.unwrap_or_else(|| request_region.unwrap_or_default())
+fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> Region {
+    global_region.unwrap_or_else(|| request_region.unwrap_or_else(|| Region::new(RUSTFS_REGION.into()).expect("valid region")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +167,7 @@ impl DefaultBucketUsecase {
         self.context.clone()
     }
 
-    fn global_region(&self) -> Option<String> {
+    fn global_region(&self) -> Option<Region> {
         self.context.as_ref().and_then(|context| context.region().get())
     }
 
@@ -431,7 +433,7 @@ impl DefaultBucketUsecase {
 
         if let Some(region) = self.global_region() {
             return Ok(S3Response::new(GetBucketLocationOutput {
-                location_constraint: Some(BucketLocationConstraint::from(region)),
+                location_constraint: Some(BucketLocationConstraint::from(region.to_string())),
             }));
         }
 
@@ -1230,9 +1232,9 @@ impl DefaultBucketUsecase {
         let event_rules =
             event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
         warn!("notify event rules: {:?}", &event_rules);
-
+        let region_clone = region.clone();
         notify
-            .add_event_specific_rules(&bucket, &region, &event_rules)
+            .add_event_specific_rules(&bucket, region_clone.as_str(), &event_rules)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
 
@@ -1800,19 +1802,20 @@ mod tests {
 
     #[test]
     fn resolve_notification_region_prefers_global_region() {
-        let region = resolve_notification_region(Some("us-east-1".to_string()), Some("ap-southeast-1".to_string()));
+        let region =
+            resolve_notification_region(Some("us-east-1".parse().unwrap()), Some("ap-southeast-1".parse().unwrap())).as_str();
         assert_eq!(region, "us-east-1");
     }
 
     #[test]
     fn resolve_notification_region_falls_back_to_request_region() {
-        let region = resolve_notification_region(None, Some("ap-southeast-1".to_string()));
+        let region = resolve_notification_region(None, Some("ap-southeast-1".parse().unwrap())).as_str();
         assert_eq!(region, "ap-southeast-1");
     }
 
     #[test]
     fn resolve_notification_region_defaults_to_empty() {
-        let region = resolve_notification_region(None, None);
+        let region = resolve_notification_region(None, None).as_str();
         assert!(region.is_empty());
     }
 

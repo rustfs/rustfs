@@ -54,6 +54,7 @@ reqwest = { workspace = true }
 moka = { workspace = true }
 openidconnect = { workspace = true }
 http = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 pollster.workspace = true

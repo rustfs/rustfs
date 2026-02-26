@@ -14,26 +14,26 @@
 
 use super::ecfs::FS;
 use super::ecfs::{
-    ACL_GROUP_ALL_USERS, ACL_GROUP_AUTHENTICATED_USERS, INTERNAL_ACL_METADATA_KEY, StoredAcl, default_owner,
-    parse_acl_json_or_canned_bucket, parse_acl_json_or_canned_object, stored_acl_from_canned_bucket,
-    stored_acl_from_canned_object,
+    default_owner, parse_acl_json_or_canned_bucket, parse_acl_json_or_canned_object, stored_acl_from_canned_bucket, stored_acl_from_canned_object,
+    StoredAcl, ACL_GROUP_ALL_USERS, ACL_GROUP_AUTHENTICATED_USERS,
+    INTERNAL_ACL_METADATA_KEY,
 };
 use super::options::get_opts;
 use crate::auth::{check_key_valid, get_condition_values, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
-use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::StorageAPI;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_policy::policy::{Args, BucketPolicyArgs};
 use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
 use s3s::access::{S3Access, S3AccessContext};
-use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
+use s3s::{dto::*, s3_error, S3Error, S3ErrorCode, S3Request, S3Result};
 use std::collections::HashMap;
 
 #[allow(dead_code)]
@@ -44,7 +44,7 @@ pub(crate) struct ReqInfo {
     pub bucket: Option<String>,
     pub object: Option<String>,
     pub version_id: Option<String>,
-    pub region: Option<String>,
+    pub region: Option<s3s::region::Region>,
 }
 
 #[derive(Clone, Copy)]
@@ -352,7 +352,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             &req.headers,
             &rustfs_credentials::Credentials::default(),
             req_info.version_id.as_deref(),
-            req.region.as_deref(),
+            req.region.clone(),
             remote_addr,
         );
         let bucket_name = req_info.bucket.as_deref().unwrap_or("");
