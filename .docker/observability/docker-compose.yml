@@ -14,6 +14,8 @@
 
 services:
 
+  # --- Tracing ---
+
   tempo-init:
     image: busybox:latest
     command: [ "sh", "-c", "chown -R 10001:10001 /var/tempo" ]
@@ -26,52 +28,20 @@ services:
 
   tempo:
     image: grafana/tempo:latest
-    user: "10001" # The container must be started with root to execute chown in the script
-    command: [ "-config.file=/etc/tempo.yaml" ] # This is passed as a parameter to the entry point script
+    user: "10001"
+    command: [ "-config.file=/etc/tempo.yaml" ]
     volumes:
       - ./tempo.yaml:/etc/tempo.yaml:ro
       - ./tempo-data:/var/tempo
     ports:
       - "3200:3200" # tempo
-      - "24317:4317" # otlp grpc
-      - "24318:4318" # otlp http
+      - "4317"      # otlp grpc
+      - "4318"      # otlp http
     restart: unless-stopped
     networks:
       - otel-network
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3200/metrics" ]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
-    environment:
-      - TZ=Asia/Shanghai
-    volumes:
-      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
-    ports:
-      - "1888:1888" # pprof
-      - "8888:8888" # Prometheus metrics for Collector
-      - "8889:8889" # Prometheus metrics for application indicators
-      - "13133:13133" # health check
-      - "4317:4317" # OTLP gRPC
-      - "4318:4318" # OTLP HTTP
-      - "55679:55679" # zpages
-    networks:
-      - otel-network
-    depends_on:
-      jaeger:
-        condition: service_started
-      tempo:
-        condition: service_started
-      prometheus:
-        condition: service_started
-      loki:
-        condition: service_started
-    healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:13133" ]
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3200/ready" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -80,13 +50,16 @@ services:
     image: jaegertracing/jaeger:latest
     environment:
       - TZ=Asia/Shanghai
-      - SPAN_STORAGE_TYPE=memory
+      - SPAN_STORAGE_TYPE=badger
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_DIRECTORY_KEY=/badger/key
       - COLLECTOR_OTLP_ENABLED=true
+    volumes:
+      - ./jaeger-data:/badger
     ports:
       - "16686:16686" # Web UI
-      - "14317:4317" # OTLP gRPC
-      - "14318:4318" # OTLP HTTP
-      - "18888:8888" # collector
+      - "14269:14269" # Admin/Metrics
     networks:
       - otel-network
     healthcheck:
@@ -94,6 +67,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+  # --- Metrics ---
+
   prometheus:
     image: prom/prometheus:latest
     environment:
@@ -105,11 +81,11 @@ services:
       - "9090:9090"
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--web.enable-otlp-receiver' # Enable OTLP
-      - '--web.enable-remote-write-receiver' # Enable remote write
-      - '--enable-feature=promql-experimental-functions' # Enable info()
-      - '--storage.tsdb.min-block-duration=15m' # Minimum block duration
-      - '--storage.tsdb.max-block-duration=1h'  # Maximum block duration
+      - '--web.enable-otlp-receiver'
+      - '--web.enable-remote-write-receiver'
+      - '--enable-feature=promql-experimental-functions'
+      - '--storage.tsdb.min-block-duration=2h'
+      - '--storage.tsdb.max-block-duration=2h'
       - '--log.level=info'
       - '--storage.tsdb.retention.time=30d'
       - '--storage.tsdb.path=/prometheus'
@@ -123,12 +99,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+  # --- Logging ---
+
   loki:
     image: grafana/loki:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
       - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - ./loki-data:/loki
     ports:
       - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
@@ -139,17 +119,53 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+  # --- Collection ---
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "1888:1888"   # pprof
+      - "8888:8888"   # Prometheus metrics for Collector
+      - "8889:8889"   # Prometheus metrics for application indicators
+      - "13133:13133" # health check
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "55679:55679" # zpages
+    networks:
+      - otel-network
+    depends_on:
+      tempo:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:13133" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # --- Visualization ---
+
   grafana:
     image: grafana/grafana:latest
     ports:
-      - "3000:3000"  # Web UI
+      - "3000:3000"
     volumes:
-      - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_SECURITY_ADMIN_USER=admin
       - TZ=Asia/Shanghai
       - GF_INSTALL_PLUGINS=grafana-pyroscope-datasource
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/home.json
     restart: unless-stopped
     networks:
       - otel-network
@@ -166,6 +182,8 @@ services:
 volumes:
   prometheus-data:
   tempo-data:
+  loki-data:
+  jaeger-data:
 
 networks:
   otel-network:

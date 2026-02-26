@@ -1,3 +1,17 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 apiVersion: 1
 
 datasources:
@@ -7,102 +21,78 @@ datasources:
     access: proxy
     orgId: 1
     url: http://prometheus:9090
-    basicAuth: false
-    isDefault: false
+    isDefault: true
     version: 1
     editable: false
     jsonData:
       httpMethod: GET
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+
   - name: Tempo
     type: tempo
+    uid: tempo
     access: proxy
     orgId: 1
     url: http://tempo:3200
-    basicAuth: false
-    isDefault: true
+    isDefault: false
     version: 1
     editable: false
-    apiVersion: 1
-    uid: tempo
     jsonData:
       httpMethod: GET
       serviceMap:
         datasourceUid: prometheus
-      streamingEnabled:
-        search: true
-      tracesToLogsV2:
-        # Field with an internal link pointing to a logs data source in Grafana.
-        # datasourceUid value must match the uid value of the logs data source.
-        datasourceUid: 'loki'
-        spanStartTimeShift: '-1h'
-        spanEndTimeShift: '1h'
-        tags: [ 'job', 'instance', 'pod', 'namespace' ]
-        filterByTraceID: false
+      tracesToLogs:
+        datasourceUid: loki
+        tags: [ 'job', 'instance', 'pod', 'namespace', 'service.name' ]
+        mappedTags: [{ key: 'service.name', value: 'app' }]
+        spanStartTimeShift: '1s'
+        spanEndTimeShift: '-1s'
+        filterByTraceID: true
         filterBySpanID: false
-        customQuery: true
-        query: 'method="$${__span.tags.method}"'
-        tracesToMetrics:
-          datasourceUid: 'prometheus'
-          spanStartTimeShift: '-1h'
-          spanEndTimeShift: '1h'
-          tags: [ { key: 'service.name', value: 'service' }, { key: 'job' } ]
-          queries:
-            - name: 'Sample query'
-              query: 'sum(rate(traces_spanmetrics_latency_bucket{$$__tags}[5m]))'
-        tracesToProfiles:
-          datasourceUid: 'grafana-pyroscope-datasource'
-          tags: [ 'job', 'instance', 'pod', 'namespace' ]
-          profileTypeId: 'process_cpu:cpu:nanoseconds:cpu:nanoseconds'
-          customQuery: true
-          query: 'method="$${__span.tags.method}"'
-        serviceMap:
-          datasourceUid: 'prometheus'
-        nodeGraph:
-          enabled: true
-        search:
-          hide: false
-        traceQuery:
-          timeShiftEnabled: true
-          spanStartTimeShift: '-1h'
-          spanEndTimeShift: '1h'
-        spanBar:
-          type: 'Tag'
-          tag: 'http.path'
-        streamingEnabled:
-          search: true
-  - name: Jaeger
-    type: jaeger
-    uid: Jaeger
-    url: http://jaeger:16686
-    basicAuth: false
-    access: proxy
-    readOnly: false
-    isDefault: false
-    jsonData:
-      tracesToLogsV2:
-        # Field with an internal link pointing to a logs data source in Grafana.
-        # datasourceUid value must match the uid value of the logs data source.
-        datasourceUid: 'loki'
-        spanStartTimeShift: '1h'
-        spanEndTimeShift: '-1h'
-        tags: [ 'job', 'instance', 'pod', 'namespace' ]
-        filterByTraceID: false
-        filterBySpanID: false
-        customQuery: true
-        query: 'method="$${__span.tags.method}"'
       tracesToMetrics:
-        datasourceUid: 'Prometheus'
-        spanStartTimeShift: '1h'
-        spanEndTimeShift: '-1h'
-        tags: [ { key: 'service.name', value: 'service' }, { key: 'job' } ]
+        datasourceUid: prometheus
+        tags: [ { key: 'service.name' }, { key: 'job' } ]
         queries:
-          - name: 'Sample query'
-            query: 'sum(rate(traces_spanmetrics_latency_bucket{$$__tags}[5m]))'
+          - name: 'Service-Level Latency'
+            query: 'sum(rate(traces_spanmetrics_latency_bucket{$$__tags}[5m])) by (le)'
+          - name: 'Service-Level Calls'
+            query: 'sum(rate(traces_spanmetrics_calls_total{$$__tags}[5m]))'
+          - name: 'Service-Level Errors'
+            query: 'sum(rate(traces_spanmetrics_calls_total{status_code="ERROR", $$__tags}[5m]))'
       nodeGraph:
         enabled: true
-      traceQuery:
-        timeShiftEnabled: true
-        spanStartTimeShift: '1h'
-        spanEndTimeShift: '-1h'
-      spanBar:
-        type: 'None'
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    orgId: 1
+    url: http://loki:3100
+    isDefault: false
+    version: 1
+    editable: false
+    jsonData:
+      derivedFields:
+        - datasourceUid: tempo
+          matcherRegex: 'trace_id=(\w+)'
+          name: 'TraceID'
+          url: '$${__value.raw}'
+
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger
+    url: http://jaeger:16686
+    access: proxy
+    isDefault: false
+    editable: false
+    jsonData:
+      tracesToLogs:
+        datasourceUid: loki
+        tags: [ 'job', 'instance', 'pod', 'namespace', 'service.name' ]
+        mappedTags: [{ key: 'service.name', value: 'app' }]
+        spanStartTimeShift: '1s'
+        spanEndTimeShift: '-1s'
+        filterByTraceID: true
+        filterBySpanID: false
