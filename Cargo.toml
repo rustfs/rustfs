@@ -156,6 +156,7 @@ chacha20poly1305 = { version = "0.11.0-rc.3" }
 crc-fast = "1.9.0"
 hmac = { version = "0.13.0-rc.5" }
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
+openidconnect = { version = "4.0", default-features = false }
 pbkdf2 = "0.13.0-rc.9"
 rsa = { version = "0.10.0-rc.15" }
 rustls = { version = "0.23.37", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }

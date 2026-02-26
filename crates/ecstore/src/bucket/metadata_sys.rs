@@ -53,6 +53,10 @@ pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
     GLOBAL_BucketMetadataSys.set(sys).unwrap();
 }
 
+pub fn get_global_bucket_metadata_sys() -> Option<Arc<RwLock<BucketMetadataSys>>> {
+    GLOBAL_BucketMetadataSys.get().cloned()
+}
+
 // panic if not init
 pub(super) fn get_bucket_metadata_sys() -> Result<Arc<RwLock<BucketMetadataSys>>> {
     if let Some(sys) = GLOBAL_BucketMetadataSys.get() {

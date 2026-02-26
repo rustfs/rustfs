@@ -47,9 +47,8 @@ use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
     StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
-    bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication},
+    bucket::replication::{get_global_replication_pool, init_background_replication},
     config as ecconfig,
-    config::GLOBAL_CONFIG_SYS,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
@@ -62,7 +61,7 @@ use rustfs_ecstore::{
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
-use rustfs_iam::init_iam_sys;
+use rustfs_iam::{init_iam_sys, init_oidc_sys};
 use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
@@ -278,12 +277,12 @@ async fn run(config: config::Config) -> Result<()> {
 
     // // Initialize global configuration system
     let mut retry_count = 0;
-    while let Err(e) = GLOBAL_CONFIG_SYS.init(store.clone()).await {
-        error!("GLOBAL_CONFIG_SYS.init failed {:?}", e);
+    while let Err(e) = ecconfig::init_global_config_sys(store.clone()).await {
+        error!("ecconfig::init_global_config_sys failed {:?}", e);
         // TODO: check error type
         retry_count += 1;
         if retry_count > 15 {
-            return Err(Error::other("GLOBAL_CONFIG_SYS.init failed"));
+            return Err(Error::other("ecconfig::init_global_config_sys failed"));
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
@@ -355,8 +354,8 @@ async fn run(config: config::Config) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
-        pool.clone().init_resync(ctx.clone(), buckets.clone()).await?;
+    if let Some(pool) = get_global_replication_pool() {
+        pool.init_resync(ctx.clone(), buckets.clone()).await?;
     }
 
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
@@ -365,6 +364,11 @@ async fn run(config: config::Config) -> Result<()> {
     // This ensures data is in memory before moving forward
     init_iam_sys(store.clone()).await.map_err(Error::other)?;
     readiness.mark_stage(SystemStage::IamReady);
+
+    // 3b. Initialize OIDC System (non-fatal if no providers configured)
+    if let Err(e) = init_oidc_sys().await {
+        warn!("OIDC initialization failed (non-fatal): {}", e);
+    }
 
     let iam_interface =
         rustfs_iam::get().map_err(|e| Error::other(format!("initialize app context IAM dependency failed: {e}")))?;

@@ -19,7 +19,7 @@ impl NodeService {
         &self,
         _request: Request<GetProcInfoRequest>,
     ) -> Result<Response<GetProcInfoResponse>, Status> {
-        let addr = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
+        let addr = get_global_local_node_name().await;
         let info = get_proc_info(&addr);
         let mut buf = Vec::new();
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
@@ -40,7 +40,7 @@ impl NodeService {
         &self,
         _request: Request<GetMemInfoRequest>,
     ) -> Result<Response<GetMemInfoResponse>, Status> {
-        let addr = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
+        let addr = get_global_local_node_name().await;
         let info = get_mem_info(&addr);
         let mut buf = Vec::new();
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
@@ -61,7 +61,7 @@ impl NodeService {
         &self,
         _request: Request<GetSysErrorsRequest>,
     ) -> Result<Response<GetSysErrorsResponse>, Status> {
-        let addr = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
+        let addr = get_global_local_node_name().await;
         let info = get_sys_errors(&addr);
         let mut buf = Vec::new();
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
@@ -82,7 +82,7 @@ impl NodeService {
         &self,
         _request: Request<GetSysConfigRequest>,
     ) -> Result<Response<GetSysConfigResponse>, Status> {
-        let addr = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
+        let addr = get_global_local_node_name().await;
         let info = get_sys_config(&addr);
         let mut buf = Vec::new();
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
@@ -103,7 +103,7 @@ impl NodeService {
         &self,
         _request: Request<GetSeLinuxInfoRequest>,
     ) -> Result<Response<GetSeLinuxInfoResponse>, Status> {
-        let addr = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
+        let addr = get_global_local_node_name().await;
         let info = get_sys_services(&addr);
         let mut buf = Vec::new();
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
@@ -164,7 +164,7 @@ impl NodeService {
         &self,
         _request: Request<GetNetInfoRequest>,
     ) -> Result<Response<GetNetInfoResponse>, Status> {
-        let addr = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
+        let addr = get_global_local_node_name().await;
         let info = get_net_info(&addr, "");
         let mut buf = Vec::new();
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
