@@ -30,7 +30,12 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use tracing::{error, info};
+use std::sync::RwLock;
+use std::time::{Duration as StdDuration, Instant};
+use tracing::{error, info, warn};
+use url::Url;
+
+const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 
 // ---- HTTP Client Adapter ----
 
@@ -139,8 +144,16 @@ pub struct OidcClaims {
 /// a `CoreClient` because the crate uses type-state generics that make storing
 /// the configured client in a HashMap impractical. The client is reconstructed
 /// on-the-fly from metadata when needed.
+#[derive(Clone)]
 struct ProviderState {
     metadata: CoreProviderMetadata,
+    discovered_at: Instant,
+}
+
+impl ProviderState {
+    fn is_stale(&self) -> bool {
+        self.discovered_at.elapsed() >= OIDC_JWKS_REFRESH_INTERVAL
+    }
 }
 
 // ---- Core OIDC system ----
@@ -148,7 +161,7 @@ struct ProviderState {
 /// Global OIDC manager for all configured providers.
 pub struct OidcSys {
     configs: HashMap<String, OidcProviderConfig>,
-    provider_states: HashMap<String, ProviderState>,
+    provider_states: RwLock<HashMap<String, ProviderState>>,
     state_store: OidcStateStore,
     http_client: ReqwestHttpClient,
 }
@@ -181,7 +194,7 @@ impl OidcSys {
 
         Ok(Self {
             configs,
-            provider_states,
+            provider_states: RwLock::new(provider_states),
             state_store: OidcStateStore::new(),
             http_client,
         })
@@ -191,7 +204,7 @@ impl OidcSys {
     pub fn empty() -> Self {
         Self {
             configs: HashMap::new(),
-            provider_states: HashMap::new(),
+            provider_states: RwLock::new(HashMap::new()),
             state_store: OidcStateStore::new(),
             http_client: ReqwestHttpClient(reqwest::Client::new()),
         }
@@ -224,22 +237,18 @@ impl OidcSys {
             .configs
             .get(provider_id)
             .ok_or_else(|| format!("unknown OIDC provider: {provider_id}"))?;
-        let state = self
-            .provider_states
-            .get(provider_id)
-            .ok_or_else(|| format!("provider not discovered: {provider_id}"))?;
+        let state = self.ensure_provider_state(provider_id, config).await?;
 
-        // Construct CoreClient on-the-fly (avoids type-state storage issues)
+        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+
+        let redirect = RedirectUrl::new(redirect_uri.to_string()).map_err(|e| format!("invalid redirect URI: {e}"))?;
+
         let client = CoreClient::from_provider_metadata(
             state.metadata.clone(),
             ClientId::new(config.client_id.clone()),
             config.client_secret.as_ref().map(|s| ClientSecret::new(s.clone())),
         )
         .set_auth_type(AuthType::RequestBody);
-
-        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-
-        let redirect = RedirectUrl::new(redirect_uri.to_string()).map_err(|e| format!("invalid redirect URI: {e}"))?;
 
         let mut auth_req =
             client.authorize_url(CoreAuthenticationFlow::AuthorizationCode, CsrfToken::new_random, Nonce::new_random);
@@ -287,10 +296,7 @@ impl OidcSys {
             .configs
             .get(&session.provider_id)
             .ok_or_else(|| format!("unknown provider: {}", session.provider_id))?;
-        let provider_state = self
-            .provider_states
-            .get(&session.provider_id)
-            .ok_or_else(|| format!("provider not discovered: {}", session.provider_id))?;
+        let provider_state = self.get_provider_state(&session.provider_id)?;
 
         // Construct CoreClient on-the-fly with JWKS from discovery
         let client = CoreClient::from_provider_metadata(
@@ -319,16 +325,36 @@ impl OidcSys {
             .ok_or_else(|| "no id_token in token response".to_string())?;
 
         let verifier = client.id_token_verifier();
-        let _verified_claims = id_token
-            .claims(&verifier, &Nonce::new(session.nonce.clone()))
-            .map_err(|e| format!("ID token verification failed: {e}"))?;
+        let verified = id_token.claims(&verifier, &Nonce::new(session.nonce.clone()));
+        if let Err(e) = verified {
+            let refreshed_state = self
+                .refresh_provider_state(&session.provider_id, config)
+                .await
+                .map_err(|refresh_err| {
+                    format!("ID token verification failed: {e}; failed to refresh provider metadata: {refresh_err}")
+                })?;
+
+            warn!(
+                "OIDC provider '{}' JWKS metadata refreshed and verification retried after failure",
+                session.provider_id
+            );
+
+            let client = CoreClient::from_provider_metadata(
+                refreshed_state.metadata,
+                ClientId::new(config.client_id.clone()),
+                config.client_secret.as_ref().map(|s| ClientSecret::new(s.clone())),
+            )
+            .set_auth_type(AuthType::RequestBody);
+
+            let verifier = client.id_token_verifier();
+            id_token
+                .claims(&verifier, &Nonce::new(session.nonce.clone()))
+                .map_err(|retry_err| format!("ID token verification failed after JWKS refresh: {retry_err}"))?;
+        }
 
         // Extract raw claims from the verified JWT for custom claim support
         // (the crate verifies signature/expiry/nonce; we decode payload for non-standard claims)
-        let raw_jwt = serde_json::to_value(id_token)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_default();
+        let raw_jwt = id_token.to_string();
         let raw = decode_jwt_payload(&raw_jwt);
 
         let claims = OidcClaims {
@@ -412,9 +438,11 @@ impl OidcSys {
             .ok_or_else(|| "JWT missing 'iss' claim".to_string())?;
 
         // Find matching provider by issuer
-        let (provider_id, config, state) = self
+        let (provider_id, config, mut state) = self
             .find_provider_by_issuer(issuer)
             .ok_or_else(|| format!("no OIDC provider configured for issuer: {issuer}"))?;
+
+        state = self.ensure_provider_state_if_stale(&provider_id, &config, &state).await?;
 
         // Reconstruct CoreClient from provider metadata
         let client = CoreClient::from_provider_metadata(
@@ -432,9 +460,25 @@ impl OidcSys {
         // Verify the token (signature, issuer, audience, expiry) — skip nonce
         // (nonce is only required for the authorization code flow)
         let verifier = client.id_token_verifier();
-        let _verified = id_token
-            .claims(&verifier, |_: Option<&Nonce>| Ok(()))
-            .map_err(|e| format!("ID token verification failed: {e}"))?;
+        if let Err(e) = id_token.claims(&verifier, |_: Option<&Nonce>| Ok(())) {
+            state = self
+                .refresh_provider_state(&provider_id, &config)
+                .await
+                .map_err(|refresh_err| {
+                    format!("ID token verification failed: {e}; failed to refresh provider metadata: {refresh_err}")
+                })?;
+
+            let client = CoreClient::from_provider_metadata(
+                state.metadata,
+                ClientId::new(config.client_id.clone()),
+                config.client_secret.as_ref().map(|s| ClientSecret::new(s.clone())),
+            )
+            .set_auth_type(AuthType::RequestBody);
+            let verifier = client.id_token_verifier();
+            id_token
+                .claims(&verifier, |_: Option<&Nonce>| Ok(()))
+                .map_err(|retry_err| format!("ID token verification failed after JWKS refresh: {retry_err}"))?;
+        }
 
         // Extract claims using the provider's claim configuration
         let claims = OidcClaims {
@@ -449,18 +493,83 @@ impl OidcSys {
     }
 
     /// Find a provider whose discovered issuer matches the given JWT issuer string.
-    fn find_provider_by_issuer(&self, issuer: &str) -> Option<(&str, &OidcProviderConfig, &ProviderState)> {
-        let issuer_normalized = issuer.trim_end_matches('/');
-        for (id, state) in &self.provider_states {
+    fn find_provider_by_issuer(&self, issuer: &str) -> Option<(String, OidcProviderConfig, ProviderState)> {
+        let (issuer_scheme, issuer_host, issuer_port, issuer_path) = normalize_issuer(issuer)?;
+        let map = self
+            .provider_states
+            .read()
+            .map_err(|e| format!("provider state lock poisoned: {e}"))
+            .ok()?;
+        for (id, state) in map.iter() {
             let provider_issuer = state.metadata.issuer().as_str();
-            let provider_normalized = provider_issuer.trim_end_matches('/');
-            if issuer_normalized == provider_normalized
+            let Some((provider_scheme, provider_host, provider_port, provider_path)) = normalize_issuer(provider_issuer) else {
+                continue;
+            };
+
+            if issuer_scheme == provider_scheme
+                && issuer_host == provider_host
+                && issuer_port == provider_port
+                && issuer_path == provider_path
                 && let Some(config) = self.configs.get(id)
             {
-                return Some((id, config, state));
+                return Some((id.clone(), config.clone(), state.clone()));
             }
         }
         None
+    }
+
+    fn get_provider_state(&self, provider_id: &str) -> Result<ProviderState, String> {
+        self.provider_states
+            .read()
+            .map_err(|e| format!("provider state lock poisoned: {e}"))?
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| format!("provider not discovered: {provider_id}"))
+    }
+
+    async fn refresh_provider_state(&self, provider_id: &str, config: &OidcProviderConfig) -> Result<ProviderState, String> {
+        let state = Self::discover_provider(config, &self.http_client).await?;
+        let mut map = self.provider_states.write().map_err(|e| {
+            let msg = e.to_string();
+            format!("provider state lock poisoned: {msg}")
+        })?;
+        map.insert(provider_id.to_string(), state.clone());
+
+        Ok(state)
+    }
+
+    async fn ensure_provider_state(&self, provider_id: &str, config: &OidcProviderConfig) -> Result<ProviderState, String> {
+        let state = self.get_provider_state(provider_id)?;
+        if state.is_stale() {
+            self.refresh_provider_state(provider_id, config).await.or_else(|refresh_err| {
+                warn!(
+                    "OIDC provider '{}' JWKS metadata refresh skipped due to transient network issue: {}",
+                    provider_id, refresh_err
+                );
+                Ok(state)
+            })
+        } else {
+            Ok(state)
+        }
+    }
+
+    async fn ensure_provider_state_if_stale(
+        &self,
+        provider_id: &str,
+        config: &OidcProviderConfig,
+        state: &ProviderState,
+    ) -> Result<ProviderState, String> {
+        if state.is_stale() {
+            self.refresh_provider_state(provider_id, config).await.or_else(|refresh_err| {
+                warn!(
+                    "OIDC provider '{}' JWKS metadata refresh skipped due to transient network issue: {}",
+                    provider_id, refresh_err
+                );
+                Ok(state.clone())
+            })
+        } else {
+            Ok(state.clone())
+        }
     }
 
     /// Get the state store (used by HTTP handlers).
@@ -611,18 +720,8 @@ impl OidcSys {
     /// `discover_async` fetches the discovery document and JWKS in one step.
     async fn discover_provider(config: &OidcProviderConfig, http_client: &ReqwestHttpClient) -> Result<ProviderState, String> {
         // The openidconnect crate expects the issuer URL (base), not the
-        // .well-known/openid-configuration URL. Strip the suffix if present.
-        let issuer_str = config
-            .config_url
-            .strip_suffix("/.well-known/openid-configuration")
-            .unwrap_or(&config.config_url);
-
-        // Ensure trailing slash for correct URL joining in the crate
-        let issuer_str = if issuer_str.ends_with('/') {
-            issuer_str.to_string()
-        } else {
-            format!("{issuer_str}/")
-        };
+        // .well-known/openid-configuration URL.
+        let issuer_str = normalize_config_url(&config.config_url)?;
 
         let issuer_url = IssuerUrl::new(issuer_str).map_err(|e| format!("invalid issuer URL: {e}"))?;
 
@@ -630,11 +729,62 @@ impl OidcSys {
             .await
             .map_err(|e| format!("discovery failed: {e}"))?;
 
-        Ok(ProviderState { metadata })
+        Ok(ProviderState {
+            metadata,
+            discovered_at: Instant::now(),
+        })
     }
 }
 
 // --- Helper functions ---
+
+fn normalize_issuer(raw: &str) -> Option<(String, String, u16, String)> {
+    let parsed = Url::parse(raw).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed.port_or_known_default()?;
+    let normalized_path = {
+        let path = parsed.path().trim_end_matches('/').to_string();
+        if path.is_empty() { "/".to_string() } else { path }
+    };
+
+    Some((parsed.scheme().to_string(), host, port, normalized_path))
+}
+
+fn normalize_config_url(config_url: &str) -> Result<String, String> {
+    let config_url = config_url.trim();
+    let url = Url::parse(config_url).map_err(|e| format!("invalid config_url: {e}"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(format!("invalid config_url scheme: {}", url.scheme()));
+    }
+    let host = url.host_str().ok_or_else(|| "config_url missing host".to_string())?;
+    let path = url.path().trim_end_matches('/');
+
+    if path.contains("/.well-known/") && !path.ends_with("/.well-known/openid-configuration") {
+        return Err("config_url uses an unsupported .well-known discovery URL".into());
+    }
+
+    let normalized_path = path.strip_suffix("/.well-known/openid-configuration").unwrap_or(path);
+
+    let mut issuer = format!("{}://{host}", url.scheme());
+    if let Some(port) = url.port() {
+        issuer.push(':');
+        issuer.push_str(&port.to_string());
+    }
+
+    if !normalized_path.is_empty() {
+        issuer.push_str(normalized_path);
+    }
+
+    if !issuer.ends_with('/') {
+        issuer.push('/');
+    }
+
+    Ok(issuer)
+}
 
 /// Decode the payload section of a JWT without validation (token must already be verified).
 pub(crate) fn decode_jwt_payload(token: &str) -> HashMap<String, serde_json::Value> {
@@ -720,6 +870,40 @@ mod tests {
         let claims = decode_jwt_payload(&token);
         assert_eq!(claims.get("sub").and_then(|v| v.as_str()), Some("user123"));
         assert_eq!(claims.get("email").and_then(|v| v.as_str()), Some("user@example.com"));
+    }
+
+    #[test]
+    fn test_normalize_issuer_matches() {
+        let lhs = normalize_issuer("https://idp.example.com/.well-known/openid-configuration/").unwrap();
+        let rhs = normalize_issuer("https://idp.example.com/.well-known/openid-configuration").unwrap();
+        assert_eq!(lhs, rhs);
+        assert_eq!(
+            lhs,
+            (
+                "https".to_string(),
+                "idp.example.com".to_string(),
+                443,
+                "/.well-known/openid-configuration".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_normalize_config_url() {
+        assert_eq!(
+            normalize_config_url("https://idp.example.com/.well-known/openid-configuration").unwrap(),
+            "https://idp.example.com/"
+        );
+        assert_eq!(
+            normalize_config_url("https://idp.example.com/.well-known/openid-configuration/").unwrap(),
+            "https://idp.example.com/"
+        );
+        assert_eq!(
+            normalize_config_url("https://idp.example.com/custom/realm").unwrap(),
+            "https://idp.example.com/custom/realm/"
+        );
+        assert!(normalize_config_url("https://idp.example.com/.well-known/invalid").is_err());
+        assert!(normalize_config_url("gopher://idp.example.com").is_err());
     }
 
     #[test]
@@ -810,7 +994,7 @@ mod tests {
         }
         OidcSys {
             configs: config_map,
-            provider_states: HashMap::new(),
+            provider_states: RwLock::new(HashMap::new()),
             state_store: OidcStateStore::new(),
             http_client: ReqwestHttpClient(reqwest::Client::new()),
         }

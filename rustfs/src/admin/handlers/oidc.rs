@@ -21,6 +21,7 @@ use matchit::Params;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
+use url::Url;
 
 const OIDC_PATH_PREFIX: &str = "/rustfs/admin/v3/oidc";
 
@@ -78,7 +79,10 @@ impl Operation for ListOidcProvidersHandler {
         let json_body = serde_json::to_vec(&providers)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json_body))))
+        let mut resp = S3Response::new((StatusCode::OK, Body::from(json_body)));
+        resp.headers
+            .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+        Ok(resp)
     }
 }
 
@@ -103,7 +107,7 @@ impl Operation for OidcAuthorizeHandler {
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
 
         // Optional: redirect_after query parameter (must be a safe relative path)
-        let redirect_after = extract_query_param(&req.uri, "redirect_after").filter(|p| is_safe_redirect_path(p));
+        let redirect_after = extract_safe_redirect_after(&req.uri)?;
 
         let auth_url = oidc_sys
             .authorize_url(provider_id, &redirect_uri, redirect_after)
@@ -192,7 +196,7 @@ impl Operation for OidcCallbackHandler {
             &new_cred.session_token,
             new_cred.expiration,
             session.redirect_after.as_deref(),
-        );
+        )?;
 
         let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
         resp.headers.insert(
@@ -213,31 +217,25 @@ fn derive_callback_uri(req: &S3Request<Body>, provider_id: &str) -> S3Result<Str
     // Use explicitly configured redirect_uri if available
     if let Some(oidc_sys) = rustfs_iam::get_oidc()
         && let Some(config) = oidc_sys.get_provider_config(provider_id)
-        && let Some(ref uri) = config.redirect_uri
     {
-        return Ok(uri.clone());
-    }
-    let scheme = req
-        .headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_else(|| req.uri.scheme_str().unwrap_or("http"));
+        if let Some(ref uri) = config.redirect_uri {
+            let parsed = Url::parse(uri).map_err(|_| s3_error!(InvalidRequest, "invalid configured redirect_uri"))?;
+            if !is_valid_scheme(parsed.scheme()) || parsed.host_str().is_none() {
+                return Err(s3_error!(InvalidRequest, "configured redirect_uri must be absolute http/https URL"));
+            }
+            return Ok(uri.clone());
+        }
 
-    if !is_valid_scheme(scheme) {
-        return Err(s3_error!(InvalidRequest, "invalid scheme in request"));
+        if !config.redirect_uri_dynamic {
+            return Err(s3_error!(
+                InvalidRequest,
+                "provider requires explicit redirect_uri because redirect_uri_dynamic is disabled"
+            ));
+        }
     }
 
-    let host = req
-        .headers
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| req.uri.host())
-        .ok_or_else(|| s3_error!(InvalidRequest, "cannot determine host for redirect URI"))?;
-
-    // Validate host doesn't contain path separators or other injection characters
-    if host.contains('/') || host.contains('\\') {
-        return Err(s3_error!(InvalidRequest, "invalid host header"));
-    }
+    let scheme = extract_request_scheme(req)?;
+    let host = extract_request_host(req)?;
 
     Ok(format!("{scheme}://{host}/rustfs/admin/v3/oidc/callback/{provider_id}"))
 }
@@ -261,6 +259,15 @@ fn extract_query_param(uri: &http::Uri, key: &str) -> Option<String> {
     })
 }
 
+fn extract_safe_redirect_after(uri: &http::Uri) -> S3Result<Option<String>> {
+    let redirect_after = extract_query_param(uri, "redirect_after");
+    match redirect_after {
+        Some(value) if !is_safe_redirect_path(&value) => Err(s3_error!(InvalidRequest, "invalid redirect_after")),
+        Some(value) => Ok(Some(value)),
+        None => Ok(None),
+    }
+}
+
 /// Build the console redirect URL with STS credentials in the hash fragment.
 fn build_console_redirect(
     req: &S3Request<Body>,
@@ -269,20 +276,9 @@ fn build_console_redirect(
     session_token: &str,
     expiration: Option<OffsetDateTime>,
     redirect_after: Option<&str>,
-) -> String {
-    let scheme = req
-        .headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| is_valid_scheme(s))
-        .unwrap_or_else(|| req.uri.scheme_str().unwrap_or("http"));
-
-    let host = req
-        .headers
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .filter(|h| !h.contains('/') && !h.contains('\\'))
-        .unwrap_or("localhost");
+) -> S3Result<String> {
+    let scheme = extract_request_scheme(req)?;
+    let host = extract_request_host(req)?;
 
     let console_prefix = "/rustfs/console";
     let page = redirect_after.filter(|p| is_safe_redirect_path(p)).unwrap_or("/");
@@ -300,7 +296,48 @@ fn build_console_redirect(
         urlencoding::encode(page),
     );
 
-    format!("{scheme}://{host}{console_prefix}/auth/oidc-callback/#{fragment}")
+    Ok(format!("{scheme}://{host}{console_prefix}/auth/oidc-callback/#{fragment}"))
+}
+
+fn extract_request_scheme(req: &S3Request<Body>) -> S3Result<String> {
+    let raw_scheme = req
+        .headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').next().map(str::trim).unwrap_or(""))
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| req.uri.scheme_str().map(str::to_owned))
+        .unwrap_or_else(|| "http".to_owned())
+        .to_ascii_lowercase();
+
+    if !is_valid_scheme(&raw_scheme) {
+        return Err(s3_error!(InvalidRequest, "invalid scheme in request"));
+    }
+
+    Ok(raw_scheme)
+}
+
+fn extract_request_host(req: &S3Request<Body>) -> S3Result<String> {
+    let host = req
+        .headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let v = v.trim();
+            if v.is_empty() { None } else { Some(v.to_owned()) }
+        })
+        .or_else(|| req.uri.host().map(str::to_owned))
+        .ok_or_else(|| s3_error!(InvalidRequest, "cannot determine host for redirect URI"))?;
+
+    // Reject host injection with path separators and validate host syntax.
+    if host.contains('/') || host.contains('\\') {
+        return Err(s3_error!(InvalidRequest, "invalid host"));
+    }
+
+    Url::parse(&format!("http://{host}")).map_err(|_| s3_error!(InvalidRequest, "invalid host header"))?;
+
+    Ok(host)
 }
 
 #[cfg(test)]
@@ -334,6 +371,20 @@ mod tests {
     fn test_extract_query_param_encoded() {
         let uri: http::Uri = "http://localhost/callback?redirect_after=%2Fdashboard".parse().unwrap();
         assert_eq!(extract_query_param(&uri, "redirect_after"), Some("/dashboard".to_string()));
+    }
+
+    #[test]
+    fn test_extract_safe_redirect_after() {
+        let uri: http::Uri = "http://localhost/callback?redirect_after=%2Fdashboard".parse().unwrap();
+        assert_eq!(
+            extract_safe_redirect_after(&uri).expect("valid redirect should pass"),
+            Some("/dashboard".to_string())
+        );
+
+        let uri: http::Uri = "http://localhost/callback?redirect_after=javascript:alert(1)"
+            .parse()
+            .unwrap();
+        assert!(extract_safe_redirect_after(&uri).is_err());
     }
 
     #[test]

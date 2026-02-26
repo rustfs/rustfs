@@ -57,6 +57,7 @@ impl Operation for IsAdminHandler {
         let is_admin = if is_admin {
             true
         } else {
+            let empty_claims = HashMap::new();
             let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "iam not init"))?;
             let conditions = get_condition_values(&req.headers, &cred, None, None, None);
             iam_store
@@ -66,7 +67,7 @@ impl Operation for IsAdminHandler {
                     action: Action::AdminAction(AdminAction::AllAdminActions),
                     conditions: &conditions,
                     is_owner: false,
-                    claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                    claims: cred.claims.as_ref().unwrap_or(&empty_claims),
                     deny_only: false,
                     bucket: "",
                     object: "",

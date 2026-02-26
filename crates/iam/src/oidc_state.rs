@@ -14,6 +14,11 @@
 
 use moka::future::Cache;
 use std::time::Duration;
+use tracing::warn;
+
+const OIDC_STATE_CAPACITY: u64 = 10_000;
+const OIDC_STATE_CAPACITY_WARNING: u64 = 9_000;
+const OIDC_STATE_CAPACITY_CRITICAL: u64 = 10_000;
 
 /// Stores the PKCE verifier and nonce for an in-flight OIDC authorization flow.
 #[derive(Debug, Clone)]
@@ -34,7 +39,7 @@ pub struct OidcStateStore {
 impl OidcStateStore {
     pub fn new() -> Self {
         let cache = Cache::builder()
-            .max_capacity(10_000)
+            .max_capacity(OIDC_STATE_CAPACITY)
             .time_to_live(Duration::from_secs(300)) // 5 minute TTL
             .build();
         Self { cache }
@@ -43,6 +48,13 @@ impl OidcStateStore {
     /// Store a new auth session keyed by the OAuth2 `state` parameter.
     pub async fn insert(&self, state: String, session: OidcAuthSession) {
         self.cache.insert(state, session).await;
+        self.cache.run_pending_tasks().await;
+        let size = self.cache.entry_count();
+        if size >= OIDC_STATE_CAPACITY_CRITICAL {
+            warn!("OIDC state store reached configured capacity ({size}/{OIDC_STATE_CAPACITY})");
+        } else if size >= OIDC_STATE_CAPACITY_WARNING {
+            warn!("OIDC state store approaching capacity ({size}/{OIDC_STATE_CAPACITY})");
+        }
     }
 
     /// Retrieve and remove an auth session (single-use). Returns None if expired or not found.
