@@ -160,7 +160,6 @@ openidconnect = { version = "4.0", default-features = false }
 pbkdf2 = "0.13.0-rc.9"
 rsa = { version = "0.10.0-rc.15" }
 rustls = { version = "0.23.37", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
-rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.14.0"
 sha1 = "0.11.0-rc.5"
 sha2 = "0.11.0-rc.5"
