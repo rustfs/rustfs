@@ -86,6 +86,12 @@ impl WebhookArgs {
             return Err(TargetError::Configuration("cert and key must be specified as a pair".to_string()));
         }
 
+        if self.skip_tls_verify && !self.client_ca.is_empty() {
+            return Err(TargetError::Configuration(
+                "skip_tls_verify and client_ca are mutually exclusive; remove client_ca or disable skip_tls_verify".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -447,8 +453,59 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::target::decode_object_name;
+    use super::WebhookArgs;
+    use crate::target::{TargetType, decode_object_name};
+    use url::Url;
     use url::form_urlencoded;
+
+    fn base_args() -> WebhookArgs {
+        WebhookArgs {
+            enable: true,
+            endpoint: Url::parse("https://example.com/hook").unwrap(),
+            auth_token: String::new(),
+            queue_dir: String::new(),
+            queue_limit: 0,
+            client_cert: String::new(),
+            client_key: String::new(),
+            client_ca: String::new(),
+            skip_tls_verify: false,
+            target_type: TargetType::NotifyEvent,
+        }
+    }
+
+    #[test]
+    fn test_validate_skip_tls_verify_and_client_ca_mutually_exclusive() {
+        let args = WebhookArgs {
+            skip_tls_verify: true,
+            client_ca: "/path/to/ca.pem".to_string(),
+            ..base_args()
+        };
+        let result = args.validate();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("skip_tls_verify") && err_msg.contains("client_ca"),
+            "Error message should mention both fields, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skip_tls_verify_without_client_ca_is_ok() {
+        let args = WebhookArgs {
+            skip_tls_verify: true,
+            ..base_args()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_ca_without_skip_tls_verify_is_ok() {
+        let args = WebhookArgs {
+            client_ca: "/path/to/ca.pem".to_string(),
+            ..base_args()
+        };
+        assert!(args.validate().is_ok());
+    }
 
     #[test]
     fn test_decode_object_name_with_spaces() {
