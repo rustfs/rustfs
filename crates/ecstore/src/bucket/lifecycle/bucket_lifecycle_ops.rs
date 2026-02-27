@@ -65,7 +65,7 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -102,7 +102,7 @@ impl LifecycleSys {
     }
 
     pub fn trace(_oi: &ObjectInfo) -> TraceFn {
-        todo!();
+        Arc::new(|_oi, _ctx| Box::pin(async move {}))
     }
 }
 
@@ -395,7 +395,7 @@ impl ExpiryState {
                     }
                     else {
                         //info!("Invalid work type - {:?}", v);
-                        todo!();
+                        warn!("lifecycle worker received unsupported operation type");
                     }
                 }
             }
@@ -788,7 +788,7 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
 }
 
 pub fn audit_tier_actions(_api: ECStore, _tier: &str, _bytes: i64) -> TimeFn {
-    todo!();
+    Arc::new(|| Box::pin(async move {}))
 }
 
 pub async fn get_transitioned_object_reader(

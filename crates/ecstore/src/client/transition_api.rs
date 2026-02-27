@@ -243,11 +243,13 @@ impl TransitionClient {
     }
 
     fn set_s3_transfer_accelerate(&self, accelerate_endpoint: &str) {
-        todo!();
+        let mut endpoint = self.s3_accelerate_endpoint.lock().unwrap();
+        *endpoint = accelerate_endpoint.to_string();
     }
 
     fn set_s3_enable_dual_stack(&self, enabled: bool) {
-        todo!();
+        let mut dual_stack = self.s3_dual_stack_enabled.lock().unwrap();
+        *dual_stack = enabled;
     }
 
     pub fn hash_materials(
@@ -255,7 +257,22 @@ impl TransitionClient {
         is_md5_requested: bool,
         is_sha256_requested: bool,
     ) -> (HashMap<String, HashAlgorithm>, HashMap<String, Vec<u8>>) {
-        todo!()
+        // `hash_algos` declares which algorithms are active for this multipart upload.
+        // `hash_sums` keeps the current part digest bytes and is refreshed on every loop.
+        let mut hash_algos = HashMap::new();
+        let mut hash_sums = HashMap::new();
+
+        if is_md5_requested {
+            hash_algos.insert("md5".to_string(), HashAlgorithm::Md5);
+            hash_sums.insert("md5".to_string(), vec![]);
+        }
+
+        if is_sha256_requested {
+            hash_algos.insert("sha256".to_string(), HashAlgorithm::SHA256);
+            hash_sums.insert("sha256".to_string(), vec![]);
+        }
+
+        (hash_algos, hash_sums)
     }
 
     fn is_online(&self) -> bool {
@@ -272,7 +289,7 @@ impl TransitionClient {
     }
 
     fn health_check(hc_duration: Duration) {
-        todo!();
+        let _ = hc_duration;
     }
 
     fn dump_http(&self, req: &http::Request<s3s::Body>, resp: &http::Response<Incoming>) -> Result<(), std::io::Error> {
@@ -734,7 +751,19 @@ impl TransitionCore {
     ) -> Result<CompletePart, std::io::Error> {
         //self.0.copy_object_part_do(src_bucket, src_object, dest_bucket, dest_object, upload_id,
         //    part_id, start_offset, length, metadata)
-        todo!();
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::client::credentials::ErrorResponse {
+                sts_error: crate::client::credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: format!(
+                        "copy_object_part is not implemented for {src_bucket}/{src_object} -> {dest_bucket}/{dest_object}"
+                    ),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 
     pub async fn put_object(
