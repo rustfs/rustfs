@@ -193,10 +193,6 @@ pub fn is_valid_object_name(object: &str) -> bool {
         return false;
     }
 
-    if object.ends_with(SLASH_SEPARATOR) {
-        return false;
-    }
-
     is_valid_object_prefix(object)
 }
 
@@ -379,10 +375,10 @@ mod tests {
         // Invalid cases - empty string
         assert!(!is_valid_object_name(""));
 
-        // Invalid cases - ends with slash (object names cannot end with slash)
-        assert!(!is_valid_object_name("object/"));
-        assert!(!is_valid_object_name("path/to/file/"));
-        assert!(!is_valid_object_name("ends/with/slash/"));
+        // Valid cases - trailing slash is allowed (empty object with trailing slash)
+        assert!(is_valid_object_name("object/"));
+        assert!(is_valid_object_name("path/to/file/"));
+        assert!(is_valid_object_name("ends/with/slash/"));
 
         // Invalid cases - bad path components (inherited from is_valid_object_prefix)
         assert!(!is_valid_object_name("."));
