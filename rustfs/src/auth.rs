@@ -122,10 +122,7 @@ impl S3Auth for IAMAuth {
         use rustfs_keystone::KEYSTONE_CREDENTIALS;
 
         if let Ok(Some(creds)) = KEYSTONE_CREDENTIALS.try_with(|c| c.clone()) {
-            tracing::debug!(
-                "IAMAuth: Keystone credentials found in task-local storage for user {}",
-                creds.parent_user
-            );
+            tracing::debug!("IAMAuth: Keystone credentials found in task-local storage for user {}", creds.parent_user);
             // Return empty secret key - Keystone uses token validation, not AWS signatures
             return Ok(SecretKey::from(String::new()));
         }
@@ -241,10 +238,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
         }
 
-        return Err(s3_error!(
-            InvalidAccessKeyId,
-            "Keystone authentication requires X-Auth-Token header"
-        ));
+        return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
     }
 
     let Some(mut cred) = get_global_action_cred() else {
