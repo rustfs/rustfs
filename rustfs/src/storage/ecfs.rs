@@ -15,11 +15,18 @@
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
+use rustfs_ecstore::{
+    StorageAPI,
+    bucket::tagging::decode_tags_to_map,
+    error::{is_err_object_not_found, is_err_version_not_found},
+    new_object_layer_fn,
+    store_api::ObjectOptions,
+};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, sync::LazyLock};
 use tokio::io::{AsyncRead, AsyncSeek};
-use tracing::{error, instrument};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 const DEFAULT_OWNER_ID: &str = "rustfsadmin";
@@ -582,6 +589,52 @@ impl FS {
     pub fn new() -> Self {
         // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
         Self {}
+    }
+
+    pub async fn get_object_tag_conditions_for_policy(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+    ) -> S3Result<std::collections::HashMap<String, Vec<String>>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Ok(std::collections::HashMap::new());
+        };
+        let opts = ObjectOptions {
+            version_id: version_id.map(String::from),
+            ..Default::default()
+        };
+        let tags = match store.get_object_tags(bucket, object, &opts).await {
+            Ok(t) => t,
+            Err(e) => {
+                if is_err_object_not_found(&e) || is_err_version_not_found(&e) {
+                    debug!(
+                        target: "rustfs::storage::ecfs",
+                        bucket = %bucket,
+                        object = %object,
+                        version_id = ?version_id,
+                        error = %e,
+                        "object or version not found when fetching tags for policy; treating as no tags"
+                    );
+                    return Ok(std::collections::HashMap::new());
+                }
+                warn!(
+                    target: "rustfs::storage::ecfs",
+                    bucket = %bucket,
+                    object = %object,
+                    version_id = ?version_id,
+                    error = %e,
+                    "get_object_tags failed for policy conditions; denying request"
+                );
+                return Err(s3_error!(AccessDenied, "Access Denied"));
+            }
+        };
+        let map = decode_tags_to_map(&tags);
+        let mut out = std::collections::HashMap::new();
+        for (k, v) in map {
+            out.insert(format!("ExistingObjectTag/{}", k), vec![v]);
+        }
+        Ok(out)
     }
 
     #[cfg(test)]
