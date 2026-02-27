@@ -2,12 +2,13 @@
 
 .PHONY: test
 test: core-deps test-deps ## Run all tests
+TEST_THREADS ?= 1
 	@echo "🧪 Running tests..."
 	@if command -v cargo-nextest >/dev/null 2>&1; then \
 		cargo nextest run --all --exclude e2e_test; \
 	else \
 		echo "ℹ️ cargo-nextest not found; falling back to 'cargo test'"; \
-		cargo test --workspace --exclude e2e_test -- --nocapture; \
+		cargo test --workspace --exclude e2e_test -- --nocapture --test-threads="$(TEST_THREADS)"; \
 	fi
 	cargo test --all --doc
 

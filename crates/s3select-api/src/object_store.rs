@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use futures::pin_mut;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
 use http::HeaderMap;
 use object_store::{
@@ -132,14 +132,24 @@ impl std::fmt::Display for EcObjectStore {
     }
 }
 
+fn unsupported_store_error(op: &str) -> o_Error {
+    o_Error::Generic {
+        store: "s3select-api",
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("operation {op} is not supported in EcObjectStore"),
+        )),
+    }
+}
+
 #[async_trait]
 impl ObjectStore for EcObjectStore {
     async fn put_opts(&self, _location: &Path, _payload: PutPayload, _opts: PutOptions) -> Result<PutResult> {
-        unimplemented!()
+        Err(unsupported_store_error("put_opts"))
     }
 
     async fn put_multipart_opts(&self, _location: &Path, _opts: PutMultipartOptions) -> Result<Box<dyn MultipartUpload>> {
-        unimplemented!()
+        Err(unsupported_store_error("put_multipart_opts"))
     }
 
     async fn get_opts(&self, location: &Path, _options: GetOptions) -> Result<GetResult> {
@@ -220,7 +230,7 @@ impl ObjectStore for EcObjectStore {
     }
 
     async fn get_ranges(&self, _location: &Path, _ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        unimplemented!()
+        Err(unsupported_store_error("get_ranges"))
     }
 
     async fn head(&self, location: &Path) -> Result<ObjectMeta> {
@@ -245,23 +255,23 @@ impl ObjectStore for EcObjectStore {
     }
 
     async fn delete(&self, _location: &Path) -> Result<()> {
-        unimplemented!()
+        Err(unsupported_store_error("delete"))
     }
 
     fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        unimplemented!()
+        stream::once(ready(Err(unsupported_store_error("list")))).boxed()
     }
 
     async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> Result<ListResult> {
-        unimplemented!()
+        Err(unsupported_store_error("list_with_delimiter"))
     }
 
     async fn copy(&self, _from: &Path, _to: &Path) -> Result<()> {
-        unimplemented!()
+        Err(unsupported_store_error("copy"))
     }
 
     async fn copy_if_not_exists(&self, _from: &Path, _too: &Path) -> Result<()> {
-        unimplemented!()
+        Err(unsupported_store_error("copy_if_not_exists"))
     }
 }
 

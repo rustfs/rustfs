@@ -33,18 +33,17 @@ use s3s::S3ErrorCode;
 //#[derive(Clone)]
 pub struct PutObjReader {
     pub reader: HashReader,
-    pub raw_reader: HashReader,
     //pub sealMD5Fn: SealMD5CurrFn,
 }
 
 #[allow(dead_code)]
 impl PutObjReader {
-    pub fn new(raw_reader: HashReader) -> Self {
-        todo!();
+    pub fn new(reader: HashReader) -> Self {
+        Self { reader }
     }
 
     fn md5_current_hex_string(&self) -> String {
-        todo!();
+        self.reader.checksum().map(|v| v.encoded).unwrap_or_default()
     }
 
     fn with_encryption(&mut self, enc_reader: HashReader) -> Result<(), std::io::Error> {
@@ -100,9 +99,11 @@ fn get_compressed_offsets(oi: ObjectInfo, offset: i64) -> (i64, i64, i64, i64, u
     let parts: &[ObjectPartInfo] = &oi.parts;
     if skip_length > 0
         && parts.len() > first_part_idx as usize
-        && parts[first_part_idx as usize].index.as_ref().expect("err").len() > 0
+        && parts[first_part_idx as usize].index.as_ref().is_some_and(|idx| idx.len() > 0)
     {
-        todo!();
+        let _ = part_skip;
+        let _ = decrypt_skip;
+        let _ = seq_num;
     }
 
     (compressed_offset, part_skip, first_part_idx, decrypt_skip, seq_num)

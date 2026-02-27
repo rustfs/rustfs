@@ -21,7 +21,9 @@ use crate::store::ECStore;
 use crate::store_api::ObjectInfo;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 pub struct EventNotifier {
     target_list: TargetList,
@@ -37,24 +39,33 @@ impl EventNotifier {
     }
 
     fn get_arn_list(&self) -> Vec<String> {
-        todo!();
+        warn!(
+            event_count = self.target_list.total_events.load(Ordering::Relaxed),
+            "event notifier arn list requested but not implemented in this build"
+        );
+        Vec::new()
     }
 
     fn set(&self, bucket: &str, meta: BucketMetadata) {
-        todo!();
+        warn!(bucket = bucket, "event notifier set() called but currently no-op in this build");
     }
 
-    fn init_bucket_targets(&self, api: ECStore) -> Result<(), std::io::Error> {
+    fn init_bucket_targets(&self, _api: ECStore) -> Result<(), std::io::Error> {
         /*if err := self.target_list.Add(globalNotifyTargetList.Targets()...); err != nil {
           return err
         }
         self.target_list = self.target_list.Init(runtime.GOMAXPROCS(0)) // TODO: make this configurable (y4m4)
         nil*/
-        todo!();
+        warn!("init_bucket_targets called but currently no-op in this build");
+        Ok(())
     }
 
     fn send(&self, args: EventArgs) {
-        todo!();
+        warn!(
+            event_name = args.event_name,
+            bucket = args.bucket_name,
+            "event send() called but notifier is not fully implemented in this build"
+        );
     }
 }
 
