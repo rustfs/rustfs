@@ -3314,6 +3314,9 @@ impl DefaultObjectUsecase {
             }
         };
 
+        // Apply adaptive buffer sizing based on file size for optimal streaming performance.
+        // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
+        // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
