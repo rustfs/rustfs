@@ -15,6 +15,7 @@
 use futures::Stream;
 use hyper::http;
 use std::{
+    io::ErrorKind,
     pin::Pin,
     sync::LazyLock,
     task::{Context, Poll},
@@ -157,7 +158,17 @@ pub fn is_request_error_retryable(_err: std::io::Error) -> bool {
         };
     }
     true*/
-    todo!();
+    matches!(
+        _err.kind(),
+        ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+    )
 }
 
 #[cfg(test)]

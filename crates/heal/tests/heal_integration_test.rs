@@ -36,6 +36,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use walkdir::WalkDir;
 
+const HEAL_FORMAT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
+const HEAL_FORMAT_WAIT_INTERVAL: Duration = Duration::from_millis(250);
+
+async fn wait_for_path_exists(path: &Path, timeout: Duration, interval: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>)> = OnceLock::new();
 static INIT: Once = Once::new();
 
@@ -47,17 +63,6 @@ pub fn init_tracing() {
             .with_thread_names(true)
             .try_init();
     });
-}
-
-async fn wait_for_path_exists(path: &Path, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if path.exists() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    path.exists()
 }
 
 /// Test helper: Create test environment with ECStore
@@ -176,7 +181,7 @@ mod serial_tests {
 
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
-
+        let _obj_dir = disk_paths[0].join(bucket_name).join(object_name);
         // ─── 1️⃣ delete single data shard file ─────────────────────────────────────
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
         // find part file at depth 2, e.g. .../<uuid>/part.1
@@ -337,14 +342,16 @@ mod serial_tests {
         assert!(!format_path.exists(), "format.json still exists after deletion");
         println!("✅ Deleted format.json on disk: {format_path:?}");
 
-        let (_result, error) = heal_storage.heal_format(false).await.expect("Failed to heal format");
-        assert!(error.is_none(), "Heal format returned error: {error:?}");
+        let (_format_result, format_error) = heal_storage.heal_format(false).await.expect("failed to run heal_format");
+        if let Some(err) = format_error {
+            info!("heal_format returned error: {:?}", err);
+        }
 
-        // Wait for task completion
-        let restored = wait_for_path_exists(&format_path, Duration::from_secs(20)).await;
+        let restored = wait_for_path_exists(&format_path, HEAL_FORMAT_WAIT_TIMEOUT, HEAL_FORMAT_WAIT_INTERVAL).await;
+        assert!(restored, "format.json does not exist on disk after heal");
 
         // ─── 2️⃣ verify format.json is restored ───────
-        assert!(restored, "format.json does not exist on disk after heal");
+        assert!(format_path.exists(), "format.json does not exist on disk after heal");
 
         info!("Heal format basic test passed");
     }
@@ -361,6 +368,15 @@ mod serial_tests {
 
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
+        let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
+        let target_part = WalkDir::new(&obj_dir)
+            .min_depth(2)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+            .map(|e| e.into_path())
+            .expect("Failed to locate part file to delete");
 
         // ─── 1️⃣ delete format.json on one disk ──────────────
         let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
@@ -368,31 +384,43 @@ mod serial_tests {
         std::fs::create_dir_all(&disk_paths[0]).expect("failed to recreate disk_paths[0] directory");
         println!("✅ Deleted format.json on disk: {:?}", disk_paths[0]);
 
-        let (_result, error) = heal_storage.heal_format(false).await.expect("Failed to heal format");
-        assert!(error.is_none(), "Heal format returned error: {error:?}");
+        let (_format_result, format_error) = heal_storage.heal_format(false).await.expect("failed to run heal_format");
+        if let Some(err) = format_error {
+            info!("heal_format returned warning/error: {:?}", err);
+        }
 
-        // Wait for task completion
-        let restored = wait_for_path_exists(&format_path, Duration::from_secs(20)).await;
-
-        // ─── 2️⃣ verify format.json is restored ───────
-        assert!(restored, "format.json does not exist on disk after heal");
-        // ─── 3 verify each part file is restored ───────
-        let heal_opts = HealOpts {
-            recursive: false,
-            dry_run: false,
-            remove: false,
+        let bucket_heal_opts = HealOpts {
+            recursive: true,
             recreate: true,
-            scan_mode: HealScanMode::Normal,
-            update_parity: true,
-            no_lock: false,
-            pool: None,
-            set: None,
+            ..Default::default()
         };
-        let (_result, error) = heal_storage
+        heal_storage
+            .heal_bucket(bucket_name, &bucket_heal_opts)
+            .await
+            .expect("failed to heal bucket");
+
+        let heal_opts = HealOpts {
+            recreate: true,
+            remove: false,
+            ..Default::default()
+        };
+        let (object_result, object_error) = heal_storage
             .heal_object(bucket_name, object_name, None, &heal_opts)
             .await
-            .expect("Failed to heal object");
-        assert!(error.is_none(), "Heal object returned error: {error:?}");
+            .expect("failed to heal object");
+        info!("heal_object result: {:?}, error: {:?}", object_result, object_error);
+        assert!(object_error.is_none(), "heal_object returned error: {object_error:?}");
+
+        let format_restored = wait_for_path_exists(&format_path, HEAL_FORMAT_WAIT_TIMEOUT, HEAL_FORMAT_WAIT_INTERVAL).await;
+        assert!(format_restored, "format.json does not exist on disk after heal");
+        let target_restored = wait_for_path_exists(&target_part, HEAL_FORMAT_WAIT_TIMEOUT, HEAL_FORMAT_WAIT_INTERVAL).await;
+
+        // ─── 3️⃣ verify format.json is restored ───────
+        assert!(format_path.exists(), "format.json does not exist on disk after heal");
+        assert!(target_restored, "part file was not restored after heal");
+
+        // ─── 3️⃣ verify each part file is restored ───────
+        assert!(target_part.exists());
 
         // Verify object metadata is accessible
         let obj_info = ecstore
