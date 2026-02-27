@@ -51,6 +51,8 @@ pub struct RemoveBucketOptions {
     _forced_delete: bool,
 }
 
+const DELETE_RESPONSE_PREVIEW_LEN: usize = 1024;
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct AdvancedRemoveOptions {
@@ -626,7 +628,7 @@ pub async fn process_remove_multi_objects_response(
         pending.insert((object.name.clone(), object.version_id.as_ref().map(|v| v.to_string()).unwrap_or_default()));
     }
 
-    let body = String::from_utf8_lossy(&body_vec);
+    let body = String::from_utf8_lossy(&body_vec).into_owned();
     let parsed: Deleted = match quick_xml::de::from_str(&body) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -638,7 +640,10 @@ pub async fn process_remove_multi_objects_response(
                         object_version_id: version_id,
                         err: Some(std::io::Error::other(ErrorResponse {
                             code: S3ErrorCode::Custom("UnmarshalDeleteResponseFailed".into()),
-                            message: format!("unmarshal multi remove response failed: {err}"),
+                            message: format!(
+                                "unmarshal multi remove response failed: {err}; response_body={}",
+                                body.chars().take(DELETE_RESPONSE_PREVIEW_LEN).collect::<String>()
+                            ),
                             bucket_name: object.bucket.clone(),
                             key: object.name.clone(),
                             resource: "".to_string(),
@@ -657,7 +662,10 @@ pub async fn process_remove_multi_objects_response(
     };
 
     for deleted in parsed.deleted {
-        pending.remove(&(deleted.key.clone(), deleted.version_id.clone()));
+        if !pending.remove(&(deleted.key.clone(), deleted.version_id.clone())) {
+            continue;
+        }
+
         let _ = result_tx
             .send(RemoveObjectResult {
                 object_name: deleted.key,
@@ -670,7 +678,10 @@ pub async fn process_remove_multi_objects_response(
     }
 
     for removed in parsed.error {
-        pending.remove(&(removed.key.clone(), removed.version_id.clone()));
+        if !pending.remove(&(removed.key.clone(), removed.version_id.clone())) {
+            continue;
+        }
+
         let _ = result_tx
             .send(RemoveObjectResult {
                 object_name: removed.key.clone(),

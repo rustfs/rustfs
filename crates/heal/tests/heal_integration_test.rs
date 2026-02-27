@@ -27,8 +27,7 @@ use rustfs_heal::heal::{
 };
 use serial_test::serial;
 use std::{
-    path::Path,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Once, OnceLock},
     time::Duration,
 };
@@ -182,6 +181,15 @@ mod serial_tests {
 
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
+        let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
+        let target_part = WalkDir::new(&obj_dir)
+            .min_depth(2)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
+            .map(|e| e.into_path())
+            .expect("Failed to locate part file to delete");
 
         // ─── 1️⃣ delete single data shard file ─────────────────────────────────────
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
@@ -369,7 +377,6 @@ mod serial_tests {
 
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
-
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
         let target_part = WalkDir::new(&obj_dir)
             .min_depth(2)
