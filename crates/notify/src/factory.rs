@@ -19,8 +19,9 @@ use rumqttc::QoS;
 use rustfs_config::notify::{ENV_NOTIFY_MQTT_KEYS, ENV_NOTIFY_WEBHOOK_KEYS, NOTIFY_MQTT_KEYS, NOTIFY_WEBHOOK_KEYS};
 use rustfs_config::{
     DEFAULT_LIMIT, EVENT_DEFAULT_DIR, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
-    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT,
-    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT,
+    WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR,
+    WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
 };
 use rustfs_ecstore::config::KVS;
 use rustfs_targets::{
@@ -75,6 +76,11 @@ impl TargetFactory for WebhookTargetFactory {
                 .unwrap_or(DEFAULT_LIMIT),
             client_cert: config.lookup(WEBHOOK_CLIENT_CERT).unwrap_or_default(),
             client_key: config.lookup(WEBHOOK_CLIENT_KEY).unwrap_or_default(),
+            root_ca: config.lookup(WEBHOOK_CLIENT_CA).unwrap_or_default(),
+            skip_tls_verify: config
+                .lookup(WEBHOOK_SKIP_TLS_VERIFY)
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT),
             target_type: rustfs_targets::target::TargetType::NotifyEvent,
         };
 
