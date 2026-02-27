@@ -139,7 +139,8 @@ pub fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
     let mut reader = io::BufReader::new(keyfile);
 
     // Load and return a single private key.
-    PrivateKeyDer::from_pem_reader(&mut reader).map_err(|e| certs_error(format!("no private key found in {filename}: {e}")))
+    PrivateKeyDer::from_pem_reader(&mut reader)
+        .map_err(|e| certs_error(format!("failed to parse private key in {filename}: {e}")))
 }
 
 /// error function
@@ -587,7 +588,7 @@ mod tests {
     #[test]
     fn test_memory_efficiency() {
         let error = certs_error("test".to_string());
-        let error_size = size_of_val(&error);
+        let error_size = std::mem::size_of_val(&error);
 
         // Error should not be excessively large
         assert!(error_size < 1024, "Error size should be reasonable, got {error_size} bytes");

@@ -76,7 +76,7 @@ impl TargetFactory for WebhookTargetFactory {
                 .unwrap_or(DEFAULT_LIMIT),
             client_cert: config.lookup(WEBHOOK_CLIENT_CERT).unwrap_or_default(),
             client_key: config.lookup(WEBHOOK_CLIENT_KEY).unwrap_or_default(),
-            root_ca: config.lookup(WEBHOOK_CLIENT_CA).unwrap_or_default(),
+            client_ca: config.lookup(WEBHOOK_CLIENT_CA).unwrap_or_default(),
             skip_tls_verify: config
                 .lookup(WEBHOOK_SKIP_TLS_VERIFY)
                 .and_then(|v| v.parse::<bool>().ok())

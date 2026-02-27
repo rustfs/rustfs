@@ -73,6 +73,11 @@ pub async fn test_ftps_core_operations() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
+        // Build ServerConfig with SNI support
+        let _ = rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))?;
+
         // Create a simple rustls config that accepts any certificate for testing
         let mut root_store = RootCertStore::empty();
         // Add the self-signed certificate to the trust store for e2e

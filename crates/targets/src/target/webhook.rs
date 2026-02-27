@@ -54,8 +54,8 @@ pub struct WebhookArgs {
     pub client_cert: String,
     /// The client key for TLS (PEM format)
     pub client_key: String,
-    /// The path to a custom root CA certificate file (PEM format) to trust the server.
-    pub root_ca: String,
+    /// The path to a custom client root CA certificate file (PEM format) to trust the server.
+    pub client_ca: String,
     /// Skip TLS certificate verification. DANGEROUS: for testing only.
     pub skip_tls_verify: bool,
     /// the target type
@@ -193,9 +193,9 @@ where
                 "Webhook target '{}' is configured to skip TLS verification. This is insecure and should not be used in production.",
                 args.endpoint
             );
-        } else if !args.root_ca.is_empty() {
+        } else if !args.client_ca.is_empty() {
             // Use user-provided custom CA certificate
-            let ca_cert_pem = std::fs::read(&args.root_ca)
+            let ca_cert_pem = std::fs::read(&args.client_ca)
                 .map_err(|e| TargetError::Configuration(format!("Failed to read root CA cert: {e}")))?;
             let ca_cert = reqwest::Certificate::from_pem(&ca_cert_pem)
                 .map_err(|e| TargetError::Configuration(format!("Failed to parse root CA cert: {e}")))?;
