@@ -284,7 +284,7 @@ impl Config {
             .trim()
             .to_string();
 
-        // Region is optional, but if not set, we should default to "rustfs-global-0" for signing compatibility with AWS S3 clients
+        // Region is optional, but if not set, we should default to "us-east-1" for signing compatibility with AWS S3 clients
         let region = region.or_else(|| Some(RUSTFS_REGION.to_string()));
 
         Ok(Config {

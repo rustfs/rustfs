@@ -14,7 +14,7 @@
 
 use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use crate::{admin, config, version};
-use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK};
+use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK, RUSTFS_REGION};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_notify::notifier_global;
 use rustfs_targets::arn::{ARN, TargetIDError};
@@ -85,6 +85,14 @@ pub(crate) fn init_update_check() {
     });
 }
 
+/// Helper function to parse ARN string to target ID
+/// Converts an ARN string to a target ID, or returns an error if parsing fails
+fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, TargetIDError> {
+    ARN::parse(arn_str)
+        .map(|arn| arn.target_id)
+        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+}
+
 /// Add existing bucket notification configurations to the global notifier system.
 /// This function retrieves notification configurations for each bucket
 /// and registers the corresponding event rules with the notifier system.
@@ -100,7 +108,7 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
         .map(|r| r.as_str())
         .unwrap_or_else(|| {
             warn!("Global region is not set; attempting notification configuration for all buckets with an empty region.");
-            ""
+            RUSTFS_REGION
         });
     for bucket in buckets.iter() {
         let has_notification_config = metadata_sys::get_notification_config(bucket).await.unwrap_or_else(|err| {
@@ -116,26 +124,16 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
                     "Bucket '{}' has existing notification configuration: {:?}", bucket, cfg);
 
                 let mut event_rules = Vec::new();
-                if let Err(e) = process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), |arn_str| {
-                    ARN::parse(arn_str)
-                        .map(|arn| arn.target_id)
-                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                }) {
+                if let Err(e) = process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), arn_to_target_id)
+                {
                     error!("Failed to parse queue notification config for bucket '{}': {:?}", bucket, e);
                 }
-                if let Err(e) = process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), |arn_str| {
-                    ARN::parse(arn_str)
-                        .map(|arn| arn.target_id)
-                        .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                }) {
+                if let Err(e) = process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), arn_to_target_id)
+                {
                     error!("Failed to parse topic notification config for bucket '{}': {:?}", bucket, e);
                 }
                 if let Err(e) =
-                    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), |arn_str| {
-                        ARN::parse(arn_str)
-                            .map(|arn| arn.target_id)
-                            .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
-                    })
+                    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), arn_to_target_id)
                 {
                     error!("Failed to parse lambda notification config for bucket '{}': {:?}", bucket, e);
                 }
@@ -155,6 +153,80 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
             }
         }
     }
+}
+
+/// Build KMS configuration for local backend
+fn build_local_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
+    let key_dir = cfg
+        .kms_key_dir
+        .as_ref()
+        .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
+
+    Ok(rustfs_kms::config::KmsConfig {
+        backend: rustfs_kms::config::KmsBackend::Local,
+        backend_config: rustfs_kms::config::BackendConfig::Local(rustfs_kms::config::LocalConfig {
+            key_dir: std::path::PathBuf::from(key_dir),
+            master_key: None,
+            file_permissions: Some(0o600),
+        }),
+        default_key_id: cfg.kms_default_key_id.clone(),
+        timeout: std::time::Duration::from_secs(30),
+        retry_attempts: 3,
+        enable_cache: true,
+        cache_config: rustfs_kms::config::CacheConfig::default(),
+    })
+}
+
+/// Build KMS configuration for Vault backend
+fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
+    let vault_address = cfg
+        .kms_vault_address
+        .as_ref()
+        .ok_or_else(|| Error::other("Vault address is required for vault backend"))?;
+    let vault_token = cfg
+        .kms_vault_token
+        .as_ref()
+        .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
+
+    Ok(rustfs_kms::config::KmsConfig {
+        backend: rustfs_kms::config::KmsBackend::Vault,
+        backend_config: rustfs_kms::config::BackendConfig::Vault(Box::new(rustfs_kms::config::VaultConfig {
+            address: vault_address.clone(),
+            auth_method: rustfs_kms::config::VaultAuthMethod::Token {
+                token: vault_token.clone(),
+            },
+            namespace: None,
+            mount_path: "transit".to_string(),
+            kv_mount: "secret".to_string(),
+            key_path_prefix: "rustfs/kms/keys".to_string(),
+            tls: None,
+        })),
+        default_key_id: cfg.kms_default_key_id.clone(),
+        timeout: std::time::Duration::from_secs(30),
+        retry_attempts: 3,
+        enable_cache: true,
+        cache_config: rustfs_kms::config::CacheConfig::default(),
+    })
+}
+
+/// Configure and start KMS service
+async fn configure_and_start_kms(
+    service_manager: &std::sync::Arc<rustfs_kms::KmsServiceManager>,
+    kms_config: rustfs_kms::config::KmsConfig,
+    config_source: &str,
+) -> std::io::Result<()> {
+    service_manager
+        .configure(kms_config)
+        .await
+        .map_err(|e| Error::other(format!("Failed to configure KMS: {e}")))?;
+
+    service_manager
+        .start()
+        .await
+        .map_err(|e| Error::other(format!("Failed to start KMS: {e}")))?;
+
+    info!("KMS service configured and started successfully from {}", config_source);
+    Ok(())
 }
 
 /// Initialize KMS system and configure if enabled
@@ -178,72 +250,12 @@ pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<
 
         // Create KMS configuration from command line options
         let kms_config = match config.kms_backend.as_str() {
-            "local" => {
-                let key_dir = config
-                    .kms_key_dir
-                    .as_ref()
-                    .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
-
-                rustfs_kms::config::KmsConfig {
-                    backend: rustfs_kms::config::KmsBackend::Local,
-                    backend_config: rustfs_kms::config::BackendConfig::Local(rustfs_kms::config::LocalConfig {
-                        key_dir: std::path::PathBuf::from(key_dir),
-                        master_key: None,
-                        file_permissions: Some(0o600),
-                    }),
-                    default_key_id: config.kms_default_key_id.clone(),
-                    timeout: std::time::Duration::from_secs(30),
-                    retry_attempts: 3,
-                    enable_cache: true,
-                    cache_config: rustfs_kms::config::CacheConfig::default(),
-                }
-            }
-            "vault" => {
-                let vault_address = config
-                    .kms_vault_address
-                    .as_ref()
-                    .ok_or_else(|| Error::other("Vault address is required for vault backend"))?;
-                let vault_token = config
-                    .kms_vault_token
-                    .as_ref()
-                    .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
-
-                rustfs_kms::config::KmsConfig {
-                    backend: rustfs_kms::config::KmsBackend::Vault,
-                    backend_config: rustfs_kms::config::BackendConfig::Vault(Box::new(rustfs_kms::config::VaultConfig {
-                        address: vault_address.clone(),
-                        auth_method: rustfs_kms::config::VaultAuthMethod::Token {
-                            token: vault_token.clone(),
-                        },
-                        namespace: None,
-                        mount_path: "transit".to_string(),
-                        kv_mount: "secret".to_string(),
-                        key_path_prefix: "rustfs/kms/keys".to_string(),
-                        tls: None,
-                    })),
-                    default_key_id: config.kms_default_key_id.clone(),
-                    timeout: std::time::Duration::from_secs(30),
-                    retry_attempts: 3,
-                    enable_cache: true,
-                    cache_config: rustfs_kms::config::CacheConfig::default(),
-                }
-            }
+            "local" => build_local_kms_config(config)?,
+            "vault" => build_vault_kms_config(config)?,
             _ => return Err(Error::other(format!("Unsupported KMS backend: {}", config.kms_backend))),
         };
 
-        // Configure the KMS service
-        service_manager
-            .configure(kms_config)
-            .await
-            .map_err(|e| Error::other(format!("Failed to configure KMS: {e}")))?;
-
-        // Start the KMS service
-        service_manager
-            .start()
-            .await
-            .map_err(|e| Error::other(format!("Failed to start KMS: {e}")))?;
-
-        info!("KMS service configured and started successfully from command line options");
+        configure_and_start_kms(&service_manager, kms_config, "command line options").await?;
     } else {
         // Try to load persisted KMS configuration from cluster storage
         info!("Attempting to load persisted KMS configuration from cluster storage...");
@@ -252,17 +264,9 @@ pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<
             info!("Found persisted KMS configuration, attempting to configure and start service...");
 
             // Configure the KMS service with persisted config
-            match service_manager.configure(persisted_config).await {
+            match configure_and_start_kms(&service_manager, persisted_config, "persisted configuration").await {
                 Ok(()) => {
-                    // Start the KMS service
-                    match service_manager.start().await {
-                        Ok(()) => {
-                            info!("KMS service configured and started successfully from persisted configuration");
-                        }
-                        Err(e) => {
-                            warn!("Failed to start KMS with persisted configuration: {}", e);
-                        }
-                    }
+                    info!("KMS service configured and started successfully from persisted configuration");
                 }
                 Err(e) => {
                     warn!("Failed to configure KMS with persisted configuration: {}", e);
@@ -318,6 +322,46 @@ pub(crate) fn init_buffer_profile_system(config: &config::Config) {
     }
 }
 
+/// Parse and normalize server address for FTP/FTPS
+/// Forces IPv4 binding to avoid libunftp IPv6 compatibility issues
+#[allow(dead_code)]
+async fn parse_and_normalize_server_address(
+    address_str: &str,
+) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
+    let addr = rustfs_utils::net::parse_and_resolve_address(address_str)
+        .map_err(|e| format!("Invalid server address '{address_str}': {e}"))?;
+
+    // Force IPv4 binding to avoid libunftp IPv6 compatibility issues
+    let normalized_addr = if addr.is_ipv6() {
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), addr.port())
+    } else {
+        addr
+    };
+
+    Ok(normalized_addr)
+}
+
+/// Start FTP/FTPS server in background with shutdown support
+/// # Arguments
+/// * `server` - The FTP/FTPS server instance
+/// * `protocol_name` - Name of the protocol (e.g., "FTP", "FTPS")
+#[allow(dead_code)]
+fn spawn_server<S>(server: S, protocol_name: &'static str) -> tokio::sync::broadcast::Sender<()>
+where
+    S: Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'static,
+{
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+
+    tokio::spawn(async move {
+        if let Err(e) = server.await {
+            error!("{} server error: {}", protocol_name, e);
+        }
+        info!("{} server shutdown completed", protocol_name);
+    });
+
+    shutdown_tx
+}
+
 /// Initialize the FTP system
 ///
 /// This function initializes the FTP server (non-encrypted) if enabled in the configuration.
@@ -338,14 +382,7 @@ pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<(
 
         // Parse FTP address - force IPv4 for libunftp compatibility
         let ftp_address_str = rustfs_utils::get_env_str(ENV_FTP_ADDRESS, DEFAULT_FTP_ADDRESS);
-        let addr = rustfs_utils::net::parse_and_resolve_address(&ftp_address_str)
-            .map_err(|e| format!("Invalid FTP address '{ftp_address_str}': {e}"))?;
-        // Force IPv4 binding to avoid libunftp IPv6 compatibility issues
-        let addr = if addr.is_ipv6() {
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), addr.port())
-        } else {
-            addr
-        };
+        let addr = parse_and_normalize_server_address(&ftp_address_str).await?;
 
         // Get FTP configuration from environment variables
         let passive_ports =
@@ -397,7 +434,7 @@ pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<(
 ///
 /// This function initializes the FTPS server if enabled in the configuration.
 /// It sets up the FTPS server with the appropriate configuration and starts
-/// the server in a background task.s
+/// the server in a background task.
 #[cfg(feature = "ftps")]
 #[instrument(skip_all)]
 pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
@@ -418,14 +455,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
 
         // Parse FTPS address - force IPv4 for libunftp compatibility
         let ftps_address_str = rustfs_utils::get_env_str(ENV_FTPS_ADDRESS, DEFAULT_FTPS_ADDRESS);
-        let addr = rustfs_utils::net::parse_and_resolve_address(&ftps_address_str)
-            .map_err(|e| format!("Invalid FTPS address '{ftps_address_str}': {e}"))?;
-        // Force IPv4 binding to avoid libunftp IPv6 compatibility issues
-        let addr = if addr.is_ipv6() {
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), addr.port())
-        } else {
-            addr
-        };
+        let addr = parse_and_normalize_server_address(&ftps_address_str).await?;
 
         // Get FTPS configuration from environment variables
         let tls_enabled = rustfs_utils::get_env_bool(ENV_FTPS_TLS_ENABLED, true);
