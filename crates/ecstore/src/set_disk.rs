@@ -3004,8 +3004,6 @@ impl StorageAPI for SetDisks {
                 &DiskError::FileCorrupt if opts.scan_mode != HealScanMode::Deep => {
                     // Instead of returning an error when a bitrot error is detected
                     // during a normal heal scan, heal again with bitrot flag enabled.
-                    let mut opts = *opts;
-                    opts.scan_mode = HealScanMode::Deep;
                     inner_opts.scan_mode = HealScanMode::Deep;
                     let (result, err) = self.heal_object(bucket, object, version_id, &inner_opts).await?;
                     return Ok((result, err.map(|e| e.into())));
