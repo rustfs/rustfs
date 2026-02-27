@@ -298,6 +298,14 @@ pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rustfs-mcp"]
 
+# Patched polyval to fix SIGILL on x86_64 CPUs without AVX2 support.
+# The upstream polyval 0.7.0-rc.9 avx2.rs backend only checks for `pclmulqdq`
+# at runtime but uses functions annotated with `#[target_feature(enable = "avx2")]`,
+# causing illegal instruction crashes on CPUs like Intel Pentium Gold / Celeron.
+# This patch can be removed once upstream polyval includes the fix.
+[patch.crates-io]
+polyval = { path = "patches/polyval" }
+
 [profile.release]
 opt-level = 3
 
