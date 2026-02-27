@@ -74,7 +74,7 @@ pub async fn test_ftps_core_operations() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         // Build ServerConfig with SNI support
-        let _ = rustls::crypto::aws_lc_rs::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))?;
 

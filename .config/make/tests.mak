@@ -1,8 +1,9 @@
 ## —— Tests and e2e test ---------------------------------------------------------------------------
 
+TEST_THREADS ?= 1
+
 .PHONY: test
 test: core-deps test-deps ## Run all tests
-TEST_THREADS ?= 1
 	@echo "🧪 Running tests..."
 	@if command -v cargo-nextest >/dev/null 2>&1; then \
 		cargo nextest run --all --exclude e2e_test; \

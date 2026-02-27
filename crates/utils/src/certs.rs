@@ -395,7 +395,7 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("no private key found"));
+        assert!(error.to_string().contains("failed to parse private key in"));
     }
 
     #[test]
@@ -408,7 +408,7 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("no private key found"));
+        assert!(error.to_string().contains("failed to parse private key in"));
     }
 
     #[test]
