@@ -184,6 +184,7 @@ atomic_enum = "0.3.0"
 aws-config = { version = "1.8.14" }
 aws-credential-types = { version = "1.2.13" }
 aws-sdk-s3 = { version = "1.124.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.1.11", default-features = false, features = ["default-client", "rustls-aws-lc"] }
 aws-smithy-types = { version = "1.4.5" }
 backtrace = "0.3.76"
 base64 = "0.22.1"
@@ -237,7 +238,7 @@ rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { version = "0.13.0-alpha.3", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", rev = "218000387f4c3e67ad478bfc4587931f88b37006" }
+s3s = { version = "0.13.0-alpha.3", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", rev = "d3f8f8fcb1a1e0af9345498ae2b6eea6a18ef152" }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.0", default-features = false }
 siphasher = "1.0.2"

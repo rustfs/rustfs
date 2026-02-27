@@ -2051,6 +2051,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         warn!("replication head_object failed bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
                         return rinfo;
                     }
+                } else if e.raw_response().is_some_and(|resp| resp.status().as_u16() == 404) {
+                    // Some HEAD Object 404 responses are surfaced by the AWS SDK as `response error`
+                    // instead of `service error (NotFound)`. Treat raw HTTP 404 as object-not-found
+                    // so replication can proceed with PUT.
                 } else {
                     rinfo.error = Some(e.to_string());
                     warn!("replication head_object failed bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);

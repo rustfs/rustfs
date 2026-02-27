@@ -58,7 +58,7 @@ impl TraceType {
     }
 
     pub fn single_type(&self) -> bool {
-        todo!()
+        self.0.count_ones() == 1
     }
 
     pub fn merge(&mut self, other: &TraceType) {

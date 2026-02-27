@@ -369,19 +369,23 @@ impl PeerRestClient {
     }
 
     pub async fn download_profile_data(&self) -> Result<()> {
-        todo!()
+        warn!("download_profile_data is not implemented in PeerRestClient");
+        Err(Error::NotImplemented)
     }
 
     pub async fn get_bucket_stats(&self) -> Result<()> {
-        todo!()
+        warn!("get_bucket_stats is not implemented in PeerRestClient");
+        Err(Error::NotImplemented)
     }
 
     pub async fn get_sr_metrics(&self) -> Result<()> {
-        todo!()
+        warn!("get_sr_metrics is not implemented in PeerRestClient");
+        Err(Error::NotImplemented)
     }
 
     pub async fn get_all_bucket_stats(&self) -> Result<()> {
-        todo!()
+        warn!("get_all_bucket_stats is not implemented in PeerRestClient");
+        Err(Error::NotImplemented)
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str) -> Result<()> {
@@ -602,13 +606,13 @@ impl PeerRestClient {
     }
 
     pub async fn get_metacache_listing(&self) -> Result<()> {
-        let _client = self.get_client().await?;
-        todo!()
+        warn!("get_metacache_listing is not implemented in PeerRestClient");
+        Err(Error::NotImplemented)
     }
 
     pub async fn update_metacache_listing(&self) -> Result<()> {
-        let _client = self.get_client().await?;
-        todo!()
+        warn!("update_metacache_listing is not implemented in PeerRestClient");
+        Err(Error::NotImplemented)
     }
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
