@@ -294,11 +294,9 @@ impl FileMeta {
 
         let offset = wr.len();
 
-        // xl header
-        rmp::encode::write_uint8(&mut wr, XL_HEADER_VERSION)?;
-        rmp::encode::write_uint8(&mut wr, XL_META_VERSION)?;
+        rmp::encode::write_uint(&mut wr, XL_HEADER_VERSION as u64)?;
+        rmp::encode::write_uint(&mut wr, XL_META_VERSION as u64)?;
 
-        // versions
         rmp::encode::write_sint(&mut wr, self.versions.len() as i64)?;
 
         for ver in self.versions.iter() {

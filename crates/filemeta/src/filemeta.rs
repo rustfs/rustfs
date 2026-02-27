@@ -48,7 +48,7 @@ pub static XL_FILE_HEADER: [u8; 4] = [b'X', b'L', b'2', b' '];
 static XL_FILE_VERSION_MAJOR: u16 = 1;
 static XL_FILE_VERSION_MINOR: u16 = 3;
 static XL_HEADER_VERSION: u8 = 3;
-pub static XL_META_VERSION: u8 = 2;
+pub static XL_META_VERSION: u8 = 3;
 static XXHASH_SEED: u64 = 0;
 
 const XL_FLAG_FREE_VERSION: u8 = 1 << 0;

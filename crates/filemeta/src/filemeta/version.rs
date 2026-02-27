@@ -111,16 +111,87 @@ impl FileMetaVersion {
     }
 
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
-        let ret: Self = rmp_serde::from_slice(buf)?;
+        use std::io::Read;
+        let mut cur = std::io::Cursor::new(buf);
 
-        *self = ret;
+        let mut fields = rmp::decode::read_map_len(&mut cur)?;
+        *self = FileMetaVersion::default();
 
-        Ok(buf.len() as u64)
+        while fields > 0 {
+            fields -= 1;
+
+            let key_len = rmp::decode::read_str_len(&mut cur)?;
+            let mut key_buf = vec![0u8; key_len as usize];
+            cur.read_exact(&mut key_buf)?;
+            let key = String::from_utf8(key_buf)?;
+
+            match key.as_str() {
+                "Type" => {
+                    let v: i64 = rmp::decode::read_int(&mut cur)?;
+                    self.version_type = VersionType::from_u8(v as u8);
+                }
+                "V2Obj" => {
+                    let mut obj = MetaObject::default();
+                    obj.decode_from(&mut cur)?;
+                    self.object = Some(obj);
+                }
+                "DelObj" => {
+                    let mut dm = MetaDeleteMarker::default();
+                    dm.decode_from(&mut cur)?;
+                    self.delete_marker = Some(dm);
+                }
+                "v" => {
+                    let v: i64 = rmp::decode::read_int(&mut cur)?;
+                    if v < 0 {
+                        return Err(Error::other("negative write_version not supported"));
+                    }
+                    self.write_version = v as u64;
+                }
+                // currently not supported V1Obj etc. extra fields, if encountered, report an error, for subsequent explicit handling when extending.
+                other => {
+                    return Err(Error::other(format!("unsupported field in FileMetaVersion: {other}")));
+                }
+            }
+        }
+
+        Ok(cur.position())
     }
 
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
-        let buf = rmp_serde::to_vec(self)?;
-        Ok(buf)
+        let mut wr = Vec::new();
+
+        // calculate the number of fields to write
+        let mut map_len: u32 = 2; // "Type" + "v"
+        if self.object.is_some() {
+            map_len += 1; // "V2Obj"
+        }
+        if self.delete_marker.is_some() {
+            map_len += 1; // "DelObj"
+        }
+
+        rmp::encode::write_map_len(&mut wr, map_len)?;
+
+        // Type
+        rmp::encode::write_str(&mut wr, "Type")?;
+        rmp::encode::write_uint(&mut wr, self.version_type.to_u8() as u64)?;
+
+        // V2Obj
+        if let Some(ref obj) = self.object {
+            rmp::encode::write_str(&mut wr, "V2Obj")?;
+            obj.encode_to(&mut wr)?;
+        }
+
+        // DelObj
+        if let Some(ref dm) = self.delete_marker {
+            rmp::encode::write_str(&mut wr, "DelObj")?;
+            dm.encode_to(&mut wr)?;
+        }
+
+        // v
+        rmp::encode::write_str(&mut wr, "v")?;
+        rmp::encode::write_uint(&mut wr, self.write_version)?;
+
+        Ok(wr)
     }
 
     pub fn free_version(&self) -> bool {
@@ -527,16 +598,287 @@ pub struct MetaObject {
 
 impl MetaObject {
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
-        let ret: Self = rmp_serde::from_slice(buf)?;
-
-        *self = ret;
-
-        Ok(buf.len() as u64)
+        let mut cur = std::io::Cursor::new(buf);
+        self.decode_from(&mut cur)?;
+        Ok(cur.position())
     }
+
     // marshal_msg custom messagepack naming consistent with go
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
-        let buf = rmp_serde::to_vec(self)?;
-        Ok(buf)
+        let mut wr = Vec::new();
+        self.encode_to(&mut wr)?;
+        Ok(wr)
+    }
+
+    pub fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
+        // fixed 18 fields
+        rmp::encode::write_map_len(wr, 18)?;
+
+        // ID
+        rmp::encode::write_str(wr, "ID")?;
+        rmp::encode::write_bin(wr, self.version_id.unwrap_or_default().as_bytes())?;
+
+        // DDir
+        rmp::encode::write_str(wr, "DDir")?;
+        rmp::encode::write_bin(wr, self.data_dir.unwrap_or_default().as_bytes())?;
+
+        // EcAlgo
+        rmp::encode::write_str(wr, "EcAlgo")?;
+        rmp::encode::write_uint(wr, self.erasure_algorithm.to_u8() as u64)?;
+
+        // EcM
+        rmp::encode::write_str(wr, "EcM")?;
+        rmp::encode::write_sint(wr, self.erasure_m as i64)?;
+
+        // EcN
+        rmp::encode::write_str(wr, "EcN")?;
+        rmp::encode::write_sint(wr, self.erasure_n as i64)?;
+
+        // EcBSize
+        rmp::encode::write_str(wr, "EcBSize")?;
+        rmp::encode::write_sint(wr, self.erasure_block_size as i64)?;
+
+        // EcIndex
+        rmp::encode::write_str(wr, "EcIndex")?;
+        rmp::encode::write_sint(wr, self.erasure_index as i64)?;
+
+        // EcDist
+        rmp::encode::write_str(wr, "EcDist")?;
+        rmp::encode::write_array_len(wr, self.erasure_dist.len() as u32)?;
+        for v in &self.erasure_dist {
+            rmp::encode::write_uint(wr, *v as u64)?;
+        }
+
+        // CSumAlgo
+        rmp::encode::write_str(wr, "CSumAlgo")?;
+        rmp::encode::write_uint(wr, self.bitrot_checksum_algo.to_u8() as u64)?;
+
+        // PartNums
+        rmp::encode::write_str(wr, "PartNums")?;
+        rmp::encode::write_array_len(wr, self.part_numbers.len() as u32)?;
+        for n in &self.part_numbers {
+            rmp::encode::write_sint(wr, *n as i64)?;
+        }
+
+        // PartETags (always write array, no allownil optimization)
+        rmp::encode::write_str(wr, "PartETags")?;
+        rmp::encode::write_array_len(wr, self.part_etags.len() as u32)?;
+        for et in &self.part_etags {
+            rmp::encode::write_str(wr, et)?;
+        }
+
+        // PartSizes
+        rmp::encode::write_str(wr, "PartSizes")?;
+        rmp::encode::write_array_len(wr, self.part_sizes.len() as u32)?;
+        for s in &self.part_sizes {
+            rmp::encode::write_sint(wr, *s as i64)?;
+        }
+
+        // PartASizes
+        rmp::encode::write_str(wr, "PartASizes")?;
+        rmp::encode::write_array_len(wr, self.part_actual_sizes.len() as u32)?;
+        for s in &self.part_actual_sizes {
+            rmp::encode::write_sint(wr, *s)?;
+        }
+
+        // PartIdx
+        rmp::encode::write_str(wr, "PartIdx")?;
+        rmp::encode::write_array_len(wr, self.part_indices.len() as u32)?;
+        for idx in &self.part_indices {
+            rmp::encode::write_bin(wr, idx)?;
+        }
+
+        // Size
+        rmp::encode::write_str(wr, "Size")?;
+        rmp::encode::write_sint(wr, self.size)?;
+
+        // MTime Unix timestamp nanos
+        rmp::encode::write_str(wr, "MTime")?;
+        let nanos = self.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp_nanos();
+        rmp::encode::write_sint(wr, nanos as i64)?;
+
+        // MetaSys
+        rmp::encode::write_str(wr, "MetaSys")?;
+        rmp::encode::write_map_len(wr, self.meta_sys.len() as u32)?;
+        for (k, v) in &self.meta_sys {
+            rmp::encode::write_str(wr, k)?;
+            rmp::encode::write_bin(wr, v)?;
+        }
+
+        // MetaUsr
+        rmp::encode::write_str(wr, "MetaUsr")?;
+        rmp::encode::write_map_len(wr, self.meta_user.len() as u32)?;
+        for (k, v) in &self.meta_user {
+            rmp::encode::write_str(wr, k)?;
+            rmp::encode::write_str(wr, v)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
+        let mut fields = rmp::decode::read_map_len(rd)?;
+        *self = MetaObject::default();
+
+        while fields > 0 {
+            fields -= 1;
+
+            let key_len = rmp::decode::read_str_len(rd)?;
+            let mut key_buf = vec![0u8; key_len as usize];
+            rd.read_exact(&mut key_buf)?;
+            let key = String::from_utf8(key_buf)?;
+
+            match key.as_str() {
+                "ID" => {
+                    let _ = rmp::decode::read_bin_len(rd)?;
+                    let mut buf = [0u8; 16];
+                    rd.read_exact(&mut buf)?;
+                    let id = Uuid::from_bytes(buf);
+                    self.version_id = if id.is_nil() { None } else { Some(id) };
+                }
+                "DDir" => {
+                    let _ = rmp::decode::read_bin_len(rd)?;
+                    let mut buf = [0u8; 16];
+                    rd.read_exact(&mut buf)?;
+                    let id = Uuid::from_bytes(buf);
+                    self.data_dir = if id.is_nil() { None } else { Some(id) };
+                }
+                "EcAlgo" => {
+                    let v: i64 = rmp::decode::read_int(rd)?;
+                    self.erasure_algorithm = ErasureAlgo::from_u8(v as u8);
+                }
+                "EcM" => {
+                    let v: i64 = rmp::decode::read_int(rd)?;
+                    self.erasure_m = v as usize;
+                }
+                "EcN" => {
+                    let v: i64 = rmp::decode::read_int(rd)?;
+                    self.erasure_n = v as usize;
+                }
+                "EcBSize" => {
+                    let v: i64 = rmp::decode::read_int(rd)?;
+                    self.erasure_block_size = v as usize;
+                }
+                "EcIndex" => {
+                    let v: i64 = rmp::decode::read_int(rd)?;
+                    self.erasure_index = v as usize;
+                }
+                "EcDist" => {
+                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    self.erasure_dist.clear();
+                    self.erasure_dist.reserve(len);
+                    for _ in 0..len {
+                        let v: i64 = rmp::decode::read_int(rd)?;
+                        self.erasure_dist.push(v as u8);
+                    }
+                }
+                "CSumAlgo" => {
+                    let v: i64 = rmp::decode::read_int(rd)?;
+                    self.bitrot_checksum_algo = ChecksumAlgo::from_u8(v as u8);
+                }
+                "PartNums" => {
+                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    self.part_numbers.clear();
+                    self.part_numbers.reserve(len);
+                    for _ in 0..len {
+                        let v: i64 = rmp::decode::read_int(rd)?;
+                        self.part_numbers.push(v as usize);
+                    }
+                }
+                "PartETags" => {
+                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    self.part_etags.clear();
+                    self.part_etags.reserve(len);
+                    for _ in 0..len {
+                        let s_len = rmp::decode::read_str_len(rd)?;
+                        let mut sbuf = vec![0u8; s_len as usize];
+                        rd.read_exact(&mut sbuf)?;
+                        let s = String::from_utf8(sbuf)?;
+                        self.part_etags.push(s);
+                    }
+                }
+                "PartSizes" => {
+                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    self.part_sizes.clear();
+                    self.part_sizes.reserve(len);
+                    for _ in 0..len {
+                        let v: i64 = rmp::decode::read_int(rd)?;
+                        self.part_sizes.push(v as usize);
+                    }
+                }
+                "PartASizes" => {
+                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    self.part_actual_sizes.clear();
+                    self.part_actual_sizes.reserve(len);
+                    for _ in 0..len {
+                        let v: i64 = rmp::decode::read_int(rd)?;
+                        self.part_actual_sizes.push(v);
+                    }
+                }
+                "PartIdx" => {
+                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    self.part_indices.clear();
+                    self.part_indices.reserve(len);
+                    for _ in 0..len {
+                        let blen = rmp::decode::read_bin_len(rd)? as usize;
+                        let mut buf = vec![0u8; blen];
+                        rd.read_exact(&mut buf)?;
+                        self.part_indices.push(Bytes::from(buf));
+                    }
+                }
+                "Size" => {
+                    let v: i64 = rmp::decode::read_int(rd)?;
+                    self.size = v;
+                }
+                "MTime" => {
+                    let nanos: i64 = rmp::decode::read_int(rd)?;
+                    let time = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)?;
+                    self.mod_time = if time == OffsetDateTime::UNIX_EPOCH {
+                        None
+                    } else {
+                        Some(time)
+                    };
+                }
+                "MetaSys" => {
+                    let len = rmp::decode::read_map_len(rd)? as usize;
+                    self.meta_sys.clear();
+                    for _ in 0..len {
+                        let k_len = rmp::decode::read_str_len(rd)?;
+                        let mut kbuf = vec![0u8; k_len as usize];
+                        rd.read_exact(&mut kbuf)?;
+                        let k = String::from_utf8(kbuf)?;
+
+                        let blen = rmp::decode::read_bin_len(rd)? as usize;
+                        let mut v = vec![0u8; blen];
+                        rd.read_exact(&mut v)?;
+
+                        self.meta_sys.insert(k, v);
+                    }
+                }
+                "MetaUsr" => {
+                    let len = rmp::decode::read_map_len(rd)? as usize;
+                    self.meta_user.clear();
+                    for _ in 0..len {
+                        let k_len = rmp::decode::read_str_len(rd)?;
+                        let mut kbuf = vec![0u8; k_len as usize];
+                        rd.read_exact(&mut kbuf)?;
+                        let k = String::from_utf8(kbuf)?;
+
+                        let v_len = rmp::decode::read_str_len(rd)?;
+                        let mut vbuf = vec![0u8; v_len as usize];
+                        rd.read_exact(&mut vbuf)?;
+                        let v = String::from_utf8(vbuf)?;
+
+                        self.meta_user.insert(k, v);
+                    }
+                }
+                other => {
+                    return Err(Error::other(format!("unsupported field in MetaObject: {other}")));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> FileInfo {
@@ -976,116 +1318,93 @@ impl MetaDeleteMarker {
         fi
     }
 
+    pub fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
+        rmp::encode::write_map_len(wr, 3)?;
+
+        // ID
+        rmp::encode::write_str(wr, "ID")?;
+        rmp::encode::write_bin(wr, self.version_id.unwrap_or_default().as_bytes())?;
+
+        // MTime Unix timestamp nanos
+        rmp::encode::write_str(wr, "MTime")?;
+        let nanos = self.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp_nanos();
+        rmp::encode::write_sint(wr, nanos as i64)?;
+
+        // MetaSys
+        rmp::encode::write_str(wr, "MetaSys")?;
+        rmp::encode::write_map_len(wr, self.meta_sys.len() as u32)?;
+        for (k, v) in &self.meta_sys {
+            rmp::encode::write_str(wr, k)?;
+            rmp::encode::write_bin(wr, v)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
+        let mut fields = rmp::decode::read_map_len(rd)?;
+        *self = MetaDeleteMarker::default();
+
+        while fields > 0 {
+            fields -= 1;
+
+            let key_len = rmp::decode::read_str_len(rd)?;
+            let mut key_buf = vec![0u8; key_len as usize];
+            rd.read_exact(&mut key_buf)?;
+            let key = String::from_utf8(key_buf)?;
+
+            match key.as_str() {
+                "ID" => {
+                    let _ = rmp::decode::read_bin_len(rd)?;
+                    let mut buf = [0u8; 16];
+                    rd.read_exact(&mut buf)?;
+                    let id = Uuid::from_bytes(buf);
+                    self.version_id = if id.is_nil() { None } else { Some(id) };
+                }
+                "MTime" => {
+                    let nanos: i64 = rmp::decode::read_int(rd)?;
+                    let time = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)?;
+                    self.mod_time = if time == OffsetDateTime::UNIX_EPOCH {
+                        None
+                    } else {
+                        Some(time)
+                    };
+                }
+                "MetaSys" => {
+                    let len = rmp::decode::read_map_len(rd)? as usize;
+                    self.meta_sys.clear();
+                    for _ in 0..len {
+                        let k_len = rmp::decode::read_str_len(rd)?;
+                        let mut kbuf = vec![0u8; k_len as usize];
+                        rd.read_exact(&mut kbuf)?;
+                        let k = String::from_utf8(kbuf)?;
+
+                        let blen = rmp::decode::read_bin_len(rd)? as usize;
+                        let mut v = vec![0u8; blen];
+                        rd.read_exact(&mut v)?;
+
+                        self.meta_sys.insert(k, v);
+                    }
+                }
+                other => {
+                    return Err(Error::other(format!("unsupported field in MetaDeleteMarker: {other}")));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
-        let ret: Self = rmp_serde::from_slice(buf)?;
-
-        *self = ret;
-
-        Ok(buf.len() as u64)
-
-        // let mut cur = Cursor::new(buf);
-
-        // let mut fields_len = rmp::decode::read_map_len(&mut cur)?;
-
-        // while fields_len > 0 {
-        //     fields_len -= 1;
-
-        //     let str_len = rmp::decode::read_str_len(&mut cur)?;
-
-        //     // !!! Vec::with_capacity(str_len) fails, vec! works normally
-        //     let mut field_buff = vec![0u8; str_len as usize];
-
-        //     cur.read_exact(&mut field_buff)?;
-
-        //     let field = String::from_utf8(field_buff)?;
-
-        //     match field.as_str() {
-        //         "ID" => {
-        //             rmp::decode::read_bin_len(&mut cur)?;
-        //             let mut buf = [0u8; 16];
-        //             cur.read_exact(&mut buf)?;
-        //             self.version_id = {
-        //                 let id = Uuid::from_bytes(buf);
-        //                 if id.is_nil() { None } else { Some(id) }
-        //             };
-        //         }
-
-        //         "MTime" => {
-        //             let unix: i64 = rmp::decode::read_int(&mut cur)?;
-        //             let time = OffsetDateTime::from_unix_timestamp(unix)?;
-        //             if time == OffsetDateTime::UNIX_EPOCH {
-        //                 self.mod_time = None;
-        //             } else {
-        //                 self.mod_time = Some(time);
-        //             }
-        //         }
-        //         "MetaSys" => {
-        //             let l = rmp::decode::read_map_len(&mut cur)?;
-        //             let mut map = HashMap::new();
-        //             for _ in 0..l {
-        //                 let str_len = rmp::decode::read_str_len(&mut cur)?;
-        //                 let mut field_buff = vec![0u8; str_len as usize];
-        //                 cur.read_exact(&mut field_buff)?;
-        //                 let key = String::from_utf8(field_buff)?;
-
-        //                 let blen = rmp::decode::read_bin_len(&mut cur)?;
-        //                 let mut val = vec![0u8; blen as usize];
-        //                 cur.read_exact(&mut val)?;
-
-        //                 map.insert(key, val);
-        //             }
-
-        //             self.meta_sys = Some(map);
-        //         }
-        //         name => return Err(Error::other(format!("not support field name {name}"))),
-        //     }
-        // }
-
-        // Ok(cur.position())
+        let mut cur = std::io::Cursor::new(buf);
+        self.decode_from(&mut cur)?;
+        Ok(cur.position())
     }
 
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
-        let buf = rmp_serde::to_vec(self)?;
-        Ok(buf)
-
-        // let mut len: u32 = 3;
-        // let mut mask: u8 = 0;
-
-        // if self.meta_sys.is_none() {
-        //     len -= 1;
-        //     mask |= 0x4;
-        // }
-
-        // let mut wr = Vec::new();
-
-        // // Field count
-        // rmp::encode::write_map_len(&mut wr, len)?;
-
-        // // string "ID"
-        // rmp::encode::write_str(&mut wr, "ID")?;
-        // rmp::encode::write_bin(&mut wr, self.version_id.unwrap_or_default().as_bytes())?;
-
-        // // string "MTime"
-        // rmp::encode::write_str(&mut wr, "MTime")?;
-        // rmp::encode::write_uint(
-        //     &mut wr,
-        //     self.mod_time
-        //         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        //         .unix_timestamp()
-        //         .try_into()
-        //         .unwrap(),
-        // )?;
-
-        // if (mask & 0x4) == 0 {
-        //     let metas = self.meta_sys.as_ref().unwrap();
-        //     rmp::encode::write_map_len(&mut wr, metas.len() as u32)?;
-        //     for (k, v) in metas {
-        //         rmp::encode::write_str(&mut wr, k.as_str())?;
-        //         rmp::encode::write_bin(&mut wr, v)?;
-        //     }
-        // }
-
-        // Ok(wr)
+        let mut wr = Vec::new();
+        self.encode_to(&mut wr)?;
+        Ok(wr)
     }
 
     /// Get delete marker signature
