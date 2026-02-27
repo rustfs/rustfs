@@ -290,7 +290,49 @@ impl CompleteMultipartUpload {
     }
 
     pub fn unmarshal(buf: &[u8]) -> Result<Self, std::io::Error> {
-        todo!();
+        #[derive(Debug, Deserialize)]
+        struct WirePart {
+            #[serde(rename = "ETag")]
+            etag: String,
+            #[serde(rename = "PartNumber")]
+            part_num: i64,
+            #[serde(rename = "ChecksumCRC32")]
+            checksum_crc32: String,
+            #[serde(rename = "ChecksumCRC32C")]
+            checksum_crc32c: String,
+            #[serde(rename = "ChecksumSHA1")]
+            checksum_sha1: String,
+            #[serde(rename = "ChecksumSHA256")]
+            checksum_sha256: String,
+            #[serde(rename = "ChecksumCRC64NVME")]
+            checksum_crc64nvme: String,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(rename = "CompleteMultipartUpload")]
+        struct WireCompleteMultipartUpload {
+            #[serde(rename = "Part", default)]
+            parts: Vec<WirePart>,
+        }
+
+        let body = String::from_utf8_lossy(buf);
+        let wire: WireCompleteMultipartUpload = quick_xml::de::from_str(&body).map_err(|err| std::io::Error::other(err))?;
+
+        Ok(Self {
+            parts: wire
+                .parts
+                .into_iter()
+                .map(|p| CompletePart {
+                    etag: p.etag,
+                    part_num: p.part_num,
+                    checksum_crc32: p.checksum_crc32,
+                    checksum_crc32c: p.checksum_crc32c,
+                    checksum_sha1: p.checksum_sha1,
+                    checksum_sha256: p.checksum_sha256,
+                    checksum_crc64nvme: p.checksum_crc64nvme,
+                })
+                .collect(),
+        })
     }
 }
 
@@ -340,7 +382,37 @@ impl DeleteMultiObjects {
     }
 
     pub fn unmarshal(buf: &[u8]) -> Result<Self, std::io::Error> {
-        todo!();
+        #[derive(Debug, Deserialize)]
+        struct WireDeleteObject {
+            #[serde(rename = "Key")]
+            key: String,
+            #[serde(rename = "VersionId")]
+            version_id: String,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(rename = "Delete")]
+        struct WireDeleteMultiObjects {
+            #[serde(rename = "Quiet", default)]
+            quiet: bool,
+            #[serde(rename = "Object", default)]
+            objects: Vec<WireDeleteObject>,
+        }
+
+        let body = String::from_utf8_lossy(buf);
+        let wire: WireDeleteMultiObjects = quick_xml::de::from_str(&body).map_err(|err| std::io::Error::other(err))?;
+
+        Ok(Self {
+            quiet: wire.quiet,
+            objects: wire
+                .objects
+                .into_iter()
+                .map(|o| DeleteObject {
+                    key: o.key,
+                    version_id: o.version_id,
+                })
+                .collect(),
+        })
     }
 }
 

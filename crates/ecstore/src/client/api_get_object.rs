@@ -41,7 +41,11 @@ use tokio_util::io::ReaderStream;
 
 impl TransitionClient {
     pub fn get_object(&self, bucket_name: &str, object_name: &str, opts: &GetObjectOptions) -> Result<Object, std::io::Error> {
-        todo!();
+        let _ = opts;
+        Err(std::io::Error::new(
+            IoErrorKind::Unsupported,
+            format!("get_object is not implemented for {bucket_name}/{object_name}"),
+        ))
     }
 
     pub async fn get_object_inner(
@@ -131,7 +135,18 @@ impl Object {
     }
 
     fn do_get_request(&self, request: &GetRequest) -> Result<GetResponse, std::io::Error> {
-        todo!()
+        let _ = request.did_offset_change;
+        let _ = request.offset;
+        let _ = request.is_first_req;
+        let _ = request.is_read_at;
+        let _ = request.setting_object_info;
+        let _ = request.is_read_op;
+        let _ = request.been_read;
+        let _ = request.buffer.len();
+        Err(std::io::Error::new(
+            IoErrorKind::Unsupported,
+            "read-path for Object in api_get_object is not implemented",
+        ))
     }
 
     fn set_offset(&mut self, bytes_read: i64) -> Result<(), std::io::Error> {

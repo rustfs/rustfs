@@ -26,6 +26,7 @@ use rustfs_utils::HashAlgorithm;
 use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
 use s3s::header::X_AMZ_BYPASS_GOVERNANCE_RETENTION;
+use serde::Deserialize;
 use std::fmt::Display;
 use std::{collections::HashMap, sync::Arc};
 use time::OffsetDateTime;
@@ -34,6 +35,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use crate::client::utils::base64_encode;
 use crate::client::{
     api_error_response::{ErrorResponse, http_resp_to_error_response, to_error_response},
+    api_s3_datatypes::{DeleteMultiObjects, DeleteObject},
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
 };
 use crate::{
@@ -354,7 +356,7 @@ impl TransitionClient {
                     body_vec.extend_from_slice(data);
                 }
             }
-            process_remove_multi_objects_response(ReaderImpl::Body(Bytes::from(body_vec)), result_tx.clone());
+            process_remove_multi_objects_response(ReaderImpl::Body(Bytes::from(body_vec)), &batch, result_tx.clone()).await;
         }
         Ok(())
     }
@@ -498,11 +500,187 @@ pub struct RemoveObjectsOptions {
 }
 
 pub fn generate_remove_multi_objects_request(objects: &[ObjectInfo]) -> Vec<u8> {
-    todo!();
+    let escape_xml = |value: &str| -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\"', "&quot;")
+            .replace('\'', "&apos;")
+    };
+
+    let request: DeleteMultiObjects = DeleteMultiObjects {
+        quiet: false,
+        objects: objects
+            .iter()
+            .map(|object| DeleteObject {
+                key: object.name.clone(),
+                version_id: object.version_id.map(|v| v.to_string()).unwrap_or_default(),
+            })
+            .collect(),
+    };
+
+    match request.marshal_msg() {
+        Ok(body) => body.into_bytes(),
+        Err(_) => {
+            let mut body = String::new();
+            body.push_str("<Delete><Quiet>false</Quiet>");
+            for object in objects {
+                body.push_str("<Object>");
+                body.push_str("<Key>");
+                body.push_str(&escape_xml(&object.name));
+                body.push_str("</Key>");
+                if !object.version_id.is_none() {
+                    body.push_str("<VersionId>");
+                    body.push_str(&escape_xml(&object.version_id.as_ref().map(|v| v.to_string()).unwrap_or_default()));
+                    body.push_str("</VersionId>");
+                }
+                body.push_str("</Object>");
+            }
+            body.push_str("</Delete>");
+            body.into_bytes()
+        }
+    }
 }
 
-pub fn process_remove_multi_objects_response(body: ReaderImpl, result_tx: Sender<RemoveObjectResult>) {
-    todo!();
+pub async fn process_remove_multi_objects_response(
+    body: ReaderImpl,
+    objects: &[ObjectInfo],
+    result_tx: Sender<RemoveObjectResult>,
+) {
+    let mut body_vec = Vec::new();
+    match body {
+        ReaderImpl::Body(content_body) => {
+            body_vec = content_body.to_vec();
+        }
+        ReaderImpl::ObjectBody(mut object_body) => match object_body.read_all().await {
+            Ok(content) => {
+                body_vec = content;
+            }
+            Err(err) => {
+                for object in objects {
+                    let version_id = object.version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                    let _ = result_tx
+                        .send(RemoveObjectResult {
+                            object_name: object.name.clone(),
+                            object_version_id: version_id,
+                            err: Some(std::io::Error::other(ErrorResponse {
+                                code: S3ErrorCode::Custom("ReadDeleteResponseFailed".into()),
+                                message: format!("read multi remove response failed: {err}"),
+                                bucket_name: object.bucket.clone(),
+                                key: object.name.clone(),
+                                resource: "".to_string(),
+                                request_id: "".to_string(),
+                                host_id: "".to_string(),
+                                region: "".to_string(),
+                                server: "".to_string(),
+                                status_code: StatusCode::OK,
+                            })),
+                            ..Default::default()
+                        })
+                        .await;
+                }
+                return;
+            }
+        },
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename = "DeleteResult")]
+    struct Deleted {
+        #[serde(rename = "Deleted", default)]
+        deleted: Vec<DeleteResultDeleted>,
+        #[serde(rename = "Error", default)]
+        error: Vec<DeleteResultError>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct DeleteResultDeleted {
+        #[serde(rename = "Key")]
+        key: String,
+        #[serde(rename = "VersionId")]
+        version_id: String,
+        #[serde(rename = "DeleteMarker")]
+        deletemarker: bool,
+        #[serde(rename = "DeleteMarkerVersionId", default)]
+        deletemarker_version_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct DeleteResultError {
+        #[serde(rename = "Key")]
+        key: String,
+        #[serde(rename = "VersionId")]
+        version_id: String,
+        #[serde(rename = "Code")]
+        code: String,
+        #[serde(rename = "Message")]
+        message: String,
+    }
+
+    let body = String::from_utf8_lossy(&body_vec);
+    let parsed: Deleted = match quick_xml::de::from_str(&body) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            for object in objects {
+                let version_id = object.version_id.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                let _ = result_tx
+                    .send(RemoveObjectResult {
+                        object_name: object.name.clone(),
+                        object_version_id: version_id,
+                        err: Some(std::io::Error::other(ErrorResponse {
+                            code: S3ErrorCode::Custom("UnmarshalDeleteResponseFailed".into()),
+                            message: format!("unmarshal multi remove response failed: {err}"),
+                            bucket_name: object.bucket.clone(),
+                            key: object.name.clone(),
+                            resource: "".to_string(),
+                            request_id: "".to_string(),
+                            host_id: "".to_string(),
+                            region: "".to_string(),
+                            server: "".to_string(),
+                            status_code: StatusCode::OK,
+                        })),
+                        ..Default::default()
+                    })
+                    .await;
+            }
+            return;
+        }
+    };
+
+    for deleted in parsed.deleted {
+        let _ = result_tx
+            .send(RemoveObjectResult {
+                object_name: deleted.key,
+                object_version_id: deleted.version_id,
+                delete_marker: deleted.deletemarker,
+                delete_marker_version_id: deleted.deletemarker_version_id,
+                err: None,
+            })
+            .await;
+    }
+
+    for removed in parsed.error {
+        let _ = result_tx
+            .send(RemoveObjectResult {
+                object_name: removed.key.clone(),
+                object_version_id: removed.version_id,
+                err: Some(std::io::Error::other(ErrorResponse {
+                    code: S3ErrorCode::Custom(removed.code.into()),
+                    message: removed.message,
+                    bucket_name: "".to_string(),
+                    key: removed.key,
+                    resource: "".to_string(),
+                    request_id: "".to_string(),
+                    host_id: "".to_string(),
+                    region: "".to_string(),
+                    server: "".to_string(),
+                    status_code: StatusCode::OK,
+                })),
+                ..Default::default()
+            })
+            .await;
+    }
 }
 
 fn has_invalid_xml_char(str: &str) -> bool {

@@ -7,7 +7,7 @@ test: core-deps test-deps ## Run all tests
 		cargo nextest run --all --exclude e2e_test; \
 	else \
 		echo "ℹ️ cargo-nextest not found; falling back to 'cargo test'"; \
-		cargo test --workspace --exclude e2e_test -- --nocapture; \
+		cargo test --workspace --exclude e2e_test -- --nocapture --test-threads=1; \
 	fi
 	cargo test --all --doc
 
