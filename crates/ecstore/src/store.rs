@@ -58,9 +58,9 @@ use crate::{
     rpc::S3PeerSys,
     sets::Sets,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
-        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
-        PutObjReader, StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
+        HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartOperations,
+        MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     store_init,
 };
@@ -259,24 +259,7 @@ lazy_static! {
 }
 
 #[async_trait::async_trait]
-impl StorageAPI for ECStore {
-    #[instrument(skip(self))]
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        self.handle_new_ns_lock(bucket, object).await
-    }
-    #[instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
-        self.handle_backend_info().await
-    }
-    #[instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        self.handle_storage_info().await
-    }
-    #[instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        self.handle_local_storage_info().await
-    }
-
+impl BucketOperations for ECStore {
     #[instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         self.handle_make_bucket(bucket, opts).await
@@ -294,7 +277,91 @@ impl StorageAPI for ECStore {
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         self.handle_delete_bucket(bucket, opts).await
     }
+}
 
+#[async_trait::async_trait]
+impl ObjectOperations for ECStore {
+    #[instrument(skip(self))]
+    async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.handle_get_object_info(bucket, object, opts).await
+    }
+
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.handle_verify_object_integrity(bucket, object, opts).await
+    }
+
+    // TODO: review
+    #[instrument(skip(self))]
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+            .await
+    }
+
+    #[instrument(skip(self))]
+    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
+        self.handle_delete_object_version(bucket, object, fi, force_del_marker).await
+    }
+
+    #[instrument(skip(self))]
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        self.handle_delete_object(bucket, object, opts).await
+    }
+    // TODO: review
+    #[instrument(skip(self))]
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+        self.handle_delete_objects(bucket, objects, opts).await
+    }
+
+    #[instrument(skip(self))]
+    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.handle_put_object_metadata(bucket, object, opts).await
+    }
+    #[instrument(skip(self))]
+    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
+        self.handle_get_object_tags(bucket, object, opts).await
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.handle_put_object_tags(bucket, object, tags, opts).await
+    }
+
+    #[instrument(skip(self))]
+    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.handle_delete_object_tags(bucket, object, opts).await
+    }
+
+    #[instrument(skip(self))]
+    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
+        self.handle_add_partial(bucket, object, version_id).await
+    }
+    #[instrument(skip(self))]
+    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.handle_transition_object(bucket, object, opts).await
+    }
+
+    #[instrument(skip(self))]
+    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.handle_restore_transitioned_object(bucket, object, opts).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ListOperations for ECStore {
     // @continuation_token marker
     // @start_after as marker when continuation_token empty
     // @delimiter default="/", empty when recursive
@@ -348,56 +415,10 @@ impl StorageAPI for ECStore {
     ) -> Result<()> {
         self.handle_walk(rx, bucket, prefix, result, opts).await
     }
+}
 
-    #[instrument(skip(self))]
-    async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.handle_get_object_info(bucket, object, opts).await
-    }
-
-    // TODO: review
-    #[instrument(skip(self))]
-    async fn copy_object(
-        &self,
-        src_bucket: &str,
-        src_object: &str,
-        dst_bucket: &str,
-        dst_object: &str,
-        src_info: &mut ObjectInfo,
-        src_opts: &ObjectOptions,
-        dst_opts: &ObjectOptions,
-    ) -> Result<ObjectInfo> {
-        self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-            .await
-    }
-    #[instrument(skip(self))]
-    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
-        self.handle_delete_object(bucket, object, opts).await
-    }
-    // TODO: review
-    #[instrument(skip(self))]
-    async fn delete_objects(
-        &self,
-        bucket: &str,
-        objects: Vec<ObjectToDelete>,
-        opts: ObjectOptions,
-    ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
-        self.handle_delete_objects(bucket, objects, opts).await
-    }
-
-    #[instrument(skip(self))]
-    async fn list_object_parts(
-        &self,
-        bucket: &str,
-        object: &str,
-        upload_id: &str,
-        part_number_marker: Option<usize>,
-        max_parts: usize,
-        opts: &ObjectOptions,
-    ) -> Result<ListPartsInfo> {
-        self.handle_list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
-            .await
-    }
-
+#[async_trait::async_trait]
+impl MultipartOperations for ECStore {
     #[instrument(skip(self))]
     async fn list_multipart_uploads(
         &self,
@@ -415,20 +436,6 @@ impl StorageAPI for ECStore {
     #[instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         self.handle_new_multipart_upload(bucket, object, opts).await
-    }
-
-    #[instrument(skip(self))]
-    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        self.handle_add_partial(bucket, object, version_id).await
-    }
-    #[instrument(skip(self))]
-    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        self.handle_transition_object(bucket, object, opts).await
-    }
-
-    #[instrument(skip(self))]
-    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        self.handle_restore_transitioned_object(bucket, object, opts).await
     }
 
     #[instrument(skip(self))]
@@ -485,6 +492,21 @@ impl StorageAPI for ECStore {
     ) -> Result<MultipartInfo> {
         self.handle_get_multipart_info(bucket, object, upload_id, opts).await
     }
+
+    #[instrument(skip(self))]
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo> {
+        self.handle_list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+            .await
+    }
+
     #[instrument(skip(self))]
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
         self.handle_abort_multipart_upload(bucket, object, upload_id, opts).await
@@ -502,40 +524,10 @@ impl StorageAPI for ECStore {
         self.handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
             .await
     }
+}
 
-    #[instrument(skip(self))]
-    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        self.handle_get_disks(pool_idx, set_idx).await
-    }
-
-    #[instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        self.handle_set_drive_counts()
-    }
-    #[instrument(skip(self))]
-    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.handle_put_object_metadata(bucket, object, opts).await
-    }
-    #[instrument(skip(self))]
-    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
-        self.handle_get_object_tags(bucket, object, opts).await
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.handle_put_object_tags(bucket, object, tags, opts).await
-    }
-
-    #[instrument(skip(self))]
-    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        self.handle_delete_object_version(bucket, object, fi, force_del_marker).await
-    }
-
-    #[instrument(skip(self))]
-    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.handle_delete_object_tags(bucket, object, opts).await
-    }
-
+#[async_trait::async_trait]
+impl HealOperations for ECStore {
     #[instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         self.handle_heal_format(dry_run).await
@@ -565,9 +557,35 @@ impl StorageAPI for ECStore {
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
         self.handle_check_abandoned_parts(bucket, object, opts).await
     }
+}
 
-    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        self.handle_verify_object_integrity(bucket, object, opts).await
+#[async_trait::async_trait]
+impl StorageAPI for ECStore {
+    #[instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
+        self.handle_new_ns_lock(bucket, object).await
+    }
+    #[instrument(skip(self))]
+    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
+        self.handle_backend_info().await
+    }
+    #[instrument(skip(self))]
+    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
+        self.handle_storage_info().await
+    }
+    #[instrument(skip(self))]
+    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+        self.handle_local_storage_info().await
+    }
+
+    #[instrument(skip(self))]
+    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
+        self.handle_get_disks(pool_idx, set_idx).await
+    }
+
+    #[instrument(skip(self))]
+    fn set_drive_counts(&self) -> Vec<usize> {
+        self.handle_set_drive_counts()
     }
 }
 

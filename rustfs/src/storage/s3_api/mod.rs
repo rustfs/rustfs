@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(dead_code)]
+
 //! Facade modules for incremental S3 API extraction from `ecfs.rs`.
 //!
 //! This file intentionally starts as skeleton-only. Behavior remains in place
 //! until each helper is moved with dedicated small refactor steps.
-#![allow(dead_code)]
 
 pub(crate) mod acl;
 pub(crate) mod bucket;

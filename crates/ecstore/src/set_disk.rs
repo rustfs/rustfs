@@ -52,9 +52,9 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
-        ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectIO, ObjectInfo,
-        PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
+        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartInfo,
+        MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::load_format_erasure,
 };
@@ -842,10 +842,20 @@ impl StorageAPI for SetDisks {
 
         get_storage_info(&local_disks, &local_endpoints).await
     }
+
     #[tracing::instrument(skip(self))]
-    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
+        Ok(self.get_disks_internal().await)
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn set_drive_counts(&self) -> Vec<usize> {
         unimplemented!()
     }
+}
+
+#[async_trait::async_trait]
+impl BucketOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
@@ -856,6 +866,19 @@ impl StorageAPI for SetDisks {
         unimplemented!()
     }
 
+    #[tracing::instrument(skip(self))]
+    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn copy_object(
         &self,
@@ -1401,45 +1424,6 @@ impl StorageAPI for SetDisks {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn list_objects_v2(
-        self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _continuation_token: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-        _fetch_owner: bool,
-        _start_after: Option<String>,
-        _incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_object_versions(
-        self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _marker: Option<String>,
-        _version_marker: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        unimplemented!()
-    }
-
-    async fn walk(
-        self: Arc<Self>,
-        _rx: CancellationToken,
-        _bucket: &str,
-        _prefix: &str,
-        _result: Sender<ObjectInfoOrErr>,
-        _opts: WalkOptions,
-    ) -> Result<()> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // Acquire a shared read-lock to protect consistency during info fetch
         let _read_lock_guard = if !opts.no_lock {
@@ -1890,6 +1874,60 @@ impl StorageAPI for SetDisks {
         self.put_object_tags(bucket, object, "", opts).await
     }
 
+    #[tracing::instrument(skip(self))]
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let get_object_reader = <Self as ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
+        // Stream to sink to avoid loading entire object into memory during verification
+        let mut reader = get_object_reader.stream;
+        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ListOperations for SetDisks {
+    #[tracing::instrument(skip(self))]
+    async fn list_objects_v2(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _continuation_token: Option<String>,
+        _delimiter: Option<String>,
+        _max_keys: i32,
+        _fetch_owner: bool,
+        _start_after: Option<String>,
+        _incl_deleted: bool,
+    ) -> Result<ListObjectsV2Info> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_versions(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _marker: Option<String>,
+        _version_marker: Option<String>,
+        _delimiter: Option<String>,
+        _max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        _rx: CancellationToken,
+        _bucket: &str,
+        _prefix: &str,
+        _result: Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
+impl MultipartOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn copy_object_part(
         &self,
@@ -2922,22 +2960,10 @@ impl StorageAPI for SetDisks {
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
+}
 
-    #[tracing::instrument(skip(self))]
-    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        Ok(self.get_disks_internal().await)
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
-        unimplemented!()
-    }
-
+#[async_trait::async_trait]
+impl HealOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         unimplemented!()
@@ -3022,15 +3048,6 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
         unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let get_object_reader = <Self as ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
-        // Stream to sink to avoid loading entire object into memory during verification
-        let mut reader = get_object_reader.stream;
-        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
-        Ok(())
     }
 }
 

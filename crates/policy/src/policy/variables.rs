@@ -161,7 +161,7 @@ impl VariableResolver {
     fn resolve_userid(&self) -> Option<String> {
         self.get_claim_as_strings("sub")
             .or_else(|| self.get_claim_as_strings("parent"))
-            .and_then(|mut vec| vec.pop()) // 取第一个值，保持原有逻辑
+            .and_then(|mut vec| vec.pop())
     }
 
     fn resolve_principal_type(&self) -> String {

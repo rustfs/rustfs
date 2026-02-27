@@ -30,6 +30,7 @@ use rustfs_ecstore::{
     new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     rebalance::{DiskStat, RebalSaveOpt},
+    store_api::BucketOperations,
     store_api::BucketOptions,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};

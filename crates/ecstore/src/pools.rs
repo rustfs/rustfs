@@ -27,7 +27,8 @@ use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::set_disk::SetDisks;
 use crate::store_api::{
-    BucketOptions, CompletePart, GetObjectReader, MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI,
+    BucketOperations, BucketOptions, CompletePart, GetObjectReader, HealOperations, MakeBucketOptions, MultipartOperations,
+    ObjectIO, ObjectOperations, ObjectOptions, PutObjReader, StorageAPI,
 };
 use crate::{sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};

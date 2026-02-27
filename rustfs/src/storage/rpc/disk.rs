@@ -633,39 +633,6 @@ impl NodeService {
 
     pub(super) async fn handle_write(&self, _request: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
         unimplemented!("write");
-        // let request = request.into_inner();
-        // if let Some(disk) = self.find_disk(&request.disk).await {
-        //     let file_writer = if request.is_append {
-        //         disk.append_file(&request.volume, &request.path).await
-        //     } else {
-        //         disk.create_file("", &request.volume, &request.path, 0).await
-        //     };
-
-        //     match file_writer {
-        //         Ok(mut file_writer) => match file_writer.write(&request.data).await {
-        //             Ok(_) => Ok(Response::new(WriteResponse {
-        //                 success: true,
-        //                 error: None,
-        //             })),
-        //             Err(err) => Ok(Response::new(WriteResponse {
-        //                 success: false,
-        //                 error: Some(err_to_proto_err(&err, &format!("write failed: {}", err))),
-        //             })),
-        //         },
-        //         Err(err) => Ok(Response::new(WriteResponse {
-        //             success: false,
-        //             error: Some(err_to_proto_err(&err, &format!("get writer failed: {}", err))),
-        //         })),
-        //     }
-        // } else {
-        //     Ok(Response::new(WriteResponse {
-        //         success: false,
-        //         error: Some(err_to_proto_err(
-        //             &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-        //             "can not find disk",
-        //         )),
-        //     }))
-        // }
     }
 
     pub(super) async fn handle_rename_file(

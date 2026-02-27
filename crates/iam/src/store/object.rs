@@ -21,8 +21,7 @@ use crate::{
 };
 use futures::future::join_all;
 use rustfs_credentials::get_global_action_cred;
-use rustfs_ecstore::StorageAPI as _;
-use rustfs_ecstore::store_api::{ObjectInfoOrErr, WalkOptions};
+use rustfs_ecstore::store_api::{ListOperations as _, ObjectInfoOrErr, WalkOptions};
 use rustfs_ecstore::{
     config::{
         RUSTFS_CONFIG_PREFIX,

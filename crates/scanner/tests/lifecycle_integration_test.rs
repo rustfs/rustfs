@@ -19,7 +19,7 @@ use rustfs_ecstore::{
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     global::GLOBAL_TierConfigMgr,
     store::ECStore,
-    store_api::{MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{BucketOperations, MakeBucketOptions, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
     tier::tier_config::{TierConfig, TierMinIO, TierType},
 };
 use rustfs_scanner::scanner::init_data_scanner;

@@ -129,29 +129,23 @@ pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
     if print_tokio_thread_enable() {
         builder
             .on_thread_start(|| {
-                let id = std::thread::current().id();
-                println!(
-                    "RustFS Worker Thread running - initializing resources time: {:?}, thread id: {:?}",
-                    jiff::Zoned::now().to_string(),
-                    id
-                );
+                tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread started");
             })
             .on_thread_stop(|| {
-                let id = std::thread::current().id();
-                println!(
-                    "RustFS Worker Thread stopping - cleaning up resources time: {:?}, thread id: {:?}",
-                    jiff::Zoned::now().to_string(),
-                    id
-                )
+                tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread stopped");
             });
     }
     if !rustfs_obs::is_production_environment() {
-        println!(
-            "Starting Tokio runtime with configured parameters:\n\
-         worker_threads: {worker_threads}, max_blocking_threads: {max_blocking_threads}, \
-         thread_stack_size: {thread_stack_size}, thread_keep_alive: {thread_keep_alive}, \
-         global_queue_interval: {global_queue_interval}, event_interval: {event_interval}, \
-         max_io_events_per_tick: {max_io_events_per_tick}, thread_name: {thread_name}"
+        tracing::debug!(
+            worker_threads,
+            max_blocking_threads,
+            thread_stack_size,
+            thread_keep_alive,
+            global_queue_interval,
+            event_interval,
+            max_io_events_per_tick,
+            thread_name,
+            "Starting Tokio runtime with configured parameters"
         );
     }
     builder

@@ -25,11 +25,11 @@ use object_store::{
 };
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
-use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::ObjectIO;
+use rustfs_ecstore::store_api::ObjectOperations;
 use rustfs_ecstore::store_api::ObjectOptions;
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
