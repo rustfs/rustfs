@@ -684,7 +684,7 @@ async fn apply_ssec_prepare_encryption_material(
 
     Ok(EncryptionMaterial {
         sse_type: SSEType::SseC,
-        server_side_encryption: ServerSideEncryption::from(ServerSideEncryption::AES256.to_owned()),
+        server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
         kms_key_id: None,
         algorithm,
         key_bytes: [0; 32],
@@ -731,7 +731,7 @@ async fn apply_ssec_encryption_material(
 
     Ok(EncryptionMaterial {
         sse_type: SSEType::SseC,
-        server_side_encryption: ServerSideEncryption::from(ServerSideEncryption::AES256.to_owned()),
+        server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
         kms_key_id: None,
         algorithm: validated.algorithm,
         key_bytes: validated.key_bytes,
@@ -776,7 +776,7 @@ async fn apply_ssec_decryption_material(
 
     Ok(DecryptionMaterial {
         sse_type: SSEType::SseC,
-        server_side_encryption: ServerSideEncryption::from(ServerSideEncryption::AES256.to_owned()), // const
+        server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256), // const
         kms_key_id: None,
         algorithm: SSECustomerAlgorithm::from(algorithm),
 
@@ -941,10 +941,8 @@ async fn apply_managed_decryption_material(
         return Ok(None);
     }
 
-    let server_side_encryption = metadata
-        .get("x-amz-server-side-encryption")
-        .cloned()
-        .ok_or_else(|| ApiError::from(StorageError::other("missing x-amz-server-side-encryption header")))?;
+    // Safe: presence is guaranteed by the contains_key check above.
+    let server_side_encryption = metadata.get("x-amz-server-side-encryption").cloned().unwrap_or_default();
 
     // Parse metadata - try using service if available, otherwise parse manually
     let (encrypted_data_key, iv, algorithm) = if let Some(service) = get_global_encryption_service().await {

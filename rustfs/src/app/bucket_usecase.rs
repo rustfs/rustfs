@@ -397,7 +397,10 @@ impl DefaultBucketUsecase {
             list_bucket_infos = futures::stream::iter(list_bucket_infos)
                 .filter_map(|info| async {
                     let mut req_clone = req.clone();
-                    let req_info = req_clone.extensions.get_mut::<ReqInfo>()?;
+                    let Some(req_info) = req_clone.extensions.get_mut::<ReqInfo>() else {
+                        debug!(bucket = %info.name, "ReqInfo missing in extensions, skipping bucket authorization");
+                        return None;
+                    };
                     req_info.bucket = Some(info.name.clone());
 
                     if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
