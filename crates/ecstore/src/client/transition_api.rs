@@ -257,6 +257,8 @@ impl TransitionClient {
         is_md5_requested: bool,
         is_sha256_requested: bool,
     ) -> (HashMap<String, HashAlgorithm>, HashMap<String, Vec<u8>>) {
+        // `hash_algos` declares which algorithms are active for this multipart upload.
+        // `hash_sums` keeps the current part digest bytes and is refreshed on every loop.
         let mut hash_algos = HashMap::new();
         let mut hash_sums = HashMap::new();
 

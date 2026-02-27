@@ -28,7 +28,10 @@ use s3s::dto::ReplicationStatus;
 use s3s::header::X_AMZ_BYPASS_GOVERNANCE_RETENTION;
 use serde::Deserialize;
 use std::fmt::Display;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -530,7 +533,7 @@ pub fn generate_remove_multi_objects_request(objects: &[ObjectInfo]) -> Vec<u8> 
                 body.push_str("<Key>");
                 body.push_str(&escape_xml(&object.name));
                 body.push_str("</Key>");
-                if !object.version_id.is_none() {
+                if object.version_id.is_some() {
                     body.push_str("<VersionId>");
                     body.push_str(&escape_xml(&object.version_id.as_ref().map(|v| v.to_string()).unwrap_or_default()));
                     body.push_str("</VersionId>");
@@ -598,7 +601,7 @@ pub async fn process_remove_multi_objects_response(
     struct DeleteResultDeleted {
         #[serde(rename = "Key")]
         key: String,
-        #[serde(rename = "VersionId")]
+        #[serde(rename = "VersionId", default)]
         version_id: String,
         #[serde(rename = "DeleteMarker")]
         deletemarker: bool,
@@ -610,12 +613,17 @@ pub async fn process_remove_multi_objects_response(
     struct DeleteResultError {
         #[serde(rename = "Key")]
         key: String,
-        #[serde(rename = "VersionId")]
+        #[serde(rename = "VersionId", default)]
         version_id: String,
         #[serde(rename = "Code")]
         code: String,
         #[serde(rename = "Message")]
         message: String,
+    }
+
+    let mut pending = HashSet::with_capacity(objects.len());
+    for object in objects {
+        pending.insert((object.name.clone(), object.version_id.as_ref().map(|v| v.to_string()).unwrap_or_default()));
     }
 
     let body = String::from_utf8_lossy(&body_vec);
@@ -649,6 +657,7 @@ pub async fn process_remove_multi_objects_response(
     };
 
     for deleted in parsed.deleted {
+        pending.remove(&(deleted.key.clone(), deleted.version_id.clone()));
         let _ = result_tx
             .send(RemoveObjectResult {
                 object_name: deleted.key,
@@ -661,6 +670,7 @@ pub async fn process_remove_multi_objects_response(
     }
 
     for removed in parsed.error {
+        pending.remove(&(removed.key.clone(), removed.version_id.clone()));
         let _ = result_tx
             .send(RemoveObjectResult {
                 object_name: removed.key.clone(),
@@ -670,6 +680,42 @@ pub async fn process_remove_multi_objects_response(
                     message: removed.message,
                     bucket_name: "".to_string(),
                     key: removed.key,
+                    resource: "".to_string(),
+                    request_id: "".to_string(),
+                    host_id: "".to_string(),
+                    region: "".to_string(),
+                    server: "".to_string(),
+                    status_code: StatusCode::OK,
+                })),
+                ..Default::default()
+            })
+            .await;
+    }
+
+    for (object_name, object_version_id) in pending {
+        let bucket_name = objects
+            .iter()
+            .find(|object| {
+                object.name == object_name && object.version_id.as_ref().map(|v| v.to_string()) == Some(object_version_id.clone())
+            })
+            .map(|o| o.bucket.clone())
+            .unwrap_or_default();
+        let object_name = object_name;
+        let object_version_id = object_version_id;
+        let error_message = format!(
+            "remove response did not contain an entry for object {} with version {}",
+            object_name, object_version_id
+        );
+
+        let _ = result_tx
+            .send(RemoveObjectResult {
+                object_name: object_name.clone(),
+                object_version_id: object_version_id.clone(),
+                err: Some(std::io::Error::other(ErrorResponse {
+                    code: S3ErrorCode::Custom("UnmatchedDeleteResponseEntry".into()),
+                    message: error_message,
+                    bucket_name,
+                    key: object_name,
                     resource: "".to_string(),
                     request_id: "".to_string(),
                     host_id: "".to_string(),

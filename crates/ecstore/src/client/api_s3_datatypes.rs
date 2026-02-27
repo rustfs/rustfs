@@ -316,7 +316,8 @@ impl CompleteMultipartUpload {
         }
 
         let body = String::from_utf8_lossy(buf);
-        let wire: WireCompleteMultipartUpload = quick_xml::de::from_str(&body).map_err(|err| std::io::Error::other(err))?;
+        let wire: WireCompleteMultipartUpload = quick_xml::de::from_str(&body)
+            .map_err(|err| std::io::Error::other(format!("failed to parse CompleteMultipartUpload XML: {err}; body: {body}")))?;
 
         Ok(Self {
             parts: wire

@@ -345,7 +345,7 @@ mod serial_tests {
 
         let (_format_result, format_error) = heal_storage.heal_format(false).await.expect("failed to run heal_format");
         if let Some(err) = format_error {
-            info!("heal_format returned warning/error: {:?}", err);
+            info!("heal_format returned error: {:?}", err);
         }
 
         let restored = wait_for_path_exists(&format_path, HEAL_FORMAT_WAIT_TIMEOUT, HEAL_FORMAT_WAIT_INTERVAL).await;
