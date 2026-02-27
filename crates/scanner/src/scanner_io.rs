@@ -499,7 +499,7 @@ impl ScannerIODisk for Disk {
                     &item.object_path()
                 );
 
-                return Err(StorageError::other("skip file".to_string()));
+                return Err(StorageError::other("failed to read metadata".to_string()));
             }
         };
 
@@ -510,7 +510,7 @@ impl ScannerIODisk for Disk {
             Ok(versions) => versions,
             Err(e) => {
                 error!("Failed to get file info versions: {}", e);
-                return Err(StorageError::other("skip file".to_string()));
+                return Err(StorageError::other("failed to get file info".to_string()));
             }
         };
 
