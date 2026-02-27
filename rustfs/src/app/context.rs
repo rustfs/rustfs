@@ -19,15 +19,14 @@
 
 use crate::config::workload_profiles::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
-use rustfs_ecstore::GLOBAL_Endpoints;
-use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, GLOBAL_BucketMetadataSys};
-use rustfs_ecstore::config::{Config, GLOBAL_SERVER_CONFIG};
+use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
+use rustfs_ecstore::config::{Config, get_global_server_config};
 use rustfs_ecstore::endpoints::EndpointServerPools;
-use rustfs_ecstore::global::get_global_region;
+use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::tier::tier::TierConfigMgr;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
-use rustfs_kms::KmsServiceManager;
+use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
 use rustfs_targets::{EventName, arn::TargetID};
 use std::sync::{Arc, OnceLock};
@@ -42,6 +41,11 @@ pub trait IamInterface: Send + Sync {
 /// KMS interface for application-layer use-cases.
 pub trait KmsInterface: Send + Sync {
     fn handle(&self) -> Arc<KmsServiceManager>;
+}
+
+/// KMS runtime interface for application-layer and admin handler integration.
+pub trait KmsRuntimeInterface: Send + Sync {
+    fn service_manager(&self) -> Option<Arc<KmsServiceManager>>;
 }
 
 /// Notify interface for application-layer use-cases.
@@ -71,7 +75,7 @@ pub trait EndpointsInterface: Send + Sync {
 
 /// Region interface for application-layer use-cases.
 pub trait RegionInterface: Send + Sync {
-    fn get(&self) -> Option<String>;
+    fn get(&self) -> Option<s3s::region::Region>;
 }
 
 /// Tier config interface for application-layer and admin handlers.
@@ -127,6 +131,16 @@ impl KmsInterface for KmsHandle {
     }
 }
 
+/// Default KMS runtime interface adapter.
+#[derive(Default)]
+pub struct KmsRuntimeHandle;
+
+impl KmsRuntimeInterface for KmsRuntimeHandle {
+    fn service_manager(&self) -> Option<Arc<KmsServiceManager>> {
+        get_global_kms_service_manager()
+    }
+}
+
 /// Default notify interface adapter.
 #[derive(Default)]
 pub struct NotifyHandle;
@@ -157,7 +171,7 @@ pub struct BucketMetadataHandle;
 
 impl BucketMetadataInterface for BucketMetadataHandle {
     fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>> {
-        GLOBAL_BucketMetadataSys.get().cloned()
+        get_global_bucket_metadata_sys()
     }
 }
 
@@ -167,7 +181,7 @@ pub struct EndpointsHandle;
 
 impl EndpointsInterface for EndpointsHandle {
     fn handle(&self) -> Option<EndpointServerPools> {
-        GLOBAL_Endpoints.get().cloned()
+        get_global_endpoints_opt()
     }
 }
 
@@ -176,7 +190,7 @@ impl EndpointsInterface for EndpointsHandle {
 pub struct RegionHandle;
 
 impl RegionInterface for RegionHandle {
-    fn get(&self) -> Option<String> {
+    fn get(&self) -> Option<s3s::region::Region> {
         get_global_region()
     }
 }
@@ -187,7 +201,7 @@ pub struct TierConfigHandle;
 
 impl TierConfigInterface for TierConfigHandle {
     fn handle(&self) -> Arc<RwLock<TierConfigMgr>> {
-        rustfs_ecstore::global::GLOBAL_TierConfigMgr.clone()
+        get_global_tier_config_mgr()
     }
 }
 
@@ -197,7 +211,7 @@ pub struct ServerConfigHandle;
 
 impl ServerConfigInterface for ServerConfigHandle {
     fn get(&self) -> Option<Config> {
-        GLOBAL_SERVER_CONFIG.get().cloned()
+        get_global_server_config()
     }
 }
 
@@ -217,6 +231,7 @@ pub struct AppContext {
     object_store: Arc<ECStore>,
     iam: Arc<dyn IamInterface>,
     kms: Arc<dyn KmsInterface>,
+    kms_runtime: Arc<dyn KmsRuntimeInterface>,
     notify: Arc<dyn NotifyInterface>,
     bucket_metadata: Arc<dyn BucketMetadataInterface>,
     endpoints: Arc<dyn EndpointsInterface>,
@@ -232,6 +247,7 @@ impl AppContext {
             object_store,
             iam,
             kms,
+            kms_runtime: default_kms_runtime_interface(),
             notify: default_notify_interface(),
             bucket_metadata: default_bucket_metadata_interface(),
             endpoints: default_endpoints_interface(),
@@ -260,6 +276,10 @@ impl AppContext {
 
     pub fn kms(&self) -> Arc<dyn KmsInterface> {
         self.kms.clone()
+    }
+
+    pub fn kms_runtime(&self) -> Arc<dyn KmsRuntimeInterface> {
+        self.kms_runtime.clone()
     }
 
     pub fn notify(&self) -> Arc<dyn NotifyInterface> {
@@ -295,6 +315,51 @@ pub fn default_notify_interface() -> Arc<dyn NotifyInterface> {
     Arc::new(NotifyHandle)
 }
 
+pub fn default_kms_runtime_interface() -> Arc<dyn KmsRuntimeInterface> {
+    Arc::new(KmsRuntimeHandle)
+}
+
+/// Resolve KMS runtime service manager using AppContext-first precedence.
+pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
+    get_global_app_context()
+        .and_then(|context| context.kms_runtime().service_manager())
+        .or_else(|| default_kms_runtime_interface().service_manager())
+}
+
+/// Resolve bucket metadata handle using AppContext-first precedence.
+pub fn resolve_bucket_metadata_handle() -> Option<Arc<RwLock<BucketMetadataSys>>> {
+    get_global_app_context()
+        .and_then(|context| context.bucket_metadata().handle())
+        .or_else(|| default_bucket_metadata_interface().handle())
+}
+
+/// Resolve object store handle from AppContext.
+pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
+    get_global_app_context().map(|context| context.object_store())
+}
+
+/// Resolve endpoints using AppContext-first precedence.
+pub fn resolve_endpoints_handle() -> Option<EndpointServerPools> {
+    get_global_app_context()
+        .and_then(|context| context.endpoints().handle())
+        .or_else(|| default_endpoints_interface().handle())
+}
+
+/// Resolve tier config handle using AppContext-first precedence.
+pub fn resolve_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
+    get_global_app_context()
+        .map(|context| context.tier_config().handle())
+        .unwrap_or_else(|| default_tier_config_interface().handle())
+}
+
+/// Resolve server config using AppContext-first precedence.
+pub fn resolve_server_config() -> Option<Config> {
+    match get_global_app_context() {
+        Some(context) => context.server_config().get(),
+        None => default_server_config_interface().get(),
+    }
+}
+
 pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
     Arc::new(BucketMetadataHandle)
 }
@@ -319,14 +384,14 @@ pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
     Arc::new(BufferConfigHandle)
 }
 
-static GLOBAL_APP_CONTEXT: OnceLock<Arc<AppContext>> = OnceLock::new();
+static APP_CONTEXT_SINGLETON: OnceLock<Arc<AppContext>> = OnceLock::new();
 
 /// Initialize global application context once and return the canonical instance.
 pub fn init_global_app_context(context: AppContext) -> Arc<AppContext> {
-    GLOBAL_APP_CONTEXT.get_or_init(|| Arc::new(context)).clone()
+    APP_CONTEXT_SINGLETON.get_or_init(|| Arc::new(context)).clone()
 }
 
 /// Get global application context if it has been initialized.
 pub fn get_global_app_context() -> Option<Arc<AppContext>> {
-    GLOBAL_APP_CONTEXT.get().cloned()
+    APP_CONTEXT_SINGLETON.get().cloned()
 }

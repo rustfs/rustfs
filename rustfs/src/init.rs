@@ -93,14 +93,15 @@ pub(crate) fn init_update_check() {
 /// * `buckets` - A vector of bucket names to process
 #[instrument(skip_all)]
 pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) {
-    let region_opt = rustfs_ecstore::global::get_global_region();
-    let region = match region_opt {
-        Some(ref r) if !r.is_empty() => r,
-        _ => {
+    let global_region = rustfs_ecstore::global::get_global_region();
+    let region = global_region
+        .as_ref()
+        .filter(|r| !r.as_str().is_empty())
+        .map(|r| r.as_str())
+        .unwrap_or_else(|| {
             warn!("Global region is not set; attempting notification configuration for all buckets with an empty region.");
             ""
-        }
-    };
+        });
     for bucket in buckets.iter() {
         let has_notification_config = metadata_sys::get_notification_config(bucket).await.unwrap_or_else(|err| {
             warn!("get_notification_config err {:?}", err);
@@ -368,7 +369,7 @@ pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<(
         // Create FTP server with protocol storage client
         let fs = crate::storage::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
-        let server: FtpsServer<crate::protocols::ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+        let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
 
         // Log server configuration
         info!(
@@ -451,7 +452,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
         // Create FTPS server with protocol storage client
         let fs = crate::storage::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
-        let server: FtpsServer<crate::protocols::ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+        let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
 
         // Log server configuration
         info!(

@@ -440,7 +440,7 @@ impl SetDisks {
         Ok(())
     }
 
-    pub(super) async fn delete_if_dang_ling(
+    pub(super) async fn delete_if_dangling(
         &self,
         bucket: &str,
         object: &str,
@@ -449,7 +449,7 @@ impl SetDisks {
         data_errs_by_part: &HashMap<usize, Vec<usize>>,
         opts: ObjectOptions,
     ) -> disk::error::Result<FileInfo> {
-        let (m, can_heal) = is_object_dang_ling(meta_arr, errs, data_errs_by_part);
+        let (m, can_heal) = is_object_dangling(meta_arr, errs, data_errs_by_part);
 
         if !can_heal {
             return Err(DiskError::ErasureReadQuorum);
