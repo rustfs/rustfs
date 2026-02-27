@@ -44,7 +44,7 @@ pub(crate) struct ReqInfo {
     pub bucket: Option<String>,
     pub object: Option<String>,
     pub version_id: Option<String>,
-    pub region: Option<String>,
+    pub region: Option<s3s::region::Region>,
 }
 
 #[derive(Clone, Copy)]
@@ -352,7 +352,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             &req.headers,
             &rustfs_credentials::Credentials::default(),
             req_info.version_id.as_deref(),
-            req.region.as_deref(),
+            req.region.clone(),
             remote_addr,
         );
         let bucket_name = req_info.bucket.as_deref().unwrap_or("");

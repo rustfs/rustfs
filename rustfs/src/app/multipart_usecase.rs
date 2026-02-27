@@ -27,6 +27,7 @@ use crate::storage::options::{
 use crate::storage::*;
 use bytes::Bytes;
 use futures::StreamExt;
+use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
@@ -164,7 +165,7 @@ impl DefaultMultipartUsecase {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
     }
 
-    fn global_region(&self) -> Option<String> {
+    fn global_region(&self) -> Option<s3s::region::Region> {
         self.context.as_ref().and_then(|context| context.region().get())
     }
 
@@ -422,12 +423,12 @@ impl DefaultMultipartUsecase {
             }
         }
 
-        let region = self.global_region().unwrap_or_else(|| "us-east-1".to_string());
+        let region = self.global_region().unwrap_or_else(|| RUSTFS_REGION.parse().unwrap());
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(region.clone()),
+            location: Some(region.to_string()),
             server_side_encryption: server_side_encryption.clone(),
             ssekms_key_id: ssekms_key_id.clone(),
             checksum_crc32: checksum_crc32.clone(),
@@ -448,7 +449,7 @@ impl DefaultMultipartUsecase {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(region),
+            location: Some(region.to_string()),
             server_side_encryption,
             ssekms_key_id,
             checksum_crc32,
