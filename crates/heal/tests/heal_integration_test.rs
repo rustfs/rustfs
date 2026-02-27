@@ -181,7 +181,7 @@ mod serial_tests {
 
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
-        let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
+        let _obj_dir = disk_paths[0].join(bucket_name).join(object_name);
         // ─── 1️⃣ delete single data shard file ─────────────────────────────────────
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
         // find part file at depth 2, e.g. .../<uuid>/part.1
