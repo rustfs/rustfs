@@ -75,7 +75,7 @@ pub trait EndpointsInterface: Send + Sync {
 
 /// Region interface for application-layer use-cases.
 pub trait RegionInterface: Send + Sync {
-    fn get(&self) -> Option<String>;
+    fn get(&self) -> Option<s3s::region::Region>;
 }
 
 /// Tier config interface for application-layer and admin handlers.
@@ -190,7 +190,7 @@ impl EndpointsInterface for EndpointsHandle {
 pub struct RegionHandle;
 
 impl RegionInterface for RegionHandle {
-    fn get(&self) -> Option<String> {
+    fn get(&self) -> Option<s3s::region::Region> {
         get_global_region()
     }
 }
@@ -384,14 +384,14 @@ pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
     Arc::new(BufferConfigHandle)
 }
 
-static GLOBAL_APP_CONTEXT: OnceLock<Arc<AppContext>> = OnceLock::new();
+static APP_CONTEXT_SINGLETON: OnceLock<Arc<AppContext>> = OnceLock::new();
 
 /// Initialize global application context once and return the canonical instance.
 pub fn init_global_app_context(context: AppContext) -> Arc<AppContext> {
-    GLOBAL_APP_CONTEXT.get_or_init(|| Arc::new(context)).clone()
+    APP_CONTEXT_SINGLETON.get_or_init(|| Arc::new(context)).clone()
 }
 
 /// Get global application context if it has been initialized.
 pub fn get_global_app_context() -> Option<Arc<AppContext>> {
-    GLOBAL_APP_CONTEXT.get().cloned()
+    APP_CONTEXT_SINGLETON.get().cloned()
 }

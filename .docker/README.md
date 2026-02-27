@@ -1,261 +1,131 @@
-# RustFS Docker Images
+# RustFS Docker Infrastructure
 
-This directory contains Docker configuration files and supporting infrastructure for building and running RustFS container images.
+This directory contains the complete Docker infrastructure for building, deploying, and monitoring RustFS. It provides ready-to-use configurations for development, testing, and production-grade observability.
 
-## 📁 Directory Structure
+## 📂 Directory Structure
 
-```
-rustfs/
-├── Dockerfile           # Production image (Alpine + pre-built binaries)
-├── Dockerfile.source    # Development image (Debian + source build)
-├── docker-buildx.sh     # Multi-architecture build script
-├── Makefile             # Build automation with simplified commands
-└── .docker/             # Supporting infrastructure
-    ├── observability/   # Monitoring and observability configs
-    ├── compose/         # Docker Compose configurations
-    ├── mqtt/            # MQTT broker configs
-    └── openobserve-otel/ # OpenObserve + OpenTelemetry configs
-```
+| Directory | Description | Status |
+| :--- | :--- | :--- |
+| **[`observability/`](observability/README.md)** | **[RECOMMENDED]** Full-stack observability (Prometheus, Grafana, Tempo, Loki). | ✅ Production-Ready |
+| **[`compose/`](compose/README.md)** | Specialized setups (e.g., 4-node distributed cluster testing). | ⚠️ Testing Only |
+| **[`mqtt/`](mqtt/README.md)** | EMQX Broker configuration for MQTT integration testing. | 🧪 Development |
+| **[`openobserve-otel/`](openobserve-otel/README.md)** | Alternative lightweight observability stack using OpenObserve. | 🔄 Alternative |
 
-## 🎯 Image Variants
+---
 
-### Core Images
+## 📄 Root Directory Files
 
-| Image | Base OS | Build Method | Size | Use Case |
-|-------|---------|--------------|------|----------|
-| `production` (default) | Alpine 3.18 | GitHub Releases | Smallest | Production deployment |
-| `source` | Debian Bookworm | Source build | Medium | Custom builds with cross-compilation |
-| `dev` | Debian Bookworm | Development tools | Large | Interactive development |
+The following files in the project root are essential for Docker operations:
 
-## 🚀 Usage Examples
+### Build Scripts & Dockerfiles
 
-### Quick Start (Production)
+| File | Description | Usage |
+| :--- | :--- | :--- |
+| **`docker-buildx.sh`** | **Multi-Arch Build Script**<br>Automates building and pushing Docker images for `amd64` and `arm64`. Supports release and dev channels. | `./docker-buildx.sh --push` |
+| **`Dockerfile`** | **Production Image (Alpine)**<br>Lightweight image using musl libc. Downloads pre-built binaries from GitHub Releases. | `docker build -t rustfs:latest .` |
+| **`Dockerfile.glibc`** | **Production Image (Ubuntu)**<br>Standard image using glibc. Useful if you need specific dynamic libraries. | `docker build -f Dockerfile.glibc .` |
+| **`Dockerfile.source`** | **Development Image**<br>Builds RustFS from source code. Includes build tools. Ideal for local development and CI. | `docker build -f Dockerfile.source .` |
 
+### Docker Compose Configurations
+
+| File | Description | Usage |
+| :--- | :--- | :--- |
+| **`docker-compose.yml`** | **Main Development Setup**<br>Comprehensive setup with profiles for development, observability, and proxying. | `docker compose up -d`<br>`docker compose --profile observability up -d` |
+| **`docker-compose-simple.yml`** | **Quick Start Setup**<br>Minimal configuration running a single RustFS instance with 4 volumes. Perfect for first-time users. | `docker compose -f docker-compose-simple.yml up -d` |
+
+---
+
+## 🌟 Observability Stack (Recommended)
+
+Located in: [`.docker/observability/`](observability/README.md)
+
+We provide a comprehensive, industry-standard observability stack designed for deep insights into RustFS performance. This is the recommended setup for both development and production monitoring.
+
+### Components
+- **Metrics**: Prometheus (Collection) + Grafana (Visualization)
+- **Traces**: Tempo (Storage) + Jaeger (UI)
+- **Logs**: Loki
+- **Ingestion**: OpenTelemetry Collector
+
+### Key Features
+- **Full Persistence**: All metrics, logs, and traces are saved to Docker volumes, ensuring no data loss on restarts.
+- **Correlation**: Seamlessly jump between Logs, Traces, and Metrics in Grafana.
+- **High Performance**: Optimized configurations for batching, compression, and memory management.
+
+### Quick Start
 ```bash
-# Default production image (Alpine + GitHub Releases)
-docker run -p 9000:9000 rustfs/rustfs:latest
-
-# Specific version
-docker run -p 9000:9000 rustfs/rustfs:1.2.3
+cd .docker/observability
+docker compose up -d
 ```
 
-### Complete Tag Strategy Examples
+---
 
+## 🧪 Specialized Environments
+
+Located in: [`.docker/compose/`](compose/README.md)
+
+These configurations are tailored for specific testing scenarios that require complex topologies.
+
+### Distributed Cluster (4-Nodes)
+Simulates a real-world distributed environment with 4 RustFS nodes running locally.
 ```bash
-# Stable Releases
-docker run rustfs/rustfs:1.2.3           # Main version (production)
-docker run rustfs/rustfs:1.2.3-production # Explicit production variant
-docker run rustfs/rustfs:1.2.3-source   # Source build variant
-docker run rustfs/rustfs:latest          # Latest stable
-
-# Prerelease Versions
-docker run rustfs/rustfs:1.3.0-alpha.2  # Specific alpha version
-docker run rustfs/rustfs:alpha           # Latest alpha
-docker run rustfs/rustfs:beta            # Latest beta
-docker run rustfs/rustfs:rc              # Latest release candidate
-
-# Development Versions
-docker run rustfs/rustfs:dev             # Latest main branch development
-docker run rustfs/rustfs:dev-13e4a0b     # Specific commit
-docker run rustfs/rustfs:dev-latest      # Latest development
-docker run rustfs/rustfs:main-latest     # Main branch latest
+docker compose -f .docker/compose/docker-compose.cluster.yaml up -d
 ```
 
-### Development Environment
-
+### Integrated Observability Test
+A self-contained environment running 4 RustFS nodes alongside the full observability stack. Useful for end-to-end testing of telemetry.
 ```bash
-# Quick setup using Makefile (recommended)
-make docker-dev-local     # Build development image locally
-make dev-env-start        # Start development container
-
-# Manual Docker commands
-docker run -it -v $(pwd):/workspace -p 9000:9000 rustfs/rustfs:latest-dev
-
-# Build from source locally
-docker build -f Dockerfile.source -t rustfs:custom .
-
-# Development with hot reload
-docker-compose up rustfs-dev
+docker compose -f .docker/compose/docker-compose.observability.yaml up -d
 ```
 
-## 🏗️ Build Arguments and Scripts
+---
 
-### Using Makefile Commands (Recommended)
+## 📡 MQTT Integration
 
-The easiest way to build images using simplified commands:
+Located in: [`.docker/mqtt/`](mqtt/README.md)
 
+Provides an EMQX broker for testing RustFS MQTT features.
+
+### Quick Start
 ```bash
-# Development images (build from source)
-make docker-dev-local             # Build for local use (single arch)
-make docker-dev                   # Build multi-arch (for CI/CD)
-make docker-dev-push REGISTRY=xxx # Build and push to registry
-
-# Production images (using pre-built binaries)
-make docker-buildx                # Build multi-arch production images
-make docker-buildx-push           # Build and push production images
-make docker-buildx-version VERSION=v1.0.0  # Build specific version
-
-# Development environment
-make dev-env-start                # Start development container
-make dev-env-stop                 # Stop development container
-make dev-env-restart              # Restart development container
-
-# Help
-make help-docker                  # Show all Docker-related commands
+cd .docker/mqtt
+docker compose up -d
 ```
+- **Dashboard**: [http://localhost:18083](http://localhost:18083) (Default: `admin` / `public`)
+- **MQTT Port**: `1883`
 
-### Using docker-buildx.sh (Advanced)
+---
 
-For direct script usage and advanced scenarios:
+## 👁️ Alternative: OpenObserve
 
+Located in: [`.docker/openobserve-otel/`](openobserve-otel/README.md)
+
+For users preferring a lightweight, all-in-one solution, we support OpenObserve. It combines logs, metrics, and traces into a single binary and UI.
+
+### Quick Start
 ```bash
-# Build latest version for all architectures
-./docker-buildx.sh
-
-# Build and push to registry
-./docker-buildx.sh --push
-
-# Build specific version
-./docker-buildx.sh --release v1.2.3
-
-# Build and push specific version
-./docker-buildx.sh --release v1.2.3 --push
+cd .docker/openobserve-otel
+docker compose up -d
 ```
 
-### Manual Docker Builds
+---
 
-All images support dynamic version selection:
+## 🔧 Common Operations
 
+### Cleaning Up
+To stop all containers and remove volumes (**WARNING**: deletes all persisted data):
 ```bash
-# Build production image with latest release
-docker build --build-arg RELEASE="latest" -t rustfs:latest .
-
-# Build from source with specific target
-docker build -f Dockerfile.source \
-  --build-arg TARGETPLATFORM="linux/amd64" \
-  -t rustfs:source .
-
-# Development build
-docker build -f Dockerfile.source -t rustfs:dev .
+docker compose down -v
 ```
 
-## 🔧 Binary Download Sources
-
-### Unified GitHub Releases
-
-The production image downloads from GitHub Releases for reliability and transparency:
-
-- ✅ **production** → GitHub Releases API with automatic latest detection
-- ✅ **Checksum verification** → SHA256SUMS validation when available
-- ✅ **Multi-architecture** → Supports amd64 and arm64
-
-### Source Build
-
-The source variant compiles from source code with advanced features:
-
-- 🔧 **Cross-compilation** → Supports multiple target platforms via `TARGETPLATFORM`
-- ⚡ **Build caching** → sccache for faster compilation
-- 🎯 **Optimized builds** → Release optimizations with LTO and symbol stripping
-
-## 📋 Architecture Support
-
-All variants support multi-architecture builds:
-
-- **linux/amd64** (x86_64)
-- **linux/arm64** (aarch64)
-
-Architecture is automatically detected during build using Docker's `TARGETARCH` build argument.
-
-## 🔐 Security Features
-
-- **Checksum Verification**: Production image verifies SHA256SUMS when available
-- **Non-root User**: All images run as user `rustfs` (UID 1000)
-- **Minimal Runtime**: Production image only includes necessary dependencies
-- **Secure Defaults**: No hardcoded credentials or keys
-
-## 🛠️ Development Workflow
-
-### Quick Start with Makefile (Recommended)
-
+### Viewing Logs
+To follow logs for a specific service:
 ```bash
-# 1. Start development environment
-make dev-env-start
-
-# 2. Your development container is now running with:
-#    - Port 9000 exposed for RustFS
-#    - Port 9010 exposed for admin console
-#    - Current directory mounted as /workspace
-
-# 3. Stop when done
-make dev-env-stop
+docker compose logs -f [service_name]
 ```
 
-### Manual Development Setup
-
+### Checking Status
+To see the status of all running containers:
 ```bash
-# Build development image from source
-make docker-dev-local
-
-# Or use traditional Docker commands
-docker build -f Dockerfile.source -t rustfs:dev .
-
-# Run with development tools
-docker run -it -v $(pwd):/workspace -p 9000:9000 rustfs:dev bash
-
-# Or use docker-compose for complex setups
-docker-compose up rustfs-dev
+docker compose ps
 ```
-
-### Common Development Tasks
-
-```bash
-# Build and test locally
-make build                        # Build binary natively
-make docker-dev-local            # Build development Docker image
-make test                        # Run tests
-make fmt                         # Format code
-make clippy                      # Run linter
-
-# Get help
-make help                        # General help
-make help-docker                 # Docker-specific help
-make help-build                  # Build-specific help
-```
-
-## 🚀 CI/CD Integration
-
-The project uses GitHub Actions for automated multi-architecture Docker builds:
-
-### Automated Builds
-
-- **Tags**: Automatic builds triggered on version tags (e.g., `v1.2.3`)
-- **Main Branch**: Development builds with `dev-latest` and `main-latest` tags
-- **Pull Requests**: Test builds without registry push
-
-### Build Variants
-
-Each build creates three image variants:
-
-- `rustfs/rustfs:v1.2.3` (production - Alpine-based)
-- `rustfs/rustfs:v1.2.3-source` (source build - Debian-based)
-- `rustfs/rustfs:v1.2.3-dev` (development - Debian-based with tools)
-
-### Manual Builds
-
-Trigger custom builds via GitHub Actions:
-
-```bash
-# Use workflow_dispatch to build specific versions
-# Available options: latest, main-latest, dev-latest, v1.2.3, dev-abc123
-```
-
-## 📦 Supporting Infrastructure
-
-The `.docker/` directory contains supporting configuration files:
-
-- **observability/** - Prometheus, Grafana, OpenTelemetry configs
-- **compose/** - Multi-service Docker Compose setups
-- **mqtt/** - MQTT broker configurations
-- **openobserve-otel/** - Log aggregation and tracing setup
-
-See individual README files in each subdirectory for specific usage instructions.

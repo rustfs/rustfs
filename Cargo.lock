@@ -530,9 +530,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.40"
+version = "0.4.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d67d43201f4d20c78bcda740c142ca52482d81da80681533d33bf3f0596c8e2"
+checksum = "d0f9ee0f6e02ffd7ad5816e9464499fba7b3effd01123b515c41d1697c43dad1"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -7345,6 +7345,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-http-client",
  "aws-smithy-types",
  "base64 0.22.1",
  "base64-simd",
@@ -8119,7 +8120,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.13.0-alpha.3"
-source = "git+https://github.com/s3s-project/s3s.git?rev=61b96d11de81c508ba5361864676824f318ef65c#61b96d11de81c508ba5361864676824f318ef65c"
+source = "git+https://github.com/s3s-project/s3s.git?rev=218000387f4c3e67ad478bfc4587931f88b37006#218000387f4c3e67ad478bfc4587931f88b37006"
 dependencies = [
  "arc-swap",
  "arrayvec",

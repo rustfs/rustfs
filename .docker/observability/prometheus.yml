@@ -17,27 +17,40 @@ global:
   evaluation_interval: 15s
   external_labels:
     cluster: 'rustfs-dev'  # Label to identify the cluster
-    relica: '1'  # Replica identifier
+    replica: '1'  # Replica identifier
 
 scrape_configs:
-  - job_name: 'otel-collector-internal'
+  - job_name: 'otel-collector'
     static_configs:
       - targets: [ 'otel-collector:8888' ]  # Scrape metrics from Collector
     scrape_interval: 10s
+
   - job_name: 'rustfs-app-metrics'
     static_configs:
       - targets: [ 'otel-collector:8889' ]  # Application indicators
     scrape_interval: 15s
     metric_relabel_configs:
+      - source_labels: [ __name__ ]
+        regex: 'go_.*'
+        action: drop  # Drop Go runtime metrics if not needed
+
   - job_name: 'tempo'
     static_configs:
       - targets: [ 'tempo:3200' ]  # Scrape metrics from Tempo
+
   - job_name: 'jaeger'
     static_configs:
-      - targets: [ 'jaeger:8888' ]  # Jaeger admin port
+      - targets: [ 'jaeger:14269' ]  # Jaeger admin port (14269 is standard for admin/metrics)
+
+  - job_name: 'loki'
+    static_configs:
+      - targets: [ 'loki:3100' ]
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: [ 'localhost:9090' ]
 
 otlp:
-  # Recommended attributes to be promoted to labels.
   promote_resource_attributes:
     - service.instance.id
     - service.name
@@ -56,10 +69,8 @@ otlp:
     - k8s.pod.name
     - k8s.replicaset.name
     - k8s.statefulset.name
-  # Ingest OTLP data keeping all characters in metric/label names.
   translation_strategy: NoUTF8EscapingWithSuffixes
 
 storage:
-  # OTLP is a push-based protocol, Out of order samples is a common scenario.
   tsdb:
     out_of_order_time_window: 30m
