@@ -48,7 +48,6 @@ regex = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
 rustfs-config = { workspace = true, features = ["constants"] }
 rustls = { workspace = true, optional = true }
-rustls-pemfile = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 s3s = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
@@ -80,7 +79,7 @@ workspace = true
 [features]
 default = ["ip"]  # features that are enabled by default
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
-tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]  # tls characteristics and their dependencies
+tls = ["dep:rustls", "dep:rustls-pki-types"]  # tls characteristics and their dependencies
 net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:thiserror", "dep:tokio"]  # network features with DNS resolver
 io = ["dep:tokio"]
 path = []  # path manipulation features

@@ -14,7 +14,7 @@
 
 use rustfs_common::{MtlsIdentityPem, set_global_mtls_identity, set_global_root_cert};
 use rustfs_config::{RUSTFS_CA_CERT, RUSTFS_PUBLIC_CERT, RUSTFS_TLS_CERT};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -47,7 +47,7 @@ impl std::error::Error for RustFSError {}
 fn parse_pem_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, RustFSError> {
     let mut out = Vec::new();
     let mut reader = std::io::Cursor::new(pem);
-    for item in rustls_pemfile::certs(&mut reader) {
+    for item in CertificateDer::pem_reader_iter(&mut reader) {
         let c = item.map_err(|e| RustFSError::Cert(format!("parse cert pem: {e}")))?;
         out.push(c);
     }
@@ -67,8 +67,7 @@ fn parse_pem_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, RustFSErr
 /// Returns `RustFSError` if parsing fails or no key is found.
 fn parse_pem_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, RustFSError> {
     let mut reader = std::io::Cursor::new(pem);
-    let key = rustls_pemfile::private_key(&mut reader).map_err(|e| RustFSError::Cert(format!("parse private key pem: {e}")))?;
-    key.ok_or_else(|| RustFSError::Cert("no private key found in PEM".into()))
+    PrivateKeyDer::from_pem_reader(&mut reader).map_err(|e| RustFSError::Cert(format!("parse private key pem: {e}")))
 }
 
 /// Helper function to read a file and return its contents.
@@ -103,6 +102,9 @@ pub(crate) async fn init_cert(tls_path: &str) -> Result<(), RustFSError> {
         info!("No TLS path configured; skipping certificate initialization");
         return Ok(());
     }
+    // Make sure to use a modern encryption suite
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let tls_dir = PathBuf::from(tls_path);
 
     // Load root certificates

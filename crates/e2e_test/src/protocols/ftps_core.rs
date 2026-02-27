@@ -18,8 +18,7 @@ use crate::common::rustfs_binary_path;
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
 use rcgen::generate_simple_self_signed;
-use rustls::crypto::aws_lc_rs::default_provider;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer, pki_types::pem::PemObject};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,17 +73,12 @@ pub async fn test_ftps_core_operations() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        // Install the aws-lc-rs crypto provider
-        default_provider()
-            .install_default()
-            .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))?;
-
         // Create a simple rustls config that accepts any certificate for testing
         let mut root_store = RootCertStore::empty();
         // Add the self-signed certificate to the trust store for e2e
         // Note: In a real environment, you'd use proper root certificates
         let cert_pem = default_cert.cert.pem();
-        let cert_der = rustls_pemfile::certs(&mut Cursor::new(cert_pem))
+        let cert_der = CertificateDer::pem_reader_iter(&mut Cursor::new(cert_pem))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("Failed to parse cert: {}", e))?;
 

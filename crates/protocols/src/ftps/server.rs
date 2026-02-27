@@ -64,7 +64,7 @@ pub struct FtpsServer<S> {
 
 impl<S> FtpsServer<S>
 where
-    S: StorageBackend + Clone + Send + Sync + 'static + std::fmt::Debug,
+    S: StorageBackend + Clone + Send + Sync + 'static + Debug,
 {
     /// Create a new FTPS server
     pub async fn new(config: FtpsConfig, storage: S) -> Result<Self, FtpsInitError> {
@@ -125,14 +125,11 @@ where
                 let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)
                     .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to create certificate resolver: {}", e)))?;
 
-                // Build ServerConfig with SNI support
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
                 let server_config = rustls::ServerConfig::builder()
                     .with_no_client_auth()
-                    .with_cert_resolver(std::sync::Arc::new(resolver));
+                    .with_cert_resolver(Arc::new(resolver));
 
-                server_builder = server_builder.ftps_manual::<std::path::PathBuf>(std::sync::Arc::new(server_config));
+                server_builder = server_builder.ftps_manual::<std::path::PathBuf>(Arc::new(server_config));
 
                 if self.config.ftps_required {
                     info!("FTPS is explicitly required for all connections");
