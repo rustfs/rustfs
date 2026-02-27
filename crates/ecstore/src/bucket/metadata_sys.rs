@@ -15,13 +15,13 @@
 use super::metadata::{BucketMetadata, load_bucket_metadata};
 use super::quota::BucketQuota;
 use super::target::BucketTargets;
-use crate::StorageAPI as _;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
 use crate::bucket::utils::{deserialize, is_meta_bucketname};
 use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
 use crate::store::ECStore;
+use crate::store_api::HealOperations as _;
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use rustfs_common::heal_channel::HealOpts;

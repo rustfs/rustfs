@@ -134,7 +134,6 @@ impl IoLoadLevel {
 /// let enable_readahead = strategy.enable_readahead;
 /// let enable_cache_writeback = strategy.cache_writeback_enabled;
 /// ```
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct IoStrategy {
     /// Recommended buffer size for I/O operations (in bytes).
@@ -164,6 +163,7 @@ pub struct IoStrategy {
     /// Whether to use tokio BufReader for improved async I/O.
     ///
     /// Always enabled for better async performance.
+    #[allow(dead_code)]
     pub use_buffered_io: bool,
 
     /// The detected I/O load level.
@@ -668,7 +668,6 @@ struct CachedObject {
 /// };
 /// manager.put_cached_object(cache_key, cached).await;
 /// ```
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct CachedGetObject {
     /// The object body data
@@ -682,6 +681,7 @@ pub struct CachedGetObject {
     /// Last modified time as RFC3339 string (e.g., "2024-01-01T12:00:00Z")
     pub last_modified: Option<String>,
     /// Expiration time as RFC3339 string
+    #[allow(dead_code)]
     pub expires: Option<String>,
     /// Cache-Control header value
     pub cache_control: Option<String>,
@@ -700,10 +700,12 @@ pub struct CachedGetObject {
     /// Number of tags associated with the object
     pub tag_count: Option<i32>,
     /// Replication status
+    #[allow(dead_code)]
     pub replication_status: Option<String>,
     /// User-defined metadata (x-amz-meta-*)
     pub user_metadata: std::collections::HashMap<String, String>,
     /// When this object was cached (for internal use, automatically set)
+    #[allow(dead_code)]
     cached_at: Option<Instant>,
     /// Access count for hot key tracking (automatically managed)
     access_count: Arc<AtomicU64>,
@@ -1320,11 +1322,8 @@ impl ConcurrencyManager {
     ///
     /// This ensures we don't overwhelm the disk subsystem with too many
     /// concurrent reads, which can cause performance degradation.
-    pub async fn acquire_disk_read_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.disk_read_semaphore
-            .acquire()
-            .await
-            .expect("semaphore closed unexpectedly")
+    pub async fn acquire_disk_read_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
+        self.disk_read_semaphore.acquire().await
     }
 
     // ============================================
@@ -1791,10 +1790,10 @@ mod tests {
     async fn test_disk_read_permits() {
         let manager = ConcurrencyManager::new();
 
-        let permit1 = manager.acquire_disk_read_permit().await;
+        let permit1 = manager.acquire_disk_read_permit().await.unwrap();
         assert_eq!(manager.disk_read_semaphore.available_permits(), 63);
 
-        let permit2 = manager.acquire_disk_read_permit().await;
+        let permit2 = manager.acquire_disk_read_permit().await.unwrap();
         assert_eq!(manager.disk_read_semaphore.available_permits(), 62);
 
         drop(permit1);

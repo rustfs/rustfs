@@ -34,7 +34,7 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::store::ECStore;
 use crate::store_api::StorageAPI;
-use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete};
+use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use bytes::BytesMut;

@@ -15,8 +15,12 @@
 pub mod local_snapshot;
 
 use crate::{
-    bucket::metadata_sys::get_replication_config, config::com::read_config, disk::DiskAPI, error::Error, store::ECStore,
-    store_api::StorageAPI,
+    bucket::metadata_sys::get_replication_config,
+    config::com::read_config,
+    disk::DiskAPI,
+    error::Error,
+    store::ECStore,
+    store_api::{BucketOperations, ListOperations},
 };
 pub use local_snapshot::{
     DATA_USAGE_DIR, DATA_USAGE_STATE_DIR, LOCAL_USAGE_SNAPSHOT_VERSION, LocalUsageSnapshot, LocalUsageSnapshotMeta,

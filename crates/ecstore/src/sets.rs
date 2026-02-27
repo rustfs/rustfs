@@ -28,9 +28,10 @@ use crate::{
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
-        ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult,
-        ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
+        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
+        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
+        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
@@ -357,56 +358,7 @@ impl ObjectIO for Sets {
 }
 
 #[async_trait::async_trait]
-impl StorageAPI for Sets {
-    #[tracing::instrument(skip(self))]
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        self.disk_set[0].new_ns_lock(bucket, object).await
-    }
-    #[tracing::instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
-        unimplemented!()
-    }
-    #[tracing::instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let mut futures = Vec::with_capacity(self.disk_set.len());
-
-        for set in self.disk_set.iter() {
-            futures.push(set.storage_info())
-        }
-
-        let results = join_all(futures).await;
-
-        let mut disks = Vec::new();
-
-        for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
-        }
-
-        rustfs_madmin::StorageInfo {
-            disks,
-            ..Default::default()
-        }
-    }
-    #[tracing::instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let mut futures = Vec::with_capacity(self.disk_set.len());
-
-        for set in self.disk_set.iter() {
-            futures.push(set.local_storage_info())
-        }
-
-        let results = join_all(futures).await;
-
-        let mut disks = Vec::new();
-
-        for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
-        }
-        rustfs_madmin::StorageInfo {
-            disks,
-            ..Default::default()
-        }
-    }
+impl BucketOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
@@ -425,49 +377,24 @@ impl StorageAPI for Sets {
     async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         unimplemented!()
     }
+}
 
-    #[tracing::instrument(skip(self))]
-    async fn list_objects_v2(
-        self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _continuation_token: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-        _fetch_owner: bool,
-        _start_after: Option<String>,
-        _incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_object_versions(
-        self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _marker: Option<String>,
-        _version_marker: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        unimplemented!()
-    }
-
-    async fn walk(
-        self: Arc<Self>,
-        _rx: CancellationToken,
-        _bucket: &str,
-        _prefix: &str,
-        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
-        _opts: WalkOptions,
-    ) -> Result<()> {
-        unimplemented!()
-    }
-
+#[async_trait::async_trait]
+impl ObjectOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let gor = self.get_object_reader(bucket, object, None, HeaderMap::new(), opts).await?;
+        let mut reader = gor.stream;
+
+        // Stream data to sink instead of reading all into memory to prevent OOM
+        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -600,20 +527,90 @@ impl StorageAPI for Sets {
         (del_objects, del_errs)
     }
 
-    async fn list_object_parts(
-        &self,
-        bucket: &str,
-        object: &str,
-        upload_id: &str,
-        part_number_marker: Option<usize>,
-        max_parts: usize,
-        opts: &ObjectOptions,
-    ) -> Result<ListPartsInfo> {
+    #[tracing::instrument(skip(self))]
+    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).put_object_metadata(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
+        self.get_disks_by_key(object).get_object_tags(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object)
-            .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+            .put_object_tags(bucket, object, tags, opts)
             .await
     }
 
+    #[tracing::instrument(skip(self))]
+    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).delete_object_tags(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
+        self.get_disks_by_key(object).add_partial(bucket, object, version_id).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object).transition_object(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object)
+            .restore_transitioned_object(bucket, object, opts)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ListOperations for Sets {
+    #[tracing::instrument(skip(self))]
+    async fn list_objects_v2(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _continuation_token: Option<String>,
+        _delimiter: Option<String>,
+        _max_keys: i32,
+        _fetch_owner: bool,
+        _start_after: Option<String>,
+        _incl_deleted: bool,
+    ) -> Result<ListObjectsV2Info> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_versions(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _marker: Option<String>,
+        _version_marker: Option<String>,
+        _delimiter: Option<String>,
+        _max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        _rx: CancellationToken,
+        _bucket: &str,
+        _prefix: &str,
+        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
+impl MultipartOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn list_multipart_uploads(
         &self,
@@ -631,23 +628,6 @@ impl StorageAPI for Sets {
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         self.get_disks_by_key(object).new_multipart_upload(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        self.get_disks_by_key(object).transition_object(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        self.get_disks_by_key(object).add_partial(bucket, object, version_id).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        self.get_disks_by_key(object)
-            .restore_transitioned_object(bucket, object, opts)
-            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -696,6 +676,20 @@ impl StorageAPI for Sets {
             .await
     }
 
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo> {
+        self.get_disks_by_key(object)
+            .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+            .await
+    }
+
     #[tracing::instrument(skip(self))]
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
         self.get_disks_by_key(object)
@@ -716,39 +710,10 @@ impl StorageAPI for Sets {
             .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
             .await
     }
+}
 
-    #[tracing::instrument(skip(self))]
-    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object).put_object_metadata(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
-        self.get_disks_by_key(object).get_object_tags(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object)
-            .put_object_tags(bucket, object, tags, opts)
-            .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object).delete_object_tags(bucket, object, opts).await
-    }
-
+#[async_trait::async_trait]
+impl HealOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         let (disks, _) = init_storage_disks_with_errors(
@@ -857,16 +822,68 @@ impl StorageAPI for Sets {
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
         unimplemented!()
     }
+}
 
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let gor = self.get_object_reader(bucket, object, None, HeaderMap::new(), opts).await?;
-        let mut reader = gor.stream;
+#[async_trait::async_trait]
+impl StorageAPI for Sets {
+    #[tracing::instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
+        self.disk_set[0].new_ns_lock(bucket, object).await
+    }
+    #[tracing::instrument(skip(self))]
+    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
+        unimplemented!()
+    }
+    #[tracing::instrument(skip(self))]
+    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
 
-        // Stream data to sink instead of reading all into memory to prevent OOM
-        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+        for set in self.disk_set.iter() {
+            futures.push(set.storage_info())
+        }
 
-        Ok(())
+        let results = join_all(futures).await;
+
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+
+        rustfs_madmin::StorageInfo {
+            disks,
+            ..Default::default()
+        }
+    }
+    #[tracing::instrument(skip(self))]
+    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
+
+        for set in self.disk_set.iter() {
+            futures.push(set.local_storage_info())
+        }
+
+        let results = join_all(futures).await;
+
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+        rustfs_madmin::StorageInfo {
+            disks,
+            ..Default::default()
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn set_drive_counts(&self) -> Vec<usize> {
+        unimplemented!()
     }
 }
 

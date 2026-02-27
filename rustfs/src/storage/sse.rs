@@ -684,7 +684,7 @@ async fn apply_ssec_prepare_encryption_material(
 
     Ok(EncryptionMaterial {
         sse_type: SSEType::SseC,
-        server_side_encryption: ServerSideEncryption::AES256.parse().unwrap(),
+        server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
         kms_key_id: None,
         algorithm,
         key_bytes: [0; 32],
@@ -731,7 +731,7 @@ async fn apply_ssec_encryption_material(
 
     Ok(EncryptionMaterial {
         sse_type: SSEType::SseC,
-        server_side_encryption: ServerSideEncryption::AES256.parse().unwrap(),
+        server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
         kms_key_id: None,
         algorithm: validated.algorithm,
         key_bytes: validated.key_bytes,
@@ -776,7 +776,7 @@ async fn apply_ssec_decryption_material(
 
     Ok(DecryptionMaterial {
         sse_type: SSEType::SseC,
-        server_side_encryption: ServerSideEncryption::AES256.parse().unwrap(), // const
+        server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256), // const
         kms_key_id: None,
         algorithm: SSECustomerAlgorithm::from(algorithm),
 
@@ -941,7 +941,8 @@ async fn apply_managed_decryption_material(
         return Ok(None);
     }
 
-    let server_side_encryption = metadata.get("x-amz-server-side-encryption").unwrap().clone();
+    // Safe: presence is guaranteed by the contains_key check above.
+    let server_side_encryption = metadata.get("x-amz-server-side-encryption").cloned().unwrap_or_default();
 
     // Parse metadata - try using service if available, otherwise parse manually
     let (encrypted_data_key, iv, algorithm) = if let Some(service) = get_global_encryption_service().await {
@@ -1169,17 +1170,17 @@ impl TestSseDekProvider {
                     let decoded_len = v.len();
                     match v.try_into() {
                         Ok(arr) => {
-                            println!("✓ Successfully loaded master key (32 bytes)");
+                            tracing::info!("Successfully loaded SSE master key (32 bytes)");
                             arr
                         }
                         Err(_) => {
-                            eprintln!("✗ Failed to load master key: decoded key is not 32 bytes (got {} bytes)", decoded_len);
+                            tracing::error!("Failed to load master key: decoded key is not 32 bytes (got {decoded_len} bytes)");
                             [0u8; 32]
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("✗ Failed to load master key: invalid base64 encoding: {}", e);
+                    tracing::error!("Failed to load master key: invalid base64 encoding: {e}");
                     [0u8; 32]
                 }
             }
@@ -1188,8 +1189,9 @@ impl TestSseDekProvider {
         };
 
         if master_key == [0u8; 32] {
-            eprintln!("✗ Failed to load master key: no valid master key loaded! All encryption operations will fail.");
-            eprintln!("    Set __RUSTFS_SSE_SIMPLE_CMK environment variable to a base64-encoded 32-byte key.");
+            tracing::error!(
+                "No valid SSE master key loaded. Set __RUSTFS_SSE_SIMPLE_CMK environment variable to a base64-encoded 32-byte key."
+            );
             std::process::exit(1);
         }
 
@@ -1459,8 +1461,9 @@ pub fn validate_ssec_params(params: SsecParams) -> Result<ValidatedSsecParams, A
         return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")));
     }
 
-    // SAFETY: We validated the length is exactly 32 bytes above
-    let key_array: [u8; 32] = key_bytes.try_into().expect("key length already validated to be 32 bytes");
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| ApiError::from(StorageError::other("SSE-C key must be exactly 32 bytes")))?;
 
     Ok(ValidatedSsecParams {
         algorithm: params.algorithm,
@@ -1706,7 +1709,7 @@ mod tests {
             .await
             .expect("Failed to generate DEK");
 
-        // 3. Prepare test data (明文)
+        // 3. Prepare test data (plaintext)
         let plaintext = b"Hello, World! This is a test message for encryption and decryption.";
         println!("Original plaintext: {:?}", String::from_utf8_lossy(plaintext));
         println!("Plaintext length: {} bytes", plaintext.len());

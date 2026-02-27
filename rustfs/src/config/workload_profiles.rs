@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Adaptive buffer sizing optimization for different workload types.
 //!
 //! This module provides intelligent buffer size selection based on file size and workload profile
@@ -86,6 +84,7 @@ pub enum WorkloadProfile {
     /// Secure storage: security first, memory constrained for compliance
     SecureStorage,
     /// Custom configuration for specialized requirements
+    #[allow(dead_code)]
     Custom(BufferConfig),
 }
 
@@ -107,6 +106,7 @@ pub struct BufferConfig {
 #[derive(Debug, Clone)]
 pub struct RustFSBufferConfig {
     /// Selected workload profile
+    #[allow(dead_code)]
     pub workload: WorkloadProfile,
     /// Computed buffer configuration (either from profile or custom)
     pub base_config: BufferConfig,
@@ -309,6 +309,7 @@ impl BufferConfig {
     }
 
     /// Validate the buffer configuration
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), String> {
         if self.min_size == 0 {
             return Err("min_size must be greater than 0".to_string());

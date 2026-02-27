@@ -18,7 +18,7 @@ use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
-    store_api::{ObjectIO, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{BucketOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
 };
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},

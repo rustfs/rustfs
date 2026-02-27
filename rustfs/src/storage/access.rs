@@ -24,11 +24,11 @@ use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
 use metrics::counter;
-use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::store_api::ObjectOperations;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_policy::policy::{Args, BucketPolicyArgs};
@@ -37,7 +37,6 @@ use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
 
-#[allow(dead_code)]
 #[derive(Default, Clone, Debug)]
 pub(crate) struct ReqInfo {
     pub cred: Option<rustfs_credentials::Credentials>,
@@ -45,6 +44,7 @@ pub(crate) struct ReqInfo {
     pub bucket: Option<String>,
     pub object: Option<String>,
     pub version_id: Option<String>,
+    #[allow(dead_code)]
     pub region: Option<s3s::region::Region>,
 }
 
@@ -201,6 +201,23 @@ async fn check_acl_access<T>(req: &S3Request<T>, req_info: &ReqInfo, action: &Ac
     Ok(acl_allows(&acl, user_id, is_authenticated, permission, ignore_public_acls))
 }
 
+pub(crate) fn req_info_ref<T>(req: &S3Request<T>) -> S3Result<&ReqInfo> {
+    req.extensions
+        .get::<ReqInfo>()
+        .ok_or_else(|| s3_error!(InternalError, "ReqInfo not found in request extensions"))
+}
+
+pub(crate) fn req_info_mut<T>(req: &mut S3Request<T>) -> S3Result<&mut ReqInfo> {
+    req.extensions
+        .get_mut::<ReqInfo>()
+        .ok_or_else(|| s3_error!(InternalError, "ReqInfo not found in request extensions"))
+}
+
+fn ext_req_info_mut(ext: &mut http::Extensions) -> S3Result<&mut ReqInfo> {
+    ext.get_mut::<ReqInfo>()
+        .ok_or_else(|| s3_error!(InternalError, "ReqInfo not found in request extensions"))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectTagConditions(pub HashMap<String, Vec<String>>);
 
@@ -241,7 +258,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     let object_tag_conditions = req.extensions.get::<ObjectTagConditions>().cloned();
 
-    let req_info = req.extensions.get::<ReqInfo>().expect("ReqInfo not found");
+    let req_info = req_info_ref(req)?;
 
     if let Some(cred) = &req_info.cred {
         let Ok(iam_store) = rustfs_iam::get() else {
@@ -550,7 +567,7 @@ impl S3Access for FS {
     async fn create_bucket(&self, req: &mut S3Request<CreateBucketInput>) -> S3Result<()> {
         license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
 
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::CreateBucketAction)).await?;
@@ -588,7 +605,7 @@ impl S3Access for FS {
                 }
             };
 
-            let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+            let req_info = ext_req_info_mut(&mut req.extensions)?;
             req_info.bucket = Some(src_bucket.clone());
             req_info.object = Some(src_key.clone());
             req_info.version_id = version_id.clone();
@@ -601,7 +618,7 @@ impl S3Access for FS {
             authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
         }
 
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
 
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -622,7 +639,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket(&self, req: &mut S3Request<DeleteBucketInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::DeleteBucketAction)).await?;
@@ -647,7 +664,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_cors(&self, req: &mut S3Request<DeleteBucketCorsInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::DeleteBucketCorsAction)).await
@@ -657,7 +674,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_encryption(&self, req: &mut S3Request<DeleteBucketEncryptionInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketEncryptionAction)).await
@@ -687,7 +704,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_lifecycle(&self, req: &mut S3Request<DeleteBucketLifecycleInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketLifecycleAction)).await
@@ -714,7 +731,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_policy(&self, req: &mut S3Request<DeleteBucketPolicyInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::DeleteBucketPolicyAction)).await
@@ -724,7 +741,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_replication(&self, req: &mut S3Request<DeleteBucketReplicationInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutReplicationConfigurationAction)).await
@@ -734,7 +751,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_tagging(&self, req: &mut S3Request<DeleteBucketTaggingInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketTaggingAction)).await
@@ -751,7 +768,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -775,7 +792,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object_tagging(&self, req: &mut S3Request<DeleteObjectTaggingInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -797,7 +814,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = None;
         req_info.version_id = None;
@@ -816,7 +833,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_public_access_block(&self, req: &mut S3Request<DeletePublicAccessBlockInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::DeleteBucketPublicAccessBlockAction)).await
@@ -836,7 +853,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_acl(&self, req: &mut S3Request<GetBucketAclInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketAclAction)).await
@@ -856,7 +873,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_cors(&self, req: &mut S3Request<GetBucketCorsInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketCorsAction)).await
@@ -866,7 +883,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_encryption(&self, req: &mut S3Request<GetBucketEncryptionInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketEncryptionAction)).await
@@ -899,7 +916,7 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketLifecycleAction)).await
@@ -909,7 +926,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_location(&self, req: &mut S3Request<GetBucketLocationInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketLocationAction)).await
@@ -936,7 +953,7 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketNotificationAction)).await
@@ -953,7 +970,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_policy(&self, req: &mut S3Request<GetBucketPolicyInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, get_bucket_policy_authorize_action()).await
@@ -963,7 +980,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_policy_status(&self, req: &mut S3Request<GetBucketPolicyStatusInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyStatusAction)).await
@@ -973,7 +990,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_replication(&self, req: &mut S3Request<GetBucketReplicationInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetReplicationConfigurationAction)).await
@@ -990,7 +1007,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_tagging(&self, req: &mut S3Request<GetBucketTaggingInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketTaggingAction)).await
@@ -1000,7 +1017,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_versioning(&self, req: &mut S3Request<GetBucketVersioningInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketVersioningAction)).await
@@ -1017,7 +1034,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object(&self, req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1034,7 +1051,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_acl(&self, req: &mut S3Request<GetObjectAclInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1051,7 +1068,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_attributes(&self, req: &mut S3Request<GetObjectAttributesInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1081,7 +1098,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_legal_hold(&self, req: &mut S3Request<GetObjectLegalHoldInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1093,7 +1110,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_lock_configuration(&self, req: &mut S3Request<GetObjectLockConfigurationInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketObjectLockConfigurationAction)).await
@@ -1103,7 +1120,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_retention(&self, req: &mut S3Request<GetObjectRetentionInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1115,7 +1132,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_tagging(&self, req: &mut S3Request<GetObjectTaggingInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1139,7 +1156,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_public_access_block(&self, req: &mut S3Request<GetPublicAccessBlockInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::GetBucketPublicAccessBlockAction)).await
@@ -1149,7 +1166,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn head_bucket(&self, req: &mut S3Request<HeadBucketInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
@@ -1159,7 +1176,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn head_object(&self, req: &mut S3Request<HeadObjectInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1224,7 +1241,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_multipart_uploads(&self, req: &mut S3Request<ListMultipartUploadsInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await
@@ -1235,7 +1252,7 @@ impl S3Access for FS {
     /// Returns `Ok(())` if the request is allowed, or an error if access is denied or another
     /// authorization-related issue occurs.
     async fn list_object_versions(&self, req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
     }
@@ -1244,7 +1261,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_objects(&self, req: &mut S3Request<ListObjectsInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
@@ -1254,7 +1271,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
@@ -1281,7 +1298,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_acl(&self, req: &mut S3Request<PutBucketAclInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketAclAction)).await
@@ -1301,7 +1318,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_cors(&self, req: &mut S3Request<PutBucketCorsInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketCorsAction)).await
@@ -1311,7 +1328,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_encryption(&self, req: &mut S3Request<PutBucketEncryptionInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketEncryptionAction)).await
@@ -1344,7 +1361,7 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketLifecycleAction)).await
@@ -1371,7 +1388,7 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketNotificationAction)).await
@@ -1388,7 +1405,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_policy(&self, req: &mut S3Request<PutBucketPolicyInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, put_bucket_policy_authorize_action()).await
@@ -1398,7 +1415,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_replication(&self, req: &mut S3Request<PutBucketReplicationInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutReplicationConfigurationAction)).await
@@ -1415,7 +1432,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_tagging(&self, req: &mut S3Request<PutBucketTaggingInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketTaggingAction)).await
@@ -1425,7 +1442,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_versioning(&self, req: &mut S3Request<PutBucketVersioningInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketVersioningAction)).await
@@ -1444,7 +1461,7 @@ impl S3Access for FS {
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
         license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
 
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1456,7 +1473,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_acl(&self, req: &mut S3Request<PutObjectAclInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1473,7 +1490,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_legal_hold(&self, req: &mut S3Request<PutObjectLegalHoldInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1485,7 +1502,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_lock_configuration(&self, req: &mut S3Request<PutObjectLockConfigurationInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)).await
@@ -1493,7 +1510,7 @@ impl S3Access for FS {
 
     /// Checks whether the PutObjectRetention request has accesses to the resources.
     async fn put_object_retention(&self, req: &mut S3Request<PutObjectRetentionInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1512,7 +1529,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_tagging(&self, req: &mut S3Request<PutObjectTaggingInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1529,7 +1546,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_public_access_block(&self, req: &mut S3Request<PutPublicAccessBlockInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::PutBucketPublicAccessBlockAction)).await
@@ -1539,7 +1556,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn restore_object(&self, req: &mut S3Request<RestoreObjectInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
@@ -1551,7 +1568,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn select_object_content(&self, req: &mut S3Request<SelectObjectContentInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
@@ -1562,7 +1579,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
-        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 

@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! Bucket application use-case contracts.
-#![allow(dead_code)]
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::auth::get_condition_values;
@@ -46,7 +45,7 @@ use rustfs_ecstore::bucket::{
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI};
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
@@ -65,8 +64,6 @@ use std::{fmt::Display, sync::Arc};
 use tracing::{debug, error, info, instrument, warn};
 use urlencoding::encode;
 
-pub type BucketUsecaseResult<T> = Result<T, ApiError>;
-
 fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
 }
@@ -75,72 +72,13 @@ fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
 }
 
+fn default_region() -> Region {
+    // RUSTFS_REGION is a compile-time constant ("us-east-1") guaranteed to be valid.
+    Region::new(RUSTFS_REGION.into()).expect("RUSTFS_REGION constant must be a valid region")
+}
+
 fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> Region {
-    global_region.unwrap_or_else(|| request_region.unwrap_or_else(|| Region::new(RUSTFS_REGION.into()).expect("valid region")))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateBucketRequest {
-    pub bucket: String,
-    pub object_lock_enabled: Option<bool>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CreateBucketResponse;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeleteBucketRequest {
-    pub bucket: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DeleteBucketResponse;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeadBucketRequest {
-    pub bucket: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HeadBucketResponse;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListObjectsV2Request {
-    pub bucket: String,
-    pub prefix: Option<String>,
-    pub delimiter: Option<String>,
-    pub continuation_token: Option<String>,
-    pub max_keys: Option<i32>,
-    pub fetch_owner: Option<bool>,
-    pub start_after: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListObjectsV2Item {
-    pub key: String,
-    pub etag: Option<String>,
-    pub size: i64,
-    pub version_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ListObjectsV2Response {
-    pub objects: Vec<ListObjectsV2Item>,
-    pub common_prefixes: Vec<String>,
-    pub key_count: i32,
-    pub is_truncated: bool,
-    pub next_continuation_token: Option<String>,
-}
-
-#[async_trait::async_trait]
-pub trait BucketUsecase: Send + Sync {
-    async fn create_bucket(&self, req: CreateBucketRequest) -> BucketUsecaseResult<CreateBucketResponse>;
-
-    async fn delete_bucket(&self, req: DeleteBucketRequest) -> BucketUsecaseResult<DeleteBucketResponse>;
-
-    async fn head_bucket(&self, req: HeadBucketRequest) -> BucketUsecaseResult<HeadBucketResponse>;
-
-    async fn list_objects_v2(&self, req: ListObjectsV2Request) -> BucketUsecaseResult<ListObjectsV2Response>;
+    global_region.or(request_region).unwrap_or_else(default_region)
 }
 
 #[derive(Clone, Default)]
@@ -149,10 +87,7 @@ pub struct DefaultBucketUsecase {
 }
 
 impl DefaultBucketUsecase {
-    pub fn new(context: Arc<AppContext>) -> Self {
-        Self { context: Some(context) }
-    }
-
+    #[cfg(test)]
     pub fn without_context() -> Self {
         Self { context: None }
     }
@@ -161,10 +96,6 @@ impl DefaultBucketUsecase {
         Self {
             context: get_global_app_context(),
         }
-    }
-
-    pub fn context(&self) -> Option<Arc<AppContext>> {
-        self.context.clone()
     }
 
     fn global_region(&self) -> Option<Region> {
@@ -466,7 +397,10 @@ impl DefaultBucketUsecase {
             list_bucket_infos = futures::stream::iter(list_bucket_infos)
                 .filter_map(|info| async {
                     let mut req_clone = req.clone();
-                    let req_info = req_clone.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+                    let Some(req_info) = req_clone.extensions.get_mut::<ReqInfo>() else {
+                        debug!(bucket = %info.name, "ReqInfo missing in extensions, skipping bucket authorization");
+                        return None;
+                    };
                     req_info.bucket = Some(info.name.clone());
 
                     if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
@@ -1747,37 +1681,6 @@ impl DefaultBucketUsecase {
                 ..Default::default()
             }
         }))
-    }
-}
-
-#[async_trait::async_trait]
-impl BucketUsecase for DefaultBucketUsecase {
-    async fn create_bucket(&self, req: CreateBucketRequest) -> BucketUsecaseResult<CreateBucketResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultBucketUsecase::create_bucket DTO path is not implemented yet",
-        )))
-    }
-
-    async fn delete_bucket(&self, req: DeleteBucketRequest) -> BucketUsecaseResult<DeleteBucketResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultBucketUsecase::delete_bucket DTO path is not implemented yet",
-        )))
-    }
-
-    async fn head_bucket(&self, req: HeadBucketRequest) -> BucketUsecaseResult<HeadBucketResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultBucketUsecase::head_bucket DTO path is not implemented yet",
-        )))
-    }
-
-    async fn list_objects_v2(&self, req: ListObjectsV2Request) -> BucketUsecaseResult<ListObjectsV2Response> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultBucketUsecase::list_objects_v2 DTO path is not implemented yet",
-        )))
     }
 }
 

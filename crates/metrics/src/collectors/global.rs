@@ -25,7 +25,7 @@ use crate::format::report_metrics;
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
-use rustfs_ecstore::store_api::BucketOptions;
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
 use rustfs_utils::get_env_opt_u64;
 use std::sync::OnceLock;

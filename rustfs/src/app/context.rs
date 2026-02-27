@@ -15,7 +15,6 @@
 //! Application-layer dependency context.
 //! This module introduces explicit dependency injection entry points
 //! for storage, IAM, and KMS handles.
-#![allow(dead_code)]
 
 use crate::config::workload_profiles::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
@@ -34,11 +33,13 @@ use tokio::sync::RwLock;
 
 /// IAM interface for application-layer use-cases.
 pub trait IamInterface: Send + Sync {
+    #[allow(dead_code)]
     fn handle(&self) -> Arc<IamSys<ObjectStore>>;
     fn is_ready(&self) -> bool;
 }
 
 /// KMS interface for application-layer use-cases.
+#[allow(dead_code)]
 pub trait KmsInterface: Send + Sync {
     fn handle(&self) -> Arc<KmsServiceManager>;
 }
@@ -95,6 +96,7 @@ pub trait BufferConfigInterface: Send + Sync {
 
 /// Default IAM interface adapter.
 pub struct IamHandle {
+    #[allow(dead_code)]
     iam: Arc<IamSys<ObjectStore>>,
 }
 
@@ -115,6 +117,7 @@ impl IamInterface for IamHandle {
 }
 
 /// Default KMS interface adapter.
+#[allow(dead_code)]
 pub struct KmsHandle {
     kms: Arc<KmsServiceManager>,
 }
@@ -230,6 +233,7 @@ impl BufferConfigInterface for BufferConfigHandle {
 pub struct AppContext {
     object_store: Arc<ECStore>,
     iam: Arc<dyn IamInterface>,
+    #[allow(dead_code)]
     kms: Arc<dyn KmsInterface>,
     kms_runtime: Arc<dyn KmsRuntimeInterface>,
     notify: Arc<dyn NotifyInterface>,
@@ -274,6 +278,7 @@ impl AppContext {
         self.iam.clone()
     }
 
+    #[allow(dead_code)]
     pub fn kms(&self) -> Arc<dyn KmsInterface> {
         self.kms.clone()
     }

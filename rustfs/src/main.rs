@@ -46,7 +46,6 @@ use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
-    StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
     bucket::replication::{get_global_replication_pool, init_background_replication},
     config as ecconfig,
@@ -56,6 +55,7 @@ use rustfs_ecstore::{
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
+    store_api::BucketOperations,
     store_api::BucketOptions,
     update_erasure_type,
 };
@@ -94,8 +94,8 @@ fn main() {
         .expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
     if let Err(ref e) = result {
-        eprintln!("{} Server encountered an error and is shutting down: {}", jiff::Zoned::now(), e);
-        error!("Server encountered an error and is shutting down: {}", e);
+        // Use eprintln as tracing may not be initialized at this point
+        eprintln!("[FATAL] Server encountered an error and is shutting down: {e}");
         std::process::exit(1);
     }
 }
@@ -110,7 +110,8 @@ async fn async_main() -> Result<()> {
     let guard = match init_obs(Some(config.clone().obs_endpoint)).await {
         Ok(g) => g,
         Err(e) => {
-            println!("Failed to initialize observability: {e}");
+            // Use eprintln as tracing is not yet initialized
+            eprintln!("[FATAL] Failed to initialize observability: {e}");
             return Err(Error::other(e));
         }
     };
@@ -434,13 +435,13 @@ async fn run(config: config::Config) -> Result<()> {
         init_metrics_system(ctx.clone());
     }
 
-    println!(
+    info!(
+        target: "rustfs::main::run",
         "RustFS server version: {} started successfully at {}, current time: {}",
         version::get_version(),
         &server_address,
         jiff::Zoned::now()
     );
-    info!(target: "rustfs::main::run","server started successfully at {}", &server_address);
     // 4. Mark as Full Ready now that critical components are warm
     readiness.mark_stage(SystemStage::FullReady);
 
@@ -580,9 +581,5 @@ async fn handle_shutdown(
 
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        "Server stopped current "
-    );
-    println!("Server stopped successfully.");
+    info!(target: "rustfs::main::handle_shutdown", "Server stopped successfully.");
 }

@@ -16,11 +16,10 @@ use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use rustfs_ecstore::{
-    StorageAPI,
     bucket::tagging::decode_tags_to_map,
     error::{is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
-    store_api::ObjectOptions,
+    store_api::{ObjectOperations, ObjectOptions},
 };
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use serde::{Deserialize, Serialize};
