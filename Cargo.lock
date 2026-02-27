@@ -7183,6 +7183,7 @@ dependencies = [
  "rustfs-filemeta",
  "rustfs-heal",
  "rustfs-iam",
+ "rustfs-keystone",
  "rustfs-kms",
  "rustfs-lock",
  "rustfs-madmin",
@@ -7499,6 +7500,33 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rustfs-keystone"
+version = "0.0.5"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "futures",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper",
+ "moka",
+ "reqwest 0.13.2",
+ "rustfs-common",
+ "rustfs-credentials",
+ "rustfs-policy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

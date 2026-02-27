@@ -15,6 +15,7 @@
 // Import HTTP server components and compression configuration
 use crate::admin;
 use crate::auth::IAMAuth;
+use crate::auth_keystone;
 use crate::config;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
@@ -37,6 +38,7 @@ use opentelemetry::global;
 use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
+use rustfs_keystone::KeystoneAuthLayer;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -617,6 +619,13 @@ fn process_connection(
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
             .layer(ReadinessGateLayer::new(readiness))
+            // Add Keystone authentication middleware
+            // This validates X-Auth-Token headers and stores credentials in task-local storage
+            // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
+            .layer({
+                let keystone_auth = auth_keystone::get_keystone_auth();
+                KeystoneAuthLayer::new(keystone_auth)
+            })
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
