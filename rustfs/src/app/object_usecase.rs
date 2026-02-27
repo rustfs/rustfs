@@ -2522,6 +2522,7 @@ impl DefaultObjectUsecase {
         let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
+        let force_delete = opts.delete_prefix;
 
         let lock_cfg = BucketObjectLockSys::get(&bucket).await;
         if lock_cfg.is_some() && opts.delete_prefix {
@@ -2544,6 +2545,17 @@ impl DefaultObjectUsecase {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        let replicate_force_delete = force_delete
+            && !replica
+            && has_replication_rules(
+                &bucket,
+                &[ObjectToDelete {
+                    object_name: key.clone(),
+                    ..Default::default()
+                }],
+            )
+            .await;
 
         // Check Object Lock retention before deletion
         // TODO: Future optimization (separate PR) - If performance becomes critical under high delete load:
@@ -2606,6 +2618,19 @@ impl DefaultObjectUsecase {
         });
 
         if obj_info.name.is_empty() {
+            if replicate_force_delete {
+                schedule_replication_delete(DeletedObjectReplicationInfo {
+                    delete_object: rustfs_ecstore::store_api::DeletedObject {
+                        object_name: key.clone(),
+                        force_delete: true,
+                        ..Default::default()
+                    },
+                    bucket: bucket.clone(),
+                    event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                    ..Default::default()
+                })
+                .await;
+            }
             return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
         }
 
