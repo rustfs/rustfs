@@ -117,8 +117,30 @@ impl IAMAuth {
 #[async_trait::async_trait]
 impl S3Auth for IAMAuth {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
+        // NEW: Check if Keystone credentials are present in task-local storage
+        // This handles pure X-Auth-Token requests without Authorization header
+        use rustfs_keystone::KEYSTONE_CREDENTIALS;
+
+        if let Ok(Some(creds)) = KEYSTONE_CREDENTIALS.try_with(|c| c.clone()) {
+            tracing::debug!("IAMAuth: Keystone credentials found in task-local storage for user {}", creds.parent_user);
+            // Return empty secret key - Keystone uses token validation, not AWS signatures
+            return Ok(SecretKey::from(String::new()));
+        }
+
         if access_key.is_empty() {
             return Err(s3_error!(UnauthorizedAccess, "Your account is not signed up"));
+        }
+
+        // Check if this is a Keystone access key (from mixed auth scenario)
+        // Keystone credentials use token authentication, not signature verification
+        if access_key.starts_with("keystone:") {
+            tracing::debug!(
+                "IAMAuth: Keystone access key detected ({}), returning empty secret for token-based auth",
+                access_key
+            );
+            // Return empty secret key - Keystone uses token validation, not AWS signatures
+            // The actual credentials are stored in task-local storage by KeystoneAuthMiddleware
+            return Ok(SecretKey::from(String::new()));
         }
 
         if let Ok(key) = self.simple_auth.get_secret_key(access_key).await {
@@ -155,6 +177,70 @@ impl S3Auth for IAMAuth {
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
 pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(Credentials, bool)> {
+    // KEYSTONE INTEGRATION: Check if Keystone credentials are present in task-local storage
+    // This handles both:
+    // 1. Pure X-Auth-Token requests (access_key may be empty)
+    // 2. Keystone access keys formatted as "keystone:user_id"
+    use crate::auth_keystone;
+    use rustfs_keystone::KEYSTONE_CREDENTIALS;
+
+    // Try to get Keystone credentials from task-local storage first
+    if let Ok(Some(credentials)) = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()) {
+        tracing::debug!("check_key_valid: Keystone credentials found in task-local storage");
+
+        if !auth_keystone::is_keystone_enabled() {
+            return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
+        }
+
+        tracing::info!(
+            "check_key_valid: Retrieved Keystone credentials for user: {} (project: {})",
+            credentials.parent_user,
+            credentials
+                .claims
+                .as_ref()
+                .and_then(|c| c.get("keystone_project_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+        );
+
+        // Determine if user is admin (owner-level access)
+        // Users with "admin" or "reseller_admin" role have owner permissions
+        // Roles are stored in claims["keystone_roles"] by the middleware
+        let is_owner = credentials
+            .claims
+            .as_ref()
+            .and_then(|claims| claims.get("keystone_roles"))
+            .and_then(|roles| roles.as_array())
+            .map(|roles| {
+                roles
+                    .iter()
+                    .any(|role| role.as_str().map(|r| r == "admin" || r == "reseller_admin").unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+        tracing::debug!(
+            "check_key_valid: Keystone user {} has owner permissions: {}",
+            credentials.parent_user,
+            is_owner
+        );
+
+        return Ok((credentials, is_owner));
+    }
+
+    // Legacy check for explicit "keystone:" prefix (for backwards compatibility)
+    if access_key.starts_with("keystone:") {
+        tracing::warn!(
+            "check_key_valid: Keystone access key detected but no credentials in task-local storage. \
+             This indicates middleware was bypassed or not configured."
+        );
+
+        if !auth_keystone::is_keystone_enabled() {
+            return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
+        }
+
+        return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
+    }
+
     let Some(mut cred) = get_global_action_cred() else {
         return Err(S3Error::with_message(
             S3ErrorCode::InternalError,
@@ -252,6 +338,39 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
     }
 
     Ok(HashMap::new())
+}
+
+/// Check for Keystone authentication headers and authenticate if present
+/// Returns Some((Credentials, is_owner)) if Keystone authentication succeeds
+/// Returns None if no Keystone headers present (fall back to standard auth)
+///
+/// Reserved for future use (alternative Keystone auth path)
+#[allow(dead_code)]
+pub async fn try_keystone_auth(headers: &HeaderMap) -> S3Result<Option<(Credentials, bool)>> {
+    use crate::auth_keystone;
+
+    if !auth_keystone::is_keystone_enabled() {
+        return Ok(None);
+    }
+
+    match auth_keystone::authenticate_keystone(headers).await? {
+        Some(cred) => {
+            // Keystone credentials are never "owner" in the traditional sense
+            // unless they have admin role
+            let is_owner = cred
+                .groups
+                .as_ref()
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .any(|g| g.eq_ignore_ascii_case("admin") || g.eq_ignore_ascii_case("reseller_admin"))
+                })
+                .unwrap_or(false);
+
+            Ok(Some((cred, is_owner)))
+        }
+        None => Ok(None),
+    }
 }
 
 pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str> {
@@ -1278,6 +1397,176 @@ mod tests {
         headers.clear();
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr_v6));
         assert_eq!(conditions.get("SourceIp").unwrap()[0], "2001:db8::1");
+    }
+
+    // ========== KEYSTONE AUTHENTICATION TESTS ==========
+
+    #[tokio::test]
+    async fn test_check_key_valid_keystone_not_enabled() {
+        // Test that keystone: access key fails when Keystone is not enabled
+        let result = check_key_valid("dummy-token", "keystone:user123").await;
+
+        // Should fail with InvalidAccessKeyId because Keystone is not enabled
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidAccessKeyId);
+    }
+
+    #[tokio::test]
+    async fn test_check_key_valid_keystone_no_credentials() {
+        use rustfs_keystone::KEYSTONE_CREDENTIALS;
+
+        // Test behavior when Keystone would be enabled but no credentials in task-local
+        // This simulates a request that bypassed middleware
+        KEYSTONE_CREDENTIALS
+            .scope(None, async {
+                // Call function that checks for keystone: prefix
+                // In real scenario, would check is_keystone_enabled() first
+                let access_key = "keystone:user123";
+                if access_key.starts_with("keystone:") {
+                    // Without credentials in task-local, this should fail
+                    let creds_result = KEYSTONE_CREDENTIALS.try_with(|c: &Option<Credentials>| c.clone());
+                    assert!(creds_result.is_ok()); // try_with succeeds
+                    assert!(creds_result.unwrap().is_none()); // but value is None
+                }
+            })
+            .await;
+    }
+
+    #[test]
+    fn test_keystone_role_detection_admin() {
+        // Test role detection logic for admin role
+        let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
+        claims.insert("roles".to_string(), json!(["admin", "member"]));
+
+        let is_owner = claims
+            .get("roles")
+            .and_then(|roles| roles.as_array())
+            .map(|roles| {
+                roles
+                    .iter()
+                    .any(|role| role.as_str().map(|r| r == "admin" || r == "reseller_admin").unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+        assert!(is_owner);
+    }
+
+    #[test]
+    fn test_keystone_role_detection_reseller_admin() {
+        // Test role detection logic for reseller_admin role
+        let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
+        claims.insert("roles".to_string(), json!(["reseller_admin"]));
+
+        let is_owner = claims
+            .get("roles")
+            .and_then(|roles| roles.as_array())
+            .map(|roles| {
+                roles
+                    .iter()
+                    .any(|role| role.as_str().map(|r| r == "admin" || r == "reseller_admin").unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+        assert!(is_owner);
+    }
+
+    #[test]
+    fn test_keystone_role_detection_non_admin() {
+        // Test role detection logic for non-admin roles
+        let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
+        claims.insert("roles".to_string(), json!(["member", "reader"]));
+
+        let is_owner = claims
+            .get("roles")
+            .and_then(|roles| roles.as_array())
+            .map(|roles| {
+                roles
+                    .iter()
+                    .any(|role| role.as_str().map(|r| r == "admin" || r == "reseller_admin").unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+        assert!(!is_owner);
+    }
+
+    #[test]
+    fn test_keystone_role_detection_empty() {
+        // Test role detection logic for empty roles
+        let mut claims: HashMap<String, serde_json::Value> = HashMap::new();
+        claims.insert("roles".to_string(), json!([]));
+
+        let is_owner = claims
+            .get("roles")
+            .and_then(|roles| roles.as_array())
+            .map(|roles| {
+                roles
+                    .iter()
+                    .any(|role| role.as_str().map(|r| r == "admin" || r == "reseller_admin").unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+        assert!(!is_owner);
+    }
+
+    #[test]
+    fn test_keystone_role_detection_no_claim() {
+        // Test role detection logic when roles claim is missing
+        let claims: HashMap<String, serde_json::Value> = HashMap::new();
+
+        let is_owner = claims
+            .get("roles")
+            .and_then(|roles| roles.as_array())
+            .map(|roles| {
+                roles
+                    .iter()
+                    .any(|role| role.as_str().map(|r| r == "admin" || r == "reseller_admin").unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+        assert!(!is_owner);
+    }
+
+    #[tokio::test]
+    async fn test_keystone_task_local_storage() {
+        use rustfs_keystone::KEYSTONE_CREDENTIALS;
+
+        // Test that task-local storage properly stores and retrieves credentials
+        let mut claims = HashMap::new();
+        claims.insert("project_id".to_string(), json!("project123"));
+        claims.insert("roles".to_string(), json!(["member"]));
+
+        let test_creds = Credentials {
+            access_key: "keystone:testuser".to_string(),
+            secret_key: String::new(),
+            session_token: String::new(),
+            expiration: None,
+            status: "on".to_string(),
+            parent_user: "testuser".to_string(),
+            groups: None,
+            claims: Some(claims),
+            name: Some("Test User".to_string()),
+            description: None,
+        };
+
+        // Outside scope, should fail
+        let result = KEYSTONE_CREDENTIALS.try_with(|c: &Option<Credentials>| c.clone());
+        assert!(result.is_err());
+
+        // Inside scope, should succeed
+        KEYSTONE_CREDENTIALS
+            .scope(Some(test_creds.clone()), async {
+                let result = KEYSTONE_CREDENTIALS.try_with(|c: &Option<Credentials>| c.clone());
+                assert!(result.is_ok());
+                let creds = result.unwrap();
+                assert!(creds.is_some());
+                assert_eq!(creds.unwrap().access_key, "keystone:testuser");
+            })
+            .await;
+
+        // After scope, should fail again
+        let result = KEYSTONE_CREDENTIALS.try_with(|c: &Option<Credentials>| c.clone());
+        assert!(result.is_err());
     }
 }
 

@@ -1,0 +1,60 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "rustfs-keystone"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "OpenStack Keystone integration for RustFS"
+keywords = ["rustfs", "openstack", "keystone", "authentication", "s3"]
+categories = ["authentication", "web-programming"]
+authors.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+moka = { workspace = true }
+rustfs-common = { workspace = true }
+rustfs-credentials = { workspace = true }
+rustfs-policy = { workspace = true }
+anyhow = { workspace = true }
+# Middleware dependencies
+tower = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true, features = ["util"] }
+axum = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
+serde_json = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
