@@ -348,7 +348,7 @@ async fn parse_and_normalize_server_address(
 #[allow(dead_code)]
 fn spawn_server<S>(server: S, protocol_name: &'static str) -> tokio::sync::broadcast::Sender<()>
 where
-    S: Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'static,
+    S: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'static,
 {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
 
