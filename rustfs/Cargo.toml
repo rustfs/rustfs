@@ -99,7 +99,6 @@ serde_urlencoded = { workspace = true }
 # Cryptography and Security
 rustls = { workspace = true }
 subtle = { workspace = true }
-rustls-pemfile = { workspace = true }
 jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 
