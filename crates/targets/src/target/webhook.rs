@@ -35,7 +35,7 @@ use std::{
 };
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Arguments for configuring a Webhook target
 #[derive(Debug, Clone)]
@@ -54,6 +54,10 @@ pub struct WebhookArgs {
     pub client_cert: String,
     /// The client key for TLS (PEM format)
     pub client_key: String,
+    /// The path to a custom client root CA certificate file (PEM format) to trust the server.
+    pub client_ca: String,
+    /// Skip TLS certificate verification. DANGEROUS: for testing only.
+    pub skip_tls_verify: bool,
     /// the target type
     pub target_type: TargetType,
 }
@@ -80,6 +84,12 @@ impl WebhookArgs {
             || self.client_cert.is_empty() && !self.client_key.is_empty()
         {
             return Err(TargetError::Configuration("cert and key must be specified as a pair".to_string()));
+        }
+
+        if self.skip_tls_verify && !self.client_ca.is_empty() {
+            return Err(TargetError::Configuration(
+                "skip_tls_verify and client_ca are mutually exclusive; remove client_ca or disable skip_tls_verify".to_string(),
+            ));
         }
 
         Ok(())
@@ -125,29 +135,9 @@ where
         args.validate()?;
         // Create a TargetID
         let target_id = TargetID::new(id, ChannelTargetType::Webhook.as_str().to_string());
-        // Build HTTP client
-        let mut client_builder = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
 
-        // Supplementary certificate processing logic
-        if !args.client_cert.is_empty() && !args.client_key.is_empty() {
-            // Add client certificate
-            let cert = std::fs::read(&args.client_cert)
-                .map_err(|e| TargetError::Configuration(format!("Failed to read client cert: {e}")))?;
-            let key = std::fs::read(&args.client_key)
-                .map_err(|e| TargetError::Configuration(format!("Failed to read client key: {e}")))?;
-
-            let identity = reqwest::Identity::from_pem(&[cert, key].concat())
-                .map_err(|e| TargetError::Configuration(format!("Failed to create identity: {e}")))?;
-            client_builder = client_builder.identity(identity);
-        }
-
-        let http_client = Arc::new(
-            client_builder
-                .build()
-                .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {e}")))?,
-        );
+        // Build HTTP client using the helper function
+        let http_client = Arc::new(Self::build_http_client(&args)?);
 
         // Build storage
         let queue_store = if !args.queue_dir.is_empty() {
@@ -194,6 +184,46 @@ where
             addr,
             cancel_sender,
         })
+    }
+
+    fn build_http_client(args: &WebhookArgs) -> Result<Client, TargetError> {
+        let mut client_builder = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
+
+        // 1. Configure server certificate verification
+        if args.skip_tls_verify {
+            // DANGEROUS: For testing only, skip all certificate verification
+            client_builder = client_builder.danger_accept_invalid_certs(true);
+            warn!(
+                "Webhook target '{}' is configured to skip TLS verification. This is insecure and should not be used in production.",
+                args.endpoint
+            );
+        } else if !args.client_ca.is_empty() {
+            // Use user-provided custom CA certificate
+            let ca_cert_pem = std::fs::read(&args.client_ca)
+                .map_err(|e| TargetError::Configuration(format!("Failed to read root CA cert: {e}")))?;
+            let ca_cert = reqwest::Certificate::from_pem(&ca_cert_pem)
+                .map_err(|e| TargetError::Configuration(format!("Failed to parse root CA cert: {e}")))?;
+            client_builder = client_builder.add_root_certificate(ca_cert);
+        }
+        // If neither is set, use the system's default trust store
+
+        // 2. Configure client certificate (mTLS)
+        if !args.client_cert.is_empty() && !args.client_key.is_empty() {
+            let cert = std::fs::read(&args.client_cert)
+                .map_err(|e| TargetError::Configuration(format!("Failed to read client cert: {e}")))?;
+            let key = std::fs::read(&args.client_key)
+                .map_err(|e| TargetError::Configuration(format!("Failed to read client key: {e}")))?;
+
+            let identity = reqwest::Identity::from_pem(&[cert, key].concat())
+                .map_err(|e| TargetError::Configuration(format!("Failed to create identity for mTLS: {e}")))?;
+            client_builder = client_builder.identity(identity);
+        }
+
+        client_builder
+            .build()
+            .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {e}")))
     }
 
     async fn init(&self) -> Result<(), TargetError> {
@@ -423,8 +453,59 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::target::decode_object_name;
+    use super::WebhookArgs;
+    use crate::target::{TargetType, decode_object_name};
+    use url::Url;
     use url::form_urlencoded;
+
+    fn base_args() -> WebhookArgs {
+        WebhookArgs {
+            enable: true,
+            endpoint: Url::parse("https://example.com/hook").unwrap(),
+            auth_token: String::new(),
+            queue_dir: String::new(),
+            queue_limit: 0,
+            client_cert: String::new(),
+            client_key: String::new(),
+            client_ca: String::new(),
+            skip_tls_verify: false,
+            target_type: TargetType::NotifyEvent,
+        }
+    }
+
+    #[test]
+    fn test_validate_skip_tls_verify_and_client_ca_mutually_exclusive() {
+        let args = WebhookArgs {
+            skip_tls_verify: true,
+            client_ca: "/path/to/ca.pem".to_string(),
+            ..base_args()
+        };
+        let result = args.validate();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("skip_tls_verify") && err_msg.contains("client_ca"),
+            "Error message should mention both fields, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skip_tls_verify_without_client_ca_is_ok() {
+        let args = WebhookArgs {
+            skip_tls_verify: true,
+            ..base_args()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_ca_without_skip_tls_verify_is_ok() {
+        let args = WebhookArgs {
+            client_ca: "/path/to/ca.pem".to_string(),
+            ..base_args()
+        };
+        assert!(args.validate().is_ok());
+    }
 
     #[test]
     fn test_decode_object_name_with_spaces() {

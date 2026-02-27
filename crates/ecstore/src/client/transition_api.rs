@@ -165,7 +165,6 @@ impl TransitionClient {
     async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let scheme = endpoint_url.scheme();
         let client;
         let tls = if let Some(store) = load_root_store_from_tls_path() {
@@ -292,7 +291,7 @@ impl TransitionClient {
         let _ = hc_duration;
     }
 
-    fn dump_http(&self, req: &http::Request<s3s::Body>, resp: &http::Response<Incoming>) -> Result<(), std::io::Error> {
+    fn dump_http(&self, req: &Request<s3s::Body>, resp: &Response<Incoming>) -> Result<(), std::io::Error> {
         let mut resp_trace: Vec<u8>;
 
         //info!("{}{}", self.trace_output, "---------BEGIN-HTTP---------");
@@ -301,7 +300,7 @@ impl TransitionClient {
         Ok(())
     }
 
-    pub async fn doit(&self, req: http::Request<s3s::Body>) -> Result<http::Response<Incoming>, std::io::Error> {
+    pub async fn doit(&self, req: Request<s3s::Body>) -> Result<Response<Incoming>, std::io::Error> {
         let req_method;
         let req_uri;
         let req_headers;
@@ -353,7 +352,7 @@ impl TransitionClient {
         &self,
         method: http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<http::Response<Incoming>, std::io::Error> {
+    ) -> Result<Response<Incoming>, std::io::Error> {
         if self.is_offline() {
             let mut s = self.endpoint_url.to_string();
             s.push_str(" is offline.");
@@ -363,7 +362,7 @@ impl TransitionClient {
         let retryable: bool;
         //let mut body_seeker: BufferReader;
         let mut req_retry = self.max_retries;
-        let mut resp: http::Response<Incoming>;
+        let mut resp: Response<Incoming>;
 
         //if metadata.content_body != nil {
         //body_seeker = BufferReader::new(metadata.content_body.read_all().await?);
@@ -401,10 +400,10 @@ impl TransitionClient {
             err_response.message = format!("remote tier error: {}", err_response.message);
 
             if self.region == "" {
-                match err_response.code {
+                return match err_response.code {
                     S3ErrorCode::AuthorizationHeaderMalformed | S3ErrorCode::InvalidArgument /*S3ErrorCode::InvalidRegion*/ => {
                         //break;
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
                     S3ErrorCode::AccessDenied => {
                         if err_response.region == "" {
@@ -421,12 +420,12 @@ impl TransitionClient {
                             metadata.bucket_location = err_response.region.clone();
                             //continue;
                         }
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
                     _ => {
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
-                }
+                };
             }
 
             if is_s3code_retryable(err_response.code.as_str()) {
@@ -447,7 +446,7 @@ impl TransitionClient {
         &self,
         method: &http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<http::Request<s3s::Body>, std::io::Error> {
+    ) -> Result<Request<s3s::Body>, std::io::Error> {
         let mut location = metadata.bucket_location.clone();
         if location == "" && metadata.bucket_name != "" {
             location = self.get_bucket_location(&metadata.bucket_name).await?;
