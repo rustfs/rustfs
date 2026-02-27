@@ -107,7 +107,10 @@ pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) 
         .filter(|r| !r.as_str().is_empty())
         .map(|r| r.as_str())
         .unwrap_or_else(|| {
-            warn!("Global region is not set; attempting notification configuration for all buckets with an empty region.");
+            warn!(
+                "Global region is not set; attempting notification configuration for all buckets using default region '{}'.",
+                RUSTFS_REGION
+            );
             RUSTFS_REGION
         });
     for bucket in buckets.iter() {
