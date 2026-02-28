@@ -1253,6 +1253,8 @@ impl DefaultObjectUsecase {
             rs = HTTPRangeSpec::from_object_info(&info, part_number);
         }
 
+        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
+
         let mut content_length = info.get_actual_size().map_err(ApiError::from)?;
 
         let content_range = if let Some(rs) = &rs {
@@ -2969,6 +2971,8 @@ impl DefaultObjectUsecase {
         {
             return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
         }
+        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
+
         // Validate SSE-C: if the object was encrypted with a customer-provided key,
         // the caller must supply the matching key even for HEAD requests (per S3 spec).
         validate_ssec_for_read(
