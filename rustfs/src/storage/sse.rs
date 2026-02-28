@@ -343,6 +343,26 @@ fn sse_invalid_argument(message: &str) -> ApiError {
     }
 }
 
+/// Extract SSE-C parameters from request headers.
+/// Used as fallback when the S3 layer does not populate them in the input struct.
+pub(crate) fn extract_ssec_params_from_headers(
+    headers: &HeaderMap,
+) -> (Option<SSECustomerAlgorithm>, Option<SSECustomerKey>, Option<SSECustomerKeyMD5>) {
+    let algorithm = headers
+        .get("x-amz-server-side-encryption-customer-algorithm")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| SSECustomerAlgorithm::from(s.to_string()));
+    let key = headers
+        .get("x-amz-server-side-encryption-customer-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| SSECustomerKey::from(s.to_string()));
+    let key_md5 = headers
+        .get("x-amz-server-side-encryption-customer-key-md5")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| SSECustomerKeyMD5::from(s.to_string()));
+    (algorithm, key, key_md5)
+}
+
 #[inline]
 pub(crate) fn validate_sse_headers_for_write(
     server_side_encryption: Option<&ServerSideEncryption>,
@@ -1674,6 +1694,51 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderValue;
+
+    #[test]
+    fn test_extract_ssec_params_from_headers() {
+        let mut headers = http::HeaderMap::new();
+        let (algo, key, md5) = extract_ssec_params_from_headers(&headers);
+        assert!(algo.is_none());
+        assert!(key.is_none());
+        assert!(md5.is_none());
+
+        headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+        let (algo, key, md5) = extract_ssec_params_from_headers(&headers);
+        assert_eq!(algo.as_deref(), Some("AES256"));
+        assert!(key.is_none());
+        assert!(md5.is_none());
+
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key",
+            HeaderValue::from_static("pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs="),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            HeaderValue::from_static("DWygnHRtgiJ77HCm+1rvHw=="),
+        );
+        let (algo, key, md5) = extract_ssec_params_from_headers(&headers);
+        assert_eq!(algo.as_deref(), Some("AES256"));
+        assert!(key.is_some());
+        assert!(md5.is_some());
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_write_rejects_algorithm_without_key() {
+        let algorithm = SSECustomerAlgorithm::from("AES256".to_string());
+        let result = validate_sse_headers_for_write(
+            None,
+            None,
+            Some(&algorithm),
+            None,
+            None,
+            true, // PutObject requires all three
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
 
     #[test]
     fn test_is_managed_sse() {
