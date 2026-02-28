@@ -341,11 +341,26 @@ impl DefaultMultipartUsecase {
             .global_region()
             .map(|region| region.to_string())
             .unwrap_or_else(|| RUSTFS_REGION.to_string());
-        let output = CompleteMultipartUploadOutput {
+        let helper_output = entity::CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
             location: Some(region.clone()),
+            server_side_encryption,
+            ssekms_key_id,
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
+            checksum_type,
+            ..Default::default()
+        };
+        let output = CompleteMultipartUploadOutput {
+            bucket: Some(bucket.clone()),
+            key: Some(key.clone()),
+            e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
+            location: Some(region),
             server_side_encryption: server_side_encryption.clone(),
             ssekms_key_id: ssekms_key_id.clone(),
             checksum_crc32: checksum_crc32.clone(),
@@ -361,22 +376,6 @@ impl DefaultMultipartUsecase {
             "TDD: Created output: SSE={:?}, KMS={:?}",
             output.server_side_encryption, output.ssekms_key_id
         );
-
-        let helper_output = entity::CompleteMultipartUploadOutput {
-            bucket: Some(bucket.clone()),
-            key: Some(key.clone()),
-            e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(region.to_string()),
-            server_side_encryption,
-            ssekms_key_id,
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
-            checksum_type,
-            ..Default::default()
-        };
 
         let mt2 = HashMap::new();
         let replicate_options =
