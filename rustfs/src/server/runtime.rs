@@ -80,11 +80,11 @@ fn compute_default_max_blocking_threads() -> usize {
 /// Panics if environment variable values are invalid
 /// # Examples
 /// ```no_run
-/// use rustfs_server::get_tokio_runtime_builder;
-/// let builder = get_tokio_runtime_builder();
+/// use rustfs_server::tokio_runtime_builder;
+/// let builder = tokio_runtime_builder();
 /// let runtime = builder.build().unwrap();
 /// ```
-pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
+pub(crate) fn tokio_runtime_builder() -> tokio::runtime::Builder {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
 
     // Worker threads(Default physical cores)
@@ -136,7 +136,10 @@ pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
             });
     }
     if !rustfs_obs::is_production_environment() {
-        tracing::debug!(
+        println!(
+            "Starting Tokio runtime with configured parameters: worker_threads={}, max_blocking_threads={}, \
+             thread_stack_size={}, thread_keep_alive={}, global_queue_interval={}, event_interval={}, \
+             max_io_events_per_tick={}, thread_name={}",
             worker_threads,
             max_blocking_threads,
             thread_stack_size,
@@ -144,8 +147,7 @@ pub(crate) fn get_tokio_runtime_builder() -> tokio::runtime::Builder {
             global_queue_interval,
             event_interval,
             max_io_events_per_tick,
-            thread_name,
-            "Starting Tokio runtime with configured parameters"
+            thread_name
         );
     }
     builder

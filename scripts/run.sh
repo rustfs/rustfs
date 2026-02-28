@@ -68,11 +68,10 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
 export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
 export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
-export RUSTFS_OBS_LOG_STDOUT_ENABLED=false # Whether to enable local stdout logging
+export RUSTFS_OBS_LOG_STDOUT_ENABLED=true # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
-export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
-export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=100 # Log rotation size in MB
-export RUSTFS_OBS_LOG_POOL_CAPA=10240 # Log pool capacity
+export RUSTFS_OBS_LOG_ROTATION_TIME="minutely" # Log rotation time unit, can be "minutely", "hourly", "daily"
+export RUSTFS_OBS_LOG_KEEP_FILES=30 # Number of log files to keep
 export RUSTFS_OBS_LOG_MESSAGE_CAPA=32768 # Log message capacity
 export RUSTFS_OBS_LOG_FLUSH_MS=300 # Log flush interval in milliseconds
 

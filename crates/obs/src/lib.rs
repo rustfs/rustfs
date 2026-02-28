@@ -30,35 +30,33 @@
 //! # use all functions
 //! rustfs-obs = { version = "0.1.0", features = ["full"] }
 //! ```
-///
-/// ## Usage
-///
-/// ```no_run
-/// use rustfs_obs::init_obs;
-///
-/// # #[tokio::main]
-/// # async fn main() {
-/// #   let _guard = match init_obs(None).await {
-/// #         Ok(g) => g,
-/// #         Err(e) => {
-/// #             panic!("Failed to initialize observability: {:?}", e);
-/// #         }
-/// #     };
-/// #   // Application logic here
-/// #   {
-/// #       // Simulate some work
-/// #       tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-/// #       println!("Application is running...");
-/// #   }
-/// #   // Guard will be dropped here, flushing telemetry data
-/// # }
-/// ```
+//!
+//! ## Usage
+//!
+//! ```no_run
+//! use rustfs_obs::init_obs;
+//!
+//! # #[tokio::main]
+//! # async fn main() {
+//! #   let _guard = match init_obs(None).await {
+//! #         Ok(g) => g,
+//! #         Err(e) => {
+//! #             panic!("Failed to initialize observability: {:?}", e);
+//! #         }
+//! #     };
+//! #   // Application logic here
+//! #   {
+//! #       // Simulate some work
+//! #       tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+//! #       println!("Application is running...");
+//! #   }
+//! #   // Guard will be dropped here, flushing telemetry data
+//! # }
+//! ```
 mod config;
 mod error;
 mod global;
 mod log_cleanup;
-mod log_config;
-mod recorder;
 mod system;
 mod telemetry;
 
@@ -66,7 +64,5 @@ pub use config::*;
 pub use error::*;
 pub use global::*;
 pub use log_cleanup::*;
-pub use log_config::*;
-pub use recorder::*;
 pub use system::SystemObserver;
-pub use telemetry::OtelGuard;
+pub use telemetry::{OtelGuard, Recorder};

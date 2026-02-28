@@ -164,7 +164,7 @@ pub const DEFAULT_LOG_FILENAME: &str = "rustfs";
 /// This is the default log filename for OBS.
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
-pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, "");
+pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, ".log");
 
 /// Default log directory for rustfs
 /// This is the default log directory for rustfs.
@@ -183,9 +183,9 @@ pub const DEFAULT_LOG_ROTATION_SIZE_MB: u64 = 100;
 /// Default log rotation time for rustfs
 /// This is the default log rotation time for rustfs.
 /// It is used to rotate the logs of the application.
-/// Default value: hour, eg: day,hour,minute,second
+/// Default value: hour, eg: daily,hourly,minutely
 /// Environment variable: RUSTFS_OBS_LOG_ROTATION_TIME
-pub const DEFAULT_LOG_ROTATION_TIME: &str = "hour";
+pub const DEFAULT_LOG_ROTATION_TIME: &str = "hourly";
 
 /// Default log keep files for rustfs
 /// This is the default log keep files for rustfs.
