@@ -307,7 +307,7 @@ impl DefaultObjectUsecase {
         } = input;
 
         // Merge SSE-C params from headers (fallback when S3 layer does not populate input)
-        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(&req.headers);
+        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(&req.headers)?;
         let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
         let sse_customer_key = sse_customer_key.or(h_key);
         let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
