@@ -56,6 +56,8 @@
 mod config;
 mod error;
 mod global;
+mod log_cleanup;
+mod log_config;
 mod recorder;
 mod system;
 mod telemetry;
@@ -63,6 +65,8 @@ mod telemetry;
 pub use config::*;
 pub use error::*;
 pub use global::*;
+pub use log_cleanup::*;
+pub use log_config::*;
 pub use recorder::*;
 pub use system::SystemObserver;
 pub use telemetry::OtelGuard;

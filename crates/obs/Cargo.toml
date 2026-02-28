@@ -36,7 +36,7 @@ full = ["gpu"]
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants", "observability"] }
 rustfs-utils = { workspace = true, features = ["ip", "path"] }
-flexi_logger = { workspace = true }
+flate2 = { workspace = true }
 metrics = { workspace = true }
 nu-ansi-term = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
@@ -48,6 +48,7 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 serde = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
+toml = "0.8"
 tracing = { workspace = true, features = ["std", "attributes"] }
 tracing-appender = { workspace = true }
 tracing-error = { workspace = true }
@@ -56,7 +57,9 @@ tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
+walkdir = { workspace = true }
 
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }
