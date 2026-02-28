@@ -382,7 +382,7 @@ pub(crate) fn validate_sse_headers_for_write(
         }
     }
 
-    if ssekms_key_id.is_some() && !server_side_encryption.is_some_and(|sse| sse.as_str() == ServerSideEncryption::AWS_KMS) {
+    if ssekms_key_id.is_some() && server_side_encryption.is_none_or(|sse| sse.as_str() != ServerSideEncryption::AWS_KMS) {
         return Err(sse_invalid_argument(
             "The SSE-KMS key ID header can only be used when x-amz-server-side-encryption is set to aws:kms.",
         ));
