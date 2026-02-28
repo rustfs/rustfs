@@ -78,6 +78,7 @@ use aes_gcm::{
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use http::HeaderMap;
 use rand::Rng;
 use rustfs_ecstore::error::StorageError;
 use rustfs_filemeta::ObjectPartInfo;
@@ -333,6 +334,105 @@ impl EncryptionRequest<'_> {
     }
 }
 
+#[inline]
+fn sse_invalid_argument(message: &str) -> ApiError {
+    ApiError {
+        code: S3ErrorCode::InvalidArgument,
+        message: message.to_string(),
+        source: None,
+    }
+}
+
+#[inline]
+pub(crate) fn validate_sse_headers_for_write(
+    server_side_encryption: Option<&ServerSideEncryption>,
+    ssekms_key_id: Option<&SSEKMSKeyId>,
+    sse_customer_algorithm: Option<&SSECustomerAlgorithm>,
+    sse_customer_key: Option<&SSECustomerKey>,
+    sse_customer_key_md5: Option<&SSECustomerKeyMD5>,
+    require_sse_customer_key: bool,
+) -> Result<(), ApiError> {
+    let has_ssec_headers = sse_customer_algorithm.is_some() || sse_customer_key.is_some() || sse_customer_key_md5.is_some();
+    let has_managed_headers = server_side_encryption.is_some() || ssekms_key_id.is_some();
+
+    if has_ssec_headers {
+        if has_managed_headers {
+            return Err(sse_invalid_argument(
+                "The SSE-C and managed server-side encryption headers cannot be used together.",
+            ));
+        }
+
+        let has_valid_ssec_headers = if require_sse_customer_key {
+            matches!(
+                (sse_customer_algorithm, sse_customer_key, sse_customer_key_md5),
+                (Some(_), Some(_), Some(_))
+            )
+        } else {
+            matches!((sse_customer_algorithm, sse_customer_key_md5), (Some(_), Some(_)))
+        };
+
+        if !has_valid_ssec_headers {
+            let message = if require_sse_customer_key {
+                "Missing SSE-C parameters. Algorithm, customer key and customer key MD5 are all required."
+            } else {
+                "Missing SSE-C parameters. Algorithm and customer key MD5 are required."
+            };
+
+            return Err(ssec_invalid_request(message));
+        }
+    }
+
+    if ssekms_key_id.is_some() && server_side_encryption.is_none_or(|sse| sse.as_str() != ServerSideEncryption::AWS_KMS) {
+        return Err(sse_invalid_argument(
+            "The SSE-KMS key ID header can only be used when x-amz-server-side-encryption is set to aws:kms.",
+        ));
+    }
+
+    Ok(())
+}
+
+#[inline]
+pub(crate) fn validate_sse_headers_for_read(metadata: &HashMap<String, String>, headers: &HeaderMap) -> Result<(), ApiError> {
+    let has_req_ssec = headers.contains_key("x-amz-server-side-encryption-customer-algorithm")
+        || headers.contains_key("x-amz-server-side-encryption-customer-key")
+        || headers.contains_key("x-amz-server-side-encryption-customer-key-md5");
+
+    let has_req_sse = headers.contains_key("x-amz-server-side-encryption")
+        || headers.contains_key("x-amz-server-side-encryption-aws-kms-key-id");
+
+    let is_object_ssec = metadata.contains_key("x-amz-server-side-encryption-customer-algorithm");
+    let is_object_sse = metadata.contains_key("x-amz-server-side-encryption");
+
+    if is_object_ssec {
+        if has_req_sse {
+            return Err(sse_invalid_argument(
+                "Server-side encryption headers cannot be used with an object encrypted using SSE-C.",
+            ));
+        }
+        return Ok(());
+    }
+
+    if is_object_sse && has_req_ssec {
+        return Err(sse_invalid_argument(
+            "SSE-C headers cannot be used with an object encrypted using server-side managed encryption.",
+        ));
+    }
+
+    if has_req_ssec {
+        return Err(ssec_invalid_request(
+            "The object was stored without SSE-C. The correct SSE-C parameters must not be provided.",
+        ));
+    }
+
+    if has_req_sse {
+        return Err(sse_invalid_argument(
+            "The object is not encrypted with server-side encryption. Do not provide server-side encryption headers.",
+        ));
+    }
+
+    Ok(())
+}
+
 /// Request parameters for unified decryption
 #[derive(Debug)]
 pub struct DecryptionRequest<'a> {
@@ -507,6 +607,15 @@ impl DecryptionMaterial {
 /// }
 /// ```
 pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
+    validate_sse_headers_for_write(
+        request.server_side_encryption.as_ref(),
+        request.ssekms_key_id.as_ref(),
+        request.sse_customer_algorithm.as_ref(),
+        request.sse_customer_key.as_ref(),
+        request.sse_customer_key_md5.as_ref(),
+        true,
+    )?;
+
     // Priority 1: SSE-C (customer-provided key)
     if let (Some(algorithm), Some(key), Some(key_md5)) =
         (request.sse_customer_algorithm, request.sse_customer_key, request.sse_customer_key_md5)
@@ -567,6 +676,15 @@ pub struct PrepareEncryptionRequest<'a> {
 }
 
 pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
+    validate_sse_headers_for_write(
+        request.server_side_encryption.as_ref(),
+        request.ssekms_key_id.as_ref(),
+        request.sse_customer_algorithm.as_ref(),
+        None,
+        request.sse_customer_key_md5.as_ref(),
+        false,
+    )?;
+
     let sse_type = prepare_sse_configuration_v2(
         request.bucket,
         request.server_side_encryption,
@@ -1656,6 +1774,192 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_sse_encryption_rejects_partial_ssec_headers() {
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let sse_key = BASE64_STANDARD.encode([42u8; 32]);
+        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let content_size = 1024;
+
+        let request_missing_md5 = EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(sse_key.clone()),
+            sse_customer_key_md5: None,
+            content_size,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let err = sse_encryption(request_missing_md5).await.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+
+        let request_missing_key = EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: None,
+            sse_customer_key_md5: Some(sse_key_md5.clone()),
+            content_size,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let err = sse_encryption(request_missing_key).await.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+
+        let request_missing_algorithm = EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: Some(sse_key),
+            sse_customer_key_md5: Some(sse_key_md5),
+            content_size,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let err = sse_encryption(request_missing_algorithm).await.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn test_sse_prepare_encryption_rejects_partial_ssec_headers() {
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+
+        let request_missing_algorithm = PrepareEncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key_md5: Some(sse_key_md5),
+        };
+
+        let err = sse_prepare_encryption(request_missing_algorithm).await.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_write_allows_aws_kms_without_key_id() {
+        let server_side_encryption: ServerSideEncryption = "aws:kms".to_string().into();
+
+        let result = validate_sse_headers_for_write(Some(&server_side_encryption), None, None, None, None, true);
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sse_prepare_encryption_allows_ssec_headers_without_customer_key() {
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+
+        let request = PrepareEncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key_md5: Some(sse_key_md5),
+        };
+
+        let material = sse_prepare_encryption(request)
+            .await
+            .expect("prepare should accept ssec headers");
+        assert!(material.is_some());
+        let metadata = &material.expect("ssec metadata should be generated").metadata;
+        assert_eq!(metadata.get("x-amz-server-side-encryption").unwrap(), "AES256");
+        assert_eq!(metadata.get("x-amz-server-side-encryption-customer-algorithm").unwrap(), "AES256");
+    }
+
+    #[tokio::test]
+    async fn test_sse_encryption_rejects_kms_key_with_invalid_algorithm() {
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let content_size = 1024;
+
+        let request = EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: Some("AES256".to_string().into()),
+            ssekms_key_id: Some("test-key".to_string()),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let err = sse_encryption(request).await.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_sse_encryption_rejects_kms_key_without_algorithm() {
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let content_size = 1024;
+
+        let request = EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: Some("test-key".to_string()),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let err = sse_encryption(request).await.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_sse_encryption_rejects_conflict_between_kms_and_ssec() {
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let content_size = 1024;
+        let sse_key = BASE64_STANDARD.encode([42u8; 32]);
+        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+
+        let request = EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: Some("aws:kms".to_string().into()),
+            ssekms_key_id: Some("test-key".to_string()),
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(sse_key),
+            sse_customer_key_md5: Some(sse_key_md5),
+            content_size,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let err = sse_encryption(request).await.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+    }
+
     #[test]
     fn test_strip_managed_encryption_metadata() {
         let mut metadata = HashMap::new();
@@ -2071,6 +2375,74 @@ mod tests {
 
         let err = validate_ssec_for_read(&metadata, Some(&fake_key_b64), Some(&stored_md5)).unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_read_rejects_kms_on_plain_object() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-server-side-encryption", http::HeaderValue::from_static("aws:kms"));
+        headers.insert("x-amz-server-side-encryption-aws-kms-key-id", http::HeaderValue::from_static("test-key"));
+
+        let metadata = HashMap::new();
+        let err = validate_sse_headers_for_read(&metadata, &headers).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_read_rejects_ssec_on_plain_object() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-server-side-encryption-customer-algorithm",
+            http::HeaderValue::from_static("AES256"),
+        );
+        headers.insert("x-amz-server-side-encryption-customer-key", http::HeaderValue::from_static("test-key"));
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            http::HeaderValue::from_static("test-key-md5"),
+        );
+
+        let metadata = HashMap::new();
+        let err = validate_sse_headers_for_read(&metadata, &headers).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_read_rejects_ssec_on_managed_object() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-server-side-encryption-customer-algorithm",
+            http::HeaderValue::from_static("AES256"),
+        );
+        headers.insert("x-amz-server-side-encryption-customer-key", http::HeaderValue::from_static("test-key"));
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            http::HeaderValue::from_static("test-key-md5"),
+        );
+
+        let metadata = HashMap::from([("x-amz-server-side-encryption".to_string(), "aws:kms".to_string())]);
+        let err = validate_sse_headers_for_read(&metadata, &headers).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_read_allows_encrypted_object_without_request_headers() {
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+            ("x-rustfs-encryption-key".to_string(), "encrypted-key".to_string()),
+        ]);
+        let headers = HeaderMap::new();
+        assert!(validate_sse_headers_for_read(&metadata, &headers).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_read_rejects_sse_on_ssec_object() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-server-side-encryption", http::HeaderValue::from_static("aws:kms"));
+        headers.insert("x-amz-server-side-encryption-aws-kms-key-id", http::HeaderValue::from_static("test-key"));
+
+        let metadata = HashMap::from([("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string())]);
+        let err = validate_sse_headers_for_read(&metadata, &headers).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
     }
 
     #[test]
