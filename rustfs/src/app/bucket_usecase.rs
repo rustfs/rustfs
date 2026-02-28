@@ -72,13 +72,11 @@ fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
 }
 
-fn default_region() -> Region {
-    // RUSTFS_REGION is a compile-time constant ("us-east-1") guaranteed to be valid.
-    Region::new(RUSTFS_REGION.into()).expect("RUSTFS_REGION constant must be a valid region")
-}
-
-fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> Region {
-    global_region.or(request_region).unwrap_or_else(default_region)
+fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> String {
+    global_region
+        .or(request_region)
+        .map(|region| region.to_string())
+        .unwrap_or_else(|| RUSTFS_REGION.to_string())
 }
 
 #[derive(Clone, Default)]
@@ -1166,9 +1164,8 @@ impl DefaultBucketUsecase {
         let event_rules =
             event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
         warn!("notify event rules: {:?}", &event_rules);
-        let region_clone = region.clone();
         notify
-            .add_event_specific_rules(&bucket, region_clone.as_str(), &event_rules)
+            .add_event_specific_rules(&bucket, region.as_str(), &event_rules)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
 
@@ -1706,22 +1703,19 @@ mod tests {
     #[test]
     fn resolve_notification_region_prefers_global_region() {
         let binding = resolve_notification_region(Some("us-east-1".parse().unwrap()), Some("ap-southeast-1".parse().unwrap()));
-        let region = binding.as_str();
-        assert_eq!(region, "us-east-1");
+        assert_eq!(binding, "us-east-1");
     }
 
     #[test]
     fn resolve_notification_region_falls_back_to_request_region() {
         let binding = resolve_notification_region(None, Some("ap-southeast-1".parse().unwrap()));
-        let region = binding.as_str();
-        assert_eq!(region, "ap-southeast-1");
+        assert_eq!(binding, "ap-southeast-1");
     }
 
     #[test]
     fn resolve_notification_region_defaults_value() {
         let binding = resolve_notification_region(None, None);
-        let region = binding.as_str();
-        assert_eq!(region, RUSTFS_REGION);
+        assert_eq!(binding, RUSTFS_REGION);
     }
 
     #[tokio::test]

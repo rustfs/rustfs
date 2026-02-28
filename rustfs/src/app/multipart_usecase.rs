@@ -79,7 +79,7 @@ impl DefaultMultipartUsecase {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
     }
 
-    fn global_region(&self) -> Option<s3s::region::Region> {
+    fn global_region(&self) -> Option<Region> {
         self.context.as_ref().and_then(|context| context.region().get())
     }
 
@@ -339,12 +339,13 @@ impl DefaultMultipartUsecase {
 
         let region = self
             .global_region()
-            .unwrap_or_else(|| Region::new(RUSTFS_REGION.into()).expect("RUSTFS_REGION constant must be a valid region"));
+            .map(|region| region.to_string())
+            .unwrap_or_else(|| RUSTFS_REGION.to_string());
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(region.to_string()),
+            location: Some(region.clone()),
             server_side_encryption: server_side_encryption.clone(),
             ssekms_key_id: ssekms_key_id.clone(),
             checksum_crc32: checksum_crc32.clone(),
