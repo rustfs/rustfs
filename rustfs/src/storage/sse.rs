@@ -344,20 +344,14 @@ fn sse_invalid_argument(message: &str) -> ApiError {
 }
 
 /// SSE-C parameters extracted from headers (algorithm, key, key MD5).
-pub(crate) type SsecParamsFromHeaders = (
-    Option<SSECustomerAlgorithm>,
-    Option<SSECustomerKey>,
-    Option<SSECustomerKeyMD5>,
-);
+pub(crate) type SsecParamsFromHeaders = (Option<SSECustomerAlgorithm>, Option<SSECustomerKey>, Option<SSECustomerKeyMD5>);
 
 /// Extract SSE-C parameters from request headers.
 /// Used as fallback when the S3 layer does not populate them in the input struct.
 ///
 /// Returns an error if an SSE-C header is present but cannot be parsed as valid UTF-8,
 /// ensuring malformed headers do not bypass validation.
-pub(crate) fn extract_ssec_params_from_headers(
-    headers: &HeaderMap,
-) -> Result<SsecParamsFromHeaders, ApiError> {
+pub(crate) fn extract_ssec_params_from_headers(headers: &HeaderMap) -> Result<SsecParamsFromHeaders, ApiError> {
     let algorithm = match headers.get("x-amz-server-side-encryption-customer-algorithm") {
         None => Ok(None),
         Some(v) => v
