@@ -2392,7 +2392,7 @@ impl DefaultObjectUsecase {
 
         let mut object_to_delete = Vec::new();
         let mut object_to_delete_idx = Vec::new();
-        let mut object_sizes = HashMap::new();
+        let mut object_sizes = Vec::new();
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             let raw_version_id = obj_id.version_id.clone();
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
@@ -2460,7 +2460,7 @@ impl DefaultObjectUsecase {
                 continue;
             }
 
-            object_sizes.insert(object.object_name.clone(), goi.size);
+            object_sizes.push(goi.size);
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
                 object.version_id = Some(Uuid::nil());
@@ -2543,7 +2543,8 @@ impl DefaultObjectUsecase {
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
                 }
                 delete_results[didx].delete_object = Some(dobjs[i].clone());
-                if let Some(&size) = object_sizes.get(&object_to_delete[i].object_name) {
+                let size = object_sizes[i];
+                if size > 0 {
                     rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, size as u64).await;
                 }
                 continue;
