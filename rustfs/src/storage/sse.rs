@@ -206,8 +206,8 @@ async fn prepare_sse_configuration(
         match e {
             Error::ConfigNotFound => {
                 // The bucket has no SSE config. If the user explicitly requested
-                // aws:kms, we must honor that — return the explicit SSE header so
-                // downstream logic can try (and fail if KMS is unavailable).
+                // any SSE (e.g. AES256 or aws:kms), honor it — return the explicit
+                // SSE header so downstream logic can apply the requested encryption.
                 if let Some(sse) = server_side_encryption {
                     Ok(Some(SseConfiguration {
                         effective_sse: sse,
