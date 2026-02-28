@@ -148,7 +148,9 @@ impl Condition {
     #[inline]
     pub fn is_negate(&self) -> bool {
         use Condition::*;
-        matches!(self, StringNotEquals(_) | StringNotEqualsIgnoreCase(_) | NotIpAddress(_))
+        // StringNotEquals/StringNotEqualsIgnoreCase handle negation via the
+        // `negate` parameter in `evaluate_with_resolver`; do NOT negate again here.
+        matches!(self, NotIpAddress(_))
     }
 
     pub fn serialize_map<T: SerializeMap>(&self, se: &mut T) -> Result<(), T::Error> {
@@ -210,5 +212,92 @@ impl PartialEq for Condition {
             (Self::DateGreaterThanEquals(l0), Self::DateGreaterThanEquals(r0)) => l0 == r0,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::function::{
+        func::{FuncKeyValue, InnerFunc},
+        key::Key,
+        string::StringFuncValue,
+    };
+    use std::collections::{BTreeSet, HashMap};
+
+    fn make_string_condition(condition_type: &str, key: &str, value: &str) -> Condition {
+        let func: StringFunc = InnerFunc(vec![FuncKeyValue {
+            key: Key {
+                name: key.try_into().unwrap(),
+                variable: None,
+            },
+            values: StringFuncValue({
+                let mut s = BTreeSet::new();
+                s.insert(value.to_string());
+                s
+            }),
+        }]);
+        match condition_type {
+            "StringEquals" => Condition::StringEquals(func),
+            "StringNotEquals" => Condition::StringNotEquals(func),
+            "StringNotEqualsIgnoreCase" => Condition::StringNotEqualsIgnoreCase(func),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_string_not_equals_no_double_negation() {
+        let cond = make_string_condition("StringNotEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+
+        let mut values = HashMap::new();
+        values.insert("x-amz-server-side-encryption".to_string(), vec!["AES256".to_string()]);
+
+        // "AES256" != "aws:kms" is true, so StringNotEquals should evaluate to true
+        assert!(
+            cond.evaluate_with_resolver(false, &values, None).await,
+            "StringNotEquals should be true when values differ"
+        );
+
+        values.insert("x-amz-server-side-encryption".to_string(), vec!["aws:kms".to_string()]);
+
+        // "aws:kms" != "aws:kms" is false, so StringNotEquals should evaluate to false
+        assert!(
+            !cond.evaluate_with_resolver(false, &values, None).await,
+            "StringNotEquals should be false when values match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_string_equals_condition() {
+        let cond = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+
+        let mut values = HashMap::new();
+        values.insert("x-amz-server-side-encryption".to_string(), vec!["aws:kms".to_string()]);
+
+        assert!(
+            cond.evaluate_with_resolver(false, &values, None).await,
+            "StringEquals should be true when values match"
+        );
+
+        values.insert("x-amz-server-side-encryption".to_string(), vec!["AES256".to_string()]);
+
+        assert!(
+            !cond.evaluate_with_resolver(false, &values, None).await,
+            "StringEquals should be false when values differ"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_string_not_equals_absent_key() {
+        let cond = make_string_condition("StringNotEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+
+        let values = HashMap::new();
+
+        // Key absent: rvalues is empty, intersection is empty.
+        // for_all=false: ivalues.count() > 0 → false. Negated → true.
+        assert!(
+            cond.evaluate_with_resolver(false, &values, None).await,
+            "StringNotEquals should be true when key is absent"
+        );
     }
 }

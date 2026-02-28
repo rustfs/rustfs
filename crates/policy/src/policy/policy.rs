@@ -1244,4 +1244,91 @@ mod test {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].as_str().unwrap(), "s3:ListBucket");
     }
+
+    #[tokio::test]
+    async fn test_bucket_policy_deny_with_string_not_equals() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Action": "s3:PutObject",
+      "Principal": {"AWS": "*"},
+      "Resource": "arn:aws:s3:::mybucket/*",
+      "Condition": {
+        "StringNotEquals": {
+          "s3:x-amz-server-side-encryption": "aws:kms"
+        }
+      }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:PutObject",
+      "Principal": {"AWS": "*"},
+      "Resource": "arn:aws:s3:::mybucket/*",
+      "Condition": {
+        "Null": {
+          "s3:x-amz-server-side-encryption": "true"
+        }
+      }
+    }
+  ]
+}
+"#;
+
+        let bp: BucketPolicy = serde_json::from_slice(data.as_bytes())?;
+
+        // Request with wrong encryption → should be DENIED (StringNotEquals matches)
+        let mut cond_wrong_enc = HashMap::new();
+        cond_wrong_enc.insert("x-amz-server-side-encryption".to_string(), vec!["AES256".to_string()]);
+
+        let args_wrong = BucketPolicyArgs {
+            account: "testowner",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "mybucket",
+            conditions: &cond_wrong_enc,
+            is_owner: true,
+            object: "testobj",
+        };
+        assert!(
+            !bp.is_allowed(&args_wrong).await,
+            "Should deny PutObject with AES256 when policy requires aws:kms"
+        );
+
+        // Request with correct encryption → should be ALLOWED
+        let mut cond_correct_enc = HashMap::new();
+        cond_correct_enc.insert("x-amz-server-side-encryption".to_string(), vec!["aws:kms".to_string()]);
+
+        let args_correct = BucketPolicyArgs {
+            account: "testowner",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "mybucket",
+            conditions: &cond_correct_enc,
+            is_owner: true,
+            object: "testobj",
+        };
+        assert!(
+            bp.is_allowed(&args_correct).await,
+            "Should allow PutObject with aws:kms matching the policy"
+        );
+
+        // Request with no encryption header → should be DENIED (Null condition matches)
+        let cond_no_enc = HashMap::new();
+
+        let args_no_enc = BucketPolicyArgs {
+            account: "testowner",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "mybucket",
+            conditions: &cond_no_enc,
+            is_owner: true,
+            object: "testobj",
+        };
+        assert!(!bp.is_allowed(&args_no_enc).await, "Should deny PutObject with no encryption header");
+
+        Ok(())
+    }
 }
