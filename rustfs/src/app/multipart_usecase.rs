@@ -625,18 +625,27 @@ impl DefaultMultipartUsecase {
             return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
         }
 
-        let server_side_encryption = fi
-            .user_defined
-            .get("x-amz-server-side-encryption")
-            .map(|s| {
-                ServerSideEncryption::from_str(s)
-                    .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
-            })
-            .transpose()?;
-        let ssekms_key_id = fi
-            .user_defined
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .map(|s| s.to_string());
+        let has_ssec = sse_customer_algorithm.is_some();
+        // When SSE-C headers are present, skip managed-encryption metadata to avoid
+        // false conflict: the bucket default SSE config stored in multipart metadata
+        // should not block a legitimate SSE-C upload part.
+        let (server_side_encryption, ssekms_key_id) = if has_ssec {
+            (None, None)
+        } else {
+            let sse = fi
+                .user_defined
+                .get("x-amz-server-side-encryption")
+                .map(|s| {
+                    ServerSideEncryption::from_str(s)
+                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
+                })
+                .transpose()?;
+            let key_id = fi
+                .user_defined
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .map(|s| s.to_string());
+            (sse, key_id)
+        };
         let part_key = fi.user_defined.get("x-rustfs-encryption-key").cloned();
         let part_nonce = fi.user_defined.get("x-rustfs-encryption-iv").cloned();
         let encryption_request = EncryptionRequest {

@@ -628,11 +628,14 @@ impl S3Access for FS {
     }
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
-    ///
-    /// This method returns `Ok(())` by default.
-    async fn create_multipart_upload(&self, _req: &mut S3Request<CreateMultipartUploadInput>) -> S3Result<()> {
+    async fn create_multipart_upload(&self, req: &mut S3Request<CreateMultipartUploadInput>) -> S3Result<()> {
         license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
-        Ok(())
+
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
     }
 
     /// Checks whether the DeleteBucket request has accesses to the resources.
