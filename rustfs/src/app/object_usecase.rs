@@ -312,6 +312,9 @@ impl DefaultObjectUsecase {
         let sse_customer_key = sse_customer_key.or(h_key);
         let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
 
+        // Merge server_side_encryption from headers (fallback when S3 layer does not populate input)
+        let server_side_encryption = server_side_encryption.or_else(|| extract_server_side_encryption_from_headers(&req.headers));
+
         // Validate object key
         validate_object_key(&key, "PUT")?;
 

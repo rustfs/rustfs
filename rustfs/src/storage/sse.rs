@@ -379,6 +379,15 @@ pub(crate) fn extract_ssec_params_from_headers(headers: &HeaderMap) -> Result<Ss
     Ok((algorithm, key, key_md5))
 }
 
+/// Extract x-amz-server-side-encryption from request headers.
+/// Used as fallback when the S3 layer does not populate it in the input struct.
+pub(crate) fn extract_server_side_encryption_from_headers(headers: &HeaderMap) -> Option<ServerSideEncryption> {
+    headers
+        .get("x-amz-server-side-encryption")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| ServerSideEncryption::from(s.to_string()))
+}
+
 #[inline]
 pub(crate) fn validate_sse_headers_for_write(
     server_side_encryption: Option<&ServerSideEncryption>,
@@ -388,6 +397,15 @@ pub(crate) fn validate_sse_headers_for_write(
     sse_customer_key_md5: Option<&SSECustomerKeyMD5>,
     require_sse_customer_key: bool,
 ) -> Result<(), ApiError> {
+    if let Some(sse) = server_side_encryption {
+        let s = sse.as_str();
+        if s != ServerSideEncryption::AES256 && s != ServerSideEncryption::AWS_KMS {
+            return Err(sse_invalid_argument(
+                "The SSE algorithm specified is not supported. The valid value is AES256 or aws:kms.",
+            ));
+        }
+    }
+
     let has_ssec_headers = sse_customer_algorithm.is_some() || sse_customer_key.is_some() || sse_customer_key_md5.is_some();
     let has_managed_headers = server_side_encryption.is_some() || ssekms_key_id.is_some();
 
@@ -1783,6 +1801,15 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_write_rejects_invalid_sse_algorithm() {
+        let bad_sse = ServerSideEncryption::from_static("aes:kms");
+        let result = validate_sse_headers_for_write(Some(&bad_sse), None, None, None, None, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
     }
 
     #[test]
