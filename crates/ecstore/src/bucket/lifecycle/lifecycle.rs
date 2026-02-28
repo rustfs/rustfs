@@ -792,7 +792,13 @@ mod tests {
                     days: Some(0),
                     ..Default::default()
                 }),
-                ..Default::default()
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
             }],
         };
 
@@ -813,7 +819,13 @@ mod tests {
                     days: Some(30),
                     ..Default::default()
                 }),
-                ..Default::default()
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
             }],
         };
 
