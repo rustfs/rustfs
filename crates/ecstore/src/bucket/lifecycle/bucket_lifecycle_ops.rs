@@ -34,7 +34,7 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::store::ECStore;
 use crate::store_api::StorageAPI;
-use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete};
+use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use bytes::BytesMut;
@@ -65,7 +65,7 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -102,7 +102,7 @@ impl LifecycleSys {
     }
 
     pub fn trace(_oi: &ObjectInfo) -> TraceFn {
-        todo!();
+        Arc::new(|_oi, _ctx| Box::pin(async move {}))
     }
 }
 
@@ -395,7 +395,7 @@ impl ExpiryState {
                     }
                     else {
                         //info!("Invalid work type - {:?}", v);
-                        todo!();
+                        warn!("lifecycle worker received unsupported operation type");
                     }
                 }
             }
@@ -788,7 +788,7 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
 }
 
 pub fn audit_tier_actions(_api: ECStore, _tier: &str, _bytes: i64) -> TimeFn {
-    todo!();
+    Arc::new(|| Box::pin(async move {}))
 }
 
 pub async fn get_transitioned_object_reader(

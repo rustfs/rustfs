@@ -18,7 +18,7 @@ use crate::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::{default_tier_config_interface, get_global_app_context},
+    app::context::resolve_tier_config_handle,
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
@@ -45,16 +45,8 @@ use s3s::{
     s3_error,
 };
 use serde_urlencoded::from_bytes;
-use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::sync::RwLock;
 use tracing::{debug, warn};
-
-fn tier_config_mgr_from_context() -> Arc<RwLock<rustfs_ecstore::tier::tier::TierConfigMgr>> {
-    get_global_app_context()
-        .map(|context| context.tier_config().handle())
-        .unwrap_or_else(|| default_tier_config_interface().handle())
-}
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct AddTierQuery {
@@ -214,7 +206,7 @@ impl Operation for AddTier {
             &_ => (),
         }
 
-        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let tier_config_mgr_handle = resolve_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.add(args, force).await {
@@ -307,7 +299,7 @@ impl Operation for EditTier {
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
 
-        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let tier_config_mgr_handle = resolve_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.edit(&tier_name, creds).await {
@@ -375,7 +367,7 @@ impl Operation for ListTiers {
         )
         .await?;
 
-        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let tier_config_mgr_handle = resolve_tier_config_handle();
         let tier_config_mgr = tier_config_mgr_handle.read().await;
         let tiers = tier_config_mgr.list_tiers();
 
@@ -431,7 +423,7 @@ impl Operation for RemoveTier {
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
 
-        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let tier_config_mgr_handle = resolve_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.remove(&tier_name, force).await {
@@ -492,7 +484,7 @@ impl Operation for VerifyTier {
         )
         .await?;
 
-        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let tier_config_mgr_handle = resolve_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         tier_config_mgr.verify(&query.tier.unwrap()).await;
 
@@ -534,7 +526,7 @@ impl Operation for GetTierInfo {
             }
         };
 
-        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let tier_config_mgr_handle = resolve_tier_config_handle();
         let tier_config_mgr = tier_config_mgr_handle.read().await;
         let info = tier_config_mgr.get(&query.tier.unwrap());
 
@@ -601,7 +593,7 @@ impl Operation for ClearTier {
             return Err(s3_error!(InvalidRequest, "get rand failed"));
         };
 
-        let tier_config_mgr_handle = tier_config_mgr_from_context();
+        let tier_config_mgr_handle = resolve_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.clear_tier(force).await {

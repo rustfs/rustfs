@@ -15,6 +15,7 @@
 mod admin;
 mod app;
 mod auth;
+mod auth_keystone;
 mod config;
 mod error;
 mod init;
@@ -45,24 +46,23 @@ use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
-    StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
-    bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication},
+    bucket::replication::{get_global_replication_pool, init_background_replication},
     config as ecconfig,
-    config::GLOBAL_CONFIG_SYS,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
+    store_api::BucketOperations,
     store_api::BucketOptions,
     update_erasure_type,
 };
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
-use rustfs_iam::init_iam_sys;
+use rustfs_iam::{init_iam_sys, init_oidc_sys};
 use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
@@ -94,8 +94,8 @@ fn main() {
         .expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
     if let Err(ref e) = result {
-        eprintln!("{} Server encountered an error and is shutting down: {}", jiff::Zoned::now(), e);
-        error!("Server encountered an error and is shutting down: {}", e);
+        // Use eprintln as tracing may not be initialized at this point
+        eprintln!("[FATAL] Server encountered an error and is shutting down: {e}");
         std::process::exit(1);
     }
 }
@@ -110,7 +110,8 @@ async fn async_main() -> Result<()> {
     let guard = match init_obs(Some(config.clone().obs_endpoint)).await {
         Ok(g) => g,
         Err(e) => {
-            println!("Failed to initialize observability: {e}");
+            // Use eprintln as tracing is not yet initialized
+            eprintln!("[FATAL] Failed to initialize observability: {e}");
             return Err(Error::other(e));
         }
     };
@@ -164,8 +165,11 @@ async fn run(config: config::Config) -> Result<()> {
     // 1. Initialize global readiness tracker
     let readiness = Arc::new(GlobalReadiness::new());
 
-    if let Some(region) = &config.region {
-        rustfs_ecstore::global::set_global_region(region.clone());
+    if let Some(region_str) = &config.region {
+        region_str
+            .parse()
+            .map(rustfs_ecstore::global::set_global_region)
+            .map_err(|e| Error::other(format!("invalid region '{}': {}", region_str, e)))?;
     }
 
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
@@ -278,12 +282,12 @@ async fn run(config: config::Config) -> Result<()> {
 
     // // Initialize global configuration system
     let mut retry_count = 0;
-    while let Err(e) = GLOBAL_CONFIG_SYS.init(store.clone()).await {
-        error!("GLOBAL_CONFIG_SYS.init failed {:?}", e);
+    while let Err(e) = ecconfig::init_global_config_sys(store.clone()).await {
+        error!("ecconfig::init_global_config_sys failed {:?}", e);
         // TODO: check error type
         retry_count += 1;
         if retry_count > 15 {
-            return Err(Error::other("GLOBAL_CONFIG_SYS.init failed"));
+            return Err(Error::other("ecconfig::init_global_config_sys failed"));
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
@@ -355,8 +359,8 @@ async fn run(config: config::Config) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
-        pool.clone().init_resync(ctx.clone(), buckets.clone()).await?;
+    if let Some(pool) = get_global_replication_pool() {
+        pool.init_resync(ctx.clone(), buckets.clone()).await?;
     }
 
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
@@ -365,6 +369,23 @@ async fn run(config: config::Config) -> Result<()> {
     // This ensures data is in memory before moving forward
     init_iam_sys(store.clone()).await.map_err(Error::other)?;
     readiness.mark_stage(SystemStage::IamReady);
+
+    // 3a. Initialize Keystone authentication if enabled
+    let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
+    if keystone_config.enable {
+        match auth_keystone::init_keystone_auth(keystone_config).await {
+            Ok(_) => info!("Keystone authentication initialized successfully"),
+            Err(e) => {
+                error!("Failed to initialize Keystone authentication: {}", e);
+                // Continue without Keystone - fall back to standard auth
+            }
+        }
+    }
+
+    // 3b. Initialize OIDC System (non-fatal if no providers configured)
+    if let Err(e) = init_oidc_sys().await {
+        warn!("OIDC initialization failed (non-fatal): {}", e);
+    }
 
     let iam_interface =
         rustfs_iam::get().map_err(|e| Error::other(format!("initialize app context IAM dependency failed: {e}")))?;
@@ -414,13 +435,13 @@ async fn run(config: config::Config) -> Result<()> {
         init_metrics_system(ctx.clone());
     }
 
-    println!(
+    info!(
+        target: "rustfs::main::run",
         "RustFS server version: {} started successfully at {}, current time: {}",
         version::get_version(),
         &server_address,
         jiff::Zoned::now()
     );
-    info!(target: "rustfs::main::run","server started successfully at {}", &server_address);
     // 4. Mark as Full Ready now that critical components are warm
     readiness.mark_stage(SystemStage::FullReady);
 
@@ -560,9 +581,5 @@ async fn handle_shutdown(
 
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        "Server stopped current "
-    );
-    println!("Server stopped successfully.");
+    info!(target: "rustfs::main::handle_shutdown", "Server stopped successfully.");
 }

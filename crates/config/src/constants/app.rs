@@ -150,8 +150,8 @@ pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
 /// Default region for rustfs
 /// This is the default region for rustfs.
 /// It is used to identify the region of the application.
-/// Default value: cn-east-1
-pub const RUSTFS_REGION: &str = "cn-east-1";
+/// Default value: us-east-1
+pub const RUSTFS_REGION: &str = "us-east-1";
 
 /// Default log filename for rustfs
 /// This is the default log filename for rustfs.

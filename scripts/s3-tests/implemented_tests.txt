@@ -17,7 +17,10 @@
 # - Metadata: User-defined metadata
 # - Conditional GET: If-Match, If-None-Match, If-Modified-Since
 #
-# Total: 123 tests
+# - SSE-C: Server-side encryption with customer-provided keys
+# - Object ownership: Bucket ownership controls
+#
+# Total: 177 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -149,3 +152,66 @@ test_set_multipart_tagging
 test_upload_part_copy_percent_encoded_key
 test_api_error_from_storage_error_mappings
 test_get_object_torrent
+
+# Object attributes
+test_get_checksum_object_attributes
+
+# SSE-C encryption tests
+test_encryption_sse_c_method_head
+test_encryption_sse_c_present
+test_encryption_sse_c_other_key
+test_encryption_sse_c_no_key
+test_encryption_sse_c_no_md5
+test_put_obj_enc_conflict_c_s3
+
+# ListObjectsV2 delimiter and encoding tests
+test_bucket_list_encoding_basic
+test_bucket_listv2_delimiter_alt
+test_bucket_listv2_delimiter_basic
+test_bucket_listv2_delimiter_dot
+test_bucket_listv2_delimiter_empty
+test_bucket_listv2_delimiter_none
+test_bucket_listv2_delimiter_not_exist
+test_bucket_listv2_delimiter_percentage
+test_bucket_listv2_delimiter_prefix_ends_with_delimiter
+test_bucket_listv2_delimiter_unreadable
+test_bucket_listv2_delimiter_whitespace
+test_bucket_listv2_encoding_basic
+
+# Multipart and tagging tests
+test_abort_multipart_upload
+test_multipart_resend_first_finishes_last
+test_set_bucket_tagging
+test_put_excess_key_tags
+test_put_excess_tags
+test_put_excess_val_tags
+
+# PublicAccessBlock tests
+test_put_get_delete_public_block
+test_put_public_block
+test_block_public_policy
+test_block_public_policy_with_principal
+test_get_public_block_deny_bucket_policy
+test_get_undefined_public_block
+
+# Bucket policy tests
+test_bucketv2_policy
+test_bucket_policy_acl
+test_bucketv2_policy_acl
+test_bucket_policy_another_bucket
+test_bucket_policy_allow_notprincipal
+test_bucket_policy_put_obj_acl
+test_object_presigned_put_object_with_acl
+test_object_put_acl_mtime
+
+# Object ownership
+test_create_bucket_no_ownership_controls
+
+# Bucket encryption
+test_put_bucket_encryption_kms
+test_put_bucket_encryption_s3
+test_get_bucket_encryption_kms
+test_get_bucket_encryption_s3
+test_delete_bucket_encryption_kms
+test_delete_bucket_encryption_s3
+test_lifecycle_expiration_days0

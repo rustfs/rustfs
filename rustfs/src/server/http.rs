@@ -15,12 +15,13 @@
 // Import HTTP server components and compression configuration
 use crate::admin;
 use crate::auth::IAMAuth;
+use crate::auth_keystone;
 use crate::config;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
     compress::{CompressionConfig, CompressionPredicate},
     hybrid::hybrid,
-    layer::{ConditionalCorsLayer, RedirectLayer},
+    layer::{ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
 };
 use crate::storage;
 use crate::storage::tonic_service::make_server;
@@ -37,6 +38,7 @@ use opentelemetry::global;
 use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
+use rustfs_keystone::KeystoneAuthLayer;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -185,14 +187,9 @@ pub async fn start_http_server(
             "Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",
 
         );
-
-        println!("Console WebUI Start Time: {now_time}");
-        println!("Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html");
-        println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html");
     } else {
-        info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
-        println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
-        println!("RustFS Start Time: {now_time}");
+        info!(target: "rustfs::main::startup", "RustFS API: {api_endpoints}  {localhost_endpoint}");
+        info!(target: "rustfs::main::startup", "RustFS Start Time: {now_time}");
         if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key)
             && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
         {
@@ -441,10 +438,7 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
     }
     debug!("Found TLS directory, checking for certificates");
 
-    // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mtls_verifier = rustfs_utils::build_webpki_client_verifier(tls_path)?;
-
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
     if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path)
         && !cert_key_pairs.is_empty()
@@ -620,6 +614,13 @@ fn process_connection(
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
             .layer(ReadinessGateLayer::new(readiness))
+            // Add Keystone authentication middleware
+            // This validates X-Auth-Token headers and stores credentials in task-local storage
+            // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
+            .layer({
+                let keystone_auth = auth_keystone::get_keystone_auth();
+                KeystoneAuthLayer::new(keystone_auth)
+            })
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
@@ -692,6 +693,7 @@ fn process_connection(
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
             .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
+            .layer(ObjectAttributesEtagFixLayer)
             // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
             // Admin has its own CORS handling in router.rs
             // Console has its own CORS layer in setup_console_middleware_stack()

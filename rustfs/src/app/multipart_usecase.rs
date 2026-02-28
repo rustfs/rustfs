@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! Multipart application use-case contracts.
-#![allow(dead_code)]
 
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::error::ApiError;
@@ -27,7 +26,7 @@ use crate::storage::options::{
 use crate::storage::*;
 use bytes::Bytes;
 use futures::StreamExt;
-use rustfs_ecstore::StorageAPI;
+use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     metadata_sys,
@@ -40,6 +39,7 @@ use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_versio
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
 use rustfs_ecstore::store_api::{CompletePart, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
+use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
 use rustfs_targets::EventName;
@@ -49,6 +49,7 @@ use rustfs_utils::http::{
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
 };
 use s3s::dto::*;
+use s3s::region::Region;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -57,95 +58,13 @@ use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{info, instrument, warn};
 
-pub type MultipartUsecaseResult<T> = Result<T, ApiError>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateMultipartUploadRequest {
-    pub bucket: String,
-    pub key: String,
-    pub metadata: HashMap<String, String>,
-    pub content_type: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateMultipartUploadResponse {
-    pub upload_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UploadPartRequest {
-    pub bucket: String,
-    pub key: String,
-    pub upload_id: String,
-    pub part_number: i32,
-    pub content_length: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UploadPartResponse {
-    pub etag: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteMultipartUploadPart {
-    pub part_number: i32,
-    pub etag: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteMultipartUploadRequest {
-    pub bucket: String,
-    pub key: String,
-    pub upload_id: String,
-    pub parts: Vec<CompleteMultipartUploadPart>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CompleteMultipartUploadResponse {
-    pub etag: Option<String>,
-    pub version_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AbortMultipartUploadRequest {
-    pub bucket: String,
-    pub key: String,
-    pub upload_id: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AbortMultipartUploadResponse;
-
-#[async_trait::async_trait]
-pub trait MultipartUsecase: Send + Sync {
-    async fn create_multipart_upload(
-        &self,
-        req: CreateMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<CreateMultipartUploadResponse>;
-
-    async fn upload_part(&self, req: UploadPartRequest) -> MultipartUsecaseResult<UploadPartResponse>;
-
-    async fn complete_multipart_upload(
-        &self,
-        req: CompleteMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<CompleteMultipartUploadResponse>;
-
-    async fn abort_multipart_upload(
-        &self,
-        req: AbortMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<AbortMultipartUploadResponse>;
-}
-
 #[derive(Clone, Default)]
 pub struct DefaultMultipartUsecase {
     context: Option<Arc<AppContext>>,
 }
 
 impl DefaultMultipartUsecase {
-    pub fn new(context: Arc<AppContext>) -> Self {
-        Self { context: Some(context) }
-    }
-
+    #[cfg(test)]
     pub fn without_context() -> Self {
         Self { context: None }
     }
@@ -156,15 +75,11 @@ impl DefaultMultipartUsecase {
         }
     }
 
-    pub fn context(&self) -> Option<Arc<AppContext>> {
-        self.context.clone()
-    }
-
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
     }
 
-    fn global_region(&self) -> Option<String> {
+    fn global_region(&self) -> Option<Region> {
         self.context.as_ref().and_then(|context| context.region().get())
     }
 
@@ -422,7 +337,10 @@ impl DefaultMultipartUsecase {
             }
         }
 
-        let region = self.global_region().unwrap_or_else(|| "us-east-1".to_string());
+        let region = self
+            .global_region()
+            .map(|region| region.to_string())
+            .unwrap_or_else(|| RUSTFS_REGION.to_string());
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
@@ -439,11 +357,6 @@ impl DefaultMultipartUsecase {
             version_id: mpu_version,
             ..Default::default()
         };
-        info!(
-            "TDD: Created output: SSE={:?}, KMS={:?}",
-            output.server_side_encryption, output.ssekms_key_id
-        );
-
         let helper_output = entity::CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
@@ -459,6 +372,10 @@ impl DefaultMultipartUsecase {
             checksum_type,
             ..Default::default()
         };
+        info!(
+            "TDD: Created output: SSE={:?}, KMS={:?}",
+            output.server_side_encryption, output.ssekms_key_id
+        );
 
         let mt2 = HashMap::new();
         let replicate_options =
@@ -1177,46 +1094,6 @@ impl DefaultMultipartUsecase {
         };
 
         Ok(S3Response::new(output))
-    }
-}
-
-#[async_trait::async_trait]
-impl MultipartUsecase for DefaultMultipartUsecase {
-    async fn create_multipart_upload(
-        &self,
-        req: CreateMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<CreateMultipartUploadResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultMultipartUsecase::create_multipart_upload is not implemented yet",
-        )))
-    }
-
-    async fn upload_part(&self, req: UploadPartRequest) -> MultipartUsecaseResult<UploadPartResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultMultipartUsecase::upload_part is not implemented yet",
-        )))
-    }
-
-    async fn complete_multipart_upload(
-        &self,
-        req: CompleteMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<CompleteMultipartUploadResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultMultipartUsecase::complete_multipart_upload is not implemented yet",
-        )))
-    }
-
-    async fn abort_multipart_upload(
-        &self,
-        req: AbortMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<AbortMultipartUploadResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultMultipartUsecase::abort_multipart_upload is not implemented yet",
-        )))
     }
 }
 

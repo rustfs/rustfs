@@ -16,6 +16,8 @@ auth_enabled: false
 server:
   http_listen_port: 3100
   grpc_listen_port: 9095
+  log_level: info
+  grpc_server_max_concurrent_streams: 1000
 
 common:
   instance_addr: 127.0.0.1
@@ -51,3 +53,11 @@ limits_config:
   reject_old_samples_max_age: 168h
   allow_structured_metadata: true
   max_line_size: 256KB
+
+pattern_ingester:
+  enabled: true
+  metric_aggregation:
+    loki_address: localhost:3100
+
+frontend:
+  encoding: protobuf

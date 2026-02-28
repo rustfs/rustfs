@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Adaptive buffer sizing optimization for different workload types.
 //!
 //! This module provides intelligent buffer size selection based on file size and workload profile
@@ -24,7 +22,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Global buffer configuration that can be set at application startup
-static GLOBAL_BUFFER_CONFIG: OnceLock<RustFSBufferConfig> = OnceLock::new();
+static BUFFER_CONFIG_SINGLETON: OnceLock<RustFSBufferConfig> = OnceLock::new();
 
 /// Global flag indicating whether buffer profiles are enabled
 static BUFFER_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -60,14 +58,14 @@ pub fn is_buffer_profile_enabled() -> bool {
 /// init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::AiTraining));
 /// ```
 pub fn init_global_buffer_config(config: RustFSBufferConfig) {
-    let _ = GLOBAL_BUFFER_CONFIG.set(config);
+    let _ = BUFFER_CONFIG_SINGLETON.set(config);
 }
 
 /// Get the global buffer configuration
 ///
 /// Returns the configured profile, or GeneralPurpose if not initialized.
 pub fn get_global_buffer_config() -> &'static RustFSBufferConfig {
-    GLOBAL_BUFFER_CONFIG.get_or_init(RustFSBufferConfig::default)
+    BUFFER_CONFIG_SINGLETON.get_or_init(RustFSBufferConfig::default)
 }
 
 /// Workload profile types that define buffer sizing strategies
@@ -86,6 +84,7 @@ pub enum WorkloadProfile {
     /// Secure storage: security first, memory constrained for compliance
     SecureStorage,
     /// Custom configuration for specialized requirements
+    #[allow(dead_code)]
     Custom(BufferConfig),
 }
 
@@ -107,6 +106,7 @@ pub struct BufferConfig {
 #[derive(Debug, Clone)]
 pub struct RustFSBufferConfig {
     /// Selected workload profile
+    #[allow(dead_code)]
     pub workload: WorkloadProfile,
     /// Computed buffer configuration (either from profile or custom)
     pub base_config: BufferConfig,
@@ -309,6 +309,7 @@ impl BufferConfig {
     }
 
     /// Validate the buffer configuration
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), String> {
         if self.min_size == 0 {
             return Err("min_size must be greater than 0".to_string());

@@ -73,18 +73,19 @@ services:
   tempo:
     image: grafana/tempo:latest
     container_name: tempo
-    user: "10001"
     command: ["-config.file=/etc/tempo.yaml"]
     volumes:
       - ./tempo.yaml:/etc/tempo.yaml:ro
       - tempo-data:/var/tempo
     ports:
       - "3200:3200" # tempo
-      - "4317" # otlp grpc
-      - "4318" # otlp http
-    restart: unless-stopped
+      - "4317"      # otlp grpc
+      - "4318"      # otlp http
     networks:
       - otel-network
+    restart: unless-stopped
+    depends_on:
+      - redpanda
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:3200/ready"]
       interval: 10s
@@ -99,6 +100,7 @@ services:
       - "9092:9092"
     networks:
       - otel-network
+    restart: unless-stopped
     command: >
       redpanda start --overprovisioned
       --mode=dev-container
@@ -125,11 +127,13 @@ services:
     command: ["--config", "/etc/jaeger/config.yml"]
     networks:
       - otel-network
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269"]
       interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 15s
 
   # --- Metrics ---
 
@@ -169,21 +173,31 @@ services:
     command: -config.file=/etc/loki/loki.yaml
     networks:
       - otel-network
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   # --- Collection ---
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
-    container_name: otel-collector
     volumes:
       - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "1888:1888"   # pprof
+      - "8888:8888"   # Prometheus metrics for Collector
+      - "8889:8889"   # Prometheus metrics for application indicators
+      - "13133:13133" # health check
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "55679:55679" # zpages
     networks:
       - otel-network
+    restart: unless-stopped
     depends_on:
       - tempo
       - jaeger
@@ -209,16 +223,15 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/etc/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
-    restart: unless-stopped
     networks:
       - otel-network
+    restart: unless-stopped
     depends_on:
       - prometheus
       - tempo
       - loki
     healthcheck:
-      test:
-        ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -233,3 +246,10 @@ volumes:
 
 networks:
   otel-network:
+    driver: bridge
+    name: "network_otel"
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+    driver_opts:
+      com.docker.network.enable_ipv6: "true"

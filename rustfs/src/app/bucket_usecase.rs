@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! Bucket application use-case contracts.
-#![allow(dead_code)]
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::auth::get_condition_values;
@@ -30,6 +29,7 @@ use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
 use metrics::counter;
+use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::bucket::{
     lifecycle::bucket_lifecycle_ops::validate_transition_tier,
     metadata::{
@@ -45,7 +45,7 @@ use rustfs_ecstore::bucket::{
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI};
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
@@ -57,13 +57,12 @@ use rustfs_targets::{
 use rustfs_utils::http::RUSTFS_FORCE_DELETE;
 use rustfs_utils::string::parse_bool;
 use s3s::dto::*;
+use s3s::region::Region;
 use s3s::xml;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use std::{fmt::Display, sync::Arc};
+use std::{collections::HashSet, fmt::Display, sync::Arc};
 use tracing::{debug, error, info, instrument, warn};
 use urlencoding::encode;
-
-pub type BucketUsecaseResult<T> = Result<T, ApiError>;
 
 fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
@@ -73,72 +72,50 @@ fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
 }
 
-fn resolve_notification_region(global_region: Option<String>, request_region: Option<String>) -> String {
-    global_region.unwrap_or_else(|| request_region.unwrap_or_default())
+fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> String {
+    global_region
+        .or(request_region)
+        .map(|region| region.to_string())
+        .unwrap_or_else(|| RUSTFS_REGION.to_string())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateBucketRequest {
-    pub bucket: String,
-    pub object_lock_enabled: Option<bool>,
+const ERR_LIFECYCLE_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
+
+fn assign_lifecycle_rule_ids(rules: &mut [LifecycleRule]) {
+    let mut rule_ids: HashSet<String> = HashSet::new();
+
+    for rule in rules.iter() {
+        if let Some(id) = rule.id.as_ref() {
+            rule_ids.insert(id.to_string());
+        }
+    }
+
+    for (idx, rule) in rules.iter_mut().enumerate() {
+        if rule.id.is_none() {
+            let mut suffix = 0usize;
+            let mut generated_id = format!("rule-{}", idx);
+
+            while rule_ids.contains(&generated_id) {
+                suffix += 1;
+                generated_id = format!("rule-{idx}-{suffix}");
+            }
+
+            rule_ids.insert(generated_id.clone());
+            rule.id = Some(generated_id);
+        }
+    }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CreateBucketResponse;
+fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> Result<(), &'static str> {
+    for rule in rules {
+        if rule.status != ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+            && rule.status != ExpirationStatus::from_static(ExpirationStatus::DISABLED)
+        {
+            return Err(ERR_LIFECYCLE_RULE_STATUS);
+        }
+    }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeleteBucketRequest {
-    pub bucket: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DeleteBucketResponse;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeadBucketRequest {
-    pub bucket: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HeadBucketResponse;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListObjectsV2Request {
-    pub bucket: String,
-    pub prefix: Option<String>,
-    pub delimiter: Option<String>,
-    pub continuation_token: Option<String>,
-    pub max_keys: Option<i32>,
-    pub fetch_owner: Option<bool>,
-    pub start_after: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListObjectsV2Item {
-    pub key: String,
-    pub etag: Option<String>,
-    pub size: i64,
-    pub version_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ListObjectsV2Response {
-    pub objects: Vec<ListObjectsV2Item>,
-    pub common_prefixes: Vec<String>,
-    pub key_count: i32,
-    pub is_truncated: bool,
-    pub next_continuation_token: Option<String>,
-}
-
-#[async_trait::async_trait]
-pub trait BucketUsecase: Send + Sync {
-    async fn create_bucket(&self, req: CreateBucketRequest) -> BucketUsecaseResult<CreateBucketResponse>;
-
-    async fn delete_bucket(&self, req: DeleteBucketRequest) -> BucketUsecaseResult<DeleteBucketResponse>;
-
-    async fn head_bucket(&self, req: HeadBucketRequest) -> BucketUsecaseResult<HeadBucketResponse>;
-
-    async fn list_objects_v2(&self, req: ListObjectsV2Request) -> BucketUsecaseResult<ListObjectsV2Response>;
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -147,10 +124,7 @@ pub struct DefaultBucketUsecase {
 }
 
 impl DefaultBucketUsecase {
-    pub fn new(context: Arc<AppContext>) -> Self {
-        Self { context: Some(context) }
-    }
-
+    #[cfg(test)]
     pub fn without_context() -> Self {
         Self { context: None }
     }
@@ -161,11 +135,7 @@ impl DefaultBucketUsecase {
         }
     }
 
-    pub fn context(&self) -> Option<Arc<AppContext>> {
-        self.context.clone()
-    }
-
-    fn global_region(&self) -> Option<String> {
+    fn global_region(&self) -> Option<Region> {
         self.context.as_ref().and_then(|context| context.region().get())
     }
 
@@ -431,7 +401,7 @@ impl DefaultBucketUsecase {
 
         if let Some(region) = self.global_region() {
             return Ok(S3Response::new(GetBucketLocationOutput {
-                location_constraint: Some(BucketLocationConstraint::from(region)),
+                location_constraint: Some(BucketLocationConstraint::from(region.to_string())),
             }));
         }
 
@@ -464,7 +434,10 @@ impl DefaultBucketUsecase {
             list_bucket_infos = futures::stream::iter(list_bucket_infos)
                 .filter_map(|info| async {
                     let mut req_clone = req.clone();
-                    let req_info = req_clone.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+                    let Some(req_info) = req_clone.extensions.get_mut::<ReqInfo>() else {
+                        debug!(bucket = %info.name, "ReqInfo missing in extensions, skipping bucket authorization");
+                        return None;
+                    };
                     req_info.bucket = Some(info.name.clone());
 
                     if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
@@ -529,7 +502,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
+        Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -707,8 +680,11 @@ impl DefaultBucketUsecase {
         let server_side_encryption_configuration = match metadata_sys::get_sse_config(&bucket).await {
             Ok((cfg, _)) => Some(cfg),
             Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(s3_error!(ServerSideEncryptionConfigurationNotFoundError));
+                }
                 warn!("get_sse_config err {:?}", err);
-                None
+                return Err(ApiError::from(err).into());
             }
         };
 
@@ -1141,17 +1117,27 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
+        let Some(mut input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
+        assign_lifecycle_rule_ids(&mut input_cfg.rules);
+        if let Err(err) = validate_lifecycle_rule_status(&input_cfg.rules) {
+            return Err(S3Error::with_message(S3ErrorCode::MalformedXML, format!("Malformed XML: {err}")));
+        }
 
-        let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
-        if let Ok(rcfg) = rcfg
-            && let Err(err) = rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg.0).await
-        {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
+        let rcfg = match metadata_sys::get_object_lock_config(&bucket).await {
+            Ok((cfg, _)) => cfg,
+            Err(StorageError::ConfigNotFound) => ObjectLockConfiguration::default(),
+            Err(err) => {
+                warn!("get_object_lock_config err {:?}", err);
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        if let Err(err) = rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg).await {
+            return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
         if let Err(err) = validate_transition_tier(&input_cfg).await {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("CustomError".into()), err.to_string()));
+            return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
         let data = serialize_config(&input_cfg)?;
@@ -1230,9 +1216,8 @@ impl DefaultBucketUsecase {
         let event_rules =
             event_rules_result.map_err(|e| s3_error!(InvalidArgument, "Invalid ARN in notification configuration: {e}"))?;
         warn!("notify event rules: {:?}", &event_rules);
-
         notify
-            .add_event_specific_rules(&bucket, &region, &event_rules)
+            .add_event_specific_rules(&bucket, region.as_str(), &event_rules)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
 
@@ -1748,37 +1733,6 @@ impl DefaultBucketUsecase {
     }
 }
 
-#[async_trait::async_trait]
-impl BucketUsecase for DefaultBucketUsecase {
-    async fn create_bucket(&self, req: CreateBucketRequest) -> BucketUsecaseResult<CreateBucketResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultBucketUsecase::create_bucket DTO path is not implemented yet",
-        )))
-    }
-
-    async fn delete_bucket(&self, req: DeleteBucketRequest) -> BucketUsecaseResult<DeleteBucketResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultBucketUsecase::delete_bucket DTO path is not implemented yet",
-        )))
-    }
-
-    async fn head_bucket(&self, req: HeadBucketRequest) -> BucketUsecaseResult<HeadBucketResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultBucketUsecase::head_bucket DTO path is not implemented yet",
-        )))
-    }
-
-    async fn list_objects_v2(&self, req: ListObjectsV2Request) -> BucketUsecaseResult<ListObjectsV2Response> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultBucketUsecase::list_objects_v2 DTO path is not implemented yet",
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1800,20 +1754,20 @@ mod tests {
 
     #[test]
     fn resolve_notification_region_prefers_global_region() {
-        let region = resolve_notification_region(Some("us-east-1".to_string()), Some("ap-southeast-1".to_string()));
-        assert_eq!(region, "us-east-1");
+        let binding = resolve_notification_region(Some("us-east-1".parse().unwrap()), Some("ap-southeast-1".parse().unwrap()));
+        assert_eq!(binding, "us-east-1");
     }
 
     #[test]
     fn resolve_notification_region_falls_back_to_request_region() {
-        let region = resolve_notification_region(None, Some("ap-southeast-1".to_string()));
-        assert_eq!(region, "ap-southeast-1");
+        let binding = resolve_notification_region(None, Some("ap-southeast-1".parse().unwrap()));
+        assert_eq!(binding, "ap-southeast-1");
     }
 
     #[test]
-    fn resolve_notification_region_defaults_to_empty() {
-        let region = resolve_notification_region(None, None);
-        assert!(region.is_empty());
+    fn resolve_notification_region_defaults_value() {
+        let binding = resolve_notification_region(None, None);
+        assert_eq!(binding, RUSTFS_REGION);
     }
 
     #[tokio::test]
@@ -1993,6 +1947,80 @@ mod tests {
 
         let err = usecase.execute_get_bucket_versioning(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn normalize_lifecycle_rules_generate_rule_ids_for_missing_values() {
+        let mut rules = vec![
+            LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            },
+            LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(60),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: Some("rule-1".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            },
+            LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(90),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            },
+        ];
+
+        assign_lifecycle_rule_ids(&mut rules);
+
+        assert_eq!(rules[0].id.as_deref(), Some("rule-0"));
+        assert_eq!(rules[1].id.as_deref(), Some("rule-1"));
+        assert_eq!(rules[2].id.as_deref(), Some("rule-2"));
+    }
+
+    #[test]
+    fn validate_lifecycle_rule_status_rejects_invalid_status() {
+        let rules = vec![LifecycleRule {
+            status: ExpirationStatus::from_static("enabled"),
+            expiration: Some(LifecycleExpiration {
+                days: Some(30),
+                ..Default::default()
+            }),
+            abort_incomplete_multipart_upload: None,
+            filter: None,
+            id: None,
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }];
+
+        assert_eq!(validate_lifecycle_rule_status(&rules).unwrap_err(), ERR_LIFECYCLE_RULE_STATUS);
     }
 
     #[tokio::test]

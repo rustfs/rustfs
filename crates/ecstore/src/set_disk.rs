@@ -52,9 +52,9 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
-        ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectIO, ObjectInfo,
-        PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
+        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartInfo,
+        MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::load_format_erasure,
 };
@@ -147,6 +147,7 @@ pub struct SetDisks {
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
     pub lockers: Vec<Arc<dyn LockClient>>,
+    local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +190,7 @@ impl SetDisks {
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
             lockers,
+            local_lock_manager: rustfs_lock::get_global_lock_manager(),
         })
     }
 
@@ -801,7 +803,7 @@ impl StorageAPI for SetDisks {
         } else {
             NamespaceLock::Local(LocalLock::new(
                 format!("set-{}-{}", self.pool_index, self.set_index),
-                Arc::new(rustfs_lock::GlobalLockManager::new()),
+                self.local_lock_manager.clone(),
             ))
         };
 
@@ -840,10 +842,20 @@ impl StorageAPI for SetDisks {
 
         get_storage_info(&local_disks, &local_endpoints).await
     }
+
     #[tracing::instrument(skip(self))]
-    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
+        Ok(self.get_disks_internal().await)
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn set_drive_counts(&self) -> Vec<usize> {
         unimplemented!()
     }
+}
+
+#[async_trait::async_trait]
+impl BucketOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
@@ -854,6 +866,19 @@ impl StorageAPI for SetDisks {
         unimplemented!()
     }
 
+    #[tracing::instrument(skip(self))]
+    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn copy_object(
         &self,
@@ -900,7 +925,7 @@ impl StorageAPI for SetDisks {
                 if err == DiskError::ErasureReadQuorum
                     && !src_bucket.starts_with(RUSTFS_META_BUCKET)
                     && self
-                        .delete_if_dang_ling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
+                        .delete_if_dangling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
                         .await
                         .is_ok()
                 {
@@ -1399,45 +1424,6 @@ impl StorageAPI for SetDisks {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn list_objects_v2(
-        self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _continuation_token: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-        _fetch_owner: bool,
-        _start_after: Option<String>,
-        _incl_deleted: bool,
-    ) -> Result<ListObjectsV2Info> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_object_versions(
-        self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _marker: Option<String>,
-        _version_marker: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        unimplemented!()
-    }
-
-    async fn walk(
-        self: Arc<Self>,
-        _rx: CancellationToken,
-        _bucket: &str,
-        _prefix: &str,
-        _result: Sender<ObjectInfoOrErr>,
-        _opts: WalkOptions,
-    ) -> Result<()> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // Acquire a shared read-lock to protect consistency during info fetch
         let _read_lock_guard = if !opts.no_lock {
@@ -1529,7 +1515,7 @@ impl StorageAPI for SetDisks {
                 if err == DiskError::ErasureReadQuorum
                     && !bucket.starts_with(RUSTFS_META_BUCKET)
                     && self
-                        .delete_if_dang_ling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
+                        .delete_if_dangling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
                         .await
                         .is_ok()
                 {
@@ -1888,6 +1874,60 @@ impl StorageAPI for SetDisks {
         self.put_object_tags(bucket, object, "", opts).await
     }
 
+    #[tracing::instrument(skip(self))]
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let get_object_reader = <Self as ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
+        // Stream to sink to avoid loading entire object into memory during verification
+        let mut reader = get_object_reader.stream;
+        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ListOperations for SetDisks {
+    #[tracing::instrument(skip(self))]
+    async fn list_objects_v2(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _continuation_token: Option<String>,
+        _delimiter: Option<String>,
+        _max_keys: i32,
+        _fetch_owner: bool,
+        _start_after: Option<String>,
+        _incl_deleted: bool,
+    ) -> Result<ListObjectsV2Info> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_versions(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _marker: Option<String>,
+        _version_marker: Option<String>,
+        _delimiter: Option<String>,
+        _max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        _rx: CancellationToken,
+        _bucket: &str,
+        _prefix: &str,
+        _result: Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
+impl MultipartOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn copy_object_part(
         &self,
@@ -2920,22 +2960,10 @@ impl StorageAPI for SetDisks {
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
+}
 
-    #[tracing::instrument(skip(self))]
-    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        Ok(self.get_disks_internal().await)
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
-        unimplemented!()
-    }
-
+#[async_trait::async_trait]
+impl HealOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         unimplemented!()
@@ -2993,15 +3021,17 @@ impl StorageAPI for SetDisks {
         }
 
         // Heal the object.
-        let (result, err) = self.heal_object(bucket, object, version_id, opts).await?;
+        // Pass no_lock=true since we already obtained write lock (or are already called with no_lock=true)
+        let mut inner_opts = *opts;
+        inner_opts.no_lock = true;
+        let (result, err) = self.heal_object(bucket, object, version_id, &inner_opts).await?;
         if let Some(err) = err.as_ref() {
             match err {
                 &DiskError::FileCorrupt if opts.scan_mode != HealScanMode::Deep => {
                     // Instead of returning an error when a bitrot error is detected
                     // during a normal heal scan, heal again with bitrot flag enabled.
-                    let mut opts = *opts;
-                    opts.scan_mode = HealScanMode::Deep;
-                    let (result, err) = self.heal_object(bucket, object, version_id, &opts).await?;
+                    inner_opts.scan_mode = HealScanMode::Deep;
+                    let (result, err) = self.heal_object(bucket, object, version_id, &inner_opts).await?;
                     return Ok((result, err.map(|e| e.into())));
                 }
                 _ => {}
@@ -3018,15 +3048,6 @@ impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
         unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let get_object_reader = <Self as ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
-        // Stream to sink to avoid loading entire object into memory during verification
-        let mut reader = get_object_reader.stream;
-        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
-        Ok(())
     }
 }
 
@@ -3052,17 +3073,17 @@ pub struct HealEntryResult {
     pub name: String,
 }
 
-fn is_object_dang_ling(
+fn is_object_dangling(
     meta_arr: &[FileInfo],
     errs: &[Option<DiskError>],
     data_errs_by_part: &HashMap<usize, Vec<usize>>,
 ) -> (FileInfo, bool) {
-    let (not_found_meta_errs, non_actionable_meta_errs) = dang_ling_meta_errs_count(errs);
+    let (not_found_meta_errs, non_actionable_meta_errs) = dangling_meta_errs_count(errs);
 
     let (mut not_found_parts_errs, mut non_actionable_parts_errs) = (0, 0);
 
     data_errs_by_part.iter().for_each(|(_, v)| {
-        let (nf, na) = dang_ling_part_errs_count(v);
+        let (nf, na) = dangling_part_errs_count(v);
         if nf > not_found_parts_errs {
             (not_found_parts_errs, non_actionable_parts_errs) = (nf, na);
         }
@@ -3106,7 +3127,7 @@ fn is_object_dang_ling(
     (valid_meta, false)
 }
 
-fn dang_ling_meta_errs_count(cerrs: &[Option<DiskError>]) -> (usize, usize) {
+fn dangling_meta_errs_count(cerrs: &[Option<DiskError>]) -> (usize, usize) {
     let (mut not_found_count, mut non_actionable_count) = (0, 0);
     cerrs.iter().for_each(|err| {
         if let Some(err) = err {
@@ -3121,7 +3142,7 @@ fn dang_ling_meta_errs_count(cerrs: &[Option<DiskError>]) -> (usize, usize) {
     (not_found_count, non_actionable_count)
 }
 
-fn dang_ling_part_errs_count(results: &[usize]) -> (usize, usize) {
+fn dangling_part_errs_count(results: &[usize]) -> (usize, usize) {
     let (mut not_found_count, mut non_actionable_count) = (0, 0);
     results.iter().for_each(|result| {
         if *result == CHECK_PART_SUCCESS {
@@ -3136,7 +3157,7 @@ fn dang_ling_part_errs_count(results: &[usize]) -> (usize, usize) {
     (not_found_count, non_actionable_count)
 }
 
-fn is_object_dir_dang_ling(errs: &[Option<DiskError>]) -> bool {
+fn is_object_dir_dangling(errs: &[Option<DiskError>]) -> bool {
     let mut found = 0;
     let mut not_found = 0;
     let mut found_not_empty = 0;
@@ -4014,33 +4035,33 @@ mod tests {
     }
 
     #[test]
-    fn test_dang_ling_meta_errs_count() {
+    fn test_dangling_meta_errs_count() {
         // Test counting dangling metadata errors
         let errs = vec![None, Some(DiskError::FileNotFound), None];
-        let (not_found_count, non_actionable_count) = dang_ling_meta_errs_count(&errs);
+        let (not_found_count, non_actionable_count) = dangling_meta_errs_count(&errs);
         assert_eq!(not_found_count, 1); // One FileNotFound error
         assert_eq!(non_actionable_count, 0); // No other errors
     }
 
     #[test]
-    fn test_dang_ling_part_errs_count() {
+    fn test_dangling_part_errs_count() {
         // Test counting dangling part errors
         let results = vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS];
-        let (not_found_count, non_actionable_count) = dang_ling_part_errs_count(&results);
+        let (not_found_count, non_actionable_count) = dangling_part_errs_count(&results);
         assert_eq!(not_found_count, 1); // One FILE_NOT_FOUND error
         assert_eq!(non_actionable_count, 0); // No other errors
     }
 
     #[test]
-    fn test_is_object_dir_dang_ling() {
+    fn test_is_object_dir_dangling() {
         // Test object directory dangling detection
         let errs = vec![Some(DiskError::FileNotFound), Some(DiskError::FileNotFound), None];
-        assert!(is_object_dir_dang_ling(&errs));
+        assert!(is_object_dir_dangling(&errs));
         let errs2 = vec![None, None, None];
-        assert!(!is_object_dir_dang_ling(&errs2));
+        assert!(!is_object_dir_dangling(&errs2));
 
         let errs3 = vec![Some(DiskError::FileCorrupt), Some(DiskError::FileNotFound)];
-        assert!(!is_object_dir_dang_ling(&errs3)); // Mixed errors, not all not found
+        assert!(!is_object_dir_dangling(&errs3)); // Mixed errors, not all not found
     }
 
     #[test]

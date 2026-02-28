@@ -18,7 +18,7 @@ use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{
     disk::{DiskStore, endpoint::Endpoint},
     store::ECStore,
-    store_api::{BucketInfo, ObjectIO, StorageAPI},
+    store_api::{BucketInfo, BucketOperations, HealOperations, ListOperations, ObjectIO, ObjectOperations, StorageAPI},
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::Arc;

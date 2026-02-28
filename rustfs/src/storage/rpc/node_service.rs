@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::{Deserializer, Serializer};
-use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, heal_channel::HealOpts};
+use rustfs_common::{get_global_local_node_name, heal_channel::HealOpts};
 use rustfs_ecstore::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},
@@ -62,26 +62,6 @@ mod health;
 mod lock;
 #[path = "metrics.rs"]
 mod metrics;
-
-// fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
-//     let mut err: &(dyn Error + 'static) = err_status;
-
-//     loop {
-//         if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-//             return Some(io_err);
-//         }
-
-//         // h2::Error do not expose std::io::Error with `source()`
-//         // https://github.com/hyperium/h2/pull/462
-//         if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
-//             if let Some(io_err) = h2_err.get_io() {
-//                 return Some(io_err);
-//             }
-//         }
-
-//         err = err.source()?;
-//     }
-// }
 
 #[derive(Debug)]
 pub struct NodeService {
@@ -198,200 +178,12 @@ impl Node for NodeService {
         let _ = request;
 
         unimplemented!("write_stream");
-
-        // let mut in_stream = request.into_inner();
-        // let (tx, rx) = mpsc::channel(128);
-
-        // tokio::spawn(async move {
-        //     let mut file_ref = None;
-        //     while let Some(result) = in_stream.next().await {
-        //         match result {
-        //             // Ok(v) => tx
-        //             //     .send(Ok(EchoResponse { message: v.message }))
-        //             //     .await
-        //             //     .expect("working rx"),
-        //             Ok(v) => {
-        //                 match file_ref.as_ref() {
-        //                     Some(_) => (),
-        //                     None => {
-        //                         if let Some(disk) = find_local_disk(&v.disk).await {
-        //                             let file_writer = if v.is_append {
-        //                                 disk.append_file(&v.volume, &v.path).await
-        //                             } else {
-        //                                 disk.create_file("", &v.volume, &v.path, 0).await
-        //                             };
-
-        //                             match file_writer {
-        //                                 Ok(file_writer) => file_ref = Some(file_writer),
-        //                                 Err(err) => {
-        //                                     tx.send(Ok(WriteResponse {
-        //                                         success: false,
-        //                                         error: Some(err_to_proto_err(
-        //                                             &err,
-        //                                             &format!("get file writer failed: {}", err),
-        //                                         )),
-        //                                     }))
-        //                                     .await
-        //                                     .expect("working rx");
-        //                                     break;
-        //                                 }
-        //                             }
-        //                         } else {
-        //                             tx.send(Ok(WriteResponse {
-        //                                 success: false,
-        //                                 error: Some(err_to_proto_err(
-        //                                     &EcsError::new(StorageError::InvalidArgument(
-        //                                         Default::default(),
-        //                                         Default::default(),
-        //                                         Default::default(),
-        //                                     )),
-        //                                     "can not find disk",
-        //                                 )),
-        //                             }))
-        //                             .await
-        //                             .expect("working rx");
-        //                             break;
-        //                         }
-        //                     }
-        //                 };
-
-        //                 match file_ref.as_mut().unwrap().write(&v.data).await {
-        //                     Ok(_) => tx.send(Ok(WriteResponse {
-        //                         success: true,
-        //                         error: None,
-        //                     })),
-        //                     Err(err) => tx.send(Ok(WriteResponse {
-        //                         success: false,
-        //                         error: Some(err_to_proto_err(&err, &format!("write failed: {}", err))),
-        //                     })),
-        //                 }
-        //                 .await
-        //                 .unwrap();
-        //             }
-        //             Err(err) => {
-        //                 if let Some(io_err) = match_for_io_error(&err) {
-        //                     if io_err.kind() == ErrorKind::BrokenPipe {
-        //                         // here you can handle special case when client
-        //                         // disconnected in unexpected way
-        //                         eprintln!("\tclient disconnected: broken pipe");
-        //                         break;
-        //                     }
-        //                 }
-
-        //                 match tx.send(Err(err)).await {
-        //                     Ok(_) => (),
-        //                     Err(_err) => break, // response was dropped
-        //                 }
-        //             }
-        //         }
-        //     }
-        //     println!("\tstream ended");
-        // });
-
-        // let out_stream = ReceiverStream::new(rx);
-
-        // Ok(Response::new(Box::pin(out_stream)))
     }
 
     type ReadAtStream = ResponseStream<ReadAtResponse>;
     async fn read_at(&self, _request: Request<Streaming<ReadAtRequest>>) -> Result<Response<Self::ReadAtStream>, Status> {
         info!("read_at");
         unimplemented!("read_at");
-
-        // let mut in_stream = request.into_inner();
-        // let (tx, rx) = mpsc::channel(128);
-
-        // tokio::spawn(async move {
-        //     let mut file_ref = None;
-        //     while let Some(result) = in_stream.next().await {
-        //         match result {
-        //             Ok(v) => {
-        //                 match file_ref.as_ref() {
-        //                     Some(_) => (),
-        //                     None => {
-        //                         if let Some(disk) = find_local_disk(&v.disk).await {
-        //                             match disk.read_file(&v.volume, &v.path).await {
-        //                                 Ok(file_reader) => file_ref = Some(file_reader),
-        //                                 Err(err) => {
-        //                                     tx.send(Ok(ReadAtResponse {
-        //                                         success: false,
-        //                                         data: Vec::new(),
-        //                                         error: Some(err_to_proto_err(&err, &format!("read file failed: {}", err))),
-        //                                         read_size: -1,
-        //                                     }))
-        //                                     .await
-        //                                     .expect("working rx");
-        //                                     break;
-        //                                 }
-        //                             }
-        //                         } else {
-        //                             tx.send(Ok(ReadAtResponse {
-        //                                 success: false,
-        //                                 data: Vec::new(),
-        //                                 error: Some(err_to_proto_err(
-        //                                     &EcsError::new(StorageError::InvalidArgument(
-        //                                         Default::default(),
-        //                                         Default::default(),
-        //                                         Default::default(),
-        //                                     )),
-        //                                     "can not find disk",
-        //                                 )),
-        //                                 read_size: -1,
-        //                             }))
-        //                             .await
-        //                             .expect("working rx");
-        //                             break;
-        //                         }
-        //                     }
-        //                 };
-
-        //                 let mut data = vec![0u8; v.length.try_into().unwrap()];
-
-        //                 match file_ref
-        //                     .as_mut()
-        //                     .unwrap()
-        //                     .read_at(v.offset.try_into().unwrap(), &mut data)
-        //                     .await
-        //                 {
-        //                     Ok(read_size) => tx.send(Ok(ReadAtResponse {
-        //                         success: true,
-        //                         data,
-        //                         read_size: read_size.try_into().unwrap(),
-        //                         error: None,
-        //                     })),
-        //                     Err(err) => tx.send(Ok(ReadAtResponse {
-        //                         success: false,
-        //                         data: Vec::new(),
-        //                         error: Some(err_to_proto_err(&err, &format!("read at failed: {}", err))),
-        //                         read_size: -1,
-        //                     })),
-        //                 }
-        //                 .await
-        //                 .unwrap();
-        //             }
-        //             Err(err) => {
-        //                 if let Some(io_err) = match_for_io_error(&err) {
-        //                     if io_err.kind() == ErrorKind::BrokenPipe {
-        //                         // here you can handle special case when client
-        //                         // disconnected in unexpected way
-        //                         eprintln!("\tclient disconnected: broken pipe");
-        //                         break;
-        //                     }
-        //                 }
-
-        //                 match tx.send(Err(err)).await {
-        //                     Ok(_) => (),
-        //                     Err(_err) => break, // response was dropped
-        //                 }
-        //             }
-        //         }
-        //     }
-        //     println!("\tstream ended");
-        // });
-
-        // let out_stream = ReceiverStream::new(rx);
-
-        // Ok(Response::new(Box::pin(out_stream)))
     }
 
     async fn list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {

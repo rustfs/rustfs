@@ -15,15 +15,13 @@
 //! Application-layer dependency context.
 //! This module introduces explicit dependency injection entry points
 //! for storage, IAM, and KMS handles.
-#![allow(dead_code)]
 
 use crate::config::workload_profiles::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
-use rustfs_ecstore::GLOBAL_Endpoints;
-use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, GLOBAL_BucketMetadataSys};
-use rustfs_ecstore::config::{Config, GLOBAL_SERVER_CONFIG};
+use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
+use rustfs_ecstore::config::{Config, get_global_server_config};
 use rustfs_ecstore::endpoints::EndpointServerPools;
-use rustfs_ecstore::global::get_global_region;
+use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::tier::tier::TierConfigMgr;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
@@ -35,11 +33,13 @@ use tokio::sync::RwLock;
 
 /// IAM interface for application-layer use-cases.
 pub trait IamInterface: Send + Sync {
+    #[allow(dead_code)]
     fn handle(&self) -> Arc<IamSys<ObjectStore>>;
     fn is_ready(&self) -> bool;
 }
 
 /// KMS interface for application-layer use-cases.
+#[allow(dead_code)]
 pub trait KmsInterface: Send + Sync {
     fn handle(&self) -> Arc<KmsServiceManager>;
 }
@@ -76,7 +76,7 @@ pub trait EndpointsInterface: Send + Sync {
 
 /// Region interface for application-layer use-cases.
 pub trait RegionInterface: Send + Sync {
-    fn get(&self) -> Option<String>;
+    fn get(&self) -> Option<s3s::region::Region>;
 }
 
 /// Tier config interface for application-layer and admin handlers.
@@ -96,6 +96,7 @@ pub trait BufferConfigInterface: Send + Sync {
 
 /// Default IAM interface adapter.
 pub struct IamHandle {
+    #[allow(dead_code)]
     iam: Arc<IamSys<ObjectStore>>,
 }
 
@@ -116,6 +117,7 @@ impl IamInterface for IamHandle {
 }
 
 /// Default KMS interface adapter.
+#[allow(dead_code)]
 pub struct KmsHandle {
     kms: Arc<KmsServiceManager>,
 }
@@ -172,7 +174,7 @@ pub struct BucketMetadataHandle;
 
 impl BucketMetadataInterface for BucketMetadataHandle {
     fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>> {
-        GLOBAL_BucketMetadataSys.get().cloned()
+        get_global_bucket_metadata_sys()
     }
 }
 
@@ -182,7 +184,7 @@ pub struct EndpointsHandle;
 
 impl EndpointsInterface for EndpointsHandle {
     fn handle(&self) -> Option<EndpointServerPools> {
-        GLOBAL_Endpoints.get().cloned()
+        get_global_endpoints_opt()
     }
 }
 
@@ -191,7 +193,7 @@ impl EndpointsInterface for EndpointsHandle {
 pub struct RegionHandle;
 
 impl RegionInterface for RegionHandle {
-    fn get(&self) -> Option<String> {
+    fn get(&self) -> Option<s3s::region::Region> {
         get_global_region()
     }
 }
@@ -202,7 +204,7 @@ pub struct TierConfigHandle;
 
 impl TierConfigInterface for TierConfigHandle {
     fn handle(&self) -> Arc<RwLock<TierConfigMgr>> {
-        rustfs_ecstore::global::GLOBAL_TierConfigMgr.clone()
+        get_global_tier_config_mgr()
     }
 }
 
@@ -212,7 +214,7 @@ pub struct ServerConfigHandle;
 
 impl ServerConfigInterface for ServerConfigHandle {
     fn get(&self) -> Option<Config> {
-        GLOBAL_SERVER_CONFIG.get().cloned()
+        get_global_server_config()
     }
 }
 
@@ -231,6 +233,7 @@ impl BufferConfigInterface for BufferConfigHandle {
 pub struct AppContext {
     object_store: Arc<ECStore>,
     iam: Arc<dyn IamInterface>,
+    #[allow(dead_code)]
     kms: Arc<dyn KmsInterface>,
     kms_runtime: Arc<dyn KmsRuntimeInterface>,
     notify: Arc<dyn NotifyInterface>,
@@ -275,6 +278,7 @@ impl AppContext {
         self.iam.clone()
     }
 
+    #[allow(dead_code)]
     pub fn kms(&self) -> Arc<dyn KmsInterface> {
         self.kms.clone()
     }
@@ -327,6 +331,40 @@ pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
         .or_else(|| default_kms_runtime_interface().service_manager())
 }
 
+/// Resolve bucket metadata handle using AppContext-first precedence.
+pub fn resolve_bucket_metadata_handle() -> Option<Arc<RwLock<BucketMetadataSys>>> {
+    get_global_app_context()
+        .and_then(|context| context.bucket_metadata().handle())
+        .or_else(|| default_bucket_metadata_interface().handle())
+}
+
+/// Resolve object store handle from AppContext.
+pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
+    get_global_app_context().map(|context| context.object_store())
+}
+
+/// Resolve endpoints using AppContext-first precedence.
+pub fn resolve_endpoints_handle() -> Option<EndpointServerPools> {
+    get_global_app_context()
+        .and_then(|context| context.endpoints().handle())
+        .or_else(|| default_endpoints_interface().handle())
+}
+
+/// Resolve tier config handle using AppContext-first precedence.
+pub fn resolve_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
+    get_global_app_context()
+        .map(|context| context.tier_config().handle())
+        .unwrap_or_else(|| default_tier_config_interface().handle())
+}
+
+/// Resolve server config using AppContext-first precedence.
+pub fn resolve_server_config() -> Option<Config> {
+    match get_global_app_context() {
+        Some(context) => context.server_config().get(),
+        None => default_server_config_interface().get(),
+    }
+}
+
 pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
     Arc::new(BucketMetadataHandle)
 }
@@ -351,14 +389,14 @@ pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
     Arc::new(BufferConfigHandle)
 }
 
-static GLOBAL_APP_CONTEXT: OnceLock<Arc<AppContext>> = OnceLock::new();
+static APP_CONTEXT_SINGLETON: OnceLock<Arc<AppContext>> = OnceLock::new();
 
 /// Initialize global application context once and return the canonical instance.
 pub fn init_global_app_context(context: AppContext) -> Arc<AppContext> {
-    GLOBAL_APP_CONTEXT.get_or_init(|| Arc::new(context)).clone()
+    APP_CONTEXT_SINGLETON.get_or_init(|| Arc::new(context)).clone()
 }
 
 /// Get global application context if it has been initialized.
 pub fn get_global_app_context() -> Option<Arc<AppContext>> {
-    GLOBAL_APP_CONTEXT.get().cloned()
+    APP_CONTEXT_SINGLETON.get().cloned()
 }

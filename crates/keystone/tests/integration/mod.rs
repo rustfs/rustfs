@@ -12,16 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::LazyLock;
-
-mod put_object;
-
-pub(crate) struct Objects;
-
-pub(crate) static GLOBAL_OBJECTS: LazyLock<Objects> = LazyLock::new(Objects::new);
-
-impl Objects {
-    pub fn new() -> Self {
-        Objects
-    }
-}
+mod middleware_tests;

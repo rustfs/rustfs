@@ -22,7 +22,9 @@ use crate::global::get_global_endpoints;
 use crate::pools::ListCallback;
 use crate::set_disk::SetDisks;
 use crate::store::ECStore;
-use crate::store_api::{CompletePart, GetObjectReader, ObjectIO, ObjectOptions, PutObjReader};
+use crate::store_api::{
+    CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader,
+};
 use http::HeaderMap;
 use rustfs_common::defer;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};

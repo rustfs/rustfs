@@ -360,6 +360,44 @@ mod tests {
     }
 
     #[test]
+    fn test_phase5_s3_entrypoints_delegate_to_usecases() {
+        fn assert_delegates_within_method(src: &str, signature: &str, delegation_call: &str, error_msg: &str) {
+            let sig_pos = src
+                .find(signature)
+                .unwrap_or_else(|| panic!("Expected to find method signature: {signature}"));
+
+            let after_sig = &src[sig_pos + signature.len()..];
+            let method_body_end_rel = after_sig.find("async fn ").unwrap_or(after_sig.len());
+            let method_body = &after_sig[..method_body_end_rel];
+
+            assert!(method_body.contains(delegation_call), "{error_msg}");
+        }
+
+        let src = include_str!("ecfs.rs");
+
+        assert_delegates_within_method(
+            src,
+            "async fn put_object(&self, req: S3Request<PutObjectInput>)",
+            "usecase.execute_put_object(self, req).await",
+            "put_object must delegate to DefaultObjectUsecase::execute_put_object",
+        );
+
+        assert_delegates_within_method(
+            src,
+            "async fn get_object(&self, req: S3Request<GetObjectInput>)",
+            "usecase.execute_get_object(req).await",
+            "get_object must delegate to DefaultObjectUsecase::execute_get_object",
+        );
+
+        assert_delegates_within_method(
+            src,
+            "async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>)",
+            "usecase.execute_list_objects_v2(req).await",
+            "list_objects_v2 must delegate to DefaultBucketUsecase::execute_list_objects_v2",
+        );
+    }
+
+    #[test]
     fn test_validate_list_object_unordered_with_delimiter() {
         // [1] Normal case: No delimiter specified.
         assert!(validate_list_object_unordered_with_delimiter(None, Some("allow-unordered=true")).is_ok());
@@ -1217,5 +1255,47 @@ mod tests {
 
         assert!(result.is_ok(), "Should succeed with valid ARN");
         assert_eq!(event_rules.len(), 1, "Should add one rule");
+    }
+
+    // --- Object tag conditions for bucket policy (s3:ExistingObjectTag) ---
+
+    /// Verifies that object tags are formatted as ExistingObjectTag/<key> condition keys
+    /// with a single-element vec value, matching the format expected by policy evaluation.
+    #[test]
+    fn test_object_tag_condition_key_format() {
+        use rustfs_ecstore::bucket::tagging::decode_tags_to_map;
+        use std::collections::HashMap;
+
+        let tags_str = "security=public&project=webapp&env=prod";
+        let map = decode_tags_to_map(tags_str);
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for (k, v) in map {
+            out.insert(format!("ExistingObjectTag/{}", k), vec![v]);
+        }
+
+        assert_eq!(out.get("ExistingObjectTag/security"), Some(&vec!["public".to_string()]));
+        assert_eq!(out.get("ExistingObjectTag/project"), Some(&vec!["webapp".to_string()]));
+        assert_eq!(out.get("ExistingObjectTag/env"), Some(&vec!["prod".to_string()]));
+        assert_eq!(out.len(), 3);
+    }
+
+    /// When no object store is available (e.g. unit test env), get_object_tag_conditions_for_policy
+    /// returns Ok(empty map) so authorization can proceed without tag conditions.
+    #[tokio::test]
+    async fn test_get_object_tag_conditions_for_policy_returns_empty_without_store() {
+        let fs = FS::new();
+        let out = fs.get_object_tag_conditions_for_policy("bucket", "key", None).await.unwrap();
+        assert!(out.is_empty(), "without store should return empty tag conditions");
+    }
+
+    /// With version_id specified, the same no-store path returns Ok(empty) (versioned object path).
+    #[tokio::test]
+    async fn test_get_object_tag_conditions_for_policy_version_id_returns_empty_without_store() {
+        let fs = FS::new();
+        let out = fs
+            .get_object_tag_conditions_for_policy("bucket", "key", Some("v1"))
+            .await
+            .unwrap();
+        assert!(out.is_empty());
     }
 }

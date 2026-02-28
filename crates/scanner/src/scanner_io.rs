@@ -34,7 +34,7 @@ use rustfs_ecstore::error::{Error, StorageError};
 use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::SetDisks;
-use rustfs_ecstore::store_api::{BucketInfo, BucketOptions, ObjectInfo};
+use rustfs_ecstore::store_api::{BucketInfo, BucketOperations, BucketOptions, ObjectInfo};
 use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
@@ -499,7 +499,7 @@ impl ScannerIODisk for Disk {
                     &item.object_path()
                 );
 
-                return Err(StorageError::other("skip file".to_string()));
+                return Err(StorageError::other("failed to read metadata".to_string()));
             }
         };
 
@@ -510,7 +510,7 @@ impl ScannerIODisk for Disk {
             Ok(versions) => versions,
             Err(e) => {
                 error!("Failed to get file info versions: {}", e);
-                return Err(StorageError::other("skip file".to_string()));
+                return Err(StorageError::other("failed to get file info".to_string()));
             }
         };
 

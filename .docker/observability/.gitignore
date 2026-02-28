@@ -1,0 +1,5 @@
+jaeger-data/*
+loki-data/*
+prometheus-data/*
+tempo-data/*
+grafana-data/*

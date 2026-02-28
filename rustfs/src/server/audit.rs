@@ -12,16 +12,13 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::app::context::{default_server_config_interface, get_global_app_context};
+use crate::app::context::resolve_server_config;
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
 use tracing::{info, warn};
 
 fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
-    match get_global_app_context() {
-        Some(context) => context.server_config().get(),
-        None => default_server_config_interface().get(),
-    }
+    resolve_server_config()
 }
 
 /// Start the audit system.

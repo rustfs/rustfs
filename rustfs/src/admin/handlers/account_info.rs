@@ -21,7 +21,7 @@ use matchit::Params;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOptions, StorageAPI};
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, StorageAPI};
 use rustfs_iam::store::MappedPolicy;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
@@ -186,6 +186,20 @@ impl Operation for AccountInfoHandler {
 
             let policies = MappedPolicy::new(&policy_name).to_slice();
             effective_policy = iam_store.get_combined_policy(&policies).await;
+        } else if let Some(claim_policies) = claims.get("policy").and_then(|v| v.as_str()) {
+            // STS/OIDC users: resolve policy names from JWT claims against built-in policies
+            let mut resolved = Vec::new();
+            for policy_name in claim_policies.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                for (name, p) in DEFAULT_POLICIES.iter() {
+                    if *name == policy_name {
+                        resolved.push(p.clone());
+                        break;
+                    }
+                }
+            }
+            if !resolved.is_empty() {
+                effective_policy = rustfs_policy::policy::Policy::merge_policies(resolved);
+            }
         } else {
             let policies = iam_store
                 .policy_db_get(&account_name, &cred.groups)

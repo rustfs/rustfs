@@ -225,7 +225,11 @@ pub fn must_get_local_ips() -> std::io::Result<Vec<IpAddr>> {
 }
 
 pub fn get_default_location(_u: Url, _region_override: &str) -> String {
-    todo!();
+    if !_region_override.is_empty() {
+        return _region_override.to_string();
+    }
+
+    _u.host().map(|host| host.to_string()).unwrap_or_default()
 }
 
 pub fn get_endpoint_url(endpoint: &str, secure: bool) -> Result<Url, Error> {
