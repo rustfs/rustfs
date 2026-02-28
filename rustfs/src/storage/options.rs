@@ -345,6 +345,25 @@ pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &m
     extract_metadata_from_mime_with_object_name(headers, metadata, false, None);
 }
 
+/// Normalizes Content-Encoding for storage per AWS S3 behavior: "aws-chunked" is a
+/// request-side transfer encoding for SigV4 streaming and must not be stored or returned.
+/// If the only value is "aws-chunked", returns None (do not persist). Otherwise returns
+/// the value with "aws-chunked" stripped, or None if nothing remains.
+fn normalize_content_encoding_for_storage(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized: String = trimmed
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.eq_ignore_ascii_case("aws-chunked"))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if normalized.is_empty() { None } else { Some(normalized) }
+}
+
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
 pub fn extract_metadata_from_mime_with_object_name(
     headers: &HeaderMap<HeaderValue>,
@@ -373,7 +392,14 @@ pub fn extract_metadata_from_mime_with_object_name(
 
         for hd in SUPPORTED_HEADERS.iter() {
             if k.as_str() == *hd {
-                metadata.insert(k.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string());
+                let raw = String::from_utf8_lossy(v.as_bytes()).to_string();
+                if *hd == "content-encoding" {
+                    if let Some(normalized) = normalize_content_encoding_for_storage(&raw) {
+                        metadata.insert(k.to_string(), normalized);
+                    }
+                } else {
+                    metadata.insert(k.to_string(), raw);
+                }
                 continue;
             }
         }
@@ -1049,6 +1075,48 @@ mod tests {
         assert_eq!(metadata.get("x-amz-tagging"), Some(&"key1=value1&key2=value2".to_string()));
         assert_eq!(metadata.get("expires"), Some(&"Wed, 21 Oct 2015 07:28:00 GMT".to_string()));
         assert_eq!(metadata.get("x-amz-replication-status"), Some(&"COMPLETED".to_string()));
+    }
+
+    /// Issue #1857: SigV4 streaming sends Content-Encoding: aws-chunked. Per AWS S3,
+    /// this is a request-side transfer encoding and must not be stored or returned.
+    /// This test verifies: (1) "aws-chunked" alone is not persisted;
+    /// (2) when combined with real encoding (e.g. gzip), only the real encoding is stored;
+    /// (3) case-insensitive stripping of aws-chunked.
+    #[test]
+    fn test_content_encoding_aws_chunked_not_persisted_issue_1857() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("aws-chunked", None),
+            ("AWS-CHUNKED", None),
+            ("aws-chunked ", None),
+            ("gzip, aws-chunked", Some("gzip")),
+            ("aws-chunked, gzip", Some("gzip")),
+            ("gzip", Some("gzip")),
+            ("zstd", Some("zstd")),
+        ];
+
+        for (header_value, expected) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-encoding", HeaderValue::from_static(header_value));
+
+            let mut metadata = HashMap::new();
+            extract_metadata_from_mime(&headers, &mut metadata);
+
+            match expected {
+                None => assert!(
+                    !metadata.contains_key("content-encoding"),
+                    "content-encoding {:?} should not be persisted, got metadata keys: {:?}",
+                    header_value,
+                    metadata.keys().collect::<Vec<_>>()
+                ),
+                Some(exp) => assert_eq!(
+                    metadata.get("content-encoding"),
+                    Some(&exp.to_string()),
+                    "content-encoding {:?} should be normalized to {:?}",
+                    header_value,
+                    exp
+                ),
+            }
+        }
     }
 
     #[test]
