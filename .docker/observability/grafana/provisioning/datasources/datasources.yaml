@@ -7,39 +7,72 @@ datasources:
     url: http://prometheus:9090
     access: proxy
     isDefault: true
-    editable: true
+    editable: false
+    jsonData:
+      httpMethod: GET
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
 
   - name: Tempo
     type: tempo
     uid: tempo
-    url: http://tempo:3200
     access: proxy
+    url: http://tempo:3200
     isDefault: false
-    editable: true
+    editable: false
     jsonData:
-      tracesToLogsV2:
-        datasourceUid: loki
-        tags: [job, instance]
-      tracesToMetrics:
-        datasourceUid: prometheus
+      httpMethod: GET
       serviceMap:
         datasourceUid: prometheus
+      tracesToLogs:
+        datasourceUid: loki
+        tags: [ 'job', 'instance', 'pod', 'namespace', 'service.name' ]
+        mappedTags: [ { key: 'service.name', value: 'app' } ]
+        spanStartTimeShift: '-1h'
+        spanEndTimeShift: '1h'
+        filterByTraceID: true
+        filterBySpanID: false
+      tracesToMetrics:
+        datasourceUid: prometheus
+        tags: [ { key: 'service.name' }, { key: 'job' } ]
+        queries:
+          - name: 'Service-Level Latency'
+            query: 'sum(rate(traces_spanmetrics_latency_bucket{$$__tags}[5m])) by (le)'
+          - name: 'Service-Level Calls'
+            query: 'sum(rate(traces_spanmetrics_calls_total{$$__tags}[5m]))'
+          - name: 'Service-Level Errors'
+            query: 'sum(rate(traces_spanmetrics_calls_total{status_code="ERROR", $$__tags}[5m]))'
       nodeGraph:
         enabled: true
 
   - name: Loki
     type: loki
     uid: loki
-    access: proxy
     url: http://loki:3100
     basicAuth: false
     isDefault: false
-    editable: true
+    editable: false
     jsonData:
-      httpMethod: GET
-      maxLines: 1000
       derivedFields:
         - datasourceUid: tempo
-          matcherRegex: "trace_id=(\\w+)"
-          name: TraceID
-          url: "$${__value.raw}"
+          matcherRegex: 'trace_id=(\w+)'
+          name: 'TraceID'
+          url: '$${__value.raw}'
+
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger
+    url: http://jaeger:16686
+    access: proxy
+    isDefault: false
+    editable: false
+    jsonData:
+      tracesToLogs:
+        datasourceUid: loki
+        tags: [ 'job', 'instance', 'pod', 'namespace', 'service.name' ]
+        mappedTags: [ { key: 'service.name', value: 'app' } ]
+        spanStartTimeShift: '1s'
+        spanEndTimeShift: '-1s'
+        filterByTraceID: true
+        filterBySpanID: false
