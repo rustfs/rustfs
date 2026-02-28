@@ -382,15 +382,9 @@ pub(crate) fn validate_sse_headers_for_write(
         }
     }
 
-    if ssekms_key_id.is_some() && server_side_encryption.is_none() {
+    if ssekms_key_id.is_some() && !server_side_encryption.is_some_and(|sse| sse.as_str() == ServerSideEncryption::AWS_KMS) {
         return Err(sse_invalid_argument(
             "The SSE-KMS key ID header can only be used when x-amz-server-side-encryption is set to aws:kms.",
-        ));
-    }
-
-    if server_side_encryption.is_some_and(|sse| sse.as_str() == ServerSideEncryption::AWS_KMS) && ssekms_key_id.is_none() {
-        return Err(sse_invalid_argument(
-            "The x-amz-server-side-encryption-aws-kms-key-id header is required when using aws:kms.",
         ));
     }
 
@@ -623,15 +617,9 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
     )?;
 
     // Priority 1: SSE-C (customer-provided key)
-    if request.sse_customer_algorithm.is_some() || request.sse_customer_key.is_some() || request.sse_customer_key_md5.is_some() {
-        let (Some(algorithm), Some(key), Some(key_md5)) =
-            (request.sse_customer_algorithm, request.sse_customer_key, request.sse_customer_key_md5)
-        else {
-            return Err(ssec_invalid_request(
-                "Missing SSE-C parameters. Algorithm, customer key and customer key MD5 are all required.",
-            ));
-        };
-
+    if let (Some(algorithm), Some(key), Some(key_md5)) =
+        (request.sse_customer_algorithm, request.sse_customer_key, request.sse_customer_key_md5)
+    {
         return apply_ssec_encryption_material(
             request.bucket,
             request.key,
@@ -1865,6 +1853,15 @@ mod tests {
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
     }
 
+    #[test]
+    fn test_validate_sse_headers_for_write_allows_aws_kms_without_key_id() {
+        let server_side_encryption: ServerSideEncryption = "aws:kms".to_string().into();
+
+        let result = validate_sse_headers_for_write(Some(&server_side_encryption), None, None, None, None, true);
+
+        assert!(result.is_ok());
+    }
+
     #[tokio::test]
     async fn test_sse_prepare_encryption_allows_ssec_headers_without_customer_key() {
         let bucket = "test-bucket";
@@ -1890,7 +1887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sse_encryption_rejects_kms_without_key() {
+    async fn test_sse_encryption_rejects_kms_key_with_invalid_algorithm() {
         let bucket = "test-bucket";
         let key = "test-key";
         let content_size = 1024;
@@ -1898,8 +1895,8 @@ mod tests {
         let request = EncryptionRequest {
             bucket,
             key,
-            server_side_encryption: Some("aws:kms".to_string().into()),
-            ssekms_key_id: None,
+            server_side_encryption: Some("AES256".to_string().into()),
+            ssekms_key_id: Some("test-key".to_string()),
             sse_customer_algorithm: None,
             sse_customer_key: None,
             sse_customer_key_md5: None,
