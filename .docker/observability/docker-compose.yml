@@ -22,7 +22,7 @@ services:
       - "9000:9000" # S3 API port
       - "9001:9001" # Console port
     environment:
-      - RUSTFS_VOLUMES=/data/rustfs{0..3} # Define 4 storage volumes
+      - RUSTFS_VOLUMES=/data/rustfs
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
@@ -33,10 +33,7 @@ services:
       - RUSTFS_OBS_LOGGER_LEVEL=info
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
     volumes:
-      - rustfs_data_0:/data/rustfs0
-      - rustfs_data_1:/data/rustfs1
-      - rustfs_data_2:/data/rustfs2
-      - rustfs_data_3:/data/rustfs3
+      - rustfs-data:/data/rustfs
     networks:
       - otel-network
     restart: unless-stopped
@@ -44,8 +41,9 @@ services:
       test:
         [
           "CMD",
-          "sh", "-c",
-          "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health"
+          "sh",
+          "-c",
+          "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health",
         ]
       interval: 30s
       timeout: 10s
@@ -59,24 +57,25 @@ services:
     image: alpine
     container_name: rustfs-init
     volumes:
-      - rustfs_data_0:/data0
-      - rustfs_data_1:/data1
-      - rustfs_data_2:/data2
-      - rustfs_data_3:/data3
+      - rustfs-data:/data
+    networks:
+      - otel-network
     command: >
       sh -c "
-        chown -R 10001:10001 /data0 /data1 /data2 /data3 &&
+        chown -R 10001:10001 /data &&
         echo 'Volume Permissions fixed' &&
         exit 0
       "
     restart: no
 
+  # --- Tracing ---
+
   tempo-init:
     image: busybox:latest
     container_name: tempo-init
-    command: [ "sh", "-c", "chown -R 10001:10001 /var/tempo" ]
+    command: ["sh", "-c", "chown -R 10001:10001 /var/tempo"]
     volumes:
-      - ./tempo_data:/var/tempo
+      - tempo-data:/var/tempo
     user: root
     networks:
       - otel-network
@@ -86,21 +85,108 @@ services:
     image: grafana/tempo:latest
     container_name: tempo
     user: "10001"
-    command: [ "-config.file=/etc/tempo.yaml" ]
+    command: ["-config.file=/etc/tempo.yaml"]
     volumes:
       - ./tempo.yaml:/etc/tempo.yaml:ro
-      - tempo_data:/var/tempo
+      - tempo-data:/var/tempo
     ports:
       - "3200:3200" # tempo
+      - "4317" # otlp grpc
+      - "4318" # otlp http
     restart: unless-stopped
     networks:
       - otel-network
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3200/metrics" ]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3200/ready"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  redpanda:
+    image: redpandadata/redpanda:latest # for tempo ingest
+    container_name: redpanda
+    ports:
+      - "9092:9092"
+    networks:
+      - otel-network
+    command: >
+      redpanda start --overprovisioned
+      --mode=dev-container
+      --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+
+  jaeger:
+    image: jaegertracing/jaeger:latest
+    container_name: jaeger
+    environment:
+      - SPAN_STORAGE_TYPE=badger
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_DIRECTORY_KEY=/badger/key
+      - COLLECTOR_OTLP_ENABLED=true
+    volumes:
+      - ./jaeger.yaml:/etc/jaeger/config.yml
+      - jaeger-data:/badger
+    ports:
+      - "16686:16686" # Web UI
+      - "14269:14269" # Admin/Metrics
+      - "4317" # otlp grpc
+      - "4318" # otlp http
+    command: ["--config", "/etc/jaeger/config.yml"]
+    networks:
+      - otel-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # --- Metrics ---
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-otlp-receiver" # Enable OTLP
+      - "--web.enable-remote-write-receiver" # Enable remote write
+      - "--enable-feature=promql-experimental-functions" # Enable info()
+      - "--storage.tsdb.retention.time=30d"
+    restart: unless-stopped
+    networks:
+      - otel-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # --- Logging ---
+
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    volumes:
+      - ./loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/loki.yaml
+    networks:
+      - otel-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # --- Collection ---
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
@@ -110,87 +196,30 @@ services:
     networks:
       - otel-network
     depends_on:
-      jaeger:
-        condition: service_started
-      tempo:
-        condition: service_started
-      prometheus:
-        condition: service_started
-      loki:
-        condition: service_started
+      - tempo
+      - jaeger
+      - prometheus
+      - loki
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:13133" ]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:13133"]
       interval: 10s
       timeout: 5s
       retries: 3
 
-  jaeger:
-    image: jaegertracing/jaeger:latest
-    container_name: jaeger
-    environment:
-      - SPAN_STORAGE_TYPE=memory
-      - COLLECTOR_OTLP_ENABLED=true
-    ports:
-      - "16686:16686"
-    networks:
-      - otel-network
-    healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:16686" ]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    ports:
-      - "9090:9090"
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--web.enable-otlp-receiver' # Enable OTLP
-      - '--web.enable-remote-write-receiver' # Enable remote write
-      - '--enable-feature=promql-experimental-functions' # Enable info()
-      - '--storage.tsdb.retention.time=30d'
-    restart: unless-stopped
-    networks:
-      - otel-network
-    healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy" ]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-
-  loki:
-    image: grafana/loki:latest
-    container_name: loki
-    volumes:
-      - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
-    ports:
-      - "3100:3100"
-    command: -config.file=/etc/loki/loki-config.yaml
-    networks:
-      - otel-network
-    healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3100/ready" ]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+  # --- Visualization ---
 
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
     ports:
       - "3000:3000"
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/etc/grafana/dashboards:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_SECURITY_ADMIN_USER=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
     restart: unless-stopped
     networks:
       - otel-network
@@ -199,19 +228,19 @@ services:
       - tempo
       - loki
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health" ]
+      test:
+        ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 3
 
 volumes:
-  rustfs_data_0:
-  rustfs_data_1:
-  rustfs_data_2:
-  rustfs_data_3:
-  prometheus_data:
-  grafana_data:
-  tempo_data:
+  rustfs-data:
+  tempo-data:
+  jaeger-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:
 
 networks:
   otel-network:
