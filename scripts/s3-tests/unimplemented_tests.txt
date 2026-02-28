@@ -11,11 +11,9 @@
 # - Conditional writes: If-Match/If-None-Match for writes
 # - Bucket Ownership Controls
 
-# Failed tests (17)
+# Failed tests (11)
 test_bucket_create_delete_bucket_ownership
 test_bucket_logging_owner
-test_bucket_policy_put_obj_kms_s3
-test_bucket_policy_put_obj_s3_kms
 test_object_checksum_crc64nvme
 test_object_checksum_sha256
 test_object_lock_put_obj_lock_enable_after_create
@@ -25,7 +23,6 @@ test_put_bucket_logging_errors
 test_put_bucket_logging_permissions
 test_put_bucket_logging_policy_wildcard
 test_rm_bucket_logging
-test_versioning_concurrent_multi_object_delete
 
 # Skipped tests (require IAM account or multiple storage classes)
 test_bucket_policy_deny_self_denied_policy

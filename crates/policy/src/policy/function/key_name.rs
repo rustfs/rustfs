@@ -184,6 +184,21 @@ pub enum S3KeyName {
     #[strum(serialize = "s3:delimiter")]
     S3Delimiter,
 
+    #[strum(serialize = "s3:x-amz-grant-full-control")]
+    S3XAmzGrantFullControl,
+
+    #[strum(serialize = "s3:x-amz-grant-read")]
+    S3XAmzGrantRead,
+
+    #[strum(serialize = "s3:x-amz-grant-write")]
+    S3XAmzGrantWrite,
+
+    #[strum(serialize = "s3:x-amz-grant-read-acp")]
+    S3XAmzGrantReadAcp,
+
+    #[strum(serialize = "s3:x-amz-grant-write-acp")]
+    S3XAmzGrantWriteAcp,
+
     #[strum(serialize = "s3:ExistingObjectTag")]
     S3ExistingObjectTag,
     #[strum(serialize = "s3:RequestObjectTagKeys")]
