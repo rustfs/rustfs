@@ -306,6 +306,12 @@ impl DefaultObjectUsecase {
             ..
         } = input;
 
+        // Merge SSE-C params from headers (fallback when S3 layer does not populate input)
+        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(&req.headers)?;
+        let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
+        let sse_customer_key = sse_customer_key.or(h_key);
+        let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
+
         // Validate object key
         validate_object_key(&key, "PUT")?;
 
@@ -386,6 +392,16 @@ impl DefaultObjectUsecase {
                 })
             })
         });
+
+        // Validate SSE-C headers early: reject partial/invalid combinations per S3 spec
+        validate_sse_headers_for_write(
+            effective_sse.as_ref(),
+            effective_kms_key_id.as_ref(),
+            sse_customer_algorithm.as_ref(),
+            sse_customer_key.as_ref(),
+            sse_customer_key_md5.as_ref(),
+            true, // PutObject requires all three: algorithm, key, key_md5
+        )?;
 
         let mut metadata = metadata.unwrap_or_default();
         let owner = req

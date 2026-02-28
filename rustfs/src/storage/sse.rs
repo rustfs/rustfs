@@ -343,6 +343,42 @@ fn sse_invalid_argument(message: &str) -> ApiError {
     }
 }
 
+/// SSE-C parameters extracted from headers (algorithm, key, key MD5).
+pub(crate) type SsecParamsFromHeaders = (Option<SSECustomerAlgorithm>, Option<SSECustomerKey>, Option<SSECustomerKeyMD5>);
+
+/// Extract SSE-C parameters from request headers.
+/// Used as fallback when the S3 layer does not populate them in the input struct.
+///
+/// Returns an error if an SSE-C header is present but cannot be parsed as valid UTF-8,
+/// ensuring malformed headers do not bypass validation.
+pub(crate) fn extract_ssec_params_from_headers(headers: &HeaderMap) -> Result<SsecParamsFromHeaders, ApiError> {
+    let algorithm = match headers.get("x-amz-server-side-encryption-customer-algorithm") {
+        None => Ok(None),
+        Some(v) => v
+            .to_str()
+            .map(|s| Some(SSECustomerAlgorithm::from(s.to_string())))
+            .map_err(|_| sse_invalid_argument("The x-amz-server-side-encryption-customer-algorithm header must be valid UTF-8.")),
+    }?;
+
+    let key = match headers.get("x-amz-server-side-encryption-customer-key") {
+        None => Ok(None),
+        Some(v) => v
+            .to_str()
+            .map(|s| Some(SSECustomerKey::from(s.to_string())))
+            .map_err(|_| sse_invalid_argument("The x-amz-server-side-encryption-customer-key header must be valid UTF-8.")),
+    }?;
+
+    let key_md5 = match headers.get("x-amz-server-side-encryption-customer-key-md5") {
+        None => Ok(None),
+        Some(v) => v
+            .to_str()
+            .map(|s| Some(SSECustomerKeyMD5::from(s.to_string())))
+            .map_err(|_| sse_invalid_argument("The x-amz-server-side-encryption-customer-key-md5 header must be valid UTF-8.")),
+    }?;
+
+    Ok((algorithm, key, key_md5))
+}
+
 #[inline]
 pub(crate) fn validate_sse_headers_for_write(
     server_side_encryption: Option<&ServerSideEncryption>,
@@ -1674,6 +1710,99 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderValue;
+
+    #[test]
+    fn test_extract_ssec_params_from_headers() {
+        let mut headers = http::HeaderMap::new();
+        let (algo, key, md5) = extract_ssec_params_from_headers(&headers).unwrap();
+        assert!(algo.is_none());
+        assert!(key.is_none());
+        assert!(md5.is_none());
+
+        headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+        let (algo, key, md5) = extract_ssec_params_from_headers(&headers).unwrap();
+        assert_eq!(algo.as_deref(), Some("AES256"));
+        assert!(key.is_none());
+        assert!(md5.is_none());
+
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key",
+            HeaderValue::from_static("pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs="),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            HeaderValue::from_static("DWygnHRtgiJ77HCm+1rvHw=="),
+        );
+        let (algo, key, md5) = extract_ssec_params_from_headers(&headers).unwrap();
+        assert_eq!(algo.as_deref(), Some("AES256"));
+        assert!(key.is_some());
+        assert!(md5.is_some());
+    }
+
+    #[test]
+    fn test_extract_ssec_params_from_headers_rejects_invalid_utf8() {
+        let mut headers = http::HeaderMap::new();
+        // Header value with invalid UTF-8; to_str() will fail
+        let invalid_utf8 = HeaderValue::from_bytes(b"invalid-\x80-utf8").unwrap();
+        headers.insert("x-amz-server-side-encryption-customer-algorithm", invalid_utf8);
+        let result = extract_ssec_params_from_headers(&headers);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_write_rejects_algorithm_without_key() {
+        let algorithm = SSECustomerAlgorithm::from("AES256".to_string());
+        let result = validate_sse_headers_for_write(
+            None,
+            None,
+            Some(&algorithm),
+            None,
+            None,
+            true, // PutObject requires all three
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_write_rejects_algorithm_and_key_without_md5() {
+        let algorithm = SSECustomerAlgorithm::from("AES256".to_string());
+        let key = SSECustomerKey::from("pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=".to_string());
+        let result = validate_sse_headers_for_write(
+            None,
+            None,
+            Some(&algorithm),
+            Some(&key),
+            None,
+            true, // PutObject requires all three
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_sse_headers_for_write_rejects_ssec_with_managed_sse() {
+        let algorithm = SSECustomerAlgorithm::from("AES256".to_string());
+        let key = SSECustomerKey::from("pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=".to_string());
+        let key_md5 = SSECustomerKeyMD5::from("DWygnHRtgiJ77HCm+1rvHw==".to_string());
+        let server_side_encryption = ServerSideEncryption::from_static(ServerSideEncryption::AES256);
+        let result = validate_sse_headers_for_write(
+            Some(&server_side_encryption),
+            None,
+            Some(&algorithm),
+            Some(&key),
+            Some(&key_md5),
+            true,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+    }
 
     #[test]
     fn test_is_managed_sse() {
