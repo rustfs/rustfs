@@ -162,11 +162,22 @@ where
 }
 
 fn is_xml_response(headers: &HeaderMap) -> bool {
-    headers
+    let is_xml = headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|content_type| content_type.to_ascii_lowercase().contains("xml"))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !is_xml {
+        return false;
+    }
+
+    match headers
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(encoding) => encoding.trim().is_empty() || encoding.eq_ignore_ascii_case("identity"),
+        None => true,
+    }
 }
 
 async fn fix_object_attributes_etag_in_xml<RestBody>(body: RestBody) -> Result<RestBody, RestBody::Error>
