@@ -45,6 +45,7 @@ const _ERR_XML_NOT_WELL_FORMED: &str =
 const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
     "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an retention bucket";
 const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration should have at most 1000 rules";
+const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "Lifecycle expiration days must be greater than 0";
 
 pub use rustfs_common::metrics::IlmAction;
 
@@ -232,6 +233,13 @@ impl Lifecycle for BucketLifecycleConfiguration {
         }
 
         for r in &self.rules {
+            if let Some(expiration) = &r.expiration {
+                if let Some(days) = expiration.days {
+                    if days <= 0 {
+                        return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS));
+                    }
+                }
+            }
             r.validate()?;
             /*if let Some(object_lock_enabled) = lr.object_lock_enabled.as_ref() {
                 if let Some(expiration) = r.expiration.as_ref() {

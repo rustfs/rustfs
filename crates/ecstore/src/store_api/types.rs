@@ -387,8 +387,12 @@ impl ObjectInfo {
         }
 
         // Check if object is encrypted
-        // Encrypted objects store original size in x-rustfs-encryption-original-size metadata
-        if let Some(size_str) = self.user_defined.get("x-rustfs-encryption-original-size")
+        // Managed SSE stores original size in x-rustfs-encryption-original-size metadata
+        // SSE-C stores original size in x-amz-server-side-encryption-customer-original-size
+        if let Some(size_str) = self
+            .user_defined
+            .get("x-rustfs-encryption-original-size")
+            .or_else(|| self.user_defined.get("x-amz-server-side-encryption-customer-original-size"))
             && !size_str.is_empty()
         {
             let size = size_str

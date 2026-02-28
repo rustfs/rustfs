@@ -465,7 +465,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
+        Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -643,8 +643,11 @@ impl DefaultBucketUsecase {
         let server_side_encryption_configuration = match metadata_sys::get_sse_config(&bucket).await {
             Ok((cfg, _)) => Some(cfg),
             Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(s3_error!(ServerSideEncryptionConfigurationNotFoundError));
+                }
                 warn!("get_sse_config err {:?}", err);
-                None
+                return Err(ApiError::from(err).into());
             }
         };
 
@@ -1079,15 +1082,21 @@ impl DefaultBucketUsecase {
 
         let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
 
-        let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
-        if let Ok(rcfg) = rcfg
-            && let Err(err) = rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg.0).await
-        {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
+        let rcfg = match metadata_sys::get_object_lock_config(&bucket).await {
+            Ok((cfg, _)) => cfg,
+            Err(StorageError::ConfigNotFound) => ObjectLockConfiguration::default(),
+            Err(err) => {
+                warn!("get_object_lock_config err {:?}", err);
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        if let Err(err) = rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg).await {
+            return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
         if let Err(err) = validate_transition_tier(&input_cfg).await {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("CustomError".into()), err.to_string()));
+            return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
         let data = serialize_config(&input_cfg)?;

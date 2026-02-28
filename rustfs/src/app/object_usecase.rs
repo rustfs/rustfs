@@ -28,6 +28,7 @@ use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256, get_opts, put_opts,
 };
+use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{restore, select};
 use crate::storage::*;
 use bytes::Bytes;
@@ -84,7 +85,8 @@ use rustfs_utils::http::{
     headers::{
         AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
         AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT, RESERVED_METADATA_PREFIX_LOWER,
+        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
+        RESERVED_METADATA_PREFIX_LOWER,
     },
 };
 use rustfs_utils::path::{is_dir_object, path_join_buf};
@@ -1575,33 +1577,230 @@ impl DefaultObjectUsecase {
         }
 
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, "s3:GetObjectAttributes");
-        let GetObjectAttributesInput { bucket, key, .. } = req.input.clone();
+        let GetObjectAttributesInput {
+            bucket,
+            key,
+            max_parts,
+            object_attributes,
+            part_number_marker,
+            version_id,
+            sse_customer_key,
+            sse_customer_key_md5,
+            ..
+        } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        if let Err(e) = store
-            .get_object_reader(&bucket, &key, None, HeaderMap::new(), &ObjectOptions::default())
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-        {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
+            .map_err(ApiError::from)?;
+
+        let info = match store.get_object_info(&bucket, &key, &opts).await {
+            Ok(info) => info,
+            Err(err) => {
+                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    if is_dir_object(&key) {
+                        let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
+                            Ok(has_children) => has_children,
+                            Err(e) => {
+                                error!(
+                                    "Failed to probe children for object attributes (bucket: {}, key: {}): {}",
+                                    bucket, key, e
+                                );
+                                false
+                            }
+                        };
+                        let msg = head_prefix_not_found_message(&bucket, &key, has_children);
+                        return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
+                    }
+                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                }
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        if info.delete_marker {
+            if opts.version_id.is_none() {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+            }
+            return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
         }
 
+        validate_ssec_for_read(&info.user_defined, sse_customer_key.as_ref(), sse_customer_key_md5.as_ref())?;
+
+        let metadata_map = info.user_defined.clone();
+        let storage_class = info
+            .storage_class
+            .clone()
+            .or_else(|| metadata_map.get(AMZ_STORAGE_CLASS).cloned())
+            .filter(|s| !s.is_empty())
+            .map(StorageClass::from);
+
+        warn!(
+            "GetObjectAttributes raw object_attributes={:?}",
+            object_attributes.iter().map(|value| value.as_str()).collect::<Vec<_>>()
+        );
+
+        let requested = |name: &'static str| -> bool {
+            object_attributes.iter().any(|value| {
+                value.as_str().split(',').any(|part| {
+                    part.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                        .eq_ignore_ascii_case(name)
+                })
+            })
+        };
+
+        let e_tag = if requested(ObjectAttributes::ETAG) {
+            info.etag.as_ref().map(|etag| to_s3s_etag(etag))
+        } else {
+            None
+        };
+
+        let object_size = if requested(ObjectAttributes::OBJECT_SIZE) {
+            Some(info.get_actual_size().map_err(ApiError::from)?)
+        } else {
+            None
+        };
+
+        let checksum = if requested(ObjectAttributes::CHECKSUM) {
+            let (checksums, _is_multipart) = info.decrypt_checksums(0, &req.headers).map_err(ApiError::from)?;
+            let mut checksum_crc32 = None;
+            let mut checksum_crc32c = None;
+            let mut checksum_sha1 = None;
+            let mut checksum_sha256 = None;
+            let mut checksum_crc64nvme = None;
+            let mut checksum_type = None;
+
+            for (k, v) in checksums {
+                if k == AMZ_CHECKSUM_TYPE {
+                    checksum_type = Some(ChecksumType::from(v));
+                    continue;
+                }
+                match rustfs_rio::ChecksumType::from_string(k.as_str()) {
+                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(v),
+                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(v),
+                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(v),
+                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(v),
+                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(v),
+                    _ => (),
+                }
+            }
+
+            Some(Checksum {
+                checksum_crc32,
+                checksum_crc32c,
+                checksum_sha1,
+                checksum_sha256,
+                checksum_crc64nvme,
+                checksum_type,
+            })
+        } else {
+            None
+        };
+
+        let object_parts = if requested(ObjectAttributes::OBJECT_PARTS) && info.is_multipart() {
+            let params = parse_list_parts_params(part_number_marker, max_parts)?;
+            let mut parts = Vec::new();
+            let mut marker = params.part_number_marker;
+            let max_parts = params.max_parts;
+            let mut start_at = 0usize;
+
+            if let Some(marker_value) = marker {
+                if let Some(index) = info.parts.iter().position(|part| part.number == marker_value) {
+                    start_at = index + 1;
+                } else {
+                    marker = None;
+                }
+            }
+
+            let max_parts: i32 = max_parts.try_into().map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "max-parts value is out of range".to_string())
+            })?;
+            let end = (start_at + params.max_parts).min(info.parts.len());
+            let is_truncated = end < info.parts.len();
+
+            for part in &info.parts[start_at..end] {
+                let (checksums, _is_multipart) = info.decrypt_checksums(part.number, &req.headers).map_err(ApiError::from)?;
+                let mut checksum_crc32 = None;
+                let mut checksum_crc32c = None;
+                let mut checksum_sha1 = None;
+                let mut checksum_sha256 = None;
+                let mut checksum_crc64nvme = None;
+
+                for (k, v) in checksums {
+                    match rustfs_rio::ChecksumType::from_string(k.as_str()) {
+                        rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(v),
+                        rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(v),
+                        rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(v),
+                        rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(v),
+                        rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(v),
+                        _ => (),
+                    }
+                }
+
+                let part_size = if part.actual_size > 0 {
+                    part.actual_size
+                } else {
+                    part.size.try_into().map_err(|_| {
+                        S3Error::with_message(S3ErrorCode::InvalidArgument, "Part size value is out of range".to_string())
+                    })?
+                };
+
+                parts.push(ObjectPart {
+                    checksum_crc32,
+                    checksum_crc32c,
+                    checksum_sha1,
+                    checksum_sha256,
+                    checksum_crc64nvme,
+                    part_number: i32::try_from(part.number).ok(),
+                    size: Some(part_size),
+                });
+            }
+
+            let part_number_marker = marker.and_then(|v| i32::try_from(v).ok());
+            let next_part_number_marker = parts.last().and_then(|part| part.part_number);
+
+            Some(GetObjectAttributesParts {
+                is_truncated: Some(is_truncated),
+                max_parts: Some(max_parts),
+                next_part_number_marker,
+                part_number_marker,
+                parts: Some(parts),
+                total_parts_count: Some(i32::try_from(info.parts.len()).map_err(|_| {
+                    S3Error::with_message(S3ErrorCode::InvalidArgument, "Part count is out of range".to_string())
+                })?),
+            })
+        } else {
+            None
+        };
+
+        let version_id = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
+            info.version_id.map(|vid| {
+                if vid == Uuid::nil() {
+                    "null".to_string()
+                } else {
+                    vid.to_string()
+                }
+            })
+        } else {
+            None
+        };
+
         let output = GetObjectAttributesOutput {
-            delete_marker: None,
-            object_parts: None,
+            checksum,
+            delete_marker: if info.delete_marker { Some(true) } else { None },
+            e_tag,
+            last_modified: info.mod_time.map(Timestamp::from),
+            object_parts,
+            object_size,
+            storage_class,
+            version_id: version_id.clone(),
             ..Default::default()
         };
 
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper
-            .object(ObjectInfo {
-                name: key.clone(),
-                bucket,
-                ..Default::default()
-            })
-            .version_id(version_id);
+        helper = helper.object(info).version_id(version_id.unwrap_or_default());
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);

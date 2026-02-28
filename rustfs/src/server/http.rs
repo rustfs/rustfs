@@ -21,7 +21,7 @@ use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
     compress::{CompressionConfig, CompressionPredicate},
     hybrid::hybrid,
-    layer::{ConditionalCorsLayer, RedirectLayer},
+    layer::{ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
 };
 use crate::storage;
 use crate::storage::tonic_service::make_server;
@@ -693,6 +693,7 @@ fn process_connection(
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
             .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
+            .layer(ObjectAttributesEtagFixLayer)
             // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
             // Admin has its own CORS handling in router.rs
             // Console has its own CORS layer in setup_console_middleware_stack()
