@@ -87,6 +87,7 @@ use rustfs_kms::{
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
 use rustfs_rio::{DecryptReader, EncryptReader, HardLimitReader, Reader, WarpReader};
+use s3s::S3ErrorCode;
 use s3s::dto::ServerSideEncryption;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -632,9 +633,10 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
         let (key, key_md5) = match (request.sse_customer_key, request.sse_customer_key_md5) {
             (Some(k), Some(md5)) => (k, md5),
             _ => {
-                return Err(ApiError::from(StorageError::other(
-                    "Object is encrypted with SSE-C but no customer key provided",
-                )));
+                return Err(ssec_invalid_request(
+                    "The object was stored using a form of Server Side Encryption. \
+                     The correct parameters must be provided to retrieve the object.",
+                ));
             }
         };
 
@@ -1432,38 +1434,36 @@ pub(crate) async fn decrypt_multipart_managed_stream(
 /// # Returns
 /// `ValidatedSsecParams` with decoded key bytes
 pub fn validate_ssec_params(params: SsecParams) -> Result<ValidatedSsecParams, ApiError> {
-    // Validate algorithm
     if !SUPPORT_SSE_ALGORITHMS.contains(&params.algorithm.as_str()) {
-        return Err(ApiError::from(StorageError::other(format!(
-            "Unsupported SSE-C algorithm: {}. Only {} is supported",
+        return Err(ssec_invalid_request(&format!(
+            "Unsupported SSE-C algorithm: {}. Only {} is supported.",
             params.algorithm, DEFAULT_SSE_ALGORITHM
-        ))));
+        )));
     }
 
-    // Decode Base64 key
     let key_bytes = BASE64_STANDARD.decode(&params.key).map_err(|e| {
         error!("Failed to decode SSE-C key: {}", e);
-        ApiError::from(StorageError::other("Invalid SSE-C key: not valid Base64"))
+        ssec_invalid_request("Invalid SSE-C key: not valid Base64.")
     })?;
 
-    // Validate key length (must be 32 bytes for AES-256)
     if key_bytes.len() != 32 {
-        return Err(ApiError::from(StorageError::other(format!(
-            "SSE-C key must be 32 bytes (256 bits), got {} bytes",
+        return Err(ssec_invalid_request(&format!(
+            "SSE-C key must be 32 bytes (256 bits), got {} bytes.",
             key_bytes.len()
-        ))));
+        )));
     }
 
-    // Verify MD5 hash
     let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
     if computed_md5 != params.key_md5 {
         error!("SSE-C key MD5 mismatch: expected '{}', got '{}'", params.key_md5, computed_md5);
-        return Err(ApiError::from(StorageError::other("SSE-C key MD5 mismatch")));
+        return Err(ssec_invalid_request(
+            "The calculated MD5 hash of the key did not match the hash that was provided.",
+        ));
     }
 
     let key_array: [u8; 32] = key_bytes
         .try_into()
-        .map_err(|_| ApiError::from(StorageError::other("SSE-C key must be exactly 32 bytes")))?;
+        .map_err(|_| ssec_invalid_request("SSE-C key must be exactly 32 bytes."))?;
 
     Ok(ValidatedSsecParams {
         algorithm: params.algorithm,
@@ -1485,17 +1485,71 @@ pub fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {
     nonce
 }
 
-/// Verify SSE-C key matches the stored metadata
+/// Verify SSE-C key matches the stored metadata.
 ///
-/// Used during GetObject to ensure the client provided the correct key.
+/// Used during GetObject/HeadObject to ensure the client provided the correct key.
+/// Returns 400 InvalidRequest on mismatch, consistent with AWS S3 behavior.
 pub fn verify_ssec_key_match(provided_md5: &str, stored_md5: Option<&String>) -> Result<(), ApiError> {
     match stored_md5 {
         Some(stored) if stored == provided_md5 => Ok(()),
-        Some(stored) => Err(ApiError::from(StorageError::other(format!(
-            "SSE-C key MD5 mismatch: provided '{}' but expected '{}'",
-            provided_md5, stored
-        )))),
-        None => Err(ApiError::from(StorageError::other("Object has no stored SSE-C key MD5"))),
+        Some(_) => Err(ssec_invalid_request(
+            "The provided encryption parameters did not match the ones used originally to encrypt the object.",
+        )),
+        None => Err(ssec_invalid_request("Object has no stored SSE-C key metadata.")),
+    }
+}
+
+/// Validate that the SSE-C headers required for reading an SSE-C encrypted object
+/// are present in the request. This is used by HeadObject which does not decrypt
+/// the data but still must verify the caller holds the correct key.
+///
+/// Performs full validation: decodes the customer key, recomputes its MD5,
+/// verifies the client-provided MD5 header matches the key, then compares
+/// the computed MD5 against the stored metadata. This prevents a client from
+/// bypassing validation by guessing/obtaining only the stored MD5 without
+/// possessing the actual encryption key.
+///
+/// Returns `Ok(())` if either the object is not SSE-C encrypted, or valid SSE-C
+/// headers are provided and the key matches. Returns 400 InvalidRequest otherwise.
+pub fn validate_ssec_for_read(
+    metadata: &HashMap<String, String>,
+    sse_customer_key: Option<&SSECustomerKey>,
+    sse_customer_key_md5: Option<&SSECustomerKeyMD5>,
+) -> Result<(), ApiError> {
+    let stored_algorithm = metadata.get("x-amz-server-side-encryption-customer-algorithm");
+    if stored_algorithm.is_none() {
+        return Ok(());
+    }
+
+    let (key, key_md5) = match (sse_customer_key, sse_customer_key_md5) {
+        (Some(k), Some(md5)) => (k, md5),
+        _ => {
+            return Err(ssec_invalid_request(
+                "The object was stored using a form of Server Side Encryption. \
+                 The correct parameters must be provided to retrieve the object.",
+            ));
+        }
+    };
+
+    // Full param validation: decode key, verify 32 bytes, recompute MD5
+    // from actual key bytes and compare to the client-provided MD5 header.
+    let algorithm = stored_algorithm.cloned().unwrap_or_else(|| DEFAULT_SSE_ALGORITHM.to_string());
+    let validated = validate_ssec_params(SsecParams {
+        algorithm,
+        key: key.to_string(),
+        key_md5: key_md5.clone(),
+    })?;
+
+    let stored_md5 = metadata.get("x-amz-server-side-encryption-customer-key-md5");
+    verify_ssec_key_match(&validated.key_md5, stored_md5)
+}
+
+/// Build an `ApiError` with `InvalidRequest` (HTTP 400) for SSE-C related errors.
+fn ssec_invalid_request(message: &str) -> ApiError {
+    ApiError {
+        code: S3ErrorCode::InvalidRequest,
+        message: message.to_string(),
+        source: None,
     }
 }
 
@@ -1931,5 +1985,116 @@ mod tests {
         // Test Debug format
         let debug_str = format!("{:?}", SSEType::SseKms);
         assert!(debug_str.contains("SseKms"));
+    }
+
+    #[test]
+    fn test_verify_ssec_key_match_returns_invalid_request() {
+        let stored = "stored_md5".to_string();
+        let err = verify_ssec_key_match("wrong_md5", Some(&stored)).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_verify_ssec_key_match_no_stored_returns_invalid_request() {
+        let err = verify_ssec_key_match("any_md5", None).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_ssec_for_read_non_encrypted_object() {
+        let metadata = HashMap::new();
+        let result = validate_ssec_for_read(&metadata, None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_ssec_for_read_missing_customer_key() {
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
+        metadata.insert(
+            "x-amz-server-side-encryption-customer-key-md5".to_string(),
+            "DWygnHRtgiJ77HCm+1rvHw==".to_string(),
+        );
+
+        let err = validate_ssec_for_read(&metadata, None, None).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_ssec_for_read_wrong_key() {
+        // Key A is used to "encrypt" the object (stored MD5 is from key A).
+        let key_a = [42u8; 32];
+        let stored_md5 = BASE64_STANDARD.encode(md5::compute(key_a).0);
+
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
+        metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), stored_md5);
+
+        // Key B is a different key; its MD5 won't match stored MD5.
+        let key_b = [99u8; 32];
+        let key_b_b64 = BASE64_STANDARD.encode(key_b);
+        let key_b_md5 = BASE64_STANDARD.encode(md5::compute(key_b).0);
+
+        let err = validate_ssec_for_read(&metadata, Some(&key_b_b64), Some(&key_b_md5)).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_ssec_for_read_correct_key() {
+        let key_bytes = [42u8; 32];
+        let key_b64 = BASE64_STANDARD.encode(key_bytes);
+        let key_md5 = BASE64_STANDARD.encode(md5::compute(key_bytes).0);
+
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
+        metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), key_md5.clone());
+
+        let result = validate_ssec_for_read(&metadata, Some(&key_b64), Some(&key_md5));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_ssec_for_read_spoofed_md5() {
+        // A client provides the correct stored MD5 in the header but with a
+        // DIFFERENT key. The server must recompute MD5 from the key bytes and
+        // reject the request because the recomputed MD5 won't match the header.
+        let real_key = [42u8; 32];
+        let stored_md5 = BASE64_STANDARD.encode(md5::compute(real_key).0);
+
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
+        metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), stored_md5.clone());
+
+        // Attacker has a different key but tries to pass the stored MD5 as their header
+        let fake_key = [99u8; 32];
+        let fake_key_b64 = BASE64_STANDARD.encode(fake_key);
+
+        let err = validate_ssec_for_read(&metadata, Some(&fake_key_b64), Some(&stored_md5)).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_ssec_params_returns_invalid_request_on_bad_algorithm() {
+        let key = BASE64_STANDARD.encode([42u8; 32]);
+        let key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
+        let params = SsecParams {
+            algorithm: "AES128".to_string(),
+            key,
+            key_md5,
+        };
+        let err = validate_ssec_params(params).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_validate_ssec_params_returns_invalid_request_on_bad_md5() {
+        let key = BASE64_STANDARD.encode([42u8; 32]);
+        let params = SsecParams {
+            algorithm: "AES256".to_string(),
+            key,
+            key_md5: BASE64_STANDARD.encode([99u8; 16]),
+        };
+        let err = validate_ssec_params(params).unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
     }
 }

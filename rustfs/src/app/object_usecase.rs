@@ -2745,6 +2745,14 @@ impl DefaultObjectUsecase {
         {
             return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
         }
+        // Validate SSE-C: if the object was encrypted with a customer-provided key,
+        // the caller must supply the matching key even for HEAD requests (per S3 spec).
+        validate_ssec_for_read(
+            &info.user_defined,
+            req.input.sse_customer_key.as_ref(),
+            req.input.sse_customer_key_md5.as_ref(),
+        )?;
+
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
