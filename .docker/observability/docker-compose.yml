@@ -70,17 +70,6 @@ services:
 
   # --- Tracing ---
 
-  tempo-init:
-    image: busybox:latest
-    container_name: tempo-init
-    command: ["sh", "-c", "chown -R 10001:10001 /var/tempo"]
-    volumes:
-      - tempo-data:/var/tempo
-    user: root
-    networks:
-      - otel-network
-    restart: no
-
   tempo:
     image: grafana/tempo:latest
     container_name: tempo
