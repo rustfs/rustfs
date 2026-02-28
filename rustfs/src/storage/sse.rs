@@ -381,11 +381,17 @@ pub(crate) fn extract_ssec_params_from_headers(headers: &HeaderMap) -> Result<Ss
 
 /// Extract x-amz-server-side-encryption from request headers.
 /// Used as fallback when the S3 layer does not populate it in the input struct.
-pub(crate) fn extract_server_side_encryption_from_headers(headers: &HeaderMap) -> Option<ServerSideEncryption> {
-    headers
-        .get("x-amz-server-side-encryption")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| ServerSideEncryption::from(s.to_string()))
+///
+/// Returns an error if the header is present but cannot be parsed as valid UTF-8,
+/// ensuring malformed headers do not bypass validation.
+pub(crate) fn extract_server_side_encryption_from_headers(headers: &HeaderMap) -> Result<Option<ServerSideEncryption>, ApiError> {
+    match headers.get("x-amz-server-side-encryption") {
+        None => Ok(None),
+        Some(v) => v
+            .to_str()
+            .map(|s| Some(ServerSideEncryption::from(s.to_string())))
+            .map_err(|_| sse_invalid_argument("The x-amz-server-side-encryption header must be valid UTF-8.")),
+    }
 }
 
 #[inline]
@@ -401,7 +407,7 @@ pub(crate) fn validate_sse_headers_for_write(
         let s = sse.as_str();
         if s != ServerSideEncryption::AES256 && s != ServerSideEncryption::AWS_KMS {
             return Err(sse_invalid_argument(
-                "The SSE algorithm specified is not supported. The valid value is AES256 or aws:kms.",
+                "The SSE algorithm specified is not supported. The valid values are AES256 or aws:kms.",
             ));
         }
     }
@@ -1765,6 +1771,17 @@ mod tests {
         let invalid_utf8 = HeaderValue::from_bytes(b"invalid-\x80-utf8").unwrap();
         headers.insert("x-amz-server-side-encryption-customer-algorithm", invalid_utf8);
         let result = extract_ssec_params_from_headers(&headers);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_extract_server_side_encryption_from_headers_rejects_invalid_utf8() {
+        let mut headers = http::HeaderMap::new();
+        let invalid_utf8 = HeaderValue::from_bytes(b"aes:kms-\x80-invalid").unwrap();
+        headers.insert("x-amz-server-side-encryption", invalid_utf8);
+        let result = extract_server_side_encryption_from_headers(&headers);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidArgument);
