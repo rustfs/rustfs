@@ -42,7 +42,7 @@ use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
         bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts},
-        lifecycle::{self, TransitionOptions},
+        lifecycle::{self, Lifecycle, TransitionOptions},
     },
     metadata::{BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
@@ -170,6 +170,36 @@ fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Op
         }
         None => Ok((None, None)),
     }
+}
+
+fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String> {
+    if !event.action.delete() {
+        return None;
+    }
+
+    let expire_time = event.due?;
+
+    if event.rule_id.is_empty() || expire_time == OffsetDateTime::UNIX_EPOCH {
+        return None;
+    }
+
+    let expiry_date = expire_time.format(&Rfc3339).ok()?;
+    Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
+}
+
+async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> Option<String> {
+    let Ok((lifecycle_config, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
+        debug!("resolve_put_object_expiration: lifecycle config not found for bucket {bucket}");
+        return None;
+    };
+
+    let obj_opts = lifecycle::ObjectOpts::from_object_info(obj_info);
+    let event = lifecycle_config.predict_expiration(&obj_opts).await;
+    debug!(
+        "resolve_put_object_expiration: bucket={bucket}, action={:?}, rule_id={}, due={:?}",
+        event.action, event.rule_id, event.due
+    );
+    build_put_object_expiration_header(&event)
 }
 
 #[derive(Clone, Default)]
@@ -516,9 +546,10 @@ impl DefaultObjectUsecase {
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts);
 
         let dsc = must_replicate(&bucket, &key, repoptions).await;
+        let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
 
         if dsc.replicate_any() {
-            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
+            schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
         }
 
         let mut checksums = PutObjectChecksums {
@@ -540,6 +571,7 @@ impl DefaultObjectUsecase {
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             ssekms_key_id: effective_kms_key_id,
+            expiration,
             checksum_crc32: checksums.crc32,
             checksum_crc32c: checksums.crc32c,
             checksum_sha1: checksums.sha1,
@@ -3830,6 +3862,62 @@ mod tests {
         let object_attributes = vec![ObjectAttributes::from_static("Checksum")];
 
         assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+    }
+
+    #[test]
+    fn build_put_object_expiration_header_returns_none_for_non_delete_events() {
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::TransitionAction,
+            rule_id: "rule-1".to_string(),
+            due: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        assert!(build_put_object_expiration_header(&event).is_none());
+    }
+
+    #[test]
+    fn build_put_object_expiration_header_formats_expected_value() {
+        let expire_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::DeleteAction,
+            rule_id: "rule-1".to_string(),
+            due: Some(expire_time),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        let expiry_date = expire_time.format(&Rfc3339).unwrap();
+        let expected = format!("expiry-date=\"{}\", rule-id=\"rule-1\"", expiry_date);
+        assert_eq!(build_put_object_expiration_header(&event), Some(expected));
+    }
+
+    #[test]
+    fn build_put_object_expiration_header_requires_rule_id_and_due_time() {
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::DeleteAction,
+            rule_id: String::new(),
+            due: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        assert!(build_put_object_expiration_header(&event).is_none());
+
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::DeleteAction,
+            rule_id: "rule-1".to_string(),
+            due: Some(OffsetDateTime::UNIX_EPOCH),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        assert!(build_put_object_expiration_header(&event).is_none());
     }
 
     #[tokio::test]
