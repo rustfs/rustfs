@@ -1,0 +1,68 @@
+# RustFS Log Configuration Example
+# This file demonstrates all available log configuration options
+
+# Directory where log files are stored
+log_dir = "./logs"
+
+# Prefix for log file names (e.g., "app.log." generates "app.log.2026-02-28")
+file_prefix = "rustfs.log."
+
+# Minimum number of log files to keep (even if size limits are exceeded)
+keep_count = 10
+
+# Maximum total size of all log files in bytes (0 = unlimited)
+# Example: 2GB = 2147483648
+max_total_size_bytes = 2147483648
+
+# Maximum size for a single log file in bytes (0 = unlimited)
+# Files exceeding this size become candidates for cleanup
+# Example: 100MB = 104857600
+max_single_file_size_bytes = 104857600
+
+# Enable gzip compression for old files before deletion
+compress_old_files = true
+
+# Gzip compression level (1-9)
+# 1 = fastest/lowest compression, 9 = slowest/highest compression
+gzip_compression_level = 6
+
+# How long to keep compressed .gz files (in days, 0 = forever)
+compressed_file_retention_days = 30
+
+# File patterns to exclude from cleanup (glob patterns)
+# These files will never be compressed or deleted
+exclude_patterns = [
+    "*.lock",
+    "current.log",
+    "*.tmp"
+]
+
+# Automatically delete empty (zero-byte) log files
+delete_empty_files = true
+
+# Minimum file age in seconds before cleanup
+# Files modified more recently than this will not be touched
+# Example: 3600 = 1 hour
+min_file_age_seconds = 3600
+
+# Log rotation period: "daily", "hourly", or "minutely"
+rotation = "daily"
+
+# OpenTelemetry endpoint (optional)
+# Example: "http://localhost:4317"
+# otel_endpoint = "http://localhost:4317"
+
+# Trace sampling ratio (0.0 to 1.0)
+trace_sample_ratio = 0.1
+
+# Log level: "trace", "debug", "info", "warn", "error"
+log_level = "info"
+
+# Cleanup task execution interval in seconds
+# Example: 21600 = 6 hours
+cleanup_interval_seconds = 21600
+
+# Dry-run mode: log what would be deleted without actually deleting
+# Useful for testing cleanup policies
+dry_run = false
+

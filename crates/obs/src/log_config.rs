@@ -44,6 +44,12 @@ pub struct LogConfig {
     /// Default: 2GB
     pub max_total_size_bytes: u64,
 
+    /// Maximum size of a single log file (bytes), 0 means no limit
+    /// When a file exceeds this size, it becomes a candidate for cleanup
+    /// Example: 100MB = 100 * 1024 * 1024
+    /// Default: 0 (no single file limit)
+    pub max_single_file_size_bytes: u64,
+
     /// Whether to gzip compress old log files before deletion
     /// When enabled, generates .gz files and removes the original files
     /// Default: true
@@ -54,8 +60,29 @@ pub struct LogConfig {
     /// Default: 6 (balances speed and compression ratio)
     pub gzip_compression_level: u32,
 
+    /// Retention period for compressed files (days)
+    /// Compressed files older than this will be permanently deleted
+    /// 0 means keep forever
+    /// Default: 30 days
+    pub compressed_file_retention_days: u64,
+
+    /// File patterns to exclude from cleanup (glob patterns)
+    /// Example: vec!["*.lock".to_string(), "current.log".to_string()]
+    /// These files will never be compressed or deleted
+    /// Default: empty (no exclusions)
+    pub exclude_patterns: Vec<String>,
+
+    /// Whether to delete empty log files during cleanup
+    /// Default: true
+    pub delete_empty_files: bool,
+
+    /// Minimum age (seconds) before a file can be cleaned up
+    /// Files modified more recently than this will not be touched
+    /// Default: 3600 (1 hour)
+    pub min_file_age_seconds: u64,
+
     /// Log file rotation period
-    /// Supported values: "daily" (daily), "hourly" (hourly)
+    /// Supported values: "daily" (daily), "hourly" (hourly), "minutely" (every minute, for testing)
     /// Default: "daily"
     pub rotation: String,
 
@@ -80,6 +107,11 @@ pub struct LogConfig {
     /// Default: 21600 (6 hours)
     /// Recommended range: 1800 (30 minutes) ~ 86400 (24 hours)
     pub cleanup_interval_seconds: u64,
+
+    /// Enable dry-run mode for cleanup (log what would be deleted without actually deleting)
+    /// Useful for testing and validation
+    /// Default: false
+    pub dry_run: bool,
 }
 
 impl Default for LogConfig {
@@ -89,13 +121,19 @@ impl Default for LogConfig {
             file_prefix: "app.log.".to_string(),
             keep_count: 10,
             max_total_size_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
+            max_single_file_size_bytes: 0,                // No single file limit
             compress_old_files: true,
             gzip_compression_level: 6,
+            compressed_file_retention_days: 30, // Keep compressed files for 30 days
+            exclude_patterns: Vec::new(),
+            delete_empty_files: true,
+            min_file_age_seconds: 3600, // 1 hour
             rotation: "daily".to_string(),
             otel_endpoint: None,
             trace_sample_ratio: 0.1,
             log_level: "info".to_string(),
             cleanup_interval_seconds: 6 * 3600, // 6 hours
+            dry_run: false,
         }
     }
 }

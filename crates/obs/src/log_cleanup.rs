@@ -20,12 +20,12 @@
 //! - Automatic gzip compression of old files (optional)
 //! - Batch deletion using fs operations
 
-use flate2::Compression;
 use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
 
@@ -43,8 +43,14 @@ pub struct LogCleaner {
     file_prefix: String,
     keep_count: usize,
     max_total_size_bytes: u64,
+    max_single_file_size_bytes: u64,
     compress_old_files: bool,
     gzip_compression_level: u32,
+    compressed_file_retention_days: u64,
+    exclude_patterns: Vec<glob::Pattern>,
+    delete_empty_files: bool,
+    min_file_age_seconds: u64,
+    dry_run: bool,
 }
 
 impl LogCleaner {
@@ -55,23 +61,48 @@ impl LogCleaner {
     /// * `file_prefix` - Log file prefix to match
     /// * `keep_count` - Minimum number of files to keep
     /// * `max_total_size_bytes` - Maximum total size in bytes (0 = unlimited)
+    /// * `max_single_file_size_bytes` - Maximum single file size in bytes (0 = unlimited)
     /// * `compress_old_files` - Whether to compress old files before deletion
     /// * `gzip_compression_level` - Gzip compression level (1-9)
+    /// * `compressed_file_retention_days` - Days to keep compressed files (0 = forever)
+    /// * `exclude_patterns` - File patterns to exclude from cleanup (glob patterns)
+    /// * `delete_empty_files` - Whether to delete empty files
+    /// * `min_file_age_seconds` - Minimum file age in seconds before cleanup
+    /// * `dry_run` - If true, only log what would be deleted without actually deleting
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         log_dir: PathBuf,
         file_prefix: String,
         keep_count: usize,
         max_total_size_bytes: u64,
+        max_single_file_size_bytes: u64,
         compress_old_files: bool,
         gzip_compression_level: u32,
+        compressed_file_retention_days: u64,
+        exclude_patterns: Vec<String>,
+        delete_empty_files: bool,
+        min_file_age_seconds: u64,
+        dry_run: bool,
     ) -> Self {
+        // Compile glob patterns
+        let patterns = exclude_patterns
+            .into_iter()
+            .filter_map(|p| glob::Pattern::new(&p).ok())
+            .collect();
+
         Self {
             log_dir,
             file_prefix,
             keep_count,
             max_total_size_bytes,
+            max_single_file_size_bytes,
             compress_old_files,
             gzip_compression_level: gzip_compression_level.clamp(1, 9),
+            compressed_file_retention_days,
+            exclude_patterns: patterns,
+            delete_empty_files,
+            min_file_age_seconds,
+            dry_run,
         }
     }
 
@@ -138,6 +169,7 @@ impl LogCleaner {
     /// Collect all log files matching the prefix
     fn collect_log_files(&self) -> Result<Vec<FileInfo>, std::io::Error> {
         let mut files = Vec::new();
+        let now = SystemTime::now();
 
         for entry in WalkDir::new(&self.log_dir)
             .max_depth(1)
@@ -158,8 +190,14 @@ impl LogCleaner {
                     continue;
                 }
 
-                // Skip already compressed files
+                // Skip already compressed files (they are handled separately)
                 if filename.ends_with(".gz") {
+                    continue;
+                }
+
+                // Check exclusion patterns
+                if self.is_excluded(filename) {
+                    debug!("Excluding file from cleanup: {:?}", filename);
                     continue;
                 }
 
@@ -167,19 +205,106 @@ impl LogCleaner {
                 if let Ok(metadata) = entry.metadata()
                     && let Ok(modified) = metadata.modified()
                 {
+                    let file_size = metadata.len();
+
+                    // Skip empty files if configured to delete them separately
+                    if file_size == 0 && self.delete_empty_files {
+                        // Handle empty files immediately
+                        if !self.dry_run {
+                            if let Err(e) = std::fs::remove_file(path) {
+                                warn!("Failed to delete empty file {:?}: {}", path, e);
+                            } else {
+                                debug!("Deleted empty file: {:?}", path);
+                            }
+                        } else {
+                            info!("[DRY RUN] Would delete empty file: {:?}", path);
+                        }
+                        continue;
+                    }
+
+                    // Check if file is old enough to be cleaned up
+                    if let Ok(age) = now.duration_since(modified) {
+                        if age.as_secs() < self.min_file_age_seconds {
+                            debug!(
+                                "Skipping file (too new): {:?}, age: {}s, min_age: {}s",
+                                filename,
+                                age.as_secs(),
+                                self.min_file_age_seconds
+                            );
+                            continue;
+                        }
+                    }
+
                     files.push(FileInfo {
                         path: path.to_path_buf(),
-                        size: metadata.len(),
+                        size: file_size,
                         modified,
                     });
                 }
             }
         }
 
+        // Also collect compressed files for retention checking
+        self.collect_compressed_files(&mut files)?;
+
         Ok(files)
     }
 
-    /// Select files to delete based on count and size limits
+    /// Check if a filename matches any exclusion pattern
+    fn is_excluded(&self, filename: &str) -> bool {
+        for pattern in &self.exclude_patterns {
+            if pattern.matches(filename) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Collect compressed files and check their retention period
+    fn collect_compressed_files(&self, files: &mut Vec<FileInfo>) -> Result<(), std::io::Error> {
+        if self.compressed_file_retention_days == 0 {
+            return Ok(()); // Keep compressed files forever
+        }
+
+        let retention_duration = Duration::from_secs(self.compressed_file_retention_days * 24 * 3600);
+        let now = SystemTime::now();
+
+        for entry in WalkDir::new(&self.log_dir)
+            .max_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+
+            if !path.is_file() {
+                continue;
+            }
+
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                // Only check .gz files that start with our prefix
+                if filename.starts_with(&self.file_prefix) && filename.ends_with(".gz") {
+                    if let Ok(metadata) = entry.metadata()
+                        && let Ok(modified) = metadata.modified()
+                        && let Ok(age) = now.duration_since(modified)
+                    {
+                        // If compressed file is older than retention period, mark for deletion
+                        if age > retention_duration {
+                            files.push(FileInfo {
+                                path: path.to_path_buf(),
+                                size: metadata.len(),
+                                modified,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Select files to delete based on count, size limits, and single file size
     fn select_files_to_delete(&self, files: &[FileInfo], total_size: u64) -> Vec<FileInfo> {
         let mut to_delete = Vec::new();
 
@@ -198,18 +323,31 @@ impl LogCleaner {
                 break;
             }
 
-            // Check if we need to delete based on size limit
+            // Check if we need to delete based on size limit or single file size
             let should_delete = if self.max_total_size_bytes > 0 {
                 current_size > self.max_total_size_bytes
             } else {
                 false
             };
 
-            if should_delete {
+            // Also check if this file exceeds single file size limit
+            let exceeds_single_file_limit = if self.max_single_file_size_bytes > 0 {
+                file_info.size > self.max_single_file_size_bytes
+            } else {
+                false
+            };
+
+            if should_delete || exceeds_single_file_limit {
+                if exceeds_single_file_limit {
+                    debug!(
+                        "File exceeds single file size limit: {:?} ({} bytes > {} bytes)",
+                        file_info.path, file_info.size, self.max_single_file_size_bytes
+                    );
+                }
                 to_delete.push(file_info.clone());
                 current_size = current_size.saturating_sub(file_info.size);
-            } else {
-                // If size limit is met, stop deleting
+            } else if should_delete {
+                // If size limit is met and single file limit not exceeded, stop deleting
                 break;
             }
         }
@@ -223,6 +361,11 @@ impl LogCleaner {
 
         // Skip if compressed file already exists
         if compressed_path.exists() {
+            return Ok(());
+        }
+
+        if self.dry_run {
+            info!("[DRY RUN] Would compress file: {:?} -> {:?}", path, compressed_path);
             return Ok(());
         }
 
@@ -258,14 +401,20 @@ impl LogCleaner {
         let mut freed_bytes = 0;
 
         for file_info in files {
-            match std::fs::remove_file(&file_info.path) {
-                Ok(()) => {
-                    deleted_count += 1;
-                    freed_bytes += file_info.size;
-                    debug!("Deleted file: {:?}", file_info.path);
-                }
-                Err(e) => {
-                    error!("Failed to delete file {:?}: {}", file_info.path, e);
+            if self.dry_run {
+                info!("[DRY RUN] Would delete file: {:?} ({} bytes)", file_info.path, file_info.size);
+                deleted_count += 1;
+                freed_bytes += file_info.size;
+            } else {
+                match std::fs::remove_file(&file_info.path) {
+                    Ok(()) => {
+                        deleted_count += 1;
+                        freed_bytes += file_info.size;
+                        debug!("Deleted file: {:?}", file_info.path);
+                    }
+                    Err(e) => {
+                        error!("Failed to delete file {:?}: {}", file_info.path, e);
+                    }
                 }
             }
         }
@@ -300,7 +449,20 @@ mod tests {
         create_test_log_file(&log_dir, "app.log.2024-01-03", 1024)?;
         create_test_log_file(&log_dir, "other.log", 1024)?; // Should be ignored
 
-        let cleaner = LogCleaner::new(log_dir.clone(), "app.log.".to_string(), 2, 2048, false, 6);
+        let cleaner = LogCleaner::new(
+            log_dir.clone(),
+            "app.log.".to_string(),
+            2,          // keep_count
+            2048,       // max_total_size_bytes
+            0,          // max_single_file_size_bytes
+            false,      // compress_old_files
+            6,          // gzip_compression_level
+            30,         // compressed_file_retention_days
+            Vec::new(), // exclude_patterns
+            true,       // delete_empty_files
+            0,          // min_file_age_seconds (0 for testing)
+            false,      // dry_run
+        );
 
         let (deleted_count, freed_bytes) = cleaner.cleanup()?;
 
@@ -320,7 +482,20 @@ mod tests {
             create_test_log_file(&log_dir, &format!("app.log.2024-01-0{}", i), 1024)?;
         }
 
-        let cleaner = LogCleaner::new(log_dir.clone(), "app.log.".to_string(), 3, 0, false, 6);
+        let cleaner = LogCleaner::new(
+            log_dir.clone(),
+            "app.log.".to_string(),
+            3,          // keep_count
+            0,          // max_total_size_bytes
+            0,          // max_single_file_size_bytes
+            false,      // compress_old_files
+            6,          // gzip_compression_level
+            30,         // compressed_file_retention_days
+            Vec::new(), // exclude_patterns
+            true,       // delete_empty_files
+            0,          // min_file_age_seconds (0 for testing)
+            false,      // dry_run
+        );
 
         let (deleted_count, _) = cleaner.cleanup()?;
 
@@ -339,7 +514,20 @@ mod tests {
         create_test_log_file(&log_dir, "app.log.2024-01-02", 2048)?;
         create_test_log_file(&log_dir, "other.log", 512)?;
 
-        let cleaner = LogCleaner::new(log_dir.clone(), "app.log.".to_string(), 1, 0, false, 6);
+        let cleaner = LogCleaner::new(
+            log_dir.clone(),
+            "app.log.".to_string(),
+            1,          // keep_count
+            0,          // max_total_size_bytes
+            0,          // max_single_file_size_bytes
+            false,      // compress_old_files
+            6,          // gzip_compression_level
+            30,         // compressed_file_retention_days
+            Vec::new(), // exclude_patterns
+            true,       // delete_empty_files
+            0,          // min_file_age_seconds (0 for testing)
+            false,      // dry_run
+        );
         let files = cleaner.collect_log_files()?;
 
         assert_eq!(files.len(), 2);

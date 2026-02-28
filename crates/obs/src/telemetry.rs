@@ -17,25 +17,25 @@ use crate::global::OBSERVABILITY_METRIC_ENABLED;
 use crate::log_cleanup::LogCleaner;
 use crate::{Recorder, TelemetryError};
 use metrics::counter;
-use opentelemetry::{KeyValue, global, trace::TracerProvider};
+use opentelemetry::{global, trace::TracerProvider, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::{
-    Resource,
     logs::SdkLoggerProvider,
     metrics::{PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
+    Resource,
 };
 use opentelemetry_semantic_conventions::{
-    SCHEMA_URL,
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
+    SCHEMA_URL,
 };
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
-    DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
+    observability::{DEFAULT_OBS_ENVIRONMENT_PRODUCTION, ENV_OBS_LOG_DIRECTORY}, APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
+    DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL,
+    SAMPLE_RATIO,
     SERVICE_VERSION,
-    observability::{DEFAULT_OBS_ENVIRONMENT_PRODUCTION, ENV_OBS_LOG_DIRECTORY},
 };
 use rustfs_utils::{get_env_opt_str, get_local_ip_with_default};
 use smallvec::SmallVec;
@@ -44,10 +44,10 @@ use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::{
-    EnvFilter, Layer,
-    fmt::{format::FmtSpan, time::LocalTime},
-    layer::SubscriberExt,
+    fmt::{format::FmtSpan, time::LocalTime}, layer::SubscriberExt,
     util::SubscriberInitExt,
+    EnvFilter,
+    Layer,
 };
 
 /// A guard object that manages the lifecycle of OpenTelemetry components.
@@ -307,8 +307,14 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
         file_prefix,
         keep_files,
         max_size,
+        0, // max_single_file_size_bytes - no single file limit by default
         compress,
-        6, // Default gzip compression level
+        6,          // gzip_compression_level
+        30,         // compressed_file_retention_days
+        Vec::new(), // exclude_patterns
+        true,       // delete_empty_files
+        3600,       // min_file_age_seconds (1 hour)
+        false,      // dry_run
     );
 
     // Spawn cleanup task (runs every 6 hours by default)

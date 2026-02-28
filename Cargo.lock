@@ -7367,8 +7367,6 @@ dependencies = [
 name = "rustfs-keystone"
 version = "0.0.5"
 dependencies = [
- "anyhow",
- "axum",
  "bytes",
  "futures",
  "http 1.4.0",
@@ -7377,7 +7375,6 @@ dependencies = [
  "hyper",
  "moka",
  "reqwest 0.13.2",
- "rustfs-common",
  "rustfs-credentials",
  "rustfs-policy",
  "serde",
@@ -7387,7 +7384,6 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -7514,8 +7510,8 @@ name = "rustfs-obs"
 version = "0.0.5"
 dependencies = [
  "flate2",
+ "glob",
  "metrics",
- "nu-ansi-term",
  "nvml-wrapper",
  "opentelemetry",
  "opentelemetry-appender-tracing",
