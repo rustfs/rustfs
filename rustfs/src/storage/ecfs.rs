@@ -19,7 +19,7 @@ use rustfs_ecstore::{
     bucket::tagging::decode_tags_to_map,
     error::{is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
-    store_api::{ObjectOperations, ObjectOptions},
+    store_api::{BucketOperations, BucketOptions, ObjectOperations, ObjectOptions},
 };
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use serde::{Deserialize, Serialize};
@@ -1020,6 +1020,28 @@ impl S3 for FS {
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_cors(req).await
+    }
+
+    async fn get_bucket_logging(&self, req: S3Request<GetBucketLoggingInput>) -> S3Result<S3Response<GetBucketLoggingOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+        Err(s3_error!(NotImplemented, "GetBucketLogging is not implemented yet"))
+    }
+
+    async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+        Err(s3_error!(NotImplemented, "PutBucketLogging is not implemented yet"))
     }
 
     async fn put_bucket_encryption(
