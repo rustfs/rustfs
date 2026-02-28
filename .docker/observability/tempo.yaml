@@ -1,28 +1,57 @@
+partition_ring_live_store: true
+stream_over_http_enabled: true
+
 server:
   http_listen_port: 3200
+  log_level: info
 
 distributor:
+  ingester_write_path_enabled: false
+  kafka_write_path_enabled: true
   receivers:
     otlp:
       protocols:
-        http:
         grpc:
+          endpoint: "tempo:4317"
+        http:
+          endpoint: "tempo:4318"
+  #log_received_spans:
+  #    enabled: true
+  #  log_discarded_spans:
+  #    enabled: true
 
-ingester:
-  max_block_duration: 30m
+backend_scheduler:
+  provider:
+    compaction:
+      compaction:
+        block_retention: 1h
+
+backend_worker:
+  backend_scheduler_addr: localhost:3200
+  compaction:
+    block_retention: 1h
+  ring:
+    kvstore:
+      store: memberlist
+
+querier:
+  query_live_store: true
 
 metrics_generator:
   registry:
     external_labels:
       source: tempo
+      cluster: docker-compose
   storage:
-    path: /tmp/tempo/generator/wal
+    path: /var/tempo/generator/wal
     remote_write:
       - url: http://prometheus:9090/api/v1/write
         send_exemplars: true
 
-querier:
-  query_live_store: false
+query_frontend:
+  rf1_after: "1999-01-01T00:00:00Z"
+  mcp_server:
+    enabled: true
 
 storage:
   trace:
@@ -32,6 +61,21 @@ storage:
     local:
       path: /var/tempo/blocks
 
-
 overrides:
-  metrics_generator_processors: [service-graphs, span-metrics] # enables metrics generator
+  defaults:
+    metrics_generator:
+      processors: ["span-metrics", "service-graphs"]
+      generate_native_histograms: both
+
+ingest:
+  enabled: true
+  kafka:
+    address: redpanda:9092
+    topic: tempo-ingest
+
+block_builder:
+  consume_cycle_duration: 30s
+
+usage_report:
+  reporting_enabled: false
+
