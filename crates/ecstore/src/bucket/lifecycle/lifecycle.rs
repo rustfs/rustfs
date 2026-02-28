@@ -45,6 +45,7 @@ const _ERR_XML_NOT_WELL_FORMED: &str =
 const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
     "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an retention bucket";
 const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration should have at most 1000 rules";
+const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "Lifecycle expiration days must be greater than 0";
 
 pub use rustfs_common::metrics::IlmAction;
 
@@ -232,6 +233,13 @@ impl Lifecycle for BucketLifecycleConfiguration {
         }
 
         for r in &self.rules {
+            if let Some(expiration) = &r.expiration {
+                if let Some(days) = expiration.days {
+                    if days <= 0 {
+                        return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS));
+                    }
+                }
+            }
             r.validate()?;
             /*if let Some(object_lock_enabled) = lr.object_lock_enabled.as_ref() {
                 if let Some(expiration) = r.expiration.as_ref() {
@@ -768,5 +776,61 @@ impl Default for TransitionOptions {
             restore_expiry: OffsetDateTime::now_utc(),
             expire_restored: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn validate_rejects_non_positive_expiration_days() {
+        let lc = BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(0),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let err = lc
+            .validate(&ObjectLockConfiguration::default())
+            .await
+            .expect_err("expected validation error");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS);
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_positive_expiration_days() {
+        let lc = BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        lc.validate(&ObjectLockConfiguration::default())
+            .await
+            .expect("expected validation to pass");
     }
 }

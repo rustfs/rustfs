@@ -387,8 +387,12 @@ impl ObjectInfo {
         }
 
         // Check if object is encrypted
-        // Encrypted objects store original size in x-rustfs-encryption-original-size metadata
-        if let Some(size_str) = self.user_defined.get("x-rustfs-encryption-original-size")
+        // Managed SSE stores original size in x-rustfs-encryption-original-size metadata
+        // SSE-C stores original size in x-amz-server-side-encryption-customer-original-size
+        if let Some(size_str) = self
+            .user_defined
+            .get("x-rustfs-encryption-original-size")
+            .or_else(|| self.user_defined.get("x-amz-server-side-encryption-customer-original-size"))
             && !size_str.is_empty()
         {
             let size = size_str
@@ -1009,4 +1013,103 @@ pub enum WalkVersionsSortOrder {
 pub struct ObjectInfoOrErr {
     pub item: Option<ObjectInfo>,
     pub err: Option<Error>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_actual_size_prefers_actual_size_field() {
+        let info = ObjectInfo {
+            size: 5,
+            actual_size: 10,
+            ..Default::default()
+        };
+
+        assert_eq!(info.get_actual_size().unwrap(), 10);
+    }
+
+    #[test]
+    fn get_actual_size_uses_compressed_metadata_size() {
+        let user_defined = {
+            let mut map = HashMap::new();
+            map.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), "zstd".to_string());
+            map.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), "42".to_string());
+            map
+        };
+
+        let info = ObjectInfo {
+            size: 100,
+            actual_size: 0,
+            user_defined,
+            ..Default::default()
+        };
+
+        assert_eq!(info.get_actual_size().unwrap(), 42);
+    }
+
+    #[test]
+    fn get_actual_size_falls_back_to_encrypted_original_size_metadata() {
+        let user_defined = {
+            let mut map = HashMap::new();
+            map.insert("x-amz-server-side-encryption-customer-original-size".to_string(), "77".to_string());
+            map
+        };
+
+        let info = ObjectInfo {
+            size: 100,
+            actual_size: 0,
+            user_defined,
+            ..Default::default()
+        };
+
+        assert_eq!(info.get_actual_size().unwrap(), 77);
+    }
+
+    #[test]
+    fn get_actual_size_uses_compressed_parts_actual_size_when_metadata_missing() {
+        let user_defined = {
+            let mut map = HashMap::new();
+            map.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), "zstd".to_string());
+            map
+        };
+
+        let info = ObjectInfo {
+            size: 12,
+            actual_size: 0,
+            user_defined,
+            parts: vec![
+                rustfs_filemeta::ObjectPartInfo {
+                    actual_size: 4,
+                    ..Default::default()
+                },
+                rustfs_filemeta::ObjectPartInfo {
+                    actual_size: 5,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(info.get_actual_size().unwrap(), 9);
+    }
+
+    #[test]
+    fn get_actual_size_returns_error_when_compressed_parts_missing_and_size_mismatch() {
+        let user_defined = {
+            let mut map = HashMap::new();
+            map.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), "zstd".to_string());
+            map
+        };
+
+        let info = ObjectInfo {
+            size: 12,
+            actual_size: 0,
+            user_defined,
+            ..Default::default()
+        };
+
+        assert!(info.get_actual_size().is_err());
+    }
 }
