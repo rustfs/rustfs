@@ -60,7 +60,7 @@ use s3s::dto::*;
 use s3s::region::Region;
 use s3s::xml;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use std::{fmt::Display, sync::Arc};
+use std::{collections::HashSet, fmt::Display, sync::Arc};
 use tracing::{debug, error, info, instrument, warn};
 use urlencoding::encode;
 
@@ -77,6 +77,45 @@ fn resolve_notification_region(global_region: Option<Region>, request_region: Op
         .or(request_region)
         .map(|region| region.to_string())
         .unwrap_or_else(|| RUSTFS_REGION.to_string())
+}
+
+const ERR_LIFECYCLE_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
+
+fn assign_lifecycle_rule_ids(rules: &mut [LifecycleRule]) {
+    let mut rule_ids: HashSet<String> = HashSet::new();
+
+    for rule in rules.iter() {
+        if let Some(id) = rule.id.as_ref() {
+            rule_ids.insert(id.to_string());
+        }
+    }
+
+    for (idx, rule) in rules.iter_mut().enumerate() {
+        if rule.id.is_none() {
+            let mut suffix = 0usize;
+            let mut generated_id = format!("rule-{}", idx);
+
+            while rule_ids.contains(&generated_id) {
+                suffix += 1;
+                generated_id = format!("rule-{idx}-{suffix}");
+            }
+
+            rule_ids.insert(generated_id.clone());
+            rule.id = Some(generated_id);
+        }
+    }
+}
+
+fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> Result<(), &'static str> {
+    for rule in rules {
+        if rule.status != ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+            && rule.status != ExpirationStatus::from_static(ExpirationStatus::DISABLED)
+        {
+            return Err(ERR_LIFECYCLE_RULE_STATUS);
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -463,7 +502,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
+        Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -641,8 +680,11 @@ impl DefaultBucketUsecase {
         let server_side_encryption_configuration = match metadata_sys::get_sse_config(&bucket).await {
             Ok((cfg, _)) => Some(cfg),
             Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(s3_error!(ServerSideEncryptionConfigurationNotFoundError));
+                }
                 warn!("get_sse_config err {:?}", err);
-                None
+                return Err(ApiError::from(err).into());
             }
         };
 
@@ -1075,17 +1117,27 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
+        let Some(mut input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
+        assign_lifecycle_rule_ids(&mut input_cfg.rules);
+        if let Err(err) = validate_lifecycle_rule_status(&input_cfg.rules) {
+            return Err(S3Error::with_message(S3ErrorCode::MalformedXML, format!("Malformed XML: {err}")));
+        }
 
-        let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
-        if let Ok(rcfg) = rcfg
-            && let Err(err) = rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg.0).await
-        {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
+        let rcfg = match metadata_sys::get_object_lock_config(&bucket).await {
+            Ok((cfg, _)) => cfg,
+            Err(StorageError::ConfigNotFound) => ObjectLockConfiguration::default(),
+            Err(err) => {
+                warn!("get_object_lock_config err {:?}", err);
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        if let Err(err) = rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg).await {
+            return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
         if let Err(err) = validate_transition_tier(&input_cfg).await {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("CustomError".into()), err.to_string()));
+            return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
         let data = serialize_config(&input_cfg)?;
@@ -1895,6 +1947,80 @@ mod tests {
 
         let err = usecase.execute_get_bucket_versioning(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn normalize_lifecycle_rules_generate_rule_ids_for_missing_values() {
+        let mut rules = vec![
+            LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            },
+            LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(60),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: Some("rule-1".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            },
+            LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(90),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            },
+        ];
+
+        assign_lifecycle_rule_ids(&mut rules);
+
+        assert_eq!(rules[0].id.as_deref(), Some("rule-0"));
+        assert_eq!(rules[1].id.as_deref(), Some("rule-1"));
+        assert_eq!(rules[2].id.as_deref(), Some("rule-2"));
+    }
+
+    #[test]
+    fn validate_lifecycle_rule_status_rejects_invalid_status() {
+        let rules = vec![LifecycleRule {
+            status: ExpirationStatus::from_static("enabled"),
+            expiration: Some(LifecycleExpiration {
+                days: Some(30),
+                ..Default::default()
+            }),
+            abort_incomplete_multipart_upload: None,
+            filter: None,
+            id: None,
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }];
+
+        assert_eq!(validate_lifecycle_rule_status(&rules).unwrap_err(), ERR_LIFECYCLE_RULE_STATUS);
     }
 
     #[tokio::test]

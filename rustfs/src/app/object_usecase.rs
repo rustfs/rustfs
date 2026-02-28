@@ -28,6 +28,7 @@ use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256, get_opts, put_opts,
 };
+use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{restore, select};
 use crate::storage::*;
 use bytes::Bytes;
@@ -41,7 +42,7 @@ use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
         bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts},
-        lifecycle::{self, TransitionOptions},
+        lifecycle::{self, Lifecycle, TransitionOptions},
     },
     metadata::{BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
@@ -84,7 +85,8 @@ use rustfs_utils::http::{
     headers::{
         AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
         AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT, RESERVED_METADATA_PREFIX_LOWER,
+        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
+        RESERVED_METADATA_PREFIX_LOWER,
     },
 };
 use rustfs_utils::path::{is_dir_object, path_join_buf};
@@ -168,6 +170,36 @@ fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Op
         }
         None => Ok((None, None)),
     }
+}
+
+fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String> {
+    if !event.action.delete() {
+        return None;
+    }
+
+    let expire_time = event.due?;
+
+    if event.rule_id.is_empty() || expire_time == OffsetDateTime::UNIX_EPOCH {
+        return None;
+    }
+
+    let expiry_date = expire_time.format(&Rfc3339).ok()?;
+    Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
+}
+
+async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> Option<String> {
+    let Ok((lifecycle_config, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
+        debug!("resolve_put_object_expiration: lifecycle config not found for bucket {bucket}");
+        return None;
+    };
+
+    let obj_opts = lifecycle::ObjectOpts::from_object_info(obj_info);
+    let event = lifecycle_config.predict_expiration(&obj_opts).await;
+    debug!(
+        "resolve_put_object_expiration: bucket={bucket}, action={:?}, rule_id={}, due={:?}",
+        event.action, event.rule_id, event.due
+    );
+    build_put_object_expiration_header(&event)
 }
 
 #[derive(Clone, Default)]
@@ -514,9 +546,10 @@ impl DefaultObjectUsecase {
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts);
 
         let dsc = must_replicate(&bucket, &key, repoptions).await;
+        let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
 
         if dsc.replicate_any() {
-            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
+            schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
         }
 
         let mut checksums = PutObjectChecksums {
@@ -538,6 +571,7 @@ impl DefaultObjectUsecase {
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             ssekms_key_id: effective_kms_key_id,
+            expiration,
             checksum_crc32: checksums.crc32,
             checksum_crc32c: checksums.crc32c,
             checksum_sha1: checksums.sha1,
@@ -1219,6 +1253,8 @@ impl DefaultObjectUsecase {
             rs = HTTPRangeSpec::from_object_info(&info, part_number);
         }
 
+        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
+
         let mut content_length = info.get_actual_size().map_err(ApiError::from)?;
 
         let content_range = if let Some(rs) = &rs {
@@ -1575,33 +1611,223 @@ impl DefaultObjectUsecase {
         }
 
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, "s3:GetObjectAttributes");
-        let GetObjectAttributesInput { bucket, key, .. } = req.input.clone();
+        let GetObjectAttributesInput {
+            bucket,
+            key,
+            max_parts,
+            object_attributes,
+            part_number_marker,
+            version_id,
+            sse_customer_key,
+            sse_customer_key_md5,
+            ..
+        } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        if let Err(e) = store
-            .get_object_reader(&bucket, &key, None, HeaderMap::new(), &ObjectOptions::default())
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-        {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
+            .map_err(ApiError::from)?;
+
+        let info = match store.get_object_info(&bucket, &key, &opts).await {
+            Ok(info) => info,
+            Err(err) => {
+                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    if is_dir_object(&key) {
+                        let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
+                            Ok(has_children) => has_children,
+                            Err(e) => {
+                                error!(
+                                    "Failed to probe children for object attributes (bucket: {}, key: {}): {}",
+                                    bucket, key, e
+                                );
+                                false
+                            }
+                        };
+                        let msg = head_prefix_not_found_message(&bucket, &key, has_children);
+                        return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
+                    }
+                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                }
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        if info.delete_marker {
+            if opts.version_id.is_none() {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+            }
+            return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
         }
 
+        validate_ssec_for_read(&info.user_defined, sse_customer_key.as_ref(), sse_customer_key_md5.as_ref())?;
+
+        let metadata_map = info.user_defined.clone();
+        let storage_class = info
+            .storage_class
+            .clone()
+            .or_else(|| metadata_map.get(AMZ_STORAGE_CLASS).cloned())
+            .filter(|s| !s.is_empty())
+            .map(StorageClass::from);
+
+        debug!(
+            "GetObjectAttributes raw object_attributes={:?}",
+            object_attributes.iter().map(|value| value.as_str()).collect::<Vec<_>>()
+        );
+
+        let requested = |name: &'static str| -> bool { object_attributes_requested(&object_attributes, name) };
+
+        let e_tag = if requested(ObjectAttributes::ETAG) {
+            info.etag.as_ref().map(|etag| to_s3s_etag(etag))
+        } else {
+            None
+        };
+
+        let object_size = if requested(ObjectAttributes::OBJECT_SIZE) {
+            Some(info.get_actual_size().map_err(ApiError::from)?)
+        } else {
+            None
+        };
+
+        let checksum = if requested(ObjectAttributes::CHECKSUM) {
+            let (checksums, _is_multipart) = info.decrypt_checksums(0, &req.headers).map_err(ApiError::from)?;
+            let mut checksum_crc32 = None;
+            let mut checksum_crc32c = None;
+            let mut checksum_sha1 = None;
+            let mut checksum_sha256 = None;
+            let mut checksum_crc64nvme = None;
+            let mut checksum_type = None;
+
+            for (k, v) in checksums {
+                if k == AMZ_CHECKSUM_TYPE {
+                    checksum_type = Some(ChecksumType::from(v));
+                    continue;
+                }
+                match rustfs_rio::ChecksumType::from_string(k.as_str()) {
+                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(v),
+                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(v),
+                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(v),
+                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(v),
+                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(v),
+                    _ => (),
+                }
+            }
+
+            Some(Checksum {
+                checksum_crc32,
+                checksum_crc32c,
+                checksum_sha1,
+                checksum_sha256,
+                checksum_crc64nvme,
+                checksum_type,
+            })
+        } else {
+            None
+        };
+
+        let object_parts = if requested(ObjectAttributes::OBJECT_PARTS) && info.is_multipart() {
+            let params = parse_list_parts_params(part_number_marker, max_parts)?;
+            let mut parts = Vec::new();
+            let mut marker = params.part_number_marker;
+            let max_parts = params.max_parts;
+            let mut start_at = 0usize;
+
+            if let Some(marker_value) = marker {
+                if let Some(index) = info.parts.iter().position(|part| part.number == marker_value) {
+                    start_at = index + 1;
+                } else {
+                    marker = None;
+                }
+            }
+
+            let max_parts: i32 = max_parts.try_into().map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "max-parts value is out of range".to_string())
+            })?;
+            let end = (start_at + params.max_parts).min(info.parts.len());
+            let is_truncated = end < info.parts.len();
+
+            for part in &info.parts[start_at..end] {
+                let (checksums, _is_multipart) = info.decrypt_checksums(part.number, &req.headers).map_err(ApiError::from)?;
+                let mut checksum_crc32 = None;
+                let mut checksum_crc32c = None;
+                let mut checksum_sha1 = None;
+                let mut checksum_sha256 = None;
+                let mut checksum_crc64nvme = None;
+
+                for (k, v) in checksums {
+                    match rustfs_rio::ChecksumType::from_string(k.as_str()) {
+                        rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(v),
+                        rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(v),
+                        rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(v),
+                        rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(v),
+                        rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(v),
+                        _ => (),
+                    }
+                }
+
+                let part_size = if part.actual_size > 0 {
+                    part.actual_size
+                } else {
+                    part.size.try_into().map_err(|_| {
+                        S3Error::with_message(S3ErrorCode::InvalidArgument, "Part size value is out of range".to_string())
+                    })?
+                };
+
+                parts.push(ObjectPart {
+                    checksum_crc32,
+                    checksum_crc32c,
+                    checksum_sha1,
+                    checksum_sha256,
+                    checksum_crc64nvme,
+                    part_number: i32::try_from(part.number).ok(),
+                    size: Some(part_size),
+                });
+            }
+
+            let part_number_marker = marker.and_then(|v| i32::try_from(v).ok());
+            let next_part_number_marker = parts.last().and_then(|part| part.part_number);
+
+            Some(GetObjectAttributesParts {
+                is_truncated: Some(is_truncated),
+                max_parts: Some(max_parts),
+                next_part_number_marker,
+                part_number_marker,
+                parts: Some(parts),
+                total_parts_count: Some(i32::try_from(info.parts.len()).map_err(|_| {
+                    S3Error::with_message(S3ErrorCode::InvalidArgument, "Part count is out of range".to_string())
+                })?),
+            })
+        } else {
+            None
+        };
+
+        let version_id = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
+            info.version_id.map(|vid| {
+                if vid == Uuid::nil() {
+                    "null".to_string()
+                } else {
+                    vid.to_string()
+                }
+            })
+        } else {
+            None
+        };
+
         let output = GetObjectAttributesOutput {
-            delete_marker: None,
-            object_parts: None,
+            checksum,
+            delete_marker: if info.delete_marker { Some(true) } else { None },
+            e_tag,
+            last_modified: info.mod_time.map(Timestamp::from),
+            object_parts,
+            object_size,
+            storage_class,
+            version_id: version_id.clone(),
             ..Default::default()
         };
 
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper
-            .object(ObjectInfo {
-                name: key.clone(),
-                bucket,
-                ..Default::default()
-            })
-            .version_id(version_id);
+        helper = helper.object(info).version_id(version_id.unwrap_or_default());
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
@@ -2745,6 +2971,16 @@ impl DefaultObjectUsecase {
         {
             return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
         }
+        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
+
+        // Validate SSE-C: if the object was encrypted with a customer-provided key,
+        // the caller must supply the matching key even for HEAD requests (per S3 spec).
+        validate_ssec_for_read(
+            &info.user_defined,
+            req.input.sse_customer_key.as_ref(),
+            req.input.sse_customer_key_md5.as_ref(),
+        )?;
+
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -3415,6 +3651,15 @@ impl DefaultObjectUsecase {
     }
 }
 
+fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'static str) -> bool {
+    object_attributes.iter().any(|value| {
+        value.as_str().split(',').any(|part| {
+            part.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .eq_ignore_ascii_case(name)
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3585,6 +3830,98 @@ mod tests {
 
         let err = usecase.execute_get_object_attributes(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn object_attributes_requested_with_single_value() {
+        let object_attributes = vec![ObjectAttributes::from_static(ObjectAttributes::ETAG)];
+
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
+        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+    }
+
+    #[test]
+    fn object_attributes_requested_with_comma_separated_values() {
+        let object_attributes = vec![
+            ObjectAttributes::from_static("ObjectParts,etag"),
+            ObjectAttributes::from_static("StorageClass"),
+        ];
+
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_PARTS));
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
+        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+    }
+
+    #[test]
+    fn object_attributes_requested_with_quotes_and_spaces() {
+        let object_attributes = vec![ObjectAttributes::from_static("'ObjectSize', \"Checksum\" , \"Etag\"")];
+
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::CHECKSUM));
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
+    }
+
+    #[test]
+    fn object_attributes_requested_returns_false_for_missing_name() {
+        let object_attributes = vec![ObjectAttributes::from_static("Checksum")];
+
+        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+    }
+
+    #[test]
+    fn build_put_object_expiration_header_returns_none_for_non_delete_events() {
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::TransitionAction,
+            rule_id: "rule-1".to_string(),
+            due: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        assert!(build_put_object_expiration_header(&event).is_none());
+    }
+
+    #[test]
+    fn build_put_object_expiration_header_formats_expected_value() {
+        let expire_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::DeleteAction,
+            rule_id: "rule-1".to_string(),
+            due: Some(expire_time),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        let expiry_date = expire_time.format(&Rfc3339).unwrap();
+        let expected = format!("expiry-date=\"{}\", rule-id=\"rule-1\"", expiry_date);
+        assert_eq!(build_put_object_expiration_header(&event), Some(expected));
+    }
+
+    #[test]
+    fn build_put_object_expiration_header_requires_rule_id_and_due_time() {
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::DeleteAction,
+            rule_id: String::new(),
+            due: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        assert!(build_put_object_expiration_header(&event).is_none());
+
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::DeleteAction,
+            rule_id: "rule-1".to_string(),
+            due: Some(OffsetDateTime::UNIX_EPOCH),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        assert!(build_put_object_expiration_header(&event).is_none());
     }
 
     #[tokio::test]
