@@ -399,3 +399,50 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use http_body_util::Full;
+
+    #[test]
+    fn test_strip_quotes_from_first_etag_removes_quotes() {
+        let input = String::from("<GetObjectAttributesOutput><ETag>\"abc\"</ETag></GetObjectAttributesOutput>");
+        let output = strip_quotes_from_first_etag(input);
+
+        assert_eq!(output, "<GetObjectAttributesOutput><ETag>abc</ETag></GetObjectAttributesOutput>");
+    }
+
+    #[test]
+    fn test_strip_quotes_from_first_etag_keeps_non_quoted_value() {
+        let input = String::from("<GetObjectAttributesOutput><ETag>abc</ETag></GetObjectAttributesOutput>");
+        let output = strip_quotes_from_first_etag(input.clone());
+
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_strip_quotes_from_first_etag_only_first_occurrence() {
+        let input = String::from("<GetObjectAttributesOutput><ETag>\"first\"</ETag><ETag>\"second\"</ETag></GetObjectAttributesOutput>");
+        let output = strip_quotes_from_first_etag(input);
+
+        assert_eq!(output, "<GetObjectAttributesOutput><ETag>first</ETag><ETag>\"second\"</ETag></GetObjectAttributesOutput>");
+    }
+
+    #[tokio::test]
+    async fn test_fix_object_attributes_etag_in_xml() {
+        let body = Full::from(Bytes::from(
+            "<GetObjectAttributesOutput><ETag>\"abc\"</ETag><Checksum>CRC32C</Checksum></GetObjectAttributesOutput>",
+        ));
+        let fixed = fix_object_attributes_etag_in_xml(body).await.unwrap();
+        let bytes = BodyExt::collect(fixed).await.unwrap().to_bytes();
+
+        assert_eq!(
+            bytes,
+            Bytes::from_static(
+                b"<GetObjectAttributesOutput><ETag>abc</ETag><Checksum>CRC32C</Checksum></GetObjectAttributesOutput>",
+            ),
+        );
+    }
+}
