@@ -21,9 +21,10 @@
 # - Object ownership: Bucket ownership controls
 #
 # - SSE-KMS: KMS-related edge cases
-# - Bucket Policy: Multipart upload authorization
+# - Bucket Policy: Multipart upload authorization, SSE condition keys
+# - Versioning: Concurrent multi-object delete
 #
-# Total: 228 tests
+# Total: 231 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -214,6 +215,8 @@ test_bucket_policy_another_bucket
 test_bucket_policy_allow_notprincipal
 test_bucket_policy_multipart
 test_bucket_policy_put_obj_acl
+test_bucket_policy_put_obj_kms_s3
+test_bucket_policy_put_obj_s3_kms
 test_object_presigned_put_object_with_acl
 test_object_put_acl_mtime
 
@@ -263,6 +266,7 @@ test_versioned_object_acl
 test_versioning_bucket_create_suspend
 test_versioning_bucket_atomic_upload_return_version_id
 test_versioning_bucket_multipart_upload_return_version_id
+test_versioning_concurrent_multi_object_delete
 test_versioning_multi_object_delete
 test_versioning_multi_object_delete_with_marker
 test_versioning_obj_create_read_remove
