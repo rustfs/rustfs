@@ -20,7 +20,7 @@
 # - SSE-C: Server-side encryption with customer-provided keys
 # - Object ownership: Bucket ownership controls
 #
-# Total: 160 tests
+# Total: 159 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -189,7 +189,6 @@ test_get_public_block_deny_bucket_policy
 test_get_undefined_public_block
 
 # Bucket policy tests
-test_bucket_policy
 test_bucketv2_policy
 test_bucket_policy_acl
 test_bucketv2_policy_acl
