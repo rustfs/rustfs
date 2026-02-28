@@ -20,7 +20,10 @@
 # - SSE-C: Server-side encryption with customer-provided keys
 # - Object ownership: Bucket ownership controls
 #
-# Total: 224 tests
+# - SSE-KMS: KMS-related edge cases
+# - Bucket Policy: Multipart upload authorization
+#
+# Total: 228 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -169,7 +172,9 @@ test_put_obj_enc_conflict_c_kms
 test_put_obj_enc_conflict_s3_kms
 test_put_obj_enc_conflict_bad_enc_kms
 test_sse_kms_not_declared
+test_sse_kms_no_key
 test_sse_kms_read_declare
+test_encryption_sse_c_multipart_bad_download
 
 # ListObjectsV2 delimiter and encoding tests
 test_bucket_list_encoding_basic
@@ -207,6 +212,7 @@ test_bucket_policy_acl
 test_bucketv2_policy_acl
 test_bucket_policy_another_bucket
 test_bucket_policy_allow_notprincipal
+test_bucket_policy_multipart
 test_bucket_policy_put_obj_acl
 test_object_presigned_put_object_with_acl
 test_object_put_acl_mtime
@@ -255,6 +261,7 @@ test_versioned_concurrent_object_create_and_remove
 test_versioned_concurrent_object_create_concurrent_remove
 test_versioned_object_acl
 test_versioning_bucket_create_suspend
+test_versioning_bucket_atomic_upload_return_version_id
 test_versioning_bucket_multipart_upload_return_version_id
 test_versioning_multi_object_delete
 test_versioning_multi_object_delete_with_marker

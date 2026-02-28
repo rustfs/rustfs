@@ -550,14 +550,21 @@ impl DefaultObjectUsecase {
         // Fast in-memory update for immediate quota consistency
         rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
 
-        let put_version = obj_info.version_id.map(|v| v.to_string());
+        let raw_version = obj_info.version_id.map(|v| v.to_string());
 
         helper = helper.object(obj_info.clone());
-        if let Some(version_id) = &put_version {
+        if let Some(version_id) = &raw_version {
             helper = helper.version_id(version_id.clone());
         }
 
-        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), put_version.clone());
+        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), raw_version.clone());
+
+        // Per S3 spec: only return VersionId when versioning is Enabled (not Suspended or default)
+        let put_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
+            raw_version
+        } else {
+            None
+        };
 
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
