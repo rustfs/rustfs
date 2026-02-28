@@ -1034,14 +1034,8 @@ mod tests {
     fn get_actual_size_uses_compressed_metadata_size() {
         let user_defined = {
             let mut map = HashMap::new();
-            map.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
-                "zstd".to_string(),
-            );
-            map.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"),
-                "42".to_string(),
-            );
+            map.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), "zstd".to_string());
+            map.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), "42".to_string());
             map
         };
 
@@ -1059,10 +1053,7 @@ mod tests {
     fn get_actual_size_falls_back_to_encrypted_original_size_metadata() {
         let user_defined = {
             let mut map = HashMap::new();
-            map.insert(
-                "x-amz-server-side-encryption-customer-original-size".to_string(),
-                "77".to_string(),
-            );
+            map.insert("x-amz-server-side-encryption-customer-original-size".to_string(), "77".to_string());
             map
         };
 

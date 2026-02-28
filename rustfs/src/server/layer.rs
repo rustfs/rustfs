@@ -138,10 +138,11 @@ where
         Box::pin(async move {
             let response = inner.call(req).await?;
             let (parts, body) = response.into_parts();
+            let should_fix = is_target && parts.status.is_success() && is_xml_response(&parts.headers);
 
             let response = match body {
                 HybridBody::Rest { rest_body } => {
-                    if !is_target {
+                    if !should_fix {
                         Response::from_parts(parts, HybridBody::Rest { rest_body })
                     } else {
                         let rest_body = fix_object_attributes_etag_in_xml(rest_body).await.map_err(Into::into)?;
@@ -158,6 +159,14 @@ where
             Ok(response)
         })
     }
+}
+
+fn is_xml_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|content_type| content_type.to_ascii_lowercase().contains("xml"))
+        .unwrap_or(false)
 }
 
 async fn fix_object_attributes_etag_in_xml<RestBody>(body: RestBody) -> Result<RestBody, RestBody::Error>
@@ -185,9 +194,6 @@ fn strip_quotes_from_first_etag(xml: String) -> String {
     let Some(trimmed) = raw.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
         return xml;
     };
-    if trimmed == raw {
-        return xml;
-    }
 
     let mut fixed = String::with_capacity(xml.len() - 2);
     fixed.push_str(&xml[..value_start]);
@@ -424,10 +430,14 @@ mod tests {
 
     #[test]
     fn test_strip_quotes_from_first_etag_only_first_occurrence() {
-        let input = String::from("<GetObjectAttributesOutput><ETag>\"first\"</ETag><ETag>\"second\"</ETag></GetObjectAttributesOutput>");
+        let input =
+            String::from("<GetObjectAttributesOutput><ETag>\"first\"</ETag><ETag>\"second\"</ETag></GetObjectAttributesOutput>");
         let output = strip_quotes_from_first_etag(input);
 
-        assert_eq!(output, "<GetObjectAttributesOutput><ETag>first</ETag><ETag>\"second\"</ETag></GetObjectAttributesOutput>");
+        assert_eq!(
+            output,
+            "<GetObjectAttributesOutput><ETag>first</ETag><ETag>\"second\"</ETag></GetObjectAttributesOutput>"
+        );
     }
 
     #[tokio::test]

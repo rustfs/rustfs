@@ -1638,14 +1638,12 @@ impl DefaultObjectUsecase {
             .filter(|s| !s.is_empty())
             .map(StorageClass::from);
 
-        warn!(
+        debug!(
             "GetObjectAttributes raw object_attributes={:?}",
             object_attributes.iter().map(|value| value.as_str()).collect::<Vec<_>>()
         );
 
-        let requested = |name: &'static str| -> bool {
-            object_attributes_requested(&object_attributes, name)
-        };
+        let requested = |name: &'static str| -> bool { object_attributes_requested(&object_attributes, name) };
 
         let e_tag = if requested(ObjectAttributes::ETAG) {
             info.etag.as_ref().map(|etag| to_s3s_etag(etag))
@@ -3619,10 +3617,10 @@ impl DefaultObjectUsecase {
 
 fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'static str) -> bool {
     object_attributes.iter().any(|value| {
-        value
-            .as_str()
-            .split(',')
-            .any(|part| part.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'').eq_ignore_ascii_case(name))
+        value.as_str().split(',').any(|part| {
+            part.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .eq_ignore_ascii_case(name)
+        })
     })
 }
 
