@@ -1644,12 +1644,7 @@ impl DefaultObjectUsecase {
         );
 
         let requested = |name: &'static str| -> bool {
-            object_attributes.iter().any(|value| {
-                value.as_str().split(',').any(|part| {
-                    part.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-                        .eq_ignore_ascii_case(name)
-                })
-            })
+            object_attributes_requested(&object_attributes, name)
         };
 
         let e_tag = if requested(ObjectAttributes::ETAG) {
@@ -3622,6 +3617,15 @@ impl DefaultObjectUsecase {
     }
 }
 
+fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'static str) -> bool {
+    object_attributes.iter().any(|value| {
+        value
+            .as_str()
+            .split(',')
+            .any(|part| part.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'').eq_ignore_ascii_case(name))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3792,6 +3796,42 @@ mod tests {
 
         let err = usecase.execute_get_object_attributes(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn object_attributes_requested_with_single_value() {
+        let object_attributes = vec![ObjectAttributes::from_static(ObjectAttributes::ETAG)];
+
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
+        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+    }
+
+    #[test]
+    fn object_attributes_requested_with_comma_separated_values() {
+        let object_attributes = vec![
+            ObjectAttributes::from_static("ObjectParts,etag"),
+            ObjectAttributes::from_static("StorageClass"),
+        ];
+
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_PARTS));
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
+        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+    }
+
+    #[test]
+    fn object_attributes_requested_with_quotes_and_spaces() {
+        let object_attributes = vec![ObjectAttributes::from_static("'ObjectSize', \"Checksum\" , \"Etag\"")];
+
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::CHECKSUM));
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
+    }
+
+    #[test]
+    fn object_attributes_requested_returns_false_for_missing_name() {
+        let object_attributes = vec![ObjectAttributes::from_static("Checksum")];
+
+        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
     }
 
     #[tokio::test]

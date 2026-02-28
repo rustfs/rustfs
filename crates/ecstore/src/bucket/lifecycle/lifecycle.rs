@@ -778,3 +778,47 @@ impl Default for TransitionOptions {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn validate_rejects_non_positive_expiration_days() {
+        let lc = BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+
+        let err = lc
+            .validate(&ObjectLockConfiguration::default())
+            .await
+            .expect_err("expected validation error");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS);
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_positive_expiration_days() {
+        let lc = BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+
+        lc.validate(&ObjectLockConfiguration::default())
+            .await
+            .expect("expected validation to pass");
+    }
+}
