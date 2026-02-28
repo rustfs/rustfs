@@ -6,18 +6,16 @@
 #
 # Unimplemented features:
 # - Bucket Logging: Access logging
-# - SSE-KMS: Partial SSE-KMS edge cases
 # - Object Lock: Enable after create
 # - Checksum: Full checksum validation
 # - Conditional writes: If-Match/If-None-Match for writes
 # - Bucket Ownership Controls
 
-# Failed tests (21)
+# Failed tests (17)
 test_bucket_create_delete_bucket_ownership
 test_bucket_logging_owner
 test_bucket_policy_put_obj_kms_s3
 test_bucket_policy_put_obj_s3_kms
-test_encryption_sse_c_multipart_bad_download
 test_object_checksum_crc64nvme
 test_object_checksum_sha256
 test_object_lock_put_obj_lock_enable_after_create
@@ -27,8 +25,6 @@ test_put_bucket_logging_errors
 test_put_bucket_logging_permissions
 test_put_bucket_logging_policy_wildcard
 test_rm_bucket_logging
-test_sse_kms_no_key
-test_versioning_bucket_atomic_upload_return_version_id
 test_versioning_concurrent_multi_object_delete
 
 # Skipped tests (require IAM account or multiple storage classes)
@@ -52,6 +48,5 @@ test_atomic_write_8mb
 
 # Tests with known issues (need further investigation)
 test_bucket_policy_different_tenant
-test_bucket_policy_multipart
 test_bucket_policy_put_obj_grant
 test_bucket_policy_tenanted_bucket

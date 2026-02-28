@@ -204,7 +204,19 @@ async fn prepare_sse_configuration(
         }))
     } else if let Err(e) = bucket_sse_config_result {
         match e {
-            Error::ConfigNotFound => Ok(None),
+            Error::ConfigNotFound => {
+                // The bucket has no SSE config. If the user explicitly requested
+                // aws:kms, we must honor that — return the explicit SSE header so
+                // downstream logic can try (and fail if KMS is unavailable).
+                if let Some(sse) = server_side_encryption {
+                    Ok(Some(SseConfiguration {
+                        effective_sse: sse,
+                        effective_kms_key_id: ssekms_key_id,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
             _ => Err(ApiError::from(e)),
         }
     } else {
