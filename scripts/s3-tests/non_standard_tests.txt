@@ -19,7 +19,6 @@ test_account_usage
 test_atomic_conditional_write_1mb
 test_atomic_dual_conditional_write_1mb
 test_atomic_write_bucket_gone
-test_bucket_create_exists_nonowner
 test_bucket_get_location
 test_bucket_head_extended
 test_bucket_header_acl_grants
