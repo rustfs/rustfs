@@ -385,9 +385,10 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             // For object-level operations, bucket owner (is_owner) must still pass ACL check.
             // Policy may have allowed due to is_owner, but object owner is authoritative.
             if let Some((AclTarget::Object, _)) = acl_permission_for_action(&action)
-                && !check_acl_access(req, req_info, &action, false).await? {
-                    return Err(s3_error!(AccessDenied, "Access Denied"));
-                }
+                && !check_acl_access(req, req_info, &action, false).await?
+            {
+                return Err(s3_error!(AccessDenied, "Access Denied"));
+            }
             return Ok(());
         }
 
