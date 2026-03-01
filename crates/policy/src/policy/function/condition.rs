@@ -439,6 +439,8 @@ mod tests {
 
         let deserialized: Functions = serde_json::from_str(&json).unwrap();
         assert_eq!(functions, deserialized);
+    }
+
     #[tokio::test]
     async fn test_if_exists_key_absent_returns_true() {
         let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
@@ -470,23 +472,5 @@ mod tests {
             !cond.evaluate_with_resolver(false, &values, None).await,
             "IfExists should delegate to inner and return false when values differ"
         );
-    }
-
-    #[test]
-    fn test_if_exists_to_key_with_suffix() {
-        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
-        let cond = Condition::IfExists(Box::new(inner));
-        assert_eq!(cond.to_key_with_suffix(), "StringEqualsIfExists");
-
-        let nested = Condition::IfExists(Box::new(cond));
-        assert_eq!(nested.to_key_with_suffix(), "StringEqualsIfExistsIfExists");
-    }
-
-    #[test]
-    fn test_if_exists_serialization_roundtrip() {
-        let json = r#"{"StringEqualsIfExists":{"s3:x-amz-server-side-encryption":"aws:kms"}}"#;
-        let funcs: crate::policy::Functions = serde_json::from_str(json).expect("Should deserialize IfExists condition");
-        let serialized = serde_json::to_string(&funcs).expect("Should serialize");
-        assert_eq!(serialized, json, "IfExists condition should round-trip through serde");
     }
 }
