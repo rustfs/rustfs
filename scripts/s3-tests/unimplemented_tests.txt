@@ -8,10 +8,9 @@
 # - Bucket Logging: Access logging
 # - Object Lock: Enable after create
 # - Checksum: Full checksum validation
-# - Conditional writes: If-Match/If-None-Match for writes
 # - Bucket Ownership Controls
 
-# Failed tests (11)
+# Failed tests
 test_bucket_create_delete_bucket_ownership
 test_bucket_logging_owner
 test_object_checksum_crc64nvme
@@ -30,18 +29,6 @@ test_bucket_policy_deny_self_denied_policy_confirm_header
 test_lifecycle_plain_null_version_current_transition
 test_lifecycle_set_noncurrent_transition
 test_lifecycle_transition_encrypted
-
-# Checksum and atomic write tests (require x-amz-checksum-* support)
-test_atomic_dual_write_1mb
-test_atomic_dual_write_4mb
-test_atomic_dual_write_8mb
-test_atomic_multipart_upload_write
-test_atomic_read_1mb
-test_atomic_read_4mb
-test_atomic_read_8mb
-test_atomic_write_1mb
-test_atomic_write_4mb
-test_atomic_write_8mb
 
 # Tests with known issues (need further investigation)
 test_bucket_policy_different_tenant
