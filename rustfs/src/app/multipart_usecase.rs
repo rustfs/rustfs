@@ -973,6 +973,13 @@ impl DefaultMultipartUsecase {
                 _ => src_info.size,
             };
 
+            if range_spec.end >= validation_size {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRange,
+                    "The requested range is not satisfiable".to_string(),
+                ));
+            }
+
             range_spec
                 .get_offset_length(validation_size)
                 .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e.to_string()))?
@@ -1215,6 +1222,36 @@ mod tests {
 
         let err = make_usecase().execute_upload_part_copy(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn test_copy_source_range_exceeds_object_size_detection() {
+        use rustfs_ecstore::store_api::HTTPRangeSpec;
+
+        fn would_exceed(range: &HTTPRangeSpec, object_size: i64) -> bool {
+            range.end >= object_size
+        }
+
+        let range_exceeds = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: 21,
+        };
+        assert!(would_exceed(&range_exceeds, 5), "bytes=0-21 on 5-byte object");
+
+        let range_valid = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: 4,
+        };
+        assert!(!would_exceed(&range_valid, 5), "bytes=0-4 on 5-byte object");
+
+        let range_suffix = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: -5,
+            end: -1,
+        };
+        assert!(!would_exceed(&range_suffix, 5), "suffix range bytes=-5");
     }
 
     #[tokio::test]

@@ -34,8 +34,9 @@
 # - CORS: Bucket-level CORS configuration, preflight, origin matching
 # - HTTP: 100-continue, multipart abort, tagging in POST Object
 # - DeleteObject: Proper NoSuchBucket for deleted buckets
+# - Multipart Copy: InvalidRange when CopySourceRange exceeds source size
 #
-# Total: 393 tests
+# Total: 394 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -486,3 +487,6 @@ test_100_continue
 test_abort_multipart_upload_not_found
 test_post_object_tags_authenticated_request
 test_object_delete_key_bucket_gone
+
+# Multipart copy range validation
+test_multipart_copy_invalid_range
