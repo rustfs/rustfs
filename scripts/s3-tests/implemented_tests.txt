@@ -36,7 +36,7 @@
 # - DeleteObject: Proper NoSuchBucket for deleted buckets
 # - Multipart Copy: InvalidRange when CopySourceRange exceeds source size
 #
-# Total: 395 tests
+# Total: 396 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -216,6 +216,7 @@ test_put_get_delete_public_block
 test_put_public_block
 test_block_public_policy
 test_block_public_policy_with_principal
+test_block_public_restrict_public_buckets
 test_get_public_block_deny_bucket_policy
 test_get_undefined_public_block
 
