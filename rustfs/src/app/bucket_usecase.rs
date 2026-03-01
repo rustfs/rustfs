@@ -150,9 +150,12 @@ impl DefaultBucketUsecase {
         }
 
         let helper = OperationHelper::new(&req, EventName::BucketCreated, "s3:CreateBucket");
-        let requester_id = req_info_ref(&req)
-            .ok()
-            .and_then(|r| r.cred.as_ref().map(|c| c.access_key.clone()));
+        let requester_id = match req_info_ref(&req) {
+            Ok(r) => r.cred.as_ref().map(|c| c.access_key.clone()),
+            Err(_) => {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Missing request info".to_string()));
+            }
+        };
         let CreateBucketInput {
             bucket,
             acl,
@@ -187,11 +190,11 @@ impl DefaultBucketUsecase {
             Err(StorageError::BucketExists(_)) => {
                 // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
                 // non-owner gets 409 BucketAlreadyExists.
-                let bucket_owner_id = metadata_sys::get_bucket_acl_config(&bucket)
-                    .await
-                    .ok()
-                    .map(|(acl, _)| parse_acl_json_or_canned_bucket(&acl, &default_owner()).owner.id)
-                    .unwrap_or_else(|| default_owner().id);
+                let bucket_owner_id = match metadata_sys::get_bucket_acl_config(&bucket).await {
+                    Ok((acl, _)) => parse_acl_json_or_canned_bucket(&acl, &default_owner()).owner.id,
+                    Err(StorageError::ConfigNotFound) => default_owner().id,
+                    Err(e) => return Err(ApiError::from(e).into()),
+                };
 
                 let is_owner = requester_id.as_deref().is_some_and(|req_id| req_id == bucket_owner_id);
 
@@ -201,10 +204,12 @@ impl DefaultBucketUsecase {
                     let _ = helper.complete(&result);
                     return result;
                 }
-                return Err(s3_error!(
+                let result = Err(s3_error!(
                     BucketAlreadyExists,
                     "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."
                 ));
+                let _ = helper.complete(&result);
+                return result;
             }
             Err(e) => return Err(ApiError::from(e).into()),
         }
