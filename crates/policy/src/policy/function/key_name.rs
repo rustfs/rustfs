@@ -336,6 +336,12 @@ pub enum AwsKeyName {
 
     #[strum(serialize = "aws:groups")]
     AWSGroups,
+
+    #[strum(serialize = "aws:SourceArn")]
+    AWSSourceArn,
+
+    #[strum(serialize = "aws:SourceAccount")]
+    AWSSourceAccount,
 }
 
 #[cfg(test)]

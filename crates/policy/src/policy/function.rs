@@ -82,17 +82,17 @@ impl Serialize for Functions {
             serializer.serialize_map(Some(self.for_any_value.len() + self.for_all_values.len() + self.for_normal.len()))?;
 
         for conditions in self.for_all_values.iter() {
-            se.serialize_key(format!("ForAllValues:{}", conditions.to_key()).as_str())?;
+            se.serialize_key(&format!("ForAllValues:{}", conditions.to_key_with_suffix()))?;
             conditions.serialize_map(&mut se)?;
         }
 
         for conditions in self.for_any_value.iter() {
-            se.serialize_key(format!("ForAnyValue:{}", conditions.to_key()).as_str())?;
+            se.serialize_key(&format!("ForAnyValue:{}", conditions.to_key_with_suffix()))?;
             conditions.serialize_map(&mut se)?;
         }
 
         for conditions in self.for_normal.iter() {
-            se.serialize_key(conditions.to_key())?;
+            se.serialize_key(&conditions.to_key_with_suffix())?;
             conditions.serialize_map(&mut se)?;
         }
 
