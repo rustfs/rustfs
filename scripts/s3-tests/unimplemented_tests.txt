@@ -28,5 +28,4 @@ test_lifecycle_transition_encrypted
 
 # Tests with known issues (need further investigation)
 test_bucket_policy_different_tenant
-test_bucket_policy_put_obj_grant
 test_bucket_policy_tenanted_bucket

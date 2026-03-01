@@ -21,7 +21,7 @@
 # - Object ownership: Bucket ownership controls
 #
 # - SSE-KMS: KMS-related edge cases
-# - Bucket Policy: Multipart upload authorization, SSE condition keys
+# - Bucket Policy: Multipart upload authorization, SSE condition keys, grant header conditions
 # - Versioning: Concurrent multi-object delete
 # - ACL: Bucket and Object ACL
 # - Object Copy: Same/cross bucket, metadata, versioning
@@ -36,7 +36,7 @@
 # - DeleteObject: Proper NoSuchBucket for deleted buckets
 # - Multipart Copy: InvalidRange when CopySourceRange exceeds source size
 #
-# Total: 394 tests
+# Total: 395 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -227,6 +227,7 @@ test_bucket_policy_another_bucket
 test_bucket_policy_allow_notprincipal
 test_bucket_policy_multipart
 test_bucket_policy_put_obj_acl
+test_bucket_policy_put_obj_grant
 test_bucket_policy_put_obj_kms_s3
 test_bucket_policy_put_obj_s3_kms
 test_object_presigned_put_object_with_acl
