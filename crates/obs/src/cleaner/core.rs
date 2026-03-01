@@ -165,7 +165,8 @@ impl LogCleaner {
 
             // Handle rotation for active file if needed
             if let Some(active_file) = to_rotate
-                && let Err(e) = self.rotate_active_file(&active_file) {
+                && let Err(e) = self.rotate_active_file(&active_file)
+            {
                 error!("Failed to rotate active file {:?}: {}", active_file.path, e);
             }
 
@@ -234,14 +235,14 @@ impl LogCleaner {
         for (idx, file) in files.iter().enumerate() {
             // If we are in the protected range, we stop deleting.
             if idx >= max_deletable_count {
-                 // However, if the active file is too large, we might rotate it.
-                 if idx == active_file_idx {
-                     let over_single = self.max_single_file_size_bytes > 0 && file.size > self.max_single_file_size_bytes;
-                     if over_single {
-                         to_rotate = Some(file.clone());
-                     }
-                 }
-                 continue;
+                // However, if the active file is too large, we might rotate it.
+                if idx == active_file_idx {
+                    let over_single = self.max_single_file_size_bytes > 0 && file.size > self.max_single_file_size_bytes;
+                    if over_single {
+                        to_rotate = Some(file.clone());
+                    }
+                }
+                continue;
             }
 
             // We are in the deletable range. Check if we *should* delete.

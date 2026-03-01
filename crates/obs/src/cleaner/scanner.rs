@@ -118,15 +118,16 @@ pub(super) fn collect_log_files(
 
         // Skip files that are too young.
         if let Ok(age) = now.duration_since(modified)
-            && age.as_secs() < min_file_age_seconds {
-                debug!(
-                    "Skipping file (too new): {:?}, age: {}s, min_age: {}s",
-                    filename,
-                    age.as_secs(),
-                    min_file_age_seconds
-                );
-                continue;
-            }
+            && age.as_secs() < min_file_age_seconds
+        {
+            debug!(
+                "Skipping file (too new): {:?}, age: {}s, min_age: {}s",
+                filename,
+                age.as_secs(),
+                min_file_age_seconds
+            );
+            continue;
+        }
 
         files.push(FileInfo {
             path: path.to_path_buf(),
