@@ -212,6 +212,12 @@ pub const DEFAULT_OBS_METRICS_EXPORT_ENABLED: bool = true;
 /// Environment variable: RUSTFS_OBS_LOGS_EXPORT_ENABLED
 pub const DEFAULT_OBS_LOGS_EXPORT_ENABLED: bool = true;
 
+/// Default profiling export enabled
+/// It is used to enable or disable exporting profiles
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_PROFILING_EXPORT_ENABLED
+pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = true;
+
 /// Default log local logging enabled for rustfs
 /// This is the default log local logging enabled for rustfs.
 /// It is used to enable or disable local logging of the application.

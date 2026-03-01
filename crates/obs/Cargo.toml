@@ -56,6 +56,9 @@ tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
+pyroscope = "0.5.8"
+pyroscope_pprofrs = "0.2.10"
+
 
 
 [dev-dependencies]

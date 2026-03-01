@@ -32,10 +32,12 @@ use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
 };
+use pyroscope::PyroscopeAgent;
+use pyroscope::pyroscope::PyroscopeAgentRunning;
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
-    DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
-    SERVICE_VERSION,
+    DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT,
+    METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION,
     observability::{
         DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_OBS_LOG_FLUSH_MS, DEFAULT_OBS_LOG_MESSAGE_CAPA, DEFAULT_OBS_LOG_POOL_CAPA,
         ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_FLUSH_MS, ENV_OBS_LOG_MESSAGE_CAPA, ENV_OBS_LOG_POOL_CAPA,
@@ -72,6 +74,8 @@ pub struct OtelGuard {
     logger_provider: Option<SdkLoggerProvider>,
     flexi_logger_handles: Option<flexi_logger::LoggerHandle>,
     tracing_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    #[cfg(unix)]
+    profiler_agent: Option<PyroscopeAgent<PyroscopeAgentRunning>>,
 }
 
 impl std::fmt::Debug for OtelGuard {
@@ -113,6 +117,15 @@ impl Drop for OtelGuard {
         if let Some(guard) = self.tracing_guard.take() {
             drop(guard);
             println!("Tracing guard dropped, flushing logs.");
+        }
+        if let Some(agent) = self.profiler_agent.take() {
+            match agent.stop() {
+                Err(err) => eprintln!("Profiling agent stop error: {err:?}"),
+                Ok(stopped) => {
+                    stopped.shutdown();
+                    println!("Profiling agent shutdown complete.");
+                }
+            }
         }
     }
 }
@@ -214,6 +227,59 @@ fn format_for_file(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &R
     )
 }
 
+/// Starts the Pyroscope continuous profiling agent if `ENV_OBS_PYROSCOPE_ENDPOINT` is set.
+/// No-op and returns None on non-unix platforms.
+#[cfg(unix)]
+fn init_profiler(config: &OtelConfig) -> Option<PyroscopeAgent<PyroscopeAgentRunning>> {
+    use pyroscope_pprofrs::{PprofConfig, pprof_backend};
+    use rustfs_config::VERSION;
+
+    if !config
+        .profiling_export_enabled
+        .unwrap_or(DEFAULT_OBS_PROFILING_EXPORT_ENABLED)
+    {
+        return None;
+    }
+
+    let endpoint = config.profiling_endpoint.as_ref()?.as_str();
+    if endpoint.is_empty() {
+        return None;
+    }
+
+    // Configure Pyroscope Agent
+    let backend = pprof_backend(PprofConfig::default().sample_rate(100));
+    let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
+    let version = config.service_version.as_deref().unwrap_or(VERSION);
+
+    // TODO: update pyroscope-rs to 1.0 when dependency on pyroscope-pprofrs is updated, and use new build api
+    // let agent = PyroscopeAgentBuilder::new(endpoint, service_name, 100, "pyroscope-rs", "1.0.1", backend)
+    //     .tags(vec![("app", service_name)])
+    //     .build()
+    //     .ok()?;
+
+    let agent = PyroscopeAgent::builder(endpoint, service_name)
+        .backend(backend)
+        .tags(vec![("app", service_name), ("version", version)]) // TODO: add git commit tag
+        .build()
+        .ok()?;
+
+    match agent.start() {
+        Ok(agent) => {
+            info!(endpoint, "Pyroscope profiling started");
+            Some(agent)
+        }
+        Err(err) => {
+            eprintln!("Pyroscope agent start error: {err:?}");
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn init_profiler(_service_name: &str) -> Option<std::convert::Infallible> {
+    None
+}
+
 /// stdout + span information (fix: retain WorkerGuard to avoid releasing after initialization)
 fn init_stdout_logging(_config: &OtelConfig, logger_level: &str, is_production: bool) -> OtelGuard {
     let env_filter = build_env_filter(logger_level, None);
@@ -247,6 +313,7 @@ fn init_stdout_logging(_config: &OtelConfig, logger_level: &str, is_production: 
         logger_provider: None,
         flexi_logger_handles: None,
         tracing_guard: Some(guard),
+        profiler_agent: None,
     }
 }
 
@@ -376,6 +443,7 @@ fn init_file_logging(config: &OtelConfig, logger_level: &str, is_production: boo
         logger_provider: None,
         flexi_logger_handles: handle,
         tracing_guard: None,
+        profiler_agent: None,
     })
 }
 
@@ -557,6 +625,7 @@ fn init_observability_http(config: &OtelConfig, logger_level: &str, is_productio
         logger_provider,
         flexi_logger_handles: None,
         tracing_guard: None,
+        profiler_agent: init_profiler(config),
     })
 }
 
@@ -570,7 +639,8 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> Result<OtelGuard, Telemetry
     let has_obs = !config.endpoint.is_empty()
         || config.trace_endpoint.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
         || config.metric_endpoint.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
-        || config.log_endpoint.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+        || config.log_endpoint.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        || config.profiling_endpoint.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
 
     if has_obs {
         return init_observability_http(config, logger_level, is_production);
