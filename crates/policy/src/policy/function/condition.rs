@@ -78,11 +78,13 @@ impl Condition {
             "NumericEquals" => Self::NumericEquals(d.next_value()?),
             "NumericNotEquals" => Self::NumericNotEquals(d.next_value()?),
             "NumericLessThan" => Self::NumericLessThan(d.next_value()?),
+            "NumericLessThanEquals" => Self::NumericLessThanEquals(d.next_value()?),
             "NumericGreaterThan" => Self::NumericGreaterThan(d.next_value()?),
             "NumericGreaterThanIfExists" => Self::NumericGreaterThanIfExists(d.next_value()?),
             "NumericGreaterThanEquals" => Self::NumericGreaterThanEquals(d.next_value()?),
             "DateEquals" => Self::DateEquals(d.next_value()?),
             "DateNotEquals" => Self::DateNotEquals(d.next_value()?),
+            "DateLessThan" => Self::DateLessThan(d.next_value()?),
             "DateLessThanEquals" => Self::DateLessThanEquals(d.next_value()?),
             "DateGreaterThan" => Self::DateGreaterThan(d.next_value()?),
             "DateGreaterThanEquals" => Self::DateGreaterThanEquals(d.next_value()?),
@@ -131,7 +133,7 @@ impl Condition {
 
     pub fn to_key_with_suffix(&self) -> String {
         match self {
-            Condition::IfExists(inner) => format!("{}IfExists", inner.to_key()),
+            Condition::IfExists(inner) => format!("{}IfExists", inner.to_key_with_suffix()),
             _ => self.to_key().to_owned(),
         }
     }
@@ -303,6 +305,7 @@ impl PartialEq for Condition {
 mod tests {
     use super::*;
     use crate::policy::function::{
+        Functions,
         func::{FuncKeyValue, InnerFunc},
         key::Key,
         string::StringFuncValue,
@@ -382,6 +385,92 @@ mod tests {
         assert!(
             cond.evaluate_with_resolver(false, &values, None).await,
             "StringNotEquals should be true when key is absent"
+        );
+    }
+
+    #[test]
+    fn test_to_key_with_suffix_if_exists() {
+        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+        let cond = Condition::IfExists(Box::new(inner));
+        assert_eq!(cond.to_key_with_suffix(), "StringEqualsIfExists");
+    }
+
+    #[test]
+    fn test_to_key_with_suffix_nested_if_exists() {
+        // IfExists(IfExists(StringEquals)) must produce a stable, predictable key
+        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+        let once = Condition::IfExists(Box::new(inner));
+        let twice = Condition::IfExists(Box::new(once));
+        assert_eq!(twice.to_key_with_suffix(), "StringEqualsIfExistsIfExists");
+    }
+
+    #[test]
+    fn test_if_exists_serde_round_trip() {
+        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+        let cond = Condition::IfExists(Box::new(inner));
+
+        let functions = Functions {
+            for_normal: vec![cond],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&functions).unwrap();
+        assert_eq!(json, r#"{"StringEqualsIfExists":{"s3:x-amz-server-side-encryption":"aws:kms"}}"#);
+
+        let deserialized: Functions = serde_json::from_str(&json).unwrap();
+        assert_eq!(functions, deserialized);
+    }
+
+    #[test]
+    fn test_nested_if_exists_serde_round_trip() {
+        // Verifies that nested IfExists(IfExists(StringEquals)) serializes with the
+        // correct key and round-trips through serde without data loss.
+        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+        let once = Condition::IfExists(Box::new(inner));
+        let twice = Condition::IfExists(Box::new(once));
+
+        let functions = Functions {
+            for_normal: vec![twice],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&functions).unwrap();
+        assert_eq!(json, r#"{"StringEqualsIfExistsIfExists":{"s3:x-amz-server-side-encryption":"aws:kms"}}"#);
+
+        let deserialized: Functions = serde_json::from_str(&json).unwrap();
+        assert_eq!(functions, deserialized);
+    }
+
+    #[tokio::test]
+    async fn test_if_exists_key_absent_returns_true() {
+        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+        let cond = Condition::IfExists(Box::new(inner));
+
+        let values = HashMap::new();
+        assert!(
+            cond.evaluate_with_resolver(false, &values, None).await,
+            "IfExists should return true when the key is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_if_exists_key_present_delegates() {
+        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+        let cond = Condition::IfExists(Box::new(inner));
+
+        let mut values = HashMap::new();
+        values.insert("x-amz-server-side-encryption".to_string(), vec!["aws:kms".to_string()]);
+
+        assert!(
+            cond.evaluate_with_resolver(false, &values, None).await,
+            "IfExists should delegate to inner and return true when values match"
+        );
+
+        values.insert("x-amz-server-side-encryption".to_string(), vec!["AES256".to_string()]);
+
+        assert!(
+            !cond.evaluate_with_resolver(false, &values, None).await,
+            "IfExists should delegate to inner and return false when values differ"
         );
     }
 }
