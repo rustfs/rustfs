@@ -275,6 +275,7 @@ opentelemetry-otlp = { version = "0.31.0", features = ["gzip-http", "reqwest-rus
 opentelemetry_sdk = { version = "0.31.0" }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.31.0" }
+pyroscope = { version= "1.0.1", features= ["backend-pprof-rs"]}
 
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
@@ -293,10 +294,14 @@ jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 
+[patch.crates-io]
+# Pyroscope uses a patched pprof, until they merge back upstream, replace all references. Otherwise, two pprof libs with symbol collision.
+pprof = { package = "pprof-pyroscope-fork", version = "0.1500.1" }
+
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rustfs-mcp"]
 
-[profile.release]
+[profile.release]                                         s
 opt-level = 3
 
 [profile.production]
