@@ -547,6 +547,15 @@ pub fn get_content_checksum(headers: &HeaderMap) -> Result<Option<Checksum>, std
     }
 
     let checksum = Checksum::new_with_type(checksum_type, &value);
+    if checksum.is_none() && !value.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            crate::errors::ChecksumMismatch {
+                want: value,
+                got: "invalid checksum value".to_string(),
+            },
+        ));
+    }
     Ok(checksum)
 }
 

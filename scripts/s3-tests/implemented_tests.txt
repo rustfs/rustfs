@@ -29,8 +29,10 @@
 # - Raw requests: Authenticated and anonymous
 # - Conditional writes: If-Match/If-None-Match for PUT/Copy
 # - Atomic read/write: Concurrent read/write consistency
+# - Object Lock: Enable on versioned existing buckets
+# - Checksum: SHA256 and CRC64NVME validation on PutObject
 #
-# Total: 376 tests
+# Total: 379 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -456,3 +458,10 @@ test_atomic_dual_write_1mb
 test_atomic_dual_write_4mb
 test_atomic_dual_write_8mb
 test_atomic_multipart_upload_write
+
+# Object Lock tests
+test_object_lock_put_obj_lock_enable_after_create
+
+# Checksum validation tests
+test_object_checksum_sha256
+test_object_checksum_crc64nvme

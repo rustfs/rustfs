@@ -609,7 +609,7 @@ impl DefaultMultipartUsecase {
             let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
-                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+                return Err(ApiError::from(err).into());
             }
 
             let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
@@ -622,7 +622,7 @@ impl DefaultMultipartUsecase {
         let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
         if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
-            return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+            return Err(ApiError::from(err).into());
         }
 
         let has_ssec = sse_customer_algorithm.is_some();
