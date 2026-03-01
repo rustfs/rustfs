@@ -216,4 +216,28 @@ mod test {
         let reparsed: Principal = serde_json::from_str(&serialized).expect("Should re-parse");
         assert_eq!(principal, reparsed);
     }
+
+    #[test]
+    fn test_principal_is_match_service() {
+        let principal = Principal {
+            aws: HashSet::new(),
+            service: HashSet::from(["logging.s3.amazonaws.com".to_string()]),
+        };
+
+        assert!(principal.is_match("logging.s3.amazonaws.com"));
+        assert!(!principal.is_match("replication.s3.amazonaws.com"));
+        assert!(!principal.is_match("arn:aws:iam::123456789012:root"));
+    }
+
+    #[test]
+    fn test_principal_is_match_aws_and_service() {
+        let principal = Principal {
+            aws: HashSet::from(["arn:aws:iam::123456789012:root".to_string()]),
+            service: HashSet::from(["logging.s3.amazonaws.com".to_string()]),
+        };
+
+        assert!(principal.is_match("arn:aws:iam::123456789012:root"));
+        assert!(principal.is_match("logging.s3.amazonaws.com"));
+        assert!(!principal.is_match("other-principal"));
+    }
 }
