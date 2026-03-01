@@ -508,6 +508,25 @@ pub fn get_condition_values(
         clone_header.remove(*obj_lock);
     }
 
+    // S3 policy condition keys use "x-amz-grant-*" (policy key s3:x-amz-grant-* -> name() returns x-amz-grant-*)
+    for grant_header in &[
+        "x-amz-grant-full-control",
+        "x-amz-grant-read",
+        "x-amz-grant-write",
+        "x-amz-grant-read-acp",
+        "x-amz-grant-write-acp",
+    ] {
+        let values = clone_header
+            .get_all(*grant_header)
+            .iter()
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .collect::<Vec<String>>();
+        if !values.is_empty() {
+            args.insert((*grant_header).to_string(), values);
+        }
+        clone_header.remove(*grant_header);
+    }
+
     for (key, _values) in clone_header.iter() {
         if key.as_str().eq_ignore_ascii_case("x-amz-tagging") {
             continue;
@@ -1035,6 +1054,25 @@ mod tests {
         assert_eq!(
             conditions.get("object-lock-retain-until-date"),
             Some(&vec!["2024-12-31T23:59:59Z".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_get_condition_values_with_grant_headers() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-grant-full-control", HeaderValue::from_static("id=owner-123"));
+        headers.insert(
+            "x-amz-grant-read",
+            HeaderValue::from_static("uri=http://acs.amazonaws.com/groups/global/AllUsers"),
+        );
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("x-amz-grant-full-control"), Some(&vec!["id=owner-123".to_string()]));
+        assert_eq!(
+            conditions.get("x-amz-grant-read"),
+            Some(&vec!["uri=http://acs.amazonaws.com/groups/global/AllUsers".to_string()])
         );
     }
 

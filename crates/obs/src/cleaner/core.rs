@@ -25,7 +25,7 @@
 
 use super::compress::compress_file;
 use super::scanner::{collect_expired_compressed_files, collect_log_files};
-use super::types::FileInfo;
+use super::types::{FileInfo, FileMatchMode};
 use std::path::PathBuf;
 use tracing::{debug, error, info};
 
@@ -41,8 +41,10 @@ use tracing::{debug, error, info};
 pub struct LogCleaner {
     /// Directory containing the managed log files.
     pub(super) log_dir: PathBuf,
-    /// Filename prefix that identifies managed files (e.g. `"rustfs.log."`).
-    pub(super) file_prefix: String,
+    /// Pattern string to match files (used as prefix or suffix).
+    pub(super) file_pattern: String,
+    /// Whether to match by prefix or suffix.
+    pub(super) match_mode: FileMatchMode,
     /// The cleaner will never delete files if doing so would leave fewer than
     /// this many files in the directory.
     pub(super) keep_count: usize,
@@ -77,7 +79,8 @@ impl LogCleaner {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         log_dir: PathBuf,
-        file_prefix: String,
+        file_pattern: String,
+        match_mode: FileMatchMode,
         keep_count: usize,
         max_total_size_bytes: u64,
         max_single_file_size_bytes: u64,
@@ -96,7 +99,8 @@ impl LogCleaner {
 
         Self {
             log_dir,
-            file_prefix,
+            file_pattern,
+            match_mode,
             keep_count,
             max_total_size_bytes,
             max_single_file_size_bytes,
@@ -136,7 +140,8 @@ impl LogCleaner {
         // ── 1. Discover active log files ──────────────────────────────────────
         let mut files = collect_log_files(
             &self.log_dir,
-            &self.file_prefix,
+            &self.file_pattern,
+            self.match_mode,
             &self.exclude_patterns,
             self.min_file_age_seconds,
             self.delete_empty_files,
@@ -156,7 +161,15 @@ impl LogCleaner {
             );
 
             // ── 2. Select + compress + delete ─────────────────────────────────
-            let to_delete = self.select_files_to_delete(&files, total_size);
+            let (to_delete, to_rotate) = self.select_files_to_process(&files, total_size);
+
+            // Handle rotation for active file if needed
+            if let Some(active_file) = to_rotate
+                && let Err(e) = self.rotate_active_file(&active_file)
+            {
+                error!("Failed to rotate active file {:?}: {}", active_file.path, e);
+            }
+
             if !to_delete.is_empty() {
                 let (d, f) = self.compress_and_delete(&to_delete)?;
                 total_deleted += d;
@@ -165,7 +178,12 @@ impl LogCleaner {
         }
 
         // ── 3. Remove expired compressed archives ─────────────────────────────
-        let expired_gz = collect_expired_compressed_files(&self.log_dir, &self.file_prefix, self.compressed_file_retention_days)?;
+        let expired_gz = collect_expired_compressed_files(
+            &self.log_dir,
+            &self.file_pattern,
+            self.match_mode,
+            self.compressed_file_retention_days,
+        )?;
         if !expired_gz.is_empty() {
             let (d, f) = self.delete_files(&expired_gz)?;
             total_deleted += d;
@@ -186,51 +204,180 @@ impl LogCleaner {
 
     // ─── Selection ────────────────────────────────────────────────────────────
 
-    /// Choose which files from `files` (sorted oldest-first) should be deleted.
+    /// Choose which files from `files` (sorted oldest-first) should be deleted or rotated.
     ///
     /// The algorithm respects three constraints in order:
     /// 1. Always keep at least `keep_count` files.
     /// 2. Delete old files while the total size exceeds `max_total_size_bytes`.
     /// 3. Delete any file whose individual size exceeds `max_single_file_size_bytes`.
-    pub(super) fn select_files_to_delete(&self, files: &[FileInfo], total_size: u64) -> Vec<FileInfo> {
+    ///
+    /// **Note**: The most recent file (assumed to be the active log) is exempt
+    /// from size-based deletion. If it exceeds the size limit, it is returned
+    /// as `to_rotate`.
+    pub(super) fn select_files_to_process(&self, files: &[FileInfo], total_size: u64) -> (Vec<FileInfo>, Option<FileInfo>) {
         let mut to_delete = Vec::new();
+        let mut to_rotate = None;
 
-        if files.len() <= self.keep_count {
-            return to_delete;
+        if files.is_empty() {
+            return (to_delete, to_rotate);
         }
 
+        // Identify the index of the most recent file (last in the sorted list).
+        // We will protect this file from size-based deletion.
+        let active_file_idx = files.len() - 1;
+
+        // The number of files we are allowed to delete.
+        // Any file with index >= max_deletable_count is protected by keep_count.
+        let max_deletable_count = files.len().saturating_sub(self.keep_count);
+
         let mut current_size = total_size;
-        let deletable = files.len() - self.keep_count;
 
         for (idx, file) in files.iter().enumerate() {
-            if idx >= deletable {
-                break;
+            // If we are in the protected range, we stop deleting.
+            if idx >= max_deletable_count {
+                // However, if the active file is too large, we might rotate it.
+                if idx == active_file_idx {
+                    let over_single = self.max_single_file_size_bytes > 0 && file.size > self.max_single_file_size_bytes;
+                    if over_single {
+                        to_rotate = Some(file.clone());
+                    }
+                }
+                continue;
             }
 
+            // We are in the deletable range. Check if we *should* delete.
+
+            // Condition 2: Enforce max_total_size_bytes.
             let over_total = self.max_total_size_bytes > 0 && current_size > self.max_total_size_bytes;
+
+            // Condition 3: Enforce max_single_file_size_bytes.
             let over_single = self.max_single_file_size_bytes > 0 && file.size > self.max_single_file_size_bytes;
 
-            if over_total || over_single {
-                if over_single {
+            if over_total {
+                // If we are over total size, we delete unless it's the active file.
+                if idx == active_file_idx {
+                    debug!(
+                        "Active log file contributes to total size limit overflow, but skipping deletion to preserve current logs."
+                    );
+                } else {
+                    current_size = current_size.saturating_sub(file.size);
+                    to_delete.push(file.clone());
+                }
+            } else if over_single {
+                // For single file limits, we MUST NOT delete the active file.
+                if idx == active_file_idx {
+                    // Mark active file for rotation instead of deletion
+                    to_rotate = Some(file.clone());
+                } else {
                     debug!(
                         "File exceeds single-file size limit: {:?} ({} > {} bytes)",
                         file.path, file.size, self.max_single_file_size_bytes
                     );
+                    current_size = current_size.saturating_sub(file.size);
+                    to_delete.push(file.clone());
                 }
-                current_size = current_size.saturating_sub(file.size);
-                to_delete.push(file.clone());
-            } else {
-                // Neither limit is breached; stop scanning.
-                break;
             }
         }
 
-        to_delete
+        (to_delete, to_rotate)
+    }
+
+    // ─── Rotation ─────────────────────────────────────────────────────────────
+
+    /// Rotate the active file by renaming it with a timestamp suffix.
+    /// The original filename will be recreated by the logging appender on next write.
+    fn rotate_active_file(&self, file: &FileInfo) -> Result<(), std::io::Error> {
+        if self.dry_run {
+            info!("[DRY RUN] Would rotate active file: {:?} ({} bytes)", file.path, file.size);
+            return Ok(());
+        }
+
+        // Generate timestamp: unix timestamp in seconds
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_secs();
+
+        let file_name = file
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid filename"))?;
+
+        // Construct the rotated filename.
+        // We must ensure the new filename still matches the file_pattern so it can be discovered
+        // by the scanner in future runs (and eventually deleted).
+        //
+        // Suffix mode: Insert timestamp BEFORE the suffix.
+        //   Example: "2026-03-01.rustfs.log" (pattern="rustfs.log")
+        //   -> "2026-03-01.1740810000.rustfs.log"
+        //
+        // Prefix mode: Append timestamp at the end.
+        //   Example: "app.log" (pattern="app")
+        //   -> "app.log.1740810000"
+        let rotated_name = match self.match_mode {
+            FileMatchMode::Suffix => {
+                if let Some(base) = file_name.strip_suffix(&self.file_pattern) {
+                    let mut new_name = String::with_capacity(file_name.len() + 20);
+                    new_name.push_str(base);
+
+                    // Ensure separator between base and timestamp
+                    if !base.is_empty() && !base.ends_with('.') {
+                        new_name.push('.');
+                    }
+                    new_name.push_str(&timestamp.to_string());
+
+                    // Ensure separator between timestamp and suffix
+                    if !self.file_pattern.starts_with('.') {
+                        new_name.push('.');
+                    }
+                    new_name.push_str(&self.file_pattern);
+
+                    new_name
+                } else {
+                    // Should not happen if scanner works correctly, but fallback safely
+                    format!("{}.{}", file_name, timestamp)
+                }
+            }
+            FileMatchMode::Prefix => {
+                // For prefix matching, appending to the end preserves the prefix.
+                format!("{}.{}", file_name, timestamp)
+            }
+        };
+
+        let rotated_path = file.path.with_file_name(&rotated_name);
+
+        // Check if target already exists to avoid overwriting (unlikely with timestamp but possible)
+        if rotated_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("Rotated file already exists: {:?}", rotated_path),
+            ));
+        }
+
+        info!("Rotating active log file: {:?} -> {:?}", file.path, rotated_path);
+
+        // Rename the current active file to the rotated name.
+        // The logging appender (tracing-appender) will automatically create a new file
+        // with the original name when it next attempts to write.
+        // Note: On Linux/Unix, this rename is atomic and safe even if the file is open.
+        if let Err(e) = std::fs::rename(&file.path, &rotated_path) {
+            // Add context to the error
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("Failed to rename {:?} to {:?}: {}", file.path, rotated_path, e),
+            ));
+        }
+
+        Ok(())
     }
 
     // ─── Compression + deletion ───────────────────────────────────────────────
 
     /// Optionally compress and then delete the given files.
+    ///
+    /// This function is synchronous and blocking. It should be called within a
+    /// `spawn_blocking` task if running in an async context.
     fn compress_and_delete(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
         if self.compress_old_files {
             for f in files {

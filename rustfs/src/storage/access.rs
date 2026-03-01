@@ -26,9 +26,9 @@ use crate::server::RemoteAddr;
 use metrics::counter;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
-use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found};
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::ObjectOperations;
+use rustfs_ecstore::store_api::{BucketOperations, ObjectOperations};
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_policy::policy::{Args, BucketPolicyArgs};
@@ -166,13 +166,19 @@ async fn load_object_acl(bucket: &str, object: &str, version_id: Option<&str>, h
 }
 
 async fn check_acl_access<T>(req: &S3Request<T>, req_info: &ReqInfo, action: &Action, policy_allowed: bool) -> S3Result<bool> {
-    if req_info.is_owner || policy_allowed {
-        return Ok(true);
-    }
-
     let Some((target, permission)) = acl_permission_for_action(action) else {
         return Ok(true);
     };
+
+    // For object-level operations, do not bypass on account-level is_owner.
+    // The bucket/account owner must have explicit ACL grant to access objects owned by others.
+    let bypass_owner = match target {
+        AclTarget::Bucket => req_info.is_owner,
+        AclTarget::Object => false,
+    };
+    if bypass_owner || policy_allowed {
+        return Ok(true);
+    }
 
     let bucket = req_info.bucket.as_deref().unwrap_or("");
     if bucket.is_empty() {
@@ -364,7 +370,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             return Err(s3_error!(AccessDenied, "Access Denied"));
         }
 
-        if PolicySys::is_allowed(&BucketPolicyArgs {
+        let policy_allowed_fallback = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: req_info.bucket.as_deref().unwrap_or(""),
             action,
             is_owner: req_info.is_owner,
@@ -373,8 +379,16 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             conditions: &conditions,
             object: req_info.object.as_deref().unwrap_or(""),
         })
-        .await
-        {
+        .await;
+
+        if policy_allowed_fallback {
+            // For object-level operations, bucket owner (is_owner) must still pass ACL check.
+            // Policy may have allowed due to is_owner, but object owner is authoritative.
+            if let Some((AclTarget::Object, _)) = acl_permission_for_action(&action)
+                && !check_acl_access(req, req_info, &action, false).await?
+            {
+                return Err(s3_error!(AccessDenied, "Access Denied"));
+            }
             return Ok(());
         }
 
@@ -446,7 +460,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
-            if PolicySys::is_allowed(&BucketPolicyArgs {
+            let policy_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: req_info.bucket.as_deref().unwrap_or(""),
                 action,
                 is_owner: false,
@@ -455,8 +469,21 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 conditions: &conditions,
                 object: req_info.object.as_deref().unwrap_or(""),
             })
-            .await
-            {
+            .await;
+
+            if policy_allowed {
+                // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
+                // Fail closed: if we cannot read the config, do not allow public access.
+                match metadata_sys::get_public_access_block_config(bucket_name).await {
+                    Ok((config, _)) => {
+                        if config.restrict_public_buckets.unwrap_or(false) {
+                            return Err(s3_error!(AccessDenied, "Access Denied"));
+                        }
+                    }
+                    Err(_) => {
+                        return Err(s3_error!(AccessDenied, "Access Denied"));
+                    }
+                }
                 return Ok(());
             }
 
@@ -771,6 +798,13 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
+        if let Some(store) = new_object_layer_fn()
+            && let Err(err) = store.get_bucket_info(&req.input.bucket, &Default::default()).await
+            && is_err_bucket_not_found(&err)
+        {
+            return Err(s3_error!(NoSuchBucket, "The specified bucket does not exist"));
+        }
+
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -938,8 +972,11 @@ impl S3Access for FS {
     /// Checks whether the GetBucketLogging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_logging(&self, _req: &mut S3Request<GetBucketLoggingInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_logging(&self, req: &mut S3Request<GetBucketLoggingInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::GetBucketLoggingAction)).await
     }
 
     /// Checks whether the GetBucketMetricsConfiguration request has accesses to the resources.

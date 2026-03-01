@@ -171,7 +171,7 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # Time and Date
 chrono = { version = "0.4.44", features = ["serde"] }
 humantime = "2.3.0"
-jiff = { version = "0.2.21", features = ["serde"] }
+jiff = { version = "0.2.22", features = ["serde"] }
 time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Utilities and Tools
@@ -235,7 +235,7 @@ rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { version = "0.13.0-alpha.3", features = ["minio"], git = "https://github.com/s3s-project/s3s.git", rev = "3600aad5bcd691683e99d1e5fa17bae3bc21791d" }
+s3s = { version = "0.13.0", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.0", default-features = false }
 siphasher = "1.0.2"

@@ -53,16 +53,16 @@
 //! #   // Guard will be dropped here, flushing telemetry data
 //! # }
 //! ```
+mod cleaner;
 mod config;
 mod error;
 mod global;
-mod log_cleanup;
 mod system;
 mod telemetry;
 
+pub use cleaner::*;
 pub use config::*;
 pub use error::*;
 pub use global::*;
-pub use log_cleanup::*;
 pub use system::SystemObserver;
 pub use telemetry::{OtelGuard, Recorder};

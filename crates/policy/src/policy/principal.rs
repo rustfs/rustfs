@@ -130,9 +130,11 @@ impl Principal {
                 return true;
             }
         }
-        // Service principals (e.g., logging.s3.amazonaws.com) allow internal
-        // AWS services. Treat them as non-matching for user requests — they
-        // only apply to service-initiated actions.
+        for pattern in self.service.iter() {
+            if wildcard::is_simple_match(pattern, principal) {
+                return true;
+            }
+        }
         false
     }
 }
@@ -213,5 +215,29 @@ mod test {
         let serialized = serde_json::to_string(&principal).expect("Should serialize");
         let reparsed: Principal = serde_json::from_str(&serialized).expect("Should re-parse");
         assert_eq!(principal, reparsed);
+    }
+
+    #[test]
+    fn test_principal_is_match_service() {
+        let principal = Principal {
+            aws: HashSet::new(),
+            service: HashSet::from(["logging.s3.amazonaws.com".to_string()]),
+        };
+
+        assert!(principal.is_match("logging.s3.amazonaws.com"));
+        assert!(!principal.is_match("replication.s3.amazonaws.com"));
+        assert!(!principal.is_match("arn:aws:iam::123456789012:root"));
+    }
+
+    #[test]
+    fn test_principal_is_match_aws_and_service() {
+        let principal = Principal {
+            aws: HashSet::from(["arn:aws:iam::123456789012:root".to_string()]),
+            service: HashSet::from(["logging.s3.amazonaws.com".to_string()]),
+        };
+
+        assert!(principal.is_match("arn:aws:iam::123456789012:root"));
+        assert!(principal.is_match("logging.s3.amazonaws.com"));
+        assert!(!principal.is_match("other-principal"));
     }
 }

@@ -18,7 +18,7 @@ use crate::app::context::{AppContext, default_notify_interface, get_global_app_c
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
-use crate::storage::access::{ReqInfo, authorize_request};
+use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
 use crate::storage::ecfs::{
     RUSTFS_OWNER, default_owner, is_public_grant, parse_acl_json_or_canned_bucket, serialize_acl, stored_acl_from_canned_bucket,
     stored_acl_from_grant_headers, stored_acl_from_policy, stored_grant_to_dto, stored_owner_to_dto,
@@ -150,6 +150,12 @@ impl DefaultBucketUsecase {
         }
 
         let helper = OperationHelper::new(&req, EventName::BucketCreated, "s3:CreateBucket");
+        let requester_id = match req_info_ref(&req) {
+            Ok(r) => r.cred.as_ref().map(|c| c.access_key.clone()),
+            Err(_) => {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Missing request info".to_string()));
+            }
+        };
         let CreateBucketInput {
             bucket,
             acl,
@@ -182,9 +188,26 @@ impl DefaultBucketUsecase {
         match make_result {
             Ok(()) => {}
             Err(StorageError::BucketExists(_)) => {
-                // Per S3 spec: CreateBucket for a bucket you already own returns 200 OK
-                let output = CreateBucketOutput::default();
-                let result = Ok(S3Response::new(output));
+                // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
+                // non-owner gets 409 BucketAlreadyExists.
+                let bucket_owner_id = match metadata_sys::get_bucket_acl_config(&bucket).await {
+                    Ok((acl, _)) => parse_acl_json_or_canned_bucket(&acl, &default_owner()).owner.id,
+                    Err(StorageError::ConfigNotFound) => default_owner().id,
+                    Err(e) => return Err(ApiError::from(e).into()),
+                };
+
+                let is_owner = requester_id.as_deref().is_some_and(|req_id| req_id == bucket_owner_id);
+
+                if is_owner {
+                    let output = CreateBucketOutput::default();
+                    let result = Ok(S3Response::new(output));
+                    let _ = helper.complete(&result);
+                    return result;
+                }
+                let result = Err(s3_error!(
+                    BucketAlreadyExists,
+                    "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."
+                ));
                 let _ = helper.complete(&result);
                 return result;
             }

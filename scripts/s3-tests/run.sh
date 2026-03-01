@@ -120,8 +120,13 @@ fi
 # =============================================================================
 # TESTEXPR: pytest -k expression to select specific tests
 # =============================================================================
-# By default, builds an inclusion expression from implemented_tests.txt.
-# Use TESTEXPR env var to override with custom selection.
+# By default, builds an inclusion expression from implemented_tests.txt,
+# combined with an exclusion expression from non_standard_tests.txt and
+# unimplemented_tests.txt to prevent substring-matching collisions.
+#
+# For example, "test_object_raw_get" in the include list would also match
+# "test_object_raw_get_x_amz_expires_not_expired" via pytest -k substring
+# matching. The exclusion guard ensures only intended tests run.
 #
 # The file-based approach provides:
 #   1. Clear visibility of which tests are run
@@ -131,18 +136,38 @@ fi
 if [[ -z "${TESTEXPR:-}" ]]; then
     if [[ -f "${IMPLEMENTED_TESTS_FILE}" ]]; then
         log_info "Loading test list from: ${IMPLEMENTED_TESTS_FILE}"
-        TESTEXPR=$(build_testexpr_from_file "${IMPLEMENTED_TESTS_FILE}")
-        if [[ -z "${TESTEXPR}" ]]; then
+        INCLUDE_EXPR=$(build_testexpr_from_file "${IMPLEMENTED_TESTS_FILE}")
+        if [[ -z "${INCLUDE_EXPR}" ]]; then
             log_error "No tests found in ${IMPLEMENTED_TESTS_FILE}"
             exit 1
         fi
-        # Count tests for logging
         TEST_COUNT=$(grep -v '^#' "${IMPLEMENTED_TESTS_FILE}" | grep -v '^[[:space:]]*$' | wc -l | xargs)
         log_info "Loaded ${TEST_COUNT} tests from implemented_tests.txt"
+
+        # Build exclusion expression from non-standard and unimplemented lists
+        # to guard against pytest -k substring matching false positives
+        EXCLUDE_EXPR=""
+        for exclude_file in "${NON_STANDARD_TESTS_FILE}" "${UNIMPLEMENTED_TESTS_FILE}"; do
+            if [[ -f "${exclude_file}" ]]; then
+                FILE_EXPR=$(build_testexpr_from_file "${exclude_file}")
+                if [[ -n "${FILE_EXPR}" ]]; then
+                    if [[ -n "${EXCLUDE_EXPR}" ]]; then
+                        EXCLUDE_EXPR+=" or "
+                    fi
+                    EXCLUDE_EXPR+="${FILE_EXPR}"
+                fi
+            fi
+        done
+
+        if [[ -n "${EXCLUDE_EXPR}" ]]; then
+            TESTEXPR="(${INCLUDE_EXPR}) and not (${EXCLUDE_EXPR})"
+            log_info "Added exclusion guard from non_standard + unimplemented lists"
+        else
+            TESTEXPR="${INCLUDE_EXPR}"
+        fi
     else
         log_warn "Test list file not found: ${IMPLEMENTED_TESTS_FILE}"
         log_warn "Falling back to exclusion-based filtering"
-        # Fallback to exclusion-based filtering if file doesn't exist
         EXCLUDED_TESTS=(
             "test_post_object"
             "test_bucket_list_objects_anonymous"

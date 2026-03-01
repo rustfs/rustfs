@@ -43,3 +43,4 @@ docs
 
 # nix stuff
 result*
+*.gz

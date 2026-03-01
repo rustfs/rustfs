@@ -17,6 +17,15 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// Strategy for matching log files against a pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileMatchMode {
+    /// The filename must start with the pattern (e.g. "app.log." matches "app.log.2024-01-01").
+    Prefix,
+    /// The filename must end with the pattern (e.g. ".log" matches "2024-01-01.log").
+    Suffix,
+}
+
 /// Metadata for a single log file discovered by the scanner.
 ///
 /// Carries enough information to make cleanup decisions (sort by age, compare

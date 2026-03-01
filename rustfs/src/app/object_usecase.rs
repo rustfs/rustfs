@@ -472,7 +472,7 @@ impl DefaultObjectUsecase {
             let mut hrd = HashReader::new(reader, size as i64, size as i64, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
-                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+                return Err(ApiError::from(err).into());
             }
 
             opts.want_checksum = hrd.checksum();
@@ -491,7 +491,7 @@ impl DefaultObjectUsecase {
 
         if size >= 0 {
             if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
-                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+                return Err(ApiError::from(err).into());
             }
 
             opts.want_checksum = reader.checksum();
@@ -788,16 +788,21 @@ impl DefaultObjectUsecase {
             Ok(_) => {}
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
+                    // AWS S3 allows enabling Object Lock on existing buckets if versioning
+                    // is already enabled. Reject only when versioning is not enabled.
+                    if !BucketVersioningSys::enabled(&bucket).await {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidBucketState,
+                            "Object Lock configuration cannot be enabled on existing buckets".to_string(),
+                        ));
+                    }
+                } else {
+                    warn!("get_object_lock_config err {:?}", err);
                     return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidBucketState,
-                        "Object Lock configuration cannot be enabled on existing buckets".to_string(),
+                        S3ErrorCode::InternalError,
+                        "Failed to get bucket ObjectLockConfiguration".to_string(),
                     ));
                 }
-                warn!("get_object_lock_config err {:?}", err);
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "Failed to get bucket ObjectLockConfiguration".to_string(),
-                ));
             }
         };
 
@@ -3524,7 +3529,7 @@ impl DefaultObjectUsecase {
         let mut hreader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
         if let Err(err) = hreader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
-            return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+            return Err(ApiError::from(err).into());
         }
 
         let decoder = CompressionFormat::from_extension(&ext).get_decoder(hreader).map_err(|e| {

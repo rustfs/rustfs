@@ -1298,4 +1298,41 @@ mod tests {
             .unwrap();
         assert!(out.is_empty());
     }
+
+    // --- CORS origin pattern matching tests ---
+
+    #[test]
+    fn test_matches_origin_pattern_suffix_wildcard() {
+        assert!(matches_origin_pattern("*suffix", "foo.suffix"));
+        assert!(matches_origin_pattern("*suffix", "suffix"));
+        assert!(!matches_origin_pattern("*suffix", "foo.suffix.get"));
+        assert!(!matches_origin_pattern("*suffix", "foo.bar"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_prefix_wildcard() {
+        assert!(matches_origin_pattern("prefix*", "prefix"));
+        assert!(matches_origin_pattern("prefix*", "prefix.suffix"));
+        assert!(!matches_origin_pattern("prefix*", "bla.prefix"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_middle_wildcard() {
+        assert!(matches_origin_pattern("start*end", "startend"));
+        assert!(matches_origin_pattern("start*end", "start1end"));
+        assert!(matches_origin_pattern("start*end", "start12end"));
+        assert!(!matches_origin_pattern("start*end", "0start12end"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_exact_no_wildcard() {
+        assert!(matches_origin_pattern("example.com", "example.com"));
+        assert!(!matches_origin_pattern("example.com", "other.com"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_single_star_wildcard() {
+        assert!(matches_origin_pattern("*", "anything.com"));
+        assert!(matches_origin_pattern("*", ""));
+    }
 }
