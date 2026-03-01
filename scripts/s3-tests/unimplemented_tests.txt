@@ -6,16 +6,12 @@
 #
 # Unimplemented features:
 # - Bucket Logging: Access logging
-# - Object Lock: Enable after create
-# - Checksum: Full checksum validation
+# - Checksum: POST Object form upload checksum
 # - Bucket Ownership Controls
 
 # Failed tests
 test_bucket_create_delete_bucket_ownership
 test_bucket_logging_owner
-test_object_checksum_crc64nvme
-test_object_checksum_sha256
-test_object_lock_put_obj_lock_enable_after_create
 test_post_object_upload_checksum
 test_put_bucket_logging
 test_put_bucket_logging_errors
