@@ -31,8 +31,11 @@
 # - Atomic read/write: Concurrent read/write consistency
 # - Object Lock: Enable on versioned existing buckets
 # - Checksum: SHA256 and CRC64NVME validation on PutObject
+# - CORS: Bucket-level CORS configuration, preflight, origin matching
+# - HTTP: 100-continue, multipart abort, tagging in POST Object
+# - DeleteObject: Proper NoSuchBucket for deleted buckets
 #
-# Total: 379 tests
+# Total: 393 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -465,3 +468,21 @@ test_object_lock_put_obj_lock_enable_after_create
 # Checksum validation tests
 test_object_checksum_sha256
 test_object_checksum_crc64nvme
+
+# CORS tests
+test_set_cors
+test_cors_origin_response
+test_cors_origin_wildcard
+test_cors_header_option
+test_cors_presigned_get_object
+test_cors_presigned_get_object_tenant
+test_cors_presigned_put_object
+test_cors_presigned_put_object_with_acl
+test_cors_presigned_put_object_tenant
+test_cors_presigned_put_object_tenant_with_acl
+
+# HTTP and DeleteObject tests
+test_100_continue
+test_abort_multipart_upload_not_found
+test_post_object_tags_authenticated_request
+test_object_delete_key_bucket_gone

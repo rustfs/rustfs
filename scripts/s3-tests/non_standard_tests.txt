@@ -8,16 +8,13 @@
 # - fails_on_aws marker: Ceph-specific features
 # - X-RGW-* headers: Ceph proprietary headers
 # - allowUnordered: Ceph-specific query parameter
-# - CORS tests: Not implemented
 # - Bucket Logging: Ceph-specific logging extensions
 # - Object Lock: Ceph-specific lock behavior differences
 # - Lifecycle: Ceph-specific lifecycle expiration behavior
 # - SSE-KMS: Ceph-specific KMS extensions
 # - Error format differences: Minor response format variations
 
-test_100_continue
 test_100_continue_error_retry
-test_abort_multipart_upload_not_found
 test_account_usage
 test_atomic_conditional_write_1mb
 test_atomic_dual_conditional_write_1mb
@@ -146,19 +143,10 @@ test_copy_object_ifmatch_failed
 test_copy_object_ifmatch_good
 test_copy_object_ifnonematch_failed
 test_copy_object_ifnonematch_good
-test_cors_header_option
-test_cors_origin_response
-test_cors_origin_wildcard
-test_cors_presigned_get_object
-test_cors_presigned_get_object_tenant
 test_cors_presigned_get_object_tenant_v2
 test_cors_presigned_get_object_v2
-test_cors_presigned_put_object
-test_cors_presigned_put_object_tenant
 test_cors_presigned_put_object_tenant_v2
-test_cors_presigned_put_object_tenant_with_acl
 test_cors_presigned_put_object_v2
-test_cors_presigned_put_object_with_acl
 test_create_bucket_bucket_owner_enforced
 test_create_bucket_bucket_owner_preferred
 test_create_bucket_object_writer
@@ -257,7 +245,6 @@ test_multipart_use_cksum_helper_sha256
 test_non_multipart_get_part
 test_non_multipart_sse_c_get_part
 test_object_copy_canned_acl
-test_object_delete_key_bucket_gone
 test_object_header_acl_grants
 test_object_lock_changing_mode_from_compliance
 test_object_lock_changing_mode_from_governance_with_bypass
@@ -307,7 +294,6 @@ test_post_object_request_missing_policy_specified_field
 test_post_object_set_key_from_filename
 test_post_object_success_redirect_action
 test_post_object_tags_anonymous_request
-test_post_object_tags_authenticated_request
 test_post_object_wrong_bucket
 test_put_bucket_logging_account_j
 test_put_bucket_logging_account_s
@@ -335,7 +321,6 @@ test_read_through
 test_restore_noncur_obj
 test_restore_object_permanent
 test_restore_object_temporary
-test_set_cors
 test_sse_kms_default_post_object_authenticated_request
 test_sse_kms_default_upload_1b
 test_sse_kms_default_upload_1kb
