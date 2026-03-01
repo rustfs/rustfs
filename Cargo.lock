@@ -6204,30 +6204,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "efca4c95a19a79d1c98f791f10aebd5c1363b473244630bb7dbde1dc98455a24"
 
 [[package]]
-name = "pprof"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38a01da47675efa7673b032bf8efd8214f1917d89685e07e395ab125ea42b187"
-dependencies = [
- "aligned-vec",
- "backtrace",
- "cfg-if",
- "findshlibs",
- "inferno 0.11.21",
- "libc",
- "log",
- "nix 0.26.4",
- "once_cell",
- "protobuf",
- "protobuf-codegen",
- "smallvec",
- "spin 0.10.0",
- "symbolic-demangle",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "pprof-pyroscope-fork"
 version = "0.1500.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6238,12 +6214,15 @@ dependencies = [
  "cfg-if",
  "findshlibs",
  "framehop",
+ "inferno 0.11.21",
  "libc",
  "log",
  "memmap2 0.5.10",
  "nix 0.26.4",
  "object 0.29.0",
  "once_cell",
+ "protobuf",
+ "protobuf-codegen",
  "smallvec",
  "spin 0.10.0",
  "symbolic-demangle",
@@ -7205,7 +7184,7 @@ dependencies = [
  "moka",
  "opentelemetry",
  "pin-project-lite",
- "pprof",
+ "pprof-pyroscope-fork",
  "rand 0.10.0",
  "reqwest 0.13.2",
  "rmp-serde",

@@ -292,16 +292,14 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profilin
 # Used to generate pprof-compatible memory profiling data and support symbolization and flame graphs
 jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
-pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
-
-[patch.crates-io]
+# pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 # Pyroscope uses a patched pprof, until they merge back upstream, replace all references. Otherwise, two pprof libs with symbol collision.
-pprof = { package = "pprof-pyroscope-fork", version = "0.1500.1" }
+pprof = { package = "pprof-pyroscope-fork", version = "0.1500.1", features = ["flamegraph", "protobuf-codec"]} 
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rustfs-mcp"]
 
-[profile.release]                                         s
+[profile.release]
 opt-level = 3
 
 [profile.production]
