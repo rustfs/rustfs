@@ -790,8 +790,7 @@ impl DefaultObjectUsecase {
                 if err == StorageError::ConfigNotFound {
                     // AWS S3 allows enabling Object Lock on existing buckets if versioning
                     // is already enabled. Reject only when versioning is not enabled.
-                    let versioning = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
-                    if !versioning.enabled() {
+                    if !BucketVersioningSys::enabled(&bucket).await {
                         return Err(S3Error::with_message(
                             S3ErrorCode::InvalidBucketState,
                             "Object Lock configuration cannot be enabled on existing buckets".to_string(),
