@@ -8,12 +8,12 @@
 # - fails_on_aws marker: Ceph-specific features
 # - X-RGW-* headers: Ceph proprietary headers
 # - allowUnordered: Ceph-specific query parameter
-# - ACL tests: RustFS uses IAM policy-based access control
 # - CORS tests: Not implemented
-# - POST Object: HTML form upload not implemented
+# - Bucket Logging: Ceph-specific logging extensions
+# - Object Lock: Ceph-specific lock behavior differences
+# - Lifecycle: Ceph-specific lifecycle expiration behavior
+# - SSE-KMS: Ceph-specific KMS extensions
 # - Error format differences: Minor response format variations
-#
-# Total: non-standard tests listed below
 
 test_100_continue
 test_100_continue_error_retry
