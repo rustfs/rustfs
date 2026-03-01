@@ -195,9 +195,7 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
-      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
-      - "--web.console.templates=/usr/share/prometheus/consoles"
-      - "--storage.tsdb.retention.time=200h"
+      - "--storage.tsdb.retention.time=30d"
       - "--web.enable-lifecycle"
       - "--web.enable-otlp-receiver"
       - "--web.enable-remote-write-receiver"
@@ -236,7 +234,7 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./.docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./.docker/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./.docker/observability/grafana/dashboards:/etc/grafana/dashboards:ro
     networks:
       - rustfs-network
     restart: unless-stopped

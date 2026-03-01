@@ -168,17 +168,28 @@ impl DefaultBucketUsecase {
 
         counter!("rustfs_create_bucket_total").increment(1);
 
-        store
+        let make_result = store
             .make_bucket(
                 &bucket,
                 &MakeBucketOptions {
-                    force_create: false, // TODO: force support
+                    force_create: false,
                     lock_enabled: object_lock_enabled_for_bucket.is_some_and(|v| v),
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(ApiError::from)?;
+            .await;
+
+        match make_result {
+            Ok(()) => {}
+            Err(StorageError::BucketExists(_)) => {
+                // Per S3 spec: CreateBucket for a bucket you already own returns 200 OK
+                let output = CreateBucketOutput::default();
+                let result = Ok(S3Response::new(output));
+                let _ = helper.complete(&result);
+                return result;
+            }
+            Err(e) => return Err(ApiError::from(e).into()),
+        }
 
         let owner = default_owner();
         let mut stored_acl = stored_acl_from_grant_headers(

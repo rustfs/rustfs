@@ -13,12 +13,15 @@
 # limitations under the License.
 
 service:
-  extensions: [ jaeger_storage, jaeger_query, remote_sampling, healthcheckv2 ]
+  extensions: [jaeger_storage, jaeger_query]
   pipelines:
     traces:
-      receivers: [ otlp, jaeger, zipkin ]
-      processors: [ batch, adaptive_sampling ]
-      exporters: [ jaeger_storage_exporter ]
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [jaeger_storage_exporter, spanmetrics]
+    metrics/spanmetrics:
+      receivers: [spanmetrics]
+      exporters: [prometheus]
   telemetry:
     resource:
       service.name: jaeger
@@ -31,60 +34,41 @@ service:
                 host: 0.0.0.0
                 port: 8888
     logs:
-      level: info
+      level: DEBUG
 
 extensions:
-  healthcheckv2:
-    use_v2: true
-    http:
-
   jaeger_query:
     storage:
-      traces: badger_store
-    ui:
-      config_file: ./cmd/jaeger/config-ui.json
-      log_access: true
-    max_clock_skew_adjust: 0s
-    grpc:
-      endpoint: 0.0.0.0:16685
-    http:
-      endpoint: 0.0.0.0:16686
-
+      traces: some_storage
+      metrics: some_metrics_storage
   jaeger_storage:
     backends:
-      badger_store:
-        badger:
-          ephemeral: false
-          directory_key: /badger/key
-          directory_value: /badger/data
-          span_store_ttl: 72h
+      some_storage:
+        memory:
+          max_traces: 100000
+    metric_backends:
+      some_metrics_storage:
+        prometheus:
+          endpoint: http://prometheus:9090
+          normalize_calls: true
+          normalize_duration: true
 
-  remote_sampling:
-    adaptive:
-      sampling_store: badger_store
-      initial_sampling_probability: 0.1
-    http:
-    grpc:
+connectors:
+  spanmetrics:
 
 receivers:
   otlp:
     protocols:
       grpc:
+        endpoint: "0.0.0.0:4317"
       http:
-
-  jaeger:
-    protocols:
-      grpc:
-      thrift_binary:
-      thrift_compact:
-      thrift_http:
-
-  zipkin:
+        endpoint: "0.0.0.0:4318"
 
 processors:
   batch:
-  adaptive_sampling:
 
 exporters:
   jaeger_storage_exporter:
-    trace_storage: badger_store
+    trace_storage: some_storage
+  prometheus:
+    endpoint: "0.0.0.0:8889"

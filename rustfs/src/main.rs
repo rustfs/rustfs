@@ -89,7 +89,7 @@ static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
-    let runtime = server::get_tokio_runtime_builder()
+    let runtime = server::tokio_runtime_builder()
         .build()
         .expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
@@ -283,7 +283,7 @@ async fn run(config: config::Config) -> Result<()> {
     // // Initialize global configuration system
     let mut retry_count = 0;
     while let Err(e) = ecconfig::init_global_config_sys(store.clone()).await {
-        error!("ecconfig::init_global_config_sys failed {:?}", e);
+        error!("ecstore config::init_global_config_sys failed {:?}", e);
         // TODO: check error type
         retry_count += 1;
         if retry_count > 15 {

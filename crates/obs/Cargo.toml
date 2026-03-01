@@ -36,9 +36,9 @@ full = ["gpu"]
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants", "observability"] }
 rustfs-utils = { workspace = true, features = ["ip", "path"] }
-flexi_logger = { workspace = true }
+flate2 = { workspace = true }
+glob = { workspace = true }
 metrics = { workspace = true }
-nu-ansi-term = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
@@ -58,8 +58,9 @@ sysinfo = { workspace = true }
 thiserror = { workspace = true }
 pyroscope = "0.5.8"
 pyroscope_pprofrs = "0.2.10"
-
+walkdir = { workspace = true }
 
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }

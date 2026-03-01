@@ -312,6 +312,9 @@ impl DefaultObjectUsecase {
         let sse_customer_key = sse_customer_key.or(h_key);
         let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
 
+        // Merge server_side_encryption from headers (fallback when S3 layer does not populate input)
+        let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
+
         // Validate object key
         validate_object_key(&key, "PUT")?;
 
@@ -547,14 +550,21 @@ impl DefaultObjectUsecase {
         // Fast in-memory update for immediate quota consistency
         rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
 
-        let put_version = obj_info.version_id.map(|v| v.to_string());
+        let raw_version = obj_info.version_id.map(|v| v.to_string());
 
         helper = helper.object(obj_info.clone());
-        if let Some(version_id) = &put_version {
+        if let Some(version_id) = &raw_version {
             helper = helper.version_id(version_id.clone());
         }
 
-        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), put_version.clone());
+        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), raw_version.clone());
+
+        // Per S3 spec: only return VersionId when versioning is Enabled (not Suspended or default)
+        let put_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
+            raw_version
+        } else {
+            None
+        };
 
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
@@ -2381,8 +2391,8 @@ impl DefaultObjectUsecase {
         let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
 
         let mut object_to_delete = Vec::new();
-        let mut object_to_delete_index = HashMap::new();
-        let mut object_sizes = HashMap::new();
+        let mut object_to_delete_idx = Vec::new();
+        let mut object_sizes = Vec::new();
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             let raw_version_id = obj_id.version_id.clone();
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
@@ -2450,7 +2460,7 @@ impl DefaultObjectUsecase {
                 continue;
             }
 
-            object_sizes.insert(object.object_name.clone(), goi.size);
+            object_sizes.push(goi.size);
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
                 object.version_id = Some(Uuid::nil());
@@ -2480,7 +2490,7 @@ impl DefaultObjectUsecase {
                 }
             }
 
-            object_to_delete_index.insert(object.object_name.clone(), idx);
+            object_to_delete_idx.push(idx);
             object_to_delete.push(object);
         }
 
@@ -2522,11 +2532,7 @@ impl DefaultObjectUsecase {
         }
 
         for (i, err) in errs.iter().enumerate() {
-            let obj = dobjs[i].clone();
-
-            let Some(didx) = object_to_delete_index.get(&obj.object_name) else {
-                continue;
-            };
+            let didx = object_to_delete_idx[i];
 
             if err.is_none()
                 || err
@@ -2536,15 +2542,16 @@ impl DefaultObjectUsecase {
                 if replicate_deletes {
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
                 }
-                delete_results[*didx].delete_object = Some(dobjs[i].clone());
-                if let Some(&size) = object_sizes.get(&obj.object_name) {
+                delete_results[didx].delete_object = Some(dobjs[i].clone());
+                let size = object_sizes[i];
+                if size > 0 {
                     rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, size as u64).await;
                 }
                 continue;
             }
 
             if let Some(err) = err.clone() {
-                delete_results[*didx].error = Some(Error {
+                delete_results[didx].error = Some(Error {
                     code: Some(err.to_string()),
                     key: Some(object_to_delete[i].object_name.clone()),
                     message: Some(err.to_string()),

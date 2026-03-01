@@ -31,7 +31,7 @@ pub(crate) use event::{init_event_notifier, shutdown_event_notifier};
 pub(crate) use http::start_http_server;
 pub(crate) use prefix::*;
 pub(crate) use readiness::ReadinessGateLayer;
-pub(crate) use runtime::get_tokio_runtime_builder;
+pub(crate) use runtime::tokio_runtime_builder;
 pub(crate) use service_state::SHUTDOWN_TIMEOUT;
 pub(crate) use service_state::ServiceState;
 pub(crate) use service_state::ServiceStateManager;

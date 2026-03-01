@@ -35,7 +35,7 @@ mod sse_test;
 
 pub(crate) use ecfs_extend::*;
 pub(crate) use sse::{
-    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, extract_ssec_params_from_headers, sse_decryption,
-    sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
-    validate_sse_headers_for_write, validate_ssec_for_read,
+    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, extract_server_side_encryption_from_headers,
+    extract_ssec_params_from_headers, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
+    validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
 };
