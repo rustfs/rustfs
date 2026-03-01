@@ -355,6 +355,34 @@ mod tests {
         }"# => true;
         "6"
     )]
+    #[test_case(
+        r#"{
+            "NumericLessThanEquals": {
+                "s3:max-keys": "10"
+            }
+        }"# => true; "numeric_less_than_equals"
+    )]
+    #[test_case(
+        r#"{
+            "DateLessThan": {
+                "aws:CurrentTime": "2026-01-01T00:00:00Z"
+            }
+        }"# => true; "date_less_than"
+    )]
+    #[test_case(
+        r#"{
+            "StringLikeIfExists": {
+                "aws:Referer": "http://www.example.com/*"
+            }
+        }"# => true; "string_like_if_exists"
+    )]
+    #[test_case(
+        r#"{
+            "ArnLike": {
+                "aws:SourceArn": "arn:aws:s3:::my-bucket"
+            }
+        }"# => true; "arn_like"
+    )]
     fn test_de(input: &str) -> bool {
         serde_json::from_str::<Functions>(input)
             .map_err(|e| eprintln!("{e:?}"))
