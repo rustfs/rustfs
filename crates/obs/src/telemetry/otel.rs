@@ -319,7 +319,8 @@ fn build_logger_provider(
 /// No-op and returns None on non-unix platforms.
 #[cfg(unix)]
 fn init_profiler(config: &OtelConfig) -> Option<PyroscopeAgent<PyroscopeAgentRunning>> {
-    use pyroscope_pprofrs::{PprofConfig, pprof_backend};
+    use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
+    use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;
 
     if !config
@@ -335,21 +336,21 @@ fn init_profiler(config: &OtelConfig) -> Option<PyroscopeAgent<PyroscopeAgentRun
     }
 
     // Configure Pyroscope Agent
-    let backend = pprof_backend(PprofConfig::default().sample_rate(100));
+    let backend = pprof_backend(PprofConfig::default(), BackendConfig::default());
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
     let version = config.service_version.as_deref().unwrap_or(VERSION);
+    let sample_rate = 100;
 
-    // TODO: update pyroscope-rs to 1.0 when dependency on pyroscope-pprofrs is updated, and use new build api
-    // let agent = PyroscopeAgentBuilder::new(endpoint, service_name, 100, "pyroscope-rs", "1.0.1", backend)
-    //     .tags(vec![("app", service_name)])
-    //     .build()
-    //     .ok()?;
-
-    let agent = PyroscopeAgent::builder(endpoint, service_name)
-        .backend(backend)
-        .tags(vec![("app", service_name), ("version", version)]) // TODO: add git commit tag
+    let agent = PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
+        .tags(vec![("app", service_name), ("version", version)])
         .build()
         .ok()?;
+
+    // let agent = PyroscopeAgent::builder(endpoint, service_name)
+    //     .backend(backend)
+    //     .tags(vec![("app", service_name), ("version", version)]) // TODO: add git commit tag
+    //     .build()
+    //     .ok()?;
 
     match agent.start() {
         Ok(agent) => {
