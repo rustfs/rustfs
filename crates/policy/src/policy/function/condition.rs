@@ -78,11 +78,13 @@ impl Condition {
             "NumericEquals" => Self::NumericEquals(d.next_value()?),
             "NumericNotEquals" => Self::NumericNotEquals(d.next_value()?),
             "NumericLessThan" => Self::NumericLessThan(d.next_value()?),
+            "NumericLessThanEquals" => Self::NumericLessThanEquals(d.next_value()?),
             "NumericGreaterThan" => Self::NumericGreaterThan(d.next_value()?),
             "NumericGreaterThanIfExists" => Self::NumericGreaterThanIfExists(d.next_value()?),
             "NumericGreaterThanEquals" => Self::NumericGreaterThanEquals(d.next_value()?),
             "DateEquals" => Self::DateEquals(d.next_value()?),
             "DateNotEquals" => Self::DateNotEquals(d.next_value()?),
+            "DateLessThan" => Self::DateLessThan(d.next_value()?),
             "DateLessThanEquals" => Self::DateLessThanEquals(d.next_value()?),
             "DateGreaterThan" => Self::DateGreaterThan(d.next_value()?),
             "DateGreaterThanEquals" => Self::DateGreaterThanEquals(d.next_value()?),
@@ -131,7 +133,7 @@ impl Condition {
 
     pub fn to_key_with_suffix(&self) -> String {
         match self {
-            Condition::IfExists(inner) => format!("{}IfExists", inner.to_key()),
+            Condition::IfExists(inner) => format!("{}IfExists", inner.to_key_with_suffix()),
             _ => self.to_key().to_owned(),
         }
     }

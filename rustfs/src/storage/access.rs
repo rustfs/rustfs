@@ -935,11 +935,11 @@ impl S3Access for FS {
         authorize_request(req, Action::S3Action(S3Action::GetBucketLocationAction)).await
     }
 
-    /// Checks whether the GetBucketLogging request has accesses to the resources.
-    ///
-    /// This method returns `Ok(())` by default.
-    async fn get_bucket_logging(&self, _req: &mut S3Request<GetBucketLoggingInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_logging(&self, req: &mut S3Request<GetBucketLoggingInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::GetBucketLoggingAction)).await
     }
 
     /// Checks whether the GetBucketMetricsConfiguration request has accesses to the resources.

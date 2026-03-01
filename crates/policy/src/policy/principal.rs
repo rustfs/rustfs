@@ -130,9 +130,11 @@ impl Principal {
                 return true;
             }
         }
-        // Service principals (e.g., logging.s3.amazonaws.com) allow internal
-        // AWS services. Treat them as non-matching for user requests — they
-        // only apply to service-initiated actions.
+        for pattern in self.service.iter() {
+            if wildcard::is_simple_match(pattern, principal) {
+                return true;
+            }
+        }
         false
     }
 }
