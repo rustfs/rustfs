@@ -305,6 +305,7 @@ impl PartialEq for Condition {
 mod tests {
     use super::*;
     use crate::policy::function::{
+        Functions,
         func::{FuncKeyValue, InnerFunc},
         key::Key,
         string::StringFuncValue,
@@ -387,6 +388,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_to_key_with_suffix_if_exists() {
+        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+        let cond = Condition::IfExists(Box::new(inner));
+        assert_eq!(cond.to_key_with_suffix(), "StringEqualsIfExists");
+    }
+
+    #[test]
+    fn test_to_key_with_suffix_nested_if_exists() {
+        // IfExists(IfExists(StringEquals)) must produce a stable, predictable key
+        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+        let once = Condition::IfExists(Box::new(inner));
+        let twice = Condition::IfExists(Box::new(once));
+        assert_eq!(twice.to_key_with_suffix(), "StringEqualsIfExistsIfExists");
+    }
+
+    #[test]
+    fn test_if_exists_serde_round_trip() {
+        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+        let cond = Condition::IfExists(Box::new(inner));
+
+        let functions = Functions {
+            for_normal: vec![cond],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&functions).unwrap();
+        assert_eq!(json, r#"{"StringEqualsIfExists":{"s3:x-amz-server-side-encryption":"aws:kms"}}"#);
+
+        let deserialized: Functions = serde_json::from_str(&json).unwrap();
+        assert_eq!(functions, deserialized);
+    }
+
+    #[test]
+    fn test_nested_if_exists_serde_round_trip() {
+        // Verifies that nested IfExists(IfExists(StringEquals)) serializes with the
+        // correct key and round-trips through serde without data loss.
+        let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
+        let once = Condition::IfExists(Box::new(inner));
+        let twice = Condition::IfExists(Box::new(once));
+
+        let functions = Functions {
+            for_normal: vec![twice],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&functions).unwrap();
+        assert_eq!(json, r#"{"StringEqualsIfExistsIfExists":{"s3:x-amz-server-side-encryption":"aws:kms"}}"#);
+
+        let deserialized: Functions = serde_json::from_str(&json).unwrap();
+        assert_eq!(functions, deserialized);
     #[tokio::test]
     async fn test_if_exists_key_absent_returns_true() {
         let inner = make_string_condition("StringEquals", "s3:x-amz-server-side-encryption", "aws:kms");
