@@ -266,6 +266,10 @@ pub enum S3Action {
     PutBucketLifecycleAction,
     #[strum(serialize = "s3:GetBucketLifecycle")]
     GetBucketLifecycleAction,
+    #[strum(serialize = "s3:PutBucketLogging")]
+    PutBucketLoggingAction,
+    #[strum(serialize = "s3:GetBucketLogging")]
+    GetBucketLoggingAction,
     #[strum(serialize = "s3:PutBucketNotification")]
     PutBucketNotificationAction,
     #[strum(serialize = "s3:PutBucketPolicy")]

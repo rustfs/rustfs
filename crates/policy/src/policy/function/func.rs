@@ -45,6 +45,12 @@ impl<T: Clone> Clone for InnerFunc<T> {
     }
 }
 
+impl<T> InnerFunc<T> {
+    pub fn key_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.0.iter().map(|kv| kv.key.name())
+    }
+}
+
 impl<T: Serialize> Serialize for InnerFunc<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
