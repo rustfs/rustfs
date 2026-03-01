@@ -17,13 +17,13 @@
 //! This module is intentionally kept read-only: it does **not** delete or
 //! compress any files — it only reports what it found.
 
-use super::types::FileInfo;
+use super::types::{FileInfo, FileMatchMode};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tracing::debug;
 use walkdir::WalkDir;
 
-/// Collect all log files in `log_dir` whose name starts with `file_prefix`.
+/// Collect all log files in `log_dir` whose name matches `file_pattern` based on `match_mode`.
 ///
 /// Files that:
 /// - are already compressed (`.gz` extension),
@@ -36,14 +36,16 @@ use walkdir::WalkDir;
 ///
 /// # Arguments
 /// * `log_dir` - Root directory to scan (depth 1 only, no recursion).
-/// * `file_prefix` - Only filenames starting with this string are considered.
+/// * `file_pattern` - Pattern string to match filenames.
+/// * `match_mode` - Whether to match by prefix or suffix.
 /// * `exclude_patterns` - Compiled glob patterns; matching files are skipped.
 /// * `min_file_age_seconds` - Files younger than this threshold are skipped.
 /// * `delete_empty_files` - When `true`, zero-byte files trigger an immediate
 ///   delete by the caller before the rest of cleanup runs.
 pub(super) fn collect_log_files(
     log_dir: &Path,
-    file_prefix: &str,
+    file_pattern: &str,
+    match_mode: FileMatchMode,
     exclude_patterns: &[glob::Pattern],
     min_file_age_seconds: u64,
     delete_empty_files: bool,
@@ -68,8 +70,13 @@ pub(super) fn collect_log_files(
             None => continue,
         };
 
-        // Only manage files that carry our prefix.
-        if !filename.starts_with(file_prefix) {
+        // Match filename based on mode
+        let matches = match match_mode {
+            FileMatchMode::Prefix => filename.starts_with(file_pattern),
+            FileMatchMode::Suffix => filename.ends_with(file_pattern),
+        };
+
+        if !matches {
             continue;
         }
 
@@ -139,12 +146,14 @@ pub(super) fn collect_log_files(
 ///
 /// # Arguments
 /// * `log_dir` - Root directory to scan.
-/// * `file_prefix` - Only `.gz` files that also start with this prefix are considered.
+/// * `file_pattern` - Pattern string to match filenames.
+/// * `match_mode` - Whether to match by prefix or suffix.
 /// * `compressed_file_retention_days` - Files older than this are eligible for
 ///   deletion; `0` means never delete compressed files.
 pub(super) fn collect_expired_compressed_files(
     log_dir: &Path,
-    file_prefix: &str,
+    file_pattern: &str,
+    match_mode: FileMatchMode,
     compressed_file_retention_days: u64,
 ) -> Result<Vec<FileInfo>, std::io::Error> {
     if compressed_file_retention_days == 0 {
@@ -171,7 +180,18 @@ pub(super) fn collect_expired_compressed_files(
             None => continue,
         };
 
-        if !filename.starts_with(file_prefix) || !filename.ends_with(".gz") {
+        if !filename.ends_with(".gz") {
+            continue;
+        }
+
+        // Check if the base filename (without .gz) matches the pattern
+        let base_filename = &filename[..filename.len() - 3];
+        let matches = match match_mode {
+            FileMatchMode::Prefix => base_filename.starts_with(file_pattern),
+            FileMatchMode::Suffix => base_filename.ends_with(file_pattern),
+        };
+
+        if !matches {
             continue;
         }
 
