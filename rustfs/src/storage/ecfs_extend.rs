@@ -669,16 +669,13 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         return None;
     }
 
-    // For OPTIONS (preflight) requests, check Access-Control-Request-Method
+    // Use Access-Control-Request-Method if present (for preflight and non-preflight requests),
+    // otherwise fall back to the actual HTTP method.
     let is_preflight = method == http::Method::OPTIONS;
-    let requested_method = if is_preflight {
-        headers
-            .get(cors::request::ACCESS_CONTROL_REQUEST_METHOD)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(method_str)
-    } else {
-        method_str
-    };
+    let requested_method = headers
+        .get(cors::request::ACCESS_CONTROL_REQUEST_METHOD)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(method_str);
 
     // Get requested headers from preflight request
     let requested_headers = if is_preflight {
