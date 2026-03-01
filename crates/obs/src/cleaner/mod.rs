@@ -31,7 +31,7 @@
 //! ```no_run
 //! use std::path::PathBuf;
 //! use rustfs_obs::LogCleaner;
-//! use rustfs_obs::cleaner::types::FileMatchMode;
+//! use rustfs_obs::types::FileMatchMode;
 //!
 //! let cleaner = LogCleaner::new(
 //!     PathBuf::from("/var/log/rustfs"),

@@ -195,7 +195,7 @@ fn init_file_logging_internal(
 
         let mut builder = RollingFileAppender::builder()
             .rotation(rotation)
-            .max_log_files(keep_files * 2);
+            .max_log_files(keep_files * 2); // Make sure there are some data files to archive to avoid premature deletion
 
         match match_mode {
             FileMatchMode::Prefix => builder = builder.filename_prefix(log_filename),

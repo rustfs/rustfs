@@ -164,10 +164,9 @@ impl LogCleaner {
             let (to_delete, to_rotate) = self.select_files_to_process(&files, total_size);
 
             // Handle rotation for active file if needed
-            if let Some(active_file) = to_rotate {
-                if let Err(e) = self.rotate_active_file(&active_file) {
-                    error!("Failed to rotate active file {:?}: {}", active_file.path, e);
-                }
+            if let Some(active_file) = to_rotate
+                && let Err(e) = self.rotate_active_file(&active_file) {
+                error!("Failed to rotate active file {:?}: {}", active_file.path, e);
             }
 
             if !to_delete.is_empty() {
@@ -226,19 +225,26 @@ impl LogCleaner {
         // We will protect this file from size-based deletion.
         let active_file_idx = files.len() - 1;
 
-        // Calculate how many files we *must* delete to satisfy keep_count.
-        let must_delete_count = files.len().saturating_sub(self.keep_count);
+        // The number of files we are allowed to delete.
+        // Any file with index >= max_deletable_count is protected by keep_count.
+        let max_deletable_count = files.len().saturating_sub(self.keep_count);
 
         let mut current_size = total_size;
 
         for (idx, file) in files.iter().enumerate() {
-            // Condition 1: Enforce keep_count.
-            // If we are in the range of files that exceed the count limit, delete them.
-            if idx < must_delete_count {
-                current_size = current_size.saturating_sub(file.size);
-                to_delete.push(file.clone());
-                continue;
+            // If we are in the protected range, we stop deleting.
+            if idx >= max_deletable_count {
+                 // However, if the active file is too large, we might rotate it.
+                 if idx == active_file_idx {
+                     let over_single = self.max_single_file_size_bytes > 0 && file.size > self.max_single_file_size_bytes;
+                     if over_single {
+                         to_rotate = Some(file.clone());
+                     }
+                 }
+                 continue;
             }
+
+            // We are in the deletable range. Check if we *should* delete.
 
             // Condition 2: Enforce max_total_size_bytes.
             let over_total = self.max_total_size_bytes > 0 && current_size > self.max_total_size_bytes;
@@ -288,7 +294,7 @@ impl LogCleaner {
         // Generate timestamp: unix timestamp in seconds
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .map_err(std::io::Error::other)?
             .as_secs();
 
         let file_name = file
