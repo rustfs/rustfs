@@ -26,7 +26,7 @@ use crate::server::RemoteAddr;
 use metrics::counter;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
-use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOperations, ObjectOperations};
 use rustfs_iam::error::Error as IamError;
@@ -772,7 +772,8 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
         if let Some(store) = new_object_layer_fn()
-            && store.get_bucket_info(&req.input.bucket, &Default::default()).await.is_err()
+            && let Err(err) = store.get_bucket_info(&req.input.bucket, &Default::default()).await
+            && is_err_bucket_not_found(&err)
         {
             return Err(s3_error!(NoSuchBucket, "The specified bucket does not exist"));
         }

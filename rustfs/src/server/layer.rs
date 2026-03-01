@@ -408,7 +408,6 @@ where
         }
 
         let mut inner = self.inner.clone();
-        let path_trimmed = path.trim_start_matches('/').to_string();
 
         Box::pin(async move {
             let mut response = inner.call(req).await.map_err(Into::into)?;
@@ -417,7 +416,7 @@ where
                 && !response.headers().contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN)
             {
                 if is_s3 {
-                    let bucket = path_trimmed.split('/').next().unwrap_or("");
+                    let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
                     if !bucket.is_empty()
                         && let Some(cors_headers) = apply_cors_headers(bucket, &method, &request_headers).await
                     {
