@@ -20,11 +20,14 @@
 //! 1. Tracer provider — flushes pending spans.
 //! 2. Meter provider — flushes pending metrics.
 //! 3. Logger provider — flushes pending log records.
-//! 4. Cleanup task — aborted to prevent lingering background work.
-//! 5. Tracing worker guard — flushes buffered log lines written by
+//! 4. Profiling agent — flushes pending profiles.
+//! 5. Cleanup task — aborted to prevent lingering background work.
+//! 6. Tracing worker guard — flushes buffered log lines written by
 //!    `tracing_appender`.
 
 use opentelemetry_sdk::{logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider};
+use pyroscope::PyroscopeAgent;
+use pyroscope::pyroscope::PyroscopeAgentRunning;
 
 /// RAII guard that owns all active OpenTelemetry providers and the
 /// `tracing_appender` worker guard.
@@ -39,6 +42,8 @@ pub struct OtelGuard {
     pub(crate) meter_provider: Option<SdkMeterProvider>,
     /// Optional logger provider for OTLP log export.
     pub(crate) logger_provider: Option<SdkLoggerProvider>,
+    // Optional profiling agent
+    pub(crate) profiling_agent: Option<PyroscopeAgent<PyroscopeAgentRunning>>,
     /// Worker guard that keeps the non-blocking `tracing_appender` thread
     /// alive.  Dropping it blocks until all buffered records are flushed.
     pub(crate) tracing_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
@@ -54,6 +59,7 @@ impl std::fmt::Debug for OtelGuard {
             .field("tracer_provider", &self.tracer_provider.is_some())
             .field("meter_provider", &self.meter_provider.is_some())
             .field("logger_provider", &self.logger_provider.is_some())
+            .field("profiling_agent", &self.profiling_agent.is_some())
             .field("tracing_guard", &self.tracing_guard.is_some())
             .field("stdout_guard", &self.stdout_guard.is_some())
             .field("cleanup_handle", &self.cleanup_handle.is_some())
@@ -98,6 +104,14 @@ impl Drop for OtelGuard {
         if let Some(guard) = self.stdout_guard.take() {
             drop(guard);
             eprintln!("Stdout guard dropped, flushing logs.");
+        }
+        if let Some(agent) = self.profiling_agent.take() {
+            match agent.stop() {
+                Err(err) => eprintln!("Profiling agent stop error: {err:?}"),
+                Ok(stopped) => {
+                    stopped.shutdown();
+                }
+            }
         }
     }
 }
