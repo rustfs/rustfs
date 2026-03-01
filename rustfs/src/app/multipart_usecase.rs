@@ -38,7 +38,7 @@ use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
-use rustfs_ecstore::store_api::{CompletePart, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
+use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
@@ -57,6 +57,18 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{info, instrument, warn};
+
+/// Returns InvalidRange error if CopySourceRange end exceeds the source object size.
+/// Used by execute_upload_part_copy to reject out-of-bounds ranges per S3 spec.
+fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_size: i64) -> S3Result<()> {
+    if range_spec.end >= object_size {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRange,
+            "The requested range is not satisfiable".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Default)]
 pub struct DefaultMultipartUsecase {
@@ -973,6 +985,8 @@ impl DefaultMultipartUsecase {
                 _ => src_info.size,
             };
 
+            validate_copy_source_range_not_exceeds(range_spec, validation_size)?;
+
             range_spec
                 .get_offset_length(validation_size)
                 .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e.to_string()))?
@@ -1215,6 +1229,44 @@ mod tests {
 
         let err = make_usecase().execute_upload_part_copy(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn test_validate_copy_source_range_not_exceeds_returns_invalid_range_when_range_exceeds() {
+        use super::validate_copy_source_range_not_exceeds;
+
+        let range_exceeds = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: 21,
+        };
+        let err = validate_copy_source_range_not_exceeds(&range_exceeds, 5).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRange);
+        assert!(err.to_string().contains("not satisfiable"));
+    }
+
+    #[test]
+    fn test_validate_copy_source_range_not_exceeds_ok_when_range_valid() {
+        use super::validate_copy_source_range_not_exceeds;
+
+        let range_valid = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: 4,
+        };
+        assert!(validate_copy_source_range_not_exceeds(&range_valid, 5).is_ok());
+    }
+
+    #[test]
+    fn test_validate_copy_source_range_not_exceeds_ok_for_suffix_range() {
+        use super::validate_copy_source_range_not_exceeds;
+
+        let range_suffix = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: -5,
+            end: -1,
+        };
+        assert!(validate_copy_source_range_not_exceeds(&range_suffix, 5).is_ok());
     }
 
     #[tokio::test]

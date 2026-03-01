@@ -17,7 +17,7 @@ use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use rustfs_ecstore::{
     bucket::tagging::decode_tags_to_map,
-    error::{is_err_object_not_found, is_err_version_not_found},
+    error::{is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
     store_api::{BucketOperations, BucketOptions, ObjectOperations, ObjectOptions},
 };
@@ -616,6 +616,9 @@ impl FS {
                         "object or version not found when fetching tags for policy; treating as no tags"
                     );
                     return Ok(std::collections::HashMap::new());
+                }
+                if is_err_bucket_not_found(&e) {
+                    return Err(s3_error!(NoSuchBucket, "The specified bucket does not exist"));
                 }
                 warn!(
                     target: "rustfs::storage::ecfs",
