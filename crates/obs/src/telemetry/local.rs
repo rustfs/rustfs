@@ -27,9 +27,10 @@
 //! cases; callers do **not** need to distinguish between stdout and file modes.
 
 use crate::TelemetryError;
+use crate::cleaner::LogCleaner;
+use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::OBSERVABILITY_METRIC_ENABLED;
-use crate::log_cleanup::LogCleaner;
 use crate::telemetry::filter::build_env_filter;
 use metrics::counter;
 use rustfs_config::observability::{
@@ -38,6 +39,7 @@ use rustfs_config::observability::{
     DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS,
 };
 use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED};
+use std::sync::Arc;
 use std::{fs, io::IsTerminal, time::Duration};
 use tracing::info;
 use tracing_error::ErrorLayer;
@@ -176,6 +178,13 @@ fn init_file_logging_internal(
         .as_deref()
         .unwrap_or(DEFAULT_LOG_ROTATION_TIME)
         .to_lowercase();
+
+    // Determine match mode from config, defaulting to Suffix
+    let match_mode = match config.log_match_mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
+        Some("prefix") => FileMatchMode::Prefix,
+        _ => FileMatchMode::Suffix,
+    };
+
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
     let file_appender = {
         let rotation = match rotation.as_str() {
@@ -183,10 +192,17 @@ fn init_file_logging_internal(
             "hourly" => Rotation::HOURLY,
             _ => Rotation::DAILY,
         };
-        RollingFileAppender::builder()
+
+        let mut builder = RollingFileAppender::builder()
             .rotation(rotation)
-            .filename_suffix(log_filename)
-            .max_log_files(keep_files)
+            .max_log_files(keep_files * 2); // Make sure there are some data files to archive to avoid premature deletion
+
+        match match_mode {
+            FileMatchMode::Prefix => builder = builder.filename_prefix(log_filename),
+            FileMatchMode::Suffix => builder = builder.filename_suffix(log_filename),
+        }
+
+        builder
             .build(log_directory)
             .expect("failed to initialize rolling file appender")
     };
@@ -329,7 +345,16 @@ fn spawn_cleanup_task(
     keep_files: usize,
 ) -> tokio::task::JoinHandle<()> {
     let log_dir = std::path::PathBuf::from(log_directory);
-    let file_prefix = config.log_filename.as_deref().unwrap_or(log_filename).to_string();
+    // Use suffix matching for log files like "2026-03-01-06-21.rustfs.log"
+    // where "rustfs.log" is the suffix.
+    let file_pattern = config.log_filename.as_deref().unwrap_or(log_filename).to_string();
+
+    // Determine match mode from config, defaulting to Suffix
+    let match_mode = match config.log_match_mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
+        Some("prefix") => FileMatchMode::Prefix,
+        _ => FileMatchMode::Suffix,
+    };
+
     let keep_count = config.log_keep_count.unwrap_or(keep_files);
     let max_total_size = config
         .log_max_total_size_bytes
@@ -358,9 +383,10 @@ fn spawn_cleanup_task(
         .log_cleanup_interval_seconds
         .unwrap_or(DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS);
 
-    let cleaner = LogCleaner::new(
+    let cleaner = Arc::new(LogCleaner::new(
         log_dir,
-        file_prefix,
+        file_pattern,
+        match_mode,
         keep_count,
         max_total_size,
         max_single_file_size,
@@ -371,14 +397,19 @@ fn spawn_cleanup_task(
         delete_empty,
         min_age,
         dry_run,
-    );
+    ));
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval));
         loop {
             interval.tick().await;
-            if let Err(e) = cleaner.cleanup() {
-                tracing::warn!("Log cleanup failed: {}", e);
+            let cleaner_clone = cleaner.clone();
+            let result = tokio::task::spawn_blocking(move || cleaner_clone.cleanup()).await;
+
+            match result {
+                Ok(Ok(_)) => {} // Success
+                Ok(Err(e)) => tracing::warn!("Log cleanup failed: {}", e),
+                Err(e) => tracing::warn!("Log cleanup task panicked: {}", e),
             }
         }
     })

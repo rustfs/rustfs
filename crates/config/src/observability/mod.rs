@@ -53,6 +53,7 @@ pub const ENV_OBS_LOG_DELETE_EMPTY_FILES: &str = "RUSTFS_OBS_LOG_DELETE_EMPTY_FI
 pub const ENV_OBS_LOG_MIN_FILE_AGE_SECONDS: &str = "RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS";
 pub const ENV_OBS_LOG_CLEANUP_INTERVAL_SECONDS: &str = "RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS";
 pub const ENV_OBS_LOG_DRY_RUN: &str = "RUSTFS_OBS_LOG_DRY_RUN";
+pub const ENV_OBS_LOG_MATCH_MODE: &str = "RUSTFS_OBS_LOG_MATCH_MODE";
 
 /// Default values for log cleanup
 pub const DEFAULT_OBS_LOG_KEEP_COUNT: usize = 10;
@@ -65,6 +66,7 @@ pub const DEFAULT_OBS_LOG_DELETE_EMPTY_FILES: bool = true;
 pub const DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS: u64 = 3600; // 1 hour
 pub const DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS: u64 = 6 * 3600; // 6 hours
 pub const DEFAULT_OBS_LOG_DRY_RUN: bool = false;
+pub const DEFAULT_OBS_LOG_MATCH_MODE: &str = "suffix";
 
 /// Default values for observability configuration
 // ### Supported Environment Values
@@ -118,6 +120,7 @@ mod tests {
         assert_eq!(ENV_OBS_LOG_MIN_FILE_AGE_SECONDS, "RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS");
         assert_eq!(ENV_OBS_LOG_CLEANUP_INTERVAL_SECONDS, "RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS");
         assert_eq!(ENV_OBS_LOG_DRY_RUN, "RUSTFS_OBS_LOG_DRY_RUN");
+        assert_eq!(ENV_OBS_LOG_MATCH_MODE, "RUSTFS_OBS_LOG_MATCH_MODE");
     }
 
     #[test]
@@ -126,5 +129,6 @@ mod tests {
         assert_eq!(DEFAULT_OBS_ENVIRONMENT_DEVELOPMENT, "development");
         assert_eq!(DEFAULT_OBS_ENVIRONMENT_TEST, "test");
         assert_eq!(DEFAULT_OBS_ENVIRONMENT_STAGING, "staging");
+        assert_eq!(DEFAULT_OBS_LOG_MATCH_MODE, "suffix");
     }
 }

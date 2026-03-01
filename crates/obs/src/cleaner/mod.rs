@@ -24,17 +24,19 @@
 //! | `types`     | Shared data types (`FileInfo`)                           |
 //! | `scanner`   | Filesystem traversal — discovers eligible files          |
 //! | `compress`  | Gzip compression helper                                  |
-//! | `cleaner`   | Core orchestration — selection, compression, deletion    |
+//! | `core`      | Core orchestration — selection, compression, deletion    |
 //!
 //! ## Usage
 //!
 //! ```no_run
 //! use std::path::PathBuf;
 //! use rustfs_obs::LogCleaner;
+//! use rustfs_obs::types::FileMatchMode;
 //!
 //! let cleaner = LogCleaner::new(
 //!     PathBuf::from("/var/log/rustfs"),
 //!     "rustfs.log.".to_string(),
+//!     FileMatchMode::Prefix,
 //!     10,              // keep_count
 //!     2 * 1024 * 1024 * 1024, // max_total_size_bytes (2 GiB)
 //!     0,               // max_single_file_size_bytes (unlimited)
@@ -51,17 +53,18 @@
 //! println!("Deleted {deleted} files, freed {freed_bytes} bytes");
 //! ```
 
-mod cleaner;
 mod compress;
+mod core;
 mod scanner;
-mod types;
+pub mod types;
 
-pub use cleaner::LogCleaner;
+pub use core::LogCleaner;
 
 #[cfg(test)]
 mod tests {
-    use super::cleaner::LogCleaner;
+    use super::core::LogCleaner;
     use super::scanner;
+    use super::types::FileMatchMode;
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
@@ -79,6 +82,7 @@ mod tests {
         LogCleaner::new(
             dir,
             "app.log.".to_string(),
+            FileMatchMode::Prefix,
             keep,
             max_bytes,
             0,          // max_single_file_size_bytes
@@ -153,7 +157,7 @@ mod tests {
         create_log_file(&dir, "app.log.2024-01-02", 2048)?;
         create_log_file(&dir, "other.log", 512)?;
 
-        let files = scanner::collect_log_files(&dir, "app.log.", &[], 0, true, false)?;
+        let files = scanner::collect_log_files(&dir, "app.log.", FileMatchMode::Prefix, &[], 0, true, false)?;
         assert_eq!(files.len(), 2, "scanner should find exactly 2 managed files");
         Ok(())
     }
@@ -167,12 +171,57 @@ mod tests {
         create_log_file(&dir, "app.log.2024-01-02", 1024)?;
         create_log_file(&dir, "app.log.2024-01-03", 1024)?;
 
-        let cleaner = LogCleaner::new(dir.clone(), "app.log.".to_string(), 1, 1024, 0, false, 6, 30, vec![], true, 0, true);
+        let cleaner = LogCleaner::new(
+            dir.clone(),
+            "app.log.".to_string(),
+            FileMatchMode::Prefix,
+            1,
+            1024,
+            0,
+            false,
+            6,
+            30,
+            vec![],
+            true,
+            0,
+            true,
+        );
         let (deleted, _freed) = cleaner.cleanup()?;
 
         // dry_run=true reports deletions but doesn't actually remove files.
         assert!(deleted > 0, "dry_run should report files as deleted");
         assert_eq!(std::fs::read_dir(&dir)?.count(), 3, "no files should actually be removed");
+        Ok(())
+    }
+
+    #[test]
+    fn test_cleanup_suffix_matching() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+
+        create_log_file(&dir, "2026-03-01-06-21.rustfs.log", 1024)?;
+        create_log_file(&dir, "2026-03-01-06-22.rustfs.log", 1024)?;
+        create_log_file(&dir, "other.log", 1024)?; // not managed
+
+        let cleaner = LogCleaner::new(
+            dir.clone(),
+            "rustfs.log".to_string(),
+            FileMatchMode::Suffix,
+            1,
+            1024,
+            0,
+            false,
+            6,
+            30,
+            vec![],
+            true,
+            0,
+            false,
+        );
+        let (deleted, freed) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 1, "should delete exactly one file");
+        assert_eq!(freed, 1024);
         Ok(())
     }
 }
