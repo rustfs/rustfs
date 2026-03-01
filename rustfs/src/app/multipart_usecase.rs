@@ -60,10 +60,7 @@ use tracing::{info, instrument, warn};
 
 /// Returns InvalidRange error if CopySourceRange end exceeds the source object size.
 /// Used by execute_upload_part_copy to reject out-of-bounds ranges per S3 spec.
-fn validate_copy_source_range_not_exceeds(
-    range_spec: &HTTPRangeSpec,
-    object_size: i64,
-) -> S3Result<()> {
+fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_size: i64) -> S3Result<()> {
     if range_spec.end >= object_size {
         return Err(S3Error::with_message(
             S3ErrorCode::InvalidRange,
