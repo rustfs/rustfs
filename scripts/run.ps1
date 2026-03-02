@@ -156,8 +156,8 @@ $env:RUSTFS_NS_SCANNER_INTERVAL = "60"
 
 # $env:RUSTFS_REGION = "us-east-1"
 
-$env:RUSTFS_ENABLE_SCANNER = "false"
-$env:RUSTFS_ENABLE_HEAL = "false"
+$env:RUSTFS_SCANNER_ENABLED = "false"
+$env:RUSTFS_HEAL_ENABLED = "false"
 
 # Object cache configuration
 $env:RUSTFS_OBJECT_CACHE_ENABLE = "true"

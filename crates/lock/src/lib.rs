@@ -69,7 +69,9 @@ pub const BUILD_TIMESTAMP: &str = "unknown";
 /// Maximum number of items in delete list
 pub const MAX_DELETE_LIST: usize = 1000;
 
-/// Default setting for RUSTFS_ENABLE_LOCKS environment variable
+/// Default setting for lock enablement.
+/// Canonical variable: RUSTFS_LOCK_ENABLED
+/// Deprecated compatibility alias: RUSTFS_ENABLE_LOCKS
 const DEFAULT_RUSTFS_LOCKS_ENABLED: bool = true;
 const ENV_LOCK_ENABLED: &str = "RUSTFS_LOCK_ENABLED";
 const ENV_LOCK_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_LOCKS";
@@ -99,14 +101,26 @@ impl Default for GlobalLockManager {
 impl GlobalLockManager {
     /// Create a lock manager based on environment variable configuration
     pub fn new() -> Self {
-        // Check RUSTFS_ENABLE_LOCKS environment variable
+        // Check lock enablement env vars with deprecated compatibility support.
         let locks_enabled = rustfs_utils::get_env_bool_with_aliases(
             ENV_LOCK_ENABLED,
             &[ENV_LOCK_ENABLED_DEPRECATED],
             DEFAULT_RUSTFS_LOCKS_ENABLED,
         );
         if !locks_enabled {
-            tracing::info!("Lock system disabled via {} environment variable", ENV_LOCK_ENABLED_DEPRECATED);
+            let disabled_by = if std::env::var(ENV_LOCK_ENABLED).is_ok() {
+                ENV_LOCK_ENABLED
+            } else if std::env::var(ENV_LOCK_ENABLED_DEPRECATED).is_ok() {
+                ENV_LOCK_ENABLED_DEPRECATED
+            } else {
+                "default setting"
+            };
+
+            if disabled_by == "default setting" {
+                tracing::info!("Lock system disabled via default setting");
+            } else {
+                tracing::info!("Lock system disabled via {} environment variable", disabled_by);
+            }
             return Self::Disabled(DisabledLockManager::new());
         }
         tracing::info!("Lock system enabled");
@@ -254,7 +268,7 @@ static GLOBAL_LOCK_MANAGER: OnceLock<Arc<GlobalLockManager>> = OnceLock::new();
 /// Get the global shared lock manager instance
 ///
 /// Returns either FastObjectLockManager or DisabledLockManager based on
-/// the RUSTFS_ENABLE_LOCKS environment variable.
+/// the RUSTFS_LOCK_ENABLED environment variable.
 pub fn get_global_lock_manager() -> Arc<GlobalLockManager> {
     GLOBAL_LOCK_MANAGER.get_or_init(|| Arc::new(GlobalLockManager::new())).clone()
 }
