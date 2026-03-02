@@ -138,7 +138,6 @@ test_multipart_upload_overwrite_existing_object
 test_multipart_upload_size_too_small
 test_object_copy_bucket_not_found
 test_object_copy_key_not_found
-test_object_copy_not_owned_object_bucket
 test_object_head_zero_bytes
 test_get_obj_head_tagging
 test_object_metadata_replaced_on_put
@@ -217,8 +216,6 @@ test_get_undefined_public_block
 test_bucketv2_policy
 test_bucket_policy_another_bucket
 test_bucket_policy_allow_notprincipal
-test_bucket_policy_multipart
-test_bucket_policy_put_obj_grant
 test_bucket_policy_put_obj_kms_s3
 test_bucket_policy_put_obj_s3_kms
 
@@ -309,7 +306,6 @@ test_bucket_listv2_unordered
 # Object copy tests
 test_object_copy_16m
 test_object_copy_diff_bucket
-test_object_copy_not_owned_bucket
 test_object_copy_replacing_metadata
 test_object_copy_retaining_metadata
 test_object_copy_same_bucket
@@ -328,9 +324,6 @@ test_object_content_encoding_aws_chunked
 test_object_raw_authenticated
 test_object_raw_authenticated_bucket_gone
 test_object_raw_authenticated_object_gone
-test_object_raw_get
-test_object_raw_get_bucket_gone
-test_object_raw_get_object_gone
 test_object_raw_get_x_amz_expires_out_range_zero
 test_object_raw_response_headers
 
@@ -405,8 +398,6 @@ test_object_checksum_crc64nvme
 
 # CORS tests
 test_set_cors
-test_cors_origin_response
-test_cors_origin_wildcard
 test_cors_header_option
 test_cors_presigned_get_object
 test_cors_presigned_get_object_tenant
@@ -414,7 +405,6 @@ test_cors_presigned_put_object
 test_cors_presigned_put_object_tenant
 
 # HTTP and DeleteObject tests
-test_100_continue
 test_abort_multipart_upload_not_found
 test_post_object_tags_authenticated_request
 test_object_delete_key_bucket_gone

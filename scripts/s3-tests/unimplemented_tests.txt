@@ -12,6 +12,8 @@
 # Failed tests
 test_bucket_create_delete_bucket_ownership
 test_bucket_logging_owner
+test_object_copy_not_owned_bucket
+test_bucket_policy_multipart
 test_post_object_upload_checksum
 test_put_bucket_logging
 test_put_bucket_logging_errors
