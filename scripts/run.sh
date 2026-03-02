@@ -178,9 +178,9 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 
 #export RUSTFS_REGION="us-east-1"
 
-export RUSTFS_ENABLE_SCANNER=true
+export RUSTFS_SCANNER_ENABLED=true
 
-export RUSTFS_ENABLE_HEAL=true
+export RUSTFS_HEAL_ENABLED=true
 
 # Object cache configuration
 export RUSTFS_OBJECT_CACHE_ENABLE=true
