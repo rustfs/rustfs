@@ -70,6 +70,7 @@ pub const TRANSITION_TIER: &str = "transition-tier";
 
 mod codec;
 mod inline_data;
+mod msgp_decode;
 mod validation;
 mod version;
 

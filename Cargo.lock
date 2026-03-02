@@ -7879,6 +7879,7 @@ name = "rustfs-utils"
 version = "0.0.5"
 dependencies = [
  "base64-simd",
+ "blake2 0.11.0-rc.5",
  "blake3",
  "brotli",
  "bytes",

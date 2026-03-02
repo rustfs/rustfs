@@ -151,6 +151,7 @@ schemars = "1.2.1"
 # Cryptography and Security
 aes-gcm = { version = "0.11.0-rc.3", features = ["rand_core"] }
 argon2 = { version = "0.6.0-rc.7" }
+blake2 = "0.11.0-rc.5"
 blake3 = { version = "1.8.3", features = ["rayon", "mmap"] }
 chacha20poly1305 = { version = "0.11.0-rc.3" }
 crc-fast = "1.9.0"
