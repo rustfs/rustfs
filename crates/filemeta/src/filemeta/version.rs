@@ -13,6 +13,203 @@
 // limitations under the License.
 
 use super::*;
+use rmp::Marker;
+use std::io::Read;
+
+/// Reader that prepends a single byte to the stream. Used when we've read the marker
+/// and need to pass it to a decoder that expects to read the marker itself.
+struct PrependByteReader<'a, R> {
+    byte: Option<u8>,
+    inner: &'a mut R,
+}
+
+impl<R: Read> Read for PrependByteReader<'_, R> {
+    #[allow(clippy::collapsible_if)]
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(b) = self.byte.take() {
+            if !buf.is_empty() {
+                buf[0] = b;
+                return Ok(1);
+            }
+            self.byte = Some(b);
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// Read MessagePack nil or array length. Returns None for nil, Some(len) for array.
+fn read_nil_or_array_len<R: std::io::Read>(rd: &mut R) -> Result<Option<usize>> {
+    let mut buf = [0u8; 1];
+    rd.read_exact(&mut buf).map_err(Error::from)?;
+    let marker = buf[0];
+    match marker {
+        0xc0 => Ok(None), // nil
+        0x90..=0x9f => Ok(Some((marker & 0x0f) as usize)),
+        0xdc => {
+            let mut b = [0u8; 2];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            Ok(Some(u16::from_be_bytes(b) as usize))
+        }
+        0xdd => {
+            let mut b = [0u8; 4];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            Ok(Some(u32::from_be_bytes(b) as usize))
+        }
+        _ => Err(Error::other(format!("expected nil or array, got marker 0x{marker:02x}"))),
+    }
+}
+
+/// Read MessagePack nil or map length. Returns None for nil, Some(len) for map.
+fn read_nil_or_map_len<R: std::io::Read>(rd: &mut R) -> Result<Option<usize>> {
+    let mut buf = [0u8; 1];
+    rd.read_exact(&mut buf).map_err(Error::from)?;
+    let marker = buf[0];
+    match marker {
+        0xc0 => Ok(None), // nil
+        0x80..=0x8f => Ok(Some((marker & 0x0f) as usize)),
+        0xde => {
+            let mut b = [0u8; 2];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            Ok(Some(u16::from_be_bytes(b) as usize))
+        }
+        0xdf => {
+            let mut b = [0u8; 4];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            Ok(Some(u32::from_be_bytes(b) as usize))
+        }
+        _ => Err(Error::other(format!("expected nil or map, got marker 0x{marker:02x}"))),
+    }
+}
+
+/// Skip a single MessagePack value. Used for unknown map keys.
+fn skip_msgp_value<R: std::io::Read>(rd: &mut R) -> Result<()> {
+    let marker = rmp::decode::read_marker(rd).map_err(Error::from)?;
+    let skip_len: usize = match marker {
+        Marker::Null | Marker::False | Marker::True => 0,
+        Marker::FixPos(_) | Marker::FixNeg(_) => 0,
+        Marker::U8 => 1,
+        Marker::U16 => 2,
+        Marker::U32 => 4,
+        Marker::U64 => 8,
+        Marker::I8 => 1,
+        Marker::I16 => 2,
+        Marker::I32 => 4,
+        Marker::I64 => 8,
+        Marker::F32 => 4,
+        Marker::F64 => 8,
+        Marker::FixStr(n) => n as usize,
+        Marker::Str8 => {
+            let mut b = [0u8; 1];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            b[0] as usize
+        }
+        Marker::Str16 => {
+            let mut b = [0u8; 2];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            u16::from_be_bytes(b) as usize
+        }
+        Marker::Str32 => {
+            let mut b = [0u8; 4];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            u32::from_be_bytes(b) as usize
+        }
+        Marker::Bin8 => {
+            let mut b = [0u8; 1];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            b[0] as usize
+        }
+        Marker::Bin16 => {
+            let mut b = [0u8; 2];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            u16::from_be_bytes(b) as usize
+        }
+        Marker::Bin32 => {
+            let mut b = [0u8; 4];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            u32::from_be_bytes(b) as usize
+        }
+        Marker::FixArray(n) => {
+            for _ in 0..n {
+                skip_msgp_value(rd)?;
+            }
+            return Ok(());
+        }
+        Marker::Array16 => {
+            let mut b = [0u8; 2];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            let n = u16::from_be_bytes(b);
+            for _ in 0..n {
+                skip_msgp_value(rd)?;
+            }
+            return Ok(());
+        }
+        Marker::Array32 => {
+            let mut b = [0u8; 4];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            let n = u32::from_be_bytes(b);
+            for _ in 0..n {
+                skip_msgp_value(rd)?;
+            }
+            return Ok(());
+        }
+        Marker::FixMap(n) => {
+            for _ in 0..n {
+                skip_msgp_value(rd)?;
+                skip_msgp_value(rd)?;
+            }
+            return Ok(());
+        }
+        Marker::Map16 => {
+            let mut b = [0u8; 2];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            let n = u16::from_be_bytes(b);
+            for _ in 0..n {
+                skip_msgp_value(rd)?;
+                skip_msgp_value(rd)?;
+            }
+            return Ok(());
+        }
+        Marker::Map32 => {
+            let mut b = [0u8; 4];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            let n = u32::from_be_bytes(b);
+            for _ in 0..n {
+                skip_msgp_value(rd)?;
+                skip_msgp_value(rd)?;
+            }
+            return Ok(());
+        }
+        Marker::FixExt1 => 1,
+        Marker::FixExt2 => 2,
+        Marker::FixExt4 => 4,
+        Marker::FixExt8 => 8,
+        Marker::FixExt16 => 16,
+        Marker::Ext8 => {
+            let mut b = [0u8; 1];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            let len = b[0] as usize;
+            1 + len // type byte + data
+        }
+        Marker::Ext16 => {
+            let mut b = [0u8; 2];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            let len = u16::from_be_bytes(b) as usize;
+            2 + len // type bytes + data
+        }
+        Marker::Ext32 => {
+            let mut b = [0u8; 4];
+            rd.read_exact(&mut b).map_err(Error::from)?;
+            let len = u32::from_be_bytes(b) as usize;
+            4 + len // type bytes + data
+        }
+        Marker::Reserved => 0,
+    };
+    if skip_len > 0 {
+        let mut buf = vec![0u8; skip_len];
+        rd.read_exact(&mut buf).map_err(Error::from)?;
+    }
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Eq, PartialOrd, Ord)]
 pub struct FileMetaShallowVersion {
@@ -104,93 +301,131 @@ impl FileMetaVersion {
     // decode_data_dir_from_meta reads data_dir from meta TODO: directly parse only data_dir from meta buf, msg.skip
     pub fn decode_data_dir_from_meta(buf: &[u8]) -> Result<Option<Uuid>> {
         let mut ver = Self::default();
-        ver.unmarshal_msg(buf)?;
-
+        ver.decode_from(&mut std::io::Cursor::new(buf))?;
         let data_dir = ver.object.map(|v| v.data_dir).unwrap_or_default();
         Ok(data_dir)
     }
 
-    pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
-        use std::io::Read;
-        let mut cur = std::io::Cursor::new(buf);
-
-        let mut fields = rmp::decode::read_map_len(&mut cur)?;
+    pub fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
+        let mut fields = rmp::decode::read_map_len(rd)?;
         *self = FileMetaVersion::default();
 
         while fields > 0 {
             fields -= 1;
 
-            let key_len = rmp::decode::read_str_len(&mut cur)?;
+            let key_len = rmp::decode::read_str_len(rd)?;
             let mut key_buf = vec![0u8; key_len as usize];
-            cur.read_exact(&mut key_buf)?;
+            rd.read_exact(&mut key_buf)?;
             let key = String::from_utf8(key_buf)?;
 
             match key.as_str() {
                 "Type" => {
-                    let v: i64 = rmp::decode::read_int(&mut cur)?;
+                    let v: i64 = rmp::decode::read_int(rd)?;
                     self.version_type = VersionType::from_u8(v as u8);
                 }
+                "V1Obj" => {
+                    // Skip V1Obj (legacy), not supported
+                    let mut buf = [0u8; 1];
+                    rd.read_exact(&mut buf).map_err(Error::from)?;
+                    if buf[0] != 0xc0 {
+                        let mut prepend = PrependByteReader {
+                            byte: Some(buf[0]),
+                            inner: rd,
+                        };
+                        skip_msgp_value(&mut prepend)?;
+                    }
+                }
                 "V2Obj" => {
-                    let mut obj = MetaObject::default();
-                    obj.decode_from(&mut cur)?;
-                    self.object = Some(obj);
+                    let mut buf = [0u8; 1];
+                    rd.read_exact(&mut buf).map_err(Error::from)?;
+                    if buf[0] == 0xc0 {
+                        self.object = None;
+                    } else {
+                        let mut prepend = PrependByteReader {
+                            byte: Some(buf[0]),
+                            inner: rd,
+                        };
+                        let mut obj = MetaObject::default();
+                        obj.decode_from(&mut prepend)?;
+                        self.object = Some(obj);
+                    }
                 }
                 "DelObj" => {
-                    let mut dm = MetaDeleteMarker::default();
-                    dm.decode_from(&mut cur)?;
-                    self.delete_marker = Some(dm);
+                    let mut buf = [0u8; 1];
+                    rd.read_exact(&mut buf).map_err(Error::from)?;
+                    if buf[0] == 0xc0 {
+                        self.delete_marker = None;
+                    } else {
+                        let mut prepend = PrependByteReader {
+                            byte: Some(buf[0]),
+                            inner: rd,
+                        };
+                        let mut dm = MetaDeleteMarker::default();
+                        dm.decode_from(&mut prepend)?;
+                        self.delete_marker = Some(dm);
+                    }
                 }
                 "v" => {
-                    let v: i64 = rmp::decode::read_int(&mut cur)?;
+                    let v: i64 = rmp::decode::read_int(rd)?;
                     if v < 0 {
                         return Err(Error::other("negative write_version not supported"));
                     }
                     self.write_version = v as u64;
                 }
-                // currently not supported V1Obj etc. extra fields, if encountered, report an error, for subsequent explicit handling when extending.
                 other => {
-                    return Err(Error::other(format!("unsupported field in FileMetaVersion: {other}")));
+                    tracing::debug!(field = %other, "decode_from: skipping unknown field");
+                    skip_msgp_value(rd)?;
                 }
             }
         }
 
+        Ok(())
+    }
+
+    pub fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
+        // Variable map size: omit V2Obj/DelObj when None
+        let mut map_len: u32 = 2; // "Type" + "v"
+        if self.object.is_some() {
+            map_len += 1;
+        }
+        if self.delete_marker.is_some() {
+            map_len += 1;
+        }
+
+        rmp::encode::write_map_len(wr, map_len)?;
+
+        // Type
+        rmp::encode::write_str(wr, "Type")?;
+        rmp::encode::write_uint(wr, self.version_type.to_u8() as u64)?;
+
+        // V2Obj
+        if let Some(ref obj) = self.object {
+            rmp::encode::write_str(wr, "V2Obj")?;
+            obj.encode_to(wr)?;
+        }
+
+        // DelObj
+        if let Some(ref dm) = self.delete_marker {
+            rmp::encode::write_str(wr, "DelObj")?;
+            dm.encode_to(wr)?;
+        }
+
+        // v
+        rmp::encode::write_str(wr, "v")?;
+        rmp::encode::write_uint(wr, self.write_version)?;
+
+        Ok(())
+    }
+
+    pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
+        let mut cur = std::io::Cursor::new(buf);
+        self.decode_from(&mut cur)?;
         Ok(cur.position())
     }
 
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut wr = Vec::new();
-
-        // calculate the number of fields to write
-        let mut map_len: u32 = 2; // "Type" + "v"
-        if self.object.is_some() {
-            map_len += 1; // "V2Obj"
-        }
-        if self.delete_marker.is_some() {
-            map_len += 1; // "DelObj"
-        }
-
-        rmp::encode::write_map_len(&mut wr, map_len)?;
-
-        // Type
-        rmp::encode::write_str(&mut wr, "Type")?;
-        rmp::encode::write_uint(&mut wr, self.version_type.to_u8() as u64)?;
-
-        // V2Obj
-        if let Some(ref obj) = self.object {
-            rmp::encode::write_str(&mut wr, "V2Obj")?;
-            obj.encode_to(&mut wr)?;
-        }
-
-        // DelObj
-        if let Some(ref dm) = self.delete_marker {
-            rmp::encode::write_str(&mut wr, "DelObj")?;
-            dm.encode_to(&mut wr)?;
-        }
-
-        // v
-        rmp::encode::write_str(&mut wr, "v")?;
-        rmp::encode::write_uint(&mut wr, self.write_version)?;
-
+        self.encode_to(&mut wr)?;
         Ok(wr)
     }
 
@@ -611,8 +846,12 @@ impl MetaObject {
     }
 
     pub fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
-        // fixed 18 fields
-        rmp::encode::write_map_len(wr, 18)?;
+        // Variable map size: omit PartIdx when empty
+        let mut map_len = 18u32;
+        if self.part_indices.is_empty() {
+            map_len -= 1;
+        }
+        rmp::encode::write_map_len(wr, map_len)?;
 
         // ID
         rmp::encode::write_str(wr, "ID")?;
@@ -660,11 +899,15 @@ impl MetaObject {
             rmp::encode::write_sint(wr, *n as i64)?;
         }
 
-        // PartETags (always write array, no allownil optimization)
+        // PartETags (write nil when empty)
         rmp::encode::write_str(wr, "PartETags")?;
-        rmp::encode::write_array_len(wr, self.part_etags.len() as u32)?;
-        for et in &self.part_etags {
-            rmp::encode::write_str(wr, et)?;
+        if self.part_etags.is_empty() {
+            rmp::encode::write_nil(wr)?;
+        } else {
+            rmp::encode::write_array_len(wr, self.part_etags.len() as u32)?;
+            for et in &self.part_etags {
+                rmp::encode::write_str(wr, et)?;
+            }
         }
 
         // PartSizes
@@ -674,18 +917,24 @@ impl MetaObject {
             rmp::encode::write_sint(wr, *s as i64)?;
         }
 
-        // PartASizes
+        // PartASizes (write nil when empty)
         rmp::encode::write_str(wr, "PartASizes")?;
-        rmp::encode::write_array_len(wr, self.part_actual_sizes.len() as u32)?;
-        for s in &self.part_actual_sizes {
-            rmp::encode::write_sint(wr, *s)?;
+        if self.part_actual_sizes.is_empty() {
+            rmp::encode::write_nil(wr)?;
+        } else {
+            rmp::encode::write_array_len(wr, self.part_actual_sizes.len() as u32)?;
+            for s in &self.part_actual_sizes {
+                rmp::encode::write_sint(wr, *s)?;
+            }
         }
 
-        // PartIdx
-        rmp::encode::write_str(wr, "PartIdx")?;
-        rmp::encode::write_array_len(wr, self.part_indices.len() as u32)?;
-        for idx in &self.part_indices {
-            rmp::encode::write_bin(wr, idx)?;
+        // PartIdx (omit when empty)
+        if !self.part_indices.is_empty() {
+            rmp::encode::write_str(wr, "PartIdx")?;
+            rmp::encode::write_array_len(wr, self.part_indices.len() as u32)?;
+            for idx in &self.part_indices {
+                rmp::encode::write_bin(wr, idx)?;
+            }
         }
 
         // Size
@@ -697,142 +946,257 @@ impl MetaObject {
         let nanos = self.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp_nanos();
         rmp::encode::write_sint(wr, nanos as i64)?;
 
-        // MetaSys
+        // MetaSys (write nil when empty)
         rmp::encode::write_str(wr, "MetaSys")?;
-        rmp::encode::write_map_len(wr, self.meta_sys.len() as u32)?;
-        for (k, v) in &self.meta_sys {
-            rmp::encode::write_str(wr, k)?;
-            rmp::encode::write_bin(wr, v)?;
+        if self.meta_sys.is_empty() {
+            rmp::encode::write_nil(wr)?;
+        } else {
+            rmp::encode::write_map_len(wr, self.meta_sys.len() as u32)?;
+            for (k, v) in &self.meta_sys {
+                rmp::encode::write_str(wr, k)?;
+                rmp::encode::write_bin(wr, v)?;
+            }
         }
 
-        // MetaUsr
+        // MetaUsr (write nil when empty)
         rmp::encode::write_str(wr, "MetaUsr")?;
-        rmp::encode::write_map_len(wr, self.meta_user.len() as u32)?;
-        for (k, v) in &self.meta_user {
-            rmp::encode::write_str(wr, k)?;
-            rmp::encode::write_str(wr, v)?;
+        if self.meta_user.is_empty() {
+            rmp::encode::write_nil(wr)?;
+        } else {
+            rmp::encode::write_map_len(wr, self.meta_user.len() as u32)?;
+            for (k, v) in &self.meta_user {
+                rmp::encode::write_str(wr, k)?;
+                rmp::encode::write_str(wr, v)?;
+            }
         }
 
         Ok(())
     }
 
     pub fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
-        let mut fields = rmp::decode::read_map_len(rd)?;
+        let mut fields = rmp::decode::read_map_len(rd).map_err(|e| {
+            tracing::error!(error = %e, "decode_from: read_map_len failed");
+            e
+        })?;
         *self = MetaObject::default();
 
         while fields > 0 {
             fields -= 1;
 
-            let key_len = rmp::decode::read_str_len(rd)?;
+            let key_len = rmp::decode::read_str_len(rd).map_err(|e| {
+                tracing::error!(error = %e, "decode_from: read_str_len key failed");
+                e
+            })?;
             let mut key_buf = vec![0u8; key_len as usize];
-            rd.read_exact(&mut key_buf)?;
-            let key = String::from_utf8(key_buf)?;
+            rd.read_exact(&mut key_buf).map_err(|e| {
+                tracing::error!(error = %e, "decode_from: read_exact key_buf failed");
+                e
+            })?;
+            let key = String::from_utf8(key_buf).map_err(|e| {
+                tracing::error!(error = %e, "decode_from: from_utf8 key failed");
+                e
+            })?;
 
             match key.as_str() {
                 "ID" => {
-                    let _ = rmp::decode::read_bin_len(rd)?;
+                    let _ = rmp::decode::read_bin_len(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_bin_len ID failed");
+                        e
+                    })?;
                     let mut buf = [0u8; 16];
-                    rd.read_exact(&mut buf)?;
+                    rd.read_exact(&mut buf).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_exact ID buf failed");
+                        e
+                    })?;
                     let id = Uuid::from_bytes(buf);
                     self.version_id = if id.is_nil() { None } else { Some(id) };
                 }
                 "DDir" => {
-                    let _ = rmp::decode::read_bin_len(rd)?;
+                    let _ = rmp::decode::read_bin_len(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_bin_len DDir failed");
+                        e
+                    })?;
                     let mut buf = [0u8; 16];
-                    rd.read_exact(&mut buf)?;
+                    rd.read_exact(&mut buf).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_exact DDir buf failed");
+                        e
+                    })?;
                     let id = Uuid::from_bytes(buf);
                     self.data_dir = if id.is_nil() { None } else { Some(id) };
                 }
                 "EcAlgo" => {
-                    let v: i64 = rmp::decode::read_int(rd)?;
+                    let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_int EcAlgo failed");
+                        e
+                    })?;
                     self.erasure_algorithm = ErasureAlgo::from_u8(v as u8);
                 }
                 "EcM" => {
-                    let v: i64 = rmp::decode::read_int(rd)?;
+                    let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_int EcM failed");
+                        e
+                    })?;
                     self.erasure_m = v as usize;
                 }
                 "EcN" => {
-                    let v: i64 = rmp::decode::read_int(rd)?;
+                    let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_int EcN failed");
+                        e
+                    })?;
                     self.erasure_n = v as usize;
                 }
                 "EcBSize" => {
-                    let v: i64 = rmp::decode::read_int(rd)?;
+                    let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_int EcBSize failed");
+                        e
+                    })?;
                     self.erasure_block_size = v as usize;
                 }
                 "EcIndex" => {
-                    let v: i64 = rmp::decode::read_int(rd)?;
+                    let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_int EcIndex failed");
+                        e
+                    })?;
                     self.erasure_index = v as usize;
                 }
                 "EcDist" => {
-                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    let len = rmp::decode::read_array_len(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_array_len EcDist failed");
+                        e
+                    })? as usize;
                     self.erasure_dist.clear();
                     self.erasure_dist.reserve(len);
                     for _ in 0..len {
-                        let v: i64 = rmp::decode::read_int(rd)?;
+                        let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_int EcDist item failed");
+                            e
+                        })?;
                         self.erasure_dist.push(v as u8);
                     }
                 }
                 "CSumAlgo" => {
-                    let v: i64 = rmp::decode::read_int(rd)?;
+                    let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_int CSumAlgo failed");
+                        e
+                    })?;
                     self.bitrot_checksum_algo = ChecksumAlgo::from_u8(v as u8);
                 }
                 "PartNums" => {
-                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    let len = rmp::decode::read_array_len(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_array_len PartNums failed");
+                        e
+                    })? as usize;
                     self.part_numbers.clear();
                     self.part_numbers.reserve(len);
                     for _ in 0..len {
-                        let v: i64 = rmp::decode::read_int(rd)?;
+                        let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_int PartNums item failed");
+                            e
+                        })?;
                         self.part_numbers.push(v as usize);
                     }
                 }
                 "PartETags" => {
-                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    let len = match read_nil_or_array_len(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read PartETags failed");
+                        e
+                    })? {
+                        None => {
+                            self.part_etags.clear();
+                            continue;
+                        }
+                        Some(n) => n,
+                    };
                     self.part_etags.clear();
                     self.part_etags.reserve(len);
                     for _ in 0..len {
-                        let s_len = rmp::decode::read_str_len(rd)?;
+                        let s_len = rmp::decode::read_str_len(rd).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_str_len PartETags item failed");
+                            e
+                        })?;
                         let mut sbuf = vec![0u8; s_len as usize];
-                        rd.read_exact(&mut sbuf)?;
-                        let s = String::from_utf8(sbuf)?;
+                        rd.read_exact(&mut sbuf).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_exact PartETags sbuf failed");
+                            e
+                        })?;
+                        let s = String::from_utf8(sbuf).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: from_utf8 PartETags item failed");
+                            e
+                        })?;
                         self.part_etags.push(s);
                     }
                 }
                 "PartSizes" => {
-                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    let len = rmp::decode::read_array_len(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_array_len PartSizes failed");
+                        e
+                    })? as usize;
                     self.part_sizes.clear();
                     self.part_sizes.reserve(len);
                     for _ in 0..len {
-                        let v: i64 = rmp::decode::read_int(rd)?;
+                        let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_int PartSizes item failed");
+                            e
+                        })?;
                         self.part_sizes.push(v as usize);
                     }
                 }
                 "PartASizes" => {
-                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    let len = match read_nil_or_array_len(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read PartASizes failed");
+                        e
+                    })? {
+                        None => {
+                            self.part_actual_sizes.clear();
+                            continue;
+                        }
+                        Some(n) => n,
+                    };
                     self.part_actual_sizes.clear();
                     self.part_actual_sizes.reserve(len);
                     for _ in 0..len {
-                        let v: i64 = rmp::decode::read_int(rd)?;
+                        let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_int PartASizes item failed");
+                            e
+                        })?;
                         self.part_actual_sizes.push(v);
                     }
                 }
                 "PartIdx" => {
-                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    let len = rmp::decode::read_array_len(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_array_len PartIdx failed");
+                        e
+                    })? as usize;
                     self.part_indices.clear();
                     self.part_indices.reserve(len);
                     for _ in 0..len {
-                        let blen = rmp::decode::read_bin_len(rd)? as usize;
+                        let blen = rmp::decode::read_bin_len(rd).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_bin_len PartIdx item failed");
+                            e
+                        })? as usize;
                         let mut buf = vec![0u8; blen];
-                        rd.read_exact(&mut buf)?;
+                        rd.read_exact(&mut buf).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_exact PartIdx buf failed");
+                            e
+                        })?;
                         self.part_indices.push(Bytes::from(buf));
                     }
                 }
                 "Size" => {
-                    let v: i64 = rmp::decode::read_int(rd)?;
+                    let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_int Size failed");
+                        e
+                    })?;
                     self.size = v;
                 }
                 "MTime" => {
-                    let nanos: i64 = rmp::decode::read_int(rd)?;
-                    let time = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)?;
+                    let nanos: i64 = rmp::decode::read_int(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read_int MTime failed");
+                        e
+                    })?;
+                    let time = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128).inspect_err(|&e| {
+                        tracing::error!(error = %e, "decode_from: from_unix_timestamp_nanos MTime failed");
+                    })?;
                     self.mod_time = if time == OffsetDateTime::UNIX_EPOCH {
                         None
                     } else {
@@ -840,40 +1204,96 @@ impl MetaObject {
                     };
                 }
                 "MetaSys" => {
-                    let len = rmp::decode::read_map_len(rd)? as usize;
+                    let len = match read_nil_or_map_len(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read MetaSys failed");
+                        e
+                    })? {
+                        None => {
+                            self.meta_sys.clear();
+                            continue;
+                        }
+                        Some(n) => n,
+                    };
                     self.meta_sys.clear();
                     for _ in 0..len {
-                        let k_len = rmp::decode::read_str_len(rd)?;
+                        let k_len = rmp::decode::read_str_len(rd).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_str_len MetaSys key failed");
+                            e
+                        })?;
                         let mut kbuf = vec![0u8; k_len as usize];
-                        rd.read_exact(&mut kbuf)?;
-                        let k = String::from_utf8(kbuf)?;
+                        rd.read_exact(&mut kbuf).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_exact MetaSys kbuf failed");
+                            e
+                        })?;
+                        let k = String::from_utf8(kbuf).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: from_utf8 MetaSys key failed");
+                            e
+                        })?;
 
-                        let blen = rmp::decode::read_bin_len(rd)? as usize;
+                        let blen = rmp::decode::read_bin_len(rd).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_bin_len MetaSys value failed");
+                            e
+                        })? as usize;
                         let mut v = vec![0u8; blen];
-                        rd.read_exact(&mut v)?;
+                        rd.read_exact(&mut v).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_exact MetaSys value failed");
+                            e
+                        })?;
 
                         self.meta_sys.insert(k, v);
                     }
                 }
                 "MetaUsr" => {
-                    let len = rmp::decode::read_map_len(rd)? as usize;
+                    let len = match read_nil_or_map_len(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: read MetaUsr failed");
+                        e
+                    })? {
+                        None => {
+                            self.meta_user.clear();
+                            continue;
+                        }
+                        Some(n) => n,
+                    };
                     self.meta_user.clear();
                     for _ in 0..len {
-                        let k_len = rmp::decode::read_str_len(rd)?;
+                        let k_len = rmp::decode::read_str_len(rd).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_str_len MetaUsr key failed");
+                            e
+                        })?;
                         let mut kbuf = vec![0u8; k_len as usize];
-                        rd.read_exact(&mut kbuf)?;
-                        let k = String::from_utf8(kbuf)?;
+                        rd.read_exact(&mut kbuf).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_exact MetaUsr kbuf failed");
+                            e
+                        })?;
+                        let k = String::from_utf8(kbuf).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: from_utf8 MetaUsr key failed");
+                            e
+                        })?;
 
-                        let v_len = rmp::decode::read_str_len(rd)?;
+                        let v_len = rmp::decode::read_str_len(rd).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_str_len MetaUsr value failed");
+                            e
+                        })?;
                         let mut vbuf = vec![0u8; v_len as usize];
-                        rd.read_exact(&mut vbuf)?;
-                        let v = String::from_utf8(vbuf)?;
+                        rd.read_exact(&mut vbuf).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read_exact MetaUsr vbuf failed");
+                            e
+                        })?;
+                        let v = String::from_utf8(vbuf).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: from_utf8 MetaUsr value failed");
+                            e
+                        })?;
 
                         self.meta_user.insert(k, v);
                     }
                 }
                 other => {
-                    return Err(Error::other(format!("unsupported field in MetaObject: {other}")));
+                    // Skip unknown fields for forward compatibility with Go (dc.Skip())
+                    tracing::debug!(field = %other, "decode_from: skipping unknown field");
+                    skip_msgp_value(rd).map_err(|e| {
+                        tracing::error!(error = %e, "decode_from: skip unknown field failed");
+                        e
+                    })?;
                 }
             }
         }

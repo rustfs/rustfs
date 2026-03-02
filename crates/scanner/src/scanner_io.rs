@@ -509,7 +509,7 @@ impl ScannerIODisk for Disk {
         let fivs = match meta.get_file_info_versions(item.bucket.as_str(), item.object_path().as_str(), false) {
             Ok(versions) => versions,
             Err(e) => {
-                error!("Failed to get file info versions: {}", e);
+                error!("Failed to get file info versions: {}/{}, err: {e}", item.bucket, item.object_path());
                 return Err(StorageError::other("skip file".to_string()));
             }
         };
