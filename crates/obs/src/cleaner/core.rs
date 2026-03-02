@@ -164,10 +164,10 @@ impl LogCleaner {
             let (to_delete, to_rotate) = self.select_files_to_process(&files, total_size);
 
             // Handle rotation for active file if needed
-            if let Some(active_file) = to_rotate {
-                if let Err(e) = self.rotate_active_file(&active_file) {
-                    error!("Failed to rotate active file {:?}: {}", active_file.path, e);
-                }
+            if let Some(active_file) = to_rotate
+                && let Err(e) = self.rotate_active_file(&active_file)
+            {
+                error!("Failed to rotate active file {:?}: {}", active_file.path, e);
             }
 
             if !to_delete.is_empty() {
