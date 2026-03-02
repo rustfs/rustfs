@@ -192,13 +192,17 @@ async fn check_acl_access<T>(req: &S3Request<T>, req_info: &ReqInfo, action: &Ac
         Err(_) => false,
     };
 
-    let mut user_ids = Vec::new();
+    let mut user_ids = [""; 2];
+    let mut user_ids_len = 0usize;
     if let Some(cred) = req_info.cred.as_ref() {
-        user_ids.push(cred.access_key.as_str());
+        user_ids[user_ids_len] = cred.access_key.as_str();
+        user_ids_len += 1;
         if (cred.is_temp() || cred.is_service_account()) && !cred.parent_user.is_empty() && cred.parent_user != cred.access_key {
-            user_ids.push(cred.parent_user.as_str());
+            user_ids[user_ids_len] = cred.parent_user.as_str();
+            user_ids_len += 1;
         }
     }
+    let user_ids = &user_ids[..user_ids_len];
     let is_authenticated = !user_ids.is_empty();
 
     let acl = match target {
@@ -212,7 +216,7 @@ async fn check_acl_access<T>(req: &S3Request<T>, req_info: &ReqInfo, action: &Ac
         }
     };
 
-    Ok(acl_allows(&acl, &user_ids, is_authenticated, permission, ignore_public_acls))
+    Ok(acl_allows(&acl, user_ids, is_authenticated, permission, ignore_public_acls))
 }
 
 pub(crate) fn req_info_ref<T>(req: &S3Request<T>) -> S3Result<&ReqInfo> {

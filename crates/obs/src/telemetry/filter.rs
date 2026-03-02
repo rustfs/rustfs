@@ -25,8 +25,8 @@ use tracing_subscriber::EnvFilter;
 /// If `default_level` is provided, it is used directly. Otherwise, the
 /// `RUST_LOG` environment variable takes precedence over `logger_level`.
 /// For non-verbose levels (`info`, `warn`, `error`), noisy internal crates
-/// (`hyper`, `tonic`, `h2`, `reqwest`, `tower`) are automatically silenced to
-/// reduce log noise.
+/// (`hyper`, `tonic`, `h2`, `reqwest`, `tower`) are automatically silenced
+/// based on the effective log configuration.
 ///
 /// # Arguments
 /// * `logger_level` - The desired log level string (e.g., `"info"`, `"debug"`).
@@ -36,15 +36,48 @@ use tracing_subscriber::EnvFilter;
 ///
 /// # Returns
 /// A configured `EnvFilter` ready to be attached to a `tracing_subscriber` registry.
+fn is_verbose_level(level: &str) -> bool {
+    matches!(level.to_ascii_lowercase().as_str(), "trace" | "debug")
+}
+
+fn rust_log_requests_verbose(rust_log: &str) -> bool {
+    rust_log.split(',').any(|directive| {
+        let directive = directive.trim();
+        if directive.is_empty() {
+            return false;
+        }
+
+        let level = directive.rsplit('=').next().unwrap_or("").trim();
+        is_verbose_level(level)
+    })
+}
+
+fn should_suppress_noisy_crates(logger_level: &str, default_level: Option<&str>, rust_log: Option<&str>) -> bool {
+    if let Some(level) = default_level {
+        return !is_verbose_level(level);
+    }
+
+    if let Some(rust_log) = rust_log {
+        return !rust_log_requests_verbose(rust_log);
+    }
+
+    !is_verbose_level(logger_level)
+}
+
 pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilter {
     let level = default_level.unwrap_or(logger_level);
+    let rust_log = if default_level.is_none() {
+        std::env::var("RUST_LOG").ok()
+    } else {
+        None
+    };
     let mut filter = default_level
         .map(EnvFilter::new)
         .unwrap_or_else(|| EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)));
 
     // Suppress chatty infrastructure crates unless the operator explicitly
     // requests trace/debug output.
-    if !matches!(level, "trace" | "debug") {
+    if should_suppress_noisy_crates(logger_level, default_level, rust_log.as_deref()) {
         let directives: SmallVec<[&str; 5]> = smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower"];
         for directive in directives {
             filter = filter.add_directive(format!("{directive}=off").parse().unwrap());
@@ -73,7 +106,7 @@ mod tests {
     #[test]
     fn test_build_env_filter_suppresses_noisy_crates() {
         // For info level, hyper/tonic/etc. should be suppressed with OFF.
-        let filter = build_env_filter("info", None);
+        let filter = build_env_filter("debug", Some("info"));
         let dbg = format!("{filter:?}");
         // The Debug output uses `LevelFilter::OFF` for suppressed crates.
         assert!(
@@ -93,5 +126,12 @@ mod tests {
             dbg.contains("LevelFilter::DEBUG"),
             "Expected 'LevelFilter::DEBUG' in filter debug output: {dbg}"
         );
+    }
+
+    #[test]
+    fn test_should_suppress_noisy_crates_respects_rust_log_debug() {
+        assert!(!should_suppress_noisy_crates("info", None, Some("debug")));
+        assert!(!should_suppress_noisy_crates("info", None, Some("s3=info,hyper=debug")));
+        assert!(should_suppress_noisy_crates("info", None, Some("info")));
     }
 }

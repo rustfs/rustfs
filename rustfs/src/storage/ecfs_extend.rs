@@ -641,7 +641,10 @@ pub(crate) fn needs_cors_processing(headers: &HeaderMap) -> bool {
 /// 2. Retrieves the bucket's CORS configuration
 /// 3. Matches the origin against CORS rules
 /// 4. Validates AllowedHeaders if request headers are present
-/// 5. Returns headers to add to the response if a match is found
+/// 5. Returns one of:
+///    - `None`: bucket has no CORS config (or request has no valid `Origin`)
+///    - `Some(empty headers)`: bucket CORS exists but request is denied / no rule matched
+///    - `Some(non-empty headers)`: bucket CORS exists and request matched
 ///
 /// Note: This function should only be called if `needs_cors_processing()` returns true
 /// to avoid unnecessary overhead for non-CORS requests.
@@ -751,22 +754,25 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         // Browsers reject `Access-Control-Allow-Origin: *` with `credentials: include`.
         let has_wildcard_origin = rule.allowed_origins.iter().any(|o| o == "*");
         let credentialed_request = is_credentialed_request(headers);
+        let mut origin_reflected = false;
 
         if has_wildcard_origin {
             if credentialed_request {
                 if let Ok(origin_value) = HeaderValue::from_str(origin) {
                     response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
+                    origin_reflected = true;
                 }
             } else {
                 response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
             }
         } else if let Ok(origin_value) = HeaderValue::from_str(origin) {
             response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
+            origin_reflected = true;
         }
 
-        // Vary: Origin when origin is reflected (credentialed wildcard requests).
+        // Vary: Origin whenever origin is reflected (non-"*" allow-origin).
         // This prevents proxy/browser caches from reusing CORS headers across different origins.
-        if has_wildcard_origin && credentialed_request {
+        if origin_reflected {
             response_headers.insert(cors::standard::VARY, HeaderValue::from_static("Origin"));
         }
 
