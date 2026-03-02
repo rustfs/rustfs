@@ -355,10 +355,9 @@ fn spawn_cleanup_task(
         _ => FileMatchMode::Suffix,
     };
 
-    let keep_count = config.log_keep_files.unwrap_or(keep_files);
     let max_total_size = config
         .log_max_total_size_bytes
-        .unwrap_or(DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES * keep_count as u64);
+        .unwrap_or(DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES);
     let max_single_file_size = config
         .log_max_single_file_size_bytes
         .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
@@ -387,7 +386,7 @@ fn spawn_cleanup_task(
         log_dir,
         file_pattern,
         match_mode,
-        keep_count,
+        keep_files,
         max_total_size,
         max_single_file_size,
         compress,

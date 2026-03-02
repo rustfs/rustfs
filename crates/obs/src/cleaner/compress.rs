@@ -20,6 +20,7 @@
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use rustfs_config::observability::DEFAULT_OBS_LOG_GZIP_COMPRESSION_EXTENSION;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
@@ -39,7 +40,7 @@ use tracing::{debug, info};
 /// Propagates any I/O error encountered while opening, reading, writing, or
 /// flushing files.
 pub(super) fn compress_file(path: &Path, level: u32, dry_run: bool) -> Result<(), std::io::Error> {
-    let gz_path = path.with_extension("gz");
+    let gz_path = path.with_extension(DEFAULT_OBS_LOG_GZIP_COMPRESSION_EXTENSION);
 
     if gz_path.exists() {
         debug!("Compressed file already exists, skipping: {:?}", gz_path);

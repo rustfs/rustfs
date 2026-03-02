@@ -15,6 +15,7 @@
 // Observability Keys
 
 mod metrics;
+use const_str::concat;
 pub use metrics::*;
 
 pub const ENV_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
@@ -59,6 +60,8 @@ pub const DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024; //
 pub const DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES: u64 = 0; // No single file limit
 pub const DEFAULT_OBS_LOG_COMPRESS_OLD_FILES: bool = true;
 pub const DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL: u32 = 6;
+pub const DEFAULT_OBS_LOG_GZIP_COMPRESSION_EXTENSION: &str = "gz";
+pub const DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION: &str = concat!(".", DEFAULT_OBS_LOG_GZIP_COMPRESSION_EXTENSION);
 pub const DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS: u64 = 30;
 pub const DEFAULT_OBS_LOG_DELETE_EMPTY_FILES: bool = true;
 pub const DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS: u64 = 3600; // 1 hour
