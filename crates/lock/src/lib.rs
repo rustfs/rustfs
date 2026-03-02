@@ -71,6 +71,8 @@ pub const MAX_DELETE_LIST: usize = 1000;
 
 /// Default setting for RUSTFS_ENABLE_LOCKS environment variable
 const DEFAULT_RUSTFS_LOCKS_ENABLED: bool = true;
+const ENV_LOCK_ENABLED: &str = "RUSTFS_LOCK_ENABLED";
+const ENV_LOCK_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_LOCKS";
 
 // ============================================================================
 // Global FastLock Manager
@@ -98,9 +100,13 @@ impl GlobalLockManager {
     /// Create a lock manager based on environment variable configuration
     pub fn new() -> Self {
         // Check RUSTFS_ENABLE_LOCKS environment variable
-        let locks_enabled = rustfs_utils::get_env_bool("RUSTFS_ENABLE_LOCKS", DEFAULT_RUSTFS_LOCKS_ENABLED);
+        let locks_enabled = rustfs_utils::get_env_bool_with_aliases(
+            ENV_LOCK_ENABLED,
+            &[ENV_LOCK_ENABLED_DEPRECATED],
+            DEFAULT_RUSTFS_LOCKS_ENABLED,
+        );
         if !locks_enabled {
-            tracing::info!("Lock system disabled via RUSTFS_ENABLE_LOCKS environment variable");
+            tracing::info!("Lock system disabled via {} environment variable", ENV_LOCK_ENABLED_DEPRECATED);
             return Self::Disabled(DisabledLockManager::new());
         }
         tracing::info!("Lock system enabled");

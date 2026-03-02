@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
+use std::{collections::HashSet, env, sync::{Mutex, OnceLock}};
+use tracing::warn;
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
 /// 8-bit type: signed i8
@@ -66,6 +67,50 @@ pub fn get_env_u8(key: &str, default: u8) -> u8 {
 ///
 pub fn get_env_opt_u8(key: &str) -> Option<u8> {
     env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
+static WARNED_ENV_MESSAGES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn log_once(key: &str, message: impl FnOnce() -> String) {
+    let seen = WARNED_ENV_MESSAGES.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut seen) = seen.lock() {
+        if seen.insert(key.to_string()) {
+            warn!("{}", message());
+        }
+    }
+}
+
+fn resolve_env_with_aliases(key: &str, deprecated: &[&str]) -> Option<(String, String)> {
+    if let Ok(value) = env::var(key) {
+        return Some((key.to_string(), value));
+    }
+
+    let (alias, value) = deprecated.iter().find_map(|alias| env::var(alias).ok().map(|value| (*alias, value)))?;
+    let deprecated_key = format!("env_alias:{alias}->{key}");
+    log_once(&deprecated_key, || format!("Environment variable {alias} is deprecated, use {key} instead"));
+    Some((alias.to_string(), value))
+}
+
+pub fn get_env_str_with_aliases(key: &str, deprecated: &[&str], default: &str) -> String {
+    resolve_env_with_aliases(key, deprecated).map_or_else(|| default.to_string(), |(_, value)| value)
+}
+
+pub fn get_env_bool_with_aliases(key: &str, deprecated: &[&str], default: bool) -> bool {
+    let Some((used_key, value)) = resolve_env_with_aliases(key, deprecated) else {
+        return default;
+    };
+
+    parse_bool_str(&value).unwrap_or_else(|| {
+        log_once(
+            &format!("env_invalid_bool:{used_key}"),
+            || {
+                format!(
+                    "Invalid bool value for {used_key}: {value}. Supported values are true/false,1/0,yes/no,on/off. Treating as unset."
+                )
+            },
+        );
+        default
+    })
 }
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
@@ -338,7 +383,7 @@ pub fn get_env_opt_usize(key: &str) -> Option<usize> {
 /// - `String`: The environment variable value if set, otherwise the default value.
 ///
 pub fn get_env_str(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
+    get_env_str_with_aliases(key, &[], default)
 }
 
 /// Retrieve an environment variable as a String, returning None if not set.
@@ -363,7 +408,7 @@ pub fn get_env_opt_str(key: &str) -> Option<String> {
 /// - `bool`: The parsed boolean value if successful, otherwise the default value.
 ///
 pub fn get_env_bool(key: &str, default: bool) -> bool {
-    env::var(key).ok().and_then(|v| parse_bool_str(&v)).unwrap_or(default)
+    get_env_bool_with_aliases(key, &[], default)
 }
 
 /// Parse a string into a boolean value.
@@ -391,5 +436,14 @@ fn parse_bool_str(s: &str) -> Option<bool> {
 /// - `Option<bool>`: The parsed boolean value if successful, otherwise None.
 ///
 pub fn get_env_opt_bool(key: &str) -> Option<bool> {
-    env::var(key).ok().and_then(|v| parse_bool_str(&v))
+    let (used_key, value) = resolve_env_with_aliases(key, &[])?;
+    parse_bool_str(&value).or_else(|| {
+        log_once(
+            &format!("env_invalid_bool_optional:{used_key}"),
+            || {
+                format!("Invalid bool value for {used_key}: {value}. Supported values are true/false,1/0,yes/no,on/off.")
+            },
+        );
+        None
+    })
 }
