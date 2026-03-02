@@ -18,6 +18,7 @@
 //! compress any files — it only reports what it found.
 
 use super::types::{FileInfo, FileMatchMode};
+use rustfs_config::observability::DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tracing::debug;
@@ -81,7 +82,7 @@ pub(super) fn collect_log_files(
         }
 
         // Compressed files are handled by collect_compressed_files.
-        if filename.ends_with(".gz") {
+        if filename.ends_with(DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION) {
             continue;
         }
 
@@ -180,7 +181,7 @@ pub(super) fn collect_expired_compressed_files(
             None => continue,
         };
 
-        if !filename.ends_with(".gz") {
+        if !filename.ends_with(DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION) {
             continue;
         }
 

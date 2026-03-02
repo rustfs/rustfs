@@ -23,6 +23,7 @@
 //! 4. Cleanup task — aborted to prevent lingering background work.
 //! 5. Tracing worker guard — flushes buffered log lines written by
 //!    `tracing_appender`.
+//! 6. Stdout worker guard — flushes buffered log lines written to stdout.
 
 use opentelemetry_sdk::{logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider};
 
@@ -39,13 +40,13 @@ pub struct OtelGuard {
     pub(crate) meter_provider: Option<SdkMeterProvider>,
     /// Optional logger provider for OTLP log export.
     pub(crate) logger_provider: Option<SdkLoggerProvider>,
+    /// Handle to the background log-cleanup task; aborted on drop.
+    pub(crate) cleanup_handle: Option<tokio::task::JoinHandle<()>>,
     /// Worker guard that keeps the non-blocking `tracing_appender` thread
     /// alive.  Dropping it blocks until all buffered records are flushed.
     pub(crate) tracing_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
     /// Optional guard for stdout logging; kept separate to allow independent flushing and shutdown.
     pub(crate) stdout_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
-    /// Handle to the background log-cleanup task; aborted on drop.
-    pub(crate) cleanup_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for OtelGuard {
@@ -54,9 +55,9 @@ impl std::fmt::Debug for OtelGuard {
             .field("tracer_provider", &self.tracer_provider.is_some())
             .field("meter_provider", &self.meter_provider.is_some())
             .field("logger_provider", &self.logger_provider.is_some())
+            .field("cleanup_handle", &self.cleanup_handle.is_some())
             .field("tracing_guard", &self.tracing_guard.is_some())
             .field("stdout_guard", &self.stdout_guard.is_some())
-            .field("cleanup_handle", &self.cleanup_handle.is_some())
             .finish()
     }
 }
