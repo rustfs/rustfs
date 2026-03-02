@@ -132,15 +132,15 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_LOGGER_LEVEL` | `info` | Log level; `RUST_LOG` syntax supported |
 | `RUSTFS_OBS_LOG_STDOUT_ENABLED` | `false` | When file logging is active, also mirror to stdout |
 | `RUSTFS_OBS_LOG_DIRECTORY` | _(empty)_ | **Directory for rolling log files. When empty, logs go to stdout only** |
-| `RUSTFS_OBS_LOG_FILENAME` | `rustfs` | Base filename for rolling logs (date suffix added automatically) |
+| `RUSTFS_OBS_LOG_FILENAME` | `rustfs.log` | Base filename for rolling logs (date suffix added automatically) |
 | `RUSTFS_OBS_LOG_ROTATION_TIME` | `hourly` | Rotation granularity: `minutely`, `hourly`, or `daily` |
-| `RUSTFS_OBS_LOG_KEEP_FILES` | `30` | Number of rolling files to keep |
+| `RUSTFS_OBS_LOG_KEEP_FILES` | `30` | Number of rolling files to keep (also used by cleaner) |
+| `RUSTFS_OBS_LOG_MATCH_MODE` | `suffix` | File matching mode: `prefix` or `suffix` |
 
 ### Log cleanup
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RUSTFS_OBS_LOG_KEEP_COUNT` | `10` | Minimum files the cleaner must always preserve |
 | `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES` | `2147483648` | Hard cap on total log directory size (2 GiB) |
 | `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES` | `0` | Per-file size cap; `0` = unlimited |
 | `RUSTFS_OBS_LOG_COMPRESS_OLD_FILES` | `true` | Gzip-compress files before deleting |
@@ -149,7 +149,7 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_LOG_EXCLUDE_PATTERNS` | _(empty)_ | Comma-separated glob patterns to never clean up |
 | `RUSTFS_OBS_LOG_DELETE_EMPTY_FILES` | `true` | Remove zero-byte files |
 | `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS` | `3600` | Minimum file age (seconds) before cleanup |
-| `RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS` | `21600` | How often the cleanup task runs (6 hours) |
+| `RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS` | `1800` | How often the cleanup task runs (0.5 hours) |
 | `RUSTFS_OBS_LOG_DRY_RUN` | `false` | Report deletions without actually removing files |
 
 
@@ -223,12 +223,12 @@ rustfs-obs/src/
 │   ├── otel.rs              # Full OTLP/HTTP pipeline
 │   └── recorder.rs          # metrics-crate → OTel bridge (Recorder)
 │
-├── log_cleanup/             # Background log-file cleanup subsystem
+├── cleaner/                 # Background log-file cleanup subsystem
 │   ├── mod.rs               # LogCleaner public API + tests
 │   ├── types.rs             # FileInfo shared type
 │   ├── scanner.rs           # Filesystem discovery
 │   ├── compress.rs          # Gzip compression helper
-│   └── cleaner.rs           # Selection, compression, deletion logic
+│   └── core.rs              # Selection, compression, deletion logic
 │
 └── system/                  # Host metrics (CPU, memory, disk, GPU)
     ├── mod.rs
@@ -245,10 +245,12 @@ rustfs-obs/src/
 ```rust
 use std::path::PathBuf;
 use rustfs_obs::LogCleaner;
+use rustfs_obs::cleaner::types::FileMatchMode;
 
 let cleaner = LogCleaner::new(
     PathBuf::from("/var/log/rustfs"),
-    "rustfs.log.".to_string(),  // file_prefix
+    "rustfs.log.".to_string(),  // file_pattern
+    FileMatchMode::Prefix,       // match_mode
     10,                          // keep_count
     2 * 1024 * 1024 * 1024,      // max_total_size_bytes (2 GiB)
     0,                           // max_single_file_size_bytes (unlimited)

@@ -195,7 +195,7 @@ fn init_file_logging_internal(
 
         let mut builder = RollingFileAppender::builder()
             .rotation(rotation)
-            .max_log_files(keep_files * 2); // Make sure there are some data files to archive to avoid premature deletion
+            .max_log_files(keep_files * 3); // Make sure there are some data files to archive to avoid premature deletion
 
         match match_mode {
             FileMatchMode::Prefix => builder = builder.filename_prefix(log_filename),
@@ -355,7 +355,7 @@ fn spawn_cleanup_task(
         _ => FileMatchMode::Suffix,
     };
 
-    let keep_count = config.log_keep_count.unwrap_or(keep_files);
+    let keep_count = config.log_keep_files.unwrap_or(keep_files);
     let max_total_size = config
         .log_max_total_size_bytes
         .unwrap_or(DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES * keep_count as u64);
