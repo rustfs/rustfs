@@ -72,10 +72,10 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-const ENV_SERVER_SCANNER_ENABLED: &str = "RUSTFS_SERVER_SCANNER_ENABLED";
-const ENV_SERVER_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
-const ENV_SERVER_HEAL_ENABLED: &str = "RUSTFS_SERVER_HEAL_ENABLED";
-const ENV_SERVER_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
+const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
+const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
+const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
+const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
@@ -409,12 +409,8 @@ async fn run(config: config::Config) -> Result<()> {
     let _ = create_ahm_services_cancel_token();
 
     // Check environment variables to determine if scanner and heal should be enabled
-    let enable_scanner = get_env_bool_with_aliases(
-        ENV_SERVER_SCANNER_ENABLED,
-        &[ENV_SERVER_SCANNER_ENABLED_DEPRECATED],
-        true,
-    );
-    let enable_heal = get_env_bool_with_aliases(ENV_SERVER_HEAL_ENABLED, &[ENV_SERVER_HEAL_ENABLED_DEPRECATED], true);
+    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
+    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
     info!(
         target: "rustfs::main::run",
@@ -510,9 +506,8 @@ async fn handle_shutdown(
     state_manager.update(ServiceState::Stopping);
 
     // Check environment variables to determine what services need to be stopped
-    let enable_scanner =
-        get_env_bool_with_aliases(ENV_SERVER_SCANNER_ENABLED, &[ENV_SERVER_SCANNER_ENABLED_DEPRECATED], true);
-    let enable_heal = get_env_bool_with_aliases(ENV_SERVER_HEAL_ENABLED, &[ENV_SERVER_HEAL_ENABLED_DEPRECATED], true);
+    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
+    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
     // Stop background services based on what was enabled
     if enable_scanner || enable_heal {

@@ -126,13 +126,9 @@ pub const RUSTFS_LICENSE_URL: &str = "https://www.apache.org/licenses/LICENSE-2.
 /// This is the environment variable for rustfs address.
 /// It is used to bind the server to a specific address.
 /// Example: RUSTFS_ADDRESS=":9000"
-pub const ENV_SERVER_ADDRESS: &str = "RUSTFS_SERVER_ADDRESS";
 pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
 
-/// Environment variable for server volumes (moduleized name).
-/// Kept with legacy fallback for compatibility.
-pub const ENV_SERVER_VOLUMES: &str = "RUSTFS_SERVER_VOLUMES";
-/// Legacy compatibility variable for server volumes.
+/// Environment variable for server volumes.
 pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
 
 /// Default port for rustfs
@@ -160,14 +156,10 @@ pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
 /// Default value: us-east-1
 pub const RUSTFS_REGION: &str = "us-east-1";
 
-/// Environment variable for server region (moduleized name).
-pub const ENV_SERVER_REGION: &str = "RUSTFS_SERVER_REGION";
-/// Legacy compatibility variable for server region.
+/// Environment variable for server region.
 pub const ENV_RUSTFS_REGION: &str = "RUSTFS_REGION";
 
-/// Environment variable for app license (moduleized name).
-pub const ENV_APP_LICENSE: &str = "RUSTFS_APP_LICENSE";
-/// Legacy compatibility variable for license.
+/// Environment variable for server license.
 pub const ENV_RUSTFS_LICENSE: &str = "RUSTFS_LICENSE";
 
 /// Default log filename for rustfs
