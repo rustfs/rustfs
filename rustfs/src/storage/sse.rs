@@ -107,9 +107,6 @@ use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKe
 
 const DEFAULT_SSE_ALGORITHM: &str = "AES256";
 
-/// Key id used for SSE-S3 when KMS is not configured (server-managed default key).
-const SSE_S3_DEFAULT_KEY_ID: &str = "rustfs-sse-s3-default";
-
 const SUPPORT_SSE_ALGORITHMS: &[&str] = &[DEFAULT_SSE_ALGORITHM];
 
 // check sse type
@@ -1034,12 +1031,6 @@ async fn apply_managed_encryption_material(
         if let Some(service) = get_global_encryption_service().await {
             kms_key_candidate = service.get_default_key_id().cloned();
         }
-    }
-    // SSE-S3 (AES256) is server-managed encryption: when KMS is not configured,
-    // use a built-in default key id so PUT/GET still work (backward compatible with alpha.83).
-    // SSE-KMS (aws:kms) always requires an explicit or KMS default key.
-    if kms_key_candidate.is_none() && encryption_type == SSEType::SseS3 {
-        kms_key_candidate = Some(SSE_S3_DEFAULT_KEY_ID.to_string());
     }
 
     let kms_key_to_use = kms_key_candidate.clone().ok_or_else(|| {
