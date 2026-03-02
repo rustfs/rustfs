@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashSet, env, sync::{Mutex, OnceLock}};
+use std::{
+    collections::HashSet,
+    env,
+    sync::{Mutex, OnceLock},
+};
 use tracing::warn;
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
@@ -87,9 +91,13 @@ fn resolve_env_with_aliases(key: &str, deprecated: &[&str]) -> Option<(String, S
         return Some((key.to_string(), value));
     }
 
-    let (alias, value) = deprecated.iter().find_map(|alias| env::var(alias).ok().map(|value| (*alias, value)))?;
+    let (alias, value) = deprecated
+        .iter()
+        .find_map(|alias| env::var(alias).ok().map(|value| (*alias, value)))?;
     let deprecated_key = format!("env_alias:{alias}->{key}");
-    log_once(&deprecated_key, || format!("Environment variable {alias} is deprecated, use {key} instead"));
+    log_once(&deprecated_key, || {
+        format!("Environment variable {alias} is deprecated, use {key} instead")
+    });
     Some((alias.to_string(), value))
 }
 
@@ -440,12 +448,9 @@ fn parse_bool_str(s: &str) -> Option<bool> {
 pub fn get_env_opt_bool(key: &str) -> Option<bool> {
     let (used_key, value) = resolve_env_with_aliases(key, &[])?;
     parse_bool_str(&value).or_else(|| {
-        log_once(
-            &format!("env_invalid_bool_optional:{used_key}"),
-            || {
-                format!("Invalid bool value for {used_key}: {value}. Supported values are true/false,1/0,yes/no,on/off.")
-            },
-        );
+        log_once(&format!("env_invalid_bool_optional:{used_key}"), || {
+            format!("Invalid bool value for {used_key}: {value}. Supported values are true/false,1/0,yes/no,on/off.")
+        });
         None
     })
 }
