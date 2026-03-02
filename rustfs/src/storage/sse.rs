@@ -107,6 +107,9 @@ use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKe
 
 const DEFAULT_SSE_ALGORITHM: &str = "AES256";
 
+/// Key id used for SSE-S3 when KMS is not configured (server-managed default key).
+const SSE_S3_DEFAULT_KEY_ID: &str = "rustfs-sse-s3-default";
+
 const SUPPORT_SSE_ALGORITHMS: &[&str] = &[DEFAULT_SSE_ALGORITHM];
 
 // check sse type
@@ -1027,10 +1030,18 @@ async fn apply_managed_encryption_material(
             kms_key_candidate = service.get_default_key_id().cloned();
         }
     }
+    // SSE-S3 (AES256) is server-managed encryption: when KMS is not configured,
+    // use a built-in default key id so PUT/GET still work (backward compatible with alpha.83).
+    // SSE-KMS (aws:kms) always requires an explicit or KMS default key.
+    if kms_key_candidate.is_none() && encryption_type == SSEType::SseS3 {
+        kms_key_candidate = Some(SSE_S3_DEFAULT_KEY_ID.to_string());
+    }
 
-    let kms_key_to_use = kms_key_candidate
-        .clone()
-        .ok_or_else(|| ApiError::from(StorageError::other("No KMS key available for managed server-side encryption")))?;
+    let kms_key_to_use = kms_key_candidate.clone().ok_or_else(|| {
+        ApiError::from(StorageError::other(
+            "No KMS key available for managed server-side encryption (required for SSE-KMS)",
+        ))
+    })?;
 
     let provider = get_sse_dek_provider().await?;
 
@@ -1390,6 +1401,33 @@ impl TestSseDekProvider {
         Self { master_key }
     }
 
+    /// Create a local SSE DEK provider for SSE-S3 when KMS is not configured.
+    /// Uses RUSTFS_SSE_S3_MASTER_KEY (base64 32-byte) if set; otherwise a built-in default.
+    /// Allows PUT/GET to work without KMS (backward compatible).
+    pub fn new_for_local_sse() -> Self {
+        let master_key = match std::env::var("RUSTFS_SSE_S3_MASTER_KEY") {
+            Ok(v) if !v.trim().is_empty() => match BASE64_STANDARD.decode(v.trim()) {
+                Ok(decoded) if decoded.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&decoded[..32]);
+                    tracing::info!("Using RUSTFS_SSE_S3_MASTER_KEY for SSE-S3 (KMS not configured)");
+                    arr
+                }
+                _ => {
+                    tracing::warn!("RUSTFS_SSE_S3_MASTER_KEY invalid (expected base64 32 bytes); using default for SSE-S3");
+                    [0u8; 32]
+                }
+            },
+            _ => {
+                tracing::debug!(
+                    "KMS not configured; using built-in default key for SSE-S3 (set RUSTFS_SSE_S3_MASTER_KEY for production)"
+                );
+                [0u8; 32]
+            }
+        };
+        Self { master_key }
+    }
+
     // Simple encryption of DEK
     pub(crate) fn encrypt_dek(dek: [u8; 32], cmk_value: [u8; 32]) -> Result<String, ApiError> {
         // Use AES-256-GCM to encrypt DEK
@@ -1501,13 +1539,16 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
         return Ok(provider.clone());
     }
 
-    // Determine provider based on environment variable
-    let provider: Arc<dyn SseDekProvider> = if std::env::var("__RUSTFS_SSE_SIMPLE_CMK").is_ok() {
+    // Determine provider: KMS when available, else test env, else local SSE-S3 fallback (no KMS)
+    let provider: Arc<dyn SseDekProvider> = if get_global_encryption_service().await.is_some() {
+        debug!("Using KmsSseDekProvider (KMS configured)");
+        Arc::new(KmsSseDekProvider::new().await?)
+    } else if std::env::var("__RUSTFS_SSE_SIMPLE_CMK").is_ok() {
         debug!("Using SimpleSseDekProvider (test mode) based on __RUSTFS_SSE_SIMPLE_CMK");
         Arc::new(TestSseDekProvider::new())
     } else {
-        debug!("Using KmsSseDekProvider (production mode)");
-        Arc::new(KmsSseDekProvider::new().await?)
+        debug!("Using local SSE-S3 provider (KMS not configured)");
+        Arc::new(TestSseDekProvider::new_for_local_sse())
     };
 
     // Store in global cache
@@ -2653,5 +2694,108 @@ mod tests {
         };
         let err = validate_ssec_params(params).unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+    }
+
+    // ========================================================================
+    // Unit tests for issue #2041: no mandatory KMS when encryption not used
+    // ========================================================================
+
+    /// When SSE-C params are not present and no managed SSE is requested,
+    /// encryption should be skipped (Ok(None)). Ensures we do not require KMS
+    /// when the client sends no encryption headers.
+    #[tokio::test]
+    async fn test_sse_encryption_skip_when_no_ssec_and_no_managed_sse_requested() {
+        let request = EncryptionRequest {
+            bucket: "test-bucket",
+            key: "test-key",
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 1024,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+        let result = sse_encryption(request).await;
+        match &result {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("expected no encryption material when no SSE params provided"),
+            Err(e) => {
+                assert!(
+                    !e.message.contains("No KMS key"),
+                    "must not require KMS when no encryption requested; got: {}",
+                    e.message
+                );
+            }
+        }
+    }
+
+    /// When SSE-C params are partial or invalid, sse_encryption must return an error.
+    #[tokio::test]
+    async fn test_sse_encryption_errors_on_invalid_ssec_params() {
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let sse_key = BASE64_STANDARD.encode([42u8; 32]);
+        let wrong_md5 = BASE64_STANDARD.encode([99u8; 16]);
+
+        let request_wrong_md5 = EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(sse_key.clone()),
+            sse_customer_key_md5: Some(wrong_md5),
+            content_size: 1024,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+        let err = sse_encryption(request_wrong_md5).await.unwrap_err();
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+
+        let request_unsupported_algorithm = EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: Some("unsupported-algo".to_string()),
+            sse_customer_key: Some(sse_key),
+            sse_customer_key_md5: Some(BASE64_STANDARD.encode(md5::compute([42u8; 32]).0)),
+            content_size: 1024,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+        let err = sse_encryption(request_unsupported_algorithm).await.unwrap_err();
+        assert!(err.code == S3ErrorCode::InvalidRequest || err.code == S3ErrorCode::InvalidArgument);
+    }
+
+    /// When bucket has no SSE-S3/aws:kms setting and request has no SSE headers,
+    /// encryption should be skipped (Ok(None)). Ensures no mandatory bucket default SSE.
+    #[tokio::test]
+    async fn test_sse_prepare_encryption_skip_when_no_params_and_no_bucket_sse() {
+        let request = PrepareEncryptionRequest {
+            bucket: "test-bucket-no-sse-config",
+            key: "test-key",
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key_md5: None,
+        };
+        let result = sse_prepare_encryption(request).await;
+        match &result {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("expected no encryption when bucket has no SSE config and no request SSE"),
+            Err(e) => {
+                assert!(
+                    !e.message.contains("No KMS key"),
+                    "must not require KMS when no bucket SSE and no request SSE; got: {}",
+                    e.message
+                );
+            }
+        }
     }
 }
