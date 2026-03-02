@@ -170,27 +170,32 @@ async fn prepare_sse_configuration(
         }));
     }
 
-    // Get bucket default encryption configuration
+    // Get bucket default encryption configuration.
+    // Only buckets with explicit SSE config return Ok; unconfigured buckets return ConfigNotFound.
     let bucket_sse_config_result = metadata_sys::get_sse_config(bucket).await;
     debug!("bucket_sse_config_result={:?}", bucket_sse_config_result);
 
     if let Ok((bucket_sse_config, _timestamp)) = bucket_sse_config_result {
-        let effective_sse = server_side_encryption
-            .clone()
-            .or_else(|| {
-                bucket_sse_config.rules.first().and_then(|rule| {
-                    debug!("Processing SSE rule: {:?}", rule);
-                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                        debug!("Found SSE default: {:?}", sse);
-                        match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
-                        }
-                    })
+        // Use request SSE, or bucket's apply_server_side_encryption_by_default. Do NOT default to
+        // AES256 when neither is set (avoids forcing encryption for buckets without default SSE).
+        let effective_sse_opt = server_side_encryption.clone().or_else(|| {
+            bucket_sse_config.rules.first().and_then(|rule| {
+                debug!("Processing SSE rule: {:?}", rule);
+                rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
+                    debug!("Found SSE default: {:?}", sse);
+                    match sse.sse_algorithm.as_str() {
+                        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback
+                    }
                 })
             })
-            .unwrap_or_else(|| ServerSideEncryption::from_static(ServerSideEncryption::AES256));
+        });
+
+        let Some(effective_sse) = effective_sse_opt else {
+            debug!("no request SSE and no bucket default SSE; skip encryption");
+            return Ok(None);
+        };
         debug!("effective_sse={:?} (original={:?})", effective_sse, server_side_encryption);
 
         let effective_kms_key_id = ssekms_key_id.or_else(|| {
