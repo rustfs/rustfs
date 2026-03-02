@@ -1,0 +1,49 @@
+---
+description: Enforce PR template when creating pull requests
+alwaysApply: true
+---
+
+# Pull Request Template Requirements
+
+When creating a pull request (using `gh pr create`), you MUST strictly follow the PR template at `.github/pull_request_template.md`. Every section must be filled in — do NOT leave any section blank.
+
+## Required Sections
+
+1. **Type of Change**: Check exactly one box that matches the change type (Bug Fix, New Feature, etc.)
+2. **Related Issues**: Link related issue numbers (e.g., `Closes #123`)
+3. **Summary of Changes**: Write 2-5 sentences describing what changed and why
+4. **Checklist**: Check all items that apply; `make pre-commit` must always be checked
+5. **Impact**: Check applicable boxes; if none apply, leave all unchecked but add "No breaking changes" under Additional Notes
+6. **Additional Notes**: Add testing steps, deployment notes, or "N/A" if nothing extra
+
+## Example
+
+```markdown
+## Type of Change
+- [ ] New Feature
+- [x] Bug Fix
+- [ ] Documentation
+
+## Related Issues
+Closes #2036
+
+## Summary of Changes
+Fixed anonymous access being denied when no PublicAccessBlock configuration exists.
+`get_public_access_block_config` returning `ConfigNotFound` was incorrectly treated
+as an access denial. Now it is handled as "no restrictions" per AWS S3 semantics.
+
+## Checklist
+- [x] I have read and followed the CONTRIBUTING.md guidelines
+- [x] Passed `make pre-commit`
+- [x] Added/updated necessary tests
+- [ ] Documentation updated (if needed)
+- [ ] CI/CD passed (if applicable)
+
+## Impact
+- [ ] Breaking change (compatibility)
+- [ ] Requires doc/config/deployment update
+
+## Additional Notes
+Workaround for users who cannot upgrade: run `put-public-access-block` with all
+options set to false on affected buckets.
+```
