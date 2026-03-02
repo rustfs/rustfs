@@ -1,8 +1,8 @@
 # Unimplemented S3 feature tests
 # ==============================
 #
-# These tests cover STANDARD S3 features not yet implemented in RustFS.
-# They are TEMPORARILY EXCLUDED and should be enabled as features are added.
+# These tests cover STANDARD S3 features planned but not yet implemented in RustFS.
+# They are TEMPORARILY EXCLUDED and should move to implemented_tests.txt when done.
 #
 # Unimplemented features:
 # - Bucket Logging: Access logging

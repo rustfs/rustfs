@@ -63,16 +63,10 @@ enum AclPermission {
 }
 
 fn acl_permission_for_action(action: &Action) -> Option<(AclTarget, AclPermission)> {
-    match action {
-        Action::S3Action(S3Action::ListBucketAction) => Some((AclTarget::Bucket, AclPermission::Read)),
-        Action::S3Action(S3Action::PutObjectAction) => Some((AclTarget::Bucket, AclPermission::Write)),
-        Action::S3Action(S3Action::GetBucketAclAction) => Some((AclTarget::Bucket, AclPermission::ReadAcp)),
-        Action::S3Action(S3Action::PutBucketAclAction) => Some((AclTarget::Bucket, AclPermission::WriteAcp)),
-        Action::S3Action(S3Action::GetObjectAction) => Some((AclTarget::Object, AclPermission::Read)),
-        Action::S3Action(S3Action::GetObjectAclAction) => Some((AclTarget::Object, AclPermission::ReadAcp)),
-        Action::S3Action(S3Action::PutObjectAclAction) => Some((AclTarget::Object, AclPermission::WriteAcp)),
-        _ => None,
-    }
+    // MinIO-compatible behavior: ACL is not part of authorization decisions.
+    // Keep ACL API compatibility surface, but never gate/allow requests by ACL grants.
+    let _ = action;
+    None
 }
 
 fn permission_matches(grant_perm: &str, required: AclPermission) -> bool {
@@ -311,7 +305,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
-                // Run this early check in deny-only mode so ACL/IAM fallbacks can still grant access.
+                // Run this early check in deny-only mode so IAM fallback can still grant access.
                 is_owner: true,
                 account: &cred.access_key,
                 groups: &cred.groups,
@@ -467,7 +461,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
-                // Run this early check in deny-only mode so ACL checks are not bypassed.
+                // Run this early check in deny-only mode so later policy checks are not bypassed.
                 is_owner: true,
                 account: "",
                 groups: &None,
