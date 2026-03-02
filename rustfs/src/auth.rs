@@ -398,29 +398,6 @@ pub fn get_condition_values(
     region: Option<s3s::region::Region>,
     remote_addr: Option<std::net::SocketAddr>,
 ) -> HashMap<String, Vec<String>> {
-    get_condition_values_with_query(header, cred, version_id, region, remote_addr, None)
-}
-
-/// Get condition values for policy evaluation with optional query-string values.
-///
-/// # Arguments
-/// * `header` - HTTP headers of the request
-/// * `cred` - User credentials
-/// * `version_id` - Optional version ID of the object
-/// * `region` - Optional region/location constraint
-/// * `remote_addr` - Optional remote address of the connection
-/// * `query` - Optional request query string
-///
-/// # Returns
-/// * `HashMap<String, Vec<String>>` - Condition values for policy evaluation
-pub fn get_condition_values_with_query(
-    header: &HeaderMap,
-    cred: &Credentials,
-    version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
-    remote_addr: Option<std::net::SocketAddr>,
-    query: Option<&str>,
-) -> HashMap<String, Vec<String>> {
     let username = if cred.is_temp() || cred.is_service_account() {
         cred.parent_user.clone()
     } else {
@@ -450,8 +427,8 @@ pub fn get_condition_values_with_query(
     // Use provided version ID or empty string
     let vid = version_id.unwrap_or("");
 
-    // Determine auth type and signature version from headers and query
-    let (auth_type, signature_version) = determine_auth_type_and_version_with_query(header, query);
+    // Determine auth type and signature version from headers
+    let (auth_type, signature_version) = determine_auth_type_and_version(header);
 
     // Get TLS status from header
     let is_tls = header
@@ -605,16 +582,10 @@ pub fn get_condition_values_with_query(
 /// # Returns
 /// * `AuthType` - The determined authentication type
 ///
-#[allow(dead_code)]
 pub fn get_request_auth_type(header: &HeaderMap) -> AuthType {
-    get_request_auth_type_with_query(header, None)
-}
-
-#[allow(dead_code)]
-pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option<&str>) -> AuthType {
     if is_request_signature_v2(header) {
         AuthType::SignedV2
-    } else if is_request_presigned_signature_v2(header, query) {
+    } else if is_request_presigned_signature_v2(header) {
         AuthType::PresignedV2
     } else if is_request_sign_streaming_v4(header) {
         AuthType::StreamingSigned
@@ -624,7 +595,7 @@ pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option
         AuthType::StreamingUnsignedTrailer
     } else if is_request_signature_v4(header) {
         AuthType::Signed
-    } else if is_request_presigned_signature_v4_with_query(header, query) {
+    } else if is_request_presigned_signature_v4(header) {
         AuthType::Presigned
     } else if is_request_jwt(header) {
         AuthType::JWT
@@ -647,14 +618,8 @@ pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option
 /// # Returns
 /// * `(String, String)` - Tuple of auth type and signature version
 ///
-#[allow(dead_code)]
 fn determine_auth_type_and_version(header: &HeaderMap) -> (String, String) {
-    determine_auth_type_and_version_with_query(header, None)
-}
-
-#[allow(dead_code)]
-fn determine_auth_type_and_version_with_query(header: &HeaderMap, query: Option<&str>) -> (String, String) {
-    match get_request_auth_type_with_query(header, query) {
+    match get_request_auth_type(header) {
         AuthType::JWT => ("JWT".to_string(), String::new()),
         AuthType::SignedV2 => ("REST-HEADER".to_string(), "AWS2".to_string()),
         AuthType::PresignedV2 => ("REST-QUERY-STRING".to_string(), "AWS2".to_string()),
@@ -725,18 +690,11 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
 ///
 /// # Returns
 /// * `bool` - True if request has AWS PreSign Version '4', false otherwise
-#[allow(dead_code)]
 pub(crate) fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
-    is_request_presigned_signature_v4_with_query(header, None)
-}
-
-pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, query: Option<&str>) -> bool {
     if let Some(credential) = header.get(AMZ_CREDENTIAL) {
         return !credential.to_str().unwrap_or("").is_empty();
     }
-    query
-        .and_then(|query| get_query_param(query, "x-amz-credential"))
-        .is_some_and(|credential| !credential.is_empty())
+    false
 }
 
 /// Verify request has AWS PreSign Version '2'
@@ -746,13 +704,11 @@ pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, q
 ///
 /// # Returns
 /// * `bool` - True if request has AWS PreSign Version '2', false otherwise
-fn is_request_presigned_signature_v2(header: &HeaderMap, query: Option<&str>) -> bool {
+fn is_request_presigned_signature_v2(header: &HeaderMap) -> bool {
     if let Some(access_key) = header.get(AMZ_ACCESS_KEY_ID) {
         return !access_key.to_str().unwrap_or("").is_empty();
     }
-    query
-        .and_then(|query| get_query_param(query, "awsaccesskeyid"))
-        .is_some_and(|access_key| !access_key.is_empty())
+    false
 }
 
 /// Verify if request has AWS Post policy Signature Version '4'
@@ -1061,20 +1017,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_condition_values_with_presigned_query() {
-        let cred = create_test_credentials();
-        let headers = HeaderMap::new();
-        let uri: Uri = "https://example.com/?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"
-            .parse()
-            .unwrap();
-
-        let conditions = get_condition_values_with_query(&headers, &cred, None, None, None, uri.query());
-
-        assert_eq!(conditions.get("signatureversion"), Some(&vec!["AWS4-HMAC-SHA256".to_string()]));
-        assert_eq!(conditions.get("authType"), Some(&vec!["REST-QUERY-STRING".to_string()]));
-    }
-
-    #[test]
     fn test_get_condition_values_temp_user() {
         let cred = create_temp_credentials();
         let headers = HeaderMap::new();
@@ -1343,18 +1285,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_request_auth_type_presigned_v2_from_query() {
-        let headers = HeaderMap::new();
-        let uri: Uri = "https://example.com/?AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE&Signature=example&Expires=1672531200"
-            .parse()
-            .unwrap();
-
-        let auth_type = get_request_auth_type_with_query(&headers, uri.query());
-
-        assert_eq!(auth_type, AuthType::PresignedV2);
-    }
-
-    #[test]
     fn test_get_request_auth_type_presigned_v4() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1363,18 +1293,6 @@ mod tests {
         );
 
         let auth_type = get_request_auth_type(&headers);
-
-        assert_eq!(auth_type, AuthType::Presigned);
-    }
-
-    #[test]
-    fn test_get_request_auth_type_presigned_v4_from_query() {
-        let headers = HeaderMap::new();
-        let uri: Uri = "https://example.com/?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"
-            .parse()
-            .unwrap();
-
-        let auth_type = get_request_auth_type_with_query(&headers, uri.query());
 
         assert_eq!(auth_type, AuthType::Presigned);
     }

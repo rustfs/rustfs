@@ -19,7 +19,7 @@ use super::ecfs::{
     stored_acl_from_canned_object,
 };
 use super::options::get_opts;
-use crate::auth::{check_key_valid, get_condition_values_with_query, get_session_token};
+use crate::auth::{check_key_valid, get_condition_values, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
@@ -276,14 +276,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
-        let mut conditions = get_condition_values_with_query(
-            &req.headers,
-            cred,
-            req_info.version_id.as_deref(),
-            None,
-            remote_addr,
-            req.uri.query(),
-        );
+        let mut conditions = get_condition_values(&req.headers, cred, req_info.version_id.as_deref(), None, remote_addr);
         // Merge object tag conditions; extend existing values if the same key exists (e.g. from get_condition_values).
         if let Some(ref tags) = object_tag_conditions {
             for (k, v) in &tags.0 {
@@ -432,13 +425,12 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             }
         }
     } else {
-        let mut conditions = get_condition_values_with_query(
+        let mut conditions = get_condition_values(
             &req.headers,
             &rustfs_credentials::Credentials::default(),
             req_info.version_id.as_deref(),
             req.region.clone(),
             remote_addr,
-            req.uri.query(),
         );
         // Merge object tag conditions; extend existing values if the same key exists.
         if let Some(ref tags) = object_tag_conditions {

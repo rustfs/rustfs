@@ -26,7 +26,7 @@ use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_ha
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256_with_query, get_opts, put_opts,
+    filter_object_metadata, get_content_sha256, get_opts, put_opts,
 };
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{restore, select};
@@ -461,7 +461,7 @@ impl DefaultObjectUsecase {
             None
         };
 
-        let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
+        let mut sha256hex = get_content_sha256(&req.headers);
 
         if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
             let algorithm = CompressionAlgorithm::default();
@@ -3521,7 +3521,7 @@ impl DefaultObjectUsecase {
             None
         };
 
-        let sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
+        let sha256hex = get_content_sha256(&req.headers);
         let actual_size = size;
 
         let reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
