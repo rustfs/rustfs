@@ -124,10 +124,11 @@ mod tests {
             create_log_file(&dir, &format!("app.log.2024-01-0{i}"), 1024)?;
         }
 
-        // No size limit, keep_files = 3 → nothing to delete (5 > 3 but size == 0 limit).
         let cleaner = make_cleaner(dir.clone(), 3, 0);
         let (deleted, _) = cleaner.cleanup()?;
-        assert_eq!(deleted, 0, "keep_files prevents deletion when no size limit");
+
+        // Updated expectation: keep_files acts as a limit (ceiling), so excess files are deleted.
+        assert_eq!(deleted, 2, "keep_files should enforce a maximum file count");
         Ok(())
     }
 
