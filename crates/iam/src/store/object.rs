@@ -597,7 +597,7 @@ impl Store for ObjectStore {
     async fn delete_group_info(&self, name: &str) -> Result<()> {
         self.delete_iam_config(get_group_info_path(name)).await.map_err(|err| {
             if is_err_config_not_found(&err) {
-                Error::NoSuchPolicy
+                Error::NoSuchGroup(name.to_string())
             } else {
                 err
             }
@@ -607,7 +607,7 @@ impl Store for ObjectStore {
     async fn load_group(&self, name: &str, m: &mut HashMap<String, GroupInfo>) -> Result<()> {
         let u: GroupInfo = self.load_iam_config(get_group_info_path(name)).await.map_err(|err| {
             if is_err_config_not_found(&err) {
-                Error::NoSuchPolicy
+                Error::NoSuchGroup(name.to_string())
             } else {
                 err
             }
