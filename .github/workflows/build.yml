@@ -174,7 +174,7 @@ jobs:
             target: x86_64-unknown-linux-musl
             cross: false
             platform: linux
-            rustflags: '-C target-cpu=x86-64-v2'
+            rustflags: ''
           - os: ubicloud-standard-2
             target: aarch64-unknown-linux-musl
             cross: true
@@ -184,7 +184,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             cross: false
             platform: linux
-            rustflags: '-C target-cpu=x86-64-v2'
+            rustflags: ''
           - os: ubicloud-standard-2
             target: aarch64-unknown-linux-gnu
             cross: true
@@ -200,13 +200,13 @@ jobs:
             target: x86_64-apple-darwin
             cross: false
             platform: macos
-            rustflags: '-C target-cpu=x86-64-v2'
+            rustflags: ''
           # Windows builds (temporarily disabled)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
             platform: windows
-            rustflags: '-C target-cpu=x86-64-v2'
+            rustflags: ''
           #- os: windows-latest
           #  target: aarch64-pc-windows-msvc
           #  cross: true
