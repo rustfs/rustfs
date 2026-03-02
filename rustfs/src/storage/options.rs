@@ -44,8 +44,9 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::auth::AuthType;
-use crate::auth::get_request_auth_type;
-use crate::auth::is_request_presigned_signature_v4;
+use crate::auth::get_query_param;
+use crate::auth::get_request_auth_type_with_query;
+use crate::auth::is_request_presigned_signature_v4_with_query;
 
 const REPLICATION_REQUEST_TRUE: HeaderValue = HeaderValue::from_static("true");
 
@@ -580,13 +581,18 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn get_content_sha256(headers: &HeaderMap<HeaderValue>) -> Option<String> {
-    match get_request_auth_type(headers) {
+    get_content_sha256_with_query(headers, None)
+}
+
+pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> Option<String> {
+    match get_request_auth_type_with_query(headers, query) {
         AuthType::Presigned | AuthType::Signed => {
-            if skip_content_sha256_cksum(headers) {
+            if skip_content_sha256_cksum_with_query(headers, query) {
                 None
             } else {
-                Some(get_content_sha256_cksum(headers, ServiceType::S3))
+                Some(get_content_sha256_cksum_with_query(headers, query, ServiceType::S3))
             }
         }
         _ => None,
@@ -595,24 +601,21 @@ pub(crate) fn get_content_sha256(headers: &HeaderMap<HeaderValue>) -> Option<Str
 
 /// skip_content_sha256_cksum returns true if caller needs to skip
 /// payload checksum, false if not.
+#[allow(dead_code)]
 fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
-    let content_sha256 = if is_request_presigned_signature_v4(headers) {
-        // For presigned requests, check query params first, then headers
-        // Note: In a real implementation, you would need to check query parameters
-        // For now, we'll just check headers
-        headers.get(AMZ_CONTENT_SHA256)
-    } else {
-        headers.get(AMZ_CONTENT_SHA256)
-    };
+    skip_content_sha256_cksum_with_query(headers, None)
+}
 
-    // Skip if no header was set
+fn skip_content_sha256_cksum_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> bool {
+    let include_query_values = matches!(get_request_auth_type_with_query(headers, query), AuthType::Presigned);
+    let content_sha256 = get_content_sha256_value(headers, query, include_query_values);
+
+    // Skip if no checksum value was set in header/query for query-presigned requests.
     let Some(header_value) = content_sha256 else {
         return true;
     };
 
-    let Ok(value) = header_value.to_str() else {
-        return true;
-    };
+    let value = header_value;
 
     // If x-amz-content-sha256 is set and the value is not
     // 'UNSIGNED-PAYLOAD' we should validate the content sha256.
@@ -643,7 +646,11 @@ fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
 }
 
 /// Returns SHA256 for calculating canonical-request.
-fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: ServiceType) -> String {
+fn get_content_sha256_cksum_with_query(
+    headers: &HeaderMap<HeaderValue>,
+    query: Option<&str>,
+    service_type: ServiceType,
+) -> String {
     if service_type == ServiceType::STS {
         // For STS requests, we would need to read the body and calculate SHA256
         // This is a simplified implementation - in practice you'd need access to the request body
@@ -651,26 +658,52 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
         return "sts-body-sha256-placeholder".to_string();
     }
 
-    let (default_sha256_cksum, content_sha256) = if is_request_presigned_signature_v4(headers) {
+    let (default_sha256_cksum, content_sha256) = if is_request_presigned_signature_v4_with_query(headers, query) {
         // For a presigned request we look at the query param for sha256.
         // X-Amz-Content-Sha256, if not set in presigned requests, checksum
         // will default to 'UNSIGNED-PAYLOAD'.
-        (UNSIGNED_PAYLOAD.to_string(), headers.get(AMZ_CONTENT_SHA256))
+        (UNSIGNED_PAYLOAD.to_string(), get_content_sha256_value(headers, query, true))
     } else {
         // X-Amz-Content-Sha256, if not set in signed requests, checksum
         // will default to sha256([]byte("")).
-        (EMPTY_STRING_SHA256_HASH.to_string(), headers.get(AMZ_CONTENT_SHA256))
+        (
+            EMPTY_STRING_SHA256_HASH.to_string(),
+            headers
+                .get(AMZ_CONTENT_SHA256)
+                .and_then(|v| v.to_str().ok().map(str::to_owned)),
+        )
     };
 
     // We found 'X-Amz-Content-Sha256' return the captured value.
-    if let Some(header_value) = content_sha256
-        && let Ok(value) = header_value.to_str()
-    {
-        return value.to_string();
+    if let Some(header_value) = content_sha256 {
+        return header_value;
     }
 
     // We couldn't find 'X-Amz-Content-Sha256'.
     default_sha256_cksum
+}
+
+fn get_content_sha256_value(
+    headers: &HeaderMap<HeaderValue>,
+    query: Option<&str>,
+    include_query_for_presigned: bool,
+) -> Option<String> {
+    if include_query_for_presigned && is_request_presigned_signature_v4_with_query(headers, query) {
+        return query
+            .and_then(|q| get_query_param(q, "x-amz-content-sha256"))
+            .or_else(|| headers.get(AMZ_CONTENT_SHA256).and_then(|v| v.to_str().ok()))
+            .map(str::to_owned);
+    }
+
+    headers
+        .get(AMZ_CONTENT_SHA256)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+#[allow(dead_code)]
+fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: ServiceType) -> String {
+    get_content_sha256_cksum_with_query(headers, None, service_type)
 }
 
 #[cfg(test)]
