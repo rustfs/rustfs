@@ -40,6 +40,10 @@ mod quota_test;
 #[cfg(test)]
 mod bucket_policy_check_test;
 
+// Regression tests for Issue #2036: anonymous access with PublicAccessBlock
+#[cfg(test)]
+mod anonymous_access_test;
+
 // Special characters in path test modules
 #[cfg(test)]
 mod special_chars_test;

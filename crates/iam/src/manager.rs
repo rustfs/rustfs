@@ -1386,11 +1386,9 @@ where
 
         let user_group_memberships = self.cache.user_group_memberships.load();
         members.iter().for_each(|member| {
-            if let Some(m) = user_group_memberships.get(member) {
-                let mut m = m.clone();
-                m.insert(group.to_string());
-                Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
-            }
+            let mut m = user_group_memberships.get(member).cloned().unwrap_or_default();
+            m.insert(group.to_string());
+            Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
         });
 
         Ok(OffsetDateTime::now_utc())
@@ -1518,13 +1516,19 @@ where
             }
         }
 
-        let gi = self
-            .cache
-            .groups
-            .load()
-            .get(group)
-            .cloned()
-            .ok_or(Error::NoSuchGroup(group.to_string()))?;
+        let gi = if members.is_empty() {
+            // Reload from backend so we see latest members (e.g. after user was deleted elsewhere)
+            let mut m = HashMap::new();
+            self.api.load_group(group, &mut m).await?;
+            m.get(group).cloned().ok_or(Error::NoSuchGroup(group.to_string()))?
+        } else {
+            self.cache
+                .groups
+                .load()
+                .get(group)
+                .cloned()
+                .ok_or(Error::NoSuchGroup(group.to_string()))?
+        };
 
         if members.is_empty() && !gi.members.is_empty() {
             return Err(Error::GroupNotEmpty);
