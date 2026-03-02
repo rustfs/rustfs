@@ -277,10 +277,26 @@ impl SetDisks {
         quorum: usize,
     ) -> (Vec<Option<DiskStore>>, Option<OffsetDateTime>, Option<String>) {
         let mod_times = Self::list_object_modtimes(parts_metadata, errs);
-        let etags = Self::list_object_etags(parts_metadata, errs);
 
         let mod_time = Self::common_time(&mod_times, quorum);
-        let etag = Self::common_etag(&etags, quorum);
+
+        if mod_time.is_none() {
+            let etags = Self::list_object_etags(parts_metadata, errs);
+            let etag_op = Self::common_etag(&etags, quorum);
+            if let Some(etag) = etag_op {
+                let mut new_disk = vec![None; disks.len()];
+                for (i, etag_item) in etags.iter().enumerate() {
+                    if let Some(etag_item) = etag_item
+                        && etag_item == &etag
+                        && parts_metadata[i].is_valid()
+                    {
+                        new_disk[i].clone_from(&disks[i]);
+                    }
+                }
+
+                return (new_disk, None, Some(etag));
+            }
+        }
 
         let mut new_disk = vec![None; disks.len()];
 
@@ -290,7 +306,7 @@ impl SetDisks {
             }
         }
 
-        (new_disk, mod_time, etag)
+        (new_disk, mod_time, None)
     }
 
     pub(super) fn pick_valid_fileinfo(
@@ -403,8 +419,9 @@ impl SetDisks {
             if let Some(hash) = op_hash
                 && let Some(max_hash) = max_val
                 && hash == max_hash
+                && metas[i].is_valid()
             {
-                if metas[i].is_valid() && !found {
+                if !found {
                     found_fi = Some(metas[i].clone());
                     found = true;
                 }
@@ -422,7 +439,7 @@ impl SetDisks {
             let mut fi = found_fi.unwrap();
 
             for (val, &count) in &valid_obj_map {
-                if count > quorum {
+                if count >= quorum {
                     fi.mod_time = val.mod_time;
                     fi.num_versions = val.num_versions;
                     fi.is_latest = val.mod_time.is_none();
