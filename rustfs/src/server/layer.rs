@@ -343,6 +343,29 @@ pub struct ConditionalCorsService<S> {
     cors_origins: Arc<Option<String>>,
 }
 
+async fn resolve_s3_options_cors_headers(bucket: &str, request_headers: &HeaderMap) -> Option<HeaderMap> {
+    apply_cors_headers(bucket, &http::Method::OPTIONS, request_headers).await
+}
+
+fn clear_cors_response_headers(headers: &mut HeaderMap) {
+    headers.remove(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN);
+    headers.remove(cors::response::ACCESS_CONTROL_ALLOW_METHODS);
+    headers.remove(cors::response::ACCESS_CONTROL_ALLOW_HEADERS);
+    headers.remove(cors::response::ACCESS_CONTROL_EXPOSE_HEADERS);
+    headers.remove(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS);
+    headers.remove(cors::response::ACCESS_CONTROL_MAX_AGE);
+}
+
+fn apply_bucket_cors_result(response_headers: &mut HeaderMap, bucket_cors_headers: &HeaderMap) {
+    // Bucket-level CORS is authoritative for S3 object/bucket paths.
+    // Clear any previously-populated CORS response headers (e.g. generic/system defaults),
+    // then apply the evaluated bucket result (which may be intentionally empty).
+    clear_cors_response_headers(response_headers);
+    for (key, value) in bucket_cors_headers.iter() {
+        response_headers.insert(key, value.clone());
+    }
+}
+
 impl<S, ResBody> Service<HttpRequest<Incoming>> for ConditionalCorsService<S>
 where
     S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
@@ -364,12 +387,32 @@ where
         let request_headers = req.headers().clone();
         let cors_origins = self.cors_origins.clone();
         let is_s3 = ConditionalCorsLayer::is_s3_path(&path);
+        let is_root = path == "/";
 
         if method == Method::OPTIONS {
+            let has_acrm = request_headers.contains_key(cors::request::ACCESS_CONTROL_REQUEST_METHOD);
+
+            if is_root {
+                return Box::pin(async move {
+                    if !has_acrm || !request_headers.contains_key(cors::standard::ORIGIN) {
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(ResBody::default())
+                            .unwrap());
+                    }
+
+                    let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                    let cors_layer = ConditionalCorsLayer {
+                        cors_origins: (*cors_origins).clone(),
+                    };
+                    cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                    Ok(response)
+                });
+            }
+
             if is_s3 {
                 let path_trimmed = path.trim_start_matches('/');
                 let bucket = path_trimmed.split('/').next().unwrap_or("").to_string();
-                let has_acrm = request_headers.contains_key(cors::request::ACCESS_CONTROL_REQUEST_METHOD);
 
                 return Box::pin(async move {
                     if !has_acrm || !request_headers.contains_key(cors::standard::ORIGIN) {
@@ -379,20 +422,27 @@ where
                             .unwrap());
                     }
 
-                    if !bucket.is_empty()
-                        && let Some(cors_headers) = apply_cors_headers(&bucket, &method, &request_headers).await
-                    {
-                        let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
-                        for (key, value) in cors_headers.iter() {
-                            response.headers_mut().insert(key, value.clone());
+                    let cors_layer = ConditionalCorsLayer {
+                        cors_origins: (*cors_origins).clone(),
+                    };
+
+                    if let Some(cors_headers) = resolve_s3_options_cors_headers(&bucket, &request_headers).await {
+                        let cors_allowed = cors_headers.contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN);
+                        let status = if cors_allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
+
+                        let mut response = Response::builder().status(status).body(ResBody::default()).unwrap();
+                        if cors_allowed {
+                            for (key, value) in cors_headers.iter() {
+                                response.headers_mut().insert(key, value.clone());
+                            }
                         }
                         return Ok(response);
                     }
 
-                    Ok(Response::builder()
-                        .status(StatusCode::FORBIDDEN)
-                        .body(ResBody::default())
-                        .unwrap())
+                    // No bucket-level CORS config: fall back to global/default CORS behavior.
+                    let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                    cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                    Ok(response)
                 });
             }
 
@@ -415,19 +465,30 @@ where
             if request_headers.contains_key(cors::standard::ORIGIN)
                 && !response.headers().contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN)
             {
+                let cors_layer = ConditionalCorsLayer {
+                    cors_origins: (*cors_origins).clone(),
+                };
+
                 if is_s3 {
                     let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
-                    if !bucket.is_empty()
-                        && let Some(cors_headers) = apply_cors_headers(bucket, &method, &request_headers).await
-                    {
-                        for (key, value) in cors_headers.iter() {
-                            response.headers_mut().insert(key, value.clone());
+                    if path == "/" {
+                        cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                    } else if !bucket.is_empty() {
+                        match apply_cors_headers(bucket, &method, &request_headers).await {
+                            Some(bucket_cors_headers) => {
+                                // Bucket-level CORS is authoritative when configured, even if it
+                                // intentionally resolves to an empty header set (no rule match).
+                                apply_bucket_cors_result(response.headers_mut(), &bucket_cors_headers);
+                            }
+                            None => {
+                                // No bucket-level CORS config: fall back to global/default policy.
+                                cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                            }
                         }
+                    } else {
+                        cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
                     }
                 } else {
-                    let cors_layer = ConditionalCorsLayer {
-                        cors_origins: (*cors_origins).clone(),
-                    };
                     cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
                 }
             }
@@ -531,5 +592,74 @@ mod tests {
             resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "https://allowed.com"
         );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_s3_options_cors_headers_no_headers_without_match() {
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("origin", "https://example.com".parse().unwrap());
+        req_headers.insert("access-control-request-method", "GET".parse().unwrap());
+
+        let headers = resolve_s3_options_cors_headers("bbb", &req_headers).await;
+        assert!(headers.is_none());
+    }
+
+    #[test]
+    fn test_apply_bucket_cors_result_clears_existing_cors_headers_with_empty_result() {
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("https://foo.example"),
+        );
+        response_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD"),
+        );
+        response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"));
+        response_headers.insert(cors::response::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("etag"));
+        response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
+        response_headers.insert(cors::response::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("3600"));
+
+        let bucket_cors_headers = HeaderMap::new();
+        apply_bucket_cors_result(&mut response_headers, &bucket_cors_headers);
+
+        assert!(response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).is_none());
+        assert!(response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_HEADERS).is_none());
+        assert!(response_headers.get(cors::response::ACCESS_CONTROL_EXPOSE_HEADERS).is_none());
+        assert!(
+            response_headers
+                .get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
+        );
+        assert!(response_headers.get(cors::response::ACCESS_CONTROL_MAX_AGE).is_none());
+    }
+
+    #[test]
+    fn test_apply_bucket_cors_result_replaces_existing_cors_headers() {
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("https://foo.example"),
+        );
+        response_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD"),
+        );
+
+        let mut bucket_cors_headers = HeaderMap::new();
+        bucket_cors_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("https://allowed.example"),
+        );
+        bucket_cors_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET"));
+
+        apply_bucket_cors_result(&mut response_headers, &bucket_cors_headers);
+
+        assert_eq!(
+            response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://allowed.example"
+        );
+        assert_eq!(response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).unwrap(), "GET");
     }
 }

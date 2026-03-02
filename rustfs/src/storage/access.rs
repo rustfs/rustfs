@@ -90,7 +90,7 @@ fn permission_matches(grant_perm: &str, required: AclPermission) -> bool {
 
 fn acl_allows(
     acl: &StoredAcl,
-    user_id: Option<&str>,
+    user_ids: &[&str],
     is_authenticated: bool,
     required: AclPermission,
     ignore_public_acls: bool,
@@ -102,7 +102,9 @@ fn acl_allows(
 
         match grant.grantee.grantee_type.as_str() {
             "CanonicalUser" => {
-                if user_id.is_some_and(|id| grant.grantee.id.as_deref() == Some(id)) {
+                if let Some(grant_id) = grant.grantee.id.as_deref()
+                    && user_ids.contains(&grant_id)
+                {
                     return true;
                 }
             }
@@ -190,8 +192,14 @@ async fn check_acl_access<T>(req: &S3Request<T>, req_info: &ReqInfo, action: &Ac
         Err(_) => false,
     };
 
-    let user_id = req_info.cred.as_ref().map(|cred| cred.access_key.as_str());
-    let is_authenticated = user_id.is_some();
+    let mut user_ids = Vec::new();
+    if let Some(cred) = req_info.cred.as_ref() {
+        user_ids.push(cred.access_key.as_str());
+        if (cred.is_temp() || cred.is_service_account()) && !cred.parent_user.is_empty() && cred.parent_user != cred.access_key {
+            user_ids.push(cred.parent_user.as_str());
+        }
+    }
+    let is_authenticated = !user_ids.is_empty();
 
     let acl = match target {
         AclTarget::Bucket => load_bucket_acl(bucket).await?,
@@ -204,7 +212,7 @@ async fn check_acl_access<T>(req: &S3Request<T>, req_info: &ReqInfo, action: &Ac
         }
     };
 
-    Ok(acl_allows(&acl, user_id, is_authenticated, permission, ignore_public_acls))
+    Ok(acl_allows(&acl, &user_ids, is_authenticated, permission, ignore_public_acls))
 }
 
 pub(crate) fn req_info_ref<T>(req: &S3Request<T>) -> S3Result<&ReqInfo> {
@@ -1652,6 +1660,7 @@ impl S3Access for FS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::ecfs::{StoredGrant, StoredGrantee};
     use std::collections::HashMap;
 
     #[test]
@@ -1697,5 +1706,60 @@ mod tests {
     async fn test_bucket_policy_uses_existing_object_tag_no_policy() {
         let result = bucket_policy_uses_existing_object_tag("test-bucket-no-policy-xyz-absent").await;
         assert!(!result, "bucket with no policy should not use ExistingObjectTag");
+    }
+
+    #[test]
+    fn test_acl_allows_parent_user_in_temporary_credential_path() {
+        let acl = StoredAcl {
+            grants: vec![StoredGrant {
+                grantee: StoredGrantee {
+                    grantee_type: "CanonicalUser".to_string(),
+                    id: Some("parent-user".to_string()),
+                    ..Default::default()
+                },
+                permission: "READ".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let user_ids: Vec<&str> = vec!["temp-user", "parent-user"];
+        assert!(acl_allows(&acl, &user_ids, true, AclPermission::Read, false));
+    }
+
+    #[test]
+    fn test_acl_allows_parent_user_required_when_current_user_has_no_grant() {
+        let acl = StoredAcl {
+            grants: vec![StoredGrant {
+                grantee: StoredGrantee {
+                    grantee_type: "CanonicalUser".to_string(),
+                    id: Some("parent-user".to_string()),
+                    ..Default::default()
+                },
+                permission: "READ".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let user_ids: Vec<&str> = vec!["temp-user"];
+        assert!(!acl_allows(&acl, &user_ids, true, AclPermission::Read, false));
+    }
+
+    #[test]
+    fn test_acl_allows_ignores_public_acls_when_blocked() {
+        let acl = StoredAcl {
+            grants: vec![StoredGrant {
+                grantee: StoredGrantee {
+                    grantee_type: "Group".to_string(),
+                    uri: Some(ACL_GROUP_ALL_USERS.to_string()),
+                    ..Default::default()
+                },
+                permission: "READ".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let user_ids: Vec<&str> = vec!["temp-user"];
+        assert!(!acl_allows(&acl, &user_ids, true, AclPermission::Read, true));
+        assert!(acl_allows(&acl, &user_ids, true, AclPermission::Read, false));
     }
 }

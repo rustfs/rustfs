@@ -15,6 +15,7 @@
 #[cfg(test)]
 mod tests {
     use crate::config::workload_profiles::WorkloadProfile;
+    use crate::server::cors;
     use crate::storage::ecfs::FS;
     use crate::storage::ecfs::RUSTFS_OWNER;
     use crate::storage::{
@@ -25,13 +26,14 @@ mod tests {
     };
     use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
+    use rustfs_ecstore::bucket::{metadata::BucketMetadata, metadata_sys};
     use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
     use rustfs_ecstore::store_api::ObjectInfo;
     use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, RESERVED_METADATA_PREFIX_LOWER};
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        Delimiter, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
-        ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
+        CORSConfiguration, CORSRule, Delimiter, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+        ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
     };
     use s3s::{S3Error, S3ErrorCode, s3_error};
     use time::OffsetDateTime;
@@ -1124,6 +1126,84 @@ mod tests {
         let _result = apply_cors_headers("non-existent-bucket-for-testing", &method, &headers).await;
         // Result depends on whether bucket exists and has CORS config
         // This is expected behavior - we just verify it doesn't panic
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_unmatched_origin_with_cors_config() {
+        if metadata_sys::get_global_bucket_metadata_sys().is_none() {
+            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+            return;
+        }
+
+        let bucket = "test-bucket-no-match-cors";
+        let mut bm = BucketMetadata::new(bucket);
+        bm.cors_config = Some(CORSConfiguration {
+            cors_rules: vec![CORSRule {
+                allowed_headers: Some(vec!["*".to_string()]),
+                allowed_methods: vec!["GET".to_string()],
+                allowed_origins: vec!["https://allowed.example.com".to_string()],
+                expose_headers: None,
+                id: Some("non-match-origin".to_string()),
+                max_age_seconds: None,
+            }],
+        });
+        metadata_sys::set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(cors::standard::ORIGIN, "https://disallowed.example.com".parse().unwrap());
+
+        let result = apply_cors_headers(bucket, &http::Method::GET, &headers).await;
+        assert!(
+            result.is_some(),
+            "Expected Some empty headers when bucket has CORS config but origin does not match any rule"
+        );
+        let result = result.unwrap();
+        assert!(result.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(result.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).is_none());
+
+        metadata_sys::set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_credentialed_request_with_wildcard_origin() {
+        if metadata_sys::get_global_bucket_metadata_sys().is_none() {
+            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+            return;
+        }
+
+        let bucket = "test-bucket-credentialed-cors";
+        let mut bm = BucketMetadata::new(bucket);
+        bm.cors_config = Some(CORSConfiguration {
+            cors_rules: vec![CORSRule {
+                allowed_headers: Some(vec!["*".to_string()]),
+                allowed_methods: vec!["GET".to_string()],
+                allowed_origins: vec!["*".to_string()],
+                expose_headers: None,
+                id: Some("credentialed-unit".to_string()),
+                max_age_seconds: None,
+            }],
+        });
+        metadata_sys::set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(cors::standard::ORIGIN, "https://console.localhost".parse().unwrap());
+        headers.insert(cors::request::ACCESS_CONTROL_REQUEST_METHOD, "GET".parse().unwrap());
+        headers.insert(cors::request::ACCESS_CONTROL_REQUEST_HEADERS, "x-amz-content-sha256".parse().unwrap());
+        headers.insert(http::header::AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=test/20260302/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256, Signature=abc".parse().unwrap());
+
+        let result = apply_cors_headers(bucket, &http::Method::OPTIONS, &headers).await.unwrap();
+        assert_eq!(
+            result.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://console.localhost",
+        );
+        assert_eq!(result.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(), "true");
+        assert_eq!(result.get(cors::standard::VARY).unwrap(), "Origin");
+
+        metadata_sys::set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

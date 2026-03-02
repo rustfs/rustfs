@@ -148,6 +148,17 @@ fn apply_trailing_checksums(
     }
 }
 
+fn object_acl_owner_from_credential(cred: &rustfs_credentials::Credentials) -> StoredOwner {
+    // STS/service-account credentials are session-scoped and rotate access keys.
+    // Use parent identity as ACL owner to keep object ownership stable across sessions.
+    let owner_access_key = if (cred.is_temp() || cred.is_service_account()) && !cred.parent_user.is_empty() {
+        cred.parent_user.as_str()
+    } else {
+        cred.access_key.as_str()
+    };
+    owner_from_access_key(owner_access_key)
+}
+
 #[derive(Default)]
 struct PutObjectChecksums {
     crc32: Option<String>,
@@ -411,7 +422,7 @@ impl DefaultObjectUsecase {
             .extensions
             .get::<ReqInfo>()
             .and_then(|info| info.cred.as_ref())
-            .map(|cred| owner_from_access_key(&cred.access_key))
+            .map(object_acl_owner_from_credential)
             .unwrap_or_else(default_owner);
         let bucket_owner = default_owner();
         let mut stored_acl = stored_acl_from_grant_headers(
@@ -3866,6 +3877,33 @@ mod tests {
 
         assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
         assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+    }
+
+    #[test]
+    fn object_acl_owner_from_temp_credential_uses_parent_user() {
+        let cred = rustfs_credentials::Credentials {
+            access_key: "STS-TEMP-ACCESS-KEY".to_string(),
+            session_token: "session-token".to_string(),
+            parent_user: "rustfsadmin".to_string(),
+            ..Default::default()
+        };
+
+        let owner = object_acl_owner_from_credential(&cred);
+        assert_eq!(owner.id, "rustfsadmin");
+        assert_eq!(owner.display_name, "RustFS Tester");
+    }
+
+    #[test]
+    fn object_acl_owner_from_regular_credential_uses_access_key() {
+        let cred = rustfs_credentials::Credentials {
+            access_key: "REGULAR-ACCESS-KEY".to_string(),
+            parent_user: "rustfsadmin".to_string(),
+            ..Default::default()
+        };
+
+        let owner = object_acl_owner_from_credential(&cred);
+        assert_eq!(owner.id, "REGULAR-ACCESS-KEY");
+        assert_eq!(owner.display_name, "REGULAR-ACCESS-KEY");
     }
 
     #[test]

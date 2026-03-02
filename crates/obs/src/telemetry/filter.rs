@@ -22,10 +22,11 @@ use tracing_subscriber::EnvFilter;
 
 /// Build an `EnvFilter` from the given log level string.
 ///
-/// If the `RUST_LOG` environment variable is set, it takes precedence over the
-/// provided `logger_level`. For non-verbose levels (`info`, `warn`, `error`),
-/// noisy internal crates (`hyper`, `tonic`, `h2`, `reqwest`, `tower`) are
-/// automatically silenced to reduce log noise.
+/// If `default_level` is provided, it is used directly. Otherwise, the
+/// `RUST_LOG` environment variable takes precedence over `logger_level`.
+/// For non-verbose levels (`info`, `warn`, `error`), noisy internal crates
+/// (`hyper`, `tonic`, `h2`, `reqwest`, `tower`) are automatically silenced to
+/// reduce log noise.
 ///
 /// # Arguments
 /// * `logger_level` - The desired log level string (e.g., `"info"`, `"debug"`).
@@ -37,11 +38,13 @@ use tracing_subscriber::EnvFilter;
 /// A configured `EnvFilter` ready to be attached to a `tracing_subscriber` registry.
 pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilter {
     let level = default_level.unwrap_or(logger_level);
-    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let mut filter = default_level
+        .map(EnvFilter::new)
+        .unwrap_or_else(|| EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)));
 
     // Suppress chatty infrastructure crates unless the operator explicitly
     // requests trace/debug output.
-    if !matches!(logger_level, "trace" | "debug") {
+    if !matches!(level, "trace" | "debug") {
         let directives: SmallVec<[&str; 5]> = smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower"];
         for directive in directives {
             filter = filter.add_directive(format!("{directive}=off").parse().unwrap());
@@ -82,7 +85,7 @@ mod tests {
     #[test]
     fn test_build_env_filter_debug_no_suppression() {
         // For debug level, our code does NOT inject any OFF directives.
-        let filter = build_env_filter("debug", None);
+        let filter = build_env_filter("info", Some("debug"));
         let dbg = format!("{filter:?}");
         // Verify the filter builds without panicking and contains the debug level.
         assert!(!dbg.is_empty());

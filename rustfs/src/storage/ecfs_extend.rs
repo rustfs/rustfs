@@ -648,6 +648,13 @@ pub(crate) fn needs_cors_processing(headers: &HeaderMap) -> bool {
 pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, headers: &HeaderMap) -> Option<HeaderMap> {
     use http::HeaderValue;
 
+    fn is_credentialed_request(headers: &HeaderMap) -> bool {
+        headers.contains_key(http::header::AUTHORIZATION)
+            || headers.contains_key(http::header::COOKIE)
+            || headers.contains_key("x-amz-security-token")
+            || headers.contains_key("x-amz-content-sha256")
+    }
+
     // Get Origin header from request
     let origin = headers.get(cors::standard::ORIGIN)?.to_str().ok()?;
 
@@ -659,14 +666,14 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
 
     // Early return if no CORS rules configured
     if cors_config.cors_rules.is_empty() {
-        return None;
+        return Some(HeaderMap::new());
     }
 
     // Check if method is supported and get its string representation
     const SUPPORTED_METHODS: &[&str] = &["GET", "PUT", "POST", "DELETE", "HEAD", "OPTIONS"];
     let method_str = method.as_str();
     if !SUPPORTED_METHODS.contains(&method_str) {
-        return None;
+        return Some(HeaderMap::new());
     }
 
     // Use Access-Control-Request-Method if present (for preflight and non-preflight requests),
@@ -740,17 +747,32 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         let mut response_headers = HeaderMap::new();
 
         // Access-Control-Allow-Origin
-        // If origin is "*", use "*", otherwise echo back the origin
+        // Credentials mode + wildcard allow list requires echoing the request origin.
+        // Browsers reject `Access-Control-Allow-Origin: *` with `credentials: include`.
         let has_wildcard_origin = rule.allowed_origins.iter().any(|o| o == "*");
+        let credentialed_request = is_credentialed_request(headers);
+
         if has_wildcard_origin {
-            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+            if credentialed_request {
+                if let Ok(origin_value) = HeaderValue::from_str(origin) {
+                    response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
+                }
+            } else {
+                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+            }
         } else if let Ok(origin_value) = HeaderValue::from_str(origin) {
             response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
         }
 
-        // Vary: Origin (required for caching, except when using wildcard)
-        if !has_wildcard_origin {
+        // Vary: Origin when origin is reflected (credentialed wildcard requests).
+        // This prevents proxy/browser caches from reusing CORS headers across different origins.
+        if has_wildcard_origin && credentialed_request {
             response_headers.insert(cors::standard::VARY, HeaderValue::from_static("Origin"));
+        }
+
+        // Credentials mode requires explicit allow-credentials.
+        if credentialed_request {
+            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
         }
 
         // Access-Control-Allow-Methods (required for preflight)
@@ -788,7 +810,7 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         return Some(response_headers);
     }
 
-    None // No matching rule found
+    Some(HeaderMap::new()) // No matching rule found
 }
 /// Check if an origin matches a pattern (supports wildcards like https://*.example.com)
 pub(crate) fn matches_origin_pattern(pattern: &str, origin: &str) -> bool {
