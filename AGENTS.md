@@ -71,8 +71,10 @@ Co-locate unit tests with their modules and give behavior-led names. Integration
 
 ## Environment Variables
 
-- `RUSTFS_ENABLE_SCANNER` - Enable/disable background data scanner (default: true)
-- `RUSTFS_ENABLE_HEAL` - Enable/disable auto-heal functionality (default: true)
+- Global configuration environment variables must use flat `RUSTFS_*` names (no module segments), such as `RUSTFS_REGION`, `RUSTFS_ADDRESS`, `RUSTFS_VOLUMES`, and `RUSTFS_LICENSE`.
+- `RUSTFS_SCANNER_ENABLED` - Enable/disable background data scanner (default: true)
+- `RUSTFS_HEAL_ENABLED` - Enable/disable auto-heal functionality (default: true)
+- Deprecated aliases (for pre-beta compatibility) are documented in [the config module README](crates/config/README.md#environment-variable-naming-conventions) and must log warnings when used.
 - For KMS tests: `NO_PROXY=127.0.0.1,localhost` and clear proxy environment variables
 
 ## Commit & Pull Request Guidelines
