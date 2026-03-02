@@ -37,7 +37,7 @@
 //!     PathBuf::from("/var/log/rustfs"),
 //!     "rustfs.log.".to_string(),
 //!     FileMatchMode::Prefix,
-//!     10,              // keep_count
+//!     10,              // keep_files
 //!     2 * 1024 * 1024 * 1024, // max_total_size_bytes (2 GiB)
 //!     0,               // max_single_file_size_bytes (unlimited)
 //!     true,            // compress_old_files
@@ -106,7 +106,7 @@ mod tests {
         create_log_file(&dir, "app.log.2024-01-03", 1024)?;
         create_log_file(&dir, "other.log", 1024)?; // not managed
 
-        // Total managed = 3 072 bytes; limit = 2 048; keep_count = 2 → must delete 1.
+        // Total managed = 3 072 bytes; limit = 2 048; keep_files = 2 → must delete 1.
         let cleaner = make_cleaner(dir.clone(), 2, 2048);
         let (deleted, freed) = cleaner.cleanup()?;
 
@@ -116,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_respects_keep_count() -> std::io::Result<()> {
+    fn test_cleanup_respects_keep_files() -> std::io::Result<()> {
         let tmp = TempDir::new()?;
         let dir = tmp.path().to_path_buf();
 
@@ -124,10 +124,11 @@ mod tests {
             create_log_file(&dir, &format!("app.log.2024-01-0{i}"), 1024)?;
         }
 
-        // No size limit, keep_count = 3 → nothing to delete (5 > 3 but size == 0 limit).
         let cleaner = make_cleaner(dir.clone(), 3, 0);
         let (deleted, _) = cleaner.cleanup()?;
-        assert_eq!(deleted, 0, "keep_count prevents deletion when no size limit");
+
+        // Updated expectation: keep_files acts as a limit (ceiling), so excess files are deleted.
+        assert_eq!(deleted, 2, "keep_files should enforce a maximum file count");
         Ok(())
     }
 

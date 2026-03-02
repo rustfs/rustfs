@@ -21,7 +21,8 @@ use crate::storage::ecfs::RUSTFS_OWNER;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
-    copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256, parse_copy_source_range, put_opts,
+    copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, parse_copy_source_range,
+    put_opts,
 };
 use crate::storage::*;
 use bytes::Bytes;
@@ -615,7 +616,7 @@ impl DefaultMultipartUsecase {
             None
         };
 
-        let mut sha256hex = get_content_sha256(&req.headers);
+        let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
         if is_compressible {
             let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;

@@ -66,7 +66,7 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
 #export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
-export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
+export RUSTFS_OBS_ENVIRONMENT=develop # Environment name development, staging, production
 export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
 export RUSTFS_OBS_LOG_STDOUT_ENABLED=true # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
@@ -178,9 +178,9 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 
 #export RUSTFS_REGION="us-east-1"
 
-export RUSTFS_ENABLE_SCANNER=true
+export RUSTFS_SCANNER_ENABLED=true
 
-export RUSTFS_ENABLE_HEAL=true
+export RUSTFS_HEAL_ENABLED=true
 
 # Object cache configuration
 export RUSTFS_OBJECT_CACHE_ENABLE=true

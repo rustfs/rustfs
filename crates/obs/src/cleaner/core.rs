@@ -47,7 +47,7 @@ pub struct LogCleaner {
     pub(super) match_mode: FileMatchMode,
     /// The cleaner will never delete files if doing so would leave fewer than
     /// this many files in the directory.
-    pub(super) keep_count: usize,
+    pub(super) keep_files: usize,
     /// Hard ceiling on the total bytes of all managed files; `0` = no limit.
     pub(super) max_total_size_bytes: u64,
     /// Hard ceiling on a single file's size; `0` = no per-file limit.
@@ -81,7 +81,7 @@ impl LogCleaner {
         log_dir: PathBuf,
         file_pattern: String,
         match_mode: FileMatchMode,
-        keep_count: usize,
+        keep_files: usize,
         max_total_size_bytes: u64,
         max_single_file_size_bytes: u64,
         compress_old_files: bool,
@@ -101,7 +101,7 @@ impl LogCleaner {
             log_dir,
             file_pattern,
             match_mode,
-            keep_count,
+            keep_files,
             max_total_size_bytes,
             max_single_file_size_bytes,
             compress_old_files,
@@ -207,7 +207,7 @@ impl LogCleaner {
     /// Choose which files from `files` (sorted oldest-first) should be deleted or rotated.
     ///
     /// The algorithm respects three constraints in order:
-    /// 1. Always keep at least `keep_count` files.
+    /// 1. Always keep at least `keep_files` files.
     /// 2. Delete old files while the total size exceeds `max_total_size_bytes`.
     /// 3. Delete any file whose individual size exceeds `max_single_file_size_bytes`.
     ///
@@ -226,26 +226,19 @@ impl LogCleaner {
         // We will protect this file from size-based deletion.
         let active_file_idx = files.len() - 1;
 
-        // The number of files we are allowed to delete.
-        // Any file with index >= max_deletable_count is protected by keep_count.
-        let max_deletable_count = files.len().saturating_sub(self.keep_count);
+        // Calculate how many files we *must* delete to satisfy keep_files.
+        let must_delete_count = files.len().saturating_sub(self.keep_files);
 
         let mut current_size = total_size;
 
         for (idx, file) in files.iter().enumerate() {
-            // If we are in the protected range, we stop deleting.
-            if idx >= max_deletable_count {
-                // However, if the active file is too large, we might rotate it.
-                if idx == active_file_idx {
-                    let over_single = self.max_single_file_size_bytes > 0 && file.size > self.max_single_file_size_bytes;
-                    if over_single {
-                        to_rotate = Some(file.clone());
-                    }
-                }
+            // Condition 1: Enforce keep_files.
+            // If we are in the range of files that exceed the count limit, delete them.
+            if idx < must_delete_count {
+                current_size = current_size.saturating_sub(file.size);
+                to_delete.push(file.clone());
                 continue;
             }
-
-            // We are in the deletable range. Check if we *should* delete.
 
             // Condition 2: Enforce max_total_size_bytes.
             let over_total = self.max_total_size_bytes > 0 && current_size > self.max_total_size_bytes;
