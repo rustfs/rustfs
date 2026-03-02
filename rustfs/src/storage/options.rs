@@ -607,9 +607,13 @@ fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
 }
 
 fn skip_content_sha256_cksum_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> bool {
-    let content_sha256 = get_content_sha256_value(headers, query, false);
+    let include_query_values = matches!(
+        get_request_auth_type_with_query(headers, query),
+        AuthType::Presigned
+    );
+    let content_sha256 = get_content_sha256_value(headers, query, include_query_values);
 
-    // Skip if no header was set
+    // Skip if no checksum value was set in header/query for query-presigned requests.
     let Some(header_value) = content_sha256 else {
         return true;
     };
