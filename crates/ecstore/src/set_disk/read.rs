@@ -658,7 +658,7 @@ impl SetDisks {
                     read_offset,
                     till_offset,
                     erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256,
+                    HashAlgorithm::HighwayHash256S,
                 )
                 .await
                 {

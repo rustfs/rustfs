@@ -419,7 +419,7 @@ impl SetDisks {
                                             ]),
                                             erasure.shard_file_size(part.size as i64),
                                             erasure.shard_size(),
-                                            HashAlgorithm::HighwayHash256,
+                                            HashAlgorithm::HighwayHash256S,
                                         )
                                         .await
                                         {

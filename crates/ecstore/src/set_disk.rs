@@ -615,7 +615,7 @@ impl ObjectIO for SetDisks {
                     &tmp_object,
                     erasure.shard_file_size(data.size()),
                     erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256,
+                    HashAlgorithm::HighwayHash256S,
                 )
                 .await
                 {
@@ -1962,7 +1962,7 @@ impl StorageAPI for SetDisks {
                     &tmp_part_path,
                     erasure.shard_file_size(data.size()),
                     erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256,
+                    HashAlgorithm::HighwayHash256S,
                 )
                 .await
                 {
