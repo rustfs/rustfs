@@ -49,9 +49,13 @@ use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
+#[cfg(unix)]
+use pyroscope::PyroscopeAgent;
+#[cfg(unix)]
+use pyroscope::pyroscope::PyroscopeAgentRunning;
 use rustfs_config::{
     APP_NAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED,
-    DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
+    DEFAULT_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
 use std::{io::IsTerminal, time::Duration};
 use tracing::info;
@@ -137,6 +141,9 @@ pub(super) fn init_observability_http(
     // ── Logger provider (HTTP) ────────────────────────────────────────────────
     let logger_provider = build_logger_provider(&log_ep, config, res, use_stdout)?;
 
+    #[cfg(unix)]
+    let profiling_agent = init_profiler(config);
+
     // ── Tracing subscriber registry ───────────────────────────────────────────
     // Build an optional stdout formatting layer. When `log_stdout_enabled` is
     // false the field is `None` and tracing-subscriber will skip it.
@@ -188,6 +195,8 @@ pub(super) fn init_observability_http(
         tracer_provider,
         meter_provider,
         logger_provider,
+        #[cfg(unix)]
+        profiling_agent,
         tracing_guard: None,
         stdout_guard: None,
         cleanup_handle: None,
@@ -307,6 +316,46 @@ fn build_logger_provider(
         builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
     }
     Ok(Some(builder.build()))
+}
+
+/// Starts the Pyroscope continuous profiling agent if `ENV_OBS_PROFILING_ENDPOINT` is set.
+/// No-op and returns None on non-unix platforms.
+#[cfg(unix)]
+fn init_profiler(config: &OtelConfig) -> Option<PyroscopeAgent<PyroscopeAgentRunning>> {
+    use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
+    use pyroscope::pyroscope::PyroscopeAgentBuilder;
+    use rustfs_config::VERSION;
+
+    if !config
+        .profiling_export_enabled
+        .unwrap_or(DEFAULT_OBS_PROFILING_EXPORT_ENABLED)
+    {
+        return None;
+    }
+
+    let endpoint = config.profiling_endpoint.as_ref()?.as_str();
+    if endpoint.is_empty() {
+        return None;
+    }
+
+    // Configure Pyroscope Agent
+    let backend = pprof_backend(PprofConfig::default(), BackendConfig::default());
+    let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
+    let version = config.service_version.as_deref().unwrap_or(VERSION);
+    let sample_rate = 100; // 100 Hz
+
+    let agent = PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
+        .tags(vec![("version", version)]) // TODO: add git commit tag
+        .build()
+        .ok()?;
+
+    match agent.start() {
+        Ok(agent) => Some(agent),
+        Err(err) => {
+            eprintln!("Pyroscope agent start error: {err:?}");
+            None
+        }
+    }
 }
 
 /// Create a stdout periodic metrics reader for the given interval.

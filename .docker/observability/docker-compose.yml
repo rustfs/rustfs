@@ -32,6 +32,7 @@ services:
       - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_OBS_LOGGER_LEVEL=info
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
+      - RUSTFS_OBS_PROFILING_ENDPOINT=http://pyroscope:4040
     volumes:
       - rustfs-data:/data/rustfs
     networks:
@@ -79,8 +80,8 @@ services:
       - tempo-data:/var/tempo
     ports:
       - "3200:3200" # tempo
-      - "4317"      # otlp grpc
-      - "4318"      # otlp http
+      - "4317" # otlp grpc
+      - "4318" # otlp http
     networks:
       - otel-network
     restart: unless-stopped
@@ -188,12 +189,12 @@ services:
     volumes:
       - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
-      - "1888:1888"   # pprof
-      - "8888:8888"   # Prometheus metrics for Collector
-      - "8889:8889"   # Prometheus metrics for application indicators
+      - "1888:1888" # pprof
+      - "8888:8888" # Prometheus metrics for Collector
+      - "8889:8889" # Prometheus metrics for application indicators
       - "13133:13133" # health check
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
       - "55679:55679" # zpages
     networks:
       - otel-network
@@ -208,6 +209,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+  # --- Profiles ---
+
+  pyroscope:
+    image: grafana/pyroscope:latest
+    container_name: pyroscope
+    ports:
+      - "4040:4040"
+    command:
+      - -self-profiling.disable-push=true
+    networks:
+      - otel-network
+    restart: unless-stopped
 
   # --- Visualization ---
 
@@ -231,7 +245,8 @@ services:
       - tempo
       - loki
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      test:
+        ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 3

@@ -76,3 +76,9 @@ datasources:
         spanEndTimeShift: '-1s'
         filterByTraceID: true
         filterBySpanID: false
+
+  - name: Pyroscope
+    type: grafana-pyroscope-datasource
+    url: http://pyroscope:4040
+    jsonData:
+      minStep: '15s'
