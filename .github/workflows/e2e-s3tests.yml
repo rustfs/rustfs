@@ -53,7 +53,7 @@ env:
   BUILDX_CACHE_SCOPE: rustfs-e2e-s3tests-source
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.test-mode || 'single' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs['test-mode'] || 'single' }}
   cancel-in-progress: true
 
 defaults:
@@ -62,7 +62,7 @@ defaults:
 
 jobs:
   s3tests-single:
-    if: github.event.inputs.test-mode == 'single'
+    if: github.event.inputs['test-mode'] == 'single'
     runs-on: ubicloud-standard-2
     timeout-minutes: 120
     steps:
@@ -224,7 +224,7 @@ jobs:
           path: artifacts/**
 
   s3tests-multi:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.test-mode == 'multi'
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs['test-mode'] == 'multi'
     runs-on: ubicloud-standard-2
     timeout-minutes: 150
     steps:
