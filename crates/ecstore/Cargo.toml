@@ -65,7 +65,7 @@ http-body = { workspace = true }
 http-body-util.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
-reed-solomon-simd = { workspace = true }
+reed-solomon-erasure = { workspace = true }
 lazy_static.workspace = true
 rustfs-lock.workspace = true
 regex = { workspace = true }

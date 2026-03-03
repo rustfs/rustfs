@@ -288,6 +288,22 @@ mod tests {
         }
     }
 
+    /// Generates 7557 bytes
+    /// Pattern: (i*7+13)%256 for each byte.
+    fn generate_compat_test_data(size: usize) -> Vec<u8> {
+        (0..size).map(|i| ((i * 7 + 13) % 256) as u8).collect()
+    }
+
+    /// Run: cargo test -p rustfs-utils test_highwayhash_compat
+    #[test]
+    fn test_highwayhash_compat() {
+        let data = generate_compat_test_data(7557);
+        let hash = HashAlgorithm::HighwayHash256S.hash_encode(&data);
+        let got = hex_simd::encode_to_string(hash.as_ref(), hex_simd::AsciiCase::Lower);
+        let expected = "06543bf1c637e67386922a43b71cca08e5faa0f9131105a2bf96dec880529551";
+        assert_eq!(got, expected, "HighwayHash256S must match: got {} want {}", got, expected);
+    }
+
     #[test]
     fn test_different_data_different_hashes() {
         let data1 = b"test data 1";

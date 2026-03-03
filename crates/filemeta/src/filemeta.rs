@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::{
-    ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, ObjectPartInfo, RawFileInfo, ReplicationState,
-    ReplicationStatusType, Result, TIER_FV_ID, TIER_FV_MARKER, VersionPurgeStatusType, is_restored_object_on_disk,
-    replication_statuses_map, version_purge_statuses_map,
+    ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, NULL_VERSION_ID, ObjectPartInfo, RawFileInfo,
+    ReplicationState, ReplicationStatusType, Result, TIER_FV_ID, TIER_FV_MARKER, VersionPurgeStatusType,
+    is_restored_object_on_disk, replication_statuses_map, version_purge_statuses_map,
 };
 use byteorder::ByteOrder;
 use bytes::Bytes;
@@ -57,6 +57,18 @@ const _XL_FLAG_INLINE_DATA: u8 = 1 << 2;
 
 const META_DATA_READ_DEFAULT: usize = 4 << 10;
 const MSGP_UINT32_SIZE: usize = 5;
+
+/// Max object versions per object, default is 10000
+const DEFAULT_OBJECT_MAX_VERSIONS: usize = 10000;
+
+/// Returns the inline data map key for a version_id. "null" for null version.
+pub(crate) fn data_key_for_version(version_id: Option<Uuid>) -> String {
+    if version_id.is_none() || version_id == Some(Uuid::nil()) {
+        NULL_VERSION_ID.to_string()
+    } else {
+        version_id.unwrap_or_default().to_string()
+    }
+}
 
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
@@ -222,13 +234,13 @@ impl FileMeta {
     }
 
     pub fn add_version(&mut self, mut fi: FileInfo) -> Result<()> {
+        // empty version_id means "null" (versioning disabled/suspended)
         if fi.version_id.is_none() {
             fi.version_id = Some(Uuid::nil());
         }
 
         if let Some(ref data) = fi.data {
-            let key = fi.version_id.unwrap_or_default().to_string();
-            self.data.replace(&key, data.to_vec())?;
+            self.data.replace(&data_key_for_version(fi.version_id), data.to_vec())?;
         }
 
         let version = FileMetaVersion::from(fi);
@@ -241,13 +253,12 @@ impl FileMeta {
             return Err(Error::other("file meta version invalid"));
         }
 
-        // TODO: make it configurable
-        // 1000 is the limit of versions
-        // if self.versions.len() + 1 > 1000 {
-        //     return Err(Error::other(
-        //         "You've exceeded the limit on the number of versions you can create on this object",
-        //     ));
-        // }
+        // check max versions limit
+        if self.versions.len() + 1 > DEFAULT_OBJECT_MAX_VERSIONS {
+            return Err(Error::other(
+                "You've exceeded the limit on the number of versions you can create on this object",
+            ));
+        }
 
         if self.versions.is_empty() {
             self.versions.push(FileMetaShallowVersion::try_from(version)?);
@@ -256,21 +267,44 @@ impl FileMeta {
 
         let vid = version.get_version_id();
 
-        if let Some(fidx) = self.versions.iter().position(|v| v.header.version_id == vid) {
+        // Match existing version for replace; null version: None and Some(nil) are equivalent
+        let matches = |h: &Option<Uuid>| {
+            let v_null = vid.is_none() || vid == Some(Uuid::nil());
+            let h_null = h.is_none() || *h == Some(Uuid::nil());
+            (v_null && h_null) || (vid == *h)
+        };
+
+        if let Some(fidx) = self.versions.iter().position(|v| matches(&v.header.version_id)) {
             return self.set_idx(fidx, version);
         }
 
+        // append placeholder to find insert position
+        let placeholder = FileMetaShallowVersion {
+            header: FileMetaVersionHeader {
+                mod_time: None, // None sorts before any real mod_time
+                ..Default::default()
+            },
+            meta: Vec::new(),
+        };
+        self.versions.push(placeholder);
+
         let mod_time = version.get_mod_time();
+        let new_shallow = FileMetaShallowVersion::try_from(version)?;
 
         for (idx, exist) in self.versions.iter().enumerate() {
-            if let Some(ref ex_mt) = exist.header.mod_time
-                && let Some(ref in_md) = mod_time
-                && ex_mt <= in_md
-            {
-                self.versions.insert(idx, FileMetaShallowVersion::try_from(version)?);
+            let ex_mt = exist.header.mod_time;
+            let insert_here = match (ex_mt, mod_time) {
+                (None, _) => true, // placeholder: always insert before
+                (Some(em), Some(nm)) => em <= nm,
+                (Some(_), None) => false,
+            };
+            if insert_here {
+                self.versions.insert(idx, new_shallow);
+                self.versions.pop(); // remove placeholder
                 return Ok(());
             }
         }
+        self.versions.pop(); // remove placeholder on fallback
         Err(Error::other("add_version failed"))
 
         // if !ver.valid() {
@@ -654,7 +688,7 @@ impl FileMeta {
             if read_data {
                 fi.data = self
                     .data
-                    .find(fi.version_id.unwrap_or_default().to_string().as_str())?
+                    .find(data_key_for_version(fi.version_id).as_str())?
                     .map(bytes::Bytes::from);
             }
 
