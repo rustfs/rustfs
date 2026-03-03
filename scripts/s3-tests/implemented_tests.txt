@@ -3,6 +3,7 @@
 #
 # These tests SHOULD PASS on RustFS for standard S3 API compatibility.
 # Run these tests to verify RustFS S3 compatibility.
+# Intentionally excluded tests (for example ACL authorization tests) are tracked in excluded_tests.txt.
 #
 # Covered operations:
 # - Bucket: Create, Delete, List, Head, GetLocation
@@ -23,7 +24,6 @@
 # - SSE-KMS: KMS-related edge cases
 # - Bucket Policy: Multipart upload authorization, SSE condition keys, grant header conditions
 # - Versioning: Concurrent multi-object delete
-# - ACL: Bucket and Object ACL
 # - Object Copy: Same/cross bucket, metadata, versioning
 # - POST Object: HTML form upload
 # - Raw requests: Authenticated and anonymous
@@ -36,7 +36,6 @@
 # - DeleteObject: Proper NoSuchBucket for deleted buckets
 # - Multipart Copy: InvalidRange when CopySourceRange exceeds source size
 #
-# Total: 396 tests
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -120,13 +119,6 @@ test_bucketv2_notexist
 test_bucketv2_policy_another_bucket
 test_get_bucket_policy_status
 test_get_nonpublicpolicy_principal_bucket_policy_status
-test_get_public_acl_bucket_policy_status
-test_get_authpublic_acl_bucket_policy_status
-test_get_publicpolicy_acl_bucket_policy_status
-test_get_nonpublicpolicy_acl_bucket_policy_status
-test_block_public_put_bucket_acls
-test_block_public_object_canned_acls
-test_ignore_public_acls
 test_set_get_del_bucket_policy
 test_get_object_ifmatch_good
 test_get_object_ifmodifiedsince_good
@@ -146,7 +138,6 @@ test_multipart_upload_overwrite_existing_object
 test_multipart_upload_size_too_small
 test_object_copy_bucket_not_found
 test_object_copy_key_not_found
-test_object_copy_not_owned_object_bucket
 test_object_head_zero_bytes
 test_get_obj_head_tagging
 test_object_metadata_replaced_on_put
@@ -223,17 +214,10 @@ test_get_undefined_public_block
 
 # Bucket policy tests
 test_bucketv2_policy
-test_bucket_policy_acl
-test_bucketv2_policy_acl
 test_bucket_policy_another_bucket
 test_bucket_policy_allow_notprincipal
-test_bucket_policy_multipart
-test_bucket_policy_put_obj_acl
-test_bucket_policy_put_obj_grant
 test_bucket_policy_put_obj_kms_s3
 test_bucket_policy_put_obj_s3_kms
-test_object_presigned_put_object_with_acl
-test_object_put_acl_mtime
 
 # Object ownership
 test_create_bucket_no_ownership_controls
@@ -276,7 +260,6 @@ test_object_lock_put_obj_retention_invalid_bucket
 # Versioning tests
 test_get_versioned_object_attributes
 test_versioned_concurrent_object_create_and_remove
-test_versioned_object_acl
 test_versioning_bucket_create_suspend
 test_versioning_bucket_atomic_upload_return_version_id
 test_versioning_bucket_multipart_upload_return_version_id
@@ -294,54 +277,8 @@ test_versioning_obj_plain_null_version_removal
 test_versioning_obj_suspend_versions
 
 # Tenant and presigned tests
-test_object_presigned_put_object_with_acl_tenant
 
-# ACL tests (bucket and object)
-test_access_bucket_private_object_private
-test_access_bucket_private_object_publicread
-test_access_bucket_private_object_publicreadwrite
-test_access_bucket_private_objectv2_private
-test_access_bucket_private_objectv2_publicread
-test_access_bucket_private_objectv2_publicreadwrite
-test_access_bucket_publicread_object_private
-test_access_bucket_publicread_object_publicread
-test_access_bucket_publicread_object_publicreadwrite
-test_access_bucket_publicreadwrite_object_private
-test_access_bucket_publicreadwrite_object_publicread
-test_access_bucket_publicreadwrite_object_publicreadwrite
-test_bucket_acl_canned
-test_bucket_acl_canned_authenticatedread
-test_bucket_acl_canned_during_create
-test_bucket_acl_canned_private_to_private
-test_bucket_acl_canned_publicreadwrite
-test_bucket_acl_default
-test_bucket_acl_grant_email
-test_bucket_acl_grant_email_not_exist
-test_bucket_acl_grant_nonexist_user
-test_bucket_acl_grant_userid_fullcontrol
-test_bucket_acl_grant_userid_read
-test_bucket_acl_grant_userid_readacp
-test_bucket_acl_grant_userid_write
-test_bucket_acl_grant_userid_writeacp
-test_bucket_acl_revoke_all
-test_bucket_concurrent_set_canned_acl
-test_object_acl
-test_object_acl_canned
-test_object_acl_canned_authenticatedread
-test_object_acl_canned_bucketownerfullcontrol
-test_object_acl_canned_bucketownerread
-test_object_acl_canned_during_create
-test_object_acl_canned_publicreadwrite
-test_object_acl_default
-test_object_acl_full_control_verify_attributes
-test_object_acl_full_control_verify_owner
-test_object_acl_read
-test_object_acl_readacp
-test_object_acl_write
-test_object_acl_writeacp
 test_object_anon_put
-test_object_anon_put_write_access
-test_put_bucket_acl_grant_group_read
 
 # Bucket creation and naming
 test_bucket_create_exists
@@ -356,7 +293,6 @@ test_bucket_list_delimiter_prefix
 test_bucket_list_delimiter_prefix_underscore
 test_bucket_list_many
 test_bucket_list_maxkeys_one
-test_bucket_list_objects_anonymous
 test_bucket_list_objects_anonymous_fail
 test_bucket_list_unordered
 test_bucket_listv2_both_continuationtoken_startafter
@@ -364,14 +300,12 @@ test_bucket_listv2_delimiter_prefix
 test_bucket_listv2_delimiter_prefix_underscore
 test_bucket_listv2_many
 test_bucket_listv2_maxkeys_one
-test_bucket_listv2_objects_anonymous
 test_bucket_listv2_objects_anonymous_fail
 test_bucket_listv2_unordered
 
 # Object copy tests
 test_object_copy_16m
 test_object_copy_diff_bucket
-test_object_copy_not_owned_bucket
 test_object_copy_replacing_metadata
 test_object_copy_retaining_metadata
 test_object_copy_same_bucket
@@ -388,20 +322,12 @@ test_object_content_encoding_aws_chunked
 
 # Raw request tests
 test_object_raw_authenticated
-test_object_raw_authenticated_bucket_acl
 test_object_raw_authenticated_bucket_gone
-test_object_raw_authenticated_object_acl
 test_object_raw_authenticated_object_gone
-test_object_raw_get
-test_object_raw_get_bucket_acl
-test_object_raw_get_bucket_gone
-test_object_raw_get_object_acl
-test_object_raw_get_object_gone
 test_object_raw_get_x_amz_expires_out_range_zero
 test_object_raw_response_headers
 
 # POST Object tests
-test_post_object_anonymous_request
 test_post_object_authenticated_no_content_type
 test_post_object_authenticated_request
 test_post_object_authenticated_request_bad_access_key
@@ -420,8 +346,6 @@ test_post_object_missing_content_length_argument
 test_post_object_missing_expires_condition
 test_post_object_missing_signature
 test_post_object_no_key_specified
-test_post_object_set_invalid_success_code
-test_post_object_set_success_code
 test_post_object_upload_larger_than_chunk
 test_post_object_upload_size_below_minimum
 test_post_object_upload_size_limit_exceeded
@@ -474,18 +398,13 @@ test_object_checksum_crc64nvme
 
 # CORS tests
 test_set_cors
-test_cors_origin_response
-test_cors_origin_wildcard
 test_cors_header_option
 test_cors_presigned_get_object
 test_cors_presigned_get_object_tenant
 test_cors_presigned_put_object
-test_cors_presigned_put_object_with_acl
 test_cors_presigned_put_object_tenant
-test_cors_presigned_put_object_tenant_with_acl
 
 # HTTP and DeleteObject tests
-test_100_continue
 test_abort_multipart_upload_not_found
 test_post_object_tags_authenticated_request
 test_object_delete_key_bucket_gone

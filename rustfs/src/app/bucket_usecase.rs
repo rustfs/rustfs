@@ -19,12 +19,9 @@ use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
-use crate::storage::ecfs::{
-    RUSTFS_OWNER, default_owner, is_public_grant, parse_acl_json_or_canned_bucket, serialize_acl, stored_acl_from_canned_bucket,
-    stored_acl_from_grant_headers, stored_acl_from_policy, stored_grant_to_dto, stored_owner_to_dto,
-};
+use crate::storage::ecfs::{RUSTFS_OWNER, default_owner};
 use crate::storage::helper::OperationHelper;
-use crate::storage::s3_api::{encryption, replication, tagging};
+use crate::storage::s3_api::{acl, encryption, replication, tagging};
 use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
@@ -33,7 +30,7 @@ use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::bucket::{
     lifecycle::bucket_lifecycle_ops::validate_transition_tier,
     metadata::{
-        BUCKET_ACL_CONFIG, BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
+        BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
         BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG,
         BUCKET_VERSIONING_CONFIG,
     },
@@ -158,12 +155,6 @@ impl DefaultBucketUsecase {
         };
         let CreateBucketInput {
             bucket,
-            acl,
-            grant_full_control,
-            grant_read,
-            grant_read_acp,
-            grant_write,
-            grant_write_acp,
             object_lock_enabled_for_bucket,
             ..
         } = req.input;
@@ -190,13 +181,7 @@ impl DefaultBucketUsecase {
             Err(StorageError::BucketExists(_)) => {
                 // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
                 // non-owner gets 409 BucketAlreadyExists.
-                let bucket_owner_id = match metadata_sys::get_bucket_acl_config(&bucket).await {
-                    Ok((acl, _)) => parse_acl_json_or_canned_bucket(&acl, &default_owner()).owner.id,
-                    Err(StorageError::ConfigNotFound) => default_owner().id,
-                    Err(e) => return Err(ApiError::from(e).into()),
-                };
-
-                let is_owner = requester_id.as_deref().is_some_and(|req_id| req_id == bucket_owner_id);
+                let is_owner = requester_id.as_deref().is_some_and(|req_id| req_id == default_owner().id);
 
                 if is_owner {
                     let output = CreateBucketOutput::default();
@@ -214,28 +199,6 @@ impl DefaultBucketUsecase {
             Err(e) => return Err(ApiError::from(e).into()),
         }
 
-        let owner = default_owner();
-        let mut stored_acl = stored_acl_from_grant_headers(
-            &owner,
-            grant_read.map(|v| v.to_string()),
-            grant_write.map(|v| v.to_string()),
-            grant_read_acp.map(|v| v.to_string()),
-            grant_write_acp.map(|v| v.to_string()),
-            grant_full_control.map(|v| v.to_string()),
-        )?;
-
-        if stored_acl.is_none()
-            && let Some(canned) = acl
-        {
-            stored_acl = Some(stored_acl_from_canned_bucket(canned.as_str(), &owner));
-        }
-
-        let stored_acl = stored_acl.unwrap_or_else(|| stored_acl_from_canned_bucket(BucketCannedACL::PRIVATE, &owner));
-        let data = serialize_acl(&stored_acl)?;
-        metadata_sys::update(&bucket, BUCKET_ACL_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
         let output = CreateBucketOutput::default();
 
         let result = Ok(S3Response::new(output));
@@ -250,13 +213,7 @@ impl DefaultBucketUsecase {
 
         let PutBucketAclInput {
             bucket,
-            acl,
             access_control_policy,
-            grant_full_control,
-            grant_read,
-            grant_read_acp,
-            grant_write,
-            grant_write_acp,
             ..
         } = req.input;
 
@@ -269,42 +226,12 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let owner = default_owner();
-        let mut stored_acl = access_control_policy
-            .as_ref()
-            .map(|policy| stored_acl_from_policy(policy, &owner))
-            .transpose()?;
-
-        if stored_acl.is_none() {
-            stored_acl = stored_acl_from_grant_headers(
-                &owner,
-                grant_read.map(|v| v.to_string()),
-                grant_write.map(|v| v.to_string()),
-                grant_read_acp.map(|v| v.to_string()),
-                grant_write_acp.map(|v| v.to_string()),
-                grant_full_control.map(|v| v.to_string()),
-            )?;
+        if access_control_policy.is_some() {
+            return Err(s3_error!(
+                NotImplemented,
+                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
+            ));
         }
-
-        if stored_acl.is_none()
-            && let Some(canned) = acl
-        {
-            stored_acl = Some(stored_acl_from_canned_bucket(canned.as_str(), &owner));
-        }
-
-        let stored_acl = stored_acl.unwrap_or_else(|| stored_acl_from_canned_bucket(BucketCannedACL::PRIVATE, &owner));
-
-        if let Ok((config, _)) = metadata_sys::get_public_access_block_config(&bucket).await
-            && config.block_public_acls.unwrap_or(false)
-            && stored_acl.grants.iter().any(is_public_grant)
-        {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
-        }
-
-        let data = serialize_acl(&stored_acl)?;
-        metadata_sys::update(&bucket, BUCKET_ACL_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(PutBucketAclOutput::default()))
     }
@@ -392,25 +319,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let owner = default_owner();
-        let stored_acl = match metadata_sys::get_bucket_acl_config(&bucket).await {
-            Ok((acl, _)) => parse_acl_json_or_canned_bucket(&acl, &owner),
-            Err(err) => {
-                if err != StorageError::ConfigNotFound {
-                    return Err(ApiError::from(err).into());
-                }
-                stored_acl_from_canned_bucket(BucketCannedACL::PRIVATE, &owner)
-            }
-        };
-
-        let mut sorted_grants = stored_acl.grants.clone();
-        sorted_grants.sort_by_key(|grant| grant.grantee.grantee_type != "Group");
-        let grants = sorted_grants.iter().map(stored_grant_to_dto).collect();
-
-        Ok(S3Response::new(GetBucketAclOutput {
-            grants: Some(grants),
-            owner: Some(stored_owner_to_dto(&stored_acl.owner)),
-        }))
+        Ok(S3Response::new(acl::build_get_bucket_acl_output()))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -922,21 +831,7 @@ impl DefaultBucketUsecase {
             Err(_) => false,
         };
 
-        let owner = default_owner();
-        let acl_public = match metadata_sys::get_bucket_acl_config(&bucket).await {
-            Ok((acl, _)) => {
-                let stored_acl = parse_acl_json_or_canned_bucket(&acl, &owner);
-                stored_acl
-                    .grants
-                    .iter()
-                    .any(|grant| is_public_grant(grant) && !ignore_public_acls)
-            }
-            Err(_) => false,
-        };
-
-        if acl_public {
-            is_public = true;
-        }
+        let _ = ignore_public_acls;
 
         let policy_public = match metadata_sys::get_bucket_policy(&bucket).await {
             Ok((cfg, _)) => cfg.statements.iter().any(|statement| {
