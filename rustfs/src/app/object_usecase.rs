@@ -1962,6 +1962,7 @@ impl DefaultObjectUsecase {
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket {
                 ref bucket,
                 ref key,

@@ -431,6 +431,7 @@ impl S3Access for FS {
         {
             let (src_bucket, src_key, version_id) = match &req.input.copy_source {
                 CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+                CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
                 CopySource::Bucket { bucket, key, version_id } => {
                     (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
                 }

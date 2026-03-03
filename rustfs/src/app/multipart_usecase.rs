@@ -916,6 +916,7 @@ impl DefaultMultipartUsecase {
 
         let (src_bucket, src_key, src_version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket {
                 bucket: ref src_bucket,
                 key: ref src_key,
