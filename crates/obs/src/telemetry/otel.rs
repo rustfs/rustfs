@@ -51,7 +51,7 @@ use opentelemetry_sdk::{
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED,
-    DEFAULT_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
+    DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
 use std::{io::IsTerminal, time::Duration};
 use tracing::info;
@@ -324,7 +324,7 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
 
     if !config
         .profiling_export_enabled
-        .unwrap_or(DEFAULT_OBS_PROFILING_EXPORT_ENABLED)
+        .unwrap_or(rustfs_config::DEFAULT_OBS_PROFILING_EXPORT_ENABLED)
     {
         return None;
     }
