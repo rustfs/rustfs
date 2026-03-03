@@ -617,7 +617,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         }
     }
 
-    let dsc = if oi.delete_marker || !oi.replication_status.is_empty() {
+    let dsc = if oi.delete_marker || !oi.replication_status.is_empty() && oi.replication_status != ReplicationStatusType::Failed {
         check_replicate_delete(
             oi.bucket.as_str(),
             &ObjectToDelete {
