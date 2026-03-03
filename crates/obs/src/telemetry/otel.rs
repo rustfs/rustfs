@@ -49,7 +49,9 @@ use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
+#[cfg(unix)]
 use pyroscope::PyroscopeAgent;
+#[cfg(unix)]
 use pyroscope::pyroscope::PyroscopeAgentRunning;
 use rustfs_config::{
     APP_NAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED,
