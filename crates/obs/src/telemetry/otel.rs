@@ -348,10 +348,7 @@ fn init_profiler(config: &OtelConfig) -> Option<PyroscopeAgent<PyroscopeAgentRun
         .ok()?;
 
     match agent.start() {
-        Ok(agent) => {
-            info!(endpoint, "Pyroscope profiling started");
-            Some(agent)
-        }
+        Ok(agent) => Some(agent),
         Err(err) => {
             eprintln!("Pyroscope agent start error: {err:?}");
             None
