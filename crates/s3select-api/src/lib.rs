@@ -61,13 +61,14 @@ pub enum QueryError {
 }
 
 impl From<DataFusionError> for QueryError {
+    #[track_caller]
     fn from(value: DataFusionError) -> Self {
         match value {
             DataFusionError::External(e) if e.downcast_ref::<QueryError>().is_some() => *e.downcast::<QueryError>().unwrap(),
 
             v => Self::Datafusion {
                 source: Box::new(v),
-                location: Default::default(),
+                location: std::panic::Location::caller(),
                 backtrace: Backtrace::capture(),
             },
         }
