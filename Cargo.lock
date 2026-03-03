@@ -7182,7 +7182,6 @@ dependencies = [
  "mimalloc",
  "mime_guess",
  "moka",
- "once_cell",
  "opentelemetry",
  "percent-encoding",
  "pin-project-lite",
