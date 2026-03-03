@@ -24,6 +24,7 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{
     BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions,
 };
+use sha2::{Digest, Sha256};
 use tracing::error;
 
 /// Sanitize storage layer errors for client responses
@@ -42,8 +43,9 @@ fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> Sw
 #[derive(Debug, Clone)]
 pub struct ContainerMapperConfig {
     /// Enable tenant prefixing for bucket names
-    /// When true, Swift container names are prefixed with project_id
-    /// Example: container "mycontainer" for project "abc123" becomes bucket "abc123-mycontainer"
+    /// When true, Swift container names are prefixed with SHA256 hash of project_id
+    /// Example: container "mycontainer" for project "abc123" becomes bucket "a1b2c3d4e5f6a1b2-mycontainer"
+    /// where "a1b2c3d4e5f6a1b2" is the first 16 hex chars of SHA256("abc123")
     pub tenant_prefix_enabled: bool,
 }
 
@@ -72,19 +74,40 @@ impl ContainerMapper {
         Self::new(ContainerMapperConfig::default())
     }
 
+    /// Generate a deterministic hash prefix from project_id
+    ///
+    /// Uses SHA256 to create a 16-character lowercase hex prefix that:
+    /// - Is deterministic (same project_id always produces same hash)
+    /// - Is collision-resistant (cryptographic hash)
+    /// - Uses only [a-z0-9] characters (S3 bucket name compatible)
+    /// - Has fixed length (16 chars from 8 bytes)
+    fn hash_project_id(&self, project_id: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(project_id.as_bytes());
+        let result = hasher.finalize();
+
+        // Take first 8 bytes and convert to 16 hex characters
+        let bytes: [u8; 8] = result[0..8].try_into().unwrap();
+        format!("{:016x}", u64::from_be_bytes(bytes))
+    }
+
     /// Convert Swift container name to S3 bucket name
     ///
     /// When tenant_prefix_enabled is true:
-    ///   container="mycontainer", project_id="abc123" -> "abc123/mycontainer"
+    ///   container="mycontainer", project_id="abc123" -> "a1b2c3d4e5f6a1b2-mycontainer"
     /// When tenant_prefix_enabled is false:
     ///   container="mycontainer", project_id="abc123" -> "mycontainer"
     ///
-    /// Note: Uses "/" as separator which is forbidden in container names (validated at line 255),
-    /// ensuring unambiguous tenant isolation with no collision risk.
+    /// Note: Uses SHA256 hash of project_id as prefix, ensuring:
+    /// - No collision risk (cryptographic hash)
+    /// - S3 bucket name compatible (only uses [a-z0-9-])
+    /// - Deterministic mapping (same input always produces same bucket name)
+    /// - Fixed-length prefix (16 hex chars = 8 bytes)
     #[allow(dead_code)] // Used in: create/delete container operations
     pub fn swift_to_s3_bucket(&self, container: &str, project_id: &str) -> String {
         if self.config.tenant_prefix_enabled {
-            format!("{}/{}", project_id, container)
+            let hash = self.hash_project_id(project_id);
+            format!("{}-{}", hash, container)
         } else {
             container.to_string()
         }
@@ -93,14 +116,15 @@ impl ContainerMapper {
     /// Convert S3 bucket name to Swift container name
     ///
     /// When tenant_prefix_enabled is true:
-    ///   bucket="abc123/mycontainer", project_id="abc123" -> "mycontainer"
+    ///   bucket="a1b2c3d4e5f6a1b2-mycontainer", project_id="abc123" -> "mycontainer"
     /// When tenant_prefix_enabled is false:
     ///   bucket="mycontainer", project_id="abc123" -> "mycontainer"
     ///
     /// Returns None if bucket doesn't belong to this tenant
     pub fn s3_to_swift_container(&self, bucket: &str, project_id: &str) -> Option<String> {
         if self.config.tenant_prefix_enabled {
-            let prefix = format!("{}/", project_id);
+            let hash = self.hash_project_id(project_id);
+            let prefix = format!("{}-", hash);
             bucket.strip_prefix(&prefix).map(|container| container.to_string())
         } else {
             Some(bucket.to_string())
@@ -110,7 +134,8 @@ impl ContainerMapper {
     /// Check if a bucket belongs to the specified project
     pub fn bucket_belongs_to_project(&self, bucket: &str, project_id: &str) -> bool {
         if self.config.tenant_prefix_enabled {
-            bucket.starts_with(&format!("{}/", project_id))
+            let hash = self.hash_project_id(project_id);
+            bucket.starts_with(&format!("{}-", hash))
         } else {
             // Without tenant prefixing, we can't determine ownership from name alone
             true
@@ -579,7 +604,12 @@ mod tests {
         });
 
         let bucket = mapper.swift_to_s3_bucket("mycontainer", "abc123");
-        assert_eq!(bucket, "abc123/mycontainer");
+        let expected_hash = mapper.hash_project_id("abc123");
+        assert_eq!(bucket, format!("{}-mycontainer", expected_hash));
+
+        // Verify hash is 16 hex characters (lowercase)
+        assert_eq!(expected_hash.len(), 16);
+        assert!(expected_hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -598,11 +628,14 @@ mod tests {
             tenant_prefix_enabled: true,
         });
 
-        let container = mapper.s3_to_swift_container("abc123/mycontainer", "abc123");
+        // Test with correct tenant
+        let hash_abc123 = mapper.hash_project_id("abc123");
+        let bucket_name = format!("{}-mycontainer", hash_abc123);
+        let container = mapper.s3_to_swift_container(&bucket_name, "abc123");
         assert_eq!(container, Some("mycontainer".to_string()));
 
-        // Different tenant should return None
-        let container = mapper.s3_to_swift_container("abc123/mycontainer", "xyz789");
+        // Different tenant should return None (different hash)
+        let container = mapper.s3_to_swift_container(&bucket_name, "xyz789");
         assert_eq!(container, None);
     }
 
@@ -622,8 +655,14 @@ mod tests {
             tenant_prefix_enabled: true,
         });
 
-        assert!(mapper.bucket_belongs_to_project("abc123/mycontainer", "abc123"));
-        assert!(!mapper.bucket_belongs_to_project("xyz789/mycontainer", "abc123"));
+        let hash_abc123 = mapper.hash_project_id("abc123");
+        let hash_xyz789 = mapper.hash_project_id("xyz789");
+
+        let bucket_abc = format!("{}-mycontainer", hash_abc123);
+        let bucket_xyz = format!("{}-mycontainer", hash_xyz789);
+
+        assert!(mapper.bucket_belongs_to_project(&bucket_abc, "abc123"));
+        assert!(!mapper.bucket_belongs_to_project(&bucket_xyz, "abc123"));
         assert!(!mapper.bucket_belongs_to_project("mycontainer", "abc123"));
     }
 
@@ -633,8 +672,11 @@ mod tests {
             tenant_prefix_enabled: true,
         });
 
+        let hash = mapper.hash_project_id("abc123");
+        let bucket_name = format!("{}-mycontainer", hash);
+
         let info = BucketInfo {
-            name: "abc123/mycontainer".to_string(),
+            name: bucket_name,
             created: Some(OffsetDateTime::now_utc()),
             deleted: None,
             versioning: false,
@@ -656,15 +698,18 @@ mod tests {
             tenant_prefix_enabled: true,
         });
 
+        let hash = mapper.hash_project_id("abc123");
+        let bucket_name = format!("{}-mycontainer", hash);
+
         let info = BucketInfo {
-            name: "abc123/mycontainer".to_string(),
+            name: bucket_name,
             created: Some(OffsetDateTime::now_utc()),
             deleted: None,
             versioning: false,
             object_locking: false,
         };
 
-        // Different project_id should return None
+        // Different project_id should return None (different hash)
         let container = bucket_info_to_container(&info, &mapper, "xyz789");
         assert!(container.is_none());
     }
@@ -718,18 +763,26 @@ mod tests {
     #[test]
     fn test_no_tenant_collision_with_separator_in_names() {
         // This test verifies that the collision vulnerability identified by Codex is fixed.
-        // With "--" separator: ("a", "b--c") and ("a--b", "c") both produced "a--b--c"
-        // With "/" separator: ("a", "b--c") → "a/b--c" and ("a--b", "c") → "a--b/c" (DIFFERENT!)
+        // With "--" separator: ("a", "b--c") and ("a--b", "c") both produced "a--b--c" (COLLISION!)
+        // With "/" separator: ("a", "b--c") → "a/b--c" and ("a--b", "c") → "a--b/c" (but "/" breaks S3)
+        // With hash: Uses SHA256 of project_id as prefix - cryptographically secure, no collisions
         let mapper = ContainerMapper::new(ContainerMapperConfig {
             tenant_prefix_enabled: true,
         });
 
-        // These should map to DIFFERENT buckets (note: containers can't contain "/" so these names are valid)
+        // These should map to DIFFERENT buckets using different hash prefixes
         let bucket1 = mapper.swift_to_s3_bucket("b--c", "a");
         let bucket2 = mapper.swift_to_s3_bucket("c", "a--b");
         assert_ne!(bucket1, bucket2, "Collision detected! Tenant isolation broken.");
-        assert_eq!(bucket1, "a/b--c");
-        assert_eq!(bucket2, "a--b/c");
+
+        // Verify bucket names use hash prefixes
+        let hash_a = mapper.hash_project_id("a");
+        let hash_ab = mapper.hash_project_id("a--b");
+        assert_eq!(bucket1, format!("{}-b--c", hash_a));
+        assert_eq!(bucket2, format!("{}-c", hash_ab));
+
+        // Verify hashes are different (no collision)
+        assert_ne!(hash_a, hash_ab);
 
         // Verify correct tenant ownership - each bucket belongs to only ONE tenant
         assert!(mapper.bucket_belongs_to_project(&bucket1, "a"));
@@ -744,5 +797,44 @@ mod tests {
 
         assert_eq!(mapper.s3_to_swift_container(&bucket2, "a--b"), Some("c".to_string()));
         assert_eq!(mapper.s3_to_swift_container(&bucket2, "a"), None);
+    }
+
+    #[test]
+    fn test_hash_deterministic() {
+        // Verify that hashing is deterministic (same input always produces same output)
+        let mapper = ContainerMapper::new(ContainerMapperConfig {
+            tenant_prefix_enabled: true,
+        });
+
+        let hash1 = mapper.hash_project_id("test-project");
+        let hash2 = mapper.hash_project_id("test-project");
+        assert_eq!(hash1, hash2, "Hash must be deterministic");
+
+        // Verify hash format (16 lowercase hex characters)
+        assert_eq!(hash1.len(), 16);
+        assert!(hash1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn test_hash_s3_compatible() {
+        // Verify bucket names are S3-compatible (only use [a-z0-9-])
+        let mapper = ContainerMapper::new(ContainerMapperConfig {
+            tenant_prefix_enabled: true,
+        });
+
+        let bucket = mapper.swift_to_s3_bucket("mycontainer", "test-project-123");
+
+        // Check all characters are S3-compatible
+        for c in bucket.chars() {
+            assert!(
+                c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-',
+                "Bucket name contains invalid character: {}",
+                c
+            );
+        }
+
+        // Verify starts with lowercase letter or digit (not dash)
+        let first_char = bucket.chars().next().unwrap();
+        assert!(first_char.is_ascii_lowercase() || first_char.is_ascii_digit());
     }
 }
