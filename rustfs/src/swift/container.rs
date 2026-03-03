@@ -75,16 +75,16 @@ impl ContainerMapper {
     /// Convert Swift container name to S3 bucket name
     ///
     /// When tenant_prefix_enabled is true:
-    ///   container="mycontainer", project_id="abc123" -> "abc123--mycontainer"
+    ///   container="mycontainer", project_id="abc123" -> "abc123/mycontainer"
     /// When tenant_prefix_enabled is false:
     ///   container="mycontainer", project_id="abc123" -> "mycontainer"
     ///
-    /// Note: Uses double-dash (--) separator to avoid ambiguity with single dashes
-    /// that may appear in project IDs or container names.
+    /// Note: Uses "/" as separator which is forbidden in container names (validated at line 255),
+    /// ensuring unambiguous tenant isolation with no collision risk.
     #[allow(dead_code)] // Used in: create/delete container operations
     pub fn swift_to_s3_bucket(&self, container: &str, project_id: &str) -> String {
         if self.config.tenant_prefix_enabled {
-            format!("{}--{}", project_id, container)
+            format!("{}/{}", project_id, container)
         } else {
             container.to_string()
         }
@@ -93,14 +93,14 @@ impl ContainerMapper {
     /// Convert S3 bucket name to Swift container name
     ///
     /// When tenant_prefix_enabled is true:
-    ///   bucket="abc123-mycontainer", project_id="abc123" -> "mycontainer"
+    ///   bucket="abc123/mycontainer", project_id="abc123" -> "mycontainer"
     /// When tenant_prefix_enabled is false:
     ///   bucket="mycontainer", project_id="abc123" -> "mycontainer"
     ///
     /// Returns None if bucket doesn't belong to this tenant
     pub fn s3_to_swift_container(&self, bucket: &str, project_id: &str) -> Option<String> {
         if self.config.tenant_prefix_enabled {
-            let prefix = format!("{}--", project_id);
+            let prefix = format!("{}/", project_id);
             bucket.strip_prefix(&prefix).map(|container| container.to_string())
         } else {
             Some(bucket.to_string())
@@ -110,7 +110,7 @@ impl ContainerMapper {
     /// Check if a bucket belongs to the specified project
     pub fn bucket_belongs_to_project(&self, bucket: &str, project_id: &str) -> bool {
         if self.config.tenant_prefix_enabled {
-            bucket.starts_with(&format!("{}--", project_id))
+            bucket.starts_with(&format!("{}/", project_id))
         } else {
             // Without tenant prefixing, we can't determine ownership from name alone
             true
@@ -579,7 +579,7 @@ mod tests {
         });
 
         let bucket = mapper.swift_to_s3_bucket("mycontainer", "abc123");
-        assert_eq!(bucket, "abc123--mycontainer");
+        assert_eq!(bucket, "abc123/mycontainer");
     }
 
     #[test]
@@ -598,11 +598,11 @@ mod tests {
             tenant_prefix_enabled: true,
         });
 
-        let container = mapper.s3_to_swift_container("abc123--mycontainer", "abc123");
+        let container = mapper.s3_to_swift_container("abc123/mycontainer", "abc123");
         assert_eq!(container, Some("mycontainer".to_string()));
 
         // Different tenant should return None
-        let container = mapper.s3_to_swift_container("abc123--mycontainer", "xyz789");
+        let container = mapper.s3_to_swift_container("abc123/mycontainer", "xyz789");
         assert_eq!(container, None);
     }
 
@@ -622,8 +622,8 @@ mod tests {
             tenant_prefix_enabled: true,
         });
 
-        assert!(mapper.bucket_belongs_to_project("abc123--mycontainer", "abc123"));
-        assert!(!mapper.bucket_belongs_to_project("xyz789--mycontainer", "abc123"));
+        assert!(mapper.bucket_belongs_to_project("abc123/mycontainer", "abc123"));
+        assert!(!mapper.bucket_belongs_to_project("xyz789/mycontainer", "abc123"));
         assert!(!mapper.bucket_belongs_to_project("mycontainer", "abc123"));
     }
 
@@ -634,7 +634,7 @@ mod tests {
         });
 
         let info = BucketInfo {
-            name: "abc123--mycontainer".to_string(),
+            name: "abc123/mycontainer".to_string(),
             created: Some(OffsetDateTime::now_utc()),
             deleted: None,
             versioning: false,
@@ -657,7 +657,7 @@ mod tests {
         });
 
         let info = BucketInfo {
-            name: "abc123--mycontainer".to_string(),
+            name: "abc123/mycontainer".to_string(),
             created: Some(OffsetDateTime::now_utc()),
             deleted: None,
             versioning: false,
@@ -713,5 +713,36 @@ mod tests {
             }
             _ => panic!("Expected BadRequest error"),
         }
+    }
+
+    #[test]
+    fn test_no_tenant_collision_with_separator_in_names() {
+        // This test verifies that the collision vulnerability identified by Codex is fixed.
+        // With "--" separator: ("a", "b--c") and ("a--b", "c") both produced "a--b--c"
+        // With "/" separator: ("a", "b--c") → "a/b--c" and ("a--b", "c") → "a--b/c" (DIFFERENT!)
+        let mapper = ContainerMapper::new(ContainerMapperConfig {
+            tenant_prefix_enabled: true,
+        });
+
+        // These should map to DIFFERENT buckets (note: containers can't contain "/" so these names are valid)
+        let bucket1 = mapper.swift_to_s3_bucket("b--c", "a");
+        let bucket2 = mapper.swift_to_s3_bucket("c", "a--b");
+        assert_ne!(bucket1, bucket2, "Collision detected! Tenant isolation broken.");
+        assert_eq!(bucket1, "a/b--c");
+        assert_eq!(bucket2, "a--b/c");
+
+        // Verify correct tenant ownership - each bucket belongs to only ONE tenant
+        assert!(mapper.bucket_belongs_to_project(&bucket1, "a"));
+        assert!(!mapper.bucket_belongs_to_project(&bucket1, "a--b"));
+
+        assert!(mapper.bucket_belongs_to_project(&bucket2, "a--b"));
+        assert!(!mapper.bucket_belongs_to_project(&bucket2, "a"));
+
+        // Verify reverse mapping works correctly
+        assert_eq!(mapper.s3_to_swift_container(&bucket1, "a"), Some("b--c".to_string()));
+        assert_eq!(mapper.s3_to_swift_container(&bucket1, "a--b"), None);
+
+        assert_eq!(mapper.s3_to_swift_container(&bucket2, "a--b"), Some("c".to_string()));
+        assert_eq!(mapper.s3_to_swift_container(&bucket2, "a"), None);
     }
 }
