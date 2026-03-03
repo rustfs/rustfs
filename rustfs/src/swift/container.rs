@@ -1,0 +1,715 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Swift container operations
+//!
+//! This module implements Swift container CRUD operations and container-bucket translation.
+
+use crate::swift::account::validate_account_access;
+use crate::swift::types::Container;
+use crate::swift::{SwiftError, SwiftResult};
+use rustfs_credentials::Credentials;
+use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::store_api::{
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions,
+};
+use tracing::error;
+
+/// Sanitize storage layer errors for client responses
+///
+/// Logs detailed error server-side while returning generic message to client.
+/// This prevents information disclosure vulnerabilities.
+fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> SwiftError {
+    // Log detailed error server-side
+    error!("Storage operation '{}' failed: {}", operation, error);
+
+    // Return generic error to client
+    SwiftError::InternalServerError(format!("{} operation failed", operation))
+}
+
+/// Container name translation options
+#[derive(Debug, Clone)]
+pub struct ContainerMapperConfig {
+    /// Enable tenant prefixing for bucket names
+    /// When true, Swift container names are prefixed with project_id
+    /// Example: container "mycontainer" for project "abc123" becomes bucket "abc123-mycontainer"
+    pub tenant_prefix_enabled: bool,
+}
+
+impl Default for ContainerMapperConfig {
+    fn default() -> Self {
+        Self {
+            tenant_prefix_enabled: true,
+        }
+    }
+}
+
+/// Handles translation between Swift container names and S3 bucket names
+pub struct ContainerMapper {
+    config: ContainerMapperConfig,
+}
+
+impl ContainerMapper {
+    /// Create a new container mapper with given configuration
+    pub fn new(config: ContainerMapperConfig) -> Self {
+        Self { config }
+    }
+
+    /// Create a new container mapper with default configuration
+    #[allow(dead_code)] // Phase 2: Will be used by list_containers
+    pub fn default() -> Self {
+        Self::new(ContainerMapperConfig::default())
+    }
+
+    /// Convert Swift container name to S3 bucket name
+    ///
+    /// When tenant_prefix_enabled is true:
+    ///   container="mycontainer", project_id="abc123" -> "abc123-mycontainer"
+    /// When tenant_prefix_enabled is false:
+    ///   container="mycontainer", project_id="abc123" -> "mycontainer"
+    #[allow(dead_code)] // Phase 2: Will be used in create/delete container operations
+    pub fn swift_to_s3_bucket(&self, container: &str, project_id: &str) -> String {
+        if self.config.tenant_prefix_enabled {
+            format!("{}-{}", project_id, container)
+        } else {
+            container.to_string()
+        }
+    }
+
+    /// Convert S3 bucket name to Swift container name
+    ///
+    /// When tenant_prefix_enabled is true:
+    ///   bucket="abc123-mycontainer", project_id="abc123" -> "mycontainer"
+    /// When tenant_prefix_enabled is false:
+    ///   bucket="mycontainer", project_id="abc123" -> "mycontainer"
+    ///
+    /// Returns None if bucket doesn't belong to this tenant
+    pub fn s3_to_swift_container(&self, bucket: &str, project_id: &str) -> Option<String> {
+        if self.config.tenant_prefix_enabled {
+            let prefix = format!("{}-", project_id);
+            bucket.strip_prefix(&prefix).map(|container| container.to_string())
+        } else {
+            Some(bucket.to_string())
+        }
+    }
+
+    /// Check if a bucket belongs to the specified project
+    pub fn bucket_belongs_to_project(&self, bucket: &str, project_id: &str) -> bool {
+        if self.config.tenant_prefix_enabled {
+            bucket.starts_with(&format!("{}-", project_id))
+        } else {
+            // Without tenant prefixing, we can't determine ownership from name alone
+            true
+        }
+    }
+}
+
+/// Convert BucketInfo to Swift Container
+///
+/// Maps S3 bucket metadata to Swift container format:
+/// - name: Extracted from bucket name (removing tenant prefix if present)
+/// - count: Number of objects (not available in BucketInfo, set to 0)
+/// - bytes: Total bytes (not available in BucketInfo, set to 0)
+/// - last_modified: ISO 8601 timestamp from created date
+pub fn bucket_info_to_container(info: &BucketInfo, mapper: &ContainerMapper, project_id: &str) -> Option<Container> {
+    // Extract container name (removing tenant prefix if applicable)
+    let container_name = mapper.s3_to_swift_container(&info.name, project_id)?;
+
+    // Format timestamp as ISO 8601
+    let last_modified = info.created.map(|dt| {
+        dt.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| String::new())
+    });
+
+    Some(Container {
+        name: container_name,
+        count: 0, // Will be populated from bucket metadata in future
+        bytes: 0, // Will be populated from bucket metadata in future
+        last_modified,
+    })
+}
+
+/// List containers for a Swift account
+///
+/// This function:
+/// 1. Validates account access using Keystone project_id
+/// 2. Lists all S3 buckets
+/// 3. Filters to buckets belonging to this tenant (using tenant prefix)
+/// 4. Converts BucketInfo to Swift Container format
+#[allow(dead_code)] // Phase 2: Will be used by handler in list containers operation
+pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftResult<Vec<Container>> {
+    // Validate account access and extract project_id
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Create mapper with default config (tenant prefixing enabled)
+    let mapper = ContainerMapper::default();
+
+    // Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // List all buckets
+    let bucket_infos = store
+        .list_bucket(&BucketOptions::default())
+        .await
+        .map_err(|e| sanitize_storage_error("Container listing", e))?;
+
+    // Filter and convert buckets to containers
+    let containers: Vec<Container> = bucket_infos
+        .iter()
+        .filter(|info| mapper.bucket_belongs_to_project(&info.name, &project_id))
+        .filter_map(|info| bucket_info_to_container(info, &mapper, &project_id))
+        .collect();
+
+    Ok(containers)
+}
+
+/// Create a container for a Swift account
+///
+/// This function:
+/// 1. Validates account access using Keystone project_id
+/// 2. Converts Swift container name to S3 bucket name (with tenant prefix)
+/// 3. Creates the bucket in S3 storage
+///
+/// Swift semantics:
+/// - PUT /v1/{account}/{container} creates a container
+/// - Returns 201 Created on success
+/// - Returns 202 Accepted if container already exists
+/// - Returns 400 Bad Request for invalid container names
+#[allow(dead_code)] // Phase 2: Will be used by handler
+pub async fn create_container(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<bool> {
+    // Validate account access and extract project_id
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Validate container name
+    validate_container_name(container)?;
+
+    // Create mapper with default config (tenant prefixing enabled)
+    let mapper = ContainerMapper::default();
+
+    // Convert Swift container name to S3 bucket name
+    let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // Check if bucket already exists
+    let bucket_exists = store.get_bucket_info(&bucket_name, &BucketOptions::default()).await.is_ok();
+
+    if bucket_exists {
+        // Container already exists - Swift returns 202 Accepted
+        return Ok(false);
+    }
+
+    // Create the bucket
+    store
+        .make_bucket(
+            &bucket_name,
+            &MakeBucketOptions {
+                force_create: false,
+                lock_enabled: false,
+                versioning_enabled: false,
+                created_at: None,
+                no_lock: false,
+            },
+        )
+        .await
+        .map_err(|e| sanitize_storage_error("Container creation", e))?;
+
+    // Container created successfully - return true for 201 Created
+    Ok(true)
+}
+
+/// Validate Swift container name
+///
+/// Container names must:
+/// - Be 1-256 characters
+/// - Not contain '/' (reserved for objects)
+/// - Not be empty
+fn validate_container_name(container: &str) -> SwiftResult<()> {
+    if container.is_empty() {
+        return Err(SwiftError::BadRequest("Container name cannot be empty".to_string()));
+    }
+
+    if container.len() > 256 {
+        return Err(SwiftError::BadRequest("Container name too long (max 256 characters)".to_string()));
+    }
+
+    if container.contains('/') {
+        return Err(SwiftError::BadRequest("Container name cannot contain '/'".to_string()));
+    }
+
+    Ok(())
+}
+
+/// Container metadata for HEAD response
+#[derive(Debug, Clone)]
+pub struct ContainerMetadata {
+    /// Number of objects in container
+    pub object_count: u64,
+    /// Total bytes used by objects
+    pub bytes_used: u64,
+    /// Container creation timestamp
+    pub created: Option<time::OffsetDateTime>,
+    /// Custom metadata (from X-Container-Meta-* headers)
+    pub custom_metadata: std::collections::HashMap<String, String>,
+}
+
+/// Get container metadata (for HEAD operation)
+///
+/// This function:
+/// 1. Validates account access using Keystone project_id
+/// 2. Converts Swift container name to S3 bucket name
+/// 3. Retrieves bucket info from storage
+/// 4. Returns container metadata
+///
+/// Swift semantics:
+/// - HEAD /v1/{account}/{container} returns container metadata
+/// - Returns 204 No Content on success with headers
+/// - Returns 404 Not Found if container doesn't exist
+#[allow(dead_code)] // Phase 2: Will be used by handler
+pub async fn get_container_metadata(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<ContainerMetadata> {
+    // Validate account access and extract project_id
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Validate container name
+    validate_container_name(container)?;
+
+    // Create mapper with default config (tenant prefixing enabled)
+    let mapper = ContainerMapper::default();
+
+    // Convert Swift container name to S3 bucket name
+    let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // Get bucket info
+    let bucket_info = store
+        .get_bucket_info(&bucket_name, &BucketOptions::default())
+        .await
+        .map_err(|e| {
+            // Check if bucket not found
+            if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
+                SwiftError::NotFound(format!("Container '{}' not found", container))
+            } else {
+                sanitize_storage_error("Container metadata retrieval", e)
+            }
+        })?;
+
+    // For Phase 2, we return basic metadata
+    // In future phases, we'll need to:
+    // 1. Count actual objects in the bucket
+    // 2. Calculate total bytes used
+    // 3. Retrieve custom metadata from bucket metadata store
+    Ok(ContainerMetadata {
+        object_count: 0, // TODO: Count objects in bucket
+        bytes_used: 0,   // TODO: Sum object sizes
+        created: bucket_info.created,
+        custom_metadata: std::collections::HashMap::new(), // TODO: Load from metadata store
+    })
+}
+
+/// Update container metadata (for POST operation)
+///
+/// This function:
+/// 1. Validates account access using Keystone project_id
+/// 2. Converts Swift container name to S3 bucket name
+/// 3. Validates container exists
+/// 4. Updates custom metadata (X-Container-Meta-* headers)
+///
+/// Swift semantics:
+/// - POST /v1/{account}/{container} updates container metadata
+/// - Returns 204 No Content on success
+/// - Returns 404 Not Found if container doesn't exist
+/// - Metadata is provided via X-Container-Meta-* headers
+#[allow(dead_code)] // Phase 2: Will be used by handler
+pub async fn update_container_metadata(
+    account: &str,
+    container: &str,
+    credentials: &Credentials,
+    _metadata: std::collections::HashMap<String, String>,
+) -> SwiftResult<()> {
+    // Validate account access and extract project_id
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Validate container name
+    validate_container_name(container)?;
+
+    // Create mapper with default config (tenant prefixing enabled)
+    let mapper = ContainerMapper::default();
+
+    // Convert Swift container name to S3 bucket name
+    let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // Verify container exists
+    store
+        .get_bucket_info(&bucket_name, &BucketOptions::default())
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
+                SwiftError::NotFound(format!("Container '{}' not found", container))
+            } else {
+                sanitize_storage_error("Container metadata retrieval", e)
+            }
+        })?;
+
+    // TODO: Phase 2 - Implement metadata storage
+    // For now, we just validate the container exists
+    // In future phases, we'll need to:
+    // 1. Store custom metadata in bucket metadata store
+    // 2. Handle X-Container-Read/Write ACL headers
+    // 3. Implement metadata merge semantics (POST merges, DELETE removes)
+
+    Ok(())
+}
+
+/// Delete a container
+///
+/// This function:
+/// 1. Validates account access using Keystone project_id
+/// 2. Converts Swift container name to S3 bucket name
+/// 3. Verifies container exists
+/// 4. Deletes the bucket from storage
+///
+/// Swift semantics:
+/// - DELETE /v1/{account}/{container} deletes a container
+/// - Returns 204 No Content on success
+/// - Returns 404 Not Found if container doesn't exist
+/// - Returns 409 Conflict if container is not empty
+#[allow(dead_code)] // Phase 2: Will be used by handler
+pub async fn delete_container(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<()> {
+    // Validate account access and extract project_id
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Validate container name
+    validate_container_name(container)?;
+
+    // Create mapper with default config (tenant prefixing enabled)
+    let mapper = ContainerMapper::default();
+
+    // Convert Swift container name to S3 bucket name
+    let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // Verify container exists first
+    store
+        .get_bucket_info(&bucket_name, &BucketOptions::default())
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
+                SwiftError::NotFound(format!("Container '{}' not found", container))
+            } else {
+                sanitize_storage_error("Container info retrieval", e)
+            }
+        })?;
+
+    // Delete the bucket
+    store
+        .delete_bucket(
+            &bucket_name,
+            &DeleteBucketOptions {
+                force: false, // Swift requires containers to be empty
+                no_lock: false,
+                no_recreate: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| {
+            let error_msg = e.to_string();
+            // Check if bucket is not empty
+            if error_msg.contains("not empty") || error_msg.contains("BucketNotEmpty") {
+                SwiftError::Conflict(format!("Container '{}' is not empty. Delete all objects first.", container))
+            } else if error_msg.contains("not found") || error_msg.contains("NoSuchBucket") {
+                SwiftError::NotFound(format!("Container '{}' not found", container))
+            } else {
+                sanitize_storage_error("Container deletion", e)
+            }
+        })?;
+
+    Ok(())
+}
+
+/// List objects in a container (GET /v1/{account}/{container})
+///
+/// Returns a list of objects within the specified container.
+/// Supports pagination, prefix filtering, and delimiter-based hierarchical listing.
+///
+/// # Arguments
+///
+/// * `account` - Swift account identifier (AUTH_{project_id})
+/// * `container` - Container name
+/// * `credentials` - Keystone credentials from middleware
+/// * `limit` - Maximum number of objects to return (default 10000)
+/// * `marker` - Pagination marker (start after this object name)
+/// * `prefix` - Filter objects by prefix
+/// * `delimiter` - Delimiter for hierarchical listings (usually "/")
+///
+/// # Returns
+///
+/// A vector of Object structs containing object metadata
+///
+/// # Errors
+///
+/// Returns SwiftError if:
+/// - Account validation fails
+/// - Container doesn't exist
+/// - Storage layer errors occur
+#[allow(dead_code)] // Phase 3: Will be used in handler for GET container operation
+pub async fn list_objects(
+    account: &str,
+    container: &str,
+    credentials: &Credentials,
+    limit: Option<i32>,
+    marker: Option<String>,
+    prefix: Option<String>,
+    delimiter: Option<String>,
+) -> SwiftResult<Vec<crate::swift::types::Object>> {
+    use crate::swift::types::Object;
+
+    // Validate account access and extract project_id
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Map container to bucket
+    let mapper = ContainerMapper::default();
+    let bucket = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // Verify bucket exists
+    store.get_bucket_info(&bucket, &BucketOptions::default()).await.map_err(|e| {
+        if e.to_string().contains("does not exist") {
+            SwiftError::NotFound(format!("Container '{}' not found", container))
+        } else {
+            sanitize_storage_error("Container access", e)
+        }
+    })?;
+
+    // Prepare list parameters
+    let max_keys = limit.unwrap_or(10000).max(0);
+    let prefix_str = prefix.unwrap_or_default();
+    let delimiter_opt = delimiter.filter(|d| !d.is_empty());
+
+    // List objects from storage
+    let object_infos = store
+        .list_objects_v2(
+            &bucket,
+            &prefix_str,
+            marker,
+            delimiter_opt,
+            max_keys,
+            false, // fetch_owner
+            None,  // start_after
+            false, // include_deleted
+        )
+        .await
+        .map_err(|e| sanitize_storage_error("Object listing", e))?;
+
+    // Convert ObjectInfo to Swift Object format
+    let mut swift_objects = Vec::new();
+    for obj_info in object_infos.objects {
+        // Skip empty names
+        if obj_info.name.is_empty() {
+            continue;
+        }
+
+        // Format last_modified as ISO 8601
+        let last_modified = if let Some(mod_time) = obj_info.mod_time {
+            mod_time
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        swift_objects.push(Object {
+            name: obj_info.name,
+            hash: obj_info.etag.unwrap_or_default(),
+            bytes: obj_info.size as u64,
+            content_type: obj_info
+                .content_type
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            last_modified,
+        });
+    }
+
+    Ok(swift_objects)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn test_swift_to_s3_bucket_with_prefix() {
+        let mapper = ContainerMapper::new(ContainerMapperConfig {
+            tenant_prefix_enabled: true,
+        });
+
+        let bucket = mapper.swift_to_s3_bucket("mycontainer", "abc123");
+        assert_eq!(bucket, "abc123-mycontainer");
+    }
+
+    #[test]
+    fn test_swift_to_s3_bucket_without_prefix() {
+        let mapper = ContainerMapper::new(ContainerMapperConfig {
+            tenant_prefix_enabled: false,
+        });
+
+        let bucket = mapper.swift_to_s3_bucket("mycontainer", "abc123");
+        assert_eq!(bucket, "mycontainer");
+    }
+
+    #[test]
+    fn test_s3_to_swift_container_with_prefix() {
+        let mapper = ContainerMapper::new(ContainerMapperConfig {
+            tenant_prefix_enabled: true,
+        });
+
+        let container = mapper.s3_to_swift_container("abc123-mycontainer", "abc123");
+        assert_eq!(container, Some("mycontainer".to_string()));
+
+        // Different tenant should return None
+        let container = mapper.s3_to_swift_container("abc123-mycontainer", "xyz789");
+        assert_eq!(container, None);
+    }
+
+    #[test]
+    fn test_s3_to_swift_container_without_prefix() {
+        let mapper = ContainerMapper::new(ContainerMapperConfig {
+            tenant_prefix_enabled: false,
+        });
+
+        let container = mapper.s3_to_swift_container("mycontainer", "abc123");
+        assert_eq!(container, Some("mycontainer".to_string()));
+    }
+
+    #[test]
+    fn test_bucket_belongs_to_project() {
+        let mapper = ContainerMapper::new(ContainerMapperConfig {
+            tenant_prefix_enabled: true,
+        });
+
+        assert!(mapper.bucket_belongs_to_project("abc123-mycontainer", "abc123"));
+        assert!(!mapper.bucket_belongs_to_project("xyz789-mycontainer", "abc123"));
+        assert!(!mapper.bucket_belongs_to_project("mycontainer", "abc123"));
+    }
+
+    #[test]
+    fn test_bucket_info_to_container() {
+        let mapper = ContainerMapper::new(ContainerMapperConfig {
+            tenant_prefix_enabled: true,
+        });
+
+        let info = BucketInfo {
+            name: "abc123-mycontainer".to_string(),
+            created: Some(OffsetDateTime::now_utc()),
+            deleted: None,
+            versioning: false,
+            object_locking: false,
+        };
+
+        let container = bucket_info_to_container(&info, &mapper, "abc123");
+        assert!(container.is_some());
+        let container = container.unwrap();
+        assert_eq!(container.name, "mycontainer");
+        assert_eq!(container.count, 0);
+        assert_eq!(container.bytes, 0);
+        assert!(container.last_modified.is_some());
+    }
+
+    #[test]
+    fn test_bucket_info_to_container_wrong_tenant() {
+        let mapper = ContainerMapper::new(ContainerMapperConfig {
+            tenant_prefix_enabled: true,
+        });
+
+        let info = BucketInfo {
+            name: "abc123-mycontainer".to_string(),
+            created: Some(OffsetDateTime::now_utc()),
+            deleted: None,
+            versioning: false,
+            object_locking: false,
+        };
+
+        // Different project_id should return None
+        let container = bucket_info_to_container(&info, &mapper, "xyz789");
+        assert!(container.is_none());
+    }
+
+    #[test]
+    fn test_validate_container_name_valid() {
+        assert!(validate_container_name("mycontainer").is_ok());
+        assert!(validate_container_name("my-container").is_ok());
+        assert!(validate_container_name("my_container").is_ok());
+        assert!(validate_container_name("my.container").is_ok());
+        assert!(validate_container_name("123").is_ok());
+    }
+
+    #[test]
+    fn test_validate_container_name_empty() {
+        let result = validate_container_name("");
+        assert!(result.is_err());
+        match result {
+            Err(SwiftError::BadRequest(msg)) => {
+                assert!(msg.contains("empty"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_container_name_too_long() {
+        let long_name = "a".repeat(257);
+        let result = validate_container_name(&long_name);
+        assert!(result.is_err());
+        match result {
+            Err(SwiftError::BadRequest(msg)) => {
+                assert!(msg.contains("too long"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_container_name_with_slash() {
+        let result = validate_container_name("my/container");
+        assert!(result.is_err());
+        match result {
+            Err(SwiftError::BadRequest(msg)) => {
+                assert!(msg.contains("'/'"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+}
