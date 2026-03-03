@@ -32,6 +32,7 @@ use tower::Service;
 use tracing::{debug, instrument};
 
 /// Swift-aware service that routes to Swift handlers or S3 service
+#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 #[derive(Clone)]
 pub struct SwiftService<S> {
     /// Swift router for URL parsing
@@ -42,6 +43,7 @@ pub struct SwiftService<S> {
 
 impl<S> SwiftService<S> {
     /// Create a new Swift service wrapping an S3 service
+    #[allow(dead_code)] // TODO: Remove once Swift API integration is complete
     pub fn new(enabled: bool, url_prefix: Option<String>, s3_service: S) -> Self {
         let router = SwiftRouter::new(enabled, url_prefix);
         Self { router, s3_service }
@@ -98,6 +100,7 @@ where
 }
 
 /// Handle Swift API requests
+#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials>) -> Result<Response<Body>, SwiftError> {
     // Credentials are required for all Swift operations
     let credentials = credentials.ok_or_else(|| SwiftError::Unauthorized("Authentication required".to_string()))?;
@@ -341,6 +344,7 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
 }
 
 /// Generate a transaction ID for Swift responses
+#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 fn generate_trans_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
@@ -351,6 +355,7 @@ fn generate_trans_id() -> String {
 }
 
 /// Convert SwiftError to HTTP Response
+#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 fn swift_error_to_response(error: SwiftError) -> Response<Body> {
     let trans_id = generate_trans_id();
     let (status, message) = match &error {

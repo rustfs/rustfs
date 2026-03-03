@@ -287,6 +287,7 @@ fn validate_container_name(container: &str) -> SwiftResult<()> {
 }
 
 /// Container metadata for HEAD response
+#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 #[derive(Debug, Clone)]
 pub struct ContainerMetadata {
     /// Number of objects in container

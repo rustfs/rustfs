@@ -19,6 +19,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// Decode percent-encoded URL segment
+#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 fn decode_url_segment(segment: &str) -> String {
     percent_encoding::percent_decode_str(segment).decode_utf8_lossy().into_owned()
 }
@@ -28,6 +29,7 @@ fn decode_url_segment(segment: &str) -> String {
 static ACCOUNT_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^AUTH_([a-zA-Z0-9_-]+)$").unwrap());
 
 /// Represents a parsed Swift route
+#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwiftRoute {
     /// Account operation: /v1/{account}
@@ -69,6 +71,7 @@ impl SwiftRoute {
 }
 
 /// Swift URL router
+#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 #[derive(Debug, Clone)]
 pub struct SwiftRouter {
     /// Enable Swift API
@@ -79,11 +82,13 @@ pub struct SwiftRouter {
 
 impl SwiftRouter {
     /// Create a new Swift router
+    #[allow(dead_code)] // TODO: Remove once Swift API integration is complete
     pub fn new(enabled: bool, url_prefix: Option<String>) -> Self {
         Self { enabled, url_prefix }
     }
 
     /// Parse a URI and return a SwiftRoute if it matches Swift URL pattern
+    #[allow(dead_code)] // TODO: Remove once Swift API integration is complete
     pub fn route(&self, uri: &Uri, method: Method) -> Option<SwiftRoute> {
         if !self.enabled {
             return None;
@@ -148,6 +153,7 @@ impl SwiftRouter {
     }
 
     /// Validate account format (must be AUTH_{uuid})
+    #[allow(dead_code)] // TODO: Remove once Swift API integration is complete
     fn is_valid_account(account: &str) -> bool {
         ACCOUNT_PATTERN.is_match(account)
     }
