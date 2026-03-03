@@ -277,14 +277,7 @@ mod tests {
                 msg.extend_from_slice(&sum);
             }
             let got = hex_simd::encode_to_string(&sum, hex_simd::AsciiCase::Lower);
-            assert_eq!(
-                got,
-                expected_hex,
-                "{} selftest mismatch: got {} want {}",
-                format!("{:?}", algo),
-                got,
-                expected_hex
-            );
+            assert_eq!(got, expected_hex, "{:?} selftest mismatch: got {} want {}", algo, got, expected_hex);
         }
     }
 
