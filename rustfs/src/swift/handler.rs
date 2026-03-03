@@ -271,7 +271,7 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                     // Current signature: handle_swift_request(route, credentials)
                     // Required: handle_swift_request(req: Request<B>, route, credentials)
                     Err(SwiftError::NotImplemented(
-                        "Object GET is not yet implemented. Use HEAD for metadata.".to_string()
+                        "Object GET is not yet implemented. Use HEAD for metadata.".to_string(),
                     ))
                 }
                 Method::HEAD => {

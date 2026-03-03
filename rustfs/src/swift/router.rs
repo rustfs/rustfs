@@ -20,9 +20,7 @@ use std::sync::LazyLock;
 
 /// Decode percent-encoded URL segment
 fn decode_url_segment(segment: &str) -> String {
-    percent_encoding::percent_decode_str(segment)
-        .decode_utf8_lossy()
-        .into_owned()
+    percent_encoding::percent_decode_str(segment).decode_utf8_lossy().into_owned()
 }
 
 /// Regex pattern for Swift account URLs: /v1/AUTH_{project_id}
@@ -137,10 +135,7 @@ impl SwiftRouter {
                     return None;
                 }
                 // Join remaining segments as object key, decoding each segment
-                let object_key = object.iter()
-                    .map(|s| decode_url_segment(s))
-                    .collect::<Vec<_>>()
-                    .join("/");
+                let object_key = object.iter().map(|s| decode_url_segment(s)).collect::<Vec<_>>().join("/");
                 Some(SwiftRoute::Object {
                     account: decode_url_segment(account),
                     container: decode_url_segment(container),

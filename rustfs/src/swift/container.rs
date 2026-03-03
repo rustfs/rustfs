@@ -89,8 +89,7 @@ impl ContainerMapper {
         // Format first 8 bytes directly as hex (SHA256 always produces 32 bytes)
         format!(
             "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            result[0], result[1], result[2], result[3],
-            result[4], result[5], result[6], result[7]
+            result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7]
         )
     }
 
@@ -612,7 +611,11 @@ mod tests {
 
         // Verify hash is 16 hex characters (lowercase)
         assert_eq!(expected_hash.len(), 16);
-        assert!(expected_hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            expected_hash
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]
