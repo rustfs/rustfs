@@ -44,7 +44,7 @@ pub enum SwiftRoute {
 
 impl SwiftRoute {
     /// Get the account identifier from the route
-    #[allow(dead_code)] // Phase 1: Will be used in Phase 2-3
+    #[allow(dead_code)] // Used by Swift implementation
     pub fn account(&self) -> &str {
         match self {
             SwiftRoute::Account { account, .. } => account,
@@ -54,7 +54,7 @@ impl SwiftRoute {
     }
 
     /// Extract project_id from account string (removes AUTH_ prefix)
-    #[allow(dead_code)] // Phase 1: Will be used in Phase 2-3
+    #[allow(dead_code)] // Used by Swift implementation
     pub fn project_id(&self) -> Option<&str> {
         let account = self.account();
         ACCOUNT_PATTERN

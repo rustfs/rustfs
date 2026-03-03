@@ -67,7 +67,7 @@ impl ContainerMapper {
     }
 
     /// Create a new container mapper with default configuration
-    #[allow(dead_code)] // Phase 2: Will be used by list_containers
+    #[allow(dead_code)] // Used by: list_containers
     pub fn default() -> Self {
         Self::new(ContainerMapperConfig::default())
     }
@@ -78,7 +78,7 @@ impl ContainerMapper {
     ///   container="mycontainer", project_id="abc123" -> "abc123-mycontainer"
     /// When tenant_prefix_enabled is false:
     ///   container="mycontainer", project_id="abc123" -> "mycontainer"
-    #[allow(dead_code)] // Phase 2: Will be used in create/delete container operations
+    #[allow(dead_code)] // Used in: create/delete container operations
     pub fn swift_to_s3_bucket(&self, container: &str, project_id: &str) -> String {
         if self.config.tenant_prefix_enabled {
             format!("{}-{}", project_id, container)
@@ -147,7 +147,7 @@ pub fn bucket_info_to_container(info: &BucketInfo, mapper: &ContainerMapper, pro
 /// 2. Lists all S3 buckets
 /// 3. Filters to buckets belonging to this tenant (using tenant prefix)
 /// 4. Converts BucketInfo to Swift Container format
-#[allow(dead_code)] // Phase 2: Will be used by handler in list containers operation
+#[allow(dead_code)] // Used by handler: list containers
 pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftResult<Vec<Container>> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -188,7 +188,7 @@ pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftR
 /// - Returns 201 Created on success
 /// - Returns 202 Accepted if container already exists
 /// - Returns 400 Bad Request for invalid container names
-#[allow(dead_code)] // Phase 2: Will be used by handler
+#[allow(dead_code)] // Used by handler
 pub async fn create_container(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<bool> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -281,7 +281,7 @@ pub struct ContainerMetadata {
 /// - HEAD /v1/{account}/{container} returns container metadata
 /// - Returns 204 No Content on success with headers
 /// - Returns 404 Not Found if container doesn't exist
-#[allow(dead_code)] // Phase 2: Will be used by handler
+#[allow(dead_code)] // Used by handler
 pub async fn get_container_metadata(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<ContainerMetadata> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -313,16 +313,15 @@ pub async fn get_container_metadata(account: &str, container: &str, credentials:
             }
         })?;
 
-    // For Phase 2, we return basic metadata
-    // In future phases, we'll need to:
-    // 1. Count actual objects in the bucket
-    // 2. Calculate total bytes used
-    // 3. Retrieve custom metadata from bucket metadata store
+    // Currently returns basic metadata with limitations:
+    // 1. Object count requires iterating all objects (expensive)
+    // 2. Bytes used requires summing all object sizes (expensive)
+    // 3. Custom metadata requires backend metadata storage implementation
     Ok(ContainerMetadata {
-        object_count: 0, // TODO: Count objects in bucket
-        bytes_used: 0,   // TODO: Sum object sizes
+        object_count: 0, // TODO: implement object counting in backend
+        bytes_used: 0,   // TODO: implement size aggregation in backend
         created: bucket_info.created,
-        custom_metadata: std::collections::HashMap::new(), // TODO: Load from metadata store
+        custom_metadata: std::collections::HashMap::new(), // TODO: implement bucket-level metadata storage
     })
 }
 
@@ -339,7 +338,7 @@ pub async fn get_container_metadata(account: &str, container: &str, credentials:
 /// - Returns 204 No Content on success
 /// - Returns 404 Not Found if container doesn't exist
 /// - Metadata is provided via X-Container-Meta-* headers
-#[allow(dead_code)] // Phase 2: Will be used by handler
+#[allow(dead_code)] // Used by handler
 pub async fn update_container_metadata(
     account: &str,
     container: &str,
@@ -375,12 +374,12 @@ pub async fn update_container_metadata(
             }
         })?;
 
-    // TODO: Phase 2 - Implement metadata storage
-    // For now, we just validate the container exists
-    // In future phases, we'll need to:
-    // 1. Store custom metadata in bucket metadata store
-    // 2. Handle X-Container-Read/Write ACL headers
-    // 3. Implement metadata merge semantics (POST merges, DELETE removes)
+    // TODO: implement bucket-level metadata storage in backend
+    // Currently only validates the container exists
+    // Future enhancements needed:
+    // 1. Store custom metadata (X-Container-Meta-* headers)
+    // 2. Support X-Container-Read/Write ACL headers
+    // 3. Implement metadata merge semantics (POST merges, not replaces)
 
     Ok(())
 }
@@ -398,7 +397,7 @@ pub async fn update_container_metadata(
 /// - Returns 204 No Content on success
 /// - Returns 404 Not Found if container doesn't exist
 /// - Returns 409 Conflict if container is not empty
-#[allow(dead_code)] // Phase 2: Will be used by handler
+#[allow(dead_code)] // Used by handler
 pub async fn delete_container(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<()> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -481,7 +480,7 @@ pub async fn delete_container(account: &str, container: &str, credentials: &Cred
 /// - Account validation fails
 /// - Container doesn't exist
 /// - Storage layer errors occur
-#[allow(dead_code)] // Phase 3: Will be used in handler for GET container operation
+#[allow(dead_code)] // Handler integration: GET container
 pub async fn list_objects(
     account: &str,
     container: &str,

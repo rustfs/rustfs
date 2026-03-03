@@ -20,7 +20,7 @@ use std::fmt;
 
 /// Swift-specific error type
 #[derive(Debug)]
-#[allow(dead_code)] // Phase 1: Some variants will be used in Phase 2-3
+#[allow(dead_code)] // Error variants used by Swift implementation
 pub enum SwiftError {
     /// 400 Bad Request
     BadRequest(String),

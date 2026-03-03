@@ -33,7 +33,7 @@ use rustfs_credentials::Credentials;
 /// - Account format is invalid
 /// - Credentials don't contain project_id
 /// - Account project_id doesn't match credentials project_id
-#[allow(dead_code)] // Phase 1: Will be used in Phase 2-3
+#[allow(dead_code)] // Used by Swift implementation
 pub fn validate_account_access(account: &str, credentials: &Credentials) -> SwiftResult<String> {
     // Extract project_id from account (strip "AUTH_" prefix)
     let account_project_id = account
@@ -65,7 +65,7 @@ pub fn validate_account_access(account: &str, credentials: &Credentials) -> Swif
 ///
 /// Admin users (with "admin" or "reseller_admin" roles) can perform
 /// cross-tenant operations and administrative tasks.
-#[allow(dead_code)] // Phase 1: Will be used in Phase 2-3
+#[allow(dead_code)] // Used by Swift implementation
 pub fn is_admin_user(credentials: &Credentials) -> bool {
     credentials
         .claims

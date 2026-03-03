@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 /// Swift container metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)] // Phase 1: Will be used in Phase 2
+#[allow(dead_code)] // Used in container listing operations
 pub struct Container {
     /// Container name
     pub name: String,
@@ -34,7 +34,7 @@ pub struct Container {
 
 /// Swift object metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)] // Phase 1: Will be used in Phase 3
+#[allow(dead_code)] // Used in object listing operations
 pub struct Object {
     /// Object name (key)
     pub name: String,
@@ -50,7 +50,7 @@ pub struct Object {
 
 /// Swift metadata extracted from headers
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Phase 1: Will be used in Phase 2-3
+#[allow(dead_code)] // Used by Swift implementation
 pub struct SwiftMetadata {
     /// Custom metadata key-value pairs (from X-Container-Meta-* or X-Object-Meta-*)
     pub metadata: HashMap<String, String>,

@@ -123,14 +123,14 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::HEAD => {
-                    // Account metadata - Phase 2
+                    // Account metadata operations not yet implemented
                     Err(SwiftError::InternalServerError(format!(
                         "Swift Account HEAD operation not yet implemented: HEAD {}",
                         account
                     )))
                 }
                 Method::POST => {
-                    // Update account metadata - Phase 2
+                    // Account metadata update not yet implemented
                     Err(SwiftError::InternalServerError(format!(
                         "Swift Account POST operation not yet implemented: POST {}",
                         account
@@ -216,7 +216,7 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                 Method::POST => {
                     // Update container metadata
                     // Note: Currently sends empty metadata because handler doesn't have access to request headers
-                    // TODO: Refactor handler to pass headers for metadata extraction (X-Container-Meta-*)
+                    // TODO: handler needs access to request headers for X-Container-Meta-* extraction
                     let metadata = std::collections::HashMap::new();
 
                     container::update_container_metadata(&account, &container, &credentials, metadata).await?;
@@ -258,7 +258,7 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                 Method::PUT => {
                     // Upload object
                     // Note: Currently cannot handle request body in this handler signature
-                    // TODO: Refactor handler to accept request body for object upload
+                    // TODO: handler needs access to request body for object upload
                     Err(SwiftError::InternalServerError(
                         "Object PUT not yet integrated with handler (requires request body access)".to_string(),
                     ))
@@ -267,11 +267,9 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                     // Download object
                     // Note: Handler architecture doesn't support streaming response bodies
                     // The get_object function returns a stream, but this handler can only return Body::from(String)
-                    // TODO: Refactor handler to accept Request<B> and return streaming Response<Body>
-                    // This requires changing handler signature from:
-                    //   handle_swift_request(route, credentials)
-                    // to:
-                    //   handle_swift_request(req: Request<B>, route, credentials)
+                    // TODO: handler needs Request<B> parameter to support streaming response
+                    // Current signature: handle_swift_request(route, credentials)
+                    // Required: handle_swift_request(req: Request<B>, route, credentials)
                     let _reader = object::get_object(&account, &container, &object, &credentials, None).await?;
 
                     let trans_id = generate_trans_id();
@@ -314,7 +312,7 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                 Method::POST => {
                     // Update object metadata
                     // Note: Currently sends empty headers because handler doesn't have access to request headers
-                    // TODO: Refactor handler to pass headers for metadata extraction (X-Object-Meta-*)
+                    // TODO: handler needs access to request headers for X-Object-Meta-* extraction
                     Err(SwiftError::InternalServerError(
                         "Object POST not yet integrated with handler (requires request headers access)".to_string(),
                     ))
@@ -337,7 +335,7 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                 m if m == Method::from_bytes(b"COPY").unwrap_or(Method::GET) && m.as_str() == "COPY" => {
                     // Server-side object copy
                     // Note: Requires access to Destination header from request
-                    // TODO: Refactor handler to pass headers for copy destination parsing
+                    // TODO: handler needs access to request headers for Destination header parsing
                     Err(SwiftError::InternalServerError(
                         "Object COPY not yet integrated with handler (requires request headers access)".to_string(),
                     ))
@@ -384,8 +382,8 @@ fn swift_error_to_response(error: SwiftError) -> Response<Body> {
         })
 }
 
-// Tests commented out for Phase 1 - will be fixed in Phase 2 when we have real handlers
+// Tests will be added when handler architecture supports full request access
 // #[cfg(test)]
 // mod tests {
-//     // Tests will be re-enabled in Phase 2
+//     // Tests will be re-enabled after handler refactoring
 // }
