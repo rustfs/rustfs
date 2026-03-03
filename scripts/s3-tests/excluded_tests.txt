@@ -1,20 +1,13 @@
-# Legacy non-standard S3 test list (compatibility fallback)
-# =========================================================
+# Excluded S3 feature tests
+# =========================
 #
-# This file is kept for backward compatibility.
-# Active exclusion classification now uses excluded_tests.txt.
-# These tests use vendor-specific extensions not part of AWS S3 API.
+# These tests are intentionally excluded from RustFS compatibility gating.
 #
-# Exclusion reasons:
-# - fails_on_aws marker: Ceph-specific features
-# - X-RGW-* headers: Ceph proprietary headers
-# - allowUnordered: Ceph-specific query parameter
-# - Bucket Logging: Ceph-specific logging extensions
-# - Object Lock: Ceph-specific lock behavior differences
-# - Lifecycle: Ceph-specific lifecycle expiration behavior
-# - SSE-KMS: Ceph-specific KMS extensions
-# - Error format differences: Minor response format variations
+# Exclusion buckets:
+# - Vendor-specific behavior not required for RustFS S3 compatibility
+# - Intentionally unsupported by product decision (for example ACL authorization)
 
+# Vendor-specific / non-portable tests
 test_100_continue_error_retry
 test_account_usage
 test_atomic_conditional_write_1mb
@@ -351,3 +344,82 @@ test_versioning_multi_object_delete_with_marker_create
 test_versioning_obj_create_overwrite_multipart
 test_versioning_obj_suspended_copy
 test_versioning_stack_delete_merkers
+
+# Intentionally unsupported by design: ACL-related tests
+test_object_raw_get
+test_object_raw_get_bucket_gone
+test_object_raw_get_object_gone
+test_object_copy_not_owned_object_bucket
+test_100_continue
+test_cors_origin_response
+test_cors_origin_wildcard
+test_bucket_policy_put_obj_grant
+test_bucket_list_objects_anonymous
+test_bucket_listv2_objects_anonymous
+test_post_object_anonymous_request
+test_post_object_set_success_code
+test_post_object_set_invalid_success_code
+test_access_bucket_private_object_private
+test_access_bucket_private_object_publicread
+test_access_bucket_private_object_publicreadwrite
+test_access_bucket_private_objectv2_private
+test_access_bucket_private_objectv2_publicread
+test_access_bucket_private_objectv2_publicreadwrite
+test_access_bucket_publicread_object_private
+test_access_bucket_publicread_object_publicread
+test_access_bucket_publicread_object_publicreadwrite
+test_access_bucket_publicreadwrite_object_private
+test_access_bucket_publicreadwrite_object_publicread
+test_access_bucket_publicreadwrite_object_publicreadwrite
+test_object_anon_put_write_access
+test_get_public_acl_bucket_policy_status
+test_get_authpublic_acl_bucket_policy_status
+test_get_publicpolicy_acl_bucket_policy_status
+test_get_nonpublicpolicy_acl_bucket_policy_status
+test_block_public_put_bucket_acls
+test_block_public_object_canned_acls
+test_ignore_public_acls
+test_bucket_policy_acl
+test_bucketv2_policy_acl
+test_bucket_policy_put_obj_acl
+test_object_presigned_put_object_with_acl
+test_object_put_acl_mtime
+test_versioned_object_acl
+test_object_presigned_put_object_with_acl_tenant
+test_bucket_acl_canned
+test_bucket_acl_canned_authenticatedread
+test_bucket_acl_canned_during_create
+test_bucket_acl_canned_private_to_private
+test_bucket_acl_canned_publicreadwrite
+test_bucket_acl_default
+test_bucket_acl_grant_email
+test_bucket_acl_grant_email_not_exist
+test_bucket_acl_grant_nonexist_user
+test_bucket_acl_grant_userid_fullcontrol
+test_bucket_acl_grant_userid_read
+test_bucket_acl_grant_userid_readacp
+test_bucket_acl_grant_userid_write
+test_bucket_acl_grant_userid_writeacp
+test_bucket_acl_revoke_all
+test_bucket_concurrent_set_canned_acl
+test_object_acl
+test_object_acl_canned
+test_object_acl_canned_authenticatedread
+test_object_acl_canned_bucketownerfullcontrol
+test_object_acl_canned_bucketownerread
+test_object_acl_canned_during_create
+test_object_acl_canned_publicreadwrite
+test_object_acl_default
+test_object_acl_full_control_verify_attributes
+test_object_acl_full_control_verify_owner
+test_object_acl_read
+test_object_acl_readacp
+test_object_acl_write
+test_object_acl_writeacp
+test_put_bucket_acl_grant_group_read
+test_object_raw_authenticated_bucket_acl
+test_object_raw_authenticated_object_acl
+test_object_raw_get_bucket_acl
+test_object_raw_get_object_acl
+test_cors_presigned_put_object_with_acl
+test_cors_presigned_put_object_tenant_with_acl

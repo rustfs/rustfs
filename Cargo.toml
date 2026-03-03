@@ -216,7 +216,7 @@ matchit = "0.9.1"
 md-5 = "0.11.0-rc.5"
 md5 = "0.8.0"
 mime_guess = "2.0.5"
-moka = { version = "0.12.13", features = ["future"] }
+moka = { version = "0.12.14", features = ["future"] }
 netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.12.0"
@@ -245,7 +245,7 @@ snafu = "0.8.9"
 snap = "1.1.1"
 starshard = { version = "1.1.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.28.0", features = ["derive"] }
-sysinfo = "0.38.2"
+sysinfo = "0.38.3"
 temp-env = "0.3.6"
 tempfile = "3.26.0"
 test-case = "3.3.1"
@@ -275,6 +275,7 @@ opentelemetry-otlp = { version = "0.31.0", features = ["gzip-http", "reqwest-rus
 opentelemetry_sdk = { version = "0.31.0" }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.31.0" }
+pyroscope = { version= "1.0.1", features= ["backend-pprof-rs"]}
 
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
@@ -291,7 +292,9 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profilin
 # Used to generate pprof-compatible memory profiling data and support symbolization and flame graphs
 jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
-pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
+# pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
+# Pyroscope uses a patched pprof, until they merge back upstream, replace all references. Otherwise, two pprof libs with symbol collision.
+pprof = { package = "pprof-pyroscope-fork", version = "0.1500.1", features = ["flamegraph", "protobuf-codec"]} 
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs", "rustfs-mcp"]

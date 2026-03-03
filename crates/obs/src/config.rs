@@ -33,13 +33,14 @@ use rustfs_config::observability::{
     ENV_OBS_LOG_MATCH_MODE, ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES,
     ENV_OBS_LOG_MIN_FILE_AGE_SECONDS, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOGGER_LEVEL,
     ENV_OBS_LOGS_EXPORT_ENABLED, ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_METRICS_EXPORT_ENABLED,
-    ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_TRACE_ENDPOINT, ENV_OBS_TRACES_EXPORT_ENABLED,
-    ENV_OBS_USE_STDOUT,
+    ENV_OBS_PROFILING_ENDPOINT, ENV_OBS_PROFILING_EXPORT_ENABLED, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME,
+    ENV_OBS_SERVICE_VERSION, ENV_OBS_TRACE_ENDPOINT, ENV_OBS_TRACES_EXPORT_ENABLED, ENV_OBS_USE_STDOUT,
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME,
     DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED,
-    DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+    DEFAULT_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
+    SERVICE_VERSION, USE_STDOUT,
 };
 use rustfs_utils::{get_env_bool, get_env_f64, get_env_opt_str, get_env_str, get_env_u64, get_env_usize};
 use serde::{Deserialize, Serialize};
@@ -92,12 +93,16 @@ pub struct OtelConfig {
     pub metric_endpoint: Option<String>,
     /// Dedicated log endpoint; overrides `endpoint` + `/v1/logs` fallback.
     pub log_endpoint: Option<String>,
+    /// Dedicated profiling endpoint.
+    pub profiling_endpoint: Option<String>,
     /// Whether to export distributed traces (default: `true`).
     pub traces_export_enabled: Option<bool>,
     /// Whether to export metrics (default: `true`).
     pub metrics_export_enabled: Option<bool>,
     /// Whether to export logs via OTLP (default: `true`).
     pub logs_export_enabled: Option<bool>,
+    /// Whether to export profiles via pyroscope (default: `true`).
+    pub profiling_export_enabled: Option<bool>,
     /// **[OTLP-only]** Mirror all signals to stdout in addition to OTLP export.
     /// Only applies when an OTLP endpoint is configured.
     pub use_stdout: Option<bool>,
@@ -216,9 +221,11 @@ impl OtelConfig {
             trace_endpoint: get_env_opt_str(ENV_OBS_TRACE_ENDPOINT),
             metric_endpoint: get_env_opt_str(ENV_OBS_METRIC_ENDPOINT),
             log_endpoint: get_env_opt_str(ENV_OBS_LOG_ENDPOINT),
+            profiling_endpoint: get_env_opt_str(ENV_OBS_PROFILING_ENDPOINT),
             traces_export_enabled: Some(get_env_bool(ENV_OBS_TRACES_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED)),
             metrics_export_enabled: Some(get_env_bool(ENV_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED)),
             logs_export_enabled: Some(get_env_bool(ENV_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED)),
+            profiling_export_enabled: Some(get_env_bool(ENV_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED)),
             use_stdout: Some(use_stdout),
             sample_ratio: Some(get_env_f64(ENV_OBS_SAMPLE_RATIO, SAMPLE_RATIO)),
             meter_interval: Some(get_env_u64(ENV_OBS_METER_INTERVAL, METER_INTERVAL)),
