@@ -86,9 +86,12 @@ impl ContainerMapper {
         hasher.update(project_id.as_bytes());
         let result = hasher.finalize();
 
-        // Take first 8 bytes and convert to 16 hex characters
-        let bytes: [u8; 8] = result[0..8].try_into().unwrap();
-        format!("{:016x}", u64::from_be_bytes(bytes))
+        // Format first 8 bytes directly as hex (SHA256 always produces 32 bytes)
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            result[0], result[1], result[2], result[3],
+            result[4], result[5], result[6], result[7]
+        )
     }
 
     /// Convert Swift container name to S3 bucket name

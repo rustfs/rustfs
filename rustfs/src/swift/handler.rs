@@ -270,9 +270,9 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                     // TODO: handler needs Request<B> parameter to support streaming response
                     // Current signature: handle_swift_request(route, credentials)
                     // Required: handle_swift_request(req: Request<B>, route, credentials)
-                    return Err(SwiftError::NotImplemented(
+                    Err(SwiftError::NotImplemented(
                         "Object GET is not yet implemented. Use HEAD for metadata.".to_string()
-                    ));
+                    ))
                 }
                 Method::HEAD => {
                     // Get object metadata

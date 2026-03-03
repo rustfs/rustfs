@@ -42,7 +42,6 @@ pub mod router;
 pub mod types;
 
 pub use errors::{SwiftError, SwiftResult};
-pub use handler::SwiftService;
 pub use router::{SwiftRoute, SwiftRouter};
 // Note: Container, Object, and SwiftMetadata types used by Swift implementation
 #[allow(unused_imports)]
