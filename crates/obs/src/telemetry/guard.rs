@@ -92,6 +92,15 @@ impl Drop for OtelGuard {
             eprintln!("Logger shutdown error: {err:?}");
         }
 
+        if let Some(agent) = self.profiling_agent.take() {
+            match agent.stop() {
+                Err(err) => eprintln!("Profiling agent stop error: {err:?}"),
+                Ok(stopped) => {
+                    stopped.shutdown();
+                }
+            }
+        }
+
         if let Some(handle) = self.cleanup_handle.take() {
             handle.abort();
             eprintln!("Log cleanup task stopped");
@@ -105,14 +114,6 @@ impl Drop for OtelGuard {
         if let Some(guard) = self.stdout_guard.take() {
             drop(guard);
             eprintln!("Stdout guard dropped, flushing logs.");
-        }
-        if let Some(agent) = self.profiling_agent.take() {
-            match agent.stop() {
-                Err(err) => eprintln!("Profiling agent stop error: {err:?}"),
-                Ok(stopped) => {
-                    stopped.shutdown();
-                }
-            }
         }
     }
 }
