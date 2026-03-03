@@ -560,17 +560,21 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
 
     // 7. Delete object from storage
     // Swift DELETE is idempotent - returns success even if object doesn't exist
-    let _result = store.delete_object(&bucket, &s3_key, opts).await.map_err(|e| {
-        let err_str = e.to_string();
-        if err_str.contains("Bucket not found") || err_str.contains("does not exist") {
-            SwiftError::NotFound(format!("Container '{}' not found", container))
-        } else {
-            sanitize_storage_error("Object deletion", e)
+    match store.delete_object(&bucket, &s3_key, opts).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let err_str = e.to_string();
+            // Only fail if the container (bucket) doesn't exist
+            if err_str.contains("Bucket not found") {
+                Err(SwiftError::NotFound(format!("Container '{}' not found", container)))
+            } else if err_str.contains("Object not found") || err_str.contains("does not exist") {
+                // Object already gone - this is success for idempotent DELETE
+                Ok(())
+            } else {
+                Err(sanitize_storage_error("Object deletion", e))
+            }
         }
-    })?;
-
-    // 8. Swift DELETE is idempotent - always return success
-    Ok(())
+    }
 }
 
 /// Update object metadata (POST)
