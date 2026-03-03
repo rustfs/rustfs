@@ -87,6 +87,14 @@ Work on feature branches (e.g., `feat/...`) after syncing `main`. Follow Convent
 - Follow the PR template format and fill in all required sections
 - Wait for reviewer approval before merging
 
+### PR Template Enforcement (MANDATORY)
+
+- Always use `.github/pull_request_template.md` when creating or updating a PR body.
+- Keep all template section headings in the final PR description (do not replace with custom sections only).
+- If a section is not applicable, explicitly write `N/A` instead of removing the section.
+- Before requesting review, verify the PR body still contains all template sections.
+- If a PR is created without the template, immediately update the PR body to match the template before any further action.
+
 ## Security & Configuration Tips
 
 Do not commit secrets or cloud credentials; prefer environment variables or vault tooling. Review IAM- and KMS-related changes with a second maintainer. Confirm proxy settings before running sensitive tests to avoid leaking traffic outside localhost.
