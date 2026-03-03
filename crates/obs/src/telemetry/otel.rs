@@ -49,10 +49,6 @@ use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
-#[cfg(unix)]
-use pyroscope::PyroscopeAgent;
-#[cfg(unix)]
-use pyroscope::pyroscope::PyroscopeAgentRunning;
 use rustfs_config::{
     APP_NAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED,
     DEFAULT_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
@@ -321,7 +317,7 @@ fn build_logger_provider(
 /// Starts the Pyroscope continuous profiling agent if `ENV_OBS_PROFILING_ENDPOINT` is set.
 /// No-op and returns None on non-unix platforms.
 #[cfg(unix)]
-fn init_profiler(config: &OtelConfig) -> Option<PyroscopeAgent<PyroscopeAgentRunning>> {
+fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;

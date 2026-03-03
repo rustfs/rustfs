@@ -56,8 +56,10 @@ tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
-pyroscope = { workspace = true, features= ["backend-pprof-rs"]}
 walkdir = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
 
 
 [dev-dependencies]
