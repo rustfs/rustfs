@@ -324,7 +324,7 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
 
     if !config
         .profiling_export_enabled
-        .unwrap_or(DEFAULT_OBS_PROFILING_EXPORT_ENABLED)
+        .unwrap_or(rustfs_config::DEFAULT_OBS_PROFILING_EXPORT_ENABLED)
     {
         return None;
     }
