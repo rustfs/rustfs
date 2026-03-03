@@ -139,7 +139,7 @@ pub(super) fn init_observability_http(
     // ── Logger provider (HTTP) ────────────────────────────────────────────────
     let logger_provider = build_logger_provider(&log_ep, config, res, use_stdout)?;
 
-    // Profiling agent (HTTP)
+    #[cfg(unix)]
     let profiling_agent = init_profiler(config);
 
     // ── Tracing subscriber registry ───────────────────────────────────────────
@@ -193,6 +193,7 @@ pub(super) fn init_observability_http(
         tracer_provider,
         meter_provider,
         logger_provider,
+        #[cfg(unix)]
         profiling_agent,
         tracing_guard: None,
         stdout_guard: None,
@@ -356,11 +357,6 @@ fn init_profiler(config: &OtelConfig) -> Option<PyroscopeAgent<PyroscopeAgentRun
             None
         }
     }
-}
-
-#[cfg(not(unix))]
-fn init_profiler(_service_name: &str) -> Option<std::convert::Infallible> {
-    None
 }
 
 /// Create a stdout periodic metrics reader for the given interval.

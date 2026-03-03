@@ -27,7 +27,9 @@
 //! 7. Stdout worker guard — flushes buffered log lines written to stdout.
 
 use opentelemetry_sdk::{logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider};
+#[cfg(unix)]
 use pyroscope::PyroscopeAgent;
+#[cfg(unix)]
 use pyroscope::pyroscope::PyroscopeAgentRunning;
 
 /// RAII guard that owns all active OpenTelemetry providers and the
@@ -43,7 +45,7 @@ pub struct OtelGuard {
     pub(crate) meter_provider: Option<SdkMeterProvider>,
     /// Optional logger provider for OTLP log export.
     pub(crate) logger_provider: Option<SdkLoggerProvider>,
-    // Optional profiling agent
+    #[cfg(unix)]
     pub(crate) profiling_agent: Option<PyroscopeAgent<PyroscopeAgentRunning>>,
     /// Handle to the background log-cleanup task; aborted on drop.
     pub(crate) cleanup_handle: Option<tokio::task::JoinHandle<()>>,
@@ -56,12 +58,13 @@ pub struct OtelGuard {
 
 impl std::fmt::Debug for OtelGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OtelGuard")
-            .field("tracer_provider", &self.tracer_provider.is_some())
+        let mut s = f.debug_struct("OtelGuard");
+        s.field("tracer_provider", &self.tracer_provider.is_some())
             .field("meter_provider", &self.meter_provider.is_some())
-            .field("logger_provider", &self.logger_provider.is_some())
-            .field("profiling_agent", &self.profiling_agent.is_some())
-            .field("cleanup_handle", &self.cleanup_handle.is_some())
+            .field("logger_provider", &self.logger_provider.is_some());
+        #[cfg(unix)]
+        s.field("profiling_agent", &self.profiling_agent.is_some());
+        s.field("cleanup_handle", &self.cleanup_handle.is_some())
             .field("tracing_guard", &self.tracing_guard.is_some())
             .field("stdout_guard", &self.stdout_guard.is_some())
             .finish()
@@ -92,6 +95,7 @@ impl Drop for OtelGuard {
             eprintln!("Logger shutdown error: {err:?}");
         }
 
+        #[cfg(unix)]
         if let Some(agent) = self.profiling_agent.take() {
             match agent.stop() {
                 Err(err) => eprintln!("Profiling agent stop error: {err:?}"),
