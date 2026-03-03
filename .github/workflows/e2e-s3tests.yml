@@ -50,6 +50,11 @@ env:
 
   RUST_LOG: info
   PLATFORM: linux/amd64
+  BUILDX_CACHE_SCOPE: rustfs-e2e-s3tests-source
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.test-mode || 'single' }}
+  cancel-in-progress: true
 
 defaults:
   run:
@@ -63,6 +68,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-e2e-s3tests-${{ hashFiles('.github/workflows/e2e-s3tests.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-e2e-s3tests-
+
+      - name: Install Python tools
+        run: |
+          python3 -m pip install --user --upgrade pip awscurl tox
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Enable buildx
         uses: docker/setup-buildx-action@v3
 
@@ -70,8 +88,8 @@ jobs:
         run: |
           DOCKER_BUILDKIT=1 docker buildx build --load \
             --platform ${PLATFORM} \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
+            --cache-from type=gha,scope=${BUILDX_CACHE_SCOPE} \
+            --cache-to type=gha,mode=max,scope=${BUILDX_CACHE_SCOPE} \
             -t rustfs-ci \
             -f Dockerfile.source .
 
@@ -121,9 +139,6 @@ jobs:
 
       - name: Provision s3-tests alt user (required by suite)
         run: |
-          python3 -m pip install --user --upgrade pip awscurl
-          export PATH="$HOME/.local/bin:$PATH"
-
           # Admin API requires AWS SigV4 signing. awscurl is used by RustFS codebase as well.
           awscurl \
             --service s3 \
@@ -156,8 +171,6 @@ jobs:
 
       - name: Prepare s3-tests
         run: |
-          python3 -m pip install --user --upgrade pip tox
-          export PATH="$HOME/.local/bin:$PATH"
           git clone --depth 1 https://github.com/ceph/s3-tests.git s3-tests
 
       - name: Run ceph s3-tests (debug friendly)
@@ -217,6 +230,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-e2e-s3tests-${{ hashFiles('.github/workflows/e2e-s3tests.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-e2e-s3tests-
+
+      - name: Install Python tools
+        run: |
+          python3 -m pip install --user --upgrade pip awscurl tox
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Enable buildx
         uses: docker/setup-buildx-action@v3
 
@@ -224,8 +250,8 @@ jobs:
         run: |
           DOCKER_BUILDKIT=1 docker buildx build --load \
             --platform ${PLATFORM} \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
+            --cache-from type=gha,scope=${BUILDX_CACHE_SCOPE} \
+            --cache-to type=gha,mode=max,scope=${BUILDX_CACHE_SCOPE} \
             -t rustfs-ci \
             -f Dockerfile.source .
 
@@ -337,9 +363,6 @@ jobs:
 
       - name: Provision s3-tests alt user (required by suite)
         run: |
-          python3 -m pip install --user --upgrade pip awscurl
-          export PATH="$HOME/.local/bin:$PATH"
-
           awscurl \
             --service s3 \
             --region "${S3_REGION}" \
@@ -368,8 +391,6 @@ jobs:
 
       - name: Prepare s3-tests
         run: |
-          python3 -m pip install --user --upgrade pip tox
-          export PATH="$HOME/.local/bin:$PATH"
           git clone --depth 1 https://github.com/ceph/s3-tests.git s3-tests
 
       - name: Run ceph s3-tests (multi, debug friendly)

@@ -44,22 +44,6 @@ on:
       - "**/*.svg"
       - ".gitignore"
       - ".dockerignore"
-  pull_request:
-    branches: [ main ]
-    paths-ignore:
-      - "**.md"
-      - "**.txt"
-      - ".github/**"
-      - "docs/**"
-      - "deploy/**"
-      - "scripts/dev_*.sh"
-      - "LICENSE*"
-      - "README*"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.svg"
-      - ".gitignore"
-      - ".dockerignore"
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
