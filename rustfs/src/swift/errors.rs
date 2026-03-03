@@ -36,6 +36,8 @@ pub enum SwiftError {
     UnprocessableEntity(String),
     /// 500 Internal Server Error
     InternalServerError(String),
+    /// 501 Not Implemented
+    NotImplemented(String),
     /// 503 Service Unavailable
     ServiceUnavailable(String),
 }
@@ -50,6 +52,7 @@ impl fmt::Display for SwiftError {
             SwiftError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             SwiftError::UnprocessableEntity(msg) => write!(f, "Unprocessable Entity: {}", msg),
             SwiftError::InternalServerError(msg) => write!(f, "Internal Server Error: {}", msg),
+            SwiftError::NotImplemented(msg) => write!(f, "Not Implemented: {}", msg),
             SwiftError::ServiceUnavailable(msg) => write!(f, "Service Unavailable: {}", msg),
         }
     }
@@ -67,6 +70,7 @@ impl SwiftError {
             SwiftError::Conflict(_) => StatusCode::CONFLICT,
             SwiftError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             SwiftError::InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            SwiftError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             SwiftError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }

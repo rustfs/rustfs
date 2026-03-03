@@ -7184,6 +7184,7 @@ dependencies = [
  "moka",
  "once_cell",
  "opentelemetry",
+ "percent-encoding",
  "pin-project-lite",
  "pprof-pyroscope-fork",
  "rand 0.10.0",

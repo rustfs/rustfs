@@ -18,6 +18,13 @@ use axum::http::{Method, Uri};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+/// Decode percent-encoded URL segment
+fn decode_url_segment(segment: &str) -> String {
+    percent_encoding::percent_decode_str(segment)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 /// Regex pattern for Swift account URLs: /v1/AUTH_{project_id}
 /// Accepts any non-empty alphanumeric string with hyphens and underscores
 static ACCOUNT_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^AUTH_([a-zA-Z0-9_-]+)$").unwrap());
@@ -109,7 +116,7 @@ impl SwiftRouter {
                     return None;
                 }
                 Some(SwiftRoute::Account {
-                    account: account.to_string(),
+                    account: decode_url_segment(account),
                     method,
                 })
             }
@@ -119,8 +126,8 @@ impl SwiftRouter {
                     return None;
                 }
                 Some(SwiftRoute::Container {
-                    account: account.to_string(),
-                    container: container.to_string(),
+                    account: decode_url_segment(account),
+                    container: decode_url_segment(container),
                     method,
                 })
             }
@@ -129,11 +136,14 @@ impl SwiftRouter {
                 if !Self::is_valid_account(account) {
                     return None;
                 }
-                // Join remaining segments as object key (preserves slashes in object names)
-                let object_key = object.join("/");
+                // Join remaining segments as object key, decoding each segment
+                let object_key = object.iter()
+                    .map(|s| decode_url_segment(s))
+                    .collect::<Vec<_>>()
+                    .join("/");
                 Some(SwiftRoute::Object {
-                    account: account.to_string(),
-                    container: container.to_string(),
+                    account: decode_url_segment(account),
+                    container: decode_url_segment(container),
                     object: object_key,
                     method,
                 })

@@ -270,15 +270,9 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                     // TODO: handler needs Request<B> parameter to support streaming response
                     // Current signature: handle_swift_request(route, credentials)
                     // Required: handle_swift_request(req: Request<B>, route, credentials)
-                    let _reader = object::get_object(&account, &container, &object, &credentials, None).await?;
-
-                    let trans_id = generate_trans_id();
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header("x-trans-id", trans_id.clone())
-                        .header("x-openstack-request-id", trans_id)
-                        .body(Body::empty()) // Cannot stream - requires handler refactoring
-                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
+                    return Err(SwiftError::NotImplemented(
+                        "Object GET is not yet implemented. Use HEAD for metadata.".to_string()
+                    ));
                 }
                 Method::HEAD => {
                     // Get object metadata
@@ -367,6 +361,7 @@ fn swift_error_to_response(error: SwiftError) -> Response<Body> {
         SwiftError::Conflict(msg) => (StatusCode::CONFLICT, msg.as_str()),
         SwiftError::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.as_str()),
         SwiftError::InternalServerError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.as_str()),
+        SwiftError::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg.as_str()),
         SwiftError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.as_str()),
     };
 
