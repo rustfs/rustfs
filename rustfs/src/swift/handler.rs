@@ -138,10 +138,9 @@ where
                 }
                 Method::HEAD => {
                     // Account metadata operations not yet implemented
-                    Err(SwiftError::InternalServerError(format!(
-                        "Swift Account HEAD operation not yet implemented: HEAD {}",
-                        account
-                    )))
+                    Err(SwiftError::NotImplemented(
+                        "Swift Account HEAD operation not yet implemented".to_string(),
+                    ))
                 }
                 Method::POST => {
                     // Account metadata update not yet implemented
@@ -276,6 +275,11 @@ where
             match method {
                 Method::PUT => {
                     // Upload object - collect body as bytes
+                    // TODO(P1): Stream uploads directly instead of buffering entire body in memory.
+                    // Current implementation buffers the entire request body before uploading,
+                    // which can cause OOM on large uploads. This should be refactored to stream
+                    // the body directly to put_object using a proper AsyncRead adapter.
+                    // See: https://github.com/rustfs/rustfs/pull/2066#pullrequestreview-3890571917
                     use http_body_util::BodyExt;
 
                     // Collect the body into bytes
@@ -328,15 +332,28 @@ where
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::GET => {
-                    // Download object - now we can return streaming response
-                    let reader = object::get_object(&account, &container, &object, &credentials, None).await?;
+                    // Download object - parse Range header if present
+                    let range = headers
+                        .get("range")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|r| object::parse_range_header(r).ok());
+
+                    // Determine status code based on range presence before moving range
+                    let status = if range.is_some() {
+                        StatusCode::PARTIAL_CONTENT
+                    } else {
+                        StatusCode::OK
+                    };
+
+                    let reader = object::get_object(&account, &container, &object, &credentials, range).await?;
 
                     // Get object metadata for headers
                     let info = object::head_object(&account, &container, &object, &credentials).await?;
 
                     let trans_id = generate_trans_id();
+
                     let mut response = Response::builder()
-                        .status(StatusCode::OK)
+                        .status(status)
                         .header("content-type", info.content_type.as_deref().unwrap_or("application/octet-stream"))
                         .header("content-length", info.size.to_string())
                         .header("x-trans-id", trans_id.clone())
@@ -432,14 +449,15 @@ where
                         .ok_or_else(|| SwiftError::BadRequest("Destination header required for COPY".to_string()))?;
 
                     // Validate destination header to prevent path traversal
-                    if destination.contains("..") || destination.starts_with('/') && destination.matches('/').count() > 3 {
-                        return Err(SwiftError::BadRequest("Invalid Destination header format".to_string()));
+                    if destination.contains("..") {
+                        return Err(SwiftError::BadRequest("Path traversal not allowed in destination".to_string()));
                     }
 
                     // Parse destination: /{container}/{object}
+                    // Object can have multiple path segments (e.g., /container/path/to/file.txt)
                     let destination_parts: Vec<&str> = destination.trim_start_matches('/').splitn(2, '/').collect();
                     if destination_parts.len() != 2 {
-                        return Err(SwiftError::BadRequest("Invalid Destination header format".to_string()));
+                        return Err(SwiftError::BadRequest("Destination must be /{container}/{object}".to_string()));
                     }
                     let dest_container = destination_parts[0];
                     let dest_object = destination_parts[1];

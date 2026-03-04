@@ -97,8 +97,9 @@ impl SwiftRouter {
             path
         };
 
-        // Split path into segments
-        let segments: Vec<&str> = path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        // Split path into segments - preserve empty segments to maintain object key fidelity
+        // Swift allows trailing slashes and consecutive slashes in object names (e.g., "dir/" or "a//b")
+        let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
         // Swift URLs must start with "v1"
         if segments.first() != Some(&"v1") {
@@ -118,7 +119,7 @@ impl SwiftRouter {
                 })
             }
             // /v1/{account}/{container}
-            ["v1", account, container] => {
+            ["v1", account, container] if container.is_empty() || !container.contains('/') => {
                 if !Self::is_valid_account(account) {
                     return None;
                 }
@@ -129,11 +130,12 @@ impl SwiftRouter {
                 })
             }
             // /v1/{account}/{container}/{object...}
-            ["v1", account, container, object @ ..] if !object.is_empty() => {
+            ["v1", account, container, object @ ..] if !object.is_empty() || segments.len() > 3 => {
                 if !Self::is_valid_account(account) {
                     return None;
                 }
-                // Join remaining segments as object key, decoding each segment
+                // Join remaining segments as object key, preserving empty segments
+                // Decode each segment individually to handle percent-encoding correctly
                 let object_key = object.iter().map(|s| decode_url_segment(s)).collect::<Vec<_>>().join("/");
                 Some(SwiftRoute::Object {
                     account: decode_url_segment(account),
