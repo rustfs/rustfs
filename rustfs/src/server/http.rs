@@ -25,6 +25,7 @@ use crate::server::{
 };
 use crate::storage;
 use crate::storage::tonic_service::make_server;
+use crate::swift::handler::SwiftService;
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{
@@ -581,7 +582,12 @@ fn process_connection(
         // Build services inside each connected task to avoid passing complex service types across tasks,
         // It also ensures that each connection has an independent service instance.
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
-        let service = hybrid(s3_service, rpc_service);
+
+        // Wrap S3 service with Swift service to handle Swift API requests
+        // Swift is enabled by default with no URL prefix (direct /v1/AUTH_* paths)
+        let swift_service = SwiftService::new(true, None, s3_service);
+
+        let service = hybrid(swift_service, rpc_service);
 
         let remote_addr = match socket.peer_addr() {
             Ok(addr) => Some(RemoteAddr(addr)),

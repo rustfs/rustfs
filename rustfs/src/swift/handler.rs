@@ -32,7 +32,6 @@ use tower::Service;
 use tracing::{debug, instrument};
 
 /// Swift-aware service that routes to Swift handlers or S3 service
-#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 #[derive(Clone)]
 pub struct SwiftService<S> {
     /// Swift router for URL parsing
@@ -43,7 +42,6 @@ pub struct SwiftService<S> {
 
 impl<S> SwiftService<S> {
     /// Create a new Swift service wrapping an S3 service
-    #[allow(dead_code)] // TODO: Remove once Swift API integration is complete
     pub fn new(enabled: bool, url_prefix: Option<String>, s3_service: S) -> Self {
         let router = SwiftRouter::new(enabled, url_prefix);
         Self { router, s3_service }
@@ -55,7 +53,9 @@ where
     S: Service<Request<B>, Response = Response<Body>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    B: Send + 'static,
+    B: axum::body::HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     type Response = Response<Body>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -79,8 +79,8 @@ where
             // This is consistent with how S3 auth handler retrieves Keystone credentials
             let credentials = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()).ok().flatten();
 
-            // Handle Swift operations based on route and method
-            let response_future = handle_swift_request(route, credentials);
+            // Handle Swift operations with full request
+            let response_future = handle_swift_request(req, route, credentials);
             return Box::pin(async move {
                 match response_future.await {
                     Ok(response) => Ok(response),
@@ -99,11 +99,23 @@ where
     }
 }
 
-/// Handle Swift API requests
-#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
-async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials>) -> Result<Response<Body>, SwiftError> {
+/// Handle Swift API requests with full access to request data
+async fn handle_swift_request<B>(
+    req: Request<B>,
+    route: SwiftRoute,
+    credentials: Option<Credentials>,
+) -> Result<Response<Body>, SwiftError>
+where
+    B: axum::body::HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     // Credentials are required for all Swift operations
     let credentials = credentials.ok_or_else(|| SwiftError::Unauthorized("Authentication required".to_string()))?;
+
+    // Extract headers and body from request
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
 
     match route {
         SwiftRoute::Account { account, method } => {
@@ -217,10 +229,15 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
                 }
                 Method::POST => {
-                    // Update container metadata
-                    // Note: Currently sends empty metadata because handler doesn't have access to request headers
-                    // TODO: handler needs access to request headers for X-Container-Meta-* extraction
-                    let metadata = std::collections::HashMap::new();
+                    // Update container metadata - now we have access to request headers
+                    let mut metadata = std::collections::HashMap::new();
+                    for (name, value) in headers.iter() {
+                        if let Some(meta_key) = name.as_str().strip_prefix("x-container-meta-")
+                            && let Ok(value_str) = value.to_str()
+                        {
+                            metadata.insert(meta_key.to_string(), value_str.to_string());
+                        }
+                    }
 
                     container::update_container_metadata(&account, &container, &credentials, metadata).await?;
 
@@ -259,23 +276,96 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
         } => {
             match method {
                 Method::PUT => {
-                    // Upload object
-                    // Note: Currently cannot handle request body in this handler signature
-                    // TODO: handler needs access to request body for object upload
-                    Err(SwiftError::InternalServerError(
-                        "Object PUT not yet integrated with handler (requires request body access)".to_string(),
-                    ))
+                    // Upload object - collect body as bytes
+                    use http_body_util::BodyExt;
+
+                    // Collect the body into bytes
+                    let collected = body
+                        .collect()
+                        .await
+                        .map_err(|e| SwiftError::BadRequest(format!("Failed to read request body: {}", e)))?;
+                    let body_bytes = collected.to_bytes();
+
+                    // Create an AsyncRead reader from the bytes
+                    // We use a simple adapter that wraps the bytes
+                    struct BytesReader {
+                        bytes: bytes::Bytes,
+                        pos: usize,
+                    }
+
+                    impl tokio::io::AsyncRead for BytesReader {
+                        fn poll_read(
+                            mut self: std::pin::Pin<&mut Self>,
+                            _cx: &mut std::task::Context<'_>,
+                            buf: &mut tokio::io::ReadBuf<'_>,
+                        ) -> std::task::Poll<std::io::Result<()>> {
+                            let remaining = self.bytes.len() - self.pos;
+                            if remaining == 0 {
+                                return std::task::Poll::Ready(Ok(()));
+                            }
+                            let to_read = std::cmp::min(remaining, buf.remaining());
+                            buf.put_slice(&self.bytes[self.pos..self.pos + to_read]);
+                            self.pos += to_read;
+                            std::task::Poll::Ready(Ok(()))
+                        }
+                    }
+
+                    let reader = BytesReader {
+                        bytes: body_bytes,
+                        pos: 0,
+                    };
+
+                    let etag = object::put_object(&account, &container, &object, &credentials, reader, &headers).await?;
+
+                    let trans_id = generate_trans_id();
+                    Response::builder()
+                        .status(StatusCode::CREATED)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("content-length", "0")
+                        .header("etag", etag)
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::empty())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::GET => {
-                    // Download object
-                    // Note: Handler architecture doesn't support streaming response bodies
-                    // The get_object function returns a stream, but this handler can only return Body::from(String)
-                    // TODO: handler needs Request<B> parameter to support streaming response
-                    // Current signature: handle_swift_request(route, credentials)
-                    // Required: handle_swift_request(req: Request<B>, route, credentials)
-                    Err(SwiftError::NotImplemented(
-                        "Object GET is not yet implemented. Use HEAD for metadata.".to_string(),
-                    ))
+                    // Download object - now we can return streaming response
+                    let reader = object::get_object(&account, &container, &object, &credentials, None).await?;
+
+                    // Get object metadata for headers
+                    let info = object::head_object(&account, &container, &object, &credentials).await?;
+
+                    let trans_id = generate_trans_id();
+                    let mut response = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", info.content_type.as_deref().unwrap_or("application/octet-stream"))
+                        .header("content-length", info.size.to_string())
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id);
+
+                    // Add ETag if available
+                    if let Some(etag) = info.etag {
+                        response = response.header("etag", etag);
+                    }
+
+                    // Add custom metadata headers (X-Object-Meta-*)
+                    for (key, value) in info.user_defined {
+                        if key != "content-type" {
+                            let header_name = format!("x-object-meta-{}", key);
+                            response = response.header(header_name, value);
+                        }
+                    }
+
+                    // Convert GetObjectReader stream to Body
+                    // Use ReaderStream to convert AsyncRead to Stream
+                    let stream = tokio_util::io::ReaderStream::new(reader.stream);
+                    let axum_body = axum::body::Body::from_stream(stream);
+                    // Use http_body_unsync since axum Body doesn't implement Sync
+                    let body = Body::http_body_unsync(axum_body);
+
+                    response
+                        .body(body)
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::HEAD => {
                     // Get object metadata
@@ -307,12 +397,18 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::POST => {
-                    // Update object metadata
-                    // Note: Currently sends empty headers because handler doesn't have access to request headers
-                    // TODO: handler needs access to request headers for X-Object-Meta-* extraction
-                    Err(SwiftError::InternalServerError(
-                        "Object POST not yet integrated with handler (requires request headers access)".to_string(),
-                    ))
+                    // Update object metadata - pass headers directly since the function expects HeaderMap
+                    object::update_object_metadata(&account, &container, &object, &credentials, &headers).await?;
+
+                    let trans_id = generate_trans_id();
+                    Response::builder()
+                        .status(StatusCode::ACCEPTED)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("content-length", "0")
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::empty())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::DELETE => {
                     // Delete object
@@ -330,12 +426,41 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                 }
                 // COPY method for server-side copy
                 m if m == Method::from_bytes(b"COPY").unwrap_or(Method::GET) && m.as_str() == "COPY" => {
-                    // Server-side object copy
-                    // Note: Requires access to Destination header from request
-                    // TODO: handler needs access to request headers for Destination header parsing
-                    Err(SwiftError::InternalServerError(
-                        "Object COPY not yet integrated with handler (requires request headers access)".to_string(),
-                    ))
+                    // Server-side object copy - now we have access to request headers
+                    let destination = headers
+                        .get("destination")
+                        .and_then(|v| v.to_str().ok())
+                        .ok_or_else(|| SwiftError::BadRequest("Destination header required for COPY".to_string()))?;
+
+                    // Parse destination: /{container}/{object}
+                    let destination_parts: Vec<&str> = destination.trim_start_matches('/').splitn(2, '/').collect();
+                    if destination_parts.len() != 2 {
+                        return Err(SwiftError::BadRequest("Invalid Destination header format".to_string()));
+                    }
+                    let dest_container = destination_parts[0];
+                    let dest_object = destination_parts[1];
+
+                    object::copy_object(
+                        &account,
+                        &container,
+                        &object,
+                        &account,
+                        dest_container,
+                        dest_object,
+                        &credentials,
+                        &headers,
+                    )
+                    .await?;
+
+                    let trans_id = generate_trans_id();
+                    Response::builder()
+                        .status(StatusCode::CREATED)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("content-length", "0")
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::empty())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 _ => Err(SwiftError::BadRequest(format!("Unsupported method for object: {}", method))),
             }
@@ -344,7 +469,6 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
 }
 
 /// Generate a transaction ID for Swift responses
-#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 fn generate_trans_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
@@ -355,7 +479,6 @@ fn generate_trans_id() -> String {
 }
 
 /// Convert SwiftError to HTTP Response
-#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 fn swift_error_to_response(error: SwiftError) -> Response<Body> {
     let trans_id = generate_trans_id();
     let (status, message) = match &error {
