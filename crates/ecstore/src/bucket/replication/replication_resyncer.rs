@@ -590,7 +590,7 @@ impl ReplicationResyncer {
     }
 }
 
-pub fn heal_should_use_check_replicate_delete(oi: &ObjectInfo) -> bool {
+fn heal_should_use_check_replicate_delete(oi: &ObjectInfo) -> bool {
     oi.delete_marker || (!oi.replication_status.is_empty() && oi.replication_status != ReplicationStatusType::Failed)
 }
 
@@ -2969,8 +2969,6 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_api::ObjectInfo;
-    use time::OffsetDateTime;
     use uuid::Uuid;
 
     #[test]
