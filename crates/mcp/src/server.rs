@@ -605,19 +605,10 @@ impl RustfsMcpServer {
 impl ServerHandler for RustfsMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability {
-                    list_changed: Some(false),
-                }),
-                ..Default::default()
-            },
+            protocol_version: ProtocolVersion::default(),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
             instructions: Some("RustFS MCP Server providing S3 operations through Model Context Protocol".into()),
-            server_info: Implementation {
-                name: "rustfs-mcp-server".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                ..Default::default()
-            },
+            server_info: Implementation::new("rustfs-mcp-server", env!("CARGO_PKG_VERSION")),
         }
     }
 
