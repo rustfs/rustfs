@@ -47,6 +47,7 @@ use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
     StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
+    bucket::migration::try_migrate_bucket_metadata,
     bucket::replication::{get_global_replication_pool, init_background_replication},
     config as ecconfig,
     endpoints::EndpointServerPools,
@@ -361,6 +362,7 @@ async fn run(config: config::Config) -> Result<()> {
         pool.init_resync(ctx.clone(), buckets.clone()).await?;
     }
 
+    try_migrate_bucket_metadata(store.clone()).await;
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
     // 3. Initialize IAM System (Blocking load)

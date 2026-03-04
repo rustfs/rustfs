@@ -17,9 +17,10 @@ pub mod bucket_target_sys;
 pub mod error;
 pub mod lifecycle;
 pub mod metadata;
+pub mod metadata_sys;
+pub mod migration;
 #[cfg(test)]
 mod metadata_test;
-pub mod metadata_sys;
 pub mod object_lock;
 pub mod policy_sys;
 pub mod quota;
