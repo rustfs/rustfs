@@ -104,7 +104,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ../../.docker/observability/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - ../../.docker/observability/loki.yaml:/etc/loki/local-config.yaml:ro
       - loki-data:/loki
     ports:
       - "3100:3100"
