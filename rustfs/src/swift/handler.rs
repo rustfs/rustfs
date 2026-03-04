@@ -138,9 +138,7 @@ where
                 }
                 Method::HEAD => {
                     // Account metadata operations not yet implemented
-                    Err(SwiftError::NotImplemented(
-                        "Swift Account HEAD operation not yet implemented".to_string(),
-                    ))
+                    Err(SwiftError::NotImplemented("Swift Account HEAD operation not yet implemented".to_string()))
                 }
                 Method::POST => {
                     // Account metadata update not yet implemented
