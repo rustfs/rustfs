@@ -604,12 +604,10 @@ impl RustfsMcpServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RustfsMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            instructions: Some("RustFS MCP Server providing S3 operations through Model Context Protocol".into()),
-            server_info: Implementation::new("rustfs-mcp-server", env!("CARGO_PKG_VERSION")),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("RustFS MCP Server providing S3 operations through Model Context Protocol".into())
+            .with_server_info(Implementation::new("rustfs-mcp-server", env!("CARGO_PKG_VERSION")))
+            .with_protocol_version(ProtocolVersion::LATEST)
     }
 
     async fn ping(&self, _ctx: RequestContext<RoleServer>) -> Result<(), ErrorData> {
