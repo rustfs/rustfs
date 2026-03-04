@@ -16,7 +16,7 @@ use anyhow::Result;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo, ToolsCapability},
+    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
     service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
 };
@@ -605,7 +605,7 @@ impl RustfsMcpServer {
 impl ServerHandler for RustfsMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("RustFS MCP Server providing S3 operations through Model Context Protocol".into())
+            .with_instructions("RustFS MCP Server providing S3 operations through Model Context Protocol")
             .with_server_info(Implementation::new("rustfs-mcp-server", env!("CARGO_PKG_VERSION")))
             .with_protocol_version(ProtocolVersion::LATEST)
     }
