@@ -16,7 +16,7 @@ use anyhow::Result;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo, ToolsCapability},
+    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
     service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
 };
@@ -604,21 +604,10 @@ impl RustfsMcpServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RustfsMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability {
-                    list_changed: Some(false),
-                }),
-                ..Default::default()
-            },
-            instructions: Some("RustFS MCP Server providing S3 operations through Model Context Protocol".into()),
-            server_info: Implementation {
-                name: "rustfs-mcp-server".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                ..Default::default()
-            },
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("RustFS MCP Server providing S3 operations through Model Context Protocol")
+            .with_server_info(Implementation::new("rustfs-mcp-server", env!("CARGO_PKG_VERSION")))
+            .with_protocol_version(ProtocolVersion::LATEST)
     }
 
     async fn ping(&self, _ctx: RequestContext<RoleServer>) -> Result<(), ErrorData> {
