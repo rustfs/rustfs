@@ -14,6 +14,7 @@
 
 //! Shared types used across the log-cleanup sub-modules.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -21,9 +22,27 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileMatchMode {
     /// The filename must start with the pattern (e.g. "app.log." matches "app.log.2024-01-01").
+    /// Corresponds to config value "prefix".
     Prefix,
     /// The filename must end with the pattern (e.g. ".log" matches "2024-01-01.log").
+    /// Corresponds to config value "suffix".
     Suffix,
+}
+
+impl FileMatchMode {
+    /// Returns the string representation of the match mode.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FileMatchMode::Prefix => "prefix",
+            FileMatchMode::Suffix => "suffix",
+        }
+    }
+}
+
+impl fmt::Display for FileMatchMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Metadata for a single log file discovered by the scanner.

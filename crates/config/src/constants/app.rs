@@ -128,6 +128,9 @@ pub const RUSTFS_LICENSE_URL: &str = "https://www.apache.org/licenses/LICENSE-2.
 /// Example: RUSTFS_ADDRESS=":9000"
 pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
 
+/// Environment variable for server volumes.
+pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
+
 /// Default port for rustfs
 /// This is the default port for rustfs.
 /// This is used to bind the server to a specific port.
@@ -152,6 +155,12 @@ pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
 /// It is used to identify the region of the application.
 /// Default value: us-east-1
 pub const RUSTFS_REGION: &str = "us-east-1";
+
+/// Environment variable for server region.
+pub const ENV_RUSTFS_REGION: &str = "RUSTFS_REGION";
+
+/// Environment variable for server license.
+pub const ENV_RUSTFS_LICENSE: &str = "RUSTFS_LICENSE";
 
 /// Default log filename for rustfs
 /// This is the default log filename for rustfs.
@@ -211,6 +220,12 @@ pub const DEFAULT_OBS_METRICS_EXPORT_ENABLED: bool = true;
 /// Default value: true
 /// Environment variable: RUSTFS_OBS_LOGS_EXPORT_ENABLED
 pub const DEFAULT_OBS_LOGS_EXPORT_ENABLED: bool = true;
+
+/// Default profiling export enabled
+/// It is used to enable or disable exporting profiles
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_PROFILING_EXPORT_ENABLED
+pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = true;
 
 /// Default log local logging enabled for rustfs
 /// This is the default log local logging enabled for rustfs.

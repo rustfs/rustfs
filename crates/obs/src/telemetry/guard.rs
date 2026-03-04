@@ -20,11 +20,17 @@
 //! 1. Tracer provider — flushes pending spans.
 //! 2. Meter provider — flushes pending metrics.
 //! 3. Logger provider — flushes pending log records.
-//! 4. Cleanup task — aborted to prevent lingering background work.
-//! 5. Tracing worker guard — flushes buffered log lines written by
+//! 4. Profiling agent — flushes pending profiles.
+//! 5. Cleanup task — aborted to prevent lingering background work.
+//! 6. Tracing worker guard — flushes buffered log lines written by
 //!    `tracing_appender`.
+//! 7. Stdout worker guard — flushes buffered log lines written to stdout.
 
 use opentelemetry_sdk::{logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider};
+#[cfg(unix)]
+use pyroscope::PyroscopeAgent;
+#[cfg(unix)]
+use pyroscope::pyroscope::PyroscopeAgentRunning;
 
 /// RAII guard that owns all active OpenTelemetry providers and the
 /// `tracing_appender` worker guard.
@@ -39,24 +45,28 @@ pub struct OtelGuard {
     pub(crate) meter_provider: Option<SdkMeterProvider>,
     /// Optional logger provider for OTLP log export.
     pub(crate) logger_provider: Option<SdkLoggerProvider>,
+    #[cfg(unix)]
+    pub(crate) profiling_agent: Option<PyroscopeAgent<PyroscopeAgentRunning>>,
+    /// Handle to the background log-cleanup task; aborted on drop.
+    pub(crate) cleanup_handle: Option<tokio::task::JoinHandle<()>>,
     /// Worker guard that keeps the non-blocking `tracing_appender` thread
     /// alive.  Dropping it blocks until all buffered records are flushed.
     pub(crate) tracing_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
     /// Optional guard for stdout logging; kept separate to allow independent flushing and shutdown.
     pub(crate) stdout_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
-    /// Handle to the background log-cleanup task; aborted on drop.
-    pub(crate) cleanup_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for OtelGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OtelGuard")
-            .field("tracer_provider", &self.tracer_provider.is_some())
+        let mut s = f.debug_struct("OtelGuard");
+        s.field("tracer_provider", &self.tracer_provider.is_some())
             .field("meter_provider", &self.meter_provider.is_some())
-            .field("logger_provider", &self.logger_provider.is_some())
+            .field("logger_provider", &self.logger_provider.is_some());
+        #[cfg(unix)]
+        s.field("profiling_agent", &self.profiling_agent.is_some());
+        s.field("cleanup_handle", &self.cleanup_handle.is_some())
             .field("tracing_guard", &self.tracing_guard.is_some())
             .field("stdout_guard", &self.stdout_guard.is_some())
-            .field("cleanup_handle", &self.cleanup_handle.is_some())
             .finish()
     }
 }
@@ -83,6 +93,16 @@ impl Drop for OtelGuard {
             && let Err(err) = provider.shutdown()
         {
             eprintln!("Logger shutdown error: {err:?}");
+        }
+
+        #[cfg(unix)]
+        if let Some(agent) = self.profiling_agent.take() {
+            match agent.stop() {
+                Err(err) => eprintln!("Profiling agent stop error: {err:?}"),
+                Ok(stopped) => {
+                    stopped.shutdown();
+                }
+            }
         }
 
         if let Some(handle) = self.cleanup_handle.take() {

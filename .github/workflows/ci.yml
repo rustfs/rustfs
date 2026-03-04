@@ -91,6 +91,8 @@ jobs:
 
   typos:
     name: Typos
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v6
@@ -116,9 +118,6 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
       - name: Run tests
         run: |
           cargo nextest run --all --exclude e2e_test
@@ -133,9 +132,40 @@ jobs:
       - name: Check layered dependencies
         run: ./scripts/check_layer_dependencies.sh
 
+  build-rustfs-debug-binary:
+    name: Build RustFS Debug Binary
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubicloud-standard-4
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-rustfs-debug-binary-${{ hashFiles('**/Cargo.lock') }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build debug binary
+        run: |
+          touch rustfs/build.rs
+          cargo build -p rustfs --bins --jobs 2
+
+      - name: Upload debug binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: rustfs-debug-binary
+          path: target/debug/rustfs
+          if-no-files-found: error
+          retention-days: 1
+
   e2e-tests:
     name: End-to-End Tests
-    needs: skip-check
+    needs: [ skip-check, build-rustfs-debug-binary ]
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: ubicloud-standard-2
     timeout-minutes: 30
@@ -148,13 +178,17 @@ jobs:
           rm -rf /tmp/rustfs
           rm -f /tmp/rustfs.log
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
+      - name: Download debug binary
+        uses: actions/download-artifact@v7
         with:
-          rust-version: stable
-          cache-shared-key: ci-e2e-${{ hashFiles('**/Cargo.lock') }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          name: rustfs-debug-binary
+          path: target/debug
+
+      - name: Make binary executable
+        run: chmod +x ./target/debug/rustfs
+
+      - name: Setup Rust toolchain for s3s-e2e installation
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@v2
@@ -162,12 +196,6 @@ jobs:
           tool: s3s-e2e
           git: https://github.com/s3s-project/s3s.git
           rev: 4a04a670cf41274d9be9ab65dc36f4aa3f92fbad
-
-      - name: Build debug binary
-        run: |
-          touch rustfs/build.rs
-          # Limit concurrency to prevent OOM
-          cargo build -p rustfs --bins --jobs 2
 
       - name: Run end-to-end tests
         run: |
@@ -184,7 +212,7 @@ jobs:
 
   s3-implemented-tests:
     name: S3 Implemented Tests
-    needs: skip-check
+    needs: [ skip-check, build-rustfs-debug-binary ]
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: ubicloud-standard-4
     timeout-minutes: 60
@@ -192,18 +220,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
+      - name: Download debug binary
+        uses: actions/download-artifact@v7
         with:
-          rust-version: stable
-          cache-shared-key: ci-s3tests-${{ hashFiles('**/Cargo.lock') }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          name: rustfs-debug-binary
+          path: target/debug
 
-      - name: Build debug binary
-        run: |
-          touch rustfs/build.rs
-          cargo build -p rustfs --bins --jobs 2
+      - name: Make binary executable
+        run: chmod +x ./target/debug/rustfs
 
       - name: Run implemented s3-tests
         run: |

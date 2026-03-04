@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! Disabled lock manager that bypasses all locking operations
-//! Used when RUSTFS_ENABLE_LOCKS environment variable is set to false
+//! Used when the lock feature is disabled via RUSTFS_LOCK_ENABLED
+//! (or deprecated RUSTFS_ENABLE_LOCKS).
 
 use std::sync::Arc;
 

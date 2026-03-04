@@ -779,10 +779,6 @@ fn normalize_config_url(config_url: &str) -> Result<String, String> {
         issuer.push_str(normalized_path);
     }
 
-    if !issuer.ends_with('/') {
-        issuer.push('/');
-    }
-
     Ok(issuer)
 }
 
@@ -892,15 +888,15 @@ mod tests {
     fn test_normalize_config_url() {
         assert_eq!(
             normalize_config_url("https://idp.example.com/.well-known/openid-configuration").unwrap(),
-            "https://idp.example.com/"
+            "https://idp.example.com"
         );
         assert_eq!(
             normalize_config_url("https://idp.example.com/.well-known/openid-configuration/").unwrap(),
-            "https://idp.example.com/"
+            "https://idp.example.com"
         );
         assert_eq!(
             normalize_config_url("https://idp.example.com/custom/realm").unwrap(),
-            "https://idp.example.com/custom/realm/"
+            "https://idp.example.com/custom/realm"
         );
         assert!(normalize_config_url("https://idp.example.com/.well-known/invalid").is_err());
         assert!(normalize_config_url("gopher://idp.example.com").is_err());
