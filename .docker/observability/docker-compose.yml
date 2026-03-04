@@ -27,31 +27,16 @@ services:
       - "3200:3200" # tempo
       - "4317" # otlp grpc
       - "4318" # otlp http
+      - "7946" # memberlist
     networks:
       - otel-network
     restart: unless-stopped
-    depends_on:
-      - redpanda
     healthcheck:
       test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3200/ready" ]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 15s
-
-  redpanda:
-    image: redpandadata/redpanda:latest # for tempo ingest
-    container_name: redpanda
-    ports:
-      - "9092:9092"
-    networks:
-      - otel-network
-    restart: unless-stopped
-    command: >
-      redpanda start --overprovisioned
-      --mode=dev-container
-      --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      --advertise-kafka-addr=PLAINTEXT://redpanda:9092
 
   jaeger:
     image: jaegertracing/jaeger:latest
