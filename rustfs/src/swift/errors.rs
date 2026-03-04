@@ -77,7 +77,10 @@ impl SwiftError {
 
     fn generate_trans_id() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_micros();
         format!("tx{:x}", timestamp)
     }
 }

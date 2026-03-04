@@ -25,7 +25,8 @@ fn decode_url_segment(segment: &str) -> String {
 
 /// Regex pattern for Swift account URLs: /v1/AUTH_{project_id}
 /// Accepts any non-empty alphanumeric string with hyphens and underscores
-static ACCOUNT_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^AUTH_([a-zA-Z0-9_-]+)$").unwrap());
+static ACCOUNT_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^AUTH_([a-zA-Z0-9_-]+)$").expect("ACCOUNT_PATTERN regex is hardcoded and must be valid"));
 
 /// Represents a parsed Swift route
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -67,12 +67,11 @@ where
 
     #[instrument(skip(self, req), fields(method = %req.method(), uri = %req.uri()))]
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let router = self.router.clone();
-        let method = req.method().clone();
-        let uri = req.uri().clone();
+        // Try to parse as Swift request - only clone method if needed
+        let method = req.method();
+        let uri = req.uri();
 
-        // Try to parse as Swift request
-        if let Some(route) = router.route(&uri, method.clone()) {
+        if let Some(route) = self.router.route(uri, method.clone()) {
             debug!("Swift route matched: {:?}", route);
 
             // Extract credentials from Keystone task-local storage (if available)
@@ -425,12 +424,17 @@ where
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 // COPY method for server-side copy
-                m if m == Method::from_bytes(b"COPY").unwrap_or(Method::GET) && m.as_str() == "COPY" => {
+                m if m.as_str() == "COPY" => {
                     // Server-side object copy - now we have access to request headers
                     let destination = headers
                         .get("destination")
                         .and_then(|v| v.to_str().ok())
                         .ok_or_else(|| SwiftError::BadRequest("Destination header required for COPY".to_string()))?;
+
+                    // Validate destination header to prevent path traversal
+                    if destination.contains("..") || destination.starts_with('/') && destination.matches('/').count() > 3 {
+                        return Err(SwiftError::BadRequest("Invalid Destination header format".to_string()));
+                    }
 
                     // Parse destination: /{container}/{object}
                     let destination_parts: Vec<&str> = destination.trim_start_matches('/').splitn(2, '/').collect();
@@ -439,6 +443,14 @@ where
                     }
                     let dest_container = destination_parts[0];
                     let dest_object = destination_parts[1];
+
+                    // Validate container and object names
+                    if dest_container.is_empty() || dest_container.len() > 256 {
+                        return Err(SwiftError::BadRequest("Invalid destination container name".to_string()));
+                    }
+                    if dest_object.is_empty() || dest_object.len() > 1024 {
+                        return Err(SwiftError::BadRequest("Invalid destination object name".to_string()));
+                    }
 
                     object::copy_object(
                         &account,
