@@ -15,7 +15,6 @@
 pub mod checker;
 
 use crate::error::Result;
-use rmp_serde::Serializer as rmpSerializer;
 use rustfs_config::{
     QUOTA_API_PATH, QUOTA_EXCEEDED_ERROR_CODE, QUOTA_INTERNAL_ERROR_CODE, QUOTA_INVALID_CONFIG_ERROR_CODE,
     QUOTA_NOT_FOUND_ERROR_CODE,
@@ -28,27 +27,35 @@ use time::OffsetDateTime;
 pub enum QuotaType {
     /// Hard quota: reject immediately when exceeded
     #[default]
+    #[serde(alias = "HARD", alias = "hard")]
     Hard,
 }
 
+/// Bucket quota configuration. quota_type defaults to Hard when omitted.
 #[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq)]
 pub struct BucketQuota {
+    #[serde(default)]
     pub quota: Option<u64>,
+    /// Defaults to Hard when missing.
+    #[serde(default)]
     pub quota_type: QuotaType,
     /// Timestamp when this quota configuration was set (for audit purposes)
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_at: Option<OffsetDateTime>,
+    /// Accept updated_at for compatibility; not used.
+    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<OffsetDateTime>,
 }
 
 impl BucketQuota {
+    /// Serialize to JSON bytes. Same format as parse_all_configs.
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        self.serialize(&mut rmpSerializer::new(&mut buf).with_struct_map())?;
-        Ok(buf)
+        serde_json::to_vec(self).map_err(Into::into)
     }
 
+    /// Deserialize from JSON bytes. Same format as parse_all_configs.
     pub fn unmarshal(buf: &[u8]) -> Result<Self> {
-        let t: BucketQuota = rmp_serde::from_slice(buf)?;
-        Ok(t)
+        serde_json::from_slice(buf).map_err(Into::into)
     }
 
     pub fn new(quota: Option<u64>) -> Self {
@@ -57,6 +64,7 @@ impl BucketQuota {
             quota,
             quota_type: QuotaType::Hard,
             created_at: Some(now),
+            updated_at: None,
         }
     }
 
@@ -154,5 +162,59 @@ impl QuotaErrorResponse {
                 host_id: host_id.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Legacy format: quota, created_at, updated_at (no quota_type)
+    #[test]
+    fn deserialize_format_without_quota_type() {
+        let json = r#"{"quota":1073741824,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}"#;
+        let q: BucketQuota = serde_json::from_slice(json.as_bytes()).expect("should parse");
+        assert_eq!(q.quota, Some(1073741824));
+        assert_eq!(q.quota_type, QuotaType::Hard);
+        assert!(q.created_at.is_some());
+        assert!(q.updated_at.is_some());
+    }
+
+    /// RustFS format: quota, quota_type, created_at
+    #[test]
+    fn deserialize_rustfs_format() {
+        let json = r#"{"quota":1073741824,"quota_type":"Hard","created_at":"2024-01-01T00:00:00Z"}"#;
+        let q: BucketQuota = serde_json::from_slice(json.as_bytes()).expect("should parse");
+        assert_eq!(q.quota, Some(1073741824));
+        assert_eq!(q.quota_type, QuotaType::Hard);
+        assert!(q.created_at.is_some());
+        assert!(q.created_at.is_some_and(|t| t.unix_timestamp() == 1704067200));
+    }
+
+    /// E2E format uses "HARD" (uppercase)
+    #[test]
+    fn deserialize_quota_type_hard_uppercase() {
+        let json = r#"{"quota":2048,"quota_type":"HARD"}"#;
+        let q: BucketQuota = serde_json::from_slice(json.as_bytes()).expect("should parse");
+        assert_eq!(q.quota_type, QuotaType::Hard);
+    }
+
+    /// marshal_msg/unmarshal use JSON, same as parse_all_configs
+    #[test]
+    fn marshal_unmarshal_roundtrip() {
+        let q = BucketQuota::new(Some(1073741824));
+        let buf = q.marshal_msg().expect("marshal");
+        let restored = BucketQuota::unmarshal(&buf).expect("unmarshal");
+        assert_eq!(q.quota, restored.quota);
+        assert_eq!(q.quota_type, restored.quota_type);
+    }
+
+    /// unmarshal accepts format without quota_type
+    #[test]
+    fn unmarshal_format_without_quota_type() {
+        let json = r#"{"quota":1073741824,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}"#;
+        let q = BucketQuota::unmarshal(json.as_bytes()).expect("should parse");
+        assert_eq!(q.quota, Some(1073741824));
+        assert_eq!(q.quota_type, QuotaType::Hard);
     }
 }

@@ -18,9 +18,10 @@ pub mod error;
 pub mod lifecycle;
 pub mod metadata;
 pub mod metadata_sys;
-pub mod migration;
 #[cfg(test)]
 mod metadata_test;
+pub mod migration;
+mod msgp_decode;
 pub mod object_lock;
 pub mod policy_sys;
 pub mod quota;
