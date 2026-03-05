@@ -73,7 +73,7 @@ use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 const REPLICATION_DIR: &str = ".replication";
 const RESYNC_FILE_NAME: &str = "resync.bin";
@@ -294,6 +294,7 @@ impl ReplicationResyncer {
         // TODO: Metrics
     }
 
+    #[instrument(skip(cancellation_token, storage))]
     pub async fn resync_bucket<S: StorageAPI>(
         self: Arc<Self>,
         cancellation_token: CancellationToken,

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, instrument, warn};
 
 fn data_scanner_start_delay() -> Duration {
     let secs = rustfs_utils::get_env_u64(ENV_DATA_SCANNER_START_DELAY_SECS, DEFAULT_DATA_SCANNER_START_DELAY_SECS);
@@ -100,6 +100,8 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
 }
 
 /// Save background healing information to storage
+
+#[instrument(skip(storeapi))]
 pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundHealInfo) {
     // Skip for ErasureSD setup
     if is_erasure_sd().await {
@@ -167,6 +169,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
                 break;
             }
             _ = ticker.tick() => {
+                let _span = info_span!("data_scanner");
 
                 cycle_info.current = cycle_info.next;
                 cycle_info.started = Utc::now();
@@ -247,6 +250,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
 }
 
 /// Store data usage info in backend. Will store all objects sent on the receiver until closed.
+#[instrument(skip(ctx, storeapi))]
 pub async fn store_data_usage_in_backend(
     ctx: CancellationToken,
     storeapi: Arc<ECStore>,
