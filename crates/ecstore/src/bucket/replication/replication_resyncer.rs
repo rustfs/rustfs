@@ -590,6 +590,10 @@ impl ReplicationResyncer {
     }
 }
 
+fn heal_should_use_check_replicate_delete(oi: &ObjectInfo) -> bool {
+    oi.delete_marker || (!oi.replication_status.is_empty() && oi.replication_status != ReplicationStatusType::Failed)
+}
+
 pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationConfig) -> ReplicateObjectInfo {
     let mut oi = oi.clone();
     let mut user_defined = oi.user_defined.clone();
@@ -617,7 +621,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         }
     }
 
-    let dsc = if oi.delete_marker || !oi.replication_status.is_empty() {
+    let dsc = if heal_should_use_check_replicate_delete(&oi) {
         check_replicate_delete(
             oi.bucket.as_str(),
             &ObjectToDelete {
@@ -2965,6 +2969,7 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn test_part_range_spec_from_actual_size() {
@@ -2978,5 +2983,72 @@ mod tests {
     fn test_part_range_spec_rejects_non_positive() {
         assert!(part_range_spec_from_actual_size(0, 0).is_err());
         assert!(part_range_spec_from_actual_size(0, -1).is_err());
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_failed_non_delete_marker() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: false,
+            replication_status: ReplicationStatusType::Failed,
+            ..Default::default()
+        };
+        assert!(
+            !heal_should_use_check_replicate_delete(&oi),
+            "Failed non-delete-marker object must use must_replicate path so it can be re-queued for heal"
+        );
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_pending_uses_delete_path() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: false,
+            replication_status: ReplicationStatusType::Pending,
+            ..Default::default()
+        };
+        assert!(
+            heal_should_use_check_replicate_delete(&oi),
+            "Pending (non-Failed) status with non-empty replication uses check_replicate_delete path"
+        );
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_delete_marker() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: true,
+            replication_status: ReplicationStatusType::Failed,
+            ..Default::default()
+        };
+        assert!(
+            heal_should_use_check_replicate_delete(&oi),
+            "Delete marker always uses check_replicate_delete path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_heal_replicate_object_info_failed_object_returns_heal_roi() {
+        let oi = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "key".to_string(),
+            delete_marker: false,
+            replication_status: ReplicationStatusType::Failed,
+            version_id: Some(Uuid::nil()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let rcfg = ReplicationConfig::new(None, None);
+        let roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+
+        assert_eq!(roi.replication_status, ReplicationStatusType::Failed);
+        assert_eq!(roi.op_type, ReplicationType::Heal);
+        assert!(
+            roi.dsc.replicate_any() || roi.dsc.targets_map.is_empty(),
+            "With no replication config, dsc may be empty; with config, replicate_any() would be true and queueing would occur"
+        );
     }
 }
