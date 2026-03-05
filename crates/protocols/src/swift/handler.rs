@@ -56,8 +56,7 @@ where
     S: Service<Request<B>, Response = Response<Body>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    B: axum::body::HttpBody + Send + 'static,
-    B::Data: Send,
+    B: axum::body::HttpBody<Data = bytes::Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     type Response = Response<Body>;
@@ -81,8 +80,11 @@ where
             // This is consistent with how S3 auth handler retrieves Keystone credentials
             let credentials = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()).ok().flatten();
 
+            // Convert Request<B> to Request<Body> for Swift handler
+            let req_body = req.map(|b| Body::http_body_unsync(b));
+
             // Handle Swift operations with full request
-            let response_future = handle_swift_request(req, route, credentials);
+            let response_future = handle_swift_request(req_body, route, credentials);
             return Box::pin(async move {
                 match response_future.await {
                     Ok(response) => Ok(response),
@@ -102,15 +104,11 @@ where
 }
 
 /// Handle Swift API requests with full access to request data
-async fn handle_swift_request<B>(
-    req: Request<B>,
+async fn handle_swift_request(
+    req: Request<Body>,
     route: SwiftRoute,
     credentials: Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError>
-where
-    B: axum::body::HttpBody + Send + 'static,
-    B::Data: Send,
-    B::Error: std::error::Error + Send + Sync + 'static,
 {
     // Credentials are required for all Swift operations
     let credentials = credentials.ok_or_else(|| SwiftError::Unauthorized("Authentication required".to_string()))?;
@@ -276,7 +274,7 @@ where
             match method {
                 Method::PUT => {
                     // Check for SLO manifest creation
-                    if let Some(query) = req.uri().query() {
+                    if let Some(query) = parts.uri.query() {
                         if query.contains("multipart-manifest=put") {
                             // SLO manifest creation
                             return slo::handle_slo_put(&account, &container, &object, body, &headers, &Some(credentials.clone())).await;
@@ -324,7 +322,7 @@ where
                     let creds_opt = Some(credentials.clone());
 
                     // Check for SLO manifest retrieval
-                    if let Some(query) = req.uri().query() {
+                    if let Some(query) = parts.uri.query() {
                         if query.contains("multipart-manifest=get") {
                             return slo::handle_slo_get_manifest(&account, &container, &object, &creds_opt).await;
                         }
@@ -438,7 +436,7 @@ where
                     let creds_opt = Some(credentials.clone());
 
                     // Check for SLO delete with segments
-                    if let Some(query) = req.uri().query() {
+                    if let Some(query) = parts.uri.query() {
                         if query.contains("multipart-manifest=delete") {
                             return slo::handle_slo_delete(&account, &container, &object, &creds_opt).await;
                         }

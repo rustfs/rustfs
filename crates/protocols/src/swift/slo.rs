@@ -236,17 +236,14 @@ fn parse_range_header(range_str: &str, total_size: u64) -> Result<(u64, u64), Sw
 }
 
 /// Handle PUT /v1/{account}/{container}/{object}?multipart-manifest=put
-pub async fn handle_slo_put<B>(
+pub async fn handle_slo_put(
     account: &str,
     container: &str,
     object: &str,
-    body: B,
+    body: Body,
     headers: &HeaderMap,
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError>
-where
-    B: http_body::Body,
-    B::Error: std::fmt::Display,
 {
     use http_body_util::BodyExt;
 

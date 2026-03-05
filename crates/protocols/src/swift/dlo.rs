@@ -190,8 +190,8 @@ fn calculate_dlo_segments_for_range(
 /// Handle GET for DLO (discover segments and stream)
 pub async fn handle_dlo_get(
     account: &str,
-    container: &str,
-    object: &str,
+    _container: &str,
+    _object: &str,
     headers: &HeaderMap,
     credentials: &Option<Credentials>,
     manifest_value: String, // "container/prefix"
