@@ -103,6 +103,7 @@ pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: 
 }
 
 /// Load data usage info from backend storage
+#[instrument(skip(store))]
 pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
     let buf: Vec<u8> = match read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await {
         Ok(data) => data,
