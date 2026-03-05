@@ -19,7 +19,9 @@
 //! to S3 service for non-Swift requests.
 
 use super::container;
+use super::dlo;
 use super::object;
+use super::slo;
 use super::{SwiftError, SwiftRoute, SwiftRouter};
 use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
@@ -28,6 +30,7 @@ use rustfs_keystone::KEYSTONE_CREDENTIALS;
 use s3s::Body;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio_util::io::StreamReader;
 use tower::Service;
 use tracing::{debug, instrument};
 
@@ -272,51 +275,38 @@ where
         } => {
             match method {
                 Method::PUT => {
-                    // Upload object - collect body as bytes
-                    // TODO(P1): Stream uploads directly instead of buffering entire body in memory.
-                    // Current implementation buffers the entire request body before uploading,
-                    // which can cause OOM on large uploads. This should be refactored to stream
-                    // the body directly to put_object using a proper AsyncRead adapter.
-                    // See: https://github.com/rustfs/rustfs/pull/2066#pullrequestreview-3890571917
-                    use http_body_util::BodyExt;
-
-                    // Collect the body into bytes
-                    let collected = body
-                        .collect()
-                        .await
-                        .map_err(|e| SwiftError::BadRequest(format!("Failed to read request body: {}", e)))?;
-                    let body_bytes = collected.to_bytes();
-
-                    // Create an AsyncRead reader from the bytes
-                    // We use a simple adapter that wraps the bytes
-                    struct BytesReader {
-                        bytes: bytes::Bytes,
-                        pos: usize,
-                    }
-
-                    impl tokio::io::AsyncRead for BytesReader {
-                        fn poll_read(
-                            mut self: std::pin::Pin<&mut Self>,
-                            _cx: &mut std::task::Context<'_>,
-                            buf: &mut tokio::io::ReadBuf<'_>,
-                        ) -> std::task::Poll<std::io::Result<()>> {
-                            let remaining = self.bytes.len() - self.pos;
-                            if remaining == 0 {
-                                return std::task::Poll::Ready(Ok(()));
-                            }
-                            let to_read = std::cmp::min(remaining, buf.remaining());
-                            buf.put_slice(&self.bytes[self.pos..self.pos + to_read]);
-                            self.pos += to_read;
-                            std::task::Poll::Ready(Ok(()))
+                    // Check for SLO manifest creation
+                    if let Some(query) = req.uri().query() {
+                        if query.contains("multipart-manifest=put") {
+                            // SLO manifest creation
+                            return slo::handle_slo_put(&account, &container, &object, body, &headers, &credentials).await;
                         }
                     }
 
-                    let reader = BytesReader {
-                        bytes: body_bytes,
-                        pos: 0,
-                    };
+                    // Check for DLO registration via X-Object-Manifest header
+                    if let Some(manifest_value) = headers.get("x-object-manifest") {
+                        if let Ok(manifest_str) = manifest_value.to_str() {
+                            return dlo::handle_dlo_register(&account, &container, &object, manifest_str, &credentials).await;
+                        }
+                    }
 
-                    let etag = object::put_object(&account, &container, &object, &credentials, reader, &headers).await?;
+                    // Regular object upload - stream directly without buffering entire body in memory
+                    // Convert HTTP body to AsyncRead stream using StreamReader
+                    use http_body_util::BodyExt;
+
+                    // Convert body into data stream with proper error mapping
+                    let stream = body
+                        .into_data_stream()
+                        .map(|result| result.map_err(|e| std::io::Error::other(e.to_string())));
+
+                    // Create streaming reader from the body stream
+                    let reader = StreamReader::new(stream);
+
+                    // Add buffering for optimal streaming performance (64KB buffer)
+                    // This provides backpressure handling and reduces syscall overhead
+                    let buffered_reader = tokio::io::BufReader::with_capacity(65536, reader);
+
+                    let etag = object::put_object(&account, &container, &object, &credentials, buffered_reader, &headers).await?;
 
                     let trans_id = generate_trans_id();
                     Response::builder()
@@ -330,7 +320,24 @@ where
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::GET => {
-                    // Download object - parse Range header if present
+                    // Check for SLO manifest retrieval
+                    if let Some(query) = req.uri().query() {
+                        if query.contains("multipart-manifest=get") {
+                            return slo::handle_slo_get_manifest(&account, &container, &object, &credentials).await;
+                        }
+                    }
+
+                    // Check if object is SLO (via metadata)
+                    if slo::is_slo_object(&account, &container, &object, &credentials).await? {
+                        return slo::handle_slo_get(&account, &container, &object, &headers, &credentials).await;
+                    }
+
+                    // Check if object is DLO (via x-object-manifest metadata)
+                    if let Some(manifest_value) = dlo::is_dlo_object(&account, &container, &object, &credentials).await? {
+                        return dlo::handle_dlo_get(&account, &container, &object, &headers, &credentials, manifest_value).await;
+                    }
+
+                    // Regular object download - parse Range header if present
                     let range = headers
                         .get("range")
                         .and_then(|v| v.to_str().ok())
@@ -425,7 +432,14 @@ where
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::DELETE => {
-                    // Delete object
+                    // Check for SLO delete with segments
+                    if let Some(query) = req.uri().query() {
+                        if query.contains("multipart-manifest=delete") {
+                            return slo::handle_slo_delete(&account, &container, &object, &credentials).await;
+                        }
+                    }
+
+                    // Regular object delete
                     object::delete_object(&account, &container, &object, &credentials).await?;
 
                     let trans_id = generate_trans_id();

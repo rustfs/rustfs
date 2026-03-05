@@ -46,6 +46,10 @@ swift = [
     "dep:tokio-util",
     "dep:serde",
     "dep:urlencoding",
+    "dep:md5",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:hex",
 ]
 
 [dependencies]
@@ -97,6 +101,10 @@ http-body-util = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
+md5 = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
 all-features = true

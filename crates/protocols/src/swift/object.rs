@@ -387,6 +387,96 @@ where
     Ok(obj_info.etag.unwrap_or_default())
 }
 
+/// Upload an object with custom metadata (for SLO/DLO internal use)
+///
+/// Similar to put_object, but allows directly specifying metadata instead of extracting from headers.
+/// This is used internally for storing SLO manifests and marker objects.
+#[allow(dead_code)] // Used by SLO implementation
+pub async fn put_object_with_metadata<R>(
+    account: &str,
+    container: &str,
+    object: &str,
+    credentials: &Option<Credentials>,
+    reader: R,
+    metadata: &HashMap<String, String>,
+) -> SwiftResult<String>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
+{
+    // If credentials are provided, validate access
+    let project_id = if let Some(creds) = credentials {
+        validate_account_access(account, creds)?
+    } else {
+        // For testing/internal use, extract project_id from account
+        account.strip_prefix("AUTH_")
+            .ok_or_else(|| SwiftError::Unauthorized("Invalid account format".to_string()))?
+            .to_string()
+    };
+
+    // Validate object name
+    ObjectKeyMapper::validate_object_name(object)?;
+
+    // Get S3 key from object name
+    let s3_key = ObjectKeyMapper::swift_to_s3_key(object)?;
+
+    // Map container to bucket using tenant prefixing
+    let mapper = ContainerMapper::default();
+    let bucket = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Validate metadata limits
+    validate_metadata(metadata)?;
+
+    // Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // Verify bucket/container exists
+    store.get_bucket_info(&bucket, &BucketOptions::default()).await.map_err(|e| {
+        if e.to_string().contains("does not exist") {
+            SwiftError::NotFound(format!("Container '{}' not found", container))
+        } else {
+            sanitize_storage_error("Container verification", e)
+        }
+    })?;
+
+    // Prepare object options with metadata
+    let opts = ObjectOptions {
+        user_defined: metadata.clone(),
+        ..Default::default()
+    };
+
+    // Content length (use -1 for unknown)
+    let content_length = -1i64;
+
+    // Wrap reader in buffered reader then WarpReader
+    let buf_reader = tokio::io::BufReader::new(reader);
+    let warp_reader: Box<dyn Reader> = Box::new(WarpReader::new(buf_reader));
+
+    // Create HashReader
+    let hash_reader = HashReader::new(
+        warp_reader,
+        content_length,
+        content_length,
+        None,  // md5hex
+        None,  // sha256hex
+        false, // disable_multipart
+    )
+    .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
+
+    // Wrap in PutObjReader
+    let mut put_reader = PutObjReader::new(hash_reader);
+
+    // Upload object to storage
+    let obj_info = store
+        .put_object(&bucket, &s3_key, &mut put_reader, &opts)
+        .await
+        .map_err(|e| sanitize_storage_error("Object upload", e))?;
+
+    // Return ETag
+    Ok(obj_info.etag.unwrap_or_default())
+}
+
 /// Download an object from Swift storage (GET)
 ///
 /// Maps Swift container/object to S3 bucket/key and retrieves the object content.
