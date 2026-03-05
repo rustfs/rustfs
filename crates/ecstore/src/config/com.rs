@@ -22,7 +22,7 @@ use rustfs_utils::path::SLASH_SEPARATOR;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use tracing::{error, warn};
+use tracing::{error, instrument, warn};
 
 pub const CONFIG_PREFIX: &str = "config";
 const CONFIG_FILE: &str = "config.json";
