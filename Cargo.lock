@@ -7739,6 +7739,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0-rc.5",
  "http 1.4.0",
+ "http-body 1.0.1",
  "http-body-util",
  "hyper",
  "libunftp",

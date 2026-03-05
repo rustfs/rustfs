@@ -279,20 +279,21 @@ where
                     if let Some(query) = req.uri().query() {
                         if query.contains("multipart-manifest=put") {
                             // SLO manifest creation
-                            return slo::handle_slo_put(&account, &container, &object, body, &headers, &credentials).await;
+                            return slo::handle_slo_put(&account, &container, &object, body, &headers, &Some(credentials.clone())).await;
                         }
                     }
 
                     // Check for DLO registration via X-Object-Manifest header
                     if let Some(manifest_value) = headers.get("x-object-manifest") {
                         if let Ok(manifest_str) = manifest_value.to_str() {
-                            return dlo::handle_dlo_register(&account, &container, &object, manifest_str, &credentials).await;
+                            return dlo::handle_dlo_register(&account, &container, &object, manifest_str, &Some(credentials.clone())).await;
                         }
                     }
 
                     // Regular object upload - stream directly without buffering entire body in memory
                     // Convert HTTP body to AsyncRead stream using StreamReader
                     use http_body_util::BodyExt;
+                    use futures::StreamExt;
 
                     // Convert body into data stream with proper error mapping
                     let stream = body
@@ -320,21 +321,23 @@ where
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::GET => {
+                    let creds_opt = Some(credentials.clone());
+
                     // Check for SLO manifest retrieval
                     if let Some(query) = req.uri().query() {
                         if query.contains("multipart-manifest=get") {
-                            return slo::handle_slo_get_manifest(&account, &container, &object, &credentials).await;
+                            return slo::handle_slo_get_manifest(&account, &container, &object, &creds_opt).await;
                         }
                     }
 
                     // Check if object is SLO (via metadata)
-                    if slo::is_slo_object(&account, &container, &object, &credentials).await? {
-                        return slo::handle_slo_get(&account, &container, &object, &headers, &credentials).await;
+                    if slo::is_slo_object(&account, &container, &object, &creds_opt).await? {
+                        return slo::handle_slo_get(&account, &container, &object, &headers, &creds_opt).await;
                     }
 
                     // Check if object is DLO (via x-object-manifest metadata)
-                    if let Some(manifest_value) = dlo::is_dlo_object(&account, &container, &object, &credentials).await? {
-                        return dlo::handle_dlo_get(&account, &container, &object, &headers, &credentials, manifest_value).await;
+                    if let Some(manifest_value) = dlo::is_dlo_object(&account, &container, &object, &creds_opt).await? {
+                        return dlo::handle_dlo_get(&account, &container, &object, &headers, &creds_opt, manifest_value).await;
                     }
 
                     // Regular object download - parse Range header if present
@@ -432,10 +435,12 @@ where
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::DELETE => {
+                    let creds_opt = Some(credentials.clone());
+
                     // Check for SLO delete with segments
                     if let Some(query) = req.uri().query() {
                         if query.contains("multipart-manifest=delete") {
-                            return slo::handle_slo_delete(&account, &container, &object, &credentials).await;
+                            return slo::handle_slo_delete(&account, &container, &object, &creds_opt).await;
                         }
                     }
 

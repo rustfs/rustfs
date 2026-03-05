@@ -20,8 +20,6 @@
 
 use super::{SwiftError, container, object};
 use axum::http::{HeaderMap, Response, StatusCode};
-use bytes::Bytes;
-use futures::{Stream, StreamExt, TryStreamExt};
 use rustfs_credentials::Credentials;
 use s3s::Body;
 use std::collections::HashMap;
@@ -78,9 +76,9 @@ pub async fn list_dlo_segments(
     // Convert to ObjectInfo and sort lexicographically
     let mut object_infos: Vec<ObjectInfo> = objects.iter().map(|obj| ObjectInfo {
         name: obj.name.clone(),
-        size: obj.bytes,
-        content_type: obj.content_type.clone(),
-        etag: obj.hash.clone(),
+        size: obj.bytes as i64,
+        content_type: Some(obj.content_type.clone()),
+        etag: Some(obj.hash.clone()),
     }).collect();
 
     // Sort lexicographically (critical for correct assembly)
@@ -216,8 +214,8 @@ pub async fn handle_dlo_get(
         .and_then(|v| v.to_str().ok())
         .and_then(|r| parse_range_header(r, total_size).ok());
 
-    // 5. Create segment stream
-    let segment_stream = create_dlo_stream(account, &segment_container, &segments, credentials, range).await?;
+    // 5. Collect segment data
+    let segment_data = collect_dlo_segments(account, &segment_container, &segments, credentials, range).await?;
 
     // 6. Build response
     let trans_id = generate_trans_id();
@@ -230,11 +228,11 @@ pub async fn handle_dlo_get(
         response = response
             .status(StatusCode::PARTIAL_CONTENT)
             .header("content-range", format!("bytes {}-{}/{}", start, end, total_size))
-            .header("content-length", (end - start + 1).to_string());
+            .header("content-length", segment_data.len().to_string());
     } else {
         response = response
             .status(StatusCode::OK)
-            .header("content-length", total_size.to_string());
+            .header("content-length", segment_data.len().to_string());
     }
 
     // Get content-type from first segment
@@ -244,19 +242,23 @@ pub async fn handle_dlo_get(
         }
     }
 
-    Ok(response.body(Body::from_stream(segment_stream))
+    Ok(response.body(Body::from(segment_data))
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
 }
 
-/// Create streaming reader for DLO segments
-async fn create_dlo_stream(
+/// Collect segment data by fetching and concatenating segments
+async fn collect_dlo_segments(
     account: &str,
     container: &str,
     segments: &[ObjectInfo],
     credentials: &Option<Credentials>,
     range: Option<(u64, u64)>,
-) -> Result<impl Stream<Item = Result<Bytes, std::io::Error>>, SwiftError> {
-    // Similar to SLO streaming, but simpler (no manifest validation needed)
+) -> Result<Vec<u8>, SwiftError> {
+    // Require credentials
+    let creds = credentials.as_ref()
+        .ok_or_else(|| SwiftError::Unauthorized("Credentials required".to_string()))?;
+
+    // Determine which segments to fetch based on range
     let segments_to_fetch = if let Some((start, end)) = range {
         calculate_dlo_segments_for_range(segments, start, end)?
     } else {
@@ -265,34 +267,28 @@ async fn create_dlo_stream(
         }).collect()
     };
 
-    let stream = futures::stream::iter(segments_to_fetch)
-        .then(move |(seg_idx, byte_start, byte_end, segment)| {
-            let account = account.to_string();
-            let container = container.to_string();
-            let credentials = credentials.clone();
+    let mut result = Vec::new();
 
-            async move {
-                let range_spec = if byte_start > 0 || byte_end < segment.size as u64 - 1 {
-                    Some((byte_start, byte_end))
-                } else {
-                    None
-                };
+    // Fetch each segment
+    for (_seg_idx, byte_start, byte_end, segment) in segments_to_fetch {
+        let range_spec = if byte_start > 0 || byte_end < segment.size as u64 - 1 {
+            Some(rustfs_ecstore::store_api::HTTPRangeSpec {
+                is_suffix_length: false,
+                start: byte_start as i64,
+                end: byte_end as i64,
+            })
+        } else {
+            None
+        };
 
-                let mut reader = object::get_object(&account, &container, &segment.name, &credentials, range_spec).await?;
+        let mut reader = object::get_object(account, container, &segment.name, creds, range_spec).await?;
 
-                let mut buffer = Vec::new();
-                use tokio::io::AsyncReadExt;
-                reader.stream.read_to_end(&mut buffer).await
-                    .map_err(|e| SwiftError::InternalServerError(format!("Failed to read segment: {}", e)))?;
+        use tokio::io::AsyncReadExt;
+        reader.stream.read_to_end(&mut result).await
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to read segment: {}", e)))?;
+    }
 
-                Ok::<Bytes, SwiftError>(Bytes::from(buffer))
-            }
-        })
-        // Map SwiftError to io::Error for Body::from_stream compatibility
-        .map_err(|e: SwiftError| std::io::Error::other(e.to_string()))
-        .boxed();
-
-    Ok(stream)
+    Ok(result)
 }
 
 /// Register DLO by setting object metadata with manifest pointer

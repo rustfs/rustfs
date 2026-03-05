@@ -20,8 +20,6 @@
 
 use super::{SwiftError, object};
 use axum::http::{HeaderMap, Response, StatusCode};
-use bytes::Bytes;
-use futures::{Stream, StreamExt, TryStreamExt};
 use rustfs_credentials::Credentials;
 use s3s::Body;
 use serde::{Deserialize, Serialize};
@@ -72,19 +70,21 @@ impl SLOManifest {
 
     /// Calculate SLO ETag: "{MD5(concat_etags)}-{count}"
     pub fn calculate_etag(&self) -> String {
-        use md5::Digest;
-        let mut hasher = md5::Md5::new();
+        // Concatenate all ETags
+        let mut etag_concat = String::new();
         for seg in &self.segments {
             // Remove quotes from etag if present
             let etag = seg.etag.trim_matches('"');
-            hasher.update(etag.as_bytes());
+            etag_concat.push_str(etag);
         }
-        let hash = format!("{:x}", hasher.finalize());
-        format!("\"{}-{}\"", hash, self.segments.len())
+
+        // Calculate MD5 hash
+        let hash = md5::compute(etag_concat.as_bytes());
+        format!("\"{:x}-{}\"", hash, self.segments.len())
     }
 
     /// Validate manifest against actual segments
-    pub async fn validate(&self, account: &str, credentials: &Option<Credentials>) -> Result<(), SwiftError> {
+    pub async fn validate(&self, account: &str, credentials: &Credentials) -> Result<(), SwiftError> {
         if self.segments.is_empty() {
             return Err(SwiftError::BadRequest("SLO manifest must contain at least one segment".to_string()));
         }
@@ -236,15 +236,23 @@ fn parse_range_header(range_str: &str, total_size: u64) -> Result<(u64, u64), Sw
 }
 
 /// Handle PUT /v1/{account}/{container}/{object}?multipart-manifest=put
-pub async fn handle_slo_put(
+pub async fn handle_slo_put<B>(
     account: &str,
     container: &str,
     object: &str,
-    body: Body,
+    body: B,
     headers: &HeaderMap,
     credentials: &Option<Credentials>,
-) -> Result<Response<Body>, SwiftError> {
+) -> Result<Response<Body>, SwiftError>
+where
+    B: http_body::Body,
+    B::Error: std::fmt::Display,
+{
     use http_body_util::BodyExt;
+
+    // Require credentials
+    let creds = credentials.as_ref()
+        .ok_or_else(|| SwiftError::Unauthorized("Credentials required for SLO operations".to_string()))?;
 
     // 1. Read manifest JSON from body
     let manifest_bytes = body
@@ -258,11 +266,11 @@ pub async fn handle_slo_put(
 
     // 3. Validate manifest size (2MB limit)
     if manifest_bytes.len() > 2 * 1024 * 1024 {
-        return Err(SwiftError::RequestEntityTooLarge("Manifest exceeds 2MB".to_string()));
+        return Err(SwiftError::BadRequest("Manifest exceeds 2MB".to_string()));
     }
 
     // 4. Validate segments exist and match ETags/sizes
-    manifest.validate(account, credentials).await?;
+    manifest.validate(account, creds).await?;
 
     // 5. Store manifest as S3 object with metadata marker
     let mut metadata = HashMap::new();
@@ -321,9 +329,13 @@ pub async fn handle_slo_get(
     headers: &HeaderMap,
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
+    // Require credentials
+    let creds = credentials.as_ref()
+        .ok_or_else(|| SwiftError::Unauthorized("Credentials required for SLO operations".to_string()))?;
+
     // 1. Load manifest
     let manifest_key = format!("{}.slo-manifest", object);
-    let mut manifest_reader = object::get_object(account, container, &manifest_key, credentials, None).await?;
+    let mut manifest_reader = object::get_object(account, container, &manifest_key, creds, None).await?;
 
     // Read manifest bytes
     let mut manifest_bytes = Vec::new();
@@ -338,8 +350,8 @@ pub async fn handle_slo_get(
         .and_then(|v| v.to_str().ok())
         .and_then(|r| parse_range_header(r, manifest.total_size()).ok());
 
-    // 3. Create segment stream
-    let segment_stream = create_slo_stream(account, &manifest, credentials, range).await?;
+    // 3. Collect segment data
+    let segment_data = collect_slo_segments(account, &manifest, credentials, range).await?;
 
     // 4. Build response
     let trans_id = generate_trans_id();
@@ -353,26 +365,27 @@ pub async fn handle_slo_get(
         response = response
             .status(StatusCode::PARTIAL_CONTENT)
             .header("content-range", format!("bytes {}-{}/{}", start, end, manifest.total_size()))
-            .header("content-length", (end - start + 1).to_string());
+            .header("content-length", segment_data.len().to_string());
     } else {
         response = response
             .status(StatusCode::OK)
-            .header("content-length", manifest.total_size().to_string());
+            .header("content-length", segment_data.len().to_string());
     }
 
-    Ok(response.body(Body::from_stream(segment_stream))
+    Ok(response.body(Body::from(segment_data))
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
 }
 
-/// Create streaming reader that chains segment readers
-async fn create_slo_stream(
+/// Collect segment data by fetching and concatenating segments
+async fn collect_slo_segments(
     account: &str,
     manifest: &SLOManifest,
     credentials: &Option<Credentials>,
     range: Option<(u64, u64)>,
-) -> Result<impl Stream<Item = Result<Bytes, std::io::Error>>, SwiftError> {
-    use futures::StreamExt;
-    use futures::TryStreamExt;
+) -> Result<Vec<u8>, SwiftError> {
+    // Require credentials
+    let creds = credentials.as_ref()
+        .ok_or_else(|| SwiftError::Unauthorized("Credentials required".to_string()))?;
 
     // Determine which segments to fetch based on range
     let segments_to_fetch = if let Some((start, end)) = range {
@@ -384,38 +397,32 @@ async fn create_slo_stream(
         }).collect()
     };
 
-    // Create async stream that fetches segments on-demand
-    let stream = futures::stream::iter(segments_to_fetch)
-        .then(move |(seg_idx, byte_start, byte_end, segment)| {
-            let account = account.to_string();
-            let credentials = credentials.clone();
+    let mut result = Vec::new();
 
-            async move {
-                let (container, object_name) = parse_segment_path(&segment.path)?;
+    // Fetch each segment
+    for (_seg_idx, byte_start, byte_end, segment) in segments_to_fetch {
+        let (container, object_name) = parse_segment_path(&segment.path)?;
 
-                // Fetch segment with range
-                let range_spec = if byte_start > 0 || byte_end < segment.size_bytes - 1 {
-                    Some((byte_start, byte_end))
-                } else {
-                    None
-                };
+        // Fetch segment with range
+        let range_spec = if byte_start > 0 || byte_end < segment.size_bytes - 1 {
+            Some(rustfs_ecstore::store_api::HTTPRangeSpec {
+                is_suffix_length: false,
+                start: byte_start as i64,
+                end: byte_end as i64,
+            })
+        } else {
+            None
+        };
 
-                let mut reader = object::get_object(&account, &container, &object_name, &credentials, range_spec).await?;
+        let mut reader = object::get_object(account, &container, &object_name, creds, range_spec).await?;
 
-                // Read segment into bytes
-                let mut buffer = Vec::new();
-                use tokio::io::AsyncReadExt;
-                reader.stream.read_to_end(&mut buffer).await
-                    .map_err(|e| SwiftError::InternalServerError(format!("Failed to read segment: {}", e)))?;
+        // Read segment into buffer
+        use tokio::io::AsyncReadExt;
+        reader.stream.read_to_end(&mut result).await
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to read segment: {}", e)))?;
+    }
 
-                Ok::<Bytes, SwiftError>(Bytes::from(buffer))
-            }
-        })
-        // Map SwiftError to io::Error for Body::from_stream compatibility
-        .map_err(|e: SwiftError| std::io::Error::other(e.to_string()))
-        .boxed();
-
-    Ok(stream)
+    Ok(result)
 }
 
 /// Handle GET /v1/{account}/{container}/{object}?multipart-manifest=get (return manifest JSON)
@@ -425,9 +432,13 @@ pub async fn handle_slo_get_manifest(
     object: &str,
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
+    // Require credentials
+    let creds = credentials.as_ref()
+        .ok_or_else(|| SwiftError::Unauthorized("Credentials required for SLO operations".to_string()))?;
+
     // Load and return the manifest JSON directly
     let manifest_key = format!("{}.slo-manifest", object);
-    let mut manifest_reader = object::get_object(account, container, &manifest_key, credentials, None).await?;
+    let mut manifest_reader = object::get_object(account, container, &manifest_key, creds, None).await?;
 
     // Read manifest bytes
     let mut manifest_bytes = Vec::new();
@@ -459,7 +470,7 @@ pub async fn handle_slo_delete(
 
     // 1. Load manifest
     let manifest_key = format!("{}.slo-manifest", object);
-    let mut manifest_reader = object::get_object(account, container, &manifest_key, credentials, None).await?;
+    let mut manifest_reader = object::get_object(account, container, &manifest_key, creds, None).await?;
 
     // Read manifest bytes
     let mut manifest_bytes = Vec::new();
