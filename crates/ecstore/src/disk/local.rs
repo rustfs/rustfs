@@ -1317,39 +1317,31 @@ fn normalize_path_components(path: impl AsRef<Path>) -> PathBuf {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
-    #[tracing::instrument(skip(self))]
     fn to_string(&self) -> String {
         self.root.to_string_lossy().to_string()
     }
-    #[tracing::instrument(skip(self))]
     fn is_local(&self) -> bool {
         true
     }
-    #[tracing::instrument(skip(self))]
     fn host_name(&self) -> String {
         self.endpoint.host_port()
     }
-    #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
         true
     }
 
-    #[tracing::instrument(skip(self))]
     fn endpoint(&self) -> Endpoint {
         self.endpoint.clone()
     }
-
     #[tracing::instrument(skip(self))]
     async fn close(&self) -> Result<()> {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
     fn path(&self) -> PathBuf {
         self.root.clone()
     }
 
-    #[tracing::instrument(skip(self))]
     fn get_disk_location(&self) -> DiskLocation {
         DiskLocation {
             pool_idx: {
@@ -1437,7 +1429,6 @@ impl DiskAPI for LocalDisk {
         Ok(Some(disk_id))
     }
 
-    #[tracing::instrument(skip(self))]
     async fn set_disk_id(&self, _id: Option<Uuid>) -> Result<()> {
         // No setup is required locally
         Ok(())
@@ -2601,6 +2592,7 @@ impl DiskAPI for LocalDisk {
         ScanGuard(Arc::clone(&self.scanning))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
         // Try to use cached file content reading for better performance, with safe fallback
         let file_path = self.get_object_path(volume, path)?;
@@ -2617,6 +2609,7 @@ impl DiskAPI for LocalDisk {
     }
 }
 
+#[tracing::instrument]
 async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInfo, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
