@@ -9,6 +9,13 @@ Applies to `.github/` and repository pull-request operations.
 - Keep all template section headings.
 - Use `N/A` for non-applicable sections.
 - Include verification commands in the PR details.
+- For `gh pr create` and `gh pr edit`, always write markdown body to a file and pass `--body-file`.
+- Do not use multiline inline `--body`; backticks and shell expansion can corrupt content or trigger unintended commands.
+- Recommended pattern:
+  - `cat > /tmp/pr_body.md <<'EOF'`
+  - `...markdown...`
+  - `EOF`
+  - `gh pr create ... --body-file /tmp/pr_body.md`
 
 ## CI Alignment
 

@@ -45,6 +45,7 @@ Do not commit when required checks fail.
 - Use `.github/pull_request_template.md` and keep all section headings.
 - Use `N/A` for non-applicable template sections.
 - Include verification commands in the PR description.
+- When using `gh pr create`/`gh pr edit`, use `--body-file` instead of inline `--body` for multiline markdown.
 
 ## Security Baseline
 
