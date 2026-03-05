@@ -142,10 +142,7 @@ where
                 }
                 Method::POST => {
                     // Account metadata update not yet implemented
-                    Err(SwiftError::InternalServerError(format!(
-                        "Swift Account POST operation not yet implemented: POST {}",
-                        account
-                    )))
+                    Err(SwiftError::NotImplemented("Swift Account POST operation not yet implemented".to_string()))
                 }
                 _ => Err(SwiftError::BadRequest(format!("Unsupported method for account: {}", method))),
             }
@@ -471,7 +468,7 @@ where
 
                     let trans_id = generate_trans_id();
                     Response::builder()
-                        .status(StatusCode::ACCEPTED)
+                        .status(StatusCode::NO_CONTENT)
                         .header("content-type", "text/html; charset=utf-8")
                         .header("content-length", "0")
                         .header("x-trans-id", trans_id.clone())
@@ -501,19 +498,32 @@ where
                         .and_then(|v| v.to_str().ok())
                         .ok_or_else(|| SwiftError::BadRequest("Destination header required for COPY".to_string()))?;
 
-                    // Validate destination header to prevent path traversal
-                    if destination.contains("..") {
-                        return Err(SwiftError::BadRequest("Path traversal not allowed in destination".to_string()));
-                    }
-
                     // Parse destination: /{container}/{object}
                     // Object can have multiple path segments (e.g., /container/path/to/file.txt)
                     let destination_parts: Vec<&str> = destination.trim_start_matches('/').splitn(2, '/').collect();
                     if destination_parts.len() != 2 {
                         return Err(SwiftError::BadRequest("Destination must be /{container}/{object}".to_string()));
                     }
-                    let dest_container = destination_parts[0];
-                    let dest_object = destination_parts[1];
+
+                    // Percent-decode and validate destination components
+                    use percent_encoding::percent_decode_str;
+                    let dest_container = percent_decode_str(destination_parts[0])
+                        .decode_utf8()
+                        .map_err(|_| SwiftError::BadRequest("Invalid UTF-8 in destination container".to_string()))?;
+                    let dest_object_raw = percent_decode_str(destination_parts[1])
+                        .decode_utf8()
+                        .map_err(|_| SwiftError::BadRequest("Invalid UTF-8 in destination object".to_string()))?;
+
+                    // Validate path segments to prevent path traversal
+                    // Check each segment (split by '/') - none should be ".."
+                    for segment in dest_object_raw.split('/') {
+                        if segment == ".." {
+                            return Err(SwiftError::BadRequest("Path traversal not allowed in destination".to_string()));
+                        }
+                    }
+
+                    let dest_container = dest_container.as_ref();
+                    let dest_object = dest_object_raw.as_ref();
 
                     // Validate container and object names
                     if dest_container.is_empty() || dest_container.len() > 256 {
