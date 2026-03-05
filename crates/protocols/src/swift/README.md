@@ -24,15 +24,21 @@ This implementation provides **Phase 1 Swift API support** (~25% of full Swift A
 
 ## Enable Feature
 
+**Swift API is opt-in and must be explicitly enabled.**
+
+Build with Swift support:
+
 ```bash
 cargo build --features swift
 ```
 
-Or for all features:
+Or enable all protocol features:
 
 ```bash
 cargo build --features full
 ```
+
+**Note:** Swift is NOT enabled by default to avoid unexpected API surface changes in existing deployments.
 
 ## Configuration
 

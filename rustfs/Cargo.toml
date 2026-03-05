@@ -31,7 +31,7 @@ name = "rustfs"
 path = "src/main.rs"
 
 [features]
-default = ["metrics", "swift"]
+default = ["metrics"]
 metrics = []
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
