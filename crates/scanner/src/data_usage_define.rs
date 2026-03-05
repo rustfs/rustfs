@@ -310,17 +310,6 @@ impl DataUsageHash {
 
         let hash = self.calculate_hash();
 
-        warn!(
-            "mod_alt: key: {} hash: {} cycle: {} cycles: {} mod: {} hash >> 32: {} result: {}",
-            self.0,
-            hash,
-            cycle,
-            cycles,
-            (hash >> 32) as u32,
-            (hash >> 32) as u32 % cycles,
-            cycle % cycles,
-        );
-
         (hash >> 32) as u32 % cycles == cycle % cycles
     }
 
@@ -1103,10 +1092,13 @@ impl DataUsageCache {
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
 
+        let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
+
         let store_clone = store.clone();
         let buf_clone = buf.clone();
+        let path_clone = path.clone();
         let res = timeout(Duration::from_secs(5), async move {
-            save_config(store_clone, name, buf_clone).await?;
+            save_config(store_clone, &path_clone, buf_clone).await?;
             Ok::<(), StorageError>(())
         })
         .await
@@ -1119,8 +1111,9 @@ impl DataUsageCache {
 
         let store_clone = store.clone();
         let backup_name = format!("{name}.bkp");
+        let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
         let res = timeout(Duration::from_secs(5), async move {
-            save_config(store_clone, backup_name.as_str(), buf).await?;
+            save_config(store_clone, &backup_path, buf).await?;
             Ok::<(), StorageError>(())
         })
         .await

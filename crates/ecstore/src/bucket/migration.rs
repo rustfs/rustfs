@@ -12,65 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Migration of bucket metadata from MinIO to RustFS format.
+//! Migration of bucket metadata from legacy format to RustFS format.
 
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-use crate::store_api::{ObjectOptions, PutObjReader, StorageAPI};
+use crate::store_api::{BucketOptions, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// metadata bucket path, used when migrating bucket metadata.
-const MIGRATING_META_BUCKET: &str = ".minio.sys";
+/// Legacy metadata bucket path, used when migrating bucket metadata.
+pub(crate) const MIGRATING_META_BUCKET: &str = ".minio.sys";
 
-/// Migrates bucket metadata
-/// using StorageAPI get_object_reader and put_object. Non-fatal: logs and returns on error.
+/// Migrates bucket metadata from legacy format to RustFS.
+/// Uses list_bucket (from disk volumes) to get bucket names, since list_objects_v2 on the legacy
+/// meta bucket may not work (legacy format differs from object layer expectations).
 /// Skips buckets that already exist in RustFS (idempotent).
 pub async fn try_migrate_bucket_metadata<S: StorageAPI>(store: Arc<S>) {
-    let prefix = format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}");
-    let loi = match store
-        .clone()
-        .list_objects_v2(
-            MIGRATING_META_BUCKET,
-            &prefix,
-            None,
-            Some(SLASH_SEPARATOR.to_string()),
-            1000,
-            false,
-            None,
-            false,
-        )
+    let buckets_list = match store
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
         .await
     {
-        Ok(loi) => loi,
+        Ok(b) => b,
         Err(e) => {
-            debug!("list migrating buckets failed (may not exist): {e}");
+            warn!("list buckets failed (skip migration): {e}");
             return;
         }
     };
 
-    let prefix = format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}");
-    let buckets: Vec<String> = loi
-        .prefixes
-        .iter()
-        .filter_map(|p| {
-            let rest = p.trim_end_matches('/').strip_prefix(&prefix)?;
-            let name = rest.trim_end_matches('/');
-            if name.is_empty() || name.contains('/') {
-                None
-            } else {
-                Some(name.to_string())
-            }
-        })
-        .collect();
+    let buckets: Vec<String> = buckets_list.into_iter().map(|b| b.name).collect();
 
     if buckets.is_empty() {
+        debug!("No migrating bucket metadata found");
         return;
     }
 
-    info!("Migrating {} bucket metadata from MinIO config", buckets.len());
+    debug!("Found {} migrating bucket metadata, migrating...", buckets.len());
 
     let opts = ObjectOptions {
         max_parity: true,
@@ -113,9 +94,9 @@ pub async fn try_migrate_bucket_metadata<S: StorageAPI>(store: Arc<S>) {
             .put_object(RUSTFS_META_BUCKET, &meta_path, &mut PutObjReader::from_vec(data), &opts)
             .await
         {
-            warn!("write migrating bucket metadata {bucket}: {e}");
+            warn!("write bucket metadata {bucket}: {e}");
         } else {
-            debug!("Migrated bucket metadata: {bucket}");
+            info!("Migrated bucket metadata: {bucket}");
         }
     }
 }
