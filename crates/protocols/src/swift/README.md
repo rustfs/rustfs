@@ -4,14 +4,23 @@ Swift-compatible object storage API implementation for RustFS.
 
 ## Features
 
-- Full Swift Object Storage API v1 compatibility
-- Container CRUD operations
-- Object CRUD with streaming support
-- Keystone token authentication
-- Multi-tenant isolation with secure bucket prefixing
-- Server-side object copy (COPY method)
-- HTTP Range requests for partial downloads
-- Custom metadata support (X-Object-Meta-*, X-Container-Meta-*)
+This implementation provides **Phase 1 Swift API support** (~25% of full Swift API):
+
+- ✅ Container CRUD operations (create, list, delete, metadata)
+- ✅ Object CRUD with streaming downloads (upload, get, head, delete)
+- ✅ Keystone token authentication
+- ✅ Multi-tenant isolation with secure SHA256-based bucket prefixing
+- ✅ Server-side object copy (COPY method)
+- ✅ HTTP Range requests for partial downloads (206, 416 responses)
+- ✅ Custom metadata support (X-Object-Meta-*, X-Container-Meta-*)
+
+**Not yet implemented:**
+- ⏳ Account-level operations (statistics, metadata)
+- ⏳ Large object support (multi-part uploads >5GB)
+- ⏳ Object versioning
+- ⏳ Container ACLs and CORS
+- ⏳ Temporary URLs (TempURL)
+- ⏳ XML/plain-text response formats (JSON only)
 
 ## Enable Feature
 
