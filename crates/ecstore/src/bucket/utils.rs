@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::migration::MIGRATING_META_BUCKET;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, StorageError};
 use regex::Regex;
@@ -20,7 +21,7 @@ use s3s::xml;
 use tracing::instrument;
 
 pub fn is_meta_bucketname(name: &str) -> bool {
-    name.starts_with(RUSTFS_META_BUCKET)
+    name.starts_with(RUSTFS_META_BUCKET) || name.starts_with(MIGRATING_META_BUCKET)
 }
 
 lazy_static::lazy_static! {

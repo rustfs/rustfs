@@ -697,7 +697,6 @@ impl LocalDisk {
                 match self.read_metadata_with_dmtime(meta_path).await {
                     Ok(res) => Ok(res),
                     Err(err) => {
-                        warn!("read_raw: error: {:?}", err);
                         if err == Error::FileNotFound
                             && !skip_access_checks(volume_dir.as_ref().to_string_lossy().to_string().as_str())
                             && let Err(e) = access(volume_dir.as_ref()).await
