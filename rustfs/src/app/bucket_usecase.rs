@@ -1888,6 +1888,7 @@ mod tests {
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
                 filter: None,
                 id: None,
                 noncurrent_version_expiration: None,
@@ -1902,6 +1903,7 @@ mod tests {
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
                 filter: None,
                 id: Some("rule-1".to_string()),
                 noncurrent_version_expiration: None,
@@ -1916,6 +1918,7 @@ mod tests {
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
                 filter: None,
                 id: None,
                 noncurrent_version_expiration: None,
@@ -1941,6 +1944,7 @@ mod tests {
                 ..Default::default()
             }),
             abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
             filter: None,
             id: None,
             noncurrent_version_expiration: None,

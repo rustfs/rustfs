@@ -360,12 +360,14 @@ impl BucketMetadataSys {
             };
 
             if !meta.lifecycle_config_xml.is_empty() {
-                let cfg = deserialize::<BucketLifecycleConfiguration>(&meta.lifecycle_config_xml)?;
-                // TODO: FIXME:
-                // for _v in cfg.rules.iter() {
-                //     break;
-                // }
-                if let Some(_v) = cfg.rules.first() {}
+                if let Ok(cfg) = deserialize::<BucketLifecycleConfiguration>(&meta.lifecycle_config_xml) {
+                    if let Some(_v) = cfg.rules.first() {}
+                } else {
+                    tracing::warn!(
+                        bucket = %bucket,
+                        "delete: failed to parse lifecycle config XML"
+                    );
+                }
             }
 
             // TODO: other lifecycle handle
