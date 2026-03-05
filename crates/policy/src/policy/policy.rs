@@ -704,7 +704,7 @@ mod test {
             action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
             bucket: "bucket2",
             conditions: &conditions,
-            is_owner: true, // Owner has all permissions
+            is_owner: true,
             object: "test.txt",
             claims: &claims,
             deny_only: true,
@@ -712,7 +712,7 @@ mod test {
 
         assert!(
             policy.is_allowed(&args_owner_deny_only).await,
-            "owner should retain all permissions even when deny_only=true"
+            "deny_only should allow when no Deny statement matches, including owner requests"
         );
 
         Ok(())
