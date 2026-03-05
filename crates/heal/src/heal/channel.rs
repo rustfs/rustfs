@@ -20,6 +20,7 @@ use crate::heal::{
 use crate::{Error, Result};
 use rustfs_common::heal_channel::{
     HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse, HealScanMode,
+    publish_heal_response,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -226,8 +227,14 @@ impl HealChannelProcessor {
     }
 
     fn publish_response(&self, response: HealChannelResponse) {
-        if let Err(e) = self.response_sender.send(response) {
+        // Try to send to local channel first, but don't block broadcast on failure
+        if let Err(e) = self.response_sender.send(response.clone()) {
             error!("Failed to enqueue heal response locally: {}", e);
+        }
+        // Always attempt to broadcast, even if local send failed
+        // Use the original response for broadcast; local send uses a clone
+        if let Err(e) = publish_heal_response(response) {
+            error!("Failed to broadcast heal response: {}", e);
         }
     }
 

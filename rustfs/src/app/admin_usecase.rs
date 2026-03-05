@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! Admin application use-case contracts.
-#![allow(dead_code)]
 
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::error::ApiError;
@@ -58,31 +57,13 @@ pub struct QueryPoolStatusRequest {
     pub by_id: bool,
 }
 
-#[async_trait::async_trait]
-pub trait AdminUsecase: Send + Sync {
-    async fn query_server_info(&self, req: QueryServerInfoRequest) -> AdminUsecaseResult<QueryServerInfoResponse>;
-
-    async fn query_storage_info(&self) -> AdminUsecaseResult<StorageInfo>;
-
-    async fn query_data_usage_info(&self) -> AdminUsecaseResult<DataUsageInfo>;
-
-    async fn list_pool_statuses(&self) -> AdminUsecaseResult<Vec<PoolStatus>>;
-
-    async fn query_pool_status(&self, req: QueryPoolStatusRequest) -> AdminUsecaseResult<PoolStatus>;
-
-    fn collect_dependency_readiness(&self) -> DependencyReadiness;
-}
-
 #[derive(Clone, Default)]
 pub struct DefaultAdminUsecase {
     context: Option<Arc<AppContext>>,
 }
 
 impl DefaultAdminUsecase {
-    pub fn new(context: Arc<AppContext>) -> Self {
-        Self { context: Some(context) }
-    }
-
+    #[cfg(test)]
     pub fn without_context() -> Self {
         Self { context: None }
     }
@@ -91,10 +72,6 @@ impl DefaultAdminUsecase {
         Self {
             context: get_global_app_context(),
         }
-    }
-
-    pub fn context(&self) -> Option<Arc<AppContext>> {
-        self.context.clone()
     }
 
     fn endpoints(&self) -> Option<EndpointServerPools> {
@@ -289,33 +266,6 @@ impl DefaultAdminUsecase {
             storage_ready: new_object_layer_fn().is_some(),
             iam_ready,
         }
-    }
-}
-
-#[async_trait::async_trait]
-impl AdminUsecase for DefaultAdminUsecase {
-    async fn query_server_info(&self, req: QueryServerInfoRequest) -> AdminUsecaseResult<QueryServerInfoResponse> {
-        self.execute_query_server_info(req).await
-    }
-
-    async fn query_storage_info(&self) -> AdminUsecaseResult<StorageInfo> {
-        self.execute_query_storage_info().await
-    }
-
-    async fn query_data_usage_info(&self) -> AdminUsecaseResult<DataUsageInfo> {
-        self.execute_query_data_usage_info().await
-    }
-
-    async fn list_pool_statuses(&self) -> AdminUsecaseResult<Vec<PoolStatus>> {
-        self.execute_list_pool_statuses().await
-    }
-
-    async fn query_pool_status(&self, req: QueryPoolStatusRequest) -> AdminUsecaseResult<PoolStatus> {
-        self.execute_query_pool_status(req).await
-    }
-
-    fn collect_dependency_readiness(&self) -> DependencyReadiness {
-        self.execute_collect_dependency_readiness()
     }
 }
 

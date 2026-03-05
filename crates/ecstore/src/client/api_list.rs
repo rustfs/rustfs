@@ -34,10 +34,21 @@ use hyper::body::Bytes;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use std::collections::HashMap;
+use std::io::ErrorKind;
 
 impl TransitionClient {
     pub fn list_buckets(&self) -> Result<Vec<BucketInfo>, std::io::Error> {
-        todo!();
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            credentials::ErrorResponse {
+                sts_error: credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: "The list_buckets API is not implemented in this build.".to_string(),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 
     pub async fn list_objects_v2_query(
@@ -237,7 +248,17 @@ impl TransitionClient {
         }
 
         Ok(listObjectVersionsOutput)*/
-        todo!();
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            credentials::ErrorResponse {
+                sts_error: credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: format!("list_object_versions_query is not implemented for bucket {bucket_name}"),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 
     pub fn list_objects_query(
@@ -249,7 +270,17 @@ impl TransitionClient {
         max_keys: i64,
         headers: HeaderMap,
     ) -> Result<ListBucketResult, std::io::Error> {
-        todo!();
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            credentials::ErrorResponse {
+                sts_error: credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: format!("list_objects_query is not implemented for bucket {bucket_name}"),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 
     pub fn list_multipart_uploads_query(
@@ -261,7 +292,17 @@ impl TransitionClient {
         delimiter: &str,
         max_uploads: i64,
     ) -> Result<ListMultipartUploadsResult, std::io::Error> {
-        todo!();
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            credentials::ErrorResponse {
+                sts_error: credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: format!("list_multipart_uploads_query is not implemented for bucket {bucket_name}"),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 
     pub fn list_object_parts(
@@ -270,11 +311,33 @@ impl TransitionClient {
         object_name: &str,
         upload_id: &str,
     ) -> Result<HashMap<i64, ObjectPart>, std::io::Error> {
-        todo!();
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            credentials::ErrorResponse {
+                sts_error: credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: format!(
+                        "list_object_parts is not implemented for bucket {bucket_name}, object {object_name}, upload_id {upload_id}"
+                    ),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 
     pub fn find_upload_ids(&self, bucket_name: &str, object_name: &str) -> Result<Vec<String>, std::io::Error> {
-        todo!();
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            credentials::ErrorResponse {
+                sts_error: credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: format!("find_upload_ids is not implemented for bucket {bucket_name}, object {object_name}"),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 
     pub async fn list_object_parts_query(
@@ -285,7 +348,19 @@ impl TransitionClient {
         part_number_marker: i64,
         max_parts: i64,
     ) -> Result<ListObjectPartsResult, std::io::Error> {
-        todo!();
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            credentials::ErrorResponse {
+                sts_error: credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: format!(
+                        "list_object_parts_query is not implemented for bucket {bucket_name}, object {object_name}, upload_id {upload_id}"
+                    ),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 }
 
@@ -304,7 +379,44 @@ pub struct ListObjectsOptions {
 
 impl ListObjectsOptions {
     pub fn set(&mut self, key: &str, value: &str) {
-        todo!();
+        match key {
+            "prefix" => {
+                self.prefix = value.to_string();
+            }
+            "start-after" => {
+                self.start_after = value.to_string();
+            }
+            "max-keys" => {
+                if let Ok(v) = value.parse::<i64>() {
+                    self.max_keys = v;
+                }
+            }
+            "delimiter" => {
+                // delimiter is currently kept in request only; this option structure does not persist it yet.
+            }
+            "reverse" | "versions" | "metadata" | "recursive" | "use-v1" => {
+                if let Some(v) = value.strip_prefix("v").or_else(|| value.strip_prefix("V")) {
+                    let v = v.eq_ignore_ascii_case("true");
+                    match key {
+                        "reverse" => self.reverse_versions = v,
+                        "versions" => self.with_versions = v,
+                        "metadata" => self.with_metadata = v,
+                        "recursive" => self.recursive = v,
+                        _ => self.use_v1 = v,
+                    }
+                } else {
+                    let v = value.eq_ignore_ascii_case("true");
+                    match key {
+                        "reverse" => self.reverse_versions = v,
+                        "versions" => self.with_versions = v,
+                        "metadata" => self.with_metadata = v,
+                        "recursive" => self.recursive = v,
+                        _ => self.use_v1 = v,
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

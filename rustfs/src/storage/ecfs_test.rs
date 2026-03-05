@@ -15,6 +15,7 @@
 #[cfg(test)]
 mod tests {
     use crate::config::workload_profiles::WorkloadProfile;
+    use crate::server::cors;
     use crate::storage::ecfs::FS;
     use crate::storage::ecfs::RUSTFS_OWNER;
     use crate::storage::{
@@ -25,13 +26,14 @@ mod tests {
     };
     use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
+    use rustfs_ecstore::bucket::{metadata::BucketMetadata, metadata_sys};
     use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
     use rustfs_ecstore::store_api::ObjectInfo;
     use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, RESERVED_METADATA_PREFIX_LOWER};
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        Delimiter, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
-        ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
+        CORSConfiguration, CORSRule, Delimiter, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+        ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
     };
     use s3s::{S3Error, S3ErrorCode, s3_error};
     use time::OffsetDateTime;
@@ -1127,6 +1129,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_apply_cors_headers_unmatched_origin_with_cors_config() {
+        if metadata_sys::get_global_bucket_metadata_sys().is_none() {
+            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+            return;
+        }
+
+        let bucket = "test-bucket-no-match-cors";
+        let mut bm = BucketMetadata::new(bucket);
+        bm.cors_config = Some(CORSConfiguration {
+            cors_rules: vec![CORSRule {
+                allowed_headers: Some(vec!["*".to_string()]),
+                allowed_methods: vec!["GET".to_string()],
+                allowed_origins: vec!["https://allowed.example.com".to_string()],
+                expose_headers: None,
+                id: Some("non-match-origin".to_string()),
+                max_age_seconds: None,
+            }],
+        });
+        metadata_sys::set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(cors::standard::ORIGIN, "https://disallowed.example.com".parse().unwrap());
+
+        let result = apply_cors_headers(bucket, &http::Method::GET, &headers).await;
+        assert!(
+            result.is_some(),
+            "Expected Some empty headers when bucket has CORS config but origin does not match any rule"
+        );
+        let result = result.unwrap();
+        assert!(result.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(result.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).is_none());
+
+        metadata_sys::set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_apply_cors_headers_credentialed_request_with_wildcard_origin() {
+        if metadata_sys::get_global_bucket_metadata_sys().is_none() {
+            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+            return;
+        }
+
+        let bucket = "test-bucket-credentialed-cors";
+        let mut bm = BucketMetadata::new(bucket);
+        bm.cors_config = Some(CORSConfiguration {
+            cors_rules: vec![CORSRule {
+                allowed_headers: Some(vec!["*".to_string()]),
+                allowed_methods: vec!["GET".to_string()],
+                allowed_origins: vec!["*".to_string()],
+                expose_headers: None,
+                id: Some("credentialed-unit".to_string()),
+                max_age_seconds: None,
+            }],
+        });
+        metadata_sys::set_bucket_metadata(bucket.to_string(), bm).await.unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(cors::standard::ORIGIN, "https://console.localhost".parse().unwrap());
+        headers.insert(cors::request::ACCESS_CONTROL_REQUEST_METHOD, "GET".parse().unwrap());
+        headers.insert(cors::request::ACCESS_CONTROL_REQUEST_HEADERS, "x-amz-content-sha256".parse().unwrap());
+        headers.insert(http::header::AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=test/20260302/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256, Signature=abc".parse().unwrap());
+
+        let result = apply_cors_headers(bucket, &http::Method::OPTIONS, &headers).await.unwrap();
+        assert_eq!(
+            result.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://console.localhost",
+        );
+        assert_eq!(result.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(), "true");
+        assert_eq!(result.get(cors::standard::VARY).unwrap(), "Origin");
+
+        metadata_sys::set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_apply_cors_headers_unsupported_method() {
         // Test with unsupported HTTP method
         let mut headers = HeaderMap::new();
@@ -1255,5 +1335,84 @@ mod tests {
 
         assert!(result.is_ok(), "Should succeed with valid ARN");
         assert_eq!(event_rules.len(), 1, "Should add one rule");
+    }
+
+    // --- Object tag conditions for bucket policy (s3:ExistingObjectTag) ---
+
+    /// Verifies that object tags are formatted as ExistingObjectTag/<key> condition keys
+    /// with a single-element vec value, matching the format expected by policy evaluation.
+    #[test]
+    fn test_object_tag_condition_key_format() {
+        use rustfs_ecstore::bucket::tagging::decode_tags_to_map;
+        use std::collections::HashMap;
+
+        let tags_str = "security=public&project=webapp&env=prod";
+        let map = decode_tags_to_map(tags_str);
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for (k, v) in map {
+            out.insert(format!("ExistingObjectTag/{}", k), vec![v]);
+        }
+
+        assert_eq!(out.get("ExistingObjectTag/security"), Some(&vec!["public".to_string()]));
+        assert_eq!(out.get("ExistingObjectTag/project"), Some(&vec!["webapp".to_string()]));
+        assert_eq!(out.get("ExistingObjectTag/env"), Some(&vec!["prod".to_string()]));
+        assert_eq!(out.len(), 3);
+    }
+
+    /// When no object store is available (e.g. unit test env), get_object_tag_conditions_for_policy
+    /// returns Ok(empty map) so authorization can proceed without tag conditions.
+    #[tokio::test]
+    async fn test_get_object_tag_conditions_for_policy_returns_empty_without_store() {
+        let fs = FS::new();
+        let out = fs.get_object_tag_conditions_for_policy("bucket", "key", None).await.unwrap();
+        assert!(out.is_empty(), "without store should return empty tag conditions");
+    }
+
+    /// With version_id specified, the same no-store path returns Ok(empty) (versioned object path).
+    #[tokio::test]
+    async fn test_get_object_tag_conditions_for_policy_version_id_returns_empty_without_store() {
+        let fs = FS::new();
+        let out = fs
+            .get_object_tag_conditions_for_policy("bucket", "key", Some("v1"))
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    // --- CORS origin pattern matching tests ---
+
+    #[test]
+    fn test_matches_origin_pattern_suffix_wildcard() {
+        assert!(matches_origin_pattern("*suffix", "foo.suffix"));
+        assert!(matches_origin_pattern("*suffix", "suffix"));
+        assert!(!matches_origin_pattern("*suffix", "foo.suffix.get"));
+        assert!(!matches_origin_pattern("*suffix", "foo.bar"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_prefix_wildcard() {
+        assert!(matches_origin_pattern("prefix*", "prefix"));
+        assert!(matches_origin_pattern("prefix*", "prefix.suffix"));
+        assert!(!matches_origin_pattern("prefix*", "bla.prefix"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_middle_wildcard() {
+        assert!(matches_origin_pattern("start*end", "startend"));
+        assert!(matches_origin_pattern("start*end", "start1end"));
+        assert!(matches_origin_pattern("start*end", "start12end"));
+        assert!(!matches_origin_pattern("start*end", "0start12end"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_exact_no_wildcard() {
+        assert!(matches_origin_pattern("example.com", "example.com"));
+        assert!(!matches_origin_pattern("example.com", "other.com"));
+    }
+
+    #[test]
+    fn test_matches_origin_pattern_single_star_wildcard() {
+        assert!(matches_origin_pattern("*", "anything.com"));
+        assert!(matches_origin_pattern("*", ""));
     }
 }

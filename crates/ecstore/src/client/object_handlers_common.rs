@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::StorageAPI;
 use crate::bucket::lifecycle::lifecycle;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::store::ECStore;
-use crate::store_api::{ObjectOptions, ObjectToDelete};
+use crate::store_api::{ObjectOperations, ObjectOptions, ObjectToDelete};
 use rustfs_lock::MAX_DELETE_LIST;
 
 pub async fn delete_object_versions(api: ECStore, bucket: &str, to_del: &[ObjectToDelete], _lc_event: lifecycle::Event) {

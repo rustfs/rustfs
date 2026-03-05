@@ -165,7 +165,6 @@ impl TransitionClient {
     async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let scheme = endpoint_url.scheme();
         let client;
         let tls = if let Some(store) = load_root_store_from_tls_path() {
@@ -243,11 +242,13 @@ impl TransitionClient {
     }
 
     fn set_s3_transfer_accelerate(&self, accelerate_endpoint: &str) {
-        todo!();
+        let mut endpoint = self.s3_accelerate_endpoint.lock().unwrap();
+        *endpoint = accelerate_endpoint.to_string();
     }
 
     fn set_s3_enable_dual_stack(&self, enabled: bool) {
-        todo!();
+        let mut dual_stack = self.s3_dual_stack_enabled.lock().unwrap();
+        *dual_stack = enabled;
     }
 
     pub fn hash_materials(
@@ -255,7 +256,22 @@ impl TransitionClient {
         is_md5_requested: bool,
         is_sha256_requested: bool,
     ) -> (HashMap<String, HashAlgorithm>, HashMap<String, Vec<u8>>) {
-        todo!()
+        // `hash_algos` declares which algorithms are active for this multipart upload.
+        // `hash_sums` keeps the current part digest bytes and is refreshed on every loop.
+        let mut hash_algos = HashMap::new();
+        let mut hash_sums = HashMap::new();
+
+        if is_md5_requested {
+            hash_algos.insert("md5".to_string(), HashAlgorithm::Md5);
+            hash_sums.insert("md5".to_string(), vec![]);
+        }
+
+        if is_sha256_requested {
+            hash_algos.insert("sha256".to_string(), HashAlgorithm::SHA256);
+            hash_sums.insert("sha256".to_string(), vec![]);
+        }
+
+        (hash_algos, hash_sums)
     }
 
     fn is_online(&self) -> bool {
@@ -272,10 +288,10 @@ impl TransitionClient {
     }
 
     fn health_check(hc_duration: Duration) {
-        todo!();
+        let _ = hc_duration;
     }
 
-    fn dump_http(&self, req: &http::Request<s3s::Body>, resp: &http::Response<Incoming>) -> Result<(), std::io::Error> {
+    fn dump_http(&self, req: &Request<s3s::Body>, resp: &Response<Incoming>) -> Result<(), std::io::Error> {
         let mut resp_trace: Vec<u8>;
 
         //info!("{}{}", self.trace_output, "---------BEGIN-HTTP---------");
@@ -284,7 +300,7 @@ impl TransitionClient {
         Ok(())
     }
 
-    pub async fn doit(&self, req: http::Request<s3s::Body>) -> Result<http::Response<Incoming>, std::io::Error> {
+    pub async fn doit(&self, req: Request<s3s::Body>) -> Result<Response<Incoming>, std::io::Error> {
         let req_method;
         let req_uri;
         let req_headers;
@@ -336,7 +352,7 @@ impl TransitionClient {
         &self,
         method: http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<http::Response<Incoming>, std::io::Error> {
+    ) -> Result<Response<Incoming>, std::io::Error> {
         if self.is_offline() {
             let mut s = self.endpoint_url.to_string();
             s.push_str(" is offline.");
@@ -346,7 +362,7 @@ impl TransitionClient {
         let retryable: bool;
         //let mut body_seeker: BufferReader;
         let mut req_retry = self.max_retries;
-        let mut resp: http::Response<Incoming>;
+        let mut resp: Response<Incoming>;
 
         //if metadata.content_body != nil {
         //body_seeker = BufferReader::new(metadata.content_body.read_all().await?);
@@ -384,10 +400,10 @@ impl TransitionClient {
             err_response.message = format!("remote tier error: {}", err_response.message);
 
             if self.region == "" {
-                match err_response.code {
+                return match err_response.code {
                     S3ErrorCode::AuthorizationHeaderMalformed | S3ErrorCode::InvalidArgument /*S3ErrorCode::InvalidRegion*/ => {
                         //break;
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
                     S3ErrorCode::AccessDenied => {
                         if err_response.region == "" {
@@ -404,12 +420,12 @@ impl TransitionClient {
                             metadata.bucket_location = err_response.region.clone();
                             //continue;
                         }
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
                     _ => {
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
-                }
+                };
             }
 
             if is_s3code_retryable(err_response.code.as_str()) {
@@ -430,7 +446,7 @@ impl TransitionClient {
         &self,
         method: &http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<http::Request<s3s::Body>, std::io::Error> {
+    ) -> Result<Request<s3s::Body>, std::io::Error> {
         let mut location = metadata.bucket_location.clone();
         if location == "" && metadata.bucket_name != "" {
             location = self.get_bucket_location(&metadata.bucket_name).await?;
@@ -734,7 +750,19 @@ impl TransitionCore {
     ) -> Result<CompletePart, std::io::Error> {
         //self.0.copy_object_part_do(src_bucket, src_object, dest_bucket, dest_object, upload_id,
         //    part_id, start_offset, length, metadata)
-        todo!();
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::client::credentials::ErrorResponse {
+                sts_error: crate::client::credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: format!(
+                        "copy_object_part is not implemented for {src_bucket}/{src_object} -> {dest_bucket}/{dest_object}"
+                    ),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 
     pub async fn put_object(

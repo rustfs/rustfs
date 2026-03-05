@@ -362,7 +362,7 @@ impl S3PeerSys {
     }
 
     pub fn get_pools(&self) -> Option<Vec<usize>> {
-        unimplemented!()
+        None
     }
 }
 

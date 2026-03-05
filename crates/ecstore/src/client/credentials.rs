@@ -18,7 +18,10 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use quick_xml;
+use serde::de::Deserialize;
 use std::fmt::{Display, Formatter};
+use std::io::{Error, ErrorKind};
 
 use time::OffsetDateTime;
 
@@ -154,10 +157,21 @@ impl ErrorResponse {
     }
 }
 
-pub fn xml_decoder<T>(body: &[u8]) -> Result<T, std::io::Error> {
-    todo!();
+pub fn xml_decoder<T>(body: &[u8]) -> Result<T, Error>
+where
+    for<'de> T: Deserialize<'de>,
+{
+    match std::str::from_utf8(body) {
+        Ok(xml_body) => quick_xml::de::from_str::<T>(xml_body).map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string())),
+        Err(err) => Err(Error::new(ErrorKind::InvalidData, err.to_string())),
+    }
 }
 
-pub fn xml_decode_and_body<T>(body_reader: &[u8]) -> Result<(Vec<u8>, T), std::io::Error> {
-    todo!();
+pub fn xml_decode_and_body<T>(body_reader: &[u8]) -> Result<(Vec<u8>, T), std::io::Error>
+where
+    for<'de> T: Deserialize<'de>,
+{
+    let body = body_reader.to_vec();
+    let parsed = xml_decoder(&body)?;
+    Ok((body, parsed))
 }

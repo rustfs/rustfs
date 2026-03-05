@@ -82,17 +82,17 @@ impl Serialize for Functions {
             serializer.serialize_map(Some(self.for_any_value.len() + self.for_all_values.len() + self.for_normal.len()))?;
 
         for conditions in self.for_all_values.iter() {
-            se.serialize_key(format!("ForAllValues:{}", conditions.to_key()).as_str())?;
+            se.serialize_key(&format!("ForAllValues:{}", conditions.to_key_with_suffix()))?;
             conditions.serialize_map(&mut se)?;
         }
 
         for conditions in self.for_any_value.iter() {
-            se.serialize_key(format!("ForAnyValue:{}", conditions.to_key()).as_str())?;
+            se.serialize_key(&format!("ForAnyValue:{}", conditions.to_key_with_suffix()))?;
             conditions.serialize_map(&mut se)?;
         }
 
         for conditions in self.for_normal.iter() {
-            se.serialize_key(conditions.to_key())?;
+            se.serialize_key(&conditions.to_key_with_suffix())?;
             conditions.serialize_map(&mut se)?;
         }
 
@@ -354,6 +354,34 @@ mod tests {
             }
         }"# => true;
         "6"
+    )]
+    #[test_case(
+        r#"{
+            "NumericLessThanEquals": {
+                "s3:max-keys": "10"
+            }
+        }"# => true; "numeric_less_than_equals"
+    )]
+    #[test_case(
+        r#"{
+            "DateLessThan": {
+                "aws:CurrentTime": "2026-01-01T00:00:00Z"
+            }
+        }"# => true; "date_less_than"
+    )]
+    #[test_case(
+        r#"{
+            "StringLikeIfExists": {
+                "aws:Referer": "http://www.example.com/*"
+            }
+        }"# => true; "string_like_if_exists"
+    )]
+    #[test_case(
+        r#"{
+            "ArnLike": {
+                "aws:SourceArn": "arn:aws:s3:::my-bucket"
+            }
+        }"# => true; "arn_like"
     )]
     fn test_de(input: &str) -> bool {
         serde_json::from_str::<Functions>(input)

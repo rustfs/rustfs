@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::store::ECStore;
+use rustfs_ecstore::store_api::ListOperations;
 use std::sync::Arc;
 
 /// Determines if the key "looks like a prefix" (ends with `/`).

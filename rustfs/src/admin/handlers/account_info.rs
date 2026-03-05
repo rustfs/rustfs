@@ -21,7 +21,7 @@ use matchit::Params;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOptions, StorageAPI};
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, StorageAPI};
 use rustfs_iam::store::MappedPolicy;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;

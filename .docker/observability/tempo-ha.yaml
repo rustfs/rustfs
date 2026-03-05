@@ -1,0 +1,286 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# High Availability Tempo Configuration for docker-compose-example-for-rustfs.yml
+# Features:
+# - Distributed architecture with multiple components
+# - Kafka-based ingestion for fault tolerance
+# - Replication factor of 3 for data resilience
+# - Query frontend for load balancing
+# - Metrics generation from traces
+# - WAL for durability
+
+partition_ring_live_store: true
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  http_server_read_timeout: 30s
+  http_server_write_timeout: 30s
+  grpc_server_max_recv_msg_size: 4194304  # 4MB
+  grpc_server_max_send_msg_size: 4194304
+  log_level: info
+  log_format: json
+
+# Memberlist configuration for distributed mode
+memberlist:
+  node_name: tempo
+  bind_port: 7946
+  join_members:
+    - tempo:7946
+  retransmit_factor: 4
+  node_timeout: 15s
+  retransmit_interval: 300ms
+  dead_node_reclaim_time: 30s
+
+# Distributor configuration - receives traces and routes to ingesters
+distributor:
+  ingester_write_path_enabled: true
+  kafka_write_path_enabled: true
+  rate_limit_bytes: 10MB
+  rate_limit_enabled: true
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"
+          max_concurrent_streams: 0
+          max_receive_message_size: 4194304
+        http:
+          endpoint: "0.0.0.0:4318"
+          cors:
+            allowed_origins:
+              - "*"
+            max_age: 86400
+    jaeger:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:14250"
+        thrift_http:
+          endpoint: "0.0.0.0:14268"
+    zipkin:
+      endpoint: "0.0.0.0:9411"
+  ring:
+    kvstore:
+      store: memberlist
+    heartbeat_timeout: 5s
+    replication_factor: 3
+    heartbeat_interval: 5s
+
+# Ingester configuration - stores traces and querying
+ingester:
+  lifecycler:
+    address: tempo
+    ring:
+      kvstore:
+        store: memberlist
+      replication_factor: 3
+      max_cache_freshness_per_sec: 10s
+      heartbeat_interval: 5s
+      heartbeat_timeout: 5s
+    num_tokens: 128
+    tokens_file_path: /var/tempo/tokens.json
+    claim_on_rollout: true
+  trace_idle_period: 20s
+  max_block_bytes: 10_000_000
+  max_block_duration: 10m
+  chunk_size_bytes: 1_000_000
+  chunk_encoding: snappy
+  wal:
+    checkpoint_duration: 5s
+    max_wal_blocks: 4
+  metrics:
+    enabled: true
+    level: block
+    target_info_duration: 15m
+
+# WAL configuration for data durability
+wal:
+  checkpoint_duration: 5s
+  flush_on_shutdown: true
+  path: /var/tempo/wal
+
+# Kafka ingestion configuration - for high throughput scenarios
+ingest:
+  enabled: true
+  kafka:
+    brokers: [ redpanda:9092 ]
+    topic: tempo-ingest
+    encoding: protobuf
+    consumer_group: tempo-ingest-consumer
+    session_timeout: 10s
+    rebalance_timeout: 1m
+    partition: auto
+    verbosity: 2
+
+# Query frontend configuration - distributed querying
+query_frontend:
+  compression: gzip
+  downstream_url: http://localhost:3200
+  log_queries_longer_than: 5s
+  cache_uncompressed_bytes: 100MB
+  max_outstanding_requests_per_tenant: 100
+  max_query_length: 48h
+  max_query_lookback: 30d
+  default_result_cache_ttl: 1m
+  result_cache:
+    cache:
+      enable_fifocache: true
+      default_validity: 1m
+  rf1_after: "1999-01-01T00:00:00Z"
+  mcp_server:
+    enabled: true
+
+# Querier configuration - queries traces
+querier:
+  frontend_worker:
+    frontend_address: localhost:3200
+    grpc_client_config:
+      max_recv_msg_size: 104857600
+  max_concurrent_queries: 20
+  max_metric_bytes_per_trace: 1MB
+
+# Query scheduler configuration - for distributed querying
+query_scheduler:
+  use_scheduler_ring: false
+
+# Metrics generator configuration - generates metrics from traces
+metrics_generator:
+  enabled: true
+  registry:
+    enabled: true
+    external_labels:
+      source: tempo
+      cluster: rustfs-docker-ha
+      environment: production
+  storage:
+    path: /var/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/api/v1/write
+        send_exemplars: true
+        resource_to_telemetry_conversion:
+          enabled: true
+  processor:
+    batch:
+      timeout: 10s
+      send_batch_size: 1024
+    memory_limiter:
+      check_interval: 5s
+      limit_mib: 512
+      spike_limit_mib: 128
+  processors:
+    - span-metrics
+    - local-blocks
+    - service-graphs
+  generate_native_histograms: both
+
+# Backend worker configuration
+backend_worker:
+  backend_scheduler_addr: localhost:3200
+  compaction:
+    block_retention: 24h
+    compacted_block_retention: 1h
+  ring:
+    kvstore:
+      store: memberlist
+
+# Backend scheduler configuration
+backend_scheduler:
+  enabled: true
+  provider:
+    compaction:
+      compaction:
+        block_retention: 24h
+        compacted_block_retention: 1h
+        concurrency: 25
+        v2_out_path: /var/tempo/blocks/compaction
+
+# Storage configuration - local backend with proper retention
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+      checkpoint_duration: 5s
+      flush_on_shutdown: true
+    local:
+      path: /var/tempo/blocks
+      bloom_filter_false_positive: 0.05
+      bloom_shift: 4
+      index:
+        downsample_bytes: 1000000
+        page_size_bytes: 0
+        cache_size_bytes: 0
+    pool:
+      max_workers: 400
+      queue_depth: 10000
+
+# Compactor configuration - manages block compaction
+compactor:
+  compaction:
+    block_retention: 168h  # 7 days
+    compacted_block_retention: 1h
+    concurrency: 25
+    v2_out_path: /var/tempo/blocks/compaction
+    shard_count: 32
+    max_block_bytes: 107374182400  # 100GB
+    max_compaction_objects: 6000000
+    max_time_per_tenant: 5m
+    block_size_bytes: 107374182400
+  ring:
+    kvstore:
+      store: memberlist
+    heartbeat_interval: 5s
+    heartbeat_timeout: 5s
+
+# Limits configuration - rate limiting and quotas
+limits:
+  max_traces_per_user: 10000
+  max_bytes_per_trace: 10485760  # 10MB
+  max_search_bytes_per_trace: 0
+  forgiving_oversize_traces: true
+  rate_limit_bytes: 10MB
+  rate_limit_enabled: true
+  ingestion_burst_size_bytes: 20MB
+  ingestion_rate_limit_bytes: 10MB
+  max_bytes_per_second: 10485760
+  metrics_generator_max_active_series: 10000
+  metrics_generator_max_churned_series: 10000
+  metrics_generator_forta_out_of_order_ttl: 5m
+
+# Override configuration
+overrides:
+  defaults:
+    metrics_generator:
+      processors:
+        - span-metrics
+        - local-blocks
+        - service-graphs
+      generate_native_histograms: both
+      max_active_series: 10000
+      max_churned_series: 10000
+
+# Usage reporting configuration
+usage_report:
+  reporting_enabled: false
+
+# Tracing configuration for debugging
+tracing:
+  enabled: true
+  jaeger:
+    sampler:
+      name: probabilistic
+      param: 0.1
+    reporter_log_spans: false
+

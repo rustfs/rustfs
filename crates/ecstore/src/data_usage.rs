@@ -16,7 +16,7 @@ pub mod local_snapshot;
 
 use crate::{
     bucket::metadata_sys::get_replication_config, config::com::read_config, disk::DiskAPI, error::Error, store::ECStore,
-    store_api::StorageAPI,
+    store_api::ListOperations,
 };
 pub use local_snapshot::{
     DATA_USAGE_DIR, DATA_USAGE_STATE_DIR, LOCAL_USAGE_SNAPSHOT_VERSION, LocalUsageSnapshot, LocalUsageSnapshotMeta,
@@ -34,7 +34,7 @@ use std::{
 };
 use tokio::fs;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 // Data usage storage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
@@ -108,31 +108,23 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
         Ok(data) => data,
         Err(e) => {
             error!("Failed to read data usage info from backend: {}", e);
-            if e == Error::ConfigNotFound {
-                info!("Data usage config not found, building basic statistics");
-                return build_basic_data_usage_info(store).await;
+
+            match read_config(store.clone(), format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()).as_str()).await {
+                Ok(data) => data,
+                Err(e) => {
+                    if e == Error::ConfigNotFound {
+                        return Ok(DataUsageInfo::default());
+                    }
+                    error!("Failed to read data usage info from backend: {}", e);
+                    return Err(Error::other(e));
+                }
             }
-            return Err(Error::other(e));
         }
     };
-
     let mut data_usage_info: DataUsageInfo =
         serde_json::from_slice(&buf).map_err(|e| Error::other(format!("Failed to deserialize data usage info: {e}")))?;
 
     info!("Loaded data usage info from backend with {} buckets", data_usage_info.buckets_count);
-
-    // Validate data and supplement if empty
-    if data_usage_info.buckets_count == 0 || data_usage_info.buckets_usage.is_empty() {
-        warn!("Loaded data is empty, supplementing with basic statistics");
-        if let Ok(basic_info) = build_basic_data_usage_info(store.clone()).await {
-            data_usage_info.buckets_count = basic_info.buckets_count;
-            data_usage_info.buckets_usage = basic_info.buckets_usage;
-            data_usage_info.bucket_sizes = basic_info.bucket_sizes;
-            data_usage_info.objects_total_count = basic_info.objects_total_count;
-            data_usage_info.objects_total_size = basic_info.objects_total_size;
-            data_usage_info.last_update = basic_info.last_update;
-        }
-    }
 
     // Handle backward compatibility
     if data_usage_info.buckets_usage.is_empty() {
@@ -496,57 +488,6 @@ pub async fn sync_memory_cache_with_backend() -> Result<(), Error> {
         }
     }
     Ok(())
-}
-
-/// Build basic data usage info with real object counts
-pub async fn build_basic_data_usage_info(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
-    let mut data_usage_info = DataUsageInfo::default();
-
-    // Get bucket list
-    match store.list_bucket(&crate::store_api::BucketOptions::default()).await {
-        Ok(buckets) => {
-            data_usage_info.buckets_count = buckets.len() as u64;
-            data_usage_info.last_update = Some(SystemTime::now());
-
-            let mut total_objects = 0u64;
-            let mut total_versions = 0u64;
-            let mut total_size = 0u64;
-            let mut total_delete_markers = 0u64;
-
-            for bucket_info in buckets {
-                if bucket_info.name.starts_with('.') {
-                    continue; // Skip system buckets
-                }
-
-                match compute_bucket_usage(store.clone(), &bucket_info.name).await {
-                    Ok(bucket_usage) => {
-                        total_objects = total_objects.saturating_add(bucket_usage.objects_count);
-                        total_versions = total_versions.saturating_add(bucket_usage.versions_count);
-                        total_size = total_size.saturating_add(bucket_usage.size);
-                        total_delete_markers = total_delete_markers.saturating_add(bucket_usage.delete_markers_count);
-
-                        data_usage_info
-                            .buckets_usage
-                            .insert(bucket_info.name.clone(), bucket_usage.clone());
-                        data_usage_info.bucket_sizes.insert(bucket_info.name, bucket_usage.size);
-                    }
-                    Err(e) => {
-                        warn!("Failed to compute bucket usage for {}: {}", bucket_info.name, e);
-                    }
-                }
-            }
-
-            data_usage_info.objects_total_count = total_objects;
-            data_usage_info.versions_total_count = total_versions;
-            data_usage_info.objects_total_size = total_size;
-            data_usage_info.delete_markers_total_count = total_delete_markers;
-        }
-        Err(e) => {
-            warn!("Failed to list buckets for basic data usage info: {}", e);
-        }
-    }
-
-    Ok(data_usage_info)
 }
 
 /// Create a data usage cache entry from size summary
