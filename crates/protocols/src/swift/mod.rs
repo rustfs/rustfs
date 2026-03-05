@@ -35,10 +35,13 @@
 
 pub mod account;
 pub mod container;
+pub mod dlo;
 pub mod errors;
 pub mod handler;
 pub mod object;
 pub mod router;
+pub mod slo;
+pub mod tempurl;
 pub mod types;
 
 pub use errors::{SwiftError, SwiftResult};
