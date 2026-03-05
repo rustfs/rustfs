@@ -827,8 +827,9 @@ pub async fn copy_object(
 
 /// Parse Swift Destination header
 ///
-/// The Destination header format is: `/container/object` or `/account/container/object`
-/// This function parses it into container and object components.
+/// The Destination header format is: `/container/object`
+/// The account segment is not included in the Destination header (it's implicit from the request URL).
+/// Object names can contain slashes (e.g., `/container/path/to/file.txt`).
 ///
 /// # Arguments
 /// * `destination` - The Destination header value
@@ -839,9 +840,15 @@ pub async fn copy_object(
 ///
 /// # Examples
 /// ```ignore
+/// // Simple object name
 /// let (container, object) = parse_destination_header("/my-container/my-object.txt")?;
 /// assert_eq!(container, "my-container");
 /// assert_eq!(object, "my-object.txt");
+///
+/// // Object with path (slashes preserved)
+/// let (container, object) = parse_destination_header("/my-container/path/to/file.txt")?;
+/// assert_eq!(container, "my-container");
+/// assert_eq!(object, "path/to/file.txt");
 /// ```
 #[allow(dead_code)] // Handler integration: COPY method
 pub fn parse_destination_header(destination: &str) -> SwiftResult<(String, String)> {
