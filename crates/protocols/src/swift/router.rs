@@ -120,8 +120,29 @@ impl SwiftRouter {
                     method,
                 })
             }
+            // /v1/{account}/ - trailing slash, route as Account
+            ["v1", account, ""] => {
+                if !Self::is_valid_account(account) {
+                    return None;
+                }
+                Some(SwiftRoute::Account {
+                    account: decode_url_segment(account),
+                    method,
+                })
+            }
             // /v1/{account}/{container}
-            ["v1", account, container] if container.is_empty() || !container.contains('/') => {
+            ["v1", account, container] if !container.is_empty() && !container.contains('/') => {
+                if !Self::is_valid_account(account) {
+                    return None;
+                }
+                Some(SwiftRoute::Container {
+                    account: decode_url_segment(account),
+                    container: decode_url_segment(container),
+                    method,
+                })
+            }
+            // /v1/{account}/{container}/ - trailing slash, route as Container
+            ["v1", account, container, ""] if !container.is_empty() => {
                 if !Self::is_valid_account(account) {
                     return None;
                 }
@@ -132,7 +153,7 @@ impl SwiftRouter {
                 })
             }
             // /v1/{account}/{container}/{object...}
-            ["v1", account, container, object @ ..] if !object.is_empty() || segments.len() > 3 => {
+            ["v1", account, container, object @ ..] if !object.is_empty() => {
                 if !Self::is_valid_account(account) {
                     return None;
                 }
