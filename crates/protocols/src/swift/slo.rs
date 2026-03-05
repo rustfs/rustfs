@@ -206,26 +206,29 @@ fn parse_range_header(range_str: &str, total_size: u64) -> Result<(u64, u64), Sw
         return Err(SwiftError::BadRequest("Invalid Range header format".to_string()));
     }
 
-    let start = if parts[0].is_empty() {
-        // Suffix range (last N bytes)
+    let (start, end) = if parts[0].is_empty() {
+        // Suffix range (last N bytes): bytes=-500
         let suffix: u64 = parts[1].parse()
             .map_err(|_| SwiftError::BadRequest("Invalid Range header".to_string()))?;
         if suffix >= total_size {
-            0
+            (0, total_size - 1)
         } else {
-            total_size - suffix
+            (total_size - suffix, total_size - 1)
         }
     } else {
-        parts[0].parse()
-            .map_err(|_| SwiftError::BadRequest("Invalid Range header".to_string()))?
-    };
-
-    let end = if parts[1].is_empty() {
-        total_size - 1
-    } else {
-        let parsed: u64 = parts[1].parse()
+        // Regular range: bytes=0-999 or bytes=0-
+        let start = parts[0].parse()
             .map_err(|_| SwiftError::BadRequest("Invalid Range header".to_string()))?;
-        std::cmp::min(parsed, total_size - 1)
+
+        let end = if parts[1].is_empty() {
+            total_size - 1
+        } else {
+            let parsed: u64 = parts[1].parse()
+                .map_err(|_| SwiftError::BadRequest("Invalid Range header".to_string()))?;
+            std::cmp::min(parsed, total_size - 1)
+        };
+
+        (start, end)
     };
 
     if start > end {
