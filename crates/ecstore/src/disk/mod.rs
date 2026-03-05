@@ -154,7 +154,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
         match self {
             Disk::Local(local_disk) => local_disk.stat_volume(volume).await,
