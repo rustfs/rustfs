@@ -66,6 +66,10 @@ pub fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
     Ok(())
 }
 
+fn should_check_deny_only(target_access_key: &str, requester_access_key: &str) -> bool {
+    target_access_key == requester_access_key
+}
+
 pub struct AddUser {}
 #[async_trait::async_trait]
 impl Operation for AddUser {
@@ -134,14 +138,15 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is not utf8"));
         }
 
-        // Security fix: Always require explicit Allow permission for CreateUser
-        // Do not use deny_only to bypass permission checks, even when creating for self
-        // This ensures consistent security semantics and prevents privilege escalation
+        let check_deny_only = should_check_deny_only(ak, &cred.access_key);
+
+        // MinIO-compatible self-operation behavior:
+        // for self password update, only explicit Deny should block the request.
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
-            false, // Always require explicit Allow permission
+            check_deny_only,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
@@ -393,14 +398,15 @@ impl Operation for GetUserInfo {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        // Security fix: Always require explicit Allow permission for GetUser
-        // Users should have explicit GetUser permission to view account information
-        // This ensures consistent security semantics across all admin operations
+        let check_deny_only = should_check_deny_only(ak, &cred.access_key);
+
+        // MinIO-compatible self-operation behavior:
+        // for self account info query, only explicit Deny should block the request.
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
-            false, // Always require explicit Allow permission
+            check_deny_only,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
@@ -1052,5 +1058,20 @@ impl Operation for ImportIam {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_check_deny_only;
+
+    #[test]
+    fn test_should_check_deny_only_for_self_request() {
+        assert!(should_check_deny_only("alice", "alice"));
+    }
+
+    #[test]
+    fn test_should_not_check_deny_only_for_other_user_request() {
+        assert!(!should_check_deny_only("alice", "bob"));
     }
 }

@@ -70,13 +70,15 @@ impl Policy {
             }
         }
 
-        // Owner has all permissions
-        if args.is_owner {
+        // DenyOnly mode: only validate explicit Deny statements.
+        // If no Deny matched above, allow the request.
+        if args.deny_only {
             return true;
         }
 
-        if args.deny_only {
-            return false;
+        // Owner has all permissions
+        if args.is_owner {
+            return true;
         }
 
         // Check Allow statements
@@ -603,7 +605,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_deny_only_security_fix() -> Result<()> {
+    async fn test_deny_only_checks_only_deny_statements() -> Result<()> {
         let data = r#"
 {
   "Version": "2012-10-17",
@@ -621,7 +623,8 @@ mod test {
         let conditions = HashMap::new();
         let claims = HashMap::new();
 
-        // Test with deny_only=true but no matching Allow statement
+        // deny_only=true should allow if no Deny statement matches,
+        // even when no Allow statement matches.
         let args_deny_only = Args {
             account: "testuser",
             groups: &None,
@@ -631,16 +634,15 @@ mod test {
             is_owner: false,
             object: "test.txt",
             claims: &claims,
-            deny_only: true, // Should NOT automatically allow
+            deny_only: true,
         };
 
-        // Should return false because deny_only=true, regardless of whether there's a matching Allow statement
         assert!(
-            !policy.is_allowed(&args_deny_only).await,
-            "deny_only should return false when deny_only=true, regardless of Allow statements"
+            policy.is_allowed(&args_deny_only).await,
+            "deny_only should allow when no Deny statement matches"
         );
 
-        // Test with deny_only=true and matching Allow statement
+        // deny_only=true should also allow when action matches Allow statement.
         let args_deny_only_allowed = Args {
             account: "testuser",
             groups: &None,
@@ -653,13 +655,12 @@ mod test {
             deny_only: true,
         };
 
-        // Should return false because deny_only=true prevents checking Allow statements (unless is_owner=true)
         assert!(
-            !policy.is_allowed(&args_deny_only_allowed).await,
-            "deny_only should return false even with matching Allow statement"
+            policy.is_allowed(&args_deny_only_allowed).await,
+            "deny_only should allow when no Deny statement matches, even if Allow exists"
         );
 
-        // Test with deny_only=false (normal case)
+        // Normal policy evaluation remains unchanged when deny_only=false.
         let args_normal = Args {
             account: "testuser",
             groups: &None,
@@ -678,6 +679,25 @@ mod test {
             "normal policy evaluation should allow with matching Allow statement"
         );
 
+        // Explicit Deny must still block request in deny_only mode.
+        let deny_policy_data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Action": ["s3:PutObject"],
+      "Resource": ["arn:aws:s3:::bucket2/*"]
+    }
+  ]
+}
+"#;
+        let deny_policy = Policy::parse_config(deny_policy_data.as_bytes())?;
+        assert!(
+            !deny_policy.is_allowed(&args_deny_only).await,
+            "deny_only should reject request when an explicit Deny matches"
+        );
+
         let args_owner_deny_only = Args {
             account: "testuser",
             groups: &None,
@@ -687,7 +707,7 @@ mod test {
             is_owner: true, // Owner has all permissions
             object: "test.txt",
             claims: &claims,
-            deny_only: true, // Even with deny_only=true, owner should be allowed
+            deny_only: true,
         };
 
         assert!(
