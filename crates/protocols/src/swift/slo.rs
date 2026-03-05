@@ -603,4 +603,291 @@ mod tests {
         assert_eq!(segments[1].1, 0);   // Start at byte 0 of seg2
         assert_eq!(segments[1].2, 500); // End at byte 500 of seg2
     }
+
+    #[test]
+    fn test_calculate_segments_for_range_single_segment() {
+        let manifest = SLOManifest {
+            segments: vec![
+                SLOSegment {
+                    path: "/c/s1".to_string(),
+                    size_bytes: 1000,
+                    etag: "e1".to_string(),
+                    range: None,
+                },
+                SLOSegment {
+                    path: "/c/s2".to_string(),
+                    size_bytes: 1000,
+                    etag: "e2".to_string(),
+                    range: None,
+                },
+            ],
+            created_at: None,
+        };
+
+        // Request bytes within first segment only
+        let segments = calculate_segments_for_range(&manifest, 100, 500).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].0, 0);   // Segment index
+        assert_eq!(segments[0].1, 100); // Start byte
+        assert_eq!(segments[0].2, 500); // End byte
+    }
+
+    #[test]
+    fn test_calculate_segments_for_range_full_segment() {
+        let manifest = SLOManifest {
+            segments: vec![
+                SLOSegment {
+                    path: "/c/s1".to_string(),
+                    size_bytes: 1000,
+                    etag: "e1".to_string(),
+                    range: None,
+                },
+            ],
+            created_at: None,
+        };
+
+        // Request entire segment
+        let segments = calculate_segments_for_range(&manifest, 0, 999).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].1, 0);
+        assert_eq!(segments[0].2, 999);
+    }
+
+    #[test]
+    fn test_calculate_segments_for_range_last_segment() {
+        let manifest = SLOManifest {
+            segments: vec![
+                SLOSegment {
+                    path: "/c/s1".to_string(),
+                    size_bytes: 1000,
+                    etag: "e1".to_string(),
+                    range: None,
+                },
+                SLOSegment {
+                    path: "/c/s2".to_string(),
+                    size_bytes: 1000,
+                    etag: "e2".to_string(),
+                    range: None,
+                },
+                SLOSegment {
+                    path: "/c/s3".to_string(),
+                    size_bytes: 500,
+                    etag: "e3".to_string(),
+                    range: None,
+                },
+            ],
+            created_at: None,
+        };
+
+        // Request bytes from last segment only
+        let segments = calculate_segments_for_range(&manifest, 2100, 2400).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].0, 2);   // Third segment
+        assert_eq!(segments[0].1, 100); // Start at byte 100 of seg3
+        assert_eq!(segments[0].2, 400); // End at byte 400 of seg3
+    }
+
+    #[test]
+    fn test_calculate_segments_for_range_all_segments() {
+        let manifest = SLOManifest {
+            segments: vec![
+                SLOSegment {
+                    path: "/c/s1".to_string(),
+                    size_bytes: 1000,
+                    etag: "e1".to_string(),
+                    range: None,
+                },
+                SLOSegment {
+                    path: "/c/s2".to_string(),
+                    size_bytes: 1000,
+                    etag: "e2".to_string(),
+                    range: None,
+                },
+            ],
+            created_at: None,
+        };
+
+        // Request entire object
+        let segments = calculate_segments_for_range(&manifest, 0, 1999).unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].1, 0);
+        assert_eq!(segments[0].2, 999);
+        assert_eq!(segments[1].1, 0);
+        assert_eq!(segments[1].2, 999);
+    }
+
+    #[test]
+    fn test_parse_range_header_invalid() {
+        // Missing bytes= prefix
+        assert!(parse_range_header("0-999", 10000).is_err());
+
+        // Invalid format
+        assert!(parse_range_header("bytes=abc-def", 10000).is_err());
+
+        // Start > end (should fail after parsing)
+        let result = parse_range_header("bytes=1000-500", 10000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_range_header_edge_cases() {
+        // Range extends beyond file size (should clamp to file size)
+        assert_eq!(parse_range_header("bytes=0-99999", 10000).unwrap(), (0, 9999));
+
+        // Suffix larger than file (should return entire file)
+        assert_eq!(parse_range_header("bytes=-99999", 10000).unwrap(), (0, 9999));
+
+        // Zero byte range
+        assert_eq!(parse_range_header("bytes=0-0", 10000).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn test_slo_manifest_from_json() {
+        // Swift API format: array wrapped with segments key or direct array
+        // Testing with serde default (empty segments array if missing)
+        let json = r#"{
+            "segments": [
+                {
+                    "path": "/container/segment1",
+                    "size_bytes": 1048576,
+                    "etag": "abc123"
+                },
+                {
+                    "path": "/container/segment2",
+                    "size_bytes": 524288,
+                    "etag": "def456"
+                }
+            ]
+        }"#;
+
+        let manifest = SLOManifest::from_json(json.as_bytes()).unwrap();
+        assert_eq!(manifest.segments.len(), 2);
+        assert_eq!(manifest.segments[0].path, "/container/segment1");
+        assert_eq!(manifest.segments[0].size_bytes, 1048576);
+        assert_eq!(manifest.segments[1].etag, "def456");
+    }
+
+    #[test]
+    fn test_slo_manifest_from_json_with_range() {
+        let json = r#"{
+            "segments": [
+                {
+                    "path": "/container/segment1",
+                    "size_bytes": 1000,
+                    "etag": "abc123",
+                    "range": "0-499"
+                }
+            ]
+        }"#;
+
+        let manifest = SLOManifest::from_json(json.as_bytes()).unwrap();
+        assert_eq!(manifest.segments.len(), 1);
+        assert_eq!(manifest.segments[0].range, Some("0-499".to_string()));
+    }
+
+    #[test]
+    fn test_slo_manifest_from_json_invalid() {
+        // Invalid: not an object or missing segments
+        let json = r#"null"#;
+        assert!(SLOManifest::from_json(json.as_bytes()).is_err());
+
+        // Invalid: segments is not an array
+        let json = r#"{"segments": "not-an-array"}"#;
+        assert!(SLOManifest::from_json(json.as_bytes()).is_err());
+
+        // Invalid: missing required fields in segment
+        let json = r#"{"segments": [{"path": "missing_required_fields"}]}"#;
+        assert!(SLOManifest::from_json(json.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_calculate_etag_multiple_segments() {
+        let manifest = SLOManifest {
+            segments: vec![
+                SLOSegment {
+                    path: "/c/s1".to_string(),
+                    size_bytes: 1000,
+                    etag: "\"abc123\"".to_string(),
+                    range: None,
+                },
+                SLOSegment {
+                    path: "/c/s2".to_string(),
+                    size_bytes: 2000,
+                    etag: "\"def456\"".to_string(),
+                    range: None,
+                },
+                SLOSegment {
+                    path: "/c/s3".to_string(),
+                    size_bytes: 1500,
+                    etag: "\"ghi789\"".to_string(),
+                    range: None,
+                },
+            ],
+            created_at: None,
+        };
+
+        let etag = manifest.calculate_etag();
+        assert!(etag.starts_with('"'));
+        assert!(etag.ends_with("-3\""));
+        assert!(etag.contains('-'));
+
+        // Verify format is MD5-count
+        let parts: Vec<&str> = etag.trim_matches('"').split('-').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1], "3");
+    }
+
+    #[test]
+    fn test_calculate_etag_strips_quotes() {
+        let manifest1 = SLOManifest {
+            segments: vec![
+                SLOSegment {
+                    path: "/c/s1".to_string(),
+                    size_bytes: 1000,
+                    etag: "\"abc123\"".to_string(),
+                    range: None,
+                },
+            ],
+            created_at: None,
+        };
+
+        let manifest2 = SLOManifest {
+            segments: vec![
+                SLOSegment {
+                    path: "/c/s1".to_string(),
+                    size_bytes: 1000,
+                    etag: "abc123".to_string(),
+                    range: None,
+                },
+            ],
+            created_at: None,
+        };
+
+        // Both should produce the same ETag (quotes are stripped)
+        assert_eq!(manifest1.calculate_etag(), manifest2.calculate_etag());
+    }
+
+    #[test]
+    fn test_parse_segment_path_edge_cases() {
+        // Leading slash
+        let (container, object) = parse_segment_path("/container/object").unwrap();
+        assert_eq!(container, "container");
+        assert_eq!(object, "object");
+
+        // No leading slash
+        let (container, object) = parse_segment_path("container/object").unwrap();
+        assert_eq!(container, "container");
+        assert_eq!(object, "object");
+
+        // Multiple slashes in object path
+        let (container, object) = parse_segment_path("/container/path/to/object").unwrap();
+        assert_eq!(container, "container");
+        assert_eq!(object, "path/to/object");
+
+        // Missing slash (invalid)
+        assert!(parse_segment_path("no-slash").is_err());
+
+        // Empty path
+        assert!(parse_segment_path("").is_err());
+    }
 }

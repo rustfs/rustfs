@@ -386,4 +386,223 @@ mod tests {
         assert_eq!(parse_range_header("bytes=0-", 10000).unwrap(), (0, 9999));
         assert_eq!(parse_range_header("bytes=-500", 10000).unwrap(), (9500, 9999));
     }
+
+    #[test]
+    fn test_parse_range_header_invalid() {
+        // Missing bytes= prefix
+        assert!(parse_range_header("0-999", 10000).is_err());
+
+        // Invalid format
+        assert!(parse_range_header("bytes=abc-def", 10000).is_err());
+
+        // Start > end
+        assert!(parse_range_header("bytes=1000-500", 10000).is_err());
+    }
+
+    #[test]
+    fn test_parse_range_header_edge_cases() {
+        // Range extends beyond file size
+        assert_eq!(parse_range_header("bytes=0-99999", 10000).unwrap(), (0, 9999));
+
+        // Suffix larger than file
+        assert_eq!(parse_range_header("bytes=-99999", 10000).unwrap(), (0, 9999));
+
+        // Single byte range
+        assert_eq!(parse_range_header("bytes=0-0", 10000).unwrap(), (0, 0));
+
+        // Last byte only
+        assert_eq!(parse_range_header("bytes=-1", 10000).unwrap(), (9999, 9999));
+    }
+
+    #[test]
+    fn test_calculate_dlo_segments_for_range_single_segment() {
+        let segments = vec![
+            ObjectInfo {
+                name: "seg001".to_string(),
+                size: 1000,
+                content_type: Some("application/octet-stream".to_string()),
+                etag: Some("abc123".to_string()),
+            },
+            ObjectInfo {
+                name: "seg002".to_string(),
+                size: 1000,
+                content_type: Some("application/octet-stream".to_string()),
+                etag: Some("def456".to_string()),
+            },
+        ];
+
+        // Request bytes within first segment only
+        let result = calculate_dlo_segments_for_range(&segments, 100, 500).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 0);   // Segment index
+        assert_eq!(result[0].1, 100); // Start byte
+        assert_eq!(result[0].2, 500); // End byte
+        assert_eq!(result[0].3.name, "seg001");
+    }
+
+    #[test]
+    fn test_calculate_dlo_segments_for_range_all_segments() {
+        let segments = vec![
+            ObjectInfo {
+                name: "seg001".to_string(),
+                size: 500,
+                content_type: None,
+                etag: None,
+            },
+            ObjectInfo {
+                name: "seg002".to_string(),
+                size: 500,
+                content_type: None,
+                etag: None,
+            },
+            ObjectInfo {
+                name: "seg003".to_string(),
+                size: 500,
+                content_type: None,
+                etag: None,
+            },
+        ];
+
+        // Request entire object
+        let result = calculate_dlo_segments_for_range(&segments, 0, 1499).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].1, 0);
+        assert_eq!(result[0].2, 499);
+        assert_eq!(result[1].1, 0);
+        assert_eq!(result[1].2, 499);
+        assert_eq!(result[2].1, 0);
+        assert_eq!(result[2].2, 499);
+    }
+
+    #[test]
+    fn test_calculate_dlo_segments_for_range_last_segment() {
+        let segments = vec![
+            ObjectInfo {
+                name: "seg001".to_string(),
+                size: 1000,
+                content_type: None,
+                etag: None,
+            },
+            ObjectInfo {
+                name: "seg002".to_string(),
+                size: 1000,
+                content_type: None,
+                etag: None,
+            },
+            ObjectInfo {
+                name: "seg003".to_string(),
+                size: 500,
+                content_type: None,
+                etag: None,
+            },
+        ];
+
+        // Request bytes from last segment only
+        let result = calculate_dlo_segments_for_range(&segments, 2100, 2400).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 2);   // Third segment
+        assert_eq!(result[0].1, 100); // Start at byte 100
+        assert_eq!(result[0].2, 400); // End at byte 400
+    }
+
+    #[test]
+    fn test_calculate_dlo_segments_for_range_empty() {
+        let segments = vec![];
+
+        // No segments should return empty result
+        let result = calculate_dlo_segments_for_range(&segments, 0, 100).unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_calculate_dlo_segments_for_range_exact_boundaries() {
+        let segments = vec![
+            ObjectInfo {
+                name: "seg001".to_string(),
+                size: 1000,
+                content_type: None,
+                etag: None,
+            },
+            ObjectInfo {
+                name: "seg002".to_string(),
+                size: 1000,
+                content_type: None,
+                etag: None,
+            },
+        ];
+
+        // Request exactly the second segment (bytes 1000-1999)
+        let result = calculate_dlo_segments_for_range(&segments, 1000, 1999).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 1);   // Second segment
+        assert_eq!(result[0].1, 0);   // Start at beginning of segment
+        assert_eq!(result[0].2, 999); // End at end of segment
+    }
+
+    #[test]
+    fn test_parse_dlo_manifest_edge_cases() {
+        // Multiple slashes in prefix
+        let (container, prefix) = parse_dlo_manifest("mycontainer/path/to/segments/prefix").unwrap();
+        assert_eq!(container, "mycontainer");
+        assert_eq!(prefix, "path/to/segments/prefix");
+
+        // Empty prefix (valid - matches all objects)
+        let (container, prefix) = parse_dlo_manifest("mycontainer/").unwrap();
+        assert_eq!(container, "mycontainer");
+        assert_eq!(prefix, "");
+
+        // No trailing slash in prefix
+        let (container, prefix) = parse_dlo_manifest("mycontainer/segments").unwrap();
+        assert_eq!(container, "mycontainer");
+        assert_eq!(prefix, "segments");
+
+        // Invalid: no slash at all
+        assert!(parse_dlo_manifest("nocontainer").is_err());
+
+        // Invalid: empty string
+        assert!(parse_dlo_manifest("").is_err());
+    }
+
+    #[test]
+    fn test_generate_trans_id_format() {
+        let trans_id = generate_trans_id();
+
+        // Should start with "tx"
+        assert!(trans_id.starts_with("tx"));
+
+        // Should be followed by a UUID (32 hex chars after "tx")
+        assert_eq!(trans_id.len(), 34); // "tx" + 32 hex chars
+
+        // Should be unique
+        let trans_id2 = generate_trans_id();
+        assert_ne!(trans_id, trans_id2);
+    }
+
+    #[test]
+    fn test_objectinfo_structure() {
+        let obj = ObjectInfo {
+            name: "test-object".to_string(),
+            size: 12345,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("abc123def456".to_string()),
+        };
+
+        assert_eq!(obj.name, "test-object");
+        assert_eq!(obj.size, 12345);
+        assert_eq!(obj.content_type, Some("text/plain".to_string()));
+        assert_eq!(obj.etag, Some("abc123def456".to_string()));
+    }
+
+    #[test]
+    fn test_objectinfo_optional_fields() {
+        let obj = ObjectInfo {
+            name: "test-object".to_string(),
+            size: 12345,
+            content_type: None,
+            etag: None,
+        };
+
+        assert!(obj.content_type.is_none());
+        assert!(obj.etag.is_none());
+    }
 }
