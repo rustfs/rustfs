@@ -32,6 +32,24 @@
 
 For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
 
+## Environment Variable Naming Conventions
+
+RustFS uses a flat naming style for top-level configuration: environment variables are `RUSTFS_*` without nested module segments.
+
+Examples:
+- `RUSTFS_REGION`
+- `RUSTFS_ADDRESS`
+- `RUSTFS_VOLUMES`
+- `RUSTFS_LICENSE`
+
+Current guidance:
+- Prefer module-specific names only when they are not top-level product configuration.
+- Renamed variables must keep backward-compatible aliases until before beta.
+- Alias usage must emit deprecation warnings and be treated as transitional only.
+- Deprecated example:
+  - `RUSTFS_ENABLE_SCANNER` -> `RUSTFS_SCANNER_ENABLED`
+  - `RUSTFS_ENABLE_HEAL` -> `RUSTFS_HEAL_ENABLED`
+
 ## 📄 License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

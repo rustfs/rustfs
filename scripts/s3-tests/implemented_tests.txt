@@ -3,6 +3,7 @@
 #
 # These tests SHOULD PASS on RustFS for standard S3 API compatibility.
 # Run these tests to verify RustFS S3 compatibility.
+# Intentionally excluded tests (for example ACL authorization tests) are tracked in excluded_tests.txt.
 #
 # Covered operations:
 # - Bucket: Create, Delete, List, Head, GetLocation
@@ -17,7 +18,24 @@
 # - Metadata: User-defined metadata
 # - Conditional GET: If-Match, If-None-Match, If-Modified-Since
 #
-# Total: 123 tests
+# - SSE-C: Server-side encryption with customer-provided keys
+# - Object ownership: Bucket ownership controls
+#
+# - SSE-KMS: KMS-related edge cases
+# - Bucket Policy: Multipart upload authorization, SSE condition keys, grant header conditions
+# - Versioning: Concurrent multi-object delete
+# - Object Copy: Same/cross bucket, metadata, versioning
+# - POST Object: HTML form upload
+# - Raw requests: Authenticated and anonymous
+# - Conditional writes: If-Match/If-None-Match for PUT/Copy
+# - Atomic read/write: Concurrent read/write consistency
+# - Object Lock: Enable on versioned existing buckets
+# - Checksum: SHA256 and CRC64NVME validation on PutObject
+# - CORS: Bucket-level CORS configuration, preflight, origin matching
+# - HTTP: 100-continue, multipart abort, tagging in POST Object
+# - DeleteObject: Proper NoSuchBucket for deleted buckets
+# - Multipart Copy: InvalidRange when CopySourceRange exceeds source size
+#
 
 test_basic_key_count
 test_bucket_create_naming_bad_short_one
@@ -101,13 +119,6 @@ test_bucketv2_notexist
 test_bucketv2_policy_another_bucket
 test_get_bucket_policy_status
 test_get_nonpublicpolicy_principal_bucket_policy_status
-test_get_public_acl_bucket_policy_status
-test_get_authpublic_acl_bucket_policy_status
-test_get_publicpolicy_acl_bucket_policy_status
-test_get_nonpublicpolicy_acl_bucket_policy_status
-test_block_public_put_bucket_acls
-test_block_public_object_canned_acls
-test_ignore_public_acls
 test_set_get_del_bucket_policy
 test_get_object_ifmatch_good
 test_get_object_ifmodifiedsince_good
@@ -127,7 +138,6 @@ test_multipart_upload_overwrite_existing_object
 test_multipart_upload_size_too_small
 test_object_copy_bucket_not_found
 test_object_copy_key_not_found
-test_object_copy_not_owned_object_bucket
 test_object_head_zero_bytes
 test_get_obj_head_tagging
 test_object_metadata_replaced_on_put
@@ -149,3 +159,255 @@ test_set_multipart_tagging
 test_upload_part_copy_percent_encoded_key
 test_api_error_from_storage_error_mappings
 test_get_object_torrent
+
+# Object attributes
+test_get_checksum_object_attributes
+
+# SSE-C encryption tests
+test_encryption_sse_c_method_head
+test_encryption_sse_c_present
+test_encryption_sse_c_other_key
+test_encryption_sse_c_no_key
+test_encryption_sse_c_no_md5
+test_encryption_key_no_sse_c
+test_encryption_sse_c_invalid_md5
+test_put_obj_enc_conflict_c_s3
+test_put_obj_enc_conflict_c_kms
+test_put_obj_enc_conflict_s3_kms
+test_put_obj_enc_conflict_bad_enc_kms
+test_sse_kms_not_declared
+test_sse_kms_no_key
+test_sse_kms_read_declare
+test_encryption_sse_c_multipart_bad_download
+
+# ListObjectsV2 delimiter and encoding tests
+test_bucket_list_encoding_basic
+test_bucket_listv2_delimiter_alt
+test_bucket_listv2_delimiter_basic
+test_bucket_listv2_delimiter_dot
+test_bucket_listv2_delimiter_empty
+test_bucket_listv2_delimiter_none
+test_bucket_listv2_delimiter_not_exist
+test_bucket_listv2_delimiter_percentage
+test_bucket_listv2_delimiter_prefix_ends_with_delimiter
+test_bucket_listv2_delimiter_unreadable
+test_bucket_listv2_delimiter_whitespace
+test_bucket_listv2_encoding_basic
+
+# Multipart and tagging tests
+test_abort_multipart_upload
+test_multipart_resend_first_finishes_last
+test_set_bucket_tagging
+test_put_excess_key_tags
+test_put_excess_tags
+test_put_excess_val_tags
+
+# PublicAccessBlock tests
+test_put_get_delete_public_block
+test_put_public_block
+test_block_public_policy
+test_block_public_policy_with_principal
+test_block_public_restrict_public_buckets
+test_bucket_create_exists_nonowner
+test_get_public_block_deny_bucket_policy
+test_get_undefined_public_block
+
+# Bucket policy tests
+test_bucketv2_policy
+test_bucket_policy_another_bucket
+test_bucket_policy_allow_notprincipal
+test_bucket_policy_put_obj_kms_s3
+test_bucket_policy_put_obj_s3_kms
+
+# Object ownership
+test_create_bucket_no_ownership_controls
+
+# Bucket encryption
+test_put_bucket_encryption_kms
+test_put_bucket_encryption_s3
+test_get_bucket_encryption_kms
+test_get_bucket_encryption_s3
+test_delete_bucket_encryption_kms
+test_delete_bucket_encryption_s3
+test_lifecycle_expiration_days0
+
+# Lifecycle tests
+test_lifecycle_delete
+test_lifecycle_expiration_header_put
+test_lifecycle_get
+test_lifecycle_get_no_id
+test_lifecycle_id_too_long
+test_lifecycle_invalid_status
+test_lifecycle_same_id
+test_lifecycle_set
+test_lifecycle_set_date
+test_lifecycle_set_deletemarker
+test_lifecycle_set_empty_filter
+test_lifecycle_set_filter
+test_lifecycle_set_invalid_date
+test_lifecycle_set_multipart
+test_lifecycle_set_noncurrent
+test_lifecycle_transition_set_invalid_date
+
+# Object Lock invalid bucket tests
+test_object_lock_get_legal_hold_invalid_bucket
+test_object_lock_get_obj_lock_invalid_bucket
+test_object_lock_get_obj_retention_invalid_bucket
+test_object_lock_put_legal_hold_invalid_bucket
+test_object_lock_put_obj_lock_invalid_bucket
+test_object_lock_put_obj_retention_invalid_bucket
+
+# Versioning tests
+test_get_versioned_object_attributes
+test_versioned_concurrent_object_create_and_remove
+test_versioning_bucket_create_suspend
+test_versioning_bucket_atomic_upload_return_version_id
+test_versioning_bucket_multipart_upload_return_version_id
+test_versioning_concurrent_multi_object_delete
+test_versioning_multi_object_delete
+test_versioning_multi_object_delete_with_marker
+test_versioning_obj_create_read_remove
+test_versioning_obj_create_read_remove_head
+test_versioning_obj_create_versions_remove_all
+test_versioning_obj_create_versions_remove_special_names
+test_versioning_obj_list_marker
+test_versioning_obj_plain_null_version_overwrite
+test_versioning_obj_plain_null_version_overwrite_suspended
+test_versioning_obj_plain_null_version_removal
+test_versioning_obj_suspend_versions
+
+# Tenant and presigned tests
+
+test_object_anon_put
+
+# Bucket creation and naming
+test_bucket_create_exists
+test_bucket_create_naming_bad_ip
+test_bucket_create_naming_dns_long
+test_bucket_create_special_key_names
+test_bucket_recreate_not_overriding
+
+# ListObjects / ListObjectsV2 additional tests
+test_bucket_list_delimiter_not_skip_special
+test_bucket_list_delimiter_prefix
+test_bucket_list_delimiter_prefix_underscore
+test_bucket_list_many
+test_bucket_list_maxkeys_one
+test_bucket_list_objects_anonymous_fail
+test_bucket_list_unordered
+test_bucket_listv2_both_continuationtoken_startafter
+test_bucket_listv2_delimiter_prefix
+test_bucket_listv2_delimiter_prefix_underscore
+test_bucket_listv2_many
+test_bucket_listv2_maxkeys_one
+test_bucket_listv2_objects_anonymous_fail
+test_bucket_listv2_unordered
+
+# Object copy tests
+test_object_copy_16m
+test_object_copy_diff_bucket
+test_object_copy_replacing_metadata
+test_object_copy_retaining_metadata
+test_object_copy_same_bucket
+test_object_copy_to_itself
+test_object_copy_to_itself_with_metadata
+test_object_copy_verify_contenttype
+test_object_copy_versioned_bucket
+test_object_copy_versioned_url_encoding
+test_object_copy_versioning_multipart_upload
+test_object_copy_zero_size
+
+# Object content encoding
+test_object_content_encoding_aws_chunked
+
+# Raw request tests
+test_object_raw_authenticated
+test_object_raw_authenticated_bucket_gone
+test_object_raw_authenticated_object_gone
+test_object_raw_get_x_amz_expires_out_range_zero
+test_object_raw_response_headers
+
+# POST Object tests
+test_post_object_authenticated_no_content_type
+test_post_object_authenticated_request
+test_post_object_authenticated_request_bad_access_key
+test_post_object_case_insensitive_condition_fields
+test_post_object_condition_is_case_sensitive
+test_post_object_empty_conditions
+test_post_object_escaped_field_values
+test_post_object_expired_policy
+test_post_object_expires_is_case_sensitive
+test_post_object_ignored_header
+test_post_object_invalid_access_key
+test_post_object_invalid_content_length_argument
+test_post_object_invalid_signature
+test_post_object_missing_conditions_list
+test_post_object_missing_content_length_argument
+test_post_object_missing_expires_condition
+test_post_object_missing_signature
+test_post_object_no_key_specified
+test_post_object_upload_larger_than_chunk
+test_post_object_upload_size_below_minimum
+test_post_object_upload_size_limit_exceeded
+test_post_object_upload_size_rgw_chunk_size_bug
+test_post_object_user_specified_header
+
+# Conditional GET additional tests
+test_get_object_ifmatch_failed
+test_get_object_ifmodifiedsince_failed
+test_get_object_ifnonematch_failed
+test_get_object_ifnonematch_good
+test_get_object_ifunmodifiedsince_good
+
+# Conditional writes (If-Match/If-None-Match for PUT/COPY)
+test_put_object_ifmatch_failed
+test_put_object_ifmatch_good
+test_put_object_ifmatch_nonexisted_failed
+test_put_object_ifmatch_overwrite_existed_good
+test_put_object_ifnonmatch_failed
+test_put_object_ifnonmatch_good
+test_put_object_ifnonmatch_nonexisted_good
+test_put_object_ifnonmatch_overwrite_existed_failed
+
+# Multipart copy tests
+test_multipart_copy_improper_range
+test_multipart_copy_small
+test_multipart_copy_special_names
+
+# Authentication tests
+test_list_buckets_invalid_auth
+
+# Atomic read/write tests
+test_atomic_read_1mb
+test_atomic_read_4mb
+test_atomic_read_8mb
+test_atomic_write_1mb
+test_atomic_write_4mb
+test_atomic_write_8mb
+test_atomic_dual_write_1mb
+test_atomic_dual_write_4mb
+test_atomic_dual_write_8mb
+test_atomic_multipart_upload_write
+
+# Object Lock tests
+test_object_lock_put_obj_lock_enable_after_create
+
+# Checksum validation tests
+test_object_checksum_sha256
+test_object_checksum_crc64nvme
+
+# CORS tests
+test_set_cors
+test_cors_header_option
+test_cors_presigned_get_object
+test_cors_presigned_get_object_tenant
+test_cors_presigned_put_object
+test_cors_presigned_put_object_tenant
+
+# HTTP and DeleteObject tests
+test_abort_multipart_upload_not_found
+test_post_object_tags_authenticated_request
+test_object_delete_key_bucket_gone
+
+# Multipart copy range validation
+test_multipart_copy_invalid_range

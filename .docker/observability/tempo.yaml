@@ -12,21 +12,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+partition_ring_live_store: true
+stream_over_http_enabled: true
+
 server:
   http_listen_port: 3200
   log_level: info
 
+memberlist:
+  node_name: tempo
+  bind_port: 7946
+  join_members:
+    - tempo:7946
+
+# Distributor configuration - receives traces and writes directly to ingesters
 distributor:
+  ingester_write_path_enabled: true
+  kafka_write_path_enabled: false
   receivers:
     otlp:
       protocols:
         grpc:
-          endpoint: "0.0.0.0:4317"
+          endpoint: "tempo:4317"
         http:
-          endpoint: "0.0.0.0:4318"
+          endpoint: "tempo:4318"
+  ring:
+    kvstore:
+      store: memberlist
 
+# Ingester configuration - consumes from Kafka and stores traces
 ingester:
-  max_block_duration: 5m # cut the headblock when this much time passes. this is being set for demo purposes and should probably be left alone normally
+  lifecycler:
+    ring:
+      kvstore:
+        store: memberlist
+      replication_factor: 1
+    tokens_file_path: /var/tempo/tokens.json
+  trace_idle_period: 10s
+  max_block_bytes: 1_000_000
+  max_block_duration: 5m
+
+backend_scheduler:
+  provider:
+    compaction:
+      compaction:
+        block_retention: 1h
+
+backend_worker:
+  backend_scheduler_addr: localhost:3200
+  compaction:
+    block_retention: 1h
+  ring:
+    kvstore:
+      store: memberlist
+
+querier:
+  frontend_worker:
+    frontend_address: tempo:3200
 
 metrics_generator:
   registry:
@@ -38,13 +80,45 @@ metrics_generator:
     remote_write:
       - url: http://prometheus:9090/api/v1/write
         send_exemplars: true
-  traces_storage:
-    path: /var/tempo/generator/traces
+
+query_frontend:
+  rf1_after: "1999-01-01T00:00:00Z"
+  mcp_server:
+    enabled: true
 
 storage:
   trace:
-    backend: local # backend configuration to use
+    backend: local
     wal:
-      path: /var/tempo/wal # where to store the wal locally
+      path: /var/tempo/wal
     local:
       path: /var/tempo/blocks
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [ "span-metrics", "service-graphs", "local-blocks" ]
+      generate_native_histograms: both
+
+ingest:
+  enabled: false
+  # Disabled because using direct ingester write path
+  # If you want Kafka path, enable this and set:
+  # kafka:
+  #   brokers: [redpanda:9092]
+  #   topic: tempo-ingest
+  #   encoding: protobuf
+  #   consumer_group: tempo-ingest-consumer
+
+block_builder:
+  consume_cycle_duration: 30s
+
+compactor:
+  compaction:
+    block_retention: 168h  # 7 days
+  ring:
+    kvstore:
+      store: memberlist
+
+usage_report:
+  reporting_enabled: false

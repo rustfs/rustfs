@@ -258,7 +258,7 @@ mod tests {
             .map(|_| {
                 let mgr = Arc::new(manager.clone());
                 tokio::spawn(async move {
-                    let _permit = mgr.acquire_disk_read_permit().await;
+                    let _permit = mgr.acquire_disk_read_permit().await.unwrap();
                     sleep(Duration::from_millis(10)).await;
                 })
             })

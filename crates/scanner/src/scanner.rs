@@ -259,8 +259,6 @@ pub async fn store_data_usage_in_backend(
             break;
         }
 
-        debug!("store_data_usage_in_backend: received data usage info: {:?}", &data_usage_info);
-
         // Serialize to JSON
         let data = match serde_json::to_vec(&data_usage_info) {
             Ok(data) => data,
@@ -272,7 +270,7 @@ pub async fn store_data_usage_in_backend(
 
         // Save a backup every 10th update
         if attempts > 10 {
-            let backup_path = format!("{:?}.bkp", &DATA_USAGE_OBJ_NAME_PATH);
+            let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
             if let Err(e) = save_config(storeapi.clone(), &backup_path, data.clone()).await {
                 warn!("Failed to save data usage backup to {}: {}", backup_path, e);
             }
@@ -280,8 +278,8 @@ pub async fn store_data_usage_in_backend(
         }
 
         // Save main configuration
-        if let Err(e) = save_config(storeapi.clone(), &DATA_USAGE_OBJ_NAME_PATH, data).await {
-            error!("Failed to save data usage info to {:?}: {e}", &DATA_USAGE_OBJ_NAME_PATH);
+        if let Err(e) = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await {
+            error!("Failed to save data usage info to {}: {e}", DATA_USAGE_OBJ_NAME_PATH.as_str());
         }
 
         attempts += 1;

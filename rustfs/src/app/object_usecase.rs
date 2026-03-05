@@ -13,12 +13,11 @@
 // limitations under the License.
 
 //! Object application use-case contracts.
-#![allow(dead_code)]
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::config::workload_profiles::RustFSBufferConfig;
 use crate::error::ApiError;
-use crate::storage::access::{ReqInfo, authorize_request, has_bypass_governance_header};
+use crate::storage::access::{authorize_request, has_bypass_governance_header, req_info_mut};
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
@@ -27,9 +26,10 @@ use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_ha
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256, get_opts, put_opts,
+    filter_object_metadata, get_content_sha256_with_query, get_opts, put_opts,
 };
-use crate::storage::s3_api::{restore, select};
+use crate::storage::s3_api::multipart::parse_list_parts_params;
+use crate::storage::s3_api::{acl, restore, select};
 use crate::storage::*;
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -38,12 +38,11 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::{counter, histogram};
-use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
         bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts},
-        lifecycle::{self, TransitionOptions},
+        lifecycle::{self, Lifecycle, TransitionOptions},
     },
     metadata::{BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
@@ -65,7 +64,8 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store_api::{
-    BucketOptions, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, PutObjReader,
+    BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
+    PutObjReader,
 };
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
@@ -85,7 +85,8 @@ use rustfs_utils::http::{
     headers::{
         AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
         AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_TAG_COUNT, RESERVED_METADATA_PREFIX_LOWER,
+        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
+        RESERVED_METADATA_PREFIX_LOWER,
     },
 };
 use rustfs_utils::path::{is_dir_object, path_join_buf};
@@ -112,7 +113,49 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-pub type ObjectUsecaseResult<T> = Result<T, ApiError>;
+/// Extract trailing-header checksum values, overriding the corresponding input fields.
+fn apply_trailing_checksums(
+    algorithm: Option<&str>,
+    trailing_headers: &Option<s3s::TrailingHeaders>,
+    checksums: &mut PutObjectChecksums,
+) {
+    let Some(alg) = algorithm else { return };
+    let Some(checksum_str) = trailing_headers.as_ref().and_then(|trailer| {
+        let key = match alg {
+            ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+            ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+            ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+            ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+            ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+            _ => return None,
+        };
+        trailer.read(|headers| {
+            headers
+                .get(key.unwrap_or_default())
+                .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+        })
+    }) else {
+        return;
+    };
+
+    match alg {
+        ChecksumAlgorithm::CRC32 => checksums.crc32 = checksum_str,
+        ChecksumAlgorithm::CRC32C => checksums.crc32c = checksum_str,
+        ChecksumAlgorithm::SHA1 => checksums.sha1 = checksum_str,
+        ChecksumAlgorithm::SHA256 => checksums.sha256 = checksum_str,
+        ChecksumAlgorithm::CRC64NVME => checksums.crc64nvme = checksum_str,
+        _ => (),
+    }
+}
+
+#[derive(Default)]
+struct PutObjectChecksums {
+    crc32: Option<String>,
+    crc32c: Option<String>,
+    sha1: Option<String>,
+    sha256: Option<String>,
+    crc64nvme: Option<String>,
+}
 
 fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Option<String>, Option<Uuid>), String> {
     let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
@@ -129,55 +172,34 @@ fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Op
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PutObjectRequest {
-    pub bucket: String,
-    pub key: String,
-    pub content_length: Option<i64>,
-    pub content_type: Option<String>,
-    pub version_id: Option<String>,
+fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String> {
+    if !event.action.delete() {
+        return None;
+    }
+
+    let expire_time = event.due?;
+
+    if event.rule_id.is_empty() || expire_time == OffsetDateTime::UNIX_EPOCH {
+        return None;
+    }
+
+    let expiry_date = expire_time.format(&Rfc3339).ok()?;
+    Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PutObjectResponse {
-    pub etag: String,
-    pub version_id: Option<String>,
-}
+async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> Option<String> {
+    let Ok((lifecycle_config, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
+        debug!("resolve_put_object_expiration: lifecycle config not found for bucket {bucket}");
+        return None;
+    };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GetObjectRequest {
-    pub bucket: String,
-    pub key: String,
-    pub version_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GetObjectResponse {
-    pub etag: Option<String>,
-    pub content_length: i64,
-    pub version_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeleteObjectRequest {
-    pub bucket: String,
-    pub key: String,
-    pub version_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DeleteObjectResponse {
-    pub delete_marker: Option<bool>,
-    pub version_id: Option<String>,
-}
-
-#[async_trait::async_trait]
-pub trait ObjectUsecase: Send + Sync {
-    async fn put_object(&self, req: PutObjectRequest) -> ObjectUsecaseResult<PutObjectResponse>;
-
-    async fn get_object(&self, req: GetObjectRequest) -> ObjectUsecaseResult<GetObjectResponse>;
-
-    async fn delete_object(&self, req: DeleteObjectRequest) -> ObjectUsecaseResult<DeleteObjectResponse>;
+    let obj_opts = lifecycle::ObjectOpts::from_object_info(obj_info);
+    let event = lifecycle_config.predict_expiration(&obj_opts).await;
+    debug!(
+        "resolve_put_object_expiration: bucket={bucket}, action={:?}, rule_id={}, due={:?}",
+        event.action, event.rule_id, event.due
+    );
+    build_put_object_expiration_header(&event)
 }
 
 #[derive(Clone, Default)]
@@ -186,10 +208,7 @@ pub struct DefaultObjectUsecase {
 }
 
 impl DefaultObjectUsecase {
-    pub fn new(context: Arc<AppContext>) -> Self {
-        Self { context: Some(context) }
-    }
-
+    #[cfg(test)]
     pub fn without_context() -> Self {
         Self { context: None }
     }
@@ -198,10 +217,6 @@ impl DefaultObjectUsecase {
         Self {
             context: get_global_app_context(),
         }
-    }
-
-    pub fn context(&self) -> Option<Arc<AppContext>> {
-        self.context.clone()
     }
 
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
@@ -214,6 +229,35 @@ impl DefaultObjectUsecase {
             .or_else(get_global_app_context)
             .map(|context| context.buffer_config().get().base_config.default_unknown)
             .unwrap_or_else(|| RustFSBufferConfig::default().base_config.default_unknown)
+    }
+
+    async fn check_bucket_quota(&self, bucket: &str, op: QuotaOperation, size: u64) -> S3Result<()> {
+        let Some(metadata_sys) = self.bucket_metadata_sys() else {
+            return Ok(());
+        };
+        let quota_checker = QuotaChecker::new(metadata_sys);
+        match quota_checker.check_quota(bucket, op, size).await {
+            Ok(result) if !result.allowed => Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!(
+                    "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                    result.current_usage.unwrap_or(0),
+                    result.quota_limit.unwrap_or(0)
+                ),
+            )),
+            Err(e) => {
+                warn!("Quota check failed for bucket {bucket}: {e}, allowing operation");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn spawn_cache_invalidation(bucket: String, key: String, version_id: Option<String>) {
+        let manager = get_concurrency_manager();
+        tokio::spawn(async move {
+            manager.invalidate_cache_versioned(&bucket, &key, version_id.as_deref()).await;
+        });
     }
 
     #[instrument(level = "debug", skip(self, _fs, req))]
@@ -243,11 +287,6 @@ impl DefaultObjectUsecase {
             body,
             bucket,
             key,
-            acl,
-            grant_full_control,
-            grant_read,
-            grant_read_acp,
-            grant_write_acp,
             content_length,
             content_type,
             tagging,
@@ -262,43 +301,21 @@ impl DefaultObjectUsecase {
             ..
         } = input;
 
+        // Merge SSE-C params from headers (fallback when S3 layer does not populate input)
+        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(&req.headers)?;
+        let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
+        let sse_customer_key = sse_customer_key.or(h_key);
+        let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
+
+        // Merge server_side_encryption from headers (fallback when S3 layer does not populate input)
+        let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
+
         // Validate object key
         validate_object_key(&key, "PUT")?;
 
-        if let Some(acl) = &acl
-            && let Ok((config, _)) = metadata_sys::get_public_access_block_config(&bucket).await
-            && config.block_public_acls.unwrap_or(false)
-            && is_public_canned_acl(acl.as_str())
-        {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
-        }
-
-        // check quota for put operation
-        if let Some(size) = content_length
-            && let Some(metadata_sys) = self.bucket_metadata_sys()
-        {
-            let quota_checker = QuotaChecker::new(metadata_sys);
-
-            match quota_checker
-                .check_quota(&bucket, QuotaOperation::PutObject, size as u64)
-                .await
-            {
-                Ok(check_result) => {
-                    if !check_result.allowed {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidRequest,
-                            format!(
-                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage.unwrap_or(0),
-                                check_result.quota_limit.unwrap_or(0)
-                            ),
-                        ));
-                    }
-                }
-                Err(e) => {
-                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
-                }
-            }
+        if let Some(size) = content_length {
+            self.check_bucket_quota(&bucket, QuotaOperation::PutObject, size as u64)
+                .await?;
         }
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
@@ -329,10 +346,6 @@ impl DefaultObjectUsecase {
             buffer_size,
             StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
         );
-
-        // let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
-
-        // let mut reader = PutObjReader::new(body, content_length as usize);
 
         let store = get_validated_store(&bucket).await?;
 
@@ -370,34 +383,17 @@ impl DefaultObjectUsecase {
             })
         });
 
-        let mut metadata = metadata.unwrap_or_default();
-        let owner = req
-            .extensions
-            .get::<ReqInfo>()
-            .and_then(|info| info.cred.as_ref())
-            .map(|cred| owner_from_access_key(&cred.access_key))
-            .unwrap_or_else(default_owner);
-        let bucket_owner = default_owner();
-        let mut stored_acl = stored_acl_from_grant_headers(
-            &owner,
-            grant_read.map(|v| v.to_string()),
-            None,
-            grant_read_acp.map(|v| v.to_string()),
-            grant_write_acp.map(|v| v.to_string()),
-            grant_full_control.map(|v| v.to_string()),
+        // Validate SSE-C headers early: reject partial/invalid combinations per S3 spec
+        validate_sse_headers_for_write(
+            effective_sse.as_ref(),
+            effective_kms_key_id.as_ref(),
+            sse_customer_algorithm.as_ref(),
+            sse_customer_key.as_ref(),
+            sse_customer_key_md5.as_ref(),
+            true, // PutObject requires all three: algorithm, key, key_md5
         )?;
 
-        if stored_acl.is_none()
-            && let Some(canned) = acl.as_ref()
-        {
-            stored_acl = Some(stored_acl_from_canned_object(canned.as_str(), &bucket_owner, &owner));
-        }
-
-        let stored_acl =
-            stored_acl.unwrap_or_else(|| stored_acl_from_canned_object(ObjectCannedACL::PRIVATE, &bucket_owner, &owner));
-        let acl_data = serialize_acl(&stored_acl)?;
-        metadata.insert(INTERNAL_ACL_METADATA_KEY.to_string(), String::from_utf8_lossy(&acl_data).to_string());
-
+        let mut metadata = metadata.unwrap_or_default();
         if let Some(content_type) = content_type {
             metadata.insert("content-type".to_string(), content_type.to_string());
         }
@@ -425,7 +421,7 @@ impl DefaultObjectUsecase {
             None
         };
 
-        let mut sha256hex = get_content_sha256(&req.headers);
+        let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
         if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
             let algorithm = CompressionAlgorithm::default();
@@ -436,7 +432,7 @@ impl DefaultObjectUsecase {
             let mut hrd = HashReader::new(reader, size as i64, size as i64, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
-                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+                return Err(ApiError::from(err).into());
             }
 
             opts.want_checksum = hrd.checksum();
@@ -455,7 +451,7 @@ impl DefaultObjectUsecase {
 
         if size >= 0 {
             if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
-                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+                return Err(ApiError::from(err).into());
             }
 
             opts.want_checksum = reader.checksum();
@@ -514,23 +510,21 @@ impl DefaultObjectUsecase {
         // Fast in-memory update for immediate quota consistency
         rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
 
-        // Invalidate cache for the written object to prevent stale data
-        let manager = get_concurrency_manager();
-        let put_bucket = bucket.clone();
-        let put_key = key.clone();
-        let put_version = obj_info.version_id.map(|v| v.to_string());
+        let raw_version = obj_info.version_id.map(|v| v.to_string());
 
         helper = helper.object(obj_info.clone());
-        if let Some(version_id) = &put_version {
+        if let Some(version_id) = &raw_version {
             helper = helper.version_id(version_id.clone());
         }
 
-        let put_version_clone = put_version.clone();
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&put_bucket, &put_key, put_version_clone.as_deref())
-                .await;
-        });
+        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), raw_version.clone());
+
+        // Per S3 spec: only return VersionId when versioning is Enabled (not Suspended or default)
+        let put_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
+            raw_version
+        } else {
+            None
+        };
 
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
@@ -538,82 +532,42 @@ impl DefaultObjectUsecase {
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts);
 
         let dsc = must_replicate(&bucket, &key, repoptions).await;
+        let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
 
         if dsc.replicate_any() {
-            schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
+            schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
         }
 
-        let mut checksum_crc32 = input.checksum_crc32;
-        let mut checksum_crc32c = input.checksum_crc32c;
-        let mut checksum_sha1 = input.checksum_sha1;
-        let mut checksum_sha256 = input.checksum_sha256;
-        let mut checksum_crc64nvme = input.checksum_crc64nvme;
-
-        if let Some(alg) = &input.checksum_algorithm
-            && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
-                let key = match alg.as_str() {
-                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
-                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
-                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
-                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
-                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
-                    _ => return None,
-                };
-                trailer.read(|headers| {
-                    headers
-                        .get(key.unwrap_or_default())
-                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
-                })
-            })
-        {
-            match alg.as_str() {
-                ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
-                ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
-                ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
-                ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
-                ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
-                _ => (),
-            }
-        }
+        let mut checksums = PutObjectChecksums {
+            crc32: input.checksum_crc32,
+            crc32c: input.checksum_crc32c,
+            sha1: input.checksum_sha1,
+            sha256: input.checksum_sha256,
+            crc64nvme: input.checksum_crc64nvme,
+        };
+        apply_trailing_checksums(
+            input.checksum_algorithm.as_ref().map(|a| a.as_str()),
+            &req.trailing_headers,
+            &mut checksums,
+        );
 
         let output = PutObjectOutput {
             e_tag,
-            server_side_encryption: effective_sse, // TDD: Return effective encryption config
+            server_side_encryption: effective_sse,
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key_md5: sse_customer_key_md5.clone(),
-            ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
+            ssekms_key_id: effective_kms_key_id,
+            expiration,
+            checksum_crc32: checksums.crc32,
+            checksum_crc32c: checksums.crc32c,
+            checksum_sha1: checksums.sha1,
+            checksum_sha256: checksums.sha256,
+            checksum_crc64nvme: checksums.crc64nvme,
             version_id: put_version,
             ..Default::default()
         };
 
-        // TODO fix response for POST Policy (multipart/form-data) ，wait s3s crate update,fix issue #1564
-        // // If it is a POST Policy(multipart/form-data) path, the PutObjectInput carries the success_action_* field
-        // // Here, the response is uniformly rewritten, with the default being 204, redirect prioritizing 303, and status supporting 200/201/204
-        // if input.success_action_status.is_some() || input.success_action_redirect.is_some() {
-        //     let mut form_fields = HashMap::<String, String>::new();
-        //     if let Some(v) = &input.success_action_status {
-        //         form_fields.insert("success_action_status".to_string(), v.to_string());
-        //     }
-        //     if let Some(v) = &input.success_action_redirect {
-        //         form_fields.insert("success_action_redirect".to_string(), v.to_string());
-        //     }
-        //
-        //     // obj_info.etag has been converted to e_tag (s3s etag) above, so try to pass the original string here
-        //     let etag_str = e_tag.as_ref().map(|v| v.as_str());
-        //
-        //     // Returns using POST semantics: 204/303/201/200
-        //     let resp = build_post_object_success_response(&form_fields, &bucket, &key, etag_str, None)?;
-        //
-        //     // Keep helper event complete (note: (StatusCode, Body) is returned here instead of PutObjectOutput)
-        //     let result = Ok(resp);
-        //     let _ = helper.complete(&result);
-        //     return result;
-        // }
+        // TODO fix response for POST Policy (multipart/form-data), wait s3s crate update, fix issue #1564
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
@@ -628,13 +582,7 @@ impl DefaultObjectUsecase {
         let PutObjectAclInput {
             bucket,
             key,
-            acl,
             access_control_policy,
-            grant_full_control,
-            grant_read,
-            grant_read_acp,
-            grant_write,
-            grant_write_acp,
             version_id,
             ..
         } = req.input;
@@ -646,63 +594,14 @@ impl DefaultObjectUsecase {
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
+        store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
-        let bucket_owner = default_owner();
-        let existing_owner = info
-            .user_defined
-            .get(INTERNAL_ACL_METADATA_KEY)
-            .and_then(|acl| serde_json::from_str::<StoredAcl>(acl).ok())
-            .map(|acl| acl.owner)
-            .unwrap_or_else(|| bucket_owner.clone());
-
-        let mut stored_acl = access_control_policy
-            .as_ref()
-            .map(|policy| stored_acl_from_policy(policy, &existing_owner))
-            .transpose()?;
-
-        if stored_acl.is_none() {
-            stored_acl = stored_acl_from_grant_headers(
-                &existing_owner,
-                grant_read.map(|v| v.to_string()),
-                grant_write.map(|v| v.to_string()),
-                grant_read_acp.map(|v| v.to_string()),
-                grant_write_acp.map(|v| v.to_string()),
-                grant_full_control.map(|v| v.to_string()),
-            )?;
+        if access_control_policy.is_some() {
+            return Err(s3_error!(
+                NotImplemented,
+                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
+            ));
         }
-
-        if stored_acl.is_none()
-            && let Some(canned) = acl
-        {
-            stored_acl = Some(stored_acl_from_canned_object(canned.as_str(), &bucket_owner, &existing_owner));
-        }
-
-        let stored_acl =
-            stored_acl.unwrap_or_else(|| stored_acl_from_canned_object(ObjectCannedACL::PRIVATE, &bucket_owner, &existing_owner));
-
-        if let Ok((config, _)) = metadata_sys::get_public_access_block_config(&bucket).await
-            && config.block_public_acls.unwrap_or(false)
-            && stored_acl.grants.iter().any(is_public_grant)
-        {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
-        }
-
-        let acl_data = serialize_acl(&stored_acl)?;
-        let mut eval_metadata = HashMap::new();
-        eval_metadata.insert(INTERNAL_ACL_METADATA_KEY.to_string(), String::from_utf8_lossy(&acl_data).to_string());
-
-        let popts = ObjectOptions {
-            mod_time: info.mod_time,
-            version_id: opts.version_id,
-            eval_metadata: Some(eval_metadata),
-            ..Default::default()
-        };
-
-        store.put_object_metadata(&bucket, &key, &popts).await.map_err(|e| {
-            error!("put_object_metadata failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
 
         Ok(S3Response::new(PutObjectAclOutput::default()))
     }
@@ -794,16 +693,21 @@ impl DefaultObjectUsecase {
             Ok(_) => {}
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
+                    // AWS S3 allows enabling Object Lock on existing buckets if versioning
+                    // is already enabled. Reject only when versioning is not enabled.
+                    if !BucketVersioningSys::enabled(&bucket).await {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidBucketState,
+                            "Object Lock configuration cannot be enabled on existing buckets".to_string(),
+                        ));
+                    }
+                } else {
+                    warn!("get_object_lock_config err {:?}", err);
                     return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidBucketState,
-                        "Object Lock configuration cannot be enabled on existing buckets".to_string(),
+                        S3ErrorCode::InternalError,
+                        "Failed to get bucket ObjectLockConfiguration".to_string(),
                     ));
                 }
-                warn!("get_object_lock_config err {:?}", err);
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "Failed to get bucket ObjectLockConfiguration".to_string(),
-                ));
             }
         };
 
@@ -1200,7 +1104,10 @@ impl DefaultObjectUsecase {
         // based on the wait time. Longer wait times indicate higher system
         // load, which triggers more conservative I/O parameters.
         let permit_wait_start = std::time::Instant::now();
-        let _disk_permit = manager.acquire_disk_read_permit().await;
+        let _disk_permit = manager
+            .acquire_disk_read_permit()
+            .await
+            .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?;
         let permit_wait_duration = permit_wait_start.elapsed();
 
         // Calculate adaptive I/O strategy from permit wait time
@@ -1281,6 +1188,8 @@ impl DefaultObjectUsecase {
         {
             rs = HTTPRangeSpec::from_object_info(&info, part_number);
         }
+
+        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
 
         let mut content_length = info.get_actual_size().map_err(ApiError::from)?;
 
@@ -1602,31 +1511,9 @@ impl DefaultObjectUsecase {
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
+        store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
-        let bucket_owner = default_owner();
-        let object_owner = info
-            .user_defined
-            .get(INTERNAL_ACL_METADATA_KEY)
-            .and_then(|acl| serde_json::from_str::<StoredAcl>(acl).ok())
-            .map(|acl| acl.owner)
-            .unwrap_or_else(default_owner);
-
-        let stored_acl = info
-            .user_defined
-            .get(INTERNAL_ACL_METADATA_KEY)
-            .map(|acl| parse_acl_json_or_canned_object(acl, &bucket_owner, &object_owner))
-            .unwrap_or_else(|| stored_acl_from_canned_object(ObjectCannedACL::PRIVATE, &bucket_owner, &object_owner));
-
-        let mut sorted_grants = stored_acl.grants.clone();
-        sorted_grants.sort_by_key(|grant| grant.grantee.grantee_type != "Group");
-        let grants = sorted_grants.iter().map(stored_grant_to_dto).collect();
-
-        Ok(S3Response::new(GetObjectAclOutput {
-            grants: Some(grants),
-            owner: Some(stored_owner_to_dto(&stored_acl.owner)),
-            ..Default::default()
-        }))
+        Ok(S3Response::new(acl::build_get_object_acl_output()))
     }
 
     pub async fn execute_get_object_attributes(
@@ -1638,33 +1525,223 @@ impl DefaultObjectUsecase {
         }
 
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, "s3:GetObjectAttributes");
-        let GetObjectAttributesInput { bucket, key, .. } = req.input.clone();
+        let GetObjectAttributesInput {
+            bucket,
+            key,
+            max_parts,
+            object_attributes,
+            part_number_marker,
+            version_id,
+            sse_customer_key,
+            sse_customer_key_md5,
+            ..
+        } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        if let Err(e) = store
-            .get_object_reader(&bucket, &key, None, HeaderMap::new(), &ObjectOptions::default())
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
-        {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
+            .map_err(ApiError::from)?;
+
+        let info = match store.get_object_info(&bucket, &key, &opts).await {
+            Ok(info) => info,
+            Err(err) => {
+                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    if is_dir_object(&key) {
+                        let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
+                            Ok(has_children) => has_children,
+                            Err(e) => {
+                                error!(
+                                    "Failed to probe children for object attributes (bucket: {}, key: {}): {}",
+                                    bucket, key, e
+                                );
+                                false
+                            }
+                        };
+                        let msg = head_prefix_not_found_message(&bucket, &key, has_children);
+                        return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
+                    }
+                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                }
+                return Err(ApiError::from(err).into());
+            }
+        };
+
+        if info.delete_marker {
+            if opts.version_id.is_none() {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+            }
+            return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
         }
 
+        validate_ssec_for_read(&info.user_defined, sse_customer_key.as_ref(), sse_customer_key_md5.as_ref())?;
+
+        let metadata_map = info.user_defined.clone();
+        let storage_class = info
+            .storage_class
+            .clone()
+            .or_else(|| metadata_map.get(AMZ_STORAGE_CLASS).cloned())
+            .filter(|s| !s.is_empty())
+            .map(StorageClass::from);
+
+        debug!(
+            "GetObjectAttributes raw object_attributes={:?}",
+            object_attributes.iter().map(|value| value.as_str()).collect::<Vec<_>>()
+        );
+
+        let requested = |name: &'static str| -> bool { object_attributes_requested(&object_attributes, name) };
+
+        let e_tag = if requested(ObjectAttributes::ETAG) {
+            info.etag.as_ref().map(|etag| to_s3s_etag(etag))
+        } else {
+            None
+        };
+
+        let object_size = if requested(ObjectAttributes::OBJECT_SIZE) {
+            Some(info.get_actual_size().map_err(ApiError::from)?)
+        } else {
+            None
+        };
+
+        let checksum = if requested(ObjectAttributes::CHECKSUM) {
+            let (checksums, _is_multipart) = info.decrypt_checksums(0, &req.headers).map_err(ApiError::from)?;
+            let mut checksum_crc32 = None;
+            let mut checksum_crc32c = None;
+            let mut checksum_sha1 = None;
+            let mut checksum_sha256 = None;
+            let mut checksum_crc64nvme = None;
+            let mut checksum_type = None;
+
+            for (k, v) in checksums {
+                if k == AMZ_CHECKSUM_TYPE {
+                    checksum_type = Some(ChecksumType::from(v));
+                    continue;
+                }
+                match rustfs_rio::ChecksumType::from_string(k.as_str()) {
+                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(v),
+                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(v),
+                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(v),
+                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(v),
+                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(v),
+                    _ => (),
+                }
+            }
+
+            Some(Checksum {
+                checksum_crc32,
+                checksum_crc32c,
+                checksum_sha1,
+                checksum_sha256,
+                checksum_crc64nvme,
+                checksum_type,
+            })
+        } else {
+            None
+        };
+
+        let object_parts = if requested(ObjectAttributes::OBJECT_PARTS) && info.is_multipart() {
+            let params = parse_list_parts_params(part_number_marker, max_parts)?;
+            let mut parts = Vec::new();
+            let mut marker = params.part_number_marker;
+            let max_parts = params.max_parts;
+            let mut start_at = 0usize;
+
+            if let Some(marker_value) = marker {
+                if let Some(index) = info.parts.iter().position(|part| part.number == marker_value) {
+                    start_at = index + 1;
+                } else {
+                    marker = None;
+                }
+            }
+
+            let max_parts: i32 = max_parts.try_into().map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "max-parts value is out of range".to_string())
+            })?;
+            let end = (start_at + params.max_parts).min(info.parts.len());
+            let is_truncated = end < info.parts.len();
+
+            for part in &info.parts[start_at..end] {
+                let (checksums, _is_multipart) = info.decrypt_checksums(part.number, &req.headers).map_err(ApiError::from)?;
+                let mut checksum_crc32 = None;
+                let mut checksum_crc32c = None;
+                let mut checksum_sha1 = None;
+                let mut checksum_sha256 = None;
+                let mut checksum_crc64nvme = None;
+
+                for (k, v) in checksums {
+                    match rustfs_rio::ChecksumType::from_string(k.as_str()) {
+                        rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(v),
+                        rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(v),
+                        rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(v),
+                        rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(v),
+                        rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(v),
+                        _ => (),
+                    }
+                }
+
+                let part_size = if part.actual_size > 0 {
+                    part.actual_size
+                } else {
+                    part.size.try_into().map_err(|_| {
+                        S3Error::with_message(S3ErrorCode::InvalidArgument, "Part size value is out of range".to_string())
+                    })?
+                };
+
+                parts.push(ObjectPart {
+                    checksum_crc32,
+                    checksum_crc32c,
+                    checksum_sha1,
+                    checksum_sha256,
+                    checksum_crc64nvme,
+                    part_number: i32::try_from(part.number).ok(),
+                    size: Some(part_size),
+                });
+            }
+
+            let part_number_marker = marker.and_then(|v| i32::try_from(v).ok());
+            let next_part_number_marker = parts.last().and_then(|part| part.part_number);
+
+            Some(GetObjectAttributesParts {
+                is_truncated: Some(is_truncated),
+                max_parts: Some(max_parts),
+                next_part_number_marker,
+                part_number_marker,
+                parts: Some(parts),
+                total_parts_count: Some(i32::try_from(info.parts.len()).map_err(|_| {
+                    S3Error::with_message(S3ErrorCode::InvalidArgument, "Part count is out of range".to_string())
+                })?),
+            })
+        } else {
+            None
+        };
+
+        let version_id = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
+            info.version_id.map(|vid| {
+                if vid == Uuid::nil() {
+                    "null".to_string()
+                } else {
+                    vid.to_string()
+                }
+            })
+        } else {
+            None
+        };
+
         let output = GetObjectAttributesOutput {
-            delete_marker: None,
-            object_parts: None,
+            checksum,
+            delete_marker: if info.delete_marker { Some(true) } else { None },
+            e_tag,
+            last_modified: info.mod_time.map(Timestamp::from),
+            object_parts,
+            object_size,
+            storage_class,
+            version_id: version_id.clone(),
             ..Default::default()
         };
 
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper
-            .object(ObjectInfo {
-                name: key.clone(),
-                bucket,
-                ..Default::default()
-            })
-            .version_id(version_id);
+        helper = helper.object(info).version_id(version_id.unwrap_or_default());
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
@@ -1885,6 +1962,7 @@ impl DefaultObjectUsecase {
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket {
                 ref bucket,
                 ref key,
@@ -2107,34 +2185,9 @@ impl DefaultObjectUsecase {
             src_info.user_defined.insert(k, v);
         }
 
-        // check quota for copy operation
-        let has_bucket_metadata = if let Some(metadata_sys) = self.bucket_metadata_sys() {
-            let quota_checker = QuotaChecker::new(metadata_sys);
-
-            match quota_checker
-                .check_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
-                .await
-            {
-                Ok(check_result) => {
-                    if !check_result.allowed {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidRequest,
-                            format!(
-                                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                                check_result.current_usage.unwrap_or(0),
-                                check_result.quota_limit.unwrap_or(0)
-                            ),
-                        ));
-                    }
-                }
-                Err(e) => {
-                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
-                }
-            }
-            true
-        } else {
-            false
-        };
+        self.check_bucket_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
+            .await?;
+        let has_bucket_metadata = self.bucket_metadata_sys().is_some();
 
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
@@ -2146,17 +2199,8 @@ impl DefaultObjectUsecase {
             rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
         }
 
-        // Invalidate cache for the destination object to prevent stale data
-        let manager = get_concurrency_manager();
-        let dest_bucket = bucket.clone();
-        let dest_key = key.clone();
         let dest_version = oi.version_id.map(|v| v.to_string());
-        let dest_version_clone = dest_version.clone();
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&dest_bucket, &dest_key, dest_version_clone.as_deref())
-                .await;
-        });
+        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), dest_version.clone());
 
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
@@ -2236,8 +2280,8 @@ impl DefaultObjectUsecase {
         let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
 
         let mut object_to_delete = Vec::new();
-        let mut object_to_delete_index = HashMap::new();
-        let mut object_sizes = HashMap::new();
+        let mut object_to_delete_idx = Vec::new();
+        let mut object_sizes = Vec::new();
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             let raw_version_id = obj_id.version_id.clone();
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
@@ -2254,7 +2298,7 @@ impl DefaultObjectUsecase {
             };
 
             {
-                let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+                let req_info = req_info_mut(&mut req)?;
                 req_info.bucket = Some(bucket.clone());
                 req_info.object = Some(obj_id.key.clone());
                 req_info.version_id = version_id.clone();
@@ -2305,7 +2349,7 @@ impl DefaultObjectUsecase {
                 continue;
             }
 
-            object_sizes.insert(object.object_name.clone(), goi.size);
+            object_sizes.push(goi.size);
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
                 object.version_id = Some(Uuid::nil());
@@ -2335,7 +2379,7 @@ impl DefaultObjectUsecase {
                 }
             }
 
-            object_to_delete_index.insert(object.object_name.clone(), idx);
+            object_to_delete_idx.push(idx);
             object_to_delete.push(object);
         }
 
@@ -2377,11 +2421,7 @@ impl DefaultObjectUsecase {
         }
 
         for (i, err) in errs.iter().enumerate() {
-            let obj = dobjs[i].clone();
-
-            let Some(didx) = object_to_delete_index.get(&obj.object_name) else {
-                continue;
-            };
+            let didx = object_to_delete_idx[i];
 
             if err.is_none()
                 || err
@@ -2391,15 +2431,16 @@ impl DefaultObjectUsecase {
                 if replicate_deletes {
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
                 }
-                delete_results[*didx].delete_object = Some(dobjs[i].clone());
-                if let Some(&size) = object_sizes.get(&obj.object_name) {
+                delete_results[didx].delete_object = Some(dobjs[i].clone());
+                let size = object_sizes[i];
+                if size > 0 {
                     rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, size as u64).await;
                 }
                 continue;
             }
 
             if let Some(err) = err.clone() {
-                delete_results[*didx].error = Some(Error {
+                delete_results[didx].error = Some(Error {
                     code: Some(err.to_string()),
                     key: Some(object_to_delete[i].object_name.clone()),
                     message: Some(err.to_string()),
@@ -2606,16 +2647,7 @@ impl DefaultObjectUsecase {
         // Fast in-memory update for immediate quota consistency
         rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, obj_info.size as u64).await;
 
-        // Invalidate cache for the deleted object
-        let manager = get_concurrency_manager();
-        let del_bucket = bucket.clone();
-        let del_key = key.clone();
-        let del_version = obj_info.version_id.map(|v| v.to_string());
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&del_bucket, &del_key, del_version.as_deref())
-                .await;
-        });
+        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), obj_info.version_id.map(|v| v.to_string()));
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {
@@ -2851,6 +2883,16 @@ impl DefaultObjectUsecase {
         {
             return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
         }
+        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
+
+        // Validate SSE-C: if the object was encrypted with a customer-provided key,
+        // the caller must supply the matching key even for HEAD requests (per S3 spec).
+        validate_ssec_for_read(
+            &info.user_defined,
+            req.input.sse_customer_key.as_ref(),
+            req.input.sse_customer_key_md5.as_ref(),
+        )?;
+
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -3363,7 +3405,7 @@ impl DefaultObjectUsecase {
             None
         };
 
-        let sha256hex = get_content_sha256(&req.headers);
+        let sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
         let actual_size = size;
 
         let reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
@@ -3371,7 +3413,7 @@ impl DefaultObjectUsecase {
         let mut hreader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
         if let Err(err) = hreader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
-            return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+            return Err(ApiError::from(err).into());
         }
 
         let decoder = CompressionFormat::from_extension(&ext).get_decoder(hreader).map_err(|e| {
@@ -3489,49 +3531,30 @@ impl DefaultObjectUsecase {
             }
         }
 
-        let mut checksum_crc32 = input.checksum_crc32;
-        let mut checksum_crc32c = input.checksum_crc32c;
-        let mut checksum_sha1 = input.checksum_sha1;
-        let mut checksum_sha256 = input.checksum_sha256;
-        let mut checksum_crc64nvme = input.checksum_crc64nvme;
-
-        if let Some(alg) = &input.checksum_algorithm
-            && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
-                let key = match alg.as_str() {
-                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
-                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
-                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
-                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
-                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
-                    _ => return None,
-                };
-                trailer.read(|headers| {
-                    headers
-                        .get(key.unwrap_or_default())
-                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
-                })
-            })
-        {
-            match alg.as_str() {
-                ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
-                ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
-                ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
-                ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
-                ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
-                _ => (),
-            }
-        }
+        let mut checksums = PutObjectChecksums {
+            crc32: input.checksum_crc32,
+            crc32c: input.checksum_crc32c,
+            sha1: input.checksum_sha1,
+            sha256: input.checksum_sha256,
+            crc64nvme: input.checksum_crc64nvme,
+        };
+        apply_trailing_checksums(
+            input.checksum_algorithm.as_ref().map(|a| a.as_str()),
+            &req.trailing_headers,
+            &mut checksums,
+        );
 
         warn!(
-            "put object extract checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
+            "put object extract checksum_crc32={:?}, checksum_crc32c={:?}, checksum_sha1={:?}, checksum_sha256={:?}, checksum_crc64nvme={:?}",
+            checksums.crc32, checksums.crc32c, checksums.sha1, checksums.sha256, checksums.crc64nvme,
         );
 
         let output = PutObjectOutput {
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
+            checksum_crc32: checksums.crc32,
+            checksum_crc32c: checksums.crc32c,
+            checksum_sha1: checksums.sha1,
+            checksum_sha256: checksums.sha256,
+            checksum_crc64nvme: checksums.crc64nvme,
             ..Default::default()
         };
         let result = Ok(S3Response::new(output));
@@ -3540,28 +3563,13 @@ impl DefaultObjectUsecase {
     }
 }
 
-#[async_trait::async_trait]
-impl ObjectUsecase for DefaultObjectUsecase {
-    async fn put_object(&self, req: PutObjectRequest) -> ObjectUsecaseResult<PutObjectResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultObjectUsecase::put_object DTO path is not implemented yet",
-        )))
-    }
-
-    async fn get_object(&self, req: GetObjectRequest) -> ObjectUsecaseResult<GetObjectResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultObjectUsecase::get_object DTO path is not implemented yet",
-        )))
-    }
-
-    async fn delete_object(&self, req: DeleteObjectRequest) -> ObjectUsecaseResult<DeleteObjectResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultObjectUsecase::delete_object DTO path is not implemented yet",
-        )))
-    }
+fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'static str) -> bool {
+    object_attributes.iter().any(|value| {
+        value.as_str().split(',').any(|part| {
+            part.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .eq_ignore_ascii_case(name)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -3734,6 +3742,98 @@ mod tests {
 
         let err = usecase.execute_get_object_attributes(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn object_attributes_requested_with_single_value() {
+        let object_attributes = vec![ObjectAttributes::from_static(ObjectAttributes::ETAG)];
+
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
+        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+    }
+
+    #[test]
+    fn object_attributes_requested_with_comma_separated_values() {
+        let object_attributes = vec![
+            ObjectAttributes::from_static("ObjectParts,etag"),
+            ObjectAttributes::from_static("StorageClass"),
+        ];
+
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_PARTS));
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
+        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+    }
+
+    #[test]
+    fn object_attributes_requested_with_quotes_and_spaces() {
+        let object_attributes = vec![ObjectAttributes::from_static("'ObjectSize', \"Checksum\" , \"Etag\"")];
+
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::CHECKSUM));
+        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
+    }
+
+    #[test]
+    fn object_attributes_requested_returns_false_for_missing_name() {
+        let object_attributes = vec![ObjectAttributes::from_static("Checksum")];
+
+        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
+    }
+
+    #[test]
+    fn build_put_object_expiration_header_returns_none_for_non_delete_events() {
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::TransitionAction,
+            rule_id: "rule-1".to_string(),
+            due: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        assert!(build_put_object_expiration_header(&event).is_none());
+    }
+
+    #[test]
+    fn build_put_object_expiration_header_formats_expected_value() {
+        let expire_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::DeleteAction,
+            rule_id: "rule-1".to_string(),
+            due: Some(expire_time),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        let expiry_date = expire_time.format(&Rfc3339).unwrap();
+        let expected = format!("expiry-date=\"{}\", rule-id=\"rule-1\"", expiry_date);
+        assert_eq!(build_put_object_expiration_header(&event), Some(expected));
+    }
+
+    #[test]
+    fn build_put_object_expiration_header_requires_rule_id_and_due_time() {
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::DeleteAction,
+            rule_id: String::new(),
+            due: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        assert!(build_put_object_expiration_header(&event).is_none());
+
+        let event = lifecycle::Event {
+            action: lifecycle::IlmAction::DeleteAction,
+            rule_id: "rule-1".to_string(),
+            due: Some(OffsetDateTime::UNIX_EPOCH),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+        };
+
+        assert!(build_put_object_expiration_header(&event).is_none());
     }
 
     #[tokio::test]

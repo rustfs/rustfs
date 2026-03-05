@@ -15,6 +15,7 @@
 mod admin;
 mod app;
 mod auth;
+mod auth_keystone;
 mod config;
 mod error;
 mod init;
@@ -45,7 +46,6 @@ use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
-    StorageAPI,
     bucket::metadata_sys::init_bucket_metadata_sys,
     bucket::migration::try_migrate_bucket_metadata,
     bucket::replication::{get_global_replication_pool, init_background_replication},
@@ -56,6 +56,7 @@ use rustfs_ecstore::{
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
+    store_api::BucketOperations,
     store_api::BucketOptions,
     update_erasure_type,
 };
@@ -66,11 +67,16 @@ use rustfs_iam::{init_iam_sys, init_oidc_sys};
 use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
-use rustfs_utils::net::parse_and_resolve_address;
+use rustfs_utils::{get_env_bool_with_aliases, net::parse_and_resolve_address};
 use std::io::{Error, Result};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
+
+const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
+const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
+const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
+const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
@@ -89,13 +95,13 @@ static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
-    let runtime = server::get_tokio_runtime_builder()
+    let runtime = server::tokio_runtime_builder()
         .build()
         .expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
     if let Err(ref e) = result {
-        eprintln!("{} Server encountered an error and is shutting down: {}", jiff::Zoned::now(), e);
-        error!("Server encountered an error and is shutting down: {}", e);
+        // Use eprintln as tracing may not be initialized at this point
+        eprintln!("[FATAL] Server encountered an error and is shutting down: {e}");
         std::process::exit(1);
     }
 }
@@ -110,7 +116,8 @@ async fn async_main() -> Result<()> {
     let guard = match init_obs(Some(config.clone().obs_endpoint)).await {
         Ok(g) => g,
         Err(e) => {
-            println!("Failed to initialize observability: {e}");
+            // Use eprintln as tracing is not yet initialized
+            eprintln!("[FATAL] Failed to initialize observability: {e}");
             return Err(Error::other(e));
         }
     };
@@ -282,7 +289,7 @@ async fn run(config: config::Config) -> Result<()> {
     // // Initialize global configuration system
     let mut retry_count = 0;
     while let Err(e) = ecconfig::init_global_config_sys(store.clone()).await {
-        error!("ecconfig::init_global_config_sys failed {:?}", e);
+        error!("ecstore config::init_global_config_sys failed {:?}", e);
         // TODO: check error type
         retry_count += 1;
         if retry_count > 15 {
@@ -370,6 +377,18 @@ async fn run(config: config::Config) -> Result<()> {
     init_iam_sys(store.clone()).await.map_err(Error::other)?;
     readiness.mark_stage(SystemStage::IamReady);
 
+    // 3a. Initialize Keystone authentication if enabled
+    let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
+    if keystone_config.enable {
+        match auth_keystone::init_keystone_auth(keystone_config).await {
+            Ok(_) => info!("Keystone authentication initialized successfully"),
+            Err(e) => {
+                error!("Failed to initialize Keystone authentication: {}", e);
+                // Continue without Keystone - fall back to standard auth
+            }
+        }
+    }
+
     // 3b. Initialize OIDC System (non-fatal if no providers configured)
     if let Err(e) = init_oidc_sys().await {
         warn!("OIDC initialization failed (non-fatal): {}", e);
@@ -392,8 +411,8 @@ async fn run(config: config::Config) -> Result<()> {
     let _ = create_ahm_services_cancel_token();
 
     // Check environment variables to determine if scanner and heal should be enabled
-    let enable_scanner = rustfs_utils::get_env_bool("RUSTFS_ENABLE_SCANNER", true);
-    let enable_heal = rustfs_utils::get_env_bool("RUSTFS_ENABLE_HEAL", true);
+    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
+    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
     info!(
         target: "rustfs::main::run",
@@ -423,13 +442,13 @@ async fn run(config: config::Config) -> Result<()> {
         init_metrics_system(ctx.clone());
     }
 
-    println!(
+    info!(
+        target: "rustfs::main::run",
         "RustFS server version: {} started successfully at {}, current time: {}",
         version::get_version(),
         &server_address,
         jiff::Zoned::now()
     );
-    info!(target: "rustfs::main::run","server started successfully at {}", &server_address);
     // 4. Mark as Full Ready now that critical components are warm
     readiness.mark_stage(SystemStage::FullReady);
 
@@ -489,8 +508,8 @@ async fn handle_shutdown(
     state_manager.update(ServiceState::Stopping);
 
     // Check environment variables to determine what services need to be stopped
-    let enable_scanner = rustfs_utils::get_env_bool("RUSTFS_ENABLE_SCANNER", true);
-    let enable_heal = rustfs_utils::get_env_bool("RUSTFS_ENABLE_HEAL", true);
+    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
+    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
     // Stop background services based on what was enabled
     if enable_scanner || enable_heal {
@@ -569,9 +588,5 @@ async fn handle_shutdown(
 
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        "Server stopped current "
-    );
-    println!("Server stopped successfully.");
+    info!(target: "rustfs::main::handle_shutdown", "Server stopped successfully.");
 }

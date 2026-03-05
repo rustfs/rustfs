@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::StorageAPI;
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
@@ -24,7 +23,8 @@ use crate::error::{
 };
 use crate::set_disk::SetDisks;
 use crate::store_api::{
-    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOptions, WalkOptions, WalkVersionsSortOrder,
+    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOperations, ObjectOptions, WalkOptions,
+    WalkVersionsSortOrder,
 };
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};

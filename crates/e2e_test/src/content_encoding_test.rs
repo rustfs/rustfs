@@ -82,4 +82,60 @@ mod tests {
 
         env.stop_server();
     }
+
+    /// Issue #1857: Content-Encoding "aws-chunked" is used by SigV4 streaming clients and must
+    /// not be stored or returned. Upload with aws-chunked and verify GET/HEAD do not return it.
+    #[tokio::test]
+    #[serial]
+    async fn test_content_encoding_aws_chunked_not_returned_issue_1857() {
+        init_logging();
+        info!("Issue #1857: aws-chunked must not be persisted or returned");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = env.create_s3_client();
+        let bucket = "content-encoding-aws-chunked-test";
+        let key = "streamed/object.bin";
+        let content = b"streaming upload body";
+
+        client
+            .create_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("Failed to create bucket");
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .content_encoding("aws-chunked")
+            .body(ByteStream::from_static(content))
+            .send()
+            .await
+            .expect("PUT failed");
+
+        let get_resp = client.get_object().bucket(bucket).key(key).send().await.expect("GET failed");
+        assert_eq!(
+            get_resp.content_encoding(),
+            None,
+            "GET must not return Content-Encoding when only aws-chunked was sent (Issue #1857)"
+        );
+
+        let head_resp = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("HEAD failed");
+        assert_eq!(
+            head_resp.content_encoding(),
+            None,
+            "HEAD must not return Content-Encoding when only aws-chunked was sent (Issue #1857)"
+        );
+
+        env.stop_server();
+    }
 }

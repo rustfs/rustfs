@@ -1,8 +1,19 @@
-cycle|app<->infra
-cycle|infra<->interface
-dep|rustfs/src/main.rs|infra->app|crate::app::context::
-dep|rustfs/src/server/audit.rs|infra->app|crate::app::context::resolve_server_config
-dep|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_server_config
-dep|rustfs/src/server/http.rs|infra->interface|crate::admin
-dep|rustfs/src/server/layer.rs|infra->interface|crate::admin::console::is_console_path
-dep|rustfs/src/storage/objects/put_object.rs|infra->app|crate::app::context::resolve_bucket_metadata_handle
+# Layer dependency baseline for the rustfs binary crate.
+#
+# These are intra-crate module references within rustfs/ that cross the
+# conceptual layer boundaries (app, infra/server, interface/admin).
+# Since they live inside one Cargo crate, Rust doesn't enforce separation.
+# The list is maintained for architectural awareness during code review.
+#
+# Format: status|source_file|direction|imported_symbol
+#
+# Status:
+#   accepted - reviewed and intentionally allowed
+#   todo     - should be resolved in a future refactor
+
+accepted|rustfs/src/main.rs|infra->app|crate::app::context::*|main wires all layers
+accepted|rustfs/src/server/audit.rs|infra->app|crate::app::context::resolve_server_config|config resolution uses global AppContext
+accepted|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_server_config|config resolution uses global AppContext
+accepted|rustfs/src/server/http.rs|infra->interface|crate::admin|HTTP server routes to admin handlers
+accepted|rustfs/src/server/layer.rs|infra->interface|crate::admin::console::is_console_path|pure path predicate for routing
+accepted|rustfs/src/storage/objects/put_object.rs|infra->app|crate::app::context::resolve_bucket_metadata_handle|metadata resolution uses global AppContext

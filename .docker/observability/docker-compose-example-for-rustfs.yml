@@ -1,0 +1,270 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  rustfs:
+    security_opt:
+      - "no-new-privileges:true"
+    image: rustfs/rustfs:latest
+    container_name: rustfs-server
+    ports:
+      - "9000:9000" # S3 API port
+      - "9001:9001" # Console port
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
+      - RUSTFS_OBS_LOGGER_LEVEL=info
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
+      - RUSTFS_OBS_PROFILING_ENDPOINT=http://pyroscope:4040
+    volumes:
+      - rustfs-data:/data/rustfs
+    networks:
+      - otel-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "sh",
+          "-c",
+          "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  rustfs-init:
+    image: alpine
+    container_name: rustfs-init
+    volumes:
+      - rustfs-data:/data
+    networks:
+      - otel-network
+    command: >
+      sh -c "
+        chown -R 10001:10001 /data &&
+        echo 'Volume Permissions fixed' &&
+        exit 0
+      "
+    restart: no
+
+  # --- Tracing ---
+
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    command: [ "-config.file=/etc/tempo.yaml" ]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200" # tempo
+      - "4317" # otlp grpc
+      - "4318" # otlp http
+    networks:
+      - otel-network
+    restart: unless-stopped
+    depends_on:
+      - redpanda
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3200/ready" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  redpanda:
+    image: redpandadata/redpanda:latest # for tempo ingest
+    container_name: redpanda
+    ports:
+      - "9092:9092"
+    networks:
+      - otel-network
+    restart: unless-stopped
+    command: >
+      redpanda start --overprovisioned
+      --mode=dev-container
+      --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+
+  jaeger:
+    image: jaegertracing/jaeger:latest
+    container_name: jaeger
+    environment:
+      - SPAN_STORAGE_TYPE=badger
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_DIRECTORY_KEY=/badger/key
+      - COLLECTOR_OTLP_ENABLED=true
+    volumes:
+      - ./jaeger.yaml:/etc/jaeger/config.yml
+      - jaeger-data:/badger
+    ports:
+      - "16686:16686" # Web UI
+      - "14269:14269" # Admin/Metrics
+      - "4317" # otlp grpc
+      - "4318" # otlp http
+    command: [ "--config", "/etc/jaeger/config.yml" ]
+    networks:
+      - otel-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:14269" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # --- Metrics ---
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-otlp-receiver" # Enable OTLP
+      - "--web.enable-remote-write-receiver" # Enable remote write
+      - "--enable-feature=promql-experimental-functions" # Enable info()
+      - "--storage.tsdb.retention.time=30d"
+    restart: unless-stopped
+    networks:
+      - otel-network
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # --- Logging ---
+
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    volumes:
+      - ./loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/loki.yaml
+    networks:
+      - otel-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3100/ready" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # --- Collection ---
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "1888:1888" # pprof
+      - "8888:8888" # Prometheus metrics for Collector
+      - "8889:8889" # Prometheus metrics for application indicators
+      - "13133:13133" # health check
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+      - "55679:55679" # zpages
+    networks:
+      - otel-network
+    restart: unless-stopped
+    depends_on:
+      - tempo
+      - jaeger
+      - prometheus
+      - loki
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:13133" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # --- Profiles ---
+
+  pyroscope:
+    image: grafana/pyroscope:latest
+    container_name: pyroscope
+    ports:
+      - "4040:4040"
+    command:
+      - -self-profiling.disable-push=true
+    networks:
+      - otel-network
+    restart: unless-stopped
+
+  # --- Visualization ---
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - otel-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    healthcheck:
+      test:
+        [ "CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  rustfs-data:
+  tempo-data:
+  jaeger-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:
+
+networks:
+  otel-network:
+    driver: bridge
+    name: "network_otel"
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+    driver_opts:
+      com.docker.network.enable_ipv6: "true"

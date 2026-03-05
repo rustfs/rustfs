@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! Multipart application use-case contracts.
-#![allow(dead_code)]
 
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::error::ApiError;
@@ -22,13 +21,13 @@ use crate::storage::ecfs::RUSTFS_OWNER;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
-    copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256, parse_copy_source_range, put_opts,
+    copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, parse_copy_source_range,
+    put_opts,
 };
 use crate::storage::*;
 use bytes::Bytes;
 use futures::StreamExt;
 use rustfs_config::RUSTFS_REGION;
-use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     metadata_sys,
@@ -40,7 +39,8 @@ use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
-use rustfs_ecstore::store_api::{CompletePart, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
+use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
+use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
 use rustfs_targets::EventName;
@@ -50,6 +50,7 @@ use rustfs_utils::http::{
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
 };
 use s3s::dto::*;
+use s3s::region::Region;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -58,83 +59,16 @@ use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{info, instrument, warn};
 
-pub type MultipartUsecaseResult<T> = Result<T, ApiError>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateMultipartUploadRequest {
-    pub bucket: String,
-    pub key: String,
-    pub metadata: HashMap<String, String>,
-    pub content_type: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateMultipartUploadResponse {
-    pub upload_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UploadPartRequest {
-    pub bucket: String,
-    pub key: String,
-    pub upload_id: String,
-    pub part_number: i32,
-    pub content_length: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UploadPartResponse {
-    pub etag: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteMultipartUploadPart {
-    pub part_number: i32,
-    pub etag: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteMultipartUploadRequest {
-    pub bucket: String,
-    pub key: String,
-    pub upload_id: String,
-    pub parts: Vec<CompleteMultipartUploadPart>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CompleteMultipartUploadResponse {
-    pub etag: Option<String>,
-    pub version_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AbortMultipartUploadRequest {
-    pub bucket: String,
-    pub key: String,
-    pub upload_id: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AbortMultipartUploadResponse;
-
-#[async_trait::async_trait]
-pub trait MultipartUsecase: Send + Sync {
-    async fn create_multipart_upload(
-        &self,
-        req: CreateMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<CreateMultipartUploadResponse>;
-
-    async fn upload_part(&self, req: UploadPartRequest) -> MultipartUsecaseResult<UploadPartResponse>;
-
-    async fn complete_multipart_upload(
-        &self,
-        req: CompleteMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<CompleteMultipartUploadResponse>;
-
-    async fn abort_multipart_upload(
-        &self,
-        req: AbortMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<AbortMultipartUploadResponse>;
+/// Returns InvalidRange error if CopySourceRange end exceeds the source object size.
+/// Used by execute_upload_part_copy to reject out-of-bounds ranges per S3 spec.
+fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_size: i64) -> S3Result<()> {
+    if range_spec.end >= object_size {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRange,
+            "The requested range is not satisfiable".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -143,10 +77,7 @@ pub struct DefaultMultipartUsecase {
 }
 
 impl DefaultMultipartUsecase {
-    pub fn new(context: Arc<AppContext>) -> Self {
-        Self { context: Some(context) }
-    }
-
+    #[cfg(test)]
     pub fn without_context() -> Self {
         Self { context: None }
     }
@@ -157,15 +88,11 @@ impl DefaultMultipartUsecase {
         }
     }
 
-    pub fn context(&self) -> Option<Arc<AppContext>> {
-        self.context.clone()
-    }
-
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
     }
 
-    fn global_region(&self) -> Option<s3s::region::Region> {
+    fn global_region(&self) -> Option<Region> {
         self.context.as_ref().and_then(|context| context.region().get())
     }
 
@@ -423,12 +350,15 @@ impl DefaultMultipartUsecase {
             }
         }
 
-        let region = self.global_region().unwrap_or_else(|| RUSTFS_REGION.parse().unwrap());
+        let region = self
+            .global_region()
+            .map(|region| region.to_string())
+            .unwrap_or_else(|| RUSTFS_REGION.to_string());
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(region.to_string()),
+            location: Some(region.clone()),
             server_side_encryption: server_side_encryption.clone(),
             ssekms_key_id: ssekms_key_id.clone(),
             checksum_crc32: checksum_crc32.clone(),
@@ -440,16 +370,11 @@ impl DefaultMultipartUsecase {
             version_id: mpu_version,
             ..Default::default()
         };
-        info!(
-            "TDD: Created output: SSE={:?}, KMS={:?}",
-            output.server_side_encryption, output.ssekms_key_id
-        );
-
         let helper_output = entity::CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(region.to_string()),
+            location: Some(region),
             server_side_encryption,
             ssekms_key_id,
             checksum_crc32,
@@ -460,6 +385,10 @@ impl DefaultMultipartUsecase {
             checksum_type,
             ..Default::default()
         };
+        info!(
+            "TDD: Created output: SSE={:?}, KMS={:?}",
+            output.server_side_encryption, output.ssekms_key_id
+        );
 
         let mt2 = HashMap::new();
         let replicate_options =
@@ -687,13 +616,13 @@ impl DefaultMultipartUsecase {
             None
         };
 
-        let mut sha256hex = get_content_sha256(&req.headers);
+        let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
         if is_compressible {
             let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
-                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+                return Err(ApiError::from(err).into());
             }
 
             let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
@@ -706,21 +635,30 @@ impl DefaultMultipartUsecase {
         let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
         if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
-            return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+            return Err(ApiError::from(err).into());
         }
 
-        let server_side_encryption = fi
-            .user_defined
-            .get("x-amz-server-side-encryption")
-            .map(|s| {
-                ServerSideEncryption::from_str(s)
-                    .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
-            })
-            .transpose()?;
-        let ssekms_key_id = fi
-            .user_defined
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .map(|s| s.to_string());
+        let has_ssec = sse_customer_algorithm.is_some();
+        // When SSE-C headers are present, skip managed-encryption metadata to avoid
+        // false conflict: the bucket default SSE config stored in multipart metadata
+        // should not block a legitimate SSE-C upload part.
+        let (server_side_encryption, ssekms_key_id) = if has_ssec {
+            (None, None)
+        } else {
+            let sse = fi
+                .user_defined
+                .get("x-amz-server-side-encryption")
+                .map(|s| {
+                    ServerSideEncryption::from_str(s)
+                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
+                })
+                .transpose()?;
+            let key_id = fi
+                .user_defined
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .map(|s| s.to_string());
+            (sse, key_id)
+        };
         let part_key = fi.user_defined.get("x-rustfs-encryption-key").cloned();
         let part_nonce = fi.user_defined.get("x-rustfs-encryption-iv").cloned();
         let encryption_request = EncryptionRequest {
@@ -978,6 +916,7 @@ impl DefaultMultipartUsecase {
 
         let (src_bucket, src_key, src_version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket {
                 bucket: ref src_bucket,
                 key: ref src_key,
@@ -1047,6 +986,8 @@ impl DefaultMultipartUsecase {
                 Ok((_, true)) => src_info.get_actual_size().unwrap_or(src_info.size),
                 _ => src_info.size,
             };
+
+            validate_copy_source_range_not_exceeds(range_spec, validation_size)?;
 
             range_spec
                 .get_offset_length(validation_size)
@@ -1181,46 +1122,6 @@ impl DefaultMultipartUsecase {
     }
 }
 
-#[async_trait::async_trait]
-impl MultipartUsecase for DefaultMultipartUsecase {
-    async fn create_multipart_upload(
-        &self,
-        req: CreateMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<CreateMultipartUploadResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultMultipartUsecase::create_multipart_upload is not implemented yet",
-        )))
-    }
-
-    async fn upload_part(&self, req: UploadPartRequest) -> MultipartUsecaseResult<UploadPartResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultMultipartUsecase::upload_part is not implemented yet",
-        )))
-    }
-
-    async fn complete_multipart_upload(
-        &self,
-        req: CompleteMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<CompleteMultipartUploadResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultMultipartUsecase::complete_multipart_upload is not implemented yet",
-        )))
-    }
-
-    async fn abort_multipart_upload(
-        &self,
-        req: AbortMultipartUploadRequest,
-    ) -> MultipartUsecaseResult<AbortMultipartUploadResponse> {
-        let _ = req;
-        Err(ApiError::from(StorageError::other(
-            "DefaultMultipartUsecase::abort_multipart_upload is not implemented yet",
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1330,6 +1231,44 @@ mod tests {
 
         let err = make_usecase().execute_upload_part_copy(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn test_validate_copy_source_range_not_exceeds_returns_invalid_range_when_range_exceeds() {
+        use super::validate_copy_source_range_not_exceeds;
+
+        let range_exceeds = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: 21,
+        };
+        let err = validate_copy_source_range_not_exceeds(&range_exceeds, 5).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRange);
+        assert!(err.to_string().contains("not satisfiable"));
+    }
+
+    #[test]
+    fn test_validate_copy_source_range_not_exceeds_ok_when_range_valid() {
+        use super::validate_copy_source_range_not_exceeds;
+
+        let range_valid = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: 4,
+        };
+        assert!(validate_copy_source_range_not_exceeds(&range_valid, 5).is_ok());
+    }
+
+    #[test]
+    fn test_validate_copy_source_range_not_exceeds_ok_for_suffix_range() {
+        use super::validate_copy_source_range_not_exceeds;
+
+        let range_suffix = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: -5,
+            end: -1,
+        };
+        assert!(validate_copy_source_range_not_exceeds(&range_suffix, 5).is_ok());
     }
 
     #[tokio::test]

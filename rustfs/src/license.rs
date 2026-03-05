@@ -55,21 +55,6 @@ pub fn license_check() -> Result<()> {
         Ok(())
     });
 
-    // let invalid_license = config::get_config().license.as_ref().map(|license| {
-    //     if license.is_empty() {
-    //         error!("License is empty");
-    //         return Err(Error::other("Incorrect license, please contact RustFS.".to_string()));
-    //     }
-    //     let token = appauth::token::parse_license(license)?;
-    //     if token.expired < SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() {
-    //         error!("License expired");
-    //         return Err(Error::other("Incorrect license, please contact RustFS.".to_string()));
-    //     }
-
-    //     info!("License is valid ! expired at {}", token.expired);
-    //     Ok(())
-    // });
-
     if invalid_license.is_none() || invalid_license.is_some_and(|v| v.is_err()) {
         return Err(Error::other("Incorrect license, please contact RustFS."));
     }

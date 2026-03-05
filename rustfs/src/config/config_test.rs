@@ -57,6 +57,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_default_console_configuration() {
         // Test that default console configuration is correct
         let args = vec!["rustfs", "/test/volume"];
@@ -68,6 +69,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_custom_console_configuration() {
         // Test custom console configuration
         let args = vec![
@@ -88,6 +90,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_console_and_endpoint_ports_different() {
         // Ensure console and endpoint use different default ports
         let args = vec!["rustfs", "/test/volume"];
@@ -107,6 +110,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_volumes_and_disk_layout_parsing() {
         use rustfs_ecstore::disks_layout::DisksLayout;
 
@@ -436,6 +440,7 @@ mod tests {
 
     /// Test error handling for invalid ellipses patterns.
     #[test]
+    #[serial]
     fn test_invalid_ellipses_patterns() {
         // Test case 1: Invalid ellipses format (letters instead of numbers)
         let args = vec!["rustfs", "/data/vol{a...z}"];
@@ -458,6 +463,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_server_domains_parsing() {
         // Test case 1: server domains without ports
         let args = vec![
@@ -525,6 +531,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_access_key_arguments_mutually_exclusive_cli() {
         // Test that CLI args configuration fails on conflict
         let args = vec![
@@ -564,6 +571,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_secret_key_arguments_mutually_exclusive_cli() {
         // Test that CLI args configuration fails on conflict
         let args = vec![

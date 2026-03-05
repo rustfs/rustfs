@@ -2,6 +2,7 @@
 .DS_Store
 .idea
 .vscode
+.cursor
 .direnv/
 /test
 /logs
@@ -43,3 +44,4 @@ docs
 
 # nix stuff
 result*
+*.gz
