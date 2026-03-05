@@ -332,7 +332,14 @@ where
                         .get("range")
                         .and_then(|v| v.to_str().ok());
 
-                    // Get object metadata first (needed for all response types)
+                    // Get object metadata first (needed for Range validation)
+                    // TODO(optimization): GetObjectReader contains object_info, but we need
+                    // metadata BEFORE calling get_object to validate Range headers and return
+                    // 416 errors without opening the object stream. Options:
+                    // 1. Modify get_object API to return (GetObjectReader, ObjectInfo)
+                    // 2. Add a .metadata() method to GetObjectReader
+                    // 3. Accept this extra HEAD call as the cost of proper Range validation
+                    // Currently using option 3 for correctness over performance.
                     let info = object::head_object(&account, &container, &object, &credentials).await?;
 
                     // Parse and validate Range header, returning 416 for invalid ranges
