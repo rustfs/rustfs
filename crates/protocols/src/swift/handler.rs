@@ -115,12 +115,10 @@ async fn handle_swift_request(
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
     let query = parts.uri.query().unwrap_or("");
-    let path = parts.uri.path();
-    let method = &parts.method;
 
     // Check for TempURL request (skip authentication if valid TempURL)
     if tempurl::is_tempurl_request(query) {
-        if let Some(tempurl_params) = tempurl::parse_tempurl_params(query) {
+        if let Some(_tempurl_params) = tempurl::parse_tempurl_params(query) {
             // For TempURL, we need to get the account's secret key
             // In a real implementation, this would be stored in account metadata
             // For now, we'll use a placeholder that can be configured
