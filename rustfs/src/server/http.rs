@@ -25,7 +25,6 @@ use crate::server::{
 };
 use crate::storage;
 use crate::storage::tonic_service::make_server;
-use crate::swift::handler::SwiftService;
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{
@@ -40,6 +39,8 @@ use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_keystone::KeystoneAuthLayer;
+#[cfg(feature = "swift")]
+use rustfs_protocols::SwiftService;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -583,11 +584,14 @@ fn process_connection(
         // It also ensures that each connection has an independent service instance.
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
 
-        // Wrap S3 service with Swift service to handle Swift API requests
+        // Wrap S3 service with Swift service to handle Swift API requests (when swift feature is enabled)
         // Swift is enabled by default with no URL prefix (direct /v1/AUTH_* paths)
-        let swift_service = SwiftService::new(true, None, s3_service);
+        #[cfg(feature = "swift")]
+        let http_service = SwiftService::new(true, None, s3_service);
+        #[cfg(not(feature = "swift"))]
+        let http_service = s3_service;
 
-        let service = hybrid(swift_service, rpc_service);
+        let service = hybrid(http_service, rpc_service);
 
         let remote_addr = match socket.peer_addr() {
             Ok(addr) => Some(RemoteAddr(addr)),

@@ -16,9 +16,9 @@
 //!
 //! This module implements Swift container CRUD operations and container-bucket translation.
 
-use crate::swift::account::validate_account_access;
-use crate::swift::types::Container;
-use crate::swift::{SwiftError, SwiftResult};
+use super::account::validate_account_access;
+use super::types::Container;
+use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{
@@ -62,16 +62,16 @@ pub struct ContainerMapper {
     config: ContainerMapperConfig,
 }
 
+impl Default for ContainerMapper {
+    fn default() -> Self {
+        Self::new(ContainerMapperConfig::default())
+    }
+}
+
 impl ContainerMapper {
     /// Create a new container mapper with given configuration
     pub fn new(config: ContainerMapperConfig) -> Self {
         Self { config }
-    }
-
-    /// Create a new container mapper with default configuration
-    #[allow(dead_code)] // Used by: list_containers
-    pub fn default() -> Self {
-        Self::new(ContainerMapperConfig::default())
     }
 
     /// Generate a deterministic hash prefix from project_id
@@ -520,8 +520,8 @@ pub async fn list_objects(
     marker: Option<String>,
     prefix: Option<String>,
     delimiter: Option<String>,
-) -> SwiftResult<Vec<crate::swift::types::Object>> {
-    use crate::swift::types::Object;
+) -> SwiftResult<Vec<super::types::Object>> {
+    use super::types::Object;
 
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;

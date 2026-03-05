@@ -25,7 +25,6 @@ mod profiling;
 mod protocols;
 mod server;
 mod storage;
-mod swift;
 mod update;
 mod version;
 

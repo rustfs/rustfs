@@ -18,9 +18,9 @@
 //! requests and delegates to appropriate Swift handlers or falls through
 //! to S3 service for non-Swift requests.
 
-use crate::swift::container;
-use crate::swift::object;
-use crate::swift::{SwiftError, SwiftRoute, SwiftRouter};
+use super::container;
+use super::object;
+use super::{SwiftError, SwiftRoute, SwiftRouter};
 use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
 use rustfs_credentials::Credentials;

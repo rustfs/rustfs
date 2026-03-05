@@ -20,8 +20,14 @@ pub mod constants;
 #[cfg(feature = "ftps")]
 pub mod ftps;
 
+#[cfg(feature = "swift")]
+pub mod swift;
+
 pub use common::session::Protocol;
 pub use common::{AuthorizationError, ProtocolPrincipal, S3Action, SessionContext, authorize_operation};
 
 #[cfg(feature = "ftps")]
 pub use ftps::{config::FtpsConfig, server::FtpsServer};
+
+#[cfg(feature = "swift")]
+pub use swift::handler::SwiftService;

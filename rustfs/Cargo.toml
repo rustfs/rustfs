@@ -31,10 +31,11 @@ name = "rustfs"
 path = "src/main.rs"
 
 [features]
-default = ["metrics"]
+default = ["metrics", "swift"]
 metrics = []
 ftps = ["rustfs-protocols/ftps"]
-full = ["metrics", "ftps"]
+swift = ["rustfs-protocols/swift"]
+full = ["metrics", "ftps", "swift"]
 
 [lints]
 workspace = true

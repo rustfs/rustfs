@@ -49,9 +49,9 @@
 //! The `parse_range_header` function parses Range headers, and `get_object` accepts
 //! an optional range parameter. See RANGE_REQUESTS.md for details.
 
-use crate::swift::account::validate_account_access;
-use crate::swift::container::ContainerMapper;
-use crate::swift::{SwiftError, SwiftResult};
+use super::account::validate_account_access;
+use super::container::ContainerMapper;
+use super::{SwiftError, SwiftResult};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::new_object_layer_fn;

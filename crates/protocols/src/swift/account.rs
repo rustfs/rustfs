@@ -14,7 +14,7 @@
 
 //! Swift account operations and validation
 
-use crate::swift::{SwiftError, SwiftResult};
+use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
 
 /// Validate that the authenticated user has access to the requested account
