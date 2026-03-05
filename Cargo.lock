@@ -7746,6 +7746,7 @@ dependencies = [
  "md5",
  "percent-encoding",
  "pin-project-lite",
+ "quick-xml 0.39.2",
  "regex",
  "rustfs-credentials",
  "rustfs-ecstore",

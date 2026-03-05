@@ -24,6 +24,7 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{
     BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions,
 };
+use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
 use tracing::error;
 
@@ -37,6 +38,52 @@ fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> Sw
 
     // Return generic error to client
     SwiftError::InternalServerError(format!("{} operation failed", operation))
+}
+
+/// Convert Swift container metadata to S3 tags
+///
+/// Swift container metadata uses X-Container-Meta-* headers.
+/// We store these as S3 tags with "swift-meta-" prefix to distinguish from regular bucket tags.
+///
+/// Example: X-Container-Meta-Color: Blue → S3 Tag: swift-meta-color=Blue
+fn swift_metadata_to_s3_tags(metadata: &std::collections::HashMap<String, String>) -> Option<Tagging> {
+    let mut tags = Vec::new();
+
+    for (key, value) in metadata {
+        // Store with "swift-meta-" prefix to namespace container metadata
+        tags.push(Tag {
+            key: Some(format!("swift-meta-{}", key.to_lowercase())),
+            value: Some(value.clone()),
+        });
+    }
+
+    if tags.is_empty() {
+        None
+    } else {
+        Some(Tagging {
+            tag_set: tags,
+        })
+    }
+}
+
+/// Convert S3 tags back to Swift container metadata
+///
+/// Extracts only tags with "swift-meta-" prefix, which represent Swift container metadata.
+/// Other tags are ignored (they may be used for other purposes).
+fn s3_tags_to_swift_metadata(tagging: &Tagging) -> std::collections::HashMap<String, String> {
+    let mut metadata = std::collections::HashMap::new();
+
+    for tag in &tagging.tag_set {
+        // Only process tags with "swift-meta-" prefix
+        if let (Some(key), Some(value)) = (&tag.key, &tag.value) {
+            if key.starts_with("swift-meta-") {
+                let meta_key = &key[11..]; // Skip "swift-meta-"
+                metadata.insert(meta_key.to_string(), value.clone());
+            }
+        }
+    }
+
+    metadata
 }
 
 /// Container name translation options
@@ -344,15 +391,30 @@ pub async fn get_container_metadata(account: &str, container: &str, credentials:
             }
         })?;
 
+    // Load bucket metadata to get custom metadata from tags
+    let custom_metadata = match rustfs_ecstore::bucket::metadata_sys::get(&bucket_name).await {
+        Ok(bucket_meta) => {
+            if let Some(tagging) = &bucket_meta.tagging_config {
+                s3_tags_to_swift_metadata(tagging)
+            } else {
+                std::collections::HashMap::new()
+            }
+        }
+        Err(_) => {
+            // If metadata not available, return empty (container may be newly created)
+            std::collections::HashMap::new()
+        }
+    };
+
     // Currently returns basic metadata with limitations:
     // 1. Object count requires iterating all objects (expensive)
     // 2. Bytes used requires summing all object sizes (expensive)
-    // 3. Custom metadata requires backend metadata storage implementation
+    // 3. Custom metadata is now loaded from bucket tags ✅
     Ok(ContainerMetadata {
         object_count: 0, // TODO: implement object counting in backend
         bytes_used: 0,   // TODO: implement size aggregation in backend
         created: bucket_info.created,
-        custom_metadata: std::collections::HashMap::new(), // TODO: implement bucket-level metadata storage
+        custom_metadata, // ✅ Now populated from bucket tags!
     })
 }
 
@@ -374,7 +436,7 @@ pub async fn update_container_metadata(
     account: &str,
     container: &str,
     credentials: &Credentials,
-    _metadata: std::collections::HashMap<String, String>,
+    metadata: std::collections::HashMap<String, String>,
 ) -> SwiftResult<()> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -405,12 +467,48 @@ pub async fn update_container_metadata(
             }
         })?;
 
-    // TODO: implement bucket-level metadata storage in backend
-    // Currently only validates the container exists
-    // Future enhancements needed:
-    // 1. Store custom metadata (X-Container-Meta-* headers)
-    // 2. Support X-Container-Read/Write ACL headers
-    // 3. Implement metadata merge semantics (POST merges, not replaces)
+    // Convert Swift metadata to S3 tags and store
+    if let Some(tagging) = swift_metadata_to_s3_tags(&metadata) {
+        // Load current bucket metadata
+        let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+            .await
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+
+        // Clone the metadata so we can modify it
+        let mut bucket_meta_clone = (*bucket_meta).clone();
+
+        // Serialize tagging to XML
+        let tagging_xml = quick_xml::se::to_string(&tagging)
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
+
+        // Update bucket metadata with new tags
+        let now = time::OffsetDateTime::now_utc();
+        bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
+        bucket_meta_clone.tagging_config_updated_at = now;
+        bucket_meta_clone.tagging_config = Some(tagging);
+
+        // Save updated metadata
+        rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
+            .await
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+    } else if metadata.is_empty() {
+        // If metadata is empty, clear existing tags
+        let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+            .await
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+
+        let mut bucket_meta_clone = (*bucket_meta).clone();
+
+        // Clear tags
+        let now = time::OffsetDateTime::now_utc();
+        bucket_meta_clone.tagging_config_xml = Vec::new();
+        bucket_meta_clone.tagging_config_updated_at = now;
+        bucket_meta_clone.tagging_config = None;
+
+        rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
+            .await
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+    }
 
     Ok(())
 }
@@ -843,5 +941,129 @@ mod tests {
         // Verify starts with lowercase letter or digit (not dash)
         let first_char = bucket.chars().next().unwrap();
         assert!(first_char.is_ascii_lowercase() || first_char.is_ascii_digit());
+    }
+
+    #[test]
+    fn test_swift_metadata_to_s3_tags() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("color".to_string(), "blue".to_string());
+        metadata.insert("description".to_string(), "test container".to_string());
+
+        let tagging = swift_metadata_to_s3_tags(&metadata).unwrap();
+        assert_eq!(tagging.tag_set.len(), 2);
+
+        // Verify tags have swift-meta- prefix
+        let color_tag = tagging.tag_set.iter()
+            .find(|t| t.key.as_deref() == Some("swift-meta-color"))
+            .expect("color tag not found");
+        assert_eq!(color_tag.value.as_deref(), Some("blue"));
+
+        let desc_tag = tagging.tag_set.iter()
+            .find(|t| t.key.as_deref() == Some("swift-meta-description"))
+            .expect("description tag not found");
+        assert_eq!(desc_tag.value.as_deref(), Some("test container"));
+    }
+
+    #[test]
+    fn test_swift_metadata_to_s3_tags_empty() {
+        let metadata = std::collections::HashMap::new();
+        let tagging = swift_metadata_to_s3_tags(&metadata);
+        assert!(tagging.is_none());
+    }
+
+    #[test]
+    fn test_swift_metadata_to_s3_tags_case_normalization() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("Color".to_string(), "Red".to_string());
+        metadata.insert("PRIORITY".to_string(), "High".to_string());
+
+        let tagging = swift_metadata_to_s3_tags(&metadata).unwrap();
+
+        // Keys should be lowercased
+        assert!(tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("swift-meta-color")));
+        assert!(tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("swift-meta-priority")));
+
+        // Values should be preserved as-is
+        let color_tag = tagging.tag_set.iter()
+            .find(|t| t.key.as_deref() == Some("swift-meta-color"))
+            .unwrap();
+        assert_eq!(color_tag.value.as_deref(), Some("Red"));
+    }
+
+    #[test]
+    fn test_s3_tags_to_swift_metadata() {
+        let tagging = Tagging {
+            tag_set: vec![
+                Tag {
+                    key: Some("swift-meta-color".to_string()),
+                    value: Some("blue".to_string()),
+                },
+                Tag {
+                    key: Some("swift-meta-description".to_string()),
+                    value: Some("test container".to_string()),
+                },
+                Tag {
+                    key: Some("other-tag".to_string()),
+                    value: Some("should-be-ignored".to_string()),
+                },
+            ],
+        };
+
+        let metadata = s3_tags_to_swift_metadata(&tagging);
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata.get("color"), Some(&"blue".to_string()));
+        assert_eq!(metadata.get("description"), Some(&"test container".to_string()));
+        assert!(!metadata.contains_key("other-tag"));
+    }
+
+    #[test]
+    fn test_s3_tags_to_swift_metadata_empty() {
+        let tagging = Tagging {
+            tag_set: vec![],
+        };
+
+        let metadata = s3_tags_to_swift_metadata(&tagging);
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_s3_tags_to_swift_metadata_no_swift_tags() {
+        let tagging = Tagging {
+            tag_set: vec![
+                Tag {
+                    key: Some("env".to_string()),
+                    value: Some("production".to_string()),
+                },
+                Tag {
+                    key: Some("team".to_string()),
+                    value: Some("backend".to_string()),
+                },
+            ],
+        };
+
+        let metadata = s3_tags_to_swift_metadata(&tagging);
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_metadata_roundtrip() {
+        // Test that we can convert metadata -> tags -> metadata without loss
+        let mut original_metadata = std::collections::HashMap::new();
+        original_metadata.insert("color".to_string(), "blue".to_string());
+        original_metadata.insert("owner".to_string(), "alice".to_string());
+        original_metadata.insert("priority".to_string(), "high".to_string());
+
+        let tagging = swift_metadata_to_s3_tags(&original_metadata).unwrap();
+        let recovered_metadata = s3_tags_to_swift_metadata(&tagging);
+
+        assert_eq!(recovered_metadata.len(), original_metadata.len());
+        for (key, value) in &original_metadata {
+            assert_eq!(
+                recovered_metadata.get(&key.to_lowercase()),
+                Some(value),
+                "Metadata key {} not preserved in roundtrip",
+                key
+            );
+        }
     }
 }

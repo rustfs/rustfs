@@ -51,6 +51,7 @@ swift = [
     "dep:hmac",
     "dep:sha1",
     "dep:hex",
+    "dep:quick-xml",
 ]
 
 [dependencies]
@@ -107,6 +108,7 @@ md5 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true, features = ["serialize"] }
 
 [package.metadata.docs.rs]
 all-features = true
