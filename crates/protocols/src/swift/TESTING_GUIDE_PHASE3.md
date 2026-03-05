@@ -347,6 +347,127 @@ swift list test-container
 
 ---
 
+## Test 4: TempURL (Temporary Public URLs)
+
+### Objective
+Verify that TempURL provides time-limited public access without authentication.
+
+**Note**: TempURL is implemented but requires account-level key storage to be fully functional. The module and tests are complete, but integration with account metadata storage is pending.
+
+### TempURL Architecture
+
+TempURL uses HMAC-SHA1 signatures to provide temporary, unauthenticated access:
+1. Account admin sets a secret key via `POST /v1/{account}` with `X-Account-Meta-Temp-URL-Key` header
+2. Users generate URLs with signature and expiration timestamp
+3. Server validates signature and expiration before granting access
+
+### Procedure (Once Account Key Storage Implemented)
+
+```bash
+# Step 1: Set TempURL key for account
+swift post -m "Temp-URL-Key:mySecretKey123"
+
+# Step 2: Upload an object
+echo "Temporary content" > temp-file.txt
+swift upload test-container temp-file.txt
+
+# Step 3: Generate TempURL (expires in 3600 seconds)
+TEMPURL=$(swift tempurl GET 3600 /v1/AUTH_test/test-container/temp-file.txt mySecretKey123)
+echo $TEMPURL
+
+# Step 4: Access via TempURL (no authentication required)
+curl "$TEMPURL"
+
+# Step 5: Verify expiration (wait for expiration or set short TTL)
+swift tempurl GET 5 /v1/AUTH_test/test-container/temp-file.txt mySecretKey123
+sleep 10
+curl "$TEMPURL"  # Should fail with 401 Unauthorized
+```
+
+### Manual TempURL Generation (Python Example)
+
+```python
+import hmac
+import hashlib
+import time
+
+method = "GET"
+expires = int(time.time()) + 3600  # 1 hour from now
+path = "/v1/AUTH_test/test-container/temp-file.txt"
+key = "mySecretKey123"
+
+# HMAC-SHA1 signature
+message = f"{method}\n{expires}\n{path}"
+signature = hmac.new(key.encode(), message.encode(), hashlib.sha1).hexdigest()
+
+# Construct URL
+url = f"http://localhost:8080{path}?temp_url_sig={signature}&temp_url_expires={expires}"
+print(url)
+```
+
+### TempURL with curl
+
+```bash
+# Generate signature (requires Python or similar)
+python3 << 'EOF'
+import hmac, hashlib, time
+method, expires, path = "GET", int(time.time())+3600, "/v1/AUTH_test/test-container/file.txt"
+key = "mySecretKey123"
+sig = hmac.new(key.encode(), f"{method}\n{expires}\n{path}".encode(), hashlib.sha1).hexdigest()
+print(f"http://localhost:8080{path}?temp_url_sig={sig}&temp_url_expires={expires}")
+EOF
+
+# Use the generated URL (no X-Auth-Token header needed)
+curl "http://localhost:8080/v1/AUTH_test/test-container/file.txt?temp_url_sig=abc123...&temp_url_expires=1234567890"
+```
+
+### Expected Results
+
+- **Valid TempURL**: Returns object content (HTTP 200)
+- **Expired TempURL**: Returns HTTP 401 Unauthorized
+- **Invalid signature**: Returns HTTP 401 Unauthorized
+- **Wrong method**: URL signed for GET cannot be used for PUT
+
+### TempURL Headers
+
+Optional query parameters:
+- `temp_url_filename`: Set `Content-Disposition: attachment; filename=...`
+- `temp_url_inline`: Set `Content-Disposition: inline`
+
+```bash
+# Download with custom filename
+curl "http://localhost:8080/v1/AUTH_test/test-container/file.txt?temp_url_sig=...&temp_url_expires=...&temp_url_filename=custom-name.txt"
+```
+
+### Implementation Status
+
+✅ **Complete**:
+- TempURL signature generation and validation
+- HMAC-SHA1 implementation
+- Expiration checking
+- Query parameter parsing
+- 19 unit tests covering all scenarios
+
+⏳ **Pending**:
+- Account-level key storage (requires account metadata infrastructure)
+- Integration with handler.rs (placeholder added)
+- `POST /v1/{account}` endpoint for setting TempURL keys
+
+### Testing TempURL Module
+
+```bash
+# Run TempURL unit tests
+cargo test -p rustfs-protocols --lib swift::tempurl
+
+# Expected: 19 tests passing
+# - Signature generation
+# - Validation (success, expired, wrong signature, wrong method, wrong path)
+# - Query parameter parsing
+# - Helper functions
+```
+
+---
+
 ## Troubleshooting
 
 ### Issue: OOM during large uploads
