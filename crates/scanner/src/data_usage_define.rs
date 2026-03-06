@@ -504,6 +504,9 @@ pub struct DataUsageEntry {
     pub obj_versions: VersionsHistogram,
     pub replication_stats: Option<ReplicationAllStats>,
     pub compacted: bool,
+    /// Number of objects that failed to scan (e.g., IO errors)
+    #[serde(default)]
+    pub failed_objects: usize,
 }
 
 impl DataUsageEntry {
@@ -541,6 +544,7 @@ impl DataUsageEntry {
         self.versions += other.versions;
         self.delete_markers += other.delete_markers;
         self.size += other.size;
+        self.failed_objects += other.failed_objects;
 
         if let Some(o_rep) = &other.replication_stats {
             if self.replication_stats.is_none() {
@@ -590,6 +594,8 @@ pub struct DataUsageCacheInfo {
     pub skip_healing: bool,
     pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
     pub replication: Option<Arc<ReplicationConfig>>,
+    #[serde(default)]
+    pub failed_objects: HashMap<String, u64>,
 }
 
 /// Data usage cache
@@ -1103,10 +1109,13 @@ impl DataUsageCache {
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
 
+        let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
+
         let store_clone = store.clone();
         let buf_clone = buf.clone();
+        let path_clone = path.clone();
         let res = timeout(Duration::from_secs(5), async move {
-            save_config(store_clone, name, buf_clone).await?;
+            save_config(store_clone, &path_clone, buf_clone).await?;
             Ok::<(), StorageError>(())
         })
         .await
@@ -1119,8 +1128,9 @@ impl DataUsageCache {
 
         let store_clone = store.clone();
         let backup_name = format!("{name}.bkp");
+        let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
         let res = timeout(Duration::from_secs(5), async move {
-            save_config(store_clone, backup_name.as_str(), buf).await?;
+            save_config(store_clone, &backup_path, buf).await?;
             Ok::<(), StorageError>(())
         })
         .await
@@ -1541,6 +1551,7 @@ impl SizeSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn test_data_usage_info_creation() {
@@ -1586,5 +1597,37 @@ mod tests {
 
         assert_eq!(summary1.total_size, 300);
         assert_eq!(summary1.versions, 15);
+    }
+
+    #[test]
+    fn test_data_usage_entry_merge_sums_failed_objects() {
+        let mut left = DataUsageEntry {
+            failed_objects: 2,
+            ..Default::default()
+        };
+
+        let right = DataUsageEntry {
+            failed_objects: 3,
+            ..Default::default()
+        };
+
+        left.merge(&right);
+
+        assert_eq!(left.failed_objects, 5);
+    }
+
+    #[test]
+    fn test_data_usage_entry_deserialize_defaults_failed_objects() {
+        let entry = DataUsageEntry::default();
+        let mut value = serde_json::to_value(&entry).expect("Failed to serialize entry");
+
+        let Value::Object(ref mut map) = value else {
+            panic!("Expected entry to serialize into an object");
+        };
+
+        map.remove("failed_objects");
+
+        let decoded: DataUsageEntry = serde_json::from_value(value).expect("Failed to deserialize entry");
+        assert_eq!(decoded.failed_objects, 0);
     }
 }

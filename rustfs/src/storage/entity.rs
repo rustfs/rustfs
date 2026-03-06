@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 use s3s::dto::{
     BucketKeyEnabled, BucketName, ChecksumCRC32, ChecksumCRC32C, ChecksumCRC64NVME, ChecksumSHA1, ChecksumSHA256, ChecksumType,
     ETag, Expiration, Location, ObjectKey, ObjectVersionId, RequestCharged, SSEKMSKeyId, ServerSideEncryption,
 };
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct CompleteMultipartUploadOutput {
     pub bucket: Option<BucketName>,

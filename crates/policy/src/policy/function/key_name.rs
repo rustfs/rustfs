@@ -160,6 +160,9 @@ pub enum S3KeyName {
     #[strum(serialize = "s3:x-amz-content-sha256")]
     S3XAmzContentSha256,
 
+    #[strum(serialize = "s3:x-amz-acl")]
+    S3XAmzAcl,
+
     #[strum(serialize = "s3:LocationConstraint")]
     S3LocationConstraint,
 
@@ -180,6 +183,21 @@ pub enum S3KeyName {
 
     #[strum(serialize = "s3:delimiter")]
     S3Delimiter,
+
+    #[strum(serialize = "s3:x-amz-grant-full-control")]
+    S3XAmzGrantFullControl,
+
+    #[strum(serialize = "s3:x-amz-grant-read")]
+    S3XAmzGrantRead,
+
+    #[strum(serialize = "s3:x-amz-grant-write")]
+    S3XAmzGrantWrite,
+
+    #[strum(serialize = "s3:x-amz-grant-read-acp")]
+    S3XAmzGrantReadAcp,
+
+    #[strum(serialize = "s3:x-amz-grant-write-acp")]
+    S3XAmzGrantWriteAcp,
 
     #[strum(serialize = "s3:ExistingObjectTag")]
     S3ExistingObjectTag,
@@ -318,6 +336,12 @@ pub enum AwsKeyName {
 
     #[strum(serialize = "aws:groups")]
     AWSGroups,
+
+    #[strum(serialize = "aws:SourceArn")]
+    AWSSourceArn,
+
+    #[strum(serialize = "aws:SourceAccount")]
+    AWSSourceAccount,
 }
 
 #[cfg(test)]

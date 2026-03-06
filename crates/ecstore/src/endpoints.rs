@@ -428,7 +428,7 @@ impl PoolEndpointList {
             }
         }
 
-        unimplemented!()
+        Ok(())
     }
 }
 

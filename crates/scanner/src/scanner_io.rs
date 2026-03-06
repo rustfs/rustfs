@@ -35,7 +35,7 @@ use rustfs_ecstore::error::{Error, StorageError};
 use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::SetDisks;
-use rustfs_ecstore::store_api::{BucketInfo, BucketOptions, ObjectInfo};
+use rustfs_ecstore::store_api::{BucketInfo, BucketOperations, BucketOptions, ObjectInfo};
 use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
@@ -178,17 +178,17 @@ impl ScannerIO for ECStore {
                         let mut all_merged = DataUsageCache::default();
                         for result in results.iter() {
                             if result.info.last_update.is_none() {
-                                return;
+                                continue;
                             }
                             all_merged.merge(result);
                         }
 
-                        if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update
-                           && let Err(e) = updates
-                                .send(all_merged.dui(&all_merged.info.name, &all_buckets_clone))
-                                .await {
+                        if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update {
+                            let dui = all_merged.dui(&all_merged.info.name, &all_buckets_clone);
+                            if let Err(e) = updates.send(dui).await {
                                 error!("Failed to send data usage info: {}", e);
                             }
+                        }
                         break;
                     }
                     _ = ticker.tick() => {
@@ -196,15 +196,14 @@ impl ScannerIO for ECStore {
                         let mut all_merged = DataUsageCache::default();
                         for result in results.iter() {
                             if result.info.last_update.is_none() {
-                                return;
+                                continue;
                             }
                             all_merged.merge(result);
                         }
 
                         if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update {
-                           if let Err(e) = updates
-                                .send(all_merged.dui(&all_merged.info.name, &all_buckets_clone))
-                                .await {
+                            let dui = all_merged.dui(&all_merged.info.name, &all_buckets_clone);
+                            if let Err(e) = updates.send(dui).await {
                                 error!("Failed to send data usage info: {}", e);
                             }
                             last_update = all_merged.info.last_update.unwrap();
@@ -300,7 +299,7 @@ impl ScannerIOCache for SetDisks {
 
                        let cache = cache_mutex_clone.lock().await;
                        if cache.info.last_update == last_update {
-                           continue;
+                        continue;
                        }
 
                        if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
@@ -500,7 +499,7 @@ impl ScannerIODisk for Disk {
                     &item.object_path()
                 );
 
-                return Err(StorageError::other("skip file".to_string()));
+                return Err(StorageError::other("failed to read metadata".to_string()));
             }
         };
 
@@ -511,7 +510,7 @@ impl ScannerIODisk for Disk {
             Ok(versions) => versions,
             Err(e) => {
                 error!("Failed to get file info versions: {}", e);
-                return Err(StorageError::other("skip file".to_string()));
+                return Err(StorageError::other("failed to get file info".to_string()));
             }
         };
 

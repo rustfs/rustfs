@@ -157,22 +157,24 @@ impl CacheInner {
 
     // todo
     pub fn is_allowed_sts(&self, _args: &Args, _parent: &str) -> bool {
-        warn!("unimplement is_allowed_sts");
+        warn!("policy cache STS check path is not implemented");
         false
     }
 
     // todo
     pub fn is_allowed_service_account(&self, _args: &Args, _parent: &str) -> bool {
-        warn!("unimplement is_allowed_sts");
+        warn!("policy cache service account check path is not implemented");
         false
     }
 
     pub fn is_allowed(&self, _args: Args) -> bool {
-        todo!()
+        warn!("policy cache is_allowed check path is currently denied by default");
+        false
     }
 
     pub fn policy_db_get(&self, _name: &str, _groups: &[String]) -> Vec<String> {
-        todo!()
+        warn!("policy cache policy_db_get is not implemented, returning empty policy set");
+        vec![]
     }
 }
 

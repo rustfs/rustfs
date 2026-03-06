@@ -20,7 +20,6 @@ use crate::disk::{
 };
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
-use rustfs_utils::string::parse_bool_with_default;
 use std::{
     path::PathBuf,
     sync::{
@@ -39,6 +38,7 @@ const DISK_HEALTH_OK: u32 = 0;
 const DISK_HEALTH_FAULTY: u32 = 1;
 
 pub const ENV_RUSTFS_DRIVE_ACTIVE_MONITORING: &str = "RUSTFS_DRIVE_ACTIVE_MONITORING";
+pub const DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING: bool = true;
 pub const ENV_RUSTFS_DRIVE_MAX_TIMEOUT_DURATION: &str = "RUSTFS_DRIVE_MAX_TIMEOUT_DURATION";
 pub const CHECK_EVERY: Duration = Duration::from_secs(15);
 pub const SKIP_IF_SUCCESS_BEFORE: Duration = Duration::from_secs(5);
@@ -180,40 +180,37 @@ pub struct LocalDiskWrapper {
 impl LocalDiskWrapper {
     /// Create a new LocalDiskWrapper
     pub fn new(disk: Arc<LocalDisk>, health_check: bool) -> Self {
-        // Check environment variable for health check override
-        // Default to true if not set, but only enable if both param and env are true
-        let env_health_check = std::env::var(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING)
-            .map(|v| parse_bool_with_default(&v, true))
-            .unwrap_or(true);
+        // Check environment variable for health check override.
+        // Only enable if both param and env are true.
+        let env_health_check =
+            rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
 
-        let ret = Self {
+        Self {
             disk,
             health: Arc::new(DiskHealthTracker::new()),
             health_check: health_check && env_health_check,
             cancel_token: CancellationToken::new(),
             disk_id: Arc::new(RwLock::new(None)),
-        };
-
-        ret.start_monitoring();
-
-        ret
+        }
     }
 
     pub fn get_disk(&self) -> Arc<LocalDisk> {
         self.disk.clone()
     }
 
-    /// Start the disk monitoring if health_check is enabled
-    pub fn start_monitoring(&self) {
-        if self.health_check {
-            let health = Arc::clone(&self.health);
-            let cancel_token = self.cancel_token.clone();
-            let disk = Arc::clone(&self.disk);
-
-            tokio::spawn(async move {
-                Self::monitor_disk_writable(disk, health, cancel_token).await;
-            });
+    /// Enable health monitoring after disk creation.
+    /// Used to defer health checks until after startup format loading completes.
+    pub fn enable_health_check(&self) {
+        if !self.health_check {
+            return;
         }
+        let health = Arc::clone(&self.health);
+        let cancel_token = self.cancel_token.clone();
+        let disk = Arc::clone(&self.disk);
+
+        tokio::spawn(async move {
+            Self::monitor_disk_writable(disk, health, cancel_token).await;
+        });
     }
 
     /// Stop the disk monitoring

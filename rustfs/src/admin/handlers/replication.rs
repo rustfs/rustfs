@@ -27,7 +27,7 @@ use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOptions, StorageAPI};
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};

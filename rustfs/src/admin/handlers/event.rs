@@ -324,7 +324,10 @@ impl Operation for ListTargetsArns {
             .clone()
             .ok_or_else(|| s3_error!(InvalidRequest, "region not found"))?;
 
-        let data_target_arn_list: Vec<_> = active_targets.iter().map(|id| id.to_arn(&region).to_string()).collect();
+        let data_target_arn_list: Vec<_> = active_targets
+            .iter()
+            .map(|id| id.to_arn(region.as_str()).to_string())
+            .collect();
 
         let data = serde_json::to_vec(&data_target_arn_list)
             .map_err(|e| s3_error!(InternalError, "failed to serialize targets: {}", e))?;

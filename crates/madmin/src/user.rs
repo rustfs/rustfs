@@ -55,6 +55,8 @@ pub enum UserAuthType {
     Builtin,
     #[serde(rename = "ldap")]
     Ldap,
+    #[serde(rename = "oidc")]
+    Oidc,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

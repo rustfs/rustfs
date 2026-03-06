@@ -16,7 +16,8 @@ use crate::disk::{
     CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader,
     FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     disk_store::{
-        CHECK_EVERY, CHECK_TIMEOUT_DURATION, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE, get_max_timeout_duration,
+        CHECK_EVERY, CHECK_TIMEOUT_DURATION, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING,
+        SKIP_IF_SUCCESS_BEFORE, get_max_timeout_duration,
     },
     endpoint::Endpoint,
 };
@@ -39,7 +40,6 @@ use rustfs_protos::proto_gen::node_service::{
     node_service_client::NodeServiceClient,
 };
 use rustfs_rio::{HttpReader, HttpWriter};
-use rustfs_utils::string::parse_bool_with_default;
 use std::{
     path::PathBuf,
     sync::{
@@ -77,9 +77,8 @@ impl RemoteDisk {
             format!("{}://{}", ep.url.scheme(), ep.url.host_str().unwrap())
         };
 
-        let env_health_check = std::env::var(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING)
-            .map(|v| parse_bool_with_default(&v, true))
-            .unwrap_or(true);
+        let env_health_check =
+            rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
 
         let disk = Self {
             id: Mutex::new(None),
@@ -91,23 +90,23 @@ impl RemoteDisk {
             cancel_token: CancellationToken::new(),
         };
 
-        // Start health monitoring
-        disk.start_health_monitoring();
-
         Ok(disk)
     }
 
-    /// Start health monitoring for the remote disk
-    fn start_health_monitoring(&self) {
-        if self.health_check {
-            let health = Arc::clone(&self.health);
-            let cancel_token = self.cancel_token.clone();
-            let addr = self.addr.clone();
-
-            tokio::spawn(async move {
-                Self::monitor_remote_disk_health(addr, health, cancel_token).await;
-            });
+    /// Enable health monitoring after disk creation.
+    /// Used to defer health checks until after startup format loading completes,
+    /// so that remote peers have time to come online.
+    pub fn enable_health_check(&self) {
+        if !self.health_check {
+            return;
         }
+        let health = Arc::clone(&self.health);
+        let cancel_token = self.cancel_token.clone();
+        let addr = self.addr.clone();
+
+        tokio::spawn(async move {
+            Self::monitor_remote_disk_health(addr, health, cancel_token).await;
+        });
     }
 
     /// Monitor remote disk health periodically
@@ -1536,6 +1535,7 @@ mod tests {
         };
 
         let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        remote_disk.enable_health_check();
 
         // wait for health check connect timeout
         tokio::time::sleep(Duration::from_secs(6)).await;

@@ -71,8 +71,10 @@ Co-locate unit tests with their modules and give behavior-led names. Integration
 
 ## Environment Variables
 
-- `RUSTFS_ENABLE_SCANNER` - Enable/disable background data scanner (default: true)
-- `RUSTFS_ENABLE_HEAL` - Enable/disable auto-heal functionality (default: true)
+- Global configuration environment variables must use flat `RUSTFS_*` names (no module segments), such as `RUSTFS_REGION`, `RUSTFS_ADDRESS`, `RUSTFS_VOLUMES`, and `RUSTFS_LICENSE`.
+- `RUSTFS_SCANNER_ENABLED` - Enable/disable background data scanner (default: true)
+- `RUSTFS_HEAL_ENABLED` - Enable/disable auto-heal functionality (default: true)
+- Deprecated aliases (for pre-beta compatibility) are documented in [the config module README](crates/config/README.md#environment-variable-naming-conventions) and must log warnings when used.
 - For KMS tests: `NO_PROXY=127.0.0.1,localhost` and clear proxy environment variables
 
 ## Commit & Pull Request Guidelines
@@ -84,6 +86,14 @@ Work on feature branches (e.g., `feat/...`) after syncing `main`. Follow Convent
 - Open PRs with a concise summary, note verification commands, link relevant issues
 - Follow the PR template format and fill in all required sections
 - Wait for reviewer approval before merging
+
+### PR Template Enforcement (MANDATORY)
+
+- Always use `.github/pull_request_template.md` when creating or updating a PR body.
+- Keep all template section headings in the final PR description (do not replace with custom sections only).
+- If a section is not applicable, explicitly write `N/A` instead of removing the section.
+- Before requesting review, verify the PR body still contains all template sections.
+- If a PR is created without the template, immediately update the PR body to match the template before any further action.
 
 ## Security & Configuration Tips
 

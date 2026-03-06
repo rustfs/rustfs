@@ -48,6 +48,9 @@ pub enum Error {
     #[error("both 'Action' and 'NotAction' are empty")]
     NonAction,
 
+    #[error("'Action' and 'NotAction' cannot both be specified in the same statement")]
+    BothActionAndNotAction,
+
     #[error("'Resource' is empty")]
     NonResource,
 

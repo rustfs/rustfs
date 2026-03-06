@@ -31,7 +31,11 @@ spec:
         {{- range .Values.ingress.hosts }}
         - {{ .host | quote }}
         {{- end }}
+      {{- if .Values.ingress.tls.existingSecret.enabled }}
+      secretName: {{ required "ingress.tls.existingSecret.name must be set when ingress.tls.existingSecret.enabled is true" .Values.ingress.tls.existingSecret.name }}
+      {{- else }}
       secretName: {{ include "rustfs.fullname" $ }}-tls
+      {{- end }}
   {{- end }}
   rules:
     {{- range .Values.ingress.hosts }}

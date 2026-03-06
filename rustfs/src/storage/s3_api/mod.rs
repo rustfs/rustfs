@@ -12,24 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(dead_code)]
+
 //! Facade modules for incremental S3 API extraction from `ecfs.rs`.
 //!
 //! This file intentionally starts as skeleton-only. Behavior remains in place
 //! until each helper is moved with dedicated small refactor steps.
 
-pub(crate) mod acl {}
+pub(crate) mod acl;
 pub(crate) mod bucket;
 pub(crate) mod common;
-pub(crate) mod encryption {}
+pub(crate) mod encryption;
 pub(crate) mod multipart;
+pub(crate) mod object_lock;
 /// Object helper facade placeholder.
 ///
 /// Read-path helpers shared across storage components should live in neutral
 /// modules (for example, `storage::readers`) and be consumed from there.
 /// Object-specific extraction steps can be added here incrementally.
 pub(crate) mod object {}
-pub(crate) mod replication {}
+pub(crate) mod replication;
 pub(crate) mod response;
-pub(crate) mod restore {}
-pub(crate) mod select {}
+pub(crate) mod restore;
+pub(crate) mod select;
+pub(crate) mod tagging;
 pub(crate) mod validation {}

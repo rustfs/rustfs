@@ -1,5 +1,7 @@
 ## —— Tests and e2e test ---------------------------------------------------------------------------
 
+TEST_THREADS ?= 1
+
 .PHONY: test
 test: core-deps test-deps ## Run all tests
 	@echo "🧪 Running tests..."
@@ -7,7 +9,7 @@ test: core-deps test-deps ## Run all tests
 		cargo nextest run --all --exclude e2e_test; \
 	else \
 		echo "ℹ️ cargo-nextest not found; falling back to 'cargo test'"; \
-		cargo test --workspace --exclude e2e_test -- --nocapture; \
+		cargo test --workspace --exclude e2e_test -- --nocapture --test-threads="$(TEST_THREADS)"; \
 	fi
 	cargo test --all --doc
 

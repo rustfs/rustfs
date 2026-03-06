@@ -5,71 +5,57 @@
 
 English | [中文](README_ZH.md)
 
-This directory contains the configuration files for setting up an observability stack with OpenObserve and OpenTelemetry
-Collector.
+This directory contains the configuration for an **alternative** observability stack using OpenObserve.
 
-### Overview
+## ⚠️ Note
 
-This setup provides a complete observability solution for your applications:
+For the **recommended** observability stack (Prometheus, Grafana, Tempo, Loki), please see `../observability/`.
 
-- **OpenObserve**: A modern, open-source observability platform for logs, metrics, and traces.
-- **OpenTelemetry Collector**: Collects and processes telemetry data before sending it to OpenObserve.
+## 🌟 Overview
 
-### Setup Instructions
+OpenObserve is a lightweight, all-in-one observability platform that handles logs, metrics, and traces in a single binary. This setup is ideal for:
+- Resource-constrained environments.
+- Quick setup and testing.
+- Users who prefer a unified UI.
 
-1. **Prerequisites**:
-    - Docker and Docker Compose installed
-    - Sufficient memory resources (minimum 2GB recommended)
+## 🚀 Quick Start
 
-2. **Starting the Services**:
-   ```bash
-   cd .docker/openobserve-otel
-   docker compose -f docker-compose.yml  up -d
-   ```
+### 1. Start Services
 
-3. **Accessing the Dashboard**:
-    - OpenObserve UI: http://localhost:5080
-    - Default credentials:
-        - Username: root@rustfs.com
-        - Password: rustfs123
+```bash
+cd .docker/openobserve-otel
+docker compose up -d
+```
 
-### Configuration
+### 2. Access Dashboard
 
-#### OpenObserve Configuration
+- **URL**: [http://localhost:5080](http://localhost:5080)
+- **Username**: `root@rustfs.com`
+- **Password**: `rustfs123`
 
-The OpenObserve service is configured with:
+## 🛠️ Configuration
 
-- Root user credentials
-- Data persistence through a volume mount
-- Memory cache enabled
-- Health checks
-- Exposed ports:
-    - 5080: HTTP API and UI
-    - 5081: OTLP gRPC
+### OpenObserve
 
-#### OpenTelemetry Collector Configuration
+- **Persistence**: Data is persisted to a Docker volume.
+- **Ports**:
+    - `5080`: HTTP API and UI
+    - `5081`: OTLP gRPC
 
-The collector is configured to:
+### OpenTelemetry Collector
 
-- Receive telemetry data via OTLP (HTTP and gRPC)
-- Collect logs from files
-- Process data in batches
-- Export data to OpenObserve
-- Manage memory usage
+- **Receivers**: OTLP (gRPC `4317`, HTTP `4318`)
+- **Exporters**: Sends data to OpenObserve.
 
-### Integration with Your Application
+## 🔗 Integration
 
-To send telemetry data from your application, configure your OpenTelemetry SDK to send data to:
+Configure your application to send OTLP data to the collector:
 
-- OTLP gRPC: `localhost:4317`
-- OTLP HTTP: `localhost:4318`
+- **Endpoint**: `http://localhost:4318` (HTTP) or `localhost:4317` (gRPC)
 
-For example, in a Rust application using the `rustfs-obs` library:
+Example for RustFS:
 
 ```bash
 export RUSTFS_OBS_ENDPOINT=http://localhost:4318
-export RUSTFS_OBS_SERVICE_NAME=yourservice
-export RUSTFS_OBS_SERVICE_VERSION=1.0.0
-export RUSTFS_OBS_ENVIRONMENT=development
+export RUSTFS_OBS_SERVICE_NAME=rustfs-node-1
 ```
-

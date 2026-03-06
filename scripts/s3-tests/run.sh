@@ -61,9 +61,9 @@ log_error() {
 # Test Classification Files
 # =============================================================================
 # Tests are classified into three categories stored in text files:
-#   - non_standard_tests.txt:  Ceph/RGW specific tests (permanently excluded)
-#   - unimplemented_tests.txt: Standard S3 features not yet implemented
 #   - implemented_tests.txt:   Tests that should pass on RustFS
+#   - unimplemented_tests.txt: Standard S3 features planned but not yet implemented
+#   - excluded_tests.txt:      Tests intentionally excluded from RustFS gating
 #
 # By default, only tests listed in implemented_tests.txt are run.
 # Use TESTEXPR env var to override and run custom test selection.
@@ -72,8 +72,9 @@ log_error() {
 # Test list files location
 TEST_LISTS_DIR="${SCRIPT_DIR}"
 IMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/implemented_tests.txt"
-NON_STANDARD_TESTS_FILE="${TEST_LISTS_DIR}/non_standard_tests.txt"
 UNIMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/unimplemented_tests.txt"
+EXCLUDED_TESTS_FILE="${TEST_LISTS_DIR}/excluded_tests.txt"
+LEGACY_NON_STANDARD_TESTS_FILE="${TEST_LISTS_DIR}/non_standard_tests.txt"
 
 # =============================================================================
 # build_testexpr_from_file: Read test names from file and build pytest -k expr
@@ -110,7 +111,7 @@ build_testexpr_from_file() {
 # MARKEXPR: pytest marker expression (safety net for marker-based filtering)
 # =============================================================================
 # Even though we use file-based test selection, we keep marker exclusions
-# as a safety net to ensure no non-standard tests slip through.
+# as a safety net to ensure excluded tests do not slip through.
 # =============================================================================
 if [[ -z "${MARKEXPR:-}" ]]; then
     # Minimal marker exclusions as safety net (file-based filtering is primary)
@@ -120,8 +121,13 @@ fi
 # =============================================================================
 # TESTEXPR: pytest -k expression to select specific tests
 # =============================================================================
-# By default, builds an inclusion expression from implemented_tests.txt.
-# Use TESTEXPR env var to override with custom selection.
+# By default, builds an inclusion expression from implemented_tests.txt,
+# combined with an exclusion expression from excluded_tests.txt and
+# unimplemented_tests.txt to prevent substring-matching collisions.
+#
+# For example, "test_object_raw_get" in the include list would also match
+# "test_object_raw_get_x_amz_expires_not_expired" via pytest -k substring
+# matching. The exclusion guard ensures only intended tests run.
 #
 # The file-based approach provides:
 #   1. Clear visibility of which tests are run
@@ -131,18 +137,44 @@ fi
 if [[ -z "${TESTEXPR:-}" ]]; then
     if [[ -f "${IMPLEMENTED_TESTS_FILE}" ]]; then
         log_info "Loading test list from: ${IMPLEMENTED_TESTS_FILE}"
-        TESTEXPR=$(build_testexpr_from_file "${IMPLEMENTED_TESTS_FILE}")
-        if [[ -z "${TESTEXPR}" ]]; then
+        INCLUDE_EXPR=$(build_testexpr_from_file "${IMPLEMENTED_TESTS_FILE}")
+        if [[ -z "${INCLUDE_EXPR}" ]]; then
             log_error "No tests found in ${IMPLEMENTED_TESTS_FILE}"
             exit 1
         fi
-        # Count tests for logging
         TEST_COUNT=$(grep -v '^#' "${IMPLEMENTED_TESTS_FILE}" | grep -v '^[[:space:]]*$' | wc -l | xargs)
         log_info "Loaded ${TEST_COUNT} tests from implemented_tests.txt"
+
+        # Build exclusion expression from excluded and unimplemented lists
+        # to guard against pytest -k substring matching false positives
+        EXCLUDE_EXPR=""
+        EXCLUDE_FILES=("${EXCLUDED_TESTS_FILE}" "${UNIMPLEMENTED_TESTS_FILE}")
+        if [[ ! -f "${EXCLUDED_TESTS_FILE}" && -f "${LEGACY_NON_STANDARD_TESTS_FILE}" ]]; then
+            log_warn "excluded_tests.txt not found, fallback to legacy non_standard_tests.txt"
+            EXCLUDE_FILES=("${LEGACY_NON_STANDARD_TESTS_FILE}" "${UNIMPLEMENTED_TESTS_FILE}")
+        fi
+
+        for exclude_file in "${EXCLUDE_FILES[@]}"; do
+            if [[ -f "${exclude_file}" ]]; then
+                FILE_EXPR=$(build_testexpr_from_file "${exclude_file}")
+                if [[ -n "${FILE_EXPR}" ]]; then
+                    if [[ -n "${EXCLUDE_EXPR}" ]]; then
+                        EXCLUDE_EXPR+=" or "
+                    fi
+                    EXCLUDE_EXPR+="${FILE_EXPR}"
+                fi
+            fi
+        done
+
+        if [[ -n "${EXCLUDE_EXPR}" ]]; then
+            TESTEXPR="(${INCLUDE_EXPR}) and not (${EXCLUDE_EXPR})"
+            log_info "Added exclusion guard from excluded + unimplemented lists"
+        else
+            TESTEXPR="${INCLUDE_EXPR}"
+        fi
     else
         log_warn "Test list file not found: ${IMPLEMENTED_TESTS_FILE}"
         log_warn "Falling back to exclusion-based filtering"
-        # Fallback to exclusion-based filtering if file doesn't exist
         EXCLUDED_TESTS=(
             "test_post_object"
             "test_bucket_list_objects_anonymous"
@@ -221,9 +253,9 @@ Environment Variables:
                             Final path: \${DATA_ROOT}/test-data/\${CONTAINER_NAME}
 
 Test Classification Files (in scripts/s3-tests/):
-  implemented_tests.txt    - Tests that should pass (run by default)
-  unimplemented_tests.txt  - Standard S3 features not yet implemented
-  non_standard_tests.txt   - Ceph/RGW specific tests (permanently excluded)
+  implemented_tests.txt    - Implemented tests (run by default)
+  unimplemented_tests.txt  - Standard S3 tests planned but not implemented
+  excluded_tests.txt       - Tests intentionally excluded from RustFS gating
 
 Notes:
   - Tests are loaded from implemented_tests.txt by default

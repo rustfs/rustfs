@@ -111,6 +111,8 @@ google-cloud-storage = { workspace = true }
 google-cloud-auth = { workspace = true }
 aws-config = { workspace = true }
 faster-hex = { workspace = true }
+ratelimit = { workspace = true }
+aws-smithy-http-client.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

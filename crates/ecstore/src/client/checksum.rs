@@ -248,8 +248,12 @@ impl ChecksumMode {
             }
         });
         let c = self.base();
-        let crc_bytes = Vec::<u8>::with_capacity(p.len() * self.raw_byte_len() as usize);
+        let mut crc_bytes = Vec::<u8>::with_capacity(p.len() * self.raw_byte_len() as usize);
         let mut h = self.hasher()?;
+        for part in p.iter() {
+            let part_checksum = part.checksum_raw(&c)?;
+            crc_bytes.extend(part_checksum);
+        }
         h.update(crc_bytes.as_ref());
         let hash = h.finalize();
         Ok(Checksum {
@@ -260,7 +264,11 @@ impl ChecksumMode {
     }
 
     pub fn full_object_checksum(&self, p: &mut [ObjectPart]) -> Result<Checksum, std::io::Error> {
-        todo!();
+        if !self.can_merge_crc() {
+            return Err(std::io::Error::other("cannot do full-object checksum"));
+        }
+
+        self.composite_checksum(p)
     }
 }
 

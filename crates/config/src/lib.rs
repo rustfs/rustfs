@@ -44,6 +44,10 @@ pub use constants::scanner::*;
 pub use constants::targets::*;
 #[cfg(feature = "constants")]
 pub use constants::tls::*;
+#[cfg(feature = "constants")]
+pub mod oidc {
+    pub use super::constants::oidc::*;
+}
 #[cfg(feature = "audit")]
 pub mod audit;
 #[cfg(feature = "notify")]

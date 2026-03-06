@@ -14,20 +14,24 @@
 
 use crate::error::{Error, Result};
 use manager::IamCache;
+use oidc::OidcSys;
 use rustfs_ecstore::store::ECStore;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 pub mod cache;
 pub mod error;
 pub mod manager;
+pub mod oidc;
+pub mod oidc_state;
 pub mod store;
 pub mod sys;
 pub mod utils;
 
 static IAM_SYS: OnceLock<Arc<IamSys<ObjectStore>>> = OnceLock::new();
+static OIDC_SYS: OnceLock<Arc<OidcSys>> = OnceLock::new();
 
 #[instrument(skip(ecstore))]
 pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
@@ -74,4 +78,40 @@ pub fn get() -> Result<Arc<IamSys<ObjectStore>>> {
 
 pub fn get_global_iam_sys() -> Option<Arc<IamSys<ObjectStore>>> {
     IAM_SYS.get().cloned()
+}
+
+/// Initialize the global OIDC system. Non-fatal if no OIDC providers are configured.
+pub async fn init_oidc_sys() -> Result<()> {
+    if OIDC_SYS.get().is_some() {
+        info!("OIDC system already initialized, skipping.");
+        return Ok(());
+    }
+
+    info!("Starting OIDC system initialization...");
+
+    let oidc_sys = match OidcSys::new().await {
+        Ok(sys) => {
+            if sys.has_providers() {
+                info!("OIDC system initialized with {} provider(s)", sys.list_providers().len());
+            } else {
+                info!("No OIDC providers configured");
+            }
+            sys
+        }
+        Err(e) => {
+            warn!("OIDC initialization failed (non-fatal): {}", e);
+            OidcSys::empty()
+        }
+    };
+
+    if OIDC_SYS.set(Arc::new(oidc_sys)).is_err() {
+        warn!("Race condition during OIDC initialization (non-fatal)");
+    }
+
+    Ok(())
+}
+
+/// Get the global OIDC system.
+pub fn get_oidc() -> Option<Arc<OidcSys>> {
+    OIDC_SYS.get().cloned()
 }

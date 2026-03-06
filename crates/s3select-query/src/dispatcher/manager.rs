@@ -218,7 +218,16 @@ impl SimpleQueryDispatcher {
                 (ListingOptions::new(Arc::new(file_format)).with_file_extension(".parquet"), false, false)
             } else if self.input.request.input_serialization.json.is_some() {
                 let file_format = JsonFormat::default();
-                (ListingOptions::new(Arc::new(file_format)).with_file_extension(".json"), false, false)
+                // Use the actual file extension from the object key so that files stored
+                // with a `.jsonl` suffix (newline-delimited JSON) are also matched by
+                // DataFusion's listing/schema-inference logic. Falling back to ".json"
+                // preserves behaviour for keys that have no extension.
+                let file_ext = std::path::Path::new(&self.input.key)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| format!(".{e}"))
+                    .unwrap_or_else(|| ".json".to_string());
+                (ListingOptions::new(Arc::new(file_format)).with_file_extension(file_ext), false, false)
             } else {
                 return Err(QueryError::NotImplemented {
                     err: "not support this file type".to_string(),

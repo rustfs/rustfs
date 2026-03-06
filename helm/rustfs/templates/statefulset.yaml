@@ -119,6 +119,14 @@ spec:
                 name: {{ include "rustfs.secretName" . }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            {{- omit .Values.livenessProbe "enabled" | toYaml | nindent 12 }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            {{- omit .Values.readinessProbe "enabled" | toYaml | nindent 12 }}
+          {{- end }}
           volumeMounts:
             {{- if .Values.mtls.enabled }}
             {{- if not .Values.mtls.serverOnly }}

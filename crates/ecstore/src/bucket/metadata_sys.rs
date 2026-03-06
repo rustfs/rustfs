@@ -15,13 +15,13 @@
 use super::metadata::{BucketMetadata, load_bucket_metadata};
 use super::quota::BucketQuota;
 use super::target::BucketTargets;
-use crate::StorageAPI as _;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
 use crate::bucket::utils::{deserialize, is_meta_bucketname};
 use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
 use crate::store::ECStore;
+use crate::store_api::HealOperations as _;
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use rustfs_common::heal_channel::HealOpts;
@@ -29,7 +29,7 @@ use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::ReplicationConfiguration;
 use s3s::dto::{
     BucketLifecycleConfiguration, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
-    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
+    PublicAccessBlockConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
 };
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -51,6 +51,10 @@ pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
     let sys = Arc::new(RwLock::new(sys));
 
     GLOBAL_BucketMetadataSys.set(sys).unwrap();
+}
+
+pub fn get_global_bucket_metadata_sys() -> Option<Arc<RwLock<BucketMetadataSys>>> {
+    GLOBAL_BucketMetadataSys.get().cloned()
 }
 
 // panic if not init
@@ -105,6 +109,13 @@ pub async fn get_bucket_policy_raw(bucket: &str) -> Result<(String, OffsetDateTi
     bucket_meta_sys.get_bucket_policy_raw(bucket).await
 }
 
+pub async fn get_bucket_acl_config(bucket: &str) -> Result<(String, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_bucket_acl_config(bucket).await
+}
+
 pub async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
@@ -131,6 +142,13 @@ pub async fn get_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_tagging_config(bucket).await
+}
+
+pub async fn get_public_access_block_config(bucket: &str) -> Result<(PublicAccessBlockConfiguration, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_public_access_block_config(bucket).await
 }
 
 pub async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
@@ -478,11 +496,31 @@ impl BucketMetadataSys {
         }
     }
 
+    pub async fn get_bucket_acl_config(&self, bucket: &str) -> Result<(String, OffsetDateTime)> {
+        let (bm, _) = self.get_config(bucket).await?;
+
+        if let Some(config) = &bm.bucket_acl_config {
+            Ok((config.clone(), bm.bucket_acl_config_updated_at))
+        } else {
+            Err(Error::ConfigNotFound)
+        }
+    }
+
     pub async fn get_tagging_config(&self, bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.tagging_config {
             Ok((config.clone(), bm.tagging_config_updated_at))
+        } else {
+            Err(Error::ConfigNotFound)
+        }
+    }
+
+    pub async fn get_public_access_block_config(&self, bucket: &str) -> Result<(PublicAccessBlockConfiguration, OffsetDateTime)> {
+        let (bm, _) = self.get_config(bucket).await?;
+
+        if let Some(config) = &bm.public_access_block_config {
+            Ok((config.clone(), bm.public_access_block_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
         }

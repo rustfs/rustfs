@@ -14,21 +14,28 @@
 
 pub mod access;
 pub mod concurrency;
-#[cfg(test)]
-mod concurrent_get_object_test;
 pub mod ecfs;
-mod ecfs_extend;
 pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod options;
 pub(crate) mod readers;
+pub mod rpc;
 pub(crate) mod s3_api;
+mod sse;
 pub mod tonic_service;
-pub(crate) use ecfs_extend::*;
+
+#[cfg(test)]
+mod concurrent_get_object_test;
+mod ecfs_extend;
 #[cfg(test)]
 mod ecfs_test;
 pub(crate) mod head_prefix;
-mod objects;
-mod sse;
 #[cfg(test)]
 mod sse_test;
+
+pub(crate) use ecfs_extend::*;
+pub(crate) use sse::{
+    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, extract_server_side_encryption_from_headers,
+    extract_ssec_params_from_headers, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
+    validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+};

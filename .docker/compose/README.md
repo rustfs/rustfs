@@ -1,80 +1,44 @@
-# Docker Compose Configurations
+# Specialized Docker Compose Configurations
 
-This directory contains specialized Docker Compose configurations for different use cases.
+This directory contains specialized Docker Compose configurations for specific testing scenarios.
+
+## ⚠️ Important Note
+
+**For Observability:**
+We **strongly recommend** using the new, fully integrated observability stack located in `../observability/`. It provides a production-ready setup with Prometheus, Grafana, Tempo, Loki, and OpenTelemetry Collector, all with persistent storage and optimized configurations.
+
+The `docker-compose.observability.yaml` in this directory is kept for legacy reference or specific minimal testing needs but is **not** the primary recommended setup.
 
 ## 📁 Configuration Files
 
-This directory contains specialized Docker Compose configurations and their associated Dockerfiles, keeping related files organized together.
+### Cluster Testing
 
-### Main Configuration (Root Directory)
+- **`docker-compose.cluster.yaml`**
+  - **Purpose**: Simulates a 4-node RustFS distributed cluster.
+  - **Use Case**: Testing distributed storage logic, consensus, and failover.
+  - **Nodes**: 4 RustFS instances.
+  - **Storage**: Uses local HTTP endpoints.
 
-- **`../../docker-compose.yml`** - **Default Production Setup**
-  - Complete production-ready configuration
-  - Includes RustFS server + full observability stack
-  - Supports multiple profiles: `dev`, `observability`, `cache`, `proxy`
-  - Recommended for most users
+### Legacy / Minimal Observability
 
-### Specialized Configurations
-
-- **`docker-compose.cluster.yaml`** - **Distributed Testing**
-  - 4-node cluster setup for testing distributed storage
-  - Uses local compiled binaries
-  - Simulates multi-node environment
-  - Ideal for development and cluster testing
-
-- **`docker-compose.observability.yaml`** - **Observability Focus**
-  - Specialized setup for testing observability features
-  - Includes OpenTelemetry, Jaeger, Prometheus, Loki, Grafana
-  - Uses `../../Dockerfile.source` for builds
-  - Perfect for observability development
+- **`docker-compose.observability.yaml`**
+  - **Purpose**: A minimal observability setup.
+  - **Status**: **Deprecated**. Please use `../observability/docker-compose.yml` instead.
 
 ## 🚀 Usage Examples
 
-### Production Setup
-
-```bash
-# Start main service
-docker-compose up -d
-
-# Start with development profile
-docker-compose --profile dev up -d
-
-# Start with full observability
-docker-compose --profile observability up -d
-```
-
 ### Cluster Testing
 
-```bash
-# Build and start 4-node cluster (run from project root)
-cd .docker/compose
-docker-compose -f docker-compose.cluster.yaml up -d
-
-# Or run directly from project root
-docker-compose -f .docker/compose/docker-compose.cluster.yaml up -d
-```
-
-### Observability Testing
+To start a 4-node cluster for distributed testing:
 
 ```bash
-# Start observability-focused environment (run from project root)
-cd .docker/compose
-docker-compose -f docker-compose.observability.yaml up -d
-
-# Or run directly from project root
-docker-compose -f .docker/compose/docker-compose.observability.yaml up -d
+# From project root
+docker compose -f .docker/compose/docker-compose.cluster.yaml up -d
 ```
 
-## 🔧 Configuration Overview
+### (Deprecated) Minimal Observability
 
-| Configuration | Nodes | Storage | Observability | Use Case |
-|---------------|-------|---------|---------------|----------|
-| **Main** | 1 | Volume mounts | Full stack | Production |
-| **Cluster** | 4 | HTTP endpoints | Basic | Testing |
-| **Observability** | 4 | Local data | Advanced | Development |
-
-## 📝 Notes
-
-- Always ensure you have built the required binaries before starting cluster tests
-- The main configuration is sufficient for most use cases
-- Specialized configurations are for specific testing scenarios
+```bash
+# From project root
+docker compose -f .docker/compose/docker-compose.observability.yaml up -d
+```

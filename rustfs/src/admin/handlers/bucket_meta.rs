@@ -25,7 +25,10 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
 use rustfs_ecstore::{
-    StorageAPI,
+    bucket::utils::{deserialize, serialize},
+    store_api::MakeBucketOptions,
+};
+use rustfs_ecstore::{
     bucket::{
         metadata::{
             BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
@@ -38,11 +41,7 @@ use rustfs_ecstore::{
     },
     error::StorageError,
     new_object_layer_fn,
-    store_api::BucketOptions,
-};
-use rustfs_ecstore::{
-    bucket::utils::{deserialize, serialize},
-    store_api::MakeBucketOptions,
+    store_api::{BucketOperations, BucketOptions},
 };
 use rustfs_policy::policy::{
     BucketPolicy,

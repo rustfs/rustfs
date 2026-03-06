@@ -52,6 +52,12 @@ pub fn register_group_management_route(r: &mut S3Router<AdminOperation>) -> std:
     )?;
 
     r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/group/{group}").as_str(),
+        AdminOperation(&DeleteGroup {}),
+    )?;
+
+    r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-group-status").as_str(),
         AdminOperation(&SetGroupStatus {}),
@@ -156,6 +162,89 @@ impl Operation for GetGroup {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+    }
+}
+
+/// Deletes an empty user group.
+///
+/// # Arguments
+/// * `group` - The name of the group to delete
+///
+/// # Returns
+/// - `200 OK` - Group deleted successfully
+/// - `400 Bad Request` - Group name missing or invalid
+/// - `401 Unauthorized` - Insufficient permissions
+/// - `404 Not Found` - Group does not exist
+/// - `409 Conflict` - Group contains members and cannot be deleted
+/// - `500 Internal Server Error` - Server-side error
+///
+/// # Example
+/// ```
+/// DELETE /rustfs/admin/v3/group/developers
+/// ```
+pub struct DeleteGroup {}
+#[async_trait::async_trait]
+impl Operation for DeleteGroup {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        warn!("handle DeleteGroup");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::RemoveUserFromGroupAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
+
+        let group = params
+            .get("group")
+            .ok_or_else(|| s3_error!(InvalidArgument, "missing group name in request"))?
+            .trim();
+
+        // Validate the group name format
+        if group.is_empty() || group.len() > 256 {
+            return Err(s3_error!(InvalidArgument, "invalid group name"));
+        }
+
+        // Sanity check the group name
+        if group.contains(['/', '\\', '\0']) {
+            return Err(s3_error!(InvalidArgument, "group name contains invalid characters"));
+        }
+
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+
+        iam_store.remove_users_from_group(group, vec![]).await.map_err(|e| {
+            warn!("delete group failed, e: {:?}", e);
+            match e {
+                rustfs_iam::error::Error::GroupNotEmpty => {
+                    s3_error!(InvalidRequest, "group is not empty")
+                }
+                rustfs_iam::error::Error::InvalidArgument => {
+                    s3_error!(InvalidArgument, "{e}")
+                }
+                _ => {
+                    if is_err_no_such_group(&e) {
+                        s3_error!(NoSuchKey, "group '{group}' does not exist")
+                    } else {
+                        s3_error!(InternalError, "{e}")
+                    }
+                }
+            }
+        })?;
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
 

@@ -24,6 +24,7 @@ pub mod kms_dynamic;
 pub mod kms_keys;
 pub mod kms_management;
 pub mod metrics;
+pub mod oidc;
 pub mod policies;
 pub mod pools;
 pub mod profile;

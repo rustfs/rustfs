@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::bandwidth::monitor::Monitor;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
@@ -29,6 +30,7 @@ use std::{
 };
 use tokio::sync::{OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
 pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;
@@ -40,7 +42,6 @@ lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
-    pub static ref GLOBAL_LOCAL_DISK: Arc<RwLock<Vec<Option<DiskStore>>>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
@@ -55,9 +56,23 @@ lazy_static! {
     pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();
     pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
     pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
-    pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
-    pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn rustfs_lock::client::LockClient>> = OnceLock::new();
+    pub static ref GLOBAL_REGION: OnceLock<s3s::region::Region> = OnceLock::new();
+    pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn LockClient>> = OnceLock::new();
     pub static ref GLOBAL_LOCK_CLIENTS: OnceLock<HashMap<String, Arc<dyn LockClient>>> = OnceLock::new();
+    pub static ref GLOBAL_BUCKET_MONITOR: OnceLock<Arc<Monitor>> = OnceLock::new();
+}
+
+pub fn init_global_bucket_monitor(num_nodes: u64) {
+    if GLOBAL_BUCKET_MONITOR.set(Monitor::new(num_nodes)).is_err() {
+        warn!(
+            "global bucket monitor already initialized, ignoring re-initialization with num_nodes={}",
+            num_nodes
+        );
+    }
+}
+
+pub fn get_global_bucket_monitor() -> Option<Arc<Monitor>> {
+    GLOBAL_BUCKET_MONITOR.get().cloned()
 }
 
 /// Global cancellation token for background services (data scanner and auto heal)
@@ -132,6 +147,14 @@ pub fn get_global_endpoints() -> EndpointServerPools {
     } else {
         EndpointServerPools::default()
     }
+}
+
+pub fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
+    GLOBAL_Endpoints.get().cloned()
+}
+
+pub fn get_global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
+    GLOBAL_TierConfigMgr.clone()
 }
 
 /// Create a new object layer instance
@@ -219,20 +242,20 @@ type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
 /// Set the global region
 ///
 /// # Arguments
-/// * `region` - The region string to set globally
+/// * `region` - The Region instance to set globally
 ///
 /// # Returns
 /// * None
-pub fn set_global_region(region: String) {
+pub fn set_global_region(region: s3s::region::Region) {
     GLOBAL_REGION.set(region).unwrap();
 }
 
 /// Get the global region
 ///
 /// # Returns
-/// * `Option<String>` - The global region string, if set
+/// * `Option<s3s::region::Region>` - The global region, if set
 ///
-pub fn get_global_region() -> Option<String> {
+pub fn get_global_region() -> Option<s3s::region::Region> {
     GLOBAL_REGION.get().cloned()
 }
 

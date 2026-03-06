@@ -63,14 +63,32 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     if path.is_empty() {
         path = "index.html"
     }
+
+    // Try the exact path first
     if let Some(file) = StaticFiles::get(path) {
         let mime_type = from_path(path).first_or_octet_stream();
-        Response::builder()
+        return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime_type.to_string())
             .body(Body::from(file.data))
-            .unwrap()
-    } else if let Some(file) = StaticFiles::get("index.html") {
+            .unwrap();
+    }
+
+    // For directory paths (trailing slash), try <path>index.html
+    if path.ends_with('/') {
+        let index_path = format!("{path}index.html");
+        if let Some(file) = StaticFiles::get(&index_path) {
+            let mime_type = from_path(&index_path).first_or_octet_stream();
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", mime_type.to_string())
+                .body(Body::from(file.data))
+                .unwrap();
+        }
+    }
+
+    // SPA fallback: serve root index.html for client-side routing
+    if let Some(file) = StaticFiles::get("index.html") {
         let mime_type = from_path("index.html").first_or_octet_stream();
         Response::builder()
             .status(StatusCode::OK)
@@ -94,11 +112,33 @@ pub(crate) struct Config {
     release: Release,
     license: License,
     doc: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    oidc: Vec<OidcProviderInfo>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct OidcProviderInfo {
+    provider_id: String,
+    display_name: String,
 }
 
 impl Config {
     fn new(local_ip: IpAddr, port: u16, version: &str, date: &str) -> Self {
         let http_prefix = rustfs_config::RUSTFS_HTTP_PREFIX;
+
+        // Collect OIDC provider info if available
+        let oidc = rustfs_iam::get_oidc()
+            .map(|sys| {
+                sys.list_providers()
+                    .into_iter()
+                    .map(|p| OidcProviderInfo {
+                        provider_id: p.provider_id,
+                        display_name: p.display_name,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Config {
             port,
             api: Api {
@@ -117,6 +157,7 @@ impl Config {
                 url: rustfs_config::RUSTFS_LICENSE_URL.to_string(),
             },
             doc: rustfs_config::RUSTFS_DOCS_URL.to_string(),
+            oidc,
         }
     }
 

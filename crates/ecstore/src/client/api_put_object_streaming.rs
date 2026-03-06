@@ -97,11 +97,11 @@ impl TransitionClient {
         if opts.checksum.is_set() {
             opts.auto_checksum = opts.checksum.clone();
         }
-        let with_checksum = self.trailing_header_support;
-        let upload_id = self.new_upload_id(bucket_name, object_name, &opts).await?;
+
         opts.user_metadata.remove("X-Amz-Checksum-Algorithm");
 
-        todo!();
+        self.put_object_multipart_stream_optional_checksum(bucket_name, object_name, reader, size, &opts)
+            .await
     }
 
     pub async fn put_object_multipart_stream_optional_checksum(

@@ -40,6 +40,10 @@ mod quota_test;
 #[cfg(test)]
 mod bucket_policy_check_test;
 
+// Regression tests for Issue #2036: anonymous access with PublicAccessBlock
+#[cfg(test)]
+mod anonymous_access_test;
+
 // Special characters in path test modules
 #[cfg(test)]
 mod special_chars_test;
@@ -58,6 +62,10 @@ mod policy;
 
 #[cfg(test)]
 mod compression_test;
+
+// Regression test for Issue #1878: DeleteMarkers not visible immediately after delete_objects
+#[cfg(test)]
+mod delete_objects_versioning_test;
 #[cfg(test)]
 mod protocols;
 
@@ -71,3 +79,7 @@ mod cluster_concurrency_test;
 // PutObject / MultipartUpload with checksum (Content-MD5, x-amz-checksum-*)
 #[cfg(test)]
 mod checksum_upload_test;
+
+// Group deletion tests
+#[cfg(test)]
+mod group_delete_test;
