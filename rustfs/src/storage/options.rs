@@ -18,7 +18,11 @@ use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
-use rustfs_utils::http::RUSTFS_FORCE_DELETE;
+use rustfs_utils::http::{
+    SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_DELETEMARKER,
+    SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header, insert_header_map,
+    is_encryption_metadata_key, is_internal_key,
+};
 use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
 use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
@@ -28,14 +32,6 @@ use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions}
 use rustfs_policy::service_type::ServiceType;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
-use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
-use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_REQUEST;
-use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
-use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_MTIME;
-use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_VERSION_ID;
-use rustfs_utils::http::RUSTFS_ENCRYPTION_LOWER;
-use rustfs_utils::http::RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE;
 use rustfs_utils::path::is_dir_object;
 use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
@@ -48,7 +44,8 @@ use crate::auth::get_query_param;
 use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
 
-const REPLICATION_REQUEST_TRUE: HeaderValue = HeaderValue::from_static("true");
+#[cfg(test)]
+use rustfs_utils::http::insert_header;
 
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
@@ -62,9 +59,7 @@ pub async fn del_opts(
     let version_suspended = BucketVersioningSys::suspended(bucket).await;
 
     let vid = if vid.is_none() {
-        headers
-            .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
-            .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
+        get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
     } else {
         vid
     };
@@ -94,9 +89,8 @@ pub async fn del_opts(
         StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())
     })?;
 
-    opts.delete_prefix = headers
-        .get(RUSTFS_FORCE_DELETE)
-        .map(|v| v.to_str().unwrap_or_default() == "true")
+    opts.delete_prefix = get_header(headers, SUFFIX_FORCE_DELETE)
+        .map(|v| v.as_ref() == "true")
         .unwrap_or_default();
 
     opts.version_id = {
@@ -109,9 +103,8 @@ pub async fn del_opts(
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
 
-    opts.delete_marker = headers
-        .get(RUSTFS_BUCKET_REPLICATION_DELETE_MARKER)
-        .map(|v| v.to_str().unwrap() == "true")
+    opts.delete_marker = get_header(headers, SUFFIX_SOURCE_DELETEMARKER)
+        .map(|v| v.as_ref() == "true")
         .unwrap_or_default();
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
@@ -207,9 +200,7 @@ pub async fn put_opts(
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
 
     let vid = if vid.is_none() {
-        headers
-            .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
-            .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
+        get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
     } else {
         vid
     };
@@ -245,27 +236,21 @@ pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> s
     let mut user_defined = HashMap::new();
 
     let mut replication_request = false;
-    if headers.get(RUSTFS_BUCKET_REPLICATION_REQUEST) == Some(&REPLICATION_REQUEST_TRUE) {
+    if get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         replication_request = true;
-        if let Some(actual_size_str) = headers
-            .get(RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE)
-            .and_then(|h| h.to_str().ok())
-        {
+        if let Some(actual_size_str) = get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE) {
             rustfs_utils::http::insert_str(
                 &mut user_defined,
                 rustfs_utils::http::SUFFIX_ACTUAL_OBJECT_SIZE_CAP,
-                actual_size_str.to_string(),
+                actual_size_str.into_owned(),
             );
         } else {
-            tracing::warn!("Failed to get or parse {} header", RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE);
+            tracing::warn!("Failed to get or parse replication actual object size header (x-rustfs-* or x-minio-*)");
         }
     }
 
-    if let Some(v) = headers.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM) {
-        user_defined.insert(
-            RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM.to_string(),
-            v.to_str().unwrap_or_default().to_owned(),
-        );
+    if let Some(v) = get_header(headers, SUFFIX_REPLICATION_SSEC_CRC) {
+        insert_header_map(&mut user_defined, SUFFIX_REPLICATION_SSEC_CRC, v.into_owned());
     }
 
     let mut opts = ObjectOptions {
@@ -296,26 +281,14 @@ pub fn copy_src_opts(_bucket: &str, _object: &str, headers: &HeaderMap<HeaderVal
 
 pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap<String, String>) -> Result<ObjectOptions> {
     let mut opts = get_default_opts(headers, metadata, false)?;
-    if headers.get(RUSTFS_BUCKET_REPLICATION_REQUEST) == Some(&REPLICATION_REQUEST_TRUE) {
+    if get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         opts.replication_request = true;
-        if let Some(v) = headers.get(RUSTFS_BUCKET_SOURCE_MTIME) {
-            match v.to_str() {
-                Ok(s) => {
-                    let trimmed_s = s.trim();
-                    match time::OffsetDateTime::parse(trimmed_s, &time::format_description::well_known::Rfc3339) {
-                        Ok(mtime) => opts.mod_time = Some(mtime),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Invalid X-RustFS-Source-Mtime value '{}' (replication request=true): {}",
-                                trimmed_s,
-                                e
-                            );
-                            opts.mod_time = None;
-                        }
-                    }
-                }
+        if let Some(v) = get_header(headers, SUFFIX_SOURCE_MTIME) {
+            let trimmed_s = v.trim();
+            match time::OffsetDateTime::parse(trimmed_s, &time::format_description::well_known::Rfc3339) {
+                Ok(mtime) => opts.mod_time = Some(mtime),
                 Err(e) => {
-                    tracing::warn!("X-RustFS-Source-Mtime header is not valid UTF-8 (replication request=true): {}", e);
+                    tracing::warn!("Invalid source-mtime value '{}' (replication request=true): {}", trimmed_s, e);
                     opts.mod_time = None;
                 }
             }
@@ -443,13 +416,13 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
     let mut filtered_metadata = HashMap::new();
     for (k, v) in metadata {
         let lower_key = k.to_ascii_lowercase();
-        // Skip internal/reserved metadata
-        if lower_key.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
+        // Skip internal/reserved metadata (x-rustfs-internal-* or x-minio-internal-*)
+        if is_internal_key(&lower_key) {
             continue;
         }
 
-        // Skip internal encryption metadata
-        if lower_key.starts_with(RUSTFS_ENCRYPTION_LOWER) {
+        // Skip internal encryption metadata (x-rustfs-encryption-* or x-minio-encryption-*)
+        if is_encryption_metadata_key(&lower_key) {
             continue;
         }
 
@@ -801,28 +774,28 @@ mod tests {
         let mut headers = create_test_headers();
         let metadata = create_test_metadata();
 
-        // Test without RUSTFS_FORCE_DELETE header - should default to false
+        // Test without force-delete header - should default to false
         let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
         assert!(result.is_ok());
         let opts = result.unwrap();
         assert!(!opts.delete_prefix);
 
         // Test with RUSTFS_FORCE_DELETE header set to "true"
-        headers.insert(RUSTFS_FORCE_DELETE, HeaderValue::from_static("true"));
+        insert_header(&mut headers, SUFFIX_FORCE_DELETE, "true");
         let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
         assert!(result.is_ok());
         let opts = result.unwrap();
         assert!(opts.delete_prefix);
 
         // Test with RUSTFS_FORCE_DELETE header set to "false"
-        headers.insert(RUSTFS_FORCE_DELETE, HeaderValue::from_static("false"));
+        insert_header(&mut headers, SUFFIX_FORCE_DELETE, "false");
         let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
         assert!(result.is_ok());
         let opts = result.unwrap();
         assert!(!opts.delete_prefix);
 
         // Test with RUSTFS_FORCE_DELETE header set to other value
-        headers.insert(RUSTFS_FORCE_DELETE, HeaderValue::from_static("maybe"));
+        insert_header(&mut headers, SUFFIX_FORCE_DELETE, "maybe");
         let result = del_opts("test-bucket", "test-object", None, &headers, metadata).await;
         assert!(result.is_ok());
         let opts = result.unwrap();
@@ -991,9 +964,9 @@ mod tests {
     #[test]
     fn test_put_opts_from_headers_with_replication_request() {
         let mut headers = HeaderMap::new();
-        headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE.clone());
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         let valid_mtime = "2024-05-20T10:30:00+08:00";
-        headers.insert(RUSTFS_BUCKET_SOURCE_MTIME, HeaderValue::from_static(valid_mtime));
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, valid_mtime);
 
         let metadata = HashMap::new();
 
@@ -1008,8 +981,8 @@ mod tests {
         assert_eq!(opts.mod_time, Some(expected_mtime));
 
         let mut headers_invalid_mtime = HeaderMap::new();
-        headers_invalid_mtime.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE.clone());
-        headers_invalid_mtime.insert(RUSTFS_BUCKET_SOURCE_MTIME, HeaderValue::from_static("invalid-time"));
+        insert_header(&mut headers_invalid_mtime, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers_invalid_mtime, SUFFIX_SOURCE_MTIME, "invalid-time");
         let result_invalid = put_opts_from_headers(&headers_invalid_mtime, HashMap::new());
         assert!(result_invalid.is_ok());
         let opts_invalid = result_invalid.unwrap();

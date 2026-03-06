@@ -51,7 +51,7 @@ use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},
 };
-use rustfs_utils::http::RUSTFS_FORCE_DELETE;
+use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
 use rustfs_utils::string::parse_bool;
 use s3s::dto::*;
 use s3s::region::Region;
@@ -249,19 +249,11 @@ impl DefaultBucketUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        // get value from header, support mc style
-        let force_str = req
-            .headers
-            .get(RUSTFS_FORCE_DELETE)
-            .map(|v| v.to_str().unwrap_or_default())
-            .unwrap_or(
-                req.headers
-                    .get("x-minio-force-delete")
-                    .map(|v| v.to_str().unwrap_or_default())
-                    .unwrap_or_default(),
-            );
+        let force_str = get_header(&req.headers, SUFFIX_FORCE_DELETE)
+            .map(|v| v.into_owned())
+            .unwrap_or_default();
 
-        let force = parse_bool(force_str).unwrap_or_default();
+        let force = parse_bool(&force_str).unwrap_or_default();
 
         if force {
             authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
@@ -1415,10 +1407,9 @@ impl DefaultBucketUsecase {
 
         let store = get_validated_store(&bucket).await?;
 
-        let incl_deleted = req
-            .headers
-            .get(rustfs_utils::http::headers::RUSTFS_INCLUDE_DELETED)
-            .is_some_and(|v| v.to_str().unwrap_or_default() == "true");
+        let incl_deleted = rustfs_utils::http::get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
+            .map(|v| v.as_ref() == "true")
+            .unwrap_or_default();
 
         let object_infos = store
             .list_objects_v2(

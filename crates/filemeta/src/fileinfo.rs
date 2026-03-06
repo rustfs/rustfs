@@ -16,8 +16,10 @@ use crate::{Error, ReplicationState, ReplicationStatusType, Result, TRANSITION_C
 use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
-use rustfs_utils::http::headers::{RESERVED_METADATA_PREFIX_LOWER, RUSTFS_HEALING};
-use rustfs_utils::http::{SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_INLINE_DATA, contains_key_str, insert_str};
+use rustfs_utils::http::headers::RESERVED_METADATA_PREFIX_LOWER;
+use rustfs_utils::http::{
+    SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_HEALING, SUFFIX_INLINE_DATA, contains_key_str, insert_str,
+};
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
@@ -370,7 +372,7 @@ impl FileInfo {
     }
 
     pub fn set_healing(&mut self) {
-        self.metadata.insert(RUSTFS_HEALING.to_string(), "true".to_string());
+        insert_str(&mut self.metadata, SUFFIX_HEALING, "true".to_string());
     }
 
     pub fn set_tier_free_version_id(&mut self, version_id: &str) {

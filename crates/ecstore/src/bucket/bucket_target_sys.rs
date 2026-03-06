@@ -43,10 +43,12 @@ use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RU
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
-    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, RUSTFS_BUCKET_REPLICATION_CHECK,
-    RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, RUSTFS_BUCKET_REPLICATION_REQUEST, RUSTFS_BUCKET_SOURCE_ETAG,
-    RUSTFS_BUCKET_SOURCE_MTIME, RUSTFS_BUCKET_SOURCE_VERSION_ID, RUSTFS_FORCE_DELETE, is_amz_header, is_minio_header,
+    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header, is_minio_header,
     is_rustfs_header, is_standard_header, is_storageclass_header,
+};
+use rustfs_utils::http::{
+    SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -67,8 +69,6 @@ use uuid::Uuid;
 
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
-
-const REPLICATION_REQUEST_TRUE: HeaderValue = HeaderValue::from_static("true");
 
 pub static GLOBAL_BUCKET_TARGET_SYS: OnceLock<BucketTargetSys> = OnceLock::new();
 
@@ -1082,23 +1082,21 @@ impl PutObjectOptions {
         }
 
         if !self.internal.source_version_id.is_empty() {
-            header.insert(
-                RUSTFS_BUCKET_SOURCE_VERSION_ID,
-                HeaderValue::from_str(&self.internal.source_version_id).expect("err"),
-            );
+            insert_header(&mut header, SUFFIX_SOURCE_VERSION_ID, &self.internal.source_version_id);
         }
         if self.internal.source_etag.is_empty() {
-            header.insert(RUSTFS_BUCKET_SOURCE_ETAG, HeaderValue::from_str(&self.internal.source_etag).expect("err"));
+            insert_header(&mut header, SUFFIX_SOURCE_ETAG, &self.internal.source_etag);
         }
         if self.internal.source_mtime.unix_timestamp() != 0 {
-            header.insert(
-                RUSTFS_BUCKET_SOURCE_MTIME,
-                HeaderValue::from_str(&self.internal.source_mtime.format(&Rfc3339).unwrap_or_default()).expect("err"),
+            insert_header(
+                &mut header,
+                SUFFIX_SOURCE_MTIME,
+                self.internal.source_mtime.format(&Rfc3339).unwrap_or_default(),
             );
         }
 
         if self.internal.replication_request {
-            header.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE);
+            insert_header(&mut header, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         }
 
         header
@@ -1267,10 +1265,8 @@ impl TargetClient {
         let builder = self.client.put_object();
 
         let version_id = opts.internal.source_version_id.clone();
-        if !version_id.is_empty()
-            && let Ok(header_value) = HeaderValue::from_str(&version_id)
-        {
-            headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
+        if !version_id.is_empty() {
+            insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
         }
 
         match builder
@@ -1304,13 +1300,11 @@ impl TargetClient {
     ) -> Result<String, S3ClientError> {
         let mut headers = HeaderMap::new();
         let version_id = opts.internal.source_version_id.clone();
-        if !version_id.is_empty()
-            && let Ok(header_value) = HeaderValue::from_str(&version_id)
-        {
-            headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
+        if !version_id.is_empty() {
+            insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
         }
         if opts.internal.replication_request {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE);
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         }
 
         match self
@@ -1419,21 +1413,18 @@ impl TargetClient {
     ) -> Result<(), S3ClientError> {
         let mut headers = HeaderMap::new();
         if opts.force_delete {
-            headers.insert(RUSTFS_FORCE_DELETE, "true".parse().unwrap());
+            insert_header(&mut headers, SUFFIX_FORCE_DELETE, "true");
         }
         if opts.governance_bypass {
             headers.insert(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, "true".parse().unwrap());
         }
 
         if opts.replication_delete_marker {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, "true".parse().unwrap());
+            insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
         }
 
         if let Some(t) = opts.replication_mtime {
-            headers.insert(
-                RUSTFS_BUCKET_SOURCE_MTIME,
-                t.format(&Rfc3339).unwrap_or_default().as_str().parse().unwrap(),
-            );
+            insert_header(&mut headers, SUFFIX_SOURCE_MTIME, t.format(&Rfc3339).unwrap_or_default());
         }
 
         if !opts.replication_status.is_empty() {
@@ -1441,10 +1432,10 @@ impl TargetClient {
         }
 
         if opts.replication_request {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, "true".parse().unwrap());
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         }
         if opts.replication_validity_check {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_CHECK, "true".parse().unwrap());
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
         }
 
         match self

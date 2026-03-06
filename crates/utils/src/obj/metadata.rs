@@ -188,7 +188,6 @@ mod tests {
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert("x-rustfs-internal-healing".to_string(), "true".to_string());
         metadata.insert("x-rustfs-internal-data-mov".to_string(), "value".to_string());
-        metadata.insert("X-RustFS-Internal-purgestatus".to_string(), "status".to_string());
         metadata.insert("x-rustfs-meta-custom".to_string(), "custom-value".to_string());
         metadata.insert("my-key".to_string(), "my-value".to_string());
 

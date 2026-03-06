@@ -20,11 +20,13 @@ use crate::{
 use byteorder::ByteOrder;
 use bytes::Bytes;
 use rustfs_utils::http::headers::{
-    self, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_RESTORE_EXPIRY_DAYS,
-    AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
-    VERSION_PURGE_STATUS_KEY,
+    AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
+    AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
 };
-use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX};
+use rustfs_utils::http::{
+    AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX, SUFFIX_DATA_MOV, SUFFIX_HEALING, SUFFIX_PURGESTATUS,
+    has_internal_suffix, insert_bytes,
+};
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -80,6 +82,11 @@ pub const TRANSITION_STATUS: &str = "transition-status";
 pub const TRANSITIONED_OBJECTNAME: &str = "transitioned-object";
 pub const TRANSITIONED_VERSION_ID: &str = "transitioned-versionID";
 pub const TRANSITION_TIER: &str = "transition-tier";
+
+/// Returns true if the key is a transient internal flag that should not be persisted to meta_sys.
+pub fn is_skip_meta_key(key: &str) -> bool {
+    has_internal_suffix(key, SUFFIX_HEALING) || has_internal_suffix(key, SUFFIX_DATA_MOV)
+}
 
 mod codec;
 mod inline_data;
@@ -190,7 +197,7 @@ impl FileMeta {
                                     lower.starts_with(RESERVED_METADATA_PREFIX_LOWER) || lower.starts_with(MINIO_INTERNAL_PREFIX);
                                 if is_system {
                                     // Skip internal flags that shouldn't be persisted
-                                    if k == headers::X_RUSTFS_HEALING || k == headers::X_RUSTFS_DATA_MOV {
+                                    if is_skip_meta_key(k) {
                                         continue;
                                     }
                                     // Insert into meta_sys
@@ -424,15 +431,14 @@ impl FileMeta {
             if !fi.version_purge_status().is_empty()
                 && let Some(delete_marker) = ventry.delete_marker.as_mut()
             {
-                delete_marker.meta_sys.insert(
-                    VERSION_PURGE_STATUS_KEY.to_string(),
-                    fi.replication_state_internal
-                        .as_ref()
-                        .map(|v| v.version_purge_status_internal.clone().unwrap_or_default())
-                        .unwrap_or_default()
-                        .as_bytes()
-                        .to_vec(),
-                );
+                let value = fi
+                    .replication_state_internal
+                    .as_ref()
+                    .map(|v| v.version_purge_status_internal.clone().unwrap_or_default())
+                    .unwrap_or_default()
+                    .as_bytes()
+                    .to_vec();
+                insert_bytes(&mut delete_marker.meta_sys, SUFFIX_PURGESTATUS, value);
             }
 
             if let Some(delete_marker) = ventry.delete_marker.as_mut() {
@@ -539,15 +545,14 @@ impl FileMeta {
                         let mut v = self.get_idx(i)?;
 
                         if let Some(obj) = v.object.as_mut() {
-                            obj.meta_sys.insert(
-                                VERSION_PURGE_STATUS_KEY.to_string(),
-                                fi.replication_state_internal
-                                    .as_ref()
-                                    .map(|v| v.version_purge_status_internal.clone().unwrap_or_default())
-                                    .unwrap_or_default()
-                                    .as_bytes()
-                                    .to_vec(),
-                            );
+                            let value = fi
+                                .replication_state_internal
+                                .as_ref()
+                                .map(|v| v.version_purge_status_internal.clone().unwrap_or_default())
+                                .unwrap_or_default()
+                                .as_bytes()
+                                .to_vec();
+                            insert_bytes(&mut obj.meta_sys, SUFFIX_PURGESTATUS, value);
                             for (k, v) in fi
                                 .replication_state_internal
                                 .as_ref()

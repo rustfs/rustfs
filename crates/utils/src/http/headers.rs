@@ -148,40 +148,14 @@ pub const AMZ_META_NAME: &str = "X-Amz-Meta-Name";
 
 pub const AMZ_META_UNENCRYPTED_CONTENT_LENGTH: &str = "X-Amz-Meta-X-Amz-Unencrypted-Content-Length";
 pub const AMZ_META_UNENCRYPTED_CONTENT_MD5: &str = "X-Amz-Meta-X-Amz-Unencrypted-Content-Md5";
+
+pub const AMZ_TAGGING_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
+
 pub const RUSTFS_ENCRYPTION: &str = "X-Rustfs-Encryption-";
 pub const RUSTFS_ENCRYPTION_LOWER: &str = "x-rustfs-encryption-";
 
 pub const RESERVED_METADATA_PREFIX: &str = "X-RustFS-Internal-";
 pub const RESERVED_METADATA_PREFIX_LOWER: &str = "x-rustfs-internal-";
-
-pub const RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";
-// pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
-
-// pub const X_RUSTFS_INLINE_DATA: &str = "x-rustfs-inline-data";
-
-pub const VERSION_PURGE_STATUS_KEY: &str = "X-Rustfs-Internal-purgestatus";
-
-pub const X_RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";
-pub const X_RUSTFS_DATA_MOV: &str = "X-Rustfs-Internal-data-mov";
-
-pub const AMZ_TAGGING_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
-
-pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
-
-pub const RUSTFS_FORCE_DELETE: &str = "X-Rustfs-Force-Delete";
-pub const RUSTFS_INCLUDE_DELETED: &str = "X-Rustfs-Include-Deleted";
-
-pub const RUSTFS_REPLICATION_RESET_STATUS: &str = "X-Rustfs-Replication-Reset-Status";
-pub const RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE: &str = "X-Rustfs-Replication-Actual-Object-Size";
-
-pub const RUSTFS_BUCKET_SOURCE_VERSION_ID: &str = "X-Rustfs-Source-Version-Id";
-pub const RUSTFS_BUCKET_SOURCE_MTIME: &str = "X-RustFS-Source-Mtime";
-pub const RUSTFS_BUCKET_SOURCE_ETAG: &str = "X-Rustfs-Source-Etag";
-pub const RUSTFS_BUCKET_REPLICATION_DELETE_MARKER: &str = "X-Rustfs-Source-DeleteMarker";
-pub const RUSTFS_BUCKET_REPLICATION_PROXY_REQUEST: &str = "X-Rustfs-Source-Proxy-Request";
-pub const RUSTFS_BUCKET_REPLICATION_REQUEST: &str = "X-Rustfs-Source-Replication-Request";
-pub const RUSTFS_BUCKET_REPLICATION_CHECK: &str = "X-Rustfs-Source-Replication-Check";
-pub const RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM: &str = "X-Rustfs-Source-Replication-Ssec-Crc";
 
 // SSEC encryption header constants
 pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
