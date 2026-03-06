@@ -41,7 +41,8 @@ pub async fn is_dlo_object(
     credentials: &Option<Credentials>,
 ) -> Result<Option<String>, SwiftError> {
     // Require credentials
-    let creds = credentials.as_ref()
+    let creds = credentials
+        .as_ref()
         .ok_or_else(|| SwiftError::Unauthorized("Credentials required".to_string()))?;
 
     // Get object metadata to check for DLO manifest header
@@ -59,7 +60,8 @@ pub async fn list_dlo_segments(
     credentials: &Option<Credentials>,
 ) -> Result<Vec<ObjectInfo>, SwiftError> {
     // Require credentials for DLO operations
-    let creds = credentials.as_ref()
+    let creds = credentials
+        .as_ref()
         .ok_or_else(|| SwiftError::Unauthorized("Credentials required for DLO operations".to_string()))?;
 
     // List objects with prefix using the container module's list_objects function
@@ -71,15 +73,19 @@ pub async fn list_dlo_segments(
         None, // marker
         Some(prefix.to_string()),
         None, // delimiter
-    ).await?;
+    )
+    .await?;
 
     // Convert to ObjectInfo and sort lexicographically
-    let mut object_infos: Vec<ObjectInfo> = objects.iter().map(|obj| ObjectInfo {
-        name: obj.name.clone(),
-        size: obj.bytes as i64,
-        content_type: Some(obj.content_type.clone()),
-        etag: Some(obj.hash.clone()),
-    }).collect();
+    let mut object_infos: Vec<ObjectInfo> = objects
+        .iter()
+        .map(|obj| ObjectInfo {
+            name: obj.name.clone(),
+            size: obj.bytes as i64,
+            content_type: Some(obj.content_type.clone()),
+            etag: Some(obj.hash.clone()),
+        })
+        .collect();
 
     // Sort lexicographically (critical for correct assembly)
     object_infos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -118,7 +124,8 @@ fn parse_range_header(range_str: &str, total_size: u64) -> Result<(u64, u64), Sw
 
     let (start, end) = if parts[0].is_empty() {
         // Suffix range (last N bytes): bytes=-500
-        let suffix: u64 = parts[1].parse()
+        let suffix: u64 = parts[1]
+            .parse()
             .map_err(|_| SwiftError::BadRequest("Invalid Range header".to_string()))?;
         if suffix >= total_size {
             (0, total_size - 1)
@@ -127,13 +134,15 @@ fn parse_range_header(range_str: &str, total_size: u64) -> Result<(u64, u64), Sw
         }
     } else {
         // Regular range: bytes=0-999 or bytes=0-
-        let start = parts[0].parse()
+        let start = parts[0]
+            .parse()
             .map_err(|_| SwiftError::BadRequest("Invalid Range header".to_string()))?;
 
         let end = if parts[1].is_empty() {
             total_size - 1
         } else {
-            let parsed: u64 = parts[1].parse()
+            let parsed: u64 = parts[1]
+                .parse()
                 .map_err(|_| SwiftError::BadRequest("Invalid Range header".to_string()))?;
             std::cmp::min(parsed, total_size - 1)
         };
@@ -164,11 +173,7 @@ fn calculate_dlo_segments_for_range(
         // Check if this segment overlaps with requested range
         if segment_end >= start && segment_start <= end {
             // Calculate byte range within this segment
-            let byte_start = if start > segment_start {
-                start - segment_start
-            } else {
-                0
-            };
+            let byte_start = start.saturating_sub(segment_start);
 
             let byte_end = if end < segment_end {
                 end - segment_start
@@ -213,7 +218,8 @@ pub async fn handle_dlo_get(
     let total_size: u64 = segments.iter().map(|s| s.size as u64).sum();
 
     // 4. Parse range header if present
-    let range = headers.get("range")
+    let range = headers
+        .get("range")
         .and_then(|v| v.to_str().ok())
         .and_then(|r| parse_range_header(r, total_size).ok());
 
@@ -240,18 +246,19 @@ pub async fn handle_dlo_get(
     }
 
     // Get content-type from first segment
-    if let Some(first) = segments.first() {
-        if let Some(ct) = &first.content_type {
-            response = response.header("content-type", ct);
-        }
+    if let Some(first) = segments.first()
+        && let Some(ct) = &first.content_type
+    {
+        response = response.header("content-type", ct);
     }
 
     // Convert stream to Body
     let axum_body = axum::body::Body::from_stream(segment_stream);
     let body = Body::http_body_unsync(axum_body);
 
-    Ok(response.body(body)
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
+    response
+        .body(body)
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 
 /// Create streaming body that chains segment readers without buffering
@@ -265,7 +272,8 @@ async fn create_dlo_stream(
     use futures::stream::{self, StreamExt, TryStreamExt};
 
     // Require credentials
-    let creds = credentials.as_ref()
+    let creds = credentials
+        .as_ref()
         .ok_or_else(|| SwiftError::Unauthorized("Credentials required".to_string()))?
         .clone();
 
@@ -273,9 +281,11 @@ async fn create_dlo_stream(
     let segments_to_fetch = if let Some((start, end)) = range {
         calculate_dlo_segments_for_range(segments, start, end)?
     } else {
-        segments.iter().enumerate().map(|(i, s)| {
-            (i, 0, s.size as u64 - 1, s.clone())
-        }).collect()
+        segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, 0, s.size as u64 - 1, s.clone()))
+            .collect()
     };
 
     let account = account.to_string();
@@ -299,8 +309,9 @@ async fn create_dlo_stream(
                     None
                 };
 
-                let reader = object::get_object(&account, &container, &segment.name, &creds, range_spec).await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let reader = object::get_object(&account, &container, &segment.name, &creds, range_spec)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
 
                 // Convert AsyncRead to Stream using ReaderStream
                 Ok::<_, std::io::Error>(tokio_util::io::ReaderStream::new(reader.stream))
@@ -328,23 +339,16 @@ pub async fn handle_dlo_register(
     metadata.insert("x-object-manifest".to_string(), manifest_value.to_string());
 
     // Use put_object_with_metadata to store the marker
-    object::put_object_with_metadata(
-        account,
-        container,
-        object,
-        credentials,
-        std::io::Cursor::new(Vec::new()),
-        &metadata,
-    )
-    .await?;
+    object::put_object_with_metadata(account, container, object, credentials, std::io::Cursor::new(Vec::new()), &metadata)
+        .await?;
 
     let trans_id = generate_trans_id();
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::CREATED)
         .header("x-trans-id", &trans_id)
         .header("x-openstack-request-id", trans_id)
         .body(Body::empty())
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 
 #[cfg(test)]
@@ -392,7 +396,7 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].1, 500); // Start at byte 500 of seg1
         assert_eq!(result[0].2, 999); // End at byte 999 of seg1
-        assert_eq!(result[1].1, 0);   // Start at byte 0 of seg2
+        assert_eq!(result[1].1, 0); // Start at byte 0 of seg2
         assert_eq!(result[1].2, 500); // End at byte 500 of seg2
     }
 
@@ -451,7 +455,7 @@ mod tests {
         // Request bytes within first segment only
         let result = calculate_dlo_segments_for_range(&segments, 100, 500).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, 0);   // Segment index
+        assert_eq!(result[0].0, 0); // Segment index
         assert_eq!(result[0].1, 100); // Start byte
         assert_eq!(result[0].2, 500); // End byte
         assert_eq!(result[0].3.name, "seg001");
@@ -517,7 +521,7 @@ mod tests {
         // Request bytes from last segment only
         let result = calculate_dlo_segments_for_range(&segments, 2100, 2400).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, 2);   // Third segment
+        assert_eq!(result[0].0, 2); // Third segment
         assert_eq!(result[0].1, 100); // Start at byte 100
         assert_eq!(result[0].2, 400); // End at byte 400
     }
@@ -551,8 +555,8 @@ mod tests {
         // Request exactly the second segment (bytes 1000-1999)
         let result = calculate_dlo_segments_for_range(&segments, 1000, 1999).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, 1);   // Second segment
-        assert_eq!(result[0].1, 0);   // Start at beginning of segment
+        assert_eq!(result[0].0, 1); // Second segment
+        assert_eq!(result[0].1, 0); // Start at beginning of segment
         assert_eq!(result[0].2, 999); // End at end of segment
     }
 

@@ -35,13 +35,24 @@
 
 pub mod account;
 pub mod acl;
+pub mod bulk;
 pub mod container;
+pub mod cors;
 pub mod dlo;
+pub mod encryption;
 pub mod errors;
+pub mod expiration;
+pub mod expiration_worker;
+pub mod formpost;
 pub mod handler;
 pub mod object;
+pub mod quota;
+pub mod ratelimit;
 pub mod router;
 pub mod slo;
+pub mod staticweb;
+pub mod symlink;
+pub mod sync;
 pub mod tempurl;
 pub mod types;
 pub mod versioning;

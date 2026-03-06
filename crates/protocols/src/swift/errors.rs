@@ -32,8 +32,12 @@ pub enum SwiftError {
     NotFound(String),
     /// 409 Conflict
     Conflict(String),
+    /// 413 Request Entity Too Large (Payload Too Large)
+    RequestEntityTooLarge(String),
     /// 422 Unprocessable Entity
     UnprocessableEntity(String),
+    /// 429 Too Many Requests
+    TooManyRequests { retry_after: u64, limit: u32, reset: u64 },
     /// 500 Internal Server Error
     InternalServerError(String),
     /// 501 Not Implemented
@@ -50,7 +54,11 @@ impl fmt::Display for SwiftError {
             SwiftError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
             SwiftError::NotFound(msg) => write!(f, "Not Found: {}", msg),
             SwiftError::Conflict(msg) => write!(f, "Conflict: {}", msg),
+            SwiftError::RequestEntityTooLarge(msg) => write!(f, "Request Entity Too Large: {}", msg),
             SwiftError::UnprocessableEntity(msg) => write!(f, "Unprocessable Entity: {}", msg),
+            SwiftError::TooManyRequests { retry_after, .. } => {
+                write!(f, "Too Many Requests: retry after {} seconds", retry_after)
+            }
             SwiftError::InternalServerError(msg) => write!(f, "Internal Server Error: {}", msg),
             SwiftError::NotImplemented(msg) => write!(f, "Not Implemented: {}", msg),
             SwiftError::ServiceUnavailable(msg) => write!(f, "Service Unavailable: {}", msg),
@@ -68,7 +76,9 @@ impl SwiftError {
             SwiftError::Forbidden(_) => StatusCode::FORBIDDEN,
             SwiftError::NotFound(_) => StatusCode::NOT_FOUND,
             SwiftError::Conflict(_) => StatusCode::CONFLICT,
+            SwiftError::RequestEntityTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             SwiftError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            SwiftError::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             SwiftError::InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SwiftError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             SwiftError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -89,6 +99,30 @@ impl IntoResponse for SwiftError {
     fn into_response(self) -> Response {
         let trans_id = Self::generate_trans_id();
         let status = self.status_code();
+
+        // Handle TooManyRequests specially to include rate limit headers
+        if let SwiftError::TooManyRequests {
+            retry_after,
+            limit,
+            reset,
+        } = &self
+        {
+            return (
+                status,
+                [
+                    ("content-type", "text/plain; charset=utf-8".to_string()),
+                    ("x-trans-id", trans_id.clone()),
+                    ("x-openstack-request-id", trans_id),
+                    ("x-ratelimit-limit", limit.to_string()),
+                    ("x-ratelimit-remaining", "0".to_string()),
+                    ("x-ratelimit-reset", reset.to_string()),
+                    ("retry-after", retry_after.to_string()),
+                ],
+                self.to_string(),
+            )
+                .into_response();
+        }
+
         let body = self.to_string();
 
         (

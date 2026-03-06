@@ -58,6 +58,7 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader};
 use rustfs_rio::{HashReader, Reader, WarpReader};
 use std::collections::HashMap;
+use tracing::debug;
 use tracing::error;
 
 /// Maximum number of metadata headers allowed per object (Swift standard)
@@ -321,17 +322,31 @@ where
         user_metadata.insert("content-type".to_string(), ct_str.to_string());
     }
 
-    // 7. Validate metadata limits
+    // 7. Extract and validate expiration headers (X-Delete-At / X-Delete-After)
+    if let Some(delete_at) = super::expiration::extract_expiration(headers)? {
+        super::expiration::validate_expiration(delete_at)?;
+        user_metadata.insert("x-delete-at".to_string(), delete_at.to_string());
+    }
+
+    // 8. Extract symlink target if creating a symlink
+    if let Some(symlink_target) = super::symlink::extract_symlink_target(headers)? {
+        // Store the fully qualified target (container/object)
+        let target_value = symlink_target.to_header_value(container);
+        user_metadata.insert("x-object-symlink-target".to_string(), target_value);
+        debug!("Creating symlink to target: {}", user_metadata.get("x-object-symlink-target").unwrap());
+    }
+
+    // 9. Validate metadata limits
     validate_metadata(&user_metadata)?;
 
-    // 8. Get content length from headers (-1 if not provided)
+    // 10. Get content length from headers (-1 if not provided)
     let content_length = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(-1);
 
-    // 9. Validate content length doesn't exceed maximum
+    // 11. Validate content length doesn't exceed maximum
     if content_length > MAX_OBJECT_SIZE {
         return Err(SwiftError::BadRequest(format!(
             "Object size {} bytes exceeds maximum of {} bytes",
@@ -339,12 +354,12 @@ where
         )));
     }
 
-    // 10. Get storage layer
+    // 12. Get storage layer
     let Some(store) = new_object_layer_fn() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
-    // 11. Verify bucket/container exists
+    // 13. Verify bucket/container exists
     store.get_bucket_info(&bucket, &BucketOptions::default()).await.map_err(|e| {
         if e.to_string().contains("does not exist") {
             SwiftError::NotFound(format!("Container '{}' not found", container))
@@ -408,7 +423,8 @@ where
         validate_account_access(account, creds)?
     } else {
         // For testing/internal use, extract project_id from account
-        account.strip_prefix("AUTH_")
+        account
+            .strip_prefix("AUTH_")
             .ok_or_else(|| SwiftError::Unauthorized("Invalid account format".to_string()))?
             .to_string()
     };

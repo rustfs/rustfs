@@ -115,10 +115,7 @@ fn get_account_metadata_bucket_name(account: &str) -> String {
 ///
 /// # Returns
 /// HashMap of metadata key-value pairs (without the prefix)
-pub async fn get_account_metadata(
-    account: &str,
-    _credentials: &Option<Credentials>,
-) -> SwiftResult<HashMap<String, String>> {
+pub async fn get_account_metadata(account: &str, _credentials: &Option<Credentials>) -> SwiftResult<HashMap<String, String>> {
     let bucket_name = get_account_metadata_bucket_name(account);
 
     // Try to load bucket metadata
@@ -134,11 +131,11 @@ pub async fn get_account_metadata(
     let mut metadata = HashMap::new();
     if let Some(tagging) = &bucket_meta.tagging_config {
         for tag in &tagging.tag_set {
-            if let (Some(key), Some(value)) = (&tag.key, &tag.value) {
-                if key.starts_with("swift-account-meta-") {
-                    let meta_key = &key[19..]; // Strip "swift-account-meta-" prefix
-                    metadata.insert(meta_key.to_string(), value.clone());
-                }
+            if let (Some(key), Some(value)) = (&tag.key, &tag.value)
+                && let Some(meta_key) = key.strip_prefix("swift-account-meta-")
+            {
+                // Strip "swift-account-meta-" prefix
+                metadata.insert(meta_key.to_string(), value.clone());
             }
         }
     }
@@ -184,7 +181,9 @@ pub async fn update_account_metadata(
     let mut bucket_meta_clone = (*bucket_meta).clone();
 
     // Get existing tags, preserving non-Swift tags
-    let mut existing_tagging = bucket_meta_clone.tagging_config.clone()
+    let mut existing_tagging = bucket_meta_clone
+        .tagging_config
+        .clone()
         .unwrap_or_else(|| Tagging { tag_set: vec![] });
 
     // Remove old swift-account-meta-* tags while preserving other tags
@@ -233,10 +232,7 @@ pub async fn update_account_metadata(
 ///
 /// Retrieves the TempURL key from account metadata.
 /// Returns None if no TempURL key is set.
-pub async fn get_tempurl_key(
-    account: &str,
-    credentials: &Option<Credentials>,
-) -> SwiftResult<Option<String>> {
+pub async fn get_tempurl_key(account: &str, credentials: &Option<Credentials>) -> SwiftResult<Option<String>> {
     let metadata = get_account_metadata(account, credentials).await?;
     Ok(metadata.get("temp-url-key").cloned())
 }

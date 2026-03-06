@@ -1313,11 +1313,31 @@ dependencies = [
 
 [[package]]
 name = "bzip2"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdb116a6ef3f6c3698828873ad02c3014b3c85cadb88496095628e3ef1e347f8"
+dependencies = [
+ "bzip2-sys",
+ "libc",
+]
+
+[[package]]
+name = "bzip2"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
 dependencies = [
  "libbz2-rs-sys",
+]
+
+[[package]]
+name = "bzip2-sys"
+version = "0.1.13+1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
+dependencies = [
+ "cc",
+ "pkg-config",
 ]
 
 [[package]]
@@ -1584,7 +1604,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb7b51a7d9c967fc26773061ba86150f19c50c0d65c887cb1fbe295fd16619b7"
 dependencies = [
  "brotli",
- "bzip2",
+ "bzip2 0.6.1",
  "compression-core",
  "flate2",
  "liblzma",
@@ -2212,7 +2232,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "bytes",
- "bzip2",
+ "bzip2 0.6.1",
  "chrono",
  "datafusion-catalog",
  "datafusion-catalog-listing",
@@ -2350,7 +2370,7 @@ dependencies = [
  "async-compression",
  "async-trait",
  "bytes",
- "bzip2",
+ "bzip2 0.6.1",
  "chrono",
  "datafusion-common",
  "datafusion-common-runtime",
@@ -7730,7 +7750,10 @@ version = "0.0.5"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
+ "bzip2 0.4.4",
+ "flate2",
  "futures",
  "futures-util",
  "hex",
@@ -7744,6 +7767,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quick-xml 0.39.2",
+ "rand 0.10.0",
  "regex",
  "rustfs-credentials",
  "rustfs-ecstore",
@@ -7758,6 +7782,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0-rc.5",
  "sha2 0.11.0-rc.5",
+ "tar",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -9116,6 +9141,17 @@ name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
+
+[[package]]
+name = "tar"
+version = "0.4.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d863878d212c87a19c1a610eb53bb01fe12951c0501cf5a0d65f724914a667a"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
 
 [[package]]
 name = "temp-env"
@@ -10741,7 +10777,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b680f2a0cd479b4cff6e1233c483fdead418106eae419dc60200ae9850f6d004"
 dependencies = [
  "aes 0.8.4",
- "bzip2",
+ "bzip2 0.6.1",
  "constant_time_eq",
  "crc32fast",
  "deflate64",

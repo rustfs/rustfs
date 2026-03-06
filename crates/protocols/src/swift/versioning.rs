@@ -37,16 +37,15 @@
 //! 4. If versions exist, restore newest to current container
 //! 5. Delete restored version from archive
 
-use super::container::{ContainerMapper, get_versions_location};
-use super::object::{ObjectKeyMapper, head_object, get_object, put_object};
-use super::{SwiftError, SwiftResult};
 use super::account::validate_account_access;
+use super::container::ContainerMapper;
+use super::object::{ObjectKeyMapper, head_object};
+use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{ListOperations, ObjectOptions, ObjectOperations};
+use rustfs_ecstore::store_api::{ListOperations, ObjectOperations, ObjectOptions};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error};
-use std::sync::Arc;
 
 /// Generate a version name for an archived object
 ///
@@ -123,7 +122,7 @@ pub async fn archive_current_version(
     );
 
     // Check if object exists
-    let object_info = match head_object(account, container, object, credentials).await {
+    let _object_info = match head_object(account, container, object, credentials).await {
         Ok(info) => info,
         Err(SwiftError::NotFound(_)) => {
             // Object doesn't exist - nothing to archive
@@ -160,24 +159,13 @@ pub async fn archive_current_version(
     let opts = ObjectOptions::default();
 
     // Get source object info for copy operation
-    let mut src_info = store
-        .get_object_info(&source_bucket, &source_key, &opts)
-        .await
-        .map_err(|e| {
-            error!("Failed to get source object info: {}", e);
-            SwiftError::InternalServerError(format!("Failed to get object info for archiving: {}", e))
-        })?;
+    let mut src_info = store.get_object_info(&source_bucket, &source_key, &opts).await.map_err(|e| {
+        error!("Failed to get source object info: {}", e);
+        SwiftError::InternalServerError(format!("Failed to get object info for archiving: {}", e))
+    })?;
 
     store
-        .copy_object(
-            &source_bucket,
-            &source_key,
-            &archive_bucket,
-            &version_key,
-            &mut src_info,
-            &opts,
-            &opts,
-        )
+        .copy_object(&source_bucket, &source_key, &archive_bucket, &version_key, &mut src_info, &opts, &opts)
         .await
         .map_err(|e| {
             error!("Failed to copy object to archive: {}", e);
@@ -281,14 +269,11 @@ pub async fn restore_previous_version(
         })?;
 
     // Delete the version from archive after successful restore
-    store
-        .delete_object(&archive_bucket, &version_key, opts)
-        .await
-        .map_err(|e| {
-            error!("Failed to delete archived version after restore: {}", e);
-            // Don't fail the restore if deletion fails - object is restored
-            SwiftError::InternalServerError(format!("Version restored but cleanup failed: {}", e))
-        })?;
+    store.delete_object(&archive_bucket, &version_key, opts).await.map_err(|e| {
+        error!("Failed to delete archived version after restore: {}", e);
+        // Don't fail the restore if deletion fails - object is restored
+        SwiftError::InternalServerError(format!("Version restored but cleanup failed: {}", e))
+    })?;
 
     debug!("Successfully restored version from {}", newest_version);
 
@@ -325,10 +310,7 @@ pub async fn list_object_versions(
     archive_container: &str,
     credentials: &Credentials,
 ) -> SwiftResult<Vec<String>> {
-    debug!(
-        "Listing versions of {}/{}/{} in {}",
-        account, container, object, archive_container
-    );
+    debug!("Listing versions of {}/{}/{} in {}", account, container, object, archive_container);
 
     // Validate account and get project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -353,12 +335,12 @@ pub async fn list_object_versions(
     let list_result = store
         .list_objects_v2(
             &archive_bucket,
-            "", // No prefix - we'll filter manually
-            None, // No continuation token
-            None, // No delimiter
-            1000, // Max keys
+            "",    // No prefix - we'll filter manually
+            None,  // No continuation token
+            None,  // No delimiter
+            1000,  // Max keys
             false, // Don't fetch owner
-            None, // No start_after
+            None,  // No start_after
             false, // Don't include deleted
         )
         .await
@@ -384,7 +366,7 @@ pub async fn list_object_versions(
     // Sort by timestamp (newest first)
     // Since timestamps are inverted (newer = smaller number), ascending string sort
     // gives us newest first because smaller numbers sort first lexicographically
-    versions.sort_by(|a: &String, b: &String| a.cmp(b)); // Ascending sort for inverted timestamps
+    versions.sort(); // Ascending sort for inverted timestamps
 
     debug!("Found {} versions", versions.len());
 
@@ -430,11 +412,14 @@ mod tests {
 
         // When sorted in ASCENDING order (a.cmp(b)), smaller timestamps come first
         // Since timestamps are inverted, this gives us newest first
-        let mut versions = vec![version1.clone(), version2.clone()];
-        versions.sort_by(|a, b| a.cmp(b)); // Ascending sort
+        let mut versions = [version1.clone(), version2.clone()];
+        versions.sort(); // Ascending sort
 
         // The newest version (version2, with smaller timestamp) should come first
-        assert_eq!(versions[0], version2, "After ascending sort, newer version (smaller timestamp) should be first");
+        assert_eq!(
+            versions[0], version2,
+            "After ascending sort, newer version (smaller timestamp) should be first"
+        );
         assert_eq!(versions[1], version1);
     }
 
@@ -462,10 +447,7 @@ mod tests {
     #[test]
     fn test_version_timestamp_inversion() {
         // Test that timestamp inversion works correctly
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
 
         let inverted = 9999999999.99999 - now;
 
@@ -500,7 +482,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
 
-        versions.sort_by(|a, b| a.cmp(b)); // Ascending sort for inverted timestamps
+        versions.sort(); // Ascending sort for inverted timestamps
 
         // Should have 2 versions of photos/cat.jpg
         assert_eq!(versions.len(), 2);

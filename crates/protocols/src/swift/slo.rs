@@ -59,8 +59,7 @@ pub struct SLOManifest {
 impl SLOManifest {
     /// Parse manifest from JSON body
     pub fn from_json(data: &[u8]) -> Result<Self, SwiftError> {
-        serde_json::from_slice(data)
-            .map_err(|e| SwiftError::BadRequest(format!("Invalid SLO manifest: {}", e)))
+        serde_json::from_slice(data).map_err(|e| SwiftError::BadRequest(format!("Invalid SLO manifest: {}", e)))
     }
 
     /// Calculate total assembled size
@@ -139,7 +138,8 @@ pub async fn is_slo_object(
     credentials: &Option<Credentials>,
 ) -> Result<bool, SwiftError> {
     // Require credentials
-    let creds = credentials.as_ref()
+    let creds = credentials
+        .as_ref()
         .ok_or_else(|| SwiftError::Unauthorized("Credentials required".to_string()))?;
 
     let info = object::head_object(account, container, object, creds).await?;
@@ -167,11 +167,7 @@ fn calculate_segments_for_range(
         // Check if this segment overlaps with requested range
         if segment_end >= start && segment_start <= end {
             // Calculate byte range within this segment
-            let byte_start = if start > segment_start {
-                start - segment_start
-            } else {
-                0
-            };
+            let byte_start = start.saturating_sub(segment_start);
 
             let byte_end = if end < segment_end {
                 end - segment_start
@@ -208,7 +204,8 @@ fn parse_range_header(range_str: &str, total_size: u64) -> Result<(u64, u64), Sw
 
     let (start, end) = if parts[0].is_empty() {
         // Suffix range (last N bytes): bytes=-500
-        let suffix: u64 = parts[1].parse()
+        let suffix: u64 = parts[1]
+            .parse()
             .map_err(|_| SwiftError::BadRequest("Invalid Range header".to_string()))?;
         if suffix >= total_size {
             (0, total_size - 1)
@@ -217,13 +214,15 @@ fn parse_range_header(range_str: &str, total_size: u64) -> Result<(u64, u64), Sw
         }
     } else {
         // Regular range: bytes=0-999 or bytes=0-
-        let start = parts[0].parse()
+        let start = parts[0]
+            .parse()
             .map_err(|_| SwiftError::BadRequest("Invalid Range header".to_string()))?;
 
         let end = if parts[1].is_empty() {
             total_size - 1
         } else {
-            let parsed: u64 = parts[1].parse()
+            let parsed: u64 = parts[1]
+                .parse()
                 .map_err(|_| SwiftError::BadRequest("Invalid Range header".to_string()))?;
             std::cmp::min(parsed, total_size - 1)
         };
@@ -246,12 +245,12 @@ pub async fn handle_slo_put(
     body: Body,
     headers: &HeaderMap,
     credentials: &Option<Credentials>,
-) -> Result<Response<Body>, SwiftError>
-{
+) -> Result<Response<Body>, SwiftError> {
     use http_body_util::BodyExt;
 
     // Require credentials
-    let creds = credentials.as_ref()
+    let creds = credentials
+        .as_ref()
         .ok_or_else(|| SwiftError::Unauthorized("Credentials required for SLO operations".to_string()))?;
 
     // 1. Read manifest JSON from body
@@ -280,10 +279,10 @@ pub async fn handle_slo_put(
 
     // Extract custom headers (X-Object-Meta-*)
     for (key, value) in headers {
-        if key.as_str().starts_with("x-object-meta-") {
-            if let Ok(v) = value.to_str() {
-                metadata.insert(key.to_string(), v.to_string());
-            }
+        if key.as_str().starts_with("x-object-meta-")
+            && let Ok(v) = value.to_str()
+        {
+            metadata.insert(key.to_string(), v.to_string());
         }
     }
 
@@ -300,25 +299,17 @@ pub async fn handle_slo_put(
     .await?;
 
     // 6. Create zero-byte marker object at original path
-    object::put_object_with_metadata(
-        account,
-        container,
-        object,
-        credentials,
-        Cursor::new(Vec::new()),
-        &metadata,
-    )
-    .await?;
+    object::put_object_with_metadata(account, container, object, credentials, Cursor::new(Vec::new()), &metadata).await?;
 
     // 7. Return response
     let trans_id = generate_trans_id();
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::CREATED)
         .header("etag", manifest.calculate_etag())
         .header("x-trans-id", &trans_id)
         .header("x-openstack-request-id", trans_id)
         .body(Body::empty())
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 
 /// Handle GET /v1/{account}/{container}/{object} for SLO
@@ -330,7 +321,8 @@ pub async fn handle_slo_get(
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
     // Require credentials
-    let creds = credentials.as_ref()
+    let creds = credentials
+        .as_ref()
         .ok_or_else(|| SwiftError::Unauthorized("Credentials required for SLO operations".to_string()))?;
 
     // 1. Load manifest
@@ -340,13 +332,17 @@ pub async fn handle_slo_get(
     // Read manifest bytes
     let mut manifest_bytes = Vec::new();
     use tokio::io::AsyncReadExt;
-    manifest_reader.stream.read_to_end(&mut manifest_bytes).await
+    manifest_reader
+        .stream
+        .read_to_end(&mut manifest_bytes)
+        .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to read manifest: {}", e)))?;
 
     let manifest = SLOManifest::from_json(&manifest_bytes)?;
 
     // 2. Parse Range header if present
-    let range = headers.get("range")
+    let range = headers
+        .get("range")
         .and_then(|v| v.to_str().ok())
         .and_then(|r| parse_range_header(r, manifest.total_size()).ok());
 
@@ -377,8 +373,9 @@ pub async fn handle_slo_get(
     let axum_body = axum::body::Body::from_stream(segment_stream);
     let body = Body::http_body_unsync(axum_body);
 
-    Ok(response.body(body)
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
+    response
+        .body(body)
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 
 /// Create streaming body that chains segment readers without buffering
@@ -391,7 +388,8 @@ async fn create_slo_stream(
     use futures::stream::{self, StreamExt, TryStreamExt};
 
     // Require credentials
-    let creds = credentials.as_ref()
+    let creds = credentials
+        .as_ref()
         .ok_or_else(|| SwiftError::Unauthorized("Credentials required".to_string()))?
         .clone();
 
@@ -400,9 +398,12 @@ async fn create_slo_stream(
         calculate_segments_for_range(manifest, start, end)?
     } else {
         // All segments, full range
-        manifest.segments.iter().enumerate().map(|(i, s)| {
-            (i, 0, s.size_bytes - 1, s.clone())
-        }).collect()
+        manifest
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, 0, s.size_bytes - 1, s.clone()))
+            .collect()
     };
 
     let account = account.to_string();
@@ -428,8 +429,9 @@ async fn create_slo_stream(
                     None
                 };
 
-                let reader = object::get_object(&account, &container, &object_name, &creds, range_spec).await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let reader = object::get_object(&account, &container, &object_name, &creds, range_spec)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
 
                 // Convert AsyncRead to Stream using ReaderStream
                 Ok::<_, std::io::Error>(tokio_util::io::ReaderStream::new(reader.stream))
@@ -448,7 +450,8 @@ pub async fn handle_slo_get_manifest(
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
     // Require credentials
-    let creds = credentials.as_ref()
+    let creds = credentials
+        .as_ref()
         .ok_or_else(|| SwiftError::Unauthorized("Credentials required for SLO operations".to_string()))?;
 
     // Load and return the manifest JSON directly
@@ -458,18 +461,21 @@ pub async fn handle_slo_get_manifest(
     // Read manifest bytes
     let mut manifest_bytes = Vec::new();
     use tokio::io::AsyncReadExt;
-    manifest_reader.stream.read_to_end(&mut manifest_bytes).await
+    manifest_reader
+        .stream
+        .read_to_end(&mut manifest_bytes)
+        .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to read manifest: {}", e)))?;
 
     let trans_id = generate_trans_id();
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json; charset=utf-8")
         .header("content-length", manifest_bytes.len().to_string())
         .header("x-trans-id", &trans_id)
         .header("x-openstack-request-id", trans_id)
         .body(Body::from(manifest_bytes))
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 
 /// Handle DELETE ?multipart-manifest=delete (remove manifest + all segments)
@@ -480,7 +486,8 @@ pub async fn handle_slo_delete(
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
     // Require credentials for delete operations
-    let creds = credentials.as_ref()
+    let creds = credentials
+        .as_ref()
         .ok_or_else(|| SwiftError::Unauthorized("Credentials required for SLO delete".to_string()))?;
 
     // 1. Load manifest
@@ -490,7 +497,10 @@ pub async fn handle_slo_delete(
     // Read manifest bytes
     let mut manifest_bytes = Vec::new();
     use tokio::io::AsyncReadExt;
-    manifest_reader.stream.read_to_end(&mut manifest_bytes).await
+    manifest_reader
+        .stream
+        .read_to_end(&mut manifest_bytes)
+        .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to read manifest: {}", e)))?;
 
     let manifest = SLOManifest::from_json(&manifest_bytes)?;
@@ -509,12 +519,12 @@ pub async fn handle_slo_delete(
     object::delete_object(account, container, object, creds).await?;
 
     let trans_id = generate_trans_id();
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header("x-trans-id", &trans_id)
         .header("x-openstack-request-id", trans_id)
         .body(Body::empty())
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 
 #[cfg(test)]
@@ -560,14 +570,12 @@ mod tests {
     #[test]
     fn test_calculate_etag() {
         let manifest = SLOManifest {
-            segments: vec![
-                SLOSegment {
-                    path: "/container/seg1".to_string(),
-                    size_bytes: 1000,
-                    etag: "abc123".to_string(),
-                    range: None,
-                },
-            ],
+            segments: vec![SLOSegment {
+                path: "/container/seg1".to_string(),
+                size_bytes: 1000,
+                etag: "abc123".to_string(),
+                range: None,
+            }],
             created_at: None,
         };
 
@@ -615,7 +623,7 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].1, 500); // Start at byte 500 of seg1
         assert_eq!(segments[0].2, 999); // End at byte 999 of seg1
-        assert_eq!(segments[1].1, 0);   // Start at byte 0 of seg2
+        assert_eq!(segments[1].1, 0); // Start at byte 0 of seg2
         assert_eq!(segments[1].2, 500); // End at byte 500 of seg2
     }
 
@@ -642,7 +650,7 @@ mod tests {
         // Request bytes within first segment only
         let segments = calculate_segments_for_range(&manifest, 100, 500).unwrap();
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].0, 0);   // Segment index
+        assert_eq!(segments[0].0, 0); // Segment index
         assert_eq!(segments[0].1, 100); // Start byte
         assert_eq!(segments[0].2, 500); // End byte
     }
@@ -650,14 +658,12 @@ mod tests {
     #[test]
     fn test_calculate_segments_for_range_full_segment() {
         let manifest = SLOManifest {
-            segments: vec![
-                SLOSegment {
-                    path: "/c/s1".to_string(),
-                    size_bytes: 1000,
-                    etag: "e1".to_string(),
-                    range: None,
-                },
-            ],
+            segments: vec![SLOSegment {
+                path: "/c/s1".to_string(),
+                size_bytes: 1000,
+                etag: "e1".to_string(),
+                range: None,
+            }],
             created_at: None,
         };
 
@@ -697,7 +703,7 @@ mod tests {
         // Request bytes from last segment only
         let segments = calculate_segments_for_range(&manifest, 2100, 2400).unwrap();
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].0, 2);   // Third segment
+        assert_eq!(segments[0].0, 2); // Third segment
         assert_eq!(segments[0].1, 100); // Start at byte 100 of seg3
         assert_eq!(segments[0].2, 400); // End at byte 400 of seg3
     }
@@ -855,26 +861,22 @@ mod tests {
     #[test]
     fn test_calculate_etag_strips_quotes() {
         let manifest1 = SLOManifest {
-            segments: vec![
-                SLOSegment {
-                    path: "/c/s1".to_string(),
-                    size_bytes: 1000,
-                    etag: "\"abc123\"".to_string(),
-                    range: None,
-                },
-            ],
+            segments: vec![SLOSegment {
+                path: "/c/s1".to_string(),
+                size_bytes: 1000,
+                etag: "\"abc123\"".to_string(),
+                range: None,
+            }],
             created_at: None,
         };
 
         let manifest2 = SLOManifest {
-            segments: vec![
-                SLOSegment {
-                    path: "/c/s1".to_string(),
-                    size_bytes: 1000,
-                    etag: "abc123".to_string(),
-                    range: None,
-                },
-            ],
+            segments: vec![SLOSegment {
+                path: "/c/s1".to_string(),
+                size_bytes: 1000,
+                etag: "abc123".to_string(),
+                range: None,
+            }],
             created_at: None,
         };
 

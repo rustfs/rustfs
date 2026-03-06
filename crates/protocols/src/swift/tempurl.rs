@@ -6,7 +6,7 @@
 //! Reference: https://docs.openstack.org/swift/latest/api/temporary_url_middleware.html
 
 use crate::swift::errors::SwiftError;
-use hmac::{Hmac, Mac, KeyInit};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -78,16 +78,11 @@ impl TempURL {
     /// - `method`: HTTP method (GET, PUT, HEAD, etc.)
     /// - `expires`: Unix timestamp when URL expires
     /// - `path`: Full path including query params except temp_url_* params
-    ///           Example: "/v1/AUTH_test/container/object"
+    ///   Example: "/v1/AUTH_test/container/object"
     ///
     /// # Returns
     /// Hex-encoded HMAC-SHA1 signature
-    pub fn generate_signature(
-        &self,
-        method: &str,
-        expires: u64,
-        path: &str,
-    ) -> Result<String, SwiftError> {
+    pub fn generate_signature(&self, method: &str, expires: u64, path: &str) -> Result<String, SwiftError> {
         // Construct message for HMAC
         // Format: "{METHOD}\n{expires}\n{path}"
         let message = format!("{}\n{}\n{}", method.to_uppercase(), expires, path);
@@ -118,12 +113,7 @@ impl TempURL {
     /// # Returns
     /// - `Ok(())` if signature is valid and not expired
     /// - `Err(SwiftError::Unauthorized)` if invalid or expired
-    pub fn validate_request(
-        &self,
-        method: &str,
-        path: &str,
-        params: &TempURLParams,
-    ) -> Result<(), SwiftError> {
+    pub fn validate_request(&self, method: &str, path: &str, params: &TempURLParams) -> Result<(), SwiftError> {
         // 1. Check expiration first (fast path for expired URLs)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -139,9 +129,7 @@ impl TempURL {
 
         // 3. Constant-time comparison to prevent timing attacks
         if !constant_time_compare(&params.temp_url_sig, &expected_sig) {
-            return Err(SwiftError::Unauthorized(
-                "Invalid TempURL signature".to_string(),
-            ));
+            return Err(SwiftError::Unauthorized("Invalid TempURL signature".to_string()));
         }
 
         // 4. TODO: Validate IP range if specified (future enhancement)
@@ -196,12 +184,7 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
 /// println!("TempURL: {}", url);
 /// // Output: /v1/AUTH_test/container/object.txt?temp_url_sig=abc123...&temp_url_expires=1234567890
 /// ```
-pub fn generate_tempurl(
-    key: &str,
-    method: &str,
-    ttl_seconds: u64,
-    path: &str,
-) -> Result<String, SwiftError> {
+pub fn generate_tempurl(key: &str, method: &str, ttl_seconds: u64, path: &str) -> Result<String, SwiftError> {
     // Calculate expiration timestamp
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -214,10 +197,7 @@ pub fn generate_tempurl(
     let signature = tempurl.generate_signature(method, expires, path)?;
 
     // Build URL with query parameters
-    let url = format!(
-        "{}?temp_url_sig={}&temp_url_expires={}",
-        path, signature, expires
-    );
+    let url = format!("{}?temp_url_sig={}&temp_url_expires={}", path, signature, expires);
 
     Ok(url)
 }
@@ -299,11 +279,7 @@ mod tests {
         let tempurl = TempURL::new("mykey".to_string());
 
         // Create signature for request that expires far in the future
-        let expires = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 3600; // +1 hour
+        let expires = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600; // +1 hour
 
         let signature = tempurl
             .generate_signature("GET", expires, "/v1/AUTH_test/container/object")
@@ -316,9 +292,11 @@ mod tests {
         };
 
         // Should validate successfully
-        assert!(tempurl
-            .validate_request("GET", "/v1/AUTH_test/container/object", &params)
-            .is_ok());
+        assert!(
+            tempurl
+                .validate_request("GET", "/v1/AUTH_test/container/object", &params)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -326,11 +304,7 @@ mod tests {
         let tempurl = TempURL::new("mykey".to_string());
 
         // Create signature that expired 1 hour ago
-        let expires = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            - 3600; // -1 hour
+        let expires = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 3600; // -1 hour
 
         let signature = tempurl
             .generate_signature("GET", expires, "/v1/AUTH_test/container/object")
@@ -352,11 +326,7 @@ mod tests {
     fn test_validate_request_wrong_signature() {
         let tempurl = TempURL::new("mykey".to_string());
 
-        let expires = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 3600;
+        let expires = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
 
         let params = TempURLParams {
             temp_url_sig: "0000000000000000000000000000000000000000".to_string(), // wrong sig
@@ -374,11 +344,7 @@ mod tests {
     fn test_validate_request_method_mismatch() {
         let tempurl = TempURL::new("mykey".to_string());
 
-        let expires = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 3600;
+        let expires = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
 
         // Generate signature for GET
         let signature = tempurl
@@ -457,8 +423,7 @@ mod tests {
 
     #[test]
     fn test_generate_tempurl() {
-        let url = generate_tempurl("mykey", "GET", 3600, "/v1/AUTH_test/container/object")
-            .unwrap();
+        let url = generate_tempurl("mykey", "GET", 3600, "/v1/AUTH_test/container/object").unwrap();
 
         // Should contain path and query params
         assert!(url.starts_with("/v1/AUTH_test/container/object?"));

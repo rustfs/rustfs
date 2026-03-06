@@ -175,14 +175,12 @@ impl ContainerAcl {
     /// Parse a single ACL grant string
     fn parse_grant(grant_str: &str, allow_public: bool) -> SwiftResult<AclGrant> {
         // Check for public read patterns (.r:*)
-        if grant_str.starts_with(".r:") {
+        if let Some(pattern) = grant_str.strip_prefix(".r:") {
             if !allow_public {
-                return Err(SwiftError::BadRequest(
-                    "Public access not allowed in write ACL".to_string(),
-                ));
+                return Err(SwiftError::BadRequest("Public access not allowed in write ACL".to_string()));
             }
 
-            let pattern = &grant_str[3..]; // Skip ".r:"
+            // Skip ".r:"
             if pattern == "*" {
                 Ok(AclGrant::PublicRead)
             } else if !pattern.is_empty() {
@@ -208,10 +206,7 @@ impl ContainerAcl {
                 Ok(AclGrant::Account(grant_str.to_string()))
             }
         } else {
-            Err(SwiftError::BadRequest(format!(
-                "Invalid ACL grant format: {}",
-                grant_str
-            )))
+            Err(SwiftError::BadRequest(format!("Invalid ACL grant format: {}", grant_str)))
         }
     }
 
@@ -224,12 +219,7 @@ impl ContainerAcl {
     ///
     /// # Returns
     /// `true` if access is allowed, `false` otherwise
-    pub fn check_read_access(
-        &self,
-        request_account: Option<&str>,
-        request_user: Option<&str>,
-        referrer: Option<&str>,
-    ) -> bool {
+    pub fn check_read_access(&self, request_account: Option<&str>, request_user: Option<&str>, referrer: Option<&str>) -> bool {
         if self.read.is_empty() {
             // No read ACL means default behavior: owner can read
             return request_account.is_some();
@@ -242,30 +232,31 @@ impl ContainerAcl {
                     return true;
                 }
                 AclGrant::PublicReadReferrer(pattern) => {
-                    if let Some(ref_header) = referrer {
-                        if Self::matches_referrer_pattern(ref_header, pattern) {
-                            debug!("Read access granted: referrer matches pattern {}", pattern);
-                            return true;
-                        }
+                    if let Some(ref_header) = referrer
+                        && Self::matches_referrer_pattern(ref_header, pattern)
+                    {
+                        debug!("Read access granted: referrer matches pattern {}", pattern);
+                        return true;
                     }
                 }
                 AclGrant::Account(account) => {
-                    if let Some(req_account) = request_account {
-                        if req_account == account {
-                            debug!("Read access granted: account {} matches", account);
-                            return true;
-                        }
+                    if let Some(req_account) = request_account
+                        && req_account == account
+                    {
+                        debug!("Read access granted: account {} matches", account);
+                        return true;
                     }
                 }
                 AclGrant::User {
                     account,
                     user: grant_user,
                 } => {
-                    if let (Some(req_account), Some(req_user)) = (request_account, request_user) {
-                        if req_account == account && req_user == grant_user {
-                            debug!("Read access granted: user {}:{} matches", account, grant_user);
-                            return true;
-                        }
+                    if let (Some(req_account), Some(req_user)) = (request_account, request_user)
+                        && req_account == account
+                        && req_user == grant_user
+                    {
+                        debug!("Read access granted: user {}:{} matches", account, grant_user);
+                        return true;
                     }
                 }
             }
@@ -283,11 +274,7 @@ impl ContainerAcl {
     ///
     /// # Returns
     /// `true` if access is allowed, `false` otherwise
-    pub fn check_write_access(
-        &self,
-        request_account: &str,
-        request_user: Option<&str>,
-    ) -> bool {
+    pub fn check_write_access(&self, request_account: &str, request_user: Option<&str>) -> bool {
         if self.write.is_empty() {
             // No write ACL means default behavior: owner can write
             return true;
@@ -309,11 +296,12 @@ impl ContainerAcl {
                     account,
                     user: grant_user,
                 } => {
-                    if let Some(req_user) = request_user {
-                        if request_account == account && req_user == grant_user {
-                            debug!("Write access granted: user {}:{} matches", account, grant_user);
-                            return true;
-                        }
+                    if let Some(req_user) = request_user
+                        && request_account == account
+                        && req_user == grant_user
+                    {
+                        debug!("Write access granted: user {}:{} matches", account, grant_user);
+                        return true;
                     }
                 }
             }
@@ -329,9 +317,9 @@ impl ContainerAcl {
     /// - `*` at start matches any subdomain: `*.example.com` matches `www.example.com`
     /// - Exact match otherwise
     fn matches_referrer_pattern(referrer: &str, pattern: &str) -> bool {
-        if pattern.starts_with('*') {
+        if let Some(suffix) = pattern.strip_prefix('*') {
             // Wildcard match: *.example.com matches www.example.com, api.example.com, etc.
-            let suffix = &pattern[1..]; // Remove leading *
+            // Remove leading *
             referrer.ends_with(suffix)
         } else {
             // Exact match
@@ -344,13 +332,7 @@ impl ContainerAcl {
         if self.read.is_empty() {
             None
         } else {
-            Some(
-                self.read
-                    .iter()
-                    .map(|g| g.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            )
+            Some(self.read.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(","))
         }
     }
 
@@ -359,13 +341,7 @@ impl ContainerAcl {
         if self.write.is_empty() {
             None
         } else {
-            Some(
-                self.write
-                    .iter()
-                    .map(|g| g.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            )
+            Some(self.write.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(","))
         }
     }
 
@@ -392,10 +368,7 @@ mod tests {
     fn test_parse_referrer_restriction() {
         let grants = ContainerAcl::parse_read(".r:*.example.com").unwrap();
         assert_eq!(grants.len(), 1);
-        assert_eq!(
-            grants[0],
-            AclGrant::PublicReadReferrer("*.example.com".to_string())
-        );
+        assert_eq!(grants[0], AclGrant::PublicReadReferrer("*.example.com".to_string()));
     }
 
     #[test]
@@ -438,10 +411,7 @@ mod tests {
         // Public read in write ACL should fail
         let result = ContainerAcl::parse_write(".r:*");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Public access not allowed"));
+        assert!(result.unwrap_err().to_string().contains("Public access not allowed"));
     }
 
     #[test]
@@ -488,8 +458,7 @@ mod tests {
     #[test]
     fn test_check_referrer_access() {
         let mut acl = ContainerAcl::new();
-        acl.read
-            .push(AclGrant::PublicReadReferrer("*.example.com".to_string()));
+        acl.read.push(AclGrant::PublicReadReferrer("*.example.com".to_string()));
 
         // Matches wildcard
         assert!(acl.check_read_access(None, None, Some("www.example.com")));
@@ -503,8 +472,7 @@ mod tests {
     #[test]
     fn test_check_account_access() {
         let mut acl = ContainerAcl::new();
-        acl.read
-            .push(AclGrant::Account("AUTH_abc123".to_string()));
+        acl.read.push(AclGrant::Account("AUTH_abc123".to_string()));
 
         // Matches account
         assert!(acl.check_read_access(Some("AUTH_abc123"), None, None));
@@ -535,8 +503,7 @@ mod tests {
     #[test]
     fn test_check_write_access() {
         let mut acl = ContainerAcl::new();
-        acl.write
-            .push(AclGrant::Account("AUTH_abc123".to_string()));
+        acl.write.push(AclGrant::Account("AUTH_abc123".to_string()));
 
         // Matches account
         assert!(acl.check_write_access("AUTH_abc123", None));
@@ -561,8 +528,7 @@ mod tests {
     fn test_to_header() {
         let mut acl = ContainerAcl::new();
         acl.read.push(AclGrant::PublicRead);
-        acl.read
-            .push(AclGrant::Account("AUTH_abc123".to_string()));
+        acl.read.push(AclGrant::Account("AUTH_abc123".to_string()));
 
         let header = acl.read_to_header().unwrap();
         assert_eq!(header, ".r:*,AUTH_abc123");
@@ -577,8 +543,278 @@ mod tests {
         assert!(acl.is_public_read());
 
         let mut acl2 = ContainerAcl::new();
-        acl2.read
-            .push(AclGrant::PublicReadReferrer("*.example.com".to_string()));
+        acl2.read.push(AclGrant::PublicReadReferrer("*.example.com".to_string()));
         assert!(acl2.is_public_read());
+    }
+
+    // Integration-style tests for ACL workflows
+
+    #[test]
+    fn test_acl_roundtrip_public_read() {
+        // Simulate: swift post container -r ".r:*"
+        let header = ".r:*";
+        let grants = ContainerAcl::parse_read(header).unwrap();
+
+        let mut acl = ContainerAcl::new();
+        acl.read = grants;
+
+        // Verify anyone can read
+        assert!(acl.check_read_access(None, None, None));
+        assert!(acl.check_read_access(Some("AUTH_other"), None, None));
+    }
+
+    #[test]
+    fn test_acl_roundtrip_referrer_restriction() {
+        // Simulate: swift post container -r ".r:*.example.com"
+        let header = ".r:*.example.com";
+        let grants = ContainerAcl::parse_read(header).unwrap();
+
+        let mut acl = ContainerAcl::new();
+        acl.read = grants;
+
+        // Verify referrer matching
+        assert!(acl.check_read_access(None, None, Some("www.example.com")));
+        assert!(acl.check_read_access(None, None, Some("api.example.com")));
+        assert!(!acl.check_read_access(None, None, Some("www.other.com")));
+        assert!(!acl.check_read_access(None, None, None));
+    }
+
+    #[test]
+    fn test_acl_roundtrip_account_access() {
+        // Simulate: swift post container -r "AUTH_abc123,AUTH_def456"
+        let header = "AUTH_abc123,AUTH_def456";
+        let grants = ContainerAcl::parse_read(header).unwrap();
+
+        let mut acl = ContainerAcl::new();
+        acl.read = grants;
+
+        // Verify account matching
+        assert!(acl.check_read_access(Some("AUTH_abc123"), None, None));
+        assert!(acl.check_read_access(Some("AUTH_def456"), None, None));
+        assert!(!acl.check_read_access(Some("AUTH_other"), None, None));
+        assert!(!acl.check_read_access(None, None, None));
+    }
+
+    #[test]
+    fn test_acl_roundtrip_mixed_grants() {
+        // Simulate: swift post container -r ".r:*.cdn.com,AUTH_abc123,AUTH_def456:user1"
+        let header = ".r:*.cdn.com,AUTH_abc123,AUTH_def456:user1";
+        let grants = ContainerAcl::parse_read(header).unwrap();
+
+        let mut acl = ContainerAcl::new();
+        acl.read = grants;
+
+        // Verify various access patterns
+        assert!(acl.check_read_access(None, None, Some("api.cdn.com"))); // Referrer
+        assert!(acl.check_read_access(Some("AUTH_abc123"), None, None)); // Account
+        assert!(acl.check_read_access(Some("AUTH_def456"), Some("user1"), None)); // User
+        assert!(!acl.check_read_access(Some("AUTH_def456"), Some("user2"), None)); // Wrong user
+        assert!(!acl.check_read_access(Some("AUTH_other"), None, None)); // Wrong account
+    }
+
+    #[test]
+    fn test_acl_write_account_only() {
+        // Simulate: swift post container -w "AUTH_abc123"
+        let header = "AUTH_abc123";
+        let grants = ContainerAcl::parse_write(header).unwrap();
+
+        let mut acl = ContainerAcl::new();
+        acl.write = grants;
+
+        // Verify write access
+        assert!(acl.check_write_access("AUTH_abc123", None));
+        assert!(!acl.check_write_access("AUTH_other", None));
+    }
+
+    #[test]
+    fn test_acl_write_user_specific() {
+        // Simulate: swift post container -w "AUTH_abc123:user1,AUTH_def456:user2"
+        let header = "AUTH_abc123:user1,AUTH_def456:user2";
+        let grants = ContainerAcl::parse_write(header).unwrap();
+
+        let mut acl = ContainerAcl::new();
+        acl.write = grants;
+
+        // Verify user-specific write access
+        assert!(acl.check_write_access("AUTH_abc123", Some("user1")));
+        assert!(acl.check_write_access("AUTH_def456", Some("user2")));
+        assert!(!acl.check_write_access("AUTH_abc123", Some("user2"))); // Wrong user
+        assert!(!acl.check_write_access("AUTH_abc123", None)); // No user specified
+        assert!(!acl.check_write_access("AUTH_other", Some("user1"))); // Wrong account
+    }
+
+    #[test]
+    fn test_acl_permission_denied_scenarios() {
+        // Test various permission denied scenarios
+        let mut acl = ContainerAcl::new();
+        acl.read.push(AclGrant::Account("AUTH_abc123".to_string()));
+        acl.write.push(AclGrant::Account("AUTH_abc123".to_string()));
+
+        // Read denied
+        assert!(!acl.check_read_access(Some("AUTH_other"), None, None));
+        assert!(!acl.check_read_access(None, None, None));
+
+        // Write denied
+        assert!(!acl.check_write_access("AUTH_other", None));
+    }
+
+    #[test]
+    fn test_acl_empty_means_owner_only() {
+        // When no ACL is set, only authenticated owner should have access
+        let acl = ContainerAcl::new();
+
+        // Empty read ACL: authenticated users can read
+        assert!(acl.check_read_access(Some("AUTH_owner"), None, None));
+        assert!(!acl.check_read_access(None, None, None)); // Unauthenticated denied
+
+        // Empty write ACL: owner can write (default behavior)
+        assert!(acl.check_write_access("AUTH_owner", None));
+    }
+
+    #[test]
+    fn test_acl_remove_scenario() {
+        // Simulate removing ACLs (setting to empty)
+        let mut acl = ContainerAcl::new();
+        acl.read.push(AclGrant::PublicRead);
+        acl.write.push(AclGrant::Account("AUTH_abc123".to_string()));
+
+        // Initially has ACLs
+        assert!(acl.is_public_read());
+        assert!(!acl.write.is_empty());
+
+        // Remove ACLs
+        acl.read.clear();
+        acl.write.clear();
+
+        // Now reverts to default behavior
+        assert!(!acl.is_public_read());
+        assert!(acl.read.is_empty());
+        assert!(acl.write.is_empty());
+    }
+
+    #[test]
+    fn test_acl_wildcard_referrer_patterns() {
+        let mut acl = ContainerAcl::new();
+        acl.read.push(AclGrant::PublicReadReferrer("*.example.com".to_string()));
+
+        // Test various subdomain patterns
+        assert!(acl.check_read_access(None, None, Some("www.example.com")));
+        assert!(acl.check_read_access(None, None, Some("api.example.com")));
+        assert!(acl.check_read_access(None, None, Some("cdn.example.com")));
+        assert!(acl.check_read_access(None, None, Some("a.b.c.example.com")));
+
+        // Should not match
+        assert!(!acl.check_read_access(None, None, Some("example.com"))); // No subdomain
+        assert!(!acl.check_read_access(None, None, Some("example.org")));
+        assert!(!acl.check_read_access(None, None, Some("notexample.com")));
+        assert!(!acl.check_read_access(None, None, None)); // No referrer
+    }
+
+    #[test]
+    fn test_acl_exact_referrer_match() {
+        let mut acl = ContainerAcl::new();
+        acl.read.push(AclGrant::PublicReadReferrer("cdn.example.com".to_string()));
+
+        // Exact match only
+        assert!(acl.check_read_access(None, None, Some("cdn.example.com")));
+
+        // Should not match
+        assert!(!acl.check_read_access(None, None, Some("api.cdn.example.com")));
+        assert!(!acl.check_read_access(None, None, Some("www.example.com")));
+        assert!(!acl.check_read_access(None, None, None));
+    }
+
+    #[test]
+    fn test_acl_header_serialization() {
+        // Test round-trip: parse → serialize → parse
+        let original = ".r:*,AUTH_abc123,AUTH_def456:user1";
+        let grants = ContainerAcl::parse_read(original).unwrap();
+
+        let mut acl = ContainerAcl::new();
+        acl.read = grants;
+
+        let serialized = acl.read_to_header().unwrap();
+        let reparsed = ContainerAcl::parse_read(&serialized).unwrap();
+
+        // Should match original parsing
+        assert_eq!(reparsed.len(), 3);
+        assert!(matches!(reparsed[0], AclGrant::PublicRead));
+        assert!(matches!(reparsed[1], AclGrant::Account(_)));
+        assert!(matches!(reparsed[2], AclGrant::User { .. }));
+    }
+
+    #[test]
+    fn test_acl_whitespace_handling() {
+        // Test that whitespace is properly trimmed
+        let header = "  .r:* , AUTH_abc123 , AUTH_def456:user1  ";
+        let grants = ContainerAcl::parse_read(header).unwrap();
+
+        assert_eq!(grants.len(), 3);
+        assert_eq!(grants[0], AclGrant::PublicRead);
+        assert_eq!(grants[1], AclGrant::Account("AUTH_abc123".to_string()));
+    }
+
+    #[test]
+    fn test_acl_multiple_referrer_patterns() {
+        // Multiple referrer restrictions
+        let header = ".r:*.example.com,.r:*.cdn.com";
+        let grants = ContainerAcl::parse_read(header).unwrap();
+
+        let mut acl = ContainerAcl::new();
+        acl.read = grants;
+
+        // Should match either pattern
+        assert!(acl.check_read_access(None, None, Some("www.example.com")));
+        assert!(acl.check_read_access(None, None, Some("api.cdn.com")));
+        assert!(!acl.check_read_access(None, None, Some("www.other.com")));
+    }
+
+    #[test]
+    fn test_acl_user_requires_both_account_and_user() {
+        let mut acl = ContainerAcl::new();
+        acl.read.push(AclGrant::User {
+            account: "AUTH_abc123".to_string(),
+            user: "user1".to_string(),
+        });
+
+        // Need both account and user to match
+        assert!(acl.check_read_access(Some("AUTH_abc123"), Some("user1"), None));
+
+        // Missing user
+        assert!(!acl.check_read_access(Some("AUTH_abc123"), None, None));
+
+        // Wrong user
+        assert!(!acl.check_read_access(Some("AUTH_abc123"), Some("user2"), None));
+
+        // Wrong account
+        assert!(!acl.check_read_access(Some("AUTH_other"), Some("user1"), None));
+    }
+
+    #[test]
+    fn test_acl_complex_scenario() {
+        // Complex real-world scenario: public CDN access + specific accounts
+        let read_header = ".r:*.cloudfront.net,AUTH_admin,AUTH_support:viewer";
+        let write_header = "AUTH_admin,AUTH_publisher:editor";
+
+        let read_grants = ContainerAcl::parse_read(read_header).unwrap();
+        let write_grants = ContainerAcl::parse_write(write_header).unwrap();
+
+        let mut acl = ContainerAcl::new();
+        acl.read = read_grants;
+        acl.write = write_grants;
+
+        // Read access scenarios
+        assert!(acl.check_read_access(None, None, Some("d111.cloudfront.net"))); // CDN
+        assert!(acl.check_read_access(Some("AUTH_admin"), None, None)); // Admin account
+        assert!(acl.check_read_access(Some("AUTH_support"), Some("viewer"), None)); // Support viewer
+        assert!(!acl.check_read_access(Some("AUTH_support"), Some("other"), None)); // Wrong user
+        assert!(!acl.check_read_access(Some("AUTH_other"), None, None)); // Unauthorized
+
+        // Write access scenarios
+        assert!(acl.check_write_access("AUTH_admin", None)); // Admin account
+        assert!(acl.check_write_access("AUTH_publisher", Some("editor"))); // Publisher editor
+        assert!(!acl.check_write_access("AUTH_publisher", Some("viewer"))); // Wrong role
+        assert!(!acl.check_write_access("AUTH_support", Some("viewer"))); // Read-only
+        assert!(!acl.check_write_access("AUTH_other", None)); // Unauthorized
     }
 }

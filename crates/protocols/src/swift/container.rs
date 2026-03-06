@@ -60,9 +60,7 @@ fn swift_metadata_to_s3_tags(metadata: &std::collections::HashMap<String, String
     if tags.is_empty() {
         None
     } else {
-        Some(Tagging {
-            tag_set: tags,
-        })
+        Some(Tagging { tag_set: tags })
     }
 }
 
@@ -75,11 +73,11 @@ fn s3_tags_to_swift_metadata(tagging: &Tagging) -> std::collections::HashMap<Str
 
     for tag in &tagging.tag_set {
         // Only process tags with "swift-meta-" prefix
-        if let (Some(key), Some(value)) = (&tag.key, &tag.value) {
-            if key.starts_with("swift-meta-") {
-                let meta_key = &key[11..]; // Skip "swift-meta-"
-                metadata.insert(meta_key.to_string(), value.clone());
-            }
+        if let (Some(key), Some(value)) = (&tag.key, &tag.value)
+            && let Some(meta_key) = key.strip_prefix("swift-meta-")
+        {
+            // Skip "swift-meta-"
+            metadata.insert(meta_key.to_string(), value.clone());
         }
     }
 
@@ -475,7 +473,9 @@ pub async fn update_container_metadata(
     let mut bucket_meta_clone = (*bucket_meta).clone();
 
     // Get existing tags, preserving non-Swift tags
-    let mut existing_tagging = bucket_meta_clone.tagging_config.clone()
+    let mut existing_tagging = bucket_meta_clone
+        .tagging_config
+        .clone()
         .unwrap_or_else(|| Tagging { tag_set: vec![] });
 
     // Remove old swift-meta-* tags while preserving other tags
@@ -830,11 +830,7 @@ pub async fn enable_versioning(
 /// * `container` - Container name to disable versioning on
 /// * `credentials` - Keystone credentials
 #[allow(dead_code)] // Used by handler
-pub async fn disable_versioning(
-    account: &str,
-    container: &str,
-    credentials: &Credentials,
-) -> SwiftResult<()> {
+pub async fn disable_versioning(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<()> {
     // Validate account access
     let project_id = validate_account_access(account, credentials)?;
 
@@ -906,11 +902,7 @@ pub async fn disable_versioning(
 /// - Some(archive_container_name) if versioning is enabled
 /// - None if versioning is not enabled
 #[allow(dead_code)] // Used by handler and object.rs
-pub async fn get_versions_location(
-    account: &str,
-    container: &str,
-    credentials: &Credentials,
-) -> SwiftResult<Option<String>> {
+pub async fn get_versions_location(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<Option<String>> {
     // Validate account access
     let project_id = validate_account_access(account, credentials)?;
 
@@ -1033,29 +1025,26 @@ pub async fn set_container_acl(
     // Remove old ACL tags
     existing_tagging
         .tag_set
-        .retain(|tag| {
-            tag.key.as_deref() != Some("swift-acl-read") &&
-            tag.key.as_deref() != Some("swift-acl-write")
-        });
+        .retain(|tag| tag.key.as_deref() != Some("swift-acl-read") && tag.key.as_deref() != Some("swift-acl-write"));
 
     // Add new read ACL tag if provided
-    if let Some(read) = read_acl {
-        if !read.trim().is_empty() {
-            existing_tagging.tag_set.push(Tag {
-                key: Some("swift-acl-read".to_string()),
-                value: Some(read.to_string()),
-            });
-        }
+    if let Some(read) = read_acl
+        && !read.trim().is_empty()
+    {
+        existing_tagging.tag_set.push(Tag {
+            key: Some("swift-acl-read".to_string()),
+            value: Some(read.to_string()),
+        });
     }
 
     // Add new write ACL tag if provided
-    if let Some(write) = write_acl {
-        if !write.trim().is_empty() {
-            existing_tagging.tag_set.push(Tag {
-                key: Some("swift-acl-write".to_string()),
-                value: Some(write.to_string()),
-            });
-        }
+    if let Some(write) = write_acl
+        && !write.trim().is_empty()
+    {
+        existing_tagging.tag_set.push(Tag {
+            key: Some("swift-acl-write".to_string()),
+            value: Some(write.to_string()),
+        });
     }
 
     let now = time::OffsetDateTime::now_utc();
@@ -1080,7 +1069,10 @@ pub async fn set_container_acl(
         .await
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
 
-    debug!("Set ACLs for container {}/{}: read={:?}, write={:?}", account, container, read_acl, write_acl);
+    debug!(
+        "Set ACLs for container {}/{}: read={:?}, write={:?}",
+        account, container, read_acl, write_acl
+    );
 
     Ok(())
 }
@@ -1120,15 +1112,13 @@ pub async fn get_container_acl(
     let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
 
     // Load bucket metadata
-    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                SwiftError::NotFound(format!("Container '{}' not found", container))
-            } else {
-                SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e))
-            }
-        })?;
+    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name).await.map_err(|e| {
+        if e.to_string().contains("not found") {
+            SwiftError::NotFound(format!("Container '{}' not found", container))
+        } else {
+            SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e))
+        }
+    })?;
 
     // Get tagging config
     let tagging = bucket_meta.tagging_config.as_ref();
@@ -1168,11 +1158,7 @@ pub async fn get_container_acl(
 /// # Returns
 /// Ok(()) if ACLs were deleted successfully
 #[allow(dead_code)] // Used by handler
-pub async fn delete_container_acl(
-    account: &str,
-    container: &str,
-    credentials: &Credentials,
-) -> SwiftResult<()> {
+pub async fn delete_container_acl(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<()> {
     // Setting both ACLs to None removes them
     set_container_acl(account, container, None, None, credentials).await
 }
@@ -1437,12 +1423,16 @@ mod tests {
         assert_eq!(tagging.tag_set.len(), 2);
 
         // Verify tags have swift-meta- prefix
-        let color_tag = tagging.tag_set.iter()
+        let color_tag = tagging
+            .tag_set
+            .iter()
             .find(|t| t.key.as_deref() == Some("swift-meta-color"))
             .expect("color tag not found");
         assert_eq!(color_tag.value.as_deref(), Some("blue"));
 
-        let desc_tag = tagging.tag_set.iter()
+        let desc_tag = tagging
+            .tag_set
+            .iter()
             .find(|t| t.key.as_deref() == Some("swift-meta-description"))
             .expect("description tag not found");
         assert_eq!(desc_tag.value.as_deref(), Some("test container"));
@@ -1465,10 +1455,17 @@ mod tests {
 
         // Keys should be lowercased
         assert!(tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("swift-meta-color")));
-        assert!(tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("swift-meta-priority")));
+        assert!(
+            tagging
+                .tag_set
+                .iter()
+                .any(|t| t.key.as_deref() == Some("swift-meta-priority"))
+        );
 
         // Values should be preserved as-is
-        let color_tag = tagging.tag_set.iter()
+        let color_tag = tagging
+            .tag_set
+            .iter()
             .find(|t| t.key.as_deref() == Some("swift-meta-color"))
             .unwrap();
         assert_eq!(color_tag.value.as_deref(), Some("Red"));
@@ -1502,9 +1499,7 @@ mod tests {
 
     #[test]
     fn test_s3_tags_to_swift_metadata_empty() {
-        let tagging = Tagging {
-            tag_set: vec![],
-        };
+        let tagging = Tagging { tag_set: vec![] };
 
         let metadata = s3_tags_to_swift_metadata(&tagging);
         assert!(metadata.is_empty());
@@ -1591,11 +1586,11 @@ mod tests {
         // Verify: should have env, team, and new swift-meta-description
         assert_eq!(existing_tagging.tag_set.len(), 3);
 
-        let has_env = existing_tagging.tag_set.iter()
-            .any(|t| t.key.as_deref() == Some("env"));
-        let has_team = existing_tagging.tag_set.iter()
-            .any(|t| t.key.as_deref() == Some("team"));
-        let has_description = existing_tagging.tag_set.iter()
+        let has_env = existing_tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("env"));
+        let has_team = existing_tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("team"));
+        let has_description = existing_tagging
+            .tag_set
+            .iter()
             .any(|t| t.key.as_deref() == Some("swift-meta-description"));
 
         assert!(has_env, "env tag should be preserved");
@@ -1639,12 +1634,15 @@ mod tests {
         // Verify: should only have env and cost-center
         assert_eq!(existing_tagging.tag_set.len(), 2);
 
-        let has_env = existing_tagging.tag_set.iter()
-            .any(|t| t.key.as_deref() == Some("env"));
-        let has_cost_center = existing_tagging.tag_set.iter()
+        let has_env = existing_tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("env"));
+        let has_cost_center = existing_tagging
+            .tag_set
+            .iter()
             .any(|t| t.key.as_deref() == Some("cost-center"));
-        let has_swift_meta = existing_tagging.tag_set.iter()
-            .any(|t| t.key.as_ref().map_or(false, |k| k.starts_with("swift-meta-")));
+        let has_swift_meta = existing_tagging
+            .tag_set
+            .iter()
+            .any(|t| t.key.as_ref().is_some_and(|k| k.starts_with("swift-meta-")));
 
         assert!(has_env, "env tag should be preserved");
         assert!(has_cost_center, "cost-center tag should be preserved");
@@ -1677,15 +1675,16 @@ mod tests {
         });
 
         // Verify: should be empty
-        assert!(existing_tagging.tag_set.is_empty(), "tagging should be empty after removing all swift-meta-* tags");
+        assert!(
+            existing_tagging.tag_set.is_empty(),
+            "tagging should be empty after removing all swift-meta-* tags"
+        );
     }
 
     #[test]
     fn test_tag_preservation_no_existing_tags() {
         // Test adding Swift metadata when no tags exist
-        let existing_tagging = Tagging {
-            tag_set: vec![],
-        };
+        let existing_tagging = Tagging { tag_set: vec![] };
 
         let mut new_metadata = std::collections::HashMap::new();
         new_metadata.insert("color".to_string(), "blue".to_string());
@@ -1788,19 +1787,22 @@ mod tests {
         assert_eq!(tagging.tag_set.len(), 2);
         assert!(tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("swift-meta-color")));
         assert!(tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("env")));
-        assert!(!tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("swift-versions-location")));
+        assert!(
+            !tagging
+                .tag_set
+                .iter()
+                .any(|t| t.key.as_deref() == Some("swift-versions-location"))
+        );
     }
 
     #[test]
     fn test_versioning_tag_update() {
         // Test updating versioning location
         let mut tagging = Tagging {
-            tag_set: vec![
-                Tag {
-                    key: Some("swift-versions-location".to_string()),
-                    value: Some("old-archive".to_string()),
-                },
-            ],
+            tag_set: vec![Tag {
+                key: Some("swift-versions-location".to_string()),
+                value: Some("old-archive".to_string()),
+            }],
         };
 
         // Remove old versioning tag
