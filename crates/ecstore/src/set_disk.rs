@@ -82,6 +82,10 @@ use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, Wa
 use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER};
+use rustfs_utils::http::{
+    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, contains_key_str, get_str,
+    insert_str,
+};
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
@@ -675,8 +679,8 @@ impl ObjectIO for SetDisks {
             )));
         }
 
-        if user_defined.contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression")) {
-            user_defined.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"), w_size.to_string());
+        if contains_key_str(&user_defined, SUFFIX_COMPRESSION) {
+            insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
         }
 
         let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
@@ -2844,25 +2848,19 @@ impl MultipartOperations for SetDisks {
         fi.metadata.insert("etag".to_owned(), etag);
 
         if opts.replication_request {
-            if let Some(actual_size) = opts
-                .user_defined
-                .get(format!("{RESERVED_METADATA_PREFIX_LOWER}Actual-Object-Size").as_str())
-            {
+            if let Some(actual_size) = get_str(&opts.user_defined, SUFFIX_ACTUAL_OBJECT_SIZE_CAP) {
+                insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, actual_size.clone());
                 fi.metadata
-                    .insert(format!("{RESERVED_METADATA_PREFIX}actual-size"), actual_size.clone());
-                fi.metadata
-                    .insert("x-rustfs-encryption-original-size".to_string(), actual_size.to_string());
+                    .insert("x-rustfs-encryption-original-size".to_string(), actual_size);
             }
         } else {
-            fi.metadata
-                .insert(format!("{RESERVED_METADATA_PREFIX}actual-size"), object_actual_size.to_string());
+            insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, object_actual_size.to_string());
             fi.metadata
                 .insert("x-rustfs-encryption-original-size".to_string(), object_actual_size.to_string());
         }
 
         if fi.is_compressed() {
-            fi.metadata
-                .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"), object_size.to_string());
+            insert_str(&mut fi.metadata, SUFFIX_COMPRESSION_SIZE, object_size.to_string());
         }
 
         if opts.data_movement {
