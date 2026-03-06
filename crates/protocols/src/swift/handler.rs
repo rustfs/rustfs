@@ -663,21 +663,52 @@ async fn handle_authenticated_request(
                         }
                     }
 
-                    // Regular object delete
-                    object::delete_object(&account, &container, &object, &credentials).await?;
-
-                    // Check if versioning is enabled and restore previous version
+                    // Check if versioning is enabled
                     if let Some(archive_container) = container::get_versions_location(&account, &container, &credentials).await? {
-                        // Attempt to restore previous version from archive
-                        // Ignore errors if no versions exist (object is fully deleted)
-                        let _ = super::versioning::restore_previous_version(
+                        // Versioning enabled - follow Swift versioning DELETE flow:
+                        // 1. Archive current version (if it exists)
+                        // 2. Restore previous version from archive
+                        // 3. If no previous version exists, delete the object
+
+                        // Step 1: Archive current version before doing anything else
+                        // This preserves the current object in version history
+                        let object_exists = object::head_object(&account, &container, &object, &credentials).await.is_ok();
+
+                        if object_exists {
+                            // Archive current version to preserve it
+                            super::versioning::archive_current_version(
+                                &account,
+                                &container,
+                                &object,
+                                &archive_container,
+                                &credentials,
+                            )
+                            .await?;
+                        }
+
+                        // Step 2: Try to restore previous version from archive
+                        let restored = super::versioning::restore_previous_version(
                             &account,
                             &container,
                             &object,
                             &archive_container,
                             &credentials,
                         )
-                        .await;
+                        .await
+                        .unwrap_or_else(|e| {
+                            // Log restore error but don't fail the DELETE
+                            tracing::warn!("Failed to restore version after delete: {}", e);
+                            false
+                        });
+
+                        // Step 3: If no version was restored, delete the object
+                        // (This handles the case where object exists but has no archived versions)
+                        if !restored && object_exists {
+                            object::delete_object(&account, &container, &object, &credentials).await?;
+                        }
+                    } else {
+                        // No versioning - regular delete
+                        object::delete_object(&account, &container, &object, &credentials).await?;
                     }
 
                     let trans_id = generate_trans_id();
