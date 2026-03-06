@@ -18,13 +18,13 @@
 //! Use suffix-based API: `get_header(headers, SUFFIX_FORCE_DELETE)` queries both
 //! x-rustfs-force-delete and x-minio-force-delete.
 
-use super::headers::RUSTFS_ENCRYPTION_LOWER;
 use http::{HeaderMap, HeaderValue};
 use std::borrow::Cow;
 
 const RUSTFS_PREFIX: &str = "x-rustfs-";
 const MINIO_PREFIX: &str = "x-minio-";
 const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
+const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
 
 // Suffix constants (part after x-rustfs- or x-minio-). Use with get_header/insert_header.
 pub const SUFFIX_FORCE_DELETE: &str = "force-delete";
@@ -44,7 +44,7 @@ pub const SUFFIX_REPLICATION_SSEC_CRC: &str = "replication-ssec-crc";
 /// x-minio-encryption-*). Case-insensitive for metadata filtering.
 pub fn is_encryption_metadata_key(key: &str) -> bool {
     let lower = key.to_lowercase();
-    lower.starts_with(RUSTFS_ENCRYPTION_LOWER) || lower.starts_with(MINIO_ENCRYPTION_PREFIX)
+    lower.starts_with(RUSTFS_ENCRYPTION_PREFIX) || lower.starts_with(MINIO_ENCRYPTION_PREFIX)
 }
 
 fn rustfs_key(suffix: &str) -> String {
