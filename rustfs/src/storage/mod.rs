@@ -21,6 +21,7 @@ pub mod options;
 pub(crate) mod readers;
 pub mod rpc;
 pub(crate) mod s3_api;
+pub(crate) mod s3_metrics;
 mod sse;
 pub mod tonic_service;
 
