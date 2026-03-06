@@ -762,18 +762,21 @@ pub async fn enable_versioning(
             }
         })?;
 
-    // Create archive container if it doesn't exist
-    let archive_exists = store
+    // Verify archive container exists (do NOT auto-create for security)
+    // Users must explicitly create the archive container before enabling versioning
+    store
         .get_bucket_info(&archive_bucket_name, &BucketOptions::default())
         .await
-        .is_ok();
-
-    if !archive_exists {
-        store
-            .make_bucket(&archive_bucket_name, &MakeBucketOptions::default())
-            .await
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to create archive container: {}", e)))?;
-    }
+        .map_err(|e| {
+            if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
+                SwiftError::BadRequest(format!(
+                    "Archive container '{}' does not exist. Please create it before enabling versioning.",
+                    archive_container
+                ))
+            } else {
+                sanitize_storage_error("Archive container verification", e)
+            }
+        })?;
 
     // Load current bucket metadata
     let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
