@@ -273,6 +273,14 @@ async fn handle_authenticated_request(
         } => {
             match method {
                 Method::PUT => {
+                    // Check for versioning header
+                    if let Some(versions_location) = headers.get("x-versions-location") {
+                        if let Ok(archive_container) = versions_location.to_str() {
+                            // Enable versioning on this container
+                            container::enable_versioning(&account, &container, archive_container, &credentials).await?;
+                        }
+                    }
+
                     // Create container
                     let is_new = container::create_container(&account, &container, &credentials).await?;
 
@@ -341,6 +349,17 @@ async fn handle_authenticated_request(
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
                 }
                 Method::POST => {
+                    // Check for versioning headers first
+                    if let Some(versions_location) = headers.get("x-versions-location") {
+                        if let Ok(archive_container) = versions_location.to_str() {
+                            // Enable versioning
+                            container::enable_versioning(&account, &container, archive_container, &credentials).await?;
+                        }
+                    } else if headers.contains_key("x-remove-versions-location") {
+                        // Disable versioning
+                        container::disable_versioning(&account, &container, &credentials).await?;
+                    }
+
                     // Update container metadata - now we have access to request headers
                     let mut metadata = std::collections::HashMap::new();
                     for (name, value) in headers.iter() {
@@ -400,6 +419,22 @@ async fn handle_authenticated_request(
                     if let Some(manifest_value) = headers.get("x-object-manifest") {
                         if let Ok(manifest_str) = manifest_value.to_str() {
                             return dlo::handle_dlo_register(&account, &container, &object, manifest_str, &Some(credentials.clone())).await;
+                        }
+                    }
+
+                    // Check if versioning is enabled for this container
+                    if let Some(archive_container) = container::get_versions_location(&account, &container, &credentials).await? {
+                        // Check if object already exists (need to archive it)
+                        if object::head_object(&account, &container, &object, &credentials).await.is_ok() {
+                            // Archive current version before overwriting
+                            super::versioning::archive_current_version(
+                                &account,
+                                &container,
+                                &object,
+                                &archive_container,
+                                &credentials,
+                            )
+                            .await?;
                         }
                     }
 
@@ -630,6 +665,20 @@ async fn handle_authenticated_request(
 
                     // Regular object delete
                     object::delete_object(&account, &container, &object, &credentials).await?;
+
+                    // Check if versioning is enabled and restore previous version
+                    if let Some(archive_container) = container::get_versions_location(&account, &container, &credentials).await? {
+                        // Attempt to restore previous version from archive
+                        // Ignore errors if no versions exist (object is fully deleted)
+                        let _ = super::versioning::restore_previous_version(
+                            &account,
+                            &container,
+                            &object,
+                            &archive_container,
+                            &credentials,
+                        )
+                        .await;
+                    }
 
                     let trans_id = generate_trans_id();
                     Response::builder()
