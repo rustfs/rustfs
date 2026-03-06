@@ -163,6 +163,11 @@ pub fn record_s3_op(op: S3Operation, bucket: &str) {
     counter!(S3_OPS_METRIC, "op" => op.as_str(), "bucket" => bucket.to_owned()).increment(1);
 }
 
-pub fn describe_s3_metrics() {
-    describe_counter!(S3_OPS_METRIC, "Total number of S3 API operations handled");
+/// One-time registration of indicator meta information
+/// This function ensures that metric descriptors are registered only once.
+pub fn init_s3_metrics() {
+    static METRICS_DESC_INIT: OnceLock<()> = OnceLock::new();
+    METRICS_DESC_INIT.get_or_init(|| {
+        describe_counter!(S3_OPS_METRIC, "Total number of S3 API operations handled");
+    });
 }

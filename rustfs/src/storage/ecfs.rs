@@ -98,9 +98,7 @@ impl AsyncSeek for InMemoryAsyncReader {
 
 impl FS {
     pub fn new() -> Self {
-        use std::sync::Once;
-        static DESCRIBE: Once = Once::new();
-        DESCRIBE.call_once(crate::storage::s3_metrics::describe_s3_metrics);
+        crate::storage::s3_metrics::init_s3_metrics();
         Self {}
     }
 
