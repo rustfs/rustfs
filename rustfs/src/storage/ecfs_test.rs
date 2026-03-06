@@ -29,7 +29,10 @@ mod tests {
     use rustfs_ecstore::bucket::{metadata::BucketMetadata, metadata_sys};
     use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
     use rustfs_ecstore::store_api::ObjectInfo;
-    use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, RESERVED_METADATA_PREFIX_LOWER};
+    use rustfs_utils::http::{
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+        contains_key_str,
+    };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
         CORSConfiguration, CORSRule, Delimiter, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
@@ -440,9 +443,7 @@ mod tests {
             compliance_metadata.get("x-amz-object-lock-retain-until-date").unwrap(),
             "2030-01-01T00:00:00Z"
         );
-        assert!(
-            compliance_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"))
-        );
+        assert!(contains_key_str(&compliance_metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
 
         // [3] Normal case: Retention with valid GOVERNANCE mode (future date)
         let valid_governance_retention = ObjectLockRetention {
@@ -502,7 +503,7 @@ mod tests {
         };
         let on_metadata = parse_object_lock_legal_hold(Some(valid_on_legal_hold)).unwrap();
         assert_eq!(on_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "ON");
-        assert!(on_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp")));
+        assert!(contains_key_str(&on_metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP));
 
         // [3] Normal case: Legal hold with valid OFF status
         let valid_off_legal_hold = ObjectLockLegalHold {

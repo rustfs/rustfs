@@ -82,12 +82,11 @@ use rustfs_s3select_query::get_global_db;
 use rustfs_targets::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION,
-    SUFFIX_COMPRESSION_SIZE,
+    SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     headers::{
         AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
         AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
         AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
-        RESERVED_METADATA_PREFIX_LOWER,
     },
     insert_str, remove_str,
 };
@@ -495,10 +494,12 @@ impl DefaultObjectUsecase {
         let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
-            let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
-            opts.user_defined.insert(k, jiff::Zoned::now().to_string());
-            let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
-            opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
+            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_REPLICATION_STATUS,
+                dsc.pending_status().unwrap_or_default(),
+            );
         }
 
         let obj_info = store
