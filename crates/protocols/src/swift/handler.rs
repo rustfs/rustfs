@@ -409,14 +409,23 @@ async fn handle_swift_request(
                         // and set proper Content-Range and Content-Length headers
                         response = response.header("accept-ranges", "bytes");
                         if let Some(rh) = range_header {
-                            // TODO: Calculate actual byte range from parsed_range and object size
-                            // For now, use the original Range header as Content-Range
-                            // This should be improved to format: "bytes START-END/TOTAL"
-                            response = response.header("content-range", format!("bytes {}", &rh[6..]));
+                            // Parse Range header and calculate actual byte range
+                            if let Some((start, end)) = parse_range_header(rh, info.size as u64) {
+                                let length = end - start + 1;
+                                response = response
+                                    .header("content-range", format!("bytes {}-{}/{}", start, end, info.size))
+                                    .header("content-length", length.to_string());
+                            } else {
+                                // Invalid range - return full object with 200 OK
+                                response = response
+                                    .status(StatusCode::OK)
+                                    .header("content-length", info.size.to_string());
+                            }
+                        } else {
+                            // No valid range - should not happen since we set is_range_request
+                            // But be defensive
+                            response = response.header("content-length", info.size.to_string());
                         }
-                        // TODO: Set content-length to actual range size, not full object size
-                        // For now we'll set the full size (incorrect but prevents breaking clients)
-                        response = response.header("content-length", info.size.to_string());
                     } else {
                         // For full responses, set full length and advertise range support
                         response = response
@@ -595,6 +604,52 @@ fn generate_trans_id() -> String {
     format!("tx{:x}", timestamp)
 }
 
+/// Parse Range header and calculate actual byte range
+///
+/// Supports formats:
+/// - "bytes=100-199" (range from 100 to 199 inclusive)
+/// - "bytes=100-" (from 100 to end)
+/// - "bytes=-500" (last 500 bytes)
+///
+/// Returns Some((start, end)) for valid range, None for invalid
+fn parse_range_header(range_header: &str, total_size: u64) -> Option<(u64, u64)> {
+    if total_size == 0 {
+        return None;
+    }
+
+    // Expected format: "bytes=START-END" or "bytes=START-" or "bytes=-SUFFIX"
+    let range_spec = range_header.strip_prefix("bytes=")?;
+
+    // Only consider first range if multiple specified (some clients send multiple ranges)
+    let first_range = range_spec.split(',').next()?.trim();
+
+    // Split on hyphen
+    let mut parts = first_range.splitn(2, '-');
+    let start_str = parts.next()?.trim();
+    let end_str = parts.next()?.trim();
+
+    match (start_str.parse::<u64>().ok(), end_str.parse::<u64>().ok()) {
+        // bytes=START-END
+        (Some(start), Some(end)) if start < total_size && start <= end => {
+            let end = end.min(total_size - 1);
+            Some((start, end))
+        }
+        // bytes=START- (from start to end of file)
+        (Some(start), None) if start < total_size => {
+            Some((start, total_size - 1))
+        }
+        // bytes=-SUFFIX (last N bytes)
+        (None, Some(suffix_len)) if suffix_len > 0 => {
+            let len = suffix_len.min(total_size);
+            let start = total_size - len;
+            let end = total_size - 1;
+            Some((start, end))
+        }
+        // Invalid or unsatisfiable range
+        _ => None,
+    }
+}
+
 /// Convert SwiftError to HTTP Response
 fn swift_error_to_response(error: SwiftError) -> Response<Body> {
     let trans_id = generate_trans_id();
@@ -622,8 +677,99 @@ fn swift_error_to_response(error: SwiftError) -> Response<Body> {
         })
 }
 
-// Tests will be added when handler architecture supports full request access
-// #[cfg(test)]
-// mod tests {
-//     // Tests will be re-enabled after handler refactoring
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_range_header_start_end() {
+        // bytes=100-199
+        let result = parse_range_header("bytes=100-199", 1000);
+        assert_eq!(result, Some((100, 199)));
+    }
+
+    #[test]
+    fn test_parse_range_header_start_to_eof() {
+        // bytes=100- (from 100 to end)
+        let result = parse_range_header("bytes=100-", 1000);
+        assert_eq!(result, Some((100, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_header_suffix() {
+        // bytes=-500 (last 500 bytes)
+        let result = parse_range_header("bytes=-500", 1000);
+        assert_eq!(result, Some((500, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_header_suffix_larger_than_file() {
+        // bytes=-2000 when file is only 1000 bytes
+        let result = parse_range_header("bytes=-2000", 1000);
+        assert_eq!(result, Some((0, 999)));
+    }
+
+    #[test]
+    fn test_parse_range_header_end_beyond_eof() {
+        // bytes=100-2000 when file is only 1000 bytes
+        let result = parse_range_header("bytes=100-2000", 1000);
+        assert_eq!(result, Some((100, 999))); // Clamp to EOF
+    }
+
+    #[test]
+    fn test_parse_range_header_start_beyond_eof() {
+        // bytes=1500- when file is only 1000 bytes
+        let result = parse_range_header("bytes=1500-", 1000);
+        assert_eq!(result, None); // Invalid
+    }
+
+    #[test]
+    fn test_parse_range_header_invalid_start_greater_than_end() {
+        // bytes=500-100 (start > end)
+        let result = parse_range_header("bytes=500-100", 1000);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_range_header_zero_size_file() {
+        // Any range on 0-byte file is invalid
+        let result = parse_range_header("bytes=0-100", 0);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_range_header_multiple_ranges_first_only() {
+        // bytes=0-100,200-300 (only parse first range)
+        let result = parse_range_header("bytes=0-100,200-300", 1000);
+        assert_eq!(result, Some((0, 100)));
+    }
+
+    #[test]
+    fn test_parse_range_header_no_bytes_prefix() {
+        // Missing "bytes=" prefix
+        let result = parse_range_header("0-100", 1000);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_range_header_invalid_format() {
+        // Invalid format
+        let result = parse_range_header("bytes=abc-def", 1000);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_range_header_single_byte() {
+        // bytes=100-100 (single byte)
+        let result = parse_range_header("bytes=100-100", 1000);
+        assert_eq!(result, Some((100, 100)));
+    }
+
+    #[test]
+    fn test_parse_range_header_full_file() {
+        // bytes=0-999 (entire 1000-byte file)
+        let result = parse_range_header("bytes=0-999", 1000);
+        assert_eq!(result, Some((0, 999)));
+    }
+}
+
