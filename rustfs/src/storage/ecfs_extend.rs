@@ -31,7 +31,7 @@ use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-    RESERVED_METADATA_PREFIX_LOWER,
+    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, insert_str,
 };
 use s3s::dto::{
     Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
@@ -284,8 +284,9 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
         // This is intentional behavior. Empty string represents "retention cleared" which is different from "retention never set". Consistent with minio
         eval_metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode);
         eval_metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), retain_until_date);
-        eval_metadata.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"),
+        insert_str(
+            &mut eval_metadata,
+            SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
             format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
         );
     }
@@ -310,8 +311,9 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
         let now = OffsetDateTime::now_utc();
         // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set".
         eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
-        eval_metadata.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
+        insert_str(
+            &mut eval_metadata,
+            SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
             format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
         );
     }

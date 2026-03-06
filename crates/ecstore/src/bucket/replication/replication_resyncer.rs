@@ -46,19 +46,20 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use regex::Regex;
 use rustfs_filemeta::{
-    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateDecision, ReplicateObjectInfo,
+    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
     ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType,
     ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
-    RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
-    headers,
+    SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_RESET_ARN_PREFIX,
+    SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP, headers,
 };
 use rustfs_utils::http::{
-    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_SSEC_CRC, get_header_map,
-    insert_header_map,
+    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_SSEC_CRC, get_header_map, get_str,
+    has_internal_suffix, insert_header_map, insert_str, internal_key_strip_suffix_prefix, is_internal_key,
 };
 use rustfs_utils::path::path_join_buf;
 use rustfs_utils::string::strings_has_prefix_fold;
@@ -611,7 +612,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
 
         let keys_to_update: Vec<_> = user_defined
             .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case(format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}").as_str()))
+            .filter(|(k, _)| has_internal_suffix(k, SUFFIX_REPLICATION_RESET))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
@@ -1126,15 +1127,7 @@ impl ObjectInfoExt for ObjectInfo {
                 .user_defined
                 .iter()
                 .filter_map(|(k, v)| {
-                    if k.starts_with(&format!("{RESERVED_METADATA_PREFIX_LOWER}-{REPLICATION_RESET}")) {
-                        Some((
-                            k.trim_start_matches(&format!("{RESERVED_METADATA_PREFIX_LOWER}-{REPLICATION_RESET}"))
-                                .to_string(),
-                            v.clone(),
-                        ))
-                    } else {
-                        None
-                    }
+                    internal_key_strip_suffix_prefix(k, SUFFIX_REPLICATION_RESET_ARN_PREFIX).map(|arn| (arn, v.clone()))
                 })
                 .collect(),
             ..Default::default()
@@ -1883,7 +1876,7 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
         let mut eval_metadata = HashMap::new();
         if let Some(ref s) = new_replication_internal {
-            eval_metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}replication-status"), s.clone());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, s.clone());
         }
         let popts = ObjectOptions {
             version_id: roi.version_id.map(|v| v.to_string()),
@@ -2547,7 +2540,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
 
         // In case of SSE-C objects copy the allowed internal headers as well
         if !is_ssec || !has_valid_sse_header {
-            if strings_has_prefix_fold(k, RESERVED_METADATA_PREFIX) {
+            if is_internal_key(k) {
                 continue;
             }
             if is_standard_header(k) {
@@ -2631,11 +2624,8 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
         if !tags.is_empty() {
             put_op.user_tags = tags;
             // set tag timestamp in opts
-            put_op.internal.tagging_timestamp = if let Some(ts) = object_info
-                .user_defined
-                .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}tagging-timestamp"))
-            {
-                OffsetDateTime::parse(ts, &Rfc3339)
+            put_op.internal.tagging_timestamp = if let Some(ts) = get_str(&object_info.user_defined, SUFFIX_TAGGING_TIMESTAMP) {
+                OffsetDateTime::parse(&ts, &Rfc3339)
                     .map_err(|e| Error::other(format!("Failed to parse tagging timestamp: {}", e)))?
             } else {
                 object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
@@ -2667,28 +2657,24 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
         put_op.retain_until_date =
             OffsetDateTime::parse(v, &Rfc3339).map_err(|e| Error::other(format!("Failed to parse retain until date: {}", e)))?;
         // set retention timestamp in opts
-        put_op.internal.retention_timestamp = if let Some(v) = object_info
-            .user_defined
-            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}objectlock-retention-timestamp"))
-        {
-            OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        } else {
-            object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        };
+        put_op.internal.retention_timestamp =
+            if let Some(v) = get_str(&object_info.user_defined, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP) {
+                OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            } else {
+                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            };
     }
 
     if let Some(v) = lk_map.lookup(headers::AMZ_OBJECT_LOCK_LEGAL_HOLD) {
         let hold = v.to_uppercase();
         put_op.legalhold = Some(ObjectLockLegalHoldStatus::from(hold.as_str()));
         // set legalhold timestamp in opts
-        put_op.internal.legalhold_timestamp = if let Some(v) = object_info
-            .user_defined
-            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}objectlock-legalhold-timestamp"))
-        {
-            OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        } else {
-            object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        };
+        put_op.internal.legalhold_timestamp =
+            if let Some(v) = get_str(&object_info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP) {
+                OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            } else {
+                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            };
     }
 
     // Handle SSE-S3 encryption

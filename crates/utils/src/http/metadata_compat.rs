@@ -40,6 +40,19 @@ pub const SUFFIX_TRANSITIONED_VERSION_ID: &str = "transitioned-versionID";
 pub const SUFFIX_TRANSITION_TIER: &str = "transition-tier";
 pub const SUFFIX_FREE_VERSION: &str = "free-version";
 pub const SUFFIX_PURGESTATUS: &str = "purgestatus";
+pub const SUFFIX_REPLICA_STATUS: &str = "replica-status";
+pub const SUFFIX_REPLICA_TIMESTAMP: &str = "replica-timestamp";
+pub const SUFFIX_REPLICATION_STATUS: &str = "replication-status";
+pub const SUFFIX_REPLICATION_TIMESTAMP: &str = "replication-timestamp";
+pub const SUFFIX_TAGGING_TIMESTAMP: &str = "tagging-timestamp";
+pub const SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP: &str = "objectlock-retention-timestamp";
+pub const SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP: &str = "objectlock-legalhold-timestamp";
+pub const SUFFIX_REPLICATION_RESET: &str = "replication-reset";
+/// Prefix for replication-reset-{arn} keys; use with internal_key_strip_suffix_prefix to extract arn.
+pub const SUFFIX_REPLICATION_RESET_ARN_PREFIX: &str = "replication-reset-";
+pub const SUFFIX_TIER_FV_ID: &str = "tier-free-versionID";
+pub const SUFFIX_TIER_FV_MARKER: &str = "tier-free-marker";
+pub const SUFFIX_TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
 
 /// Returns true if the key is an internal metadata key (x-rustfs-internal-* or x-minio-internal-*)
 /// for xl.meta compatibility. Case-insensitive.
@@ -49,7 +62,6 @@ pub fn is_internal_key(key: &str) -> bool {
 }
 
 /// Returns true if the key matches the given suffix for either x-rustfs-internal-* or x-minio-internal-*.
-/// Case-insensitive. E.g. has_internal_suffix("X-Minio-Internal-purgestatus", "purgestatus") == true.
 pub fn has_internal_suffix(key: &str, suffix: &str) -> bool {
     let lower = key.to_lowercase();
     let rustfs_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{suffix}");
@@ -57,11 +69,40 @@ pub fn has_internal_suffix(key: &str, suffix: &str) -> bool {
     lower == rustfs_key || lower == minio_key
 }
 
+/// Strips x-rustfs-internal- or x-minio-internal- prefix from key. Returns the suffix part.
+/// Case-insensitive. Returns None if key is not an internal key.
+pub fn strip_internal_prefix(key: &str) -> Option<String> {
+    let lower = key.to_lowercase();
+    lower
+        .strip_prefix(RESERVED_METADATA_PREFIX_LOWER)
+        .or_else(|| lower.strip_prefix(MINIO_INTERNAL_PREFIX))
+        .map(|s| s.to_string())
+}
+
+/// Returns true if key is internal and its suffix part starts with the given suffix_prefix.
+/// E.g. internal_key_starts_with("x-rustfs-internal-replication-reset-arn1", "replication-reset") == true.
+pub fn internal_key_starts_with(key: &str, suffix_prefix: &str) -> bool {
+    strip_internal_prefix(key).is_some_and(|s| s.starts_with(suffix_prefix))
+}
+
+/// For keys like x-rustfs-internal-replication-reset-{arn}, strips the internal prefix and suffix_prefix,
+/// returning the remainder (e.g. "arn1"). Returns None if key does not match.
+pub fn internal_key_strip_suffix_prefix(key: &str, suffix_prefix: &str) -> Option<String> {
+    let rest = strip_internal_prefix(key)?;
+    rest.strip_prefix(suffix_prefix).map(|s| s.to_string())
+}
+
 fn both_keys(suffix: &str) -> (String, String) {
     (
         format!("{RESERVED_METADATA_PREFIX_LOWER}{suffix}"),
         format!("{MINIO_INTERNAL_PREFIX}{suffix}"),
     )
+}
+
+/// Builds the RustFS internal key for the given suffix. Use when a single key is needed (e.g. for
+/// backward compat). Prefer insert_str/get_str when both keys should be written/read.
+pub fn internal_key_rustfs(suffix: &str) -> String {
+    format!("{RESERVED_METADATA_PREFIX_LOWER}{suffix}")
 }
 
 // === String type (FileInfo.metadata, user_defined) ===

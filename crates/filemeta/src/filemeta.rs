@@ -14,18 +14,19 @@
 
 use crate::{
     ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, NULL_VERSION_ID, ObjectPartInfo, RawFileInfo,
-    ReplicationState, ReplicationStatusType, Result, TIER_FV_ID, TIER_FV_MARKER, VersionPurgeStatusType,
-    is_restored_object_on_disk, replication_statuses_map, version_purge_statuses_map,
+    ReplicationState, ReplicationStatusType, Result, VersionPurgeStatusType, is_restored_object_on_disk,
+    replication_statuses_map, version_purge_statuses_map,
 };
 use byteorder::ByteOrder;
 use bytes::Bytes;
 use rustfs_utils::http::headers::{
     AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
-    AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
+    AMZ_STORAGE_CLASS,
 };
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX, SUFFIX_DATA_MOV, SUFFIX_HEALING, SUFFIX_PURGESTATUS,
-    has_internal_suffix, insert_bytes,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_DATA_MOV, SUFFIX_HEALING, SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS,
+    SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, has_internal_suffix, insert_bytes,
+    is_internal_key,
 };
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
@@ -192,9 +193,7 @@ impl FileMeta {
                             for (k, v) in fi.metadata.iter() {
                                 // Split metadata into meta_user and meta_sys based on prefix
                                 // This logic must match From<FileInfo> for MetaObject
-                                let lower = k.to_lowercase();
-                                let is_system =
-                                    lower.starts_with(RESERVED_METADATA_PREFIX_LOWER) || lower.starts_with(MINIO_INTERNAL_PREFIX);
+                                let is_system = is_internal_key(k);
                                 if is_system {
                                     // Skip internal flags that shouldn't be persisted
                                     if is_skip_meta_key(k) {
@@ -387,8 +386,9 @@ impl FileMeta {
                 && let Some(delete_marker) = ventry.delete_marker.as_mut()
             {
                 if fi.delete_marker_replication_status() == ReplicationStatusType::Replica {
-                    delete_marker.meta_sys.insert(
-                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replica-status"),
+                    insert_bytes(
+                        &mut delete_marker.meta_sys,
+                        SUFFIX_REPLICA_STATUS,
                         fi.replication_state_internal
                             .as_ref()
                             .map(|v| v.replica_status.clone())
@@ -397,8 +397,9 @@ impl FileMeta {
                             .as_bytes()
                             .to_vec(),
                     );
-                    delete_marker.meta_sys.insert(
-                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replica-timestamp"),
+                    insert_bytes(
+                        &mut delete_marker.meta_sys,
+                        SUFFIX_REPLICA_TIMESTAMP,
                         fi.replication_state_internal
                             .as_ref()
                             .map(|v| v.replica_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
@@ -407,8 +408,9 @@ impl FileMeta {
                             .to_vec(),
                     );
                 } else {
-                    delete_marker.meta_sys.insert(
-                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status"),
+                    insert_bytes(
+                        &mut delete_marker.meta_sys,
+                        SUFFIX_REPLICATION_STATUS,
                         fi.replication_state_internal
                             .as_ref()
                             .map(|v| v.replication_status_internal.clone().unwrap_or_default())
@@ -416,8 +418,9 @@ impl FileMeta {
                             .as_bytes()
                             .to_vec(),
                     );
-                    delete_marker.meta_sys.insert(
-                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp"),
+                    insert_bytes(
+                        &mut delete_marker.meta_sys,
+                        SUFFIX_REPLICATION_TIMESTAMP,
                         fi.replication_state_internal
                             .as_ref()
                             .map(|v| v.replication_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
@@ -476,8 +479,9 @@ impl FileMeta {
                         if let Some(delete_marker) = v.delete_marker.as_mut() {
                             if !fi.delete_marker_replication_status().is_empty() {
                                 if fi.delete_marker_replication_status() == ReplicationStatusType::Replica {
-                                    delete_marker.meta_sys.insert(
-                                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replica-status"),
+                                    insert_bytes(
+                                        &mut delete_marker.meta_sys,
+                                        SUFFIX_REPLICA_STATUS,
                                         fi.replication_state_internal
                                             .as_ref()
                                             .map(|v| v.replica_status.clone())
@@ -486,8 +490,9 @@ impl FileMeta {
                                             .as_bytes()
                                             .to_vec(),
                                     );
-                                    delete_marker.meta_sys.insert(
-                                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replica-timestamp"),
+                                    insert_bytes(
+                                        &mut delete_marker.meta_sys,
+                                        SUFFIX_REPLICA_TIMESTAMP,
                                         fi.replication_state_internal
                                             .as_ref()
                                             .map(|v| v.replica_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
@@ -496,8 +501,9 @@ impl FileMeta {
                                             .to_vec(),
                                     );
                                 } else {
-                                    delete_marker.meta_sys.insert(
-                                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status"),
+                                    insert_bytes(
+                                        &mut delete_marker.meta_sys,
+                                        SUFFIX_REPLICATION_STATUS,
                                         fi.replication_state_internal
                                             .as_ref()
                                             .map(|v| v.replication_status_internal.clone().unwrap_or_default())
@@ -505,8 +511,9 @@ impl FileMeta {
                                             .as_bytes()
                                             .to_vec(),
                                     );
-                                    delete_marker.meta_sys.insert(
-                                        format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp"),
+                                    insert_bytes(
+                                        &mut delete_marker.meta_sys,
+                                        SUFFIX_REPLICATION_TIMESTAMP,
                                         fi.replication_state_internal
                                             .as_ref()
                                             .map(|v| v.replication_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())

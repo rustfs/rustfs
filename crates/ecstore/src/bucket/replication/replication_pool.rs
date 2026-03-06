@@ -41,7 +41,7 @@ use rustfs_filemeta::VersionPurgeStatusType;
 use rustfs_filemeta::replication_statuses_map;
 use rustfs_filemeta::version_purge_statuses_map;
 use rustfs_filemeta::{REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE};
-use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
+use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
@@ -984,10 +984,8 @@ pub fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
 pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc: ReplicateDecision, op_type: ReplicationType) {
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
-    let tm = oi
-        .user_defined
-        .get(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp"))
-        .map(|v| OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
+    let tm = get_str(&oi.user_defined, SUFFIX_REPLICATION_TIMESTAMP)
+        .map(|v| OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
     let mut rstate = oi.replication_state();
     rstate.replicate_decision_str = dsc.to_string();
     let asz = oi.get_actual_size().unwrap_or_default();

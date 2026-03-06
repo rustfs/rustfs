@@ -15,9 +15,9 @@
 use super::msgp_decode::{PrependByteReader, read_nil_or_array_len, read_nil_or_map_len, skip_msgp_value};
 use super::*;
 use rustfs_utils::http::{
-    MINIO_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TRANSITION_STATUS,
-    SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, contains_key_bytes, get_bytes,
-    has_internal_suffix, insert_bytes, remove_bytes,
+    SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER,
+    SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID,
+    contains_key_bytes, get_bytes, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix,
 };
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Eq, PartialOrd, Ord)]
@@ -1162,13 +1162,10 @@ impl MetaObject {
             metadata.insert(k.to_owned(), v.to_owned());
         }
 
-        let tier_fvidkey = format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_ID}").to_lowercase();
-        let tier_fvmarker_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_MARKER}").to_lowercase();
-
         for (k, v) in &self.meta_sys {
             let lower_k = k.to_lowercase();
 
-            if lower_k == tier_fvidkey || lower_k == tier_fvmarker_key {
+            if has_internal_suffix(&lower_k, SUFFIX_TIER_FV_ID) || has_internal_suffix(&lower_k, SUFFIX_TIER_FV_MARKER) {
                 continue;
             }
 
@@ -1176,7 +1173,7 @@ impl MetaObject {
                 continue;
             }
 
-            if lower_k.starts_with(RESERVED_METADATA_PREFIX_LOWER) || lower_k.starts_with(MINIO_INTERNAL_PREFIX) {
+            if is_internal_key(k) {
                 metadata.insert(k.to_owned(), String::from_utf8(v.to_owned()).unwrap_or_default());
             }
         }
@@ -1360,12 +1357,7 @@ impl From<FileInfo> for MetaObject {
         let mut meta_sys = HashMap::new();
         let mut meta_user = HashMap::new();
         for (k, v) in value.metadata.iter() {
-            let lower = k.to_lowercase();
-            if (k.len() > RESERVED_METADATA_PREFIX.len()
-                && (k.starts_with(RESERVED_METADATA_PREFIX) || k.starts_with(RESERVED_METADATA_PREFIX_LOWER)))
-                || lower.starts_with("x-minio-internal-")
-                || lower.starts_with("x-minio-")
-            {
+            if is_internal_key(k) {
                 if is_skip_meta_key(k) {
                     continue;
                 }
@@ -1435,11 +1427,9 @@ fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<
             continue;
         }
 
-        let sub_key = k
-            .strip_prefix(RESERVED_METADATA_PREFIX_LOWER)
-            .or_else(|| k.strip_prefix(rustfs_utils::http::MINIO_INTERNAL_PREFIX));
-        if let Some(sub_key) = sub_key {
-            match sub_key {
+        let sub_key_opt = strip_internal_prefix(k);
+        if let Some(ref sub_key) = sub_key_opt {
+            match sub_key.as_str() {
                 "replica-timestamp" => {
                     has = true;
                     rs.replica_timestamp = Some(OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
