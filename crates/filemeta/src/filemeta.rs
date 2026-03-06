@@ -1078,6 +1078,7 @@ mod test {
             object: None,
             delete_marker: None,
             write_version: 1,
+            uses_legacy_checksum: false,
         };
 
         assert!(legacy_version.is_legacy(), "Should be recognized as a Legacy version");
@@ -1195,6 +1196,7 @@ mod test {
             }),
             delete_marker: None,
             write_version: 1,
+            uses_legacy_checksum: false,
         };
 
         let shallow_version = FileMetaShallowVersion::try_from(version).expect("Conversion failed");
@@ -1408,6 +1410,7 @@ mod test {
                 object: None,
                 delete_marker: Some(delete_marker),
                 write_version: (i + 100) as u64,
+                uses_legacy_checksum: false,
             };
 
             let shallow_version = FileMetaShallowVersion::try_from(delete_version).unwrap();

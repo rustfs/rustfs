@@ -236,6 +236,8 @@ pub struct FileInfo {
     // Combined checksum when object was uploaded
     pub checksum: Option<Bytes>,
     pub versioned: bool,
+    /// True when version meta was parsed via rmp_serde fallback (legacy format).
+    pub uses_legacy_checksum: bool,
 }
 
 impl FileInfo {
