@@ -43,6 +43,7 @@ pub mod router;
 pub mod slo;
 pub mod tempurl;
 pub mod types;
+pub mod versioning;
 
 pub use errors::{SwiftError, SwiftResult};
 pub use router::{SwiftRoute, SwiftRouter};
