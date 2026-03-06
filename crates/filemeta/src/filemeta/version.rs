@@ -325,8 +325,11 @@ impl TryFrom<&[u8]> for FileMetaVersion {
 
     fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
         let mut ver = FileMetaVersion::default();
-        ver.unmarshal_msg(value)?;
-        Ok(ver)
+        if ver.unmarshal_msg(value).is_ok() {
+            return Ok(ver);
+        }
+        // Fallback for legacy ver_meta: rmp_serde format
+        rmp_serde::from_slice(value).map_err(Error::other)
     }
 }
 
