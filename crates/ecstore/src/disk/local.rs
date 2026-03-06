@@ -1320,12 +1320,15 @@ impl DiskAPI for LocalDisk {
     fn to_string(&self) -> String {
         self.root.to_string_lossy().to_string()
     }
+
     fn is_local(&self) -> bool {
         true
     }
+
     fn host_name(&self) -> String {
         self.endpoint.host_port()
     }
+
     async fn is_online(&self) -> bool {
         true
     }
@@ -1333,7 +1336,7 @@ impl DiskAPI for LocalDisk {
     fn endpoint(&self) -> Endpoint {
         self.endpoint.clone()
     }
-    #[tracing::instrument(skip(self))]
+
     async fn close(&self) -> Result<()> {
         Ok(())
     }
