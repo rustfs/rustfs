@@ -16,6 +16,12 @@
 
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
+use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::store_api::{BucketOperations, MakeBucketOptions};
+use s3s::dto::{Tag, Tagging};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use time;
 
 /// Validate that the authenticated user has access to the requested account
 ///
@@ -78,6 +84,161 @@ pub fn is_admin_user(credentials: &Credentials) -> bool {
                 .any(|r| r.as_str().map(|s| s == "admin" || s == "reseller_admin").unwrap_or(false))
         })
         .unwrap_or(false)
+}
+
+/// Get account metadata bucket name
+///
+/// Account metadata is stored in a special S3 bucket named after
+/// the hashed account identifier. This allows storing TempURL keys
+/// and other account-level metadata.
+///
+/// # Format
+/// ```text
+/// swift-account-{sha256(account)[0..16]}
+/// ```
+fn get_account_metadata_bucket_name(account: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(account.as_bytes());
+    let hash_bytes = hasher.finalize();
+    let hash = hex::encode(hash_bytes);
+    format!("swift-account-{}", &hash[0..16])
+}
+
+/// Get account metadata from S3 bucket tags
+///
+/// Retrieves account-level metadata such as TempURL keys.
+/// Metadata is stored as S3 bucket tags with the prefix `swift-account-meta-`.
+///
+/// # Arguments
+/// * `account` - Account identifier (e.g., "AUTH_7188e165...")
+/// * `credentials` - S3 credentials for accessing the metadata bucket
+///
+/// # Returns
+/// HashMap of metadata key-value pairs (without the prefix)
+pub async fn get_account_metadata(
+    account: &str,
+    _credentials: &Option<Credentials>,
+) -> SwiftResult<HashMap<String, String>> {
+    let bucket_name = get_account_metadata_bucket_name(account);
+
+    // Try to load bucket metadata
+    let bucket_meta = match rustfs_ecstore::bucket::metadata_sys::get(&bucket_name).await {
+        Ok(meta) => meta,
+        Err(_) => {
+            // Bucket doesn't exist - return empty metadata
+            return Ok(HashMap::new());
+        }
+    };
+
+    // Extract metadata from bucket tags
+    let mut metadata = HashMap::new();
+    if let Some(tagging) = &bucket_meta.tagging_config {
+        for tag in &tagging.tag_set {
+            if let (Some(key), Some(value)) = (&tag.key, &tag.value) {
+                if key.starts_with("swift-account-meta-") {
+                    let meta_key = &key[19..]; // Strip "swift-account-meta-" prefix
+                    metadata.insert(meta_key.to_string(), value.clone());
+                }
+            }
+        }
+    }
+
+    Ok(metadata)
+}
+
+/// Update account metadata (stored in S3 bucket tags)
+///
+/// Updates account-level metadata such as TempURL keys.
+/// Only updates swift-account-meta-* tags, preserving other tags.
+///
+/// # Arguments
+/// * `account` - Account identifier
+/// * `metadata` - Metadata key-value pairs to store (keys will be prefixed with `swift-account-meta-`)
+/// * `credentials` - S3 credentials
+pub async fn update_account_metadata(
+    account: &str,
+    metadata: &HashMap<String, String>,
+    _credentials: &Option<Credentials>,
+) -> SwiftResult<()> {
+    let bucket_name = get_account_metadata_bucket_name(account);
+
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // Create bucket if it doesn't exist
+    let bucket_exists = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name).await.is_ok();
+    if !bucket_exists {
+        // Create bucket for account metadata
+        store
+            .make_bucket(&bucket_name, &MakeBucketOptions::default())
+            .await
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to create account metadata bucket: {}", e)))?;
+    }
+
+    // Load current bucket metadata
+    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+
+    let mut bucket_meta_clone = (*bucket_meta).clone();
+
+    // Get existing tags, preserving non-Swift tags
+    let mut existing_tagging = bucket_meta_clone.tagging_config.clone()
+        .unwrap_or_else(|| Tagging { tag_set: vec![] });
+
+    // Remove old swift-account-meta-* tags while preserving other tags
+    existing_tagging.tag_set.retain(|tag| {
+        if let Some(key) = &tag.key {
+            !key.starts_with("swift-account-meta-")
+        } else {
+            true
+        }
+    });
+
+    // Add new metadata tags
+    for (key, value) in metadata {
+        existing_tagging.tag_set.push(Tag {
+            key: Some(format!("swift-account-meta-{}", key)),
+            value: Some(value.clone()),
+        });
+    }
+
+    let now = time::OffsetDateTime::now_utc();
+
+    if existing_tagging.tag_set.is_empty() {
+        // No tags remain; clear tagging config
+        bucket_meta_clone.tagging_config_xml = Vec::new();
+        bucket_meta_clone.tagging_config_updated_at = now;
+        bucket_meta_clone.tagging_config = None;
+    } else {
+        // Serialize tags to XML
+        let tagging_xml = quick_xml::se::to_string(&existing_tagging)
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
+
+        bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
+        bucket_meta_clone.tagging_config_updated_at = now;
+        bucket_meta_clone.tagging_config = Some(existing_tagging);
+    }
+
+    // Save updated metadata
+    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name.clone(), bucket_meta_clone)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+
+    Ok(())
+}
+
+/// Get TempURL key for account
+///
+/// Retrieves the TempURL key from account metadata.
+/// Returns None if no TempURL key is set.
+pub async fn get_tempurl_key(
+    account: &str,
+    credentials: &Option<Credentials>,
+) -> SwiftResult<Option<String>> {
+    let metadata = get_account_metadata(account, credentials).await?;
+    Ok(metadata.get("temp-url-key").cloned())
 }
 
 #[cfg(test)]
@@ -172,5 +333,20 @@ mod tests {
         claims.insert("keystone_project_id".to_string(), json!("project123"));
         creds.claims = Some(claims);
         assert!(!is_admin_user(&creds));
+    }
+
+    #[test]
+    fn test_get_account_metadata_bucket_name() {
+        let bucket = get_account_metadata_bucket_name("AUTH_test123");
+        assert!(bucket.starts_with("swift-account-"));
+        assert_eq!(bucket.len(), "swift-account-".len() + 16); // prefix + 16 hex chars
+
+        // Should be deterministic
+        let bucket2 = get_account_metadata_bucket_name("AUTH_test123");
+        assert_eq!(bucket, bucket2);
+
+        // Different accounts should have different buckets
+        let bucket3 = get_account_metadata_bucket_name("AUTH_test456");
+        assert_ne!(bucket, bucket3);
     }
 }

@@ -49,6 +49,9 @@ swift = [
     "dep:urlencoding",
     "dep:md5",
     "dep:quick-xml",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:hex",
 ]
 
 [dependencies]
@@ -103,6 +106,9 @@ serde = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
 md5 = { workspace = true, optional = true }
 quick-xml = { workspace = true, optional = true, features = ["serialize"] }
+hmac = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
 all-features = true
