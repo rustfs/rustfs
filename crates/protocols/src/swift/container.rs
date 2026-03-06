@@ -26,7 +26,7 @@ use rustfs_ecstore::store_api::{
 };
 use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
-use tracing::error;
+use tracing::{debug, error};
 
 /// Sanitize storage layer errors for client responses
 ///
@@ -940,6 +940,241 @@ pub async fn get_versions_location(
     }
 
     Ok(None)
+}
+
+/// Set container ACLs (read and/or write)
+///
+/// Stores ACLs in S3 bucket tags for persistent storage.
+///
+/// # Arguments
+/// * `account` - Account identifier
+/// * `container` - Container name
+/// * `read_acl` - Read ACL header value (X-Container-Read), or None to remove
+/// * `write_acl` - Write ACL header value (X-Container-Write), or None to remove
+/// * `credentials` - Keystone credentials
+///
+/// # Returns
+/// - Ok(()) if ACLs were set successfully
+/// - Err if validation fails or storage error occurs
+///
+/// # Storage
+/// ACLs are stored as S3 bucket tags:
+/// - Tag key: `swift-acl-read` with comma-separated grants
+/// - Tag key: `swift-acl-write` with comma-separated grants
+///
+/// # Example
+/// ```ignore
+/// set_container_acl(
+///     "AUTH_abc123",
+///     "photos",
+///     Some(".r:*,AUTH_def456"),  // Public + specific account
+///     Some("AUTH_def456"),        // Only specific account can write
+///     &credentials
+/// ).await?;
+/// ```
+#[allow(dead_code)] // Used by handler
+pub async fn set_container_acl(
+    account: &str,
+    container: &str,
+    read_acl: Option<&str>,
+    write_acl: Option<&str>,
+    credentials: &Credentials,
+) -> SwiftResult<()> {
+    use super::acl::ContainerAcl;
+
+    // Validate ACLs by parsing them
+    if let Some(read) = read_acl {
+        ContainerAcl::parse_read(read)?;
+    }
+    if let Some(write) = write_acl {
+        ContainerAcl::parse_write(write)?;
+    }
+
+    // Validate account access
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Validate container name
+    validate_container_name(container)?;
+
+    // Map container to S3 bucket
+    let mapper = ContainerMapper::default();
+    let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // Verify container exists
+    store
+        .get_bucket_info(&bucket_name, &BucketOptions::default())
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
+                SwiftError::NotFound(format!("Container '{}' not found", container))
+            } else {
+                sanitize_storage_error("Container verification", e)
+            }
+        })?;
+
+    // Load current bucket metadata
+    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+
+    let mut bucket_meta_clone = (*bucket_meta).clone();
+
+    // Get existing tags
+    let mut existing_tagging = bucket_meta_clone
+        .tagging_config
+        .clone()
+        .unwrap_or_else(|| Tagging { tag_set: vec![] });
+
+    // Remove old ACL tags
+    existing_tagging
+        .tag_set
+        .retain(|tag| {
+            tag.key.as_deref() != Some("swift-acl-read") &&
+            tag.key.as_deref() != Some("swift-acl-write")
+        });
+
+    // Add new read ACL tag if provided
+    if let Some(read) = read_acl {
+        if !read.trim().is_empty() {
+            existing_tagging.tag_set.push(Tag {
+                key: Some("swift-acl-read".to_string()),
+                value: Some(read.to_string()),
+            });
+        }
+    }
+
+    // Add new write ACL tag if provided
+    if let Some(write) = write_acl {
+        if !write.trim().is_empty() {
+            existing_tagging.tag_set.push(Tag {
+                key: Some("swift-acl-write".to_string()),
+                value: Some(write.to_string()),
+            });
+        }
+    }
+
+    let now = time::OffsetDateTime::now_utc();
+
+    if existing_tagging.tag_set.is_empty() {
+        // No tags remain; clear tagging config
+        bucket_meta_clone.tagging_config_xml = Vec::new();
+        bucket_meta_clone.tagging_config_updated_at = now;
+        bucket_meta_clone.tagging_config = None;
+    } else {
+        // Serialize tags to XML
+        let tagging_xml = quick_xml::se::to_string(&existing_tagging)
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
+
+        bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
+        bucket_meta_clone.tagging_config_updated_at = now;
+        bucket_meta_clone.tagging_config = Some(existing_tagging);
+    }
+
+    // Save updated metadata
+    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+
+    debug!("Set ACLs for container {}/{}: read={:?}, write={:?}", account, container, read_acl, write_acl);
+
+    Ok(())
+}
+
+/// Get container ACLs
+///
+/// Retrieves ACLs from S3 bucket tags and parses them.
+///
+/// # Arguments
+/// * `account` - Account identifier
+/// * `container` - Container name
+/// * `credentials` - Keystone credentials
+///
+/// # Returns
+/// ContainerAcl with read and write grants, or empty ACL if none set
+///
+/// # Example
+/// ```ignore
+/// let acl = get_container_acl("AUTH_abc123", "photos", &credentials).await?;
+/// if acl.is_public_read() {
+///     println!("Container is publicly readable");
+/// }
+/// ```
+#[allow(dead_code)] // Used by handler
+pub async fn get_container_acl(
+    account: &str,
+    container: &str,
+    credentials: &Credentials,
+) -> SwiftResult<super::acl::ContainerAcl> {
+    use super::acl::ContainerAcl;
+
+    // Validate account access
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Map container to S3 bucket
+    let mapper = ContainerMapper::default();
+    let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Load bucket metadata
+    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                SwiftError::NotFound(format!("Container '{}' not found", container))
+            } else {
+                SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e))
+            }
+        })?;
+
+    // Get tagging config
+    let tagging = bucket_meta.tagging_config.as_ref();
+
+    let mut read_grants = Vec::new();
+    let mut write_grants = Vec::new();
+
+    if let Some(tags) = tagging {
+        for tag in &tags.tag_set {
+            match (tag.key.as_deref(), tag.value.as_deref()) {
+                (Some("swift-acl-read"), Some(value)) => {
+                    read_grants = ContainerAcl::parse_read(value)?;
+                }
+                (Some("swift-acl-write"), Some(value)) => {
+                    write_grants = ContainerAcl::parse_write(value)?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(ContainerAcl {
+        read: read_grants,
+        write: write_grants,
+    })
+}
+
+/// Delete container ACLs
+///
+/// Removes both read and write ACL tags from the container.
+///
+/// # Arguments
+/// * `account` - Account identifier
+/// * `container` - Container name
+/// * `credentials` - Keystone credentials
+///
+/// # Returns
+/// Ok(()) if ACLs were deleted successfully
+#[allow(dead_code)] // Used by handler
+pub async fn delete_container_acl(
+    account: &str,
+    container: &str,
+    credentials: &Credentials,
+) -> SwiftResult<()> {
+    // Setting both ACLs to None removes them
+    set_container_acl(account, container, None, None, credentials).await
 }
 
 #[cfg(test)]
