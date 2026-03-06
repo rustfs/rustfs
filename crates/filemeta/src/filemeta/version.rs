@@ -49,6 +49,9 @@ pub struct FileMetaVersion {
     pub delete_marker: Option<MetaDeleteMarker>,
     #[serde(rename = "v")]
     pub write_version: u64, // rustfs version
+    /// True when parsed via rmp_serde fallback (legacy format). Used for checksum algorithm selection.
+    #[serde(skip)]
+    pub uses_legacy_checksum: bool,
 }
 
 impl FileMetaVersion {
@@ -242,7 +245,7 @@ impl FileMetaVersion {
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> FileInfo {
-        match self.version_type {
+        let mut fi = match self.version_type {
             VersionType::Invalid | VersionType::Legacy => FileInfo {
                 name: path.to_string(),
                 volume: volume.to_string(),
@@ -258,7 +261,9 @@ impl FileMetaVersion {
                 .as_ref()
                 .unwrap_or(&MetaDeleteMarker::default())
                 .into_fileinfo(volume, path, all_parts),
-        }
+        };
+        fi.uses_legacy_checksum = self.uses_legacy_checksum;
+        fi
     }
 
     /// Support for Legacy version type
@@ -326,10 +331,13 @@ impl TryFrom<&[u8]> for FileMetaVersion {
     fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
         let mut ver = FileMetaVersion::default();
         if ver.unmarshal_msg(value).is_ok() {
+            ver.uses_legacy_checksum = false;
             return Ok(ver);
         }
         // Fallback for legacy ver_meta: rmp_serde format
-        rmp_serde::from_slice(value).map_err(Error::other)
+        let mut ver: Self = rmp_serde::from_slice(value).map_err(Error::other)?;
+        ver.uses_legacy_checksum = true;
+        Ok(ver)
     }
 }
 
@@ -342,6 +350,7 @@ impl From<FileInfo> for FileMetaVersion {
                     delete_marker: Some(MetaDeleteMarker::from(value)),
                     object: None,
                     write_version: 0,
+                    uses_legacy_checksum: value.uses_legacy_checksum,
                 }
             } else {
                 FileMetaVersion {
@@ -349,6 +358,7 @@ impl From<FileInfo> for FileMetaVersion {
                     delete_marker: None,
                     object: Some(MetaObject::from(value)),
                     write_version: 0,
+                    uses_legacy_checksum: value.uses_legacy_checksum,
                 }
             }
         }

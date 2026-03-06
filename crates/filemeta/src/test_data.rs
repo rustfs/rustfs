@@ -56,6 +56,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
         object: Some(object_version),
         delete_marker: None,
         write_version: 1,
+        uses_legacy_checksum: false,
     };
 
     let shallow_version = FileMetaShallowVersion::try_from(file_version)?;
@@ -74,6 +75,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
         object: None,
         delete_marker: Some(delete_marker),
         write_version: 2,
+        uses_legacy_checksum: false,
     };
 
     let delete_shallow_version = FileMetaShallowVersion::try_from(delete_file_version)?;
@@ -86,6 +88,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
         object: None,
         delete_marker: None,
         write_version: 3,
+        uses_legacy_checksum: false,
     };
 
     let mut legacy_shallow = FileMetaShallowVersion::try_from(legacy_version)?;
@@ -139,6 +142,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
             object: Some(object_version),
             delete_marker: None,
             write_version: (i + 1) as u64,
+            uses_legacy_checksum: false,
         };
 
         let shallow_version = FileMetaShallowVersion::try_from(file_version)?;
@@ -158,6 +162,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
                 object: None,
                 delete_marker: Some(delete_marker),
                 write_version: (i + 100) as u64,
+                uses_legacy_checksum: false,
             };
 
             let delete_shallow_version = FileMetaShallowVersion::try_from(delete_file_version)?;
@@ -245,6 +250,7 @@ pub fn create_xlmeta_with_inline_data() -> Result<Vec<u8>> {
         object: Some(object_version),
         delete_marker: None,
         write_version: 1,
+        uses_legacy_checksum: false,
     };
 
     let shallow_version = FileMetaShallowVersion::try_from(file_version)?;
