@@ -23,6 +23,10 @@ pub const MINIO_INTERNAL_PREFIX: &str = "x-minio-internal-";
 // Key suffixes (lowercase, no prefix)
 pub const SUFFIX_INLINE_DATA: &str = "inline-data";
 pub const SUFFIX_DATA_MOVED: &str = "data-moved";
+/// Transient flag for data movement
+pub const SUFFIX_DATA_MOV: &str = "data-mov";
+/// Transient flag for healing
+pub const SUFFIX_HEALING: &str = "healing";
 pub const SUFFIX_COMPRESSION: &str = "compression";
 pub const SUFFIX_COMPRESSION_SIZE: &str = "compression-size";
 pub const SUFFIX_ACTUAL_SIZE: &str = "actual-size";
@@ -35,6 +39,23 @@ pub const SUFFIX_TRANSITIONED_OBJECTNAME: &str = "transitioned-object";
 pub const SUFFIX_TRANSITIONED_VERSION_ID: &str = "transitioned-versionID";
 pub const SUFFIX_TRANSITION_TIER: &str = "transition-tier";
 pub const SUFFIX_FREE_VERSION: &str = "free-version";
+pub const SUFFIX_PURGESTATUS: &str = "purgestatus";
+
+/// Returns true if the key is an internal metadata key (x-rustfs-internal-* or x-minio-internal-*)
+/// for xl.meta compatibility. Case-insensitive.
+pub fn is_internal_key(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    lower.starts_with(RESERVED_METADATA_PREFIX_LOWER) || lower.starts_with(MINIO_INTERNAL_PREFIX)
+}
+
+/// Returns true if the key matches the given suffix for either x-rustfs-internal-* or x-minio-internal-*.
+/// Case-insensitive. E.g. has_internal_suffix("X-Minio-Internal-purgestatus", "purgestatus") == true.
+pub fn has_internal_suffix(key: &str, suffix: &str) -> bool {
+    let lower = key.to_lowercase();
+    let rustfs_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{suffix}");
+    let minio_key = format!("{MINIO_INTERNAL_PREFIX}{suffix}");
+    lower == rustfs_key || lower == minio_key
+}
 
 fn both_keys(suffix: &str) -> (String, String) {
     (
@@ -90,4 +111,33 @@ pub fn remove_bytes(map: &mut HashMap<String, Vec<u8>>, suffix: &str) {
     let (k1, k2) = both_keys(suffix);
     map.remove(&k1);
     map.remove(&k2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_internal_key() {
+        assert!(is_internal_key("x-rustfs-internal-healing"));
+        assert!(is_internal_key("x-rustfs-internal-purgestatus"));
+        assert!(is_internal_key("X-RustFS-Internal-purgestatus"));
+        assert!(is_internal_key("x-minio-internal-compression"));
+        assert!(is_internal_key("x-minio-internal-replication-status"));
+        assert!(is_internal_key("X-Minio-Internal-Compression"));
+        assert!(!is_internal_key("x-amz-meta-custom"));
+        assert!(!is_internal_key("content-type"));
+        assert!(!is_internal_key("x-rustfs-meta-custom"));
+    }
+
+    #[test]
+    fn test_has_internal_suffix() {
+        assert!(has_internal_suffix("x-rustfs-internal-purgestatus", SUFFIX_PURGESTATUS));
+        assert!(has_internal_suffix("X-Minio-Internal-purgestatus", SUFFIX_PURGESTATUS));
+        assert!(has_internal_suffix("x-minio-internal-compression", SUFFIX_COMPRESSION));
+        assert!(has_internal_suffix("x-rustfs-internal-healing", SUFFIX_HEALING));
+        assert!(has_internal_suffix("x-minio-internal-data-mov", SUFFIX_DATA_MOV));
+        assert!(!has_internal_suffix("x-rustfs-internal-purgestatus", SUFFIX_HEALING));
+        assert!(!has_internal_suffix("x-amz-meta-custom", SUFFIX_PURGESTATUS));
+    }
 }

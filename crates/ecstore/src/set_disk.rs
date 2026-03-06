@@ -79,12 +79,11 @@ use rustfs_lock::local_lock::LocalLock;
 use rustfs_lock::{FastLockGuard, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
-use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::http::{
-    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, contains_key_str, get_str,
-    insert_str,
+    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    contains_key_str, get_header_map, get_str, insert_str, remove_header_map,
 };
 use rustfs_utils::{
     HashAlgorithm,
@@ -2453,11 +2452,11 @@ impl MultipartOperations for SetDisks {
 
         fi.data_dir = Some(Uuid::new_v4());
 
-        if let Some(cssum) = user_defined.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM)
+        if let Some(cssum) = get_header_map(&user_defined, SUFFIX_REPLICATION_SSEC_CRC)
             && !cssum.is_empty()
         {
-            fi.checksum = base64_simd::STANDARD.decode_to_vec(cssum).ok().map(Bytes::from);
-            user_defined.remove(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM);
+            fi.checksum = base64_simd::STANDARD.decode_to_vec(&cssum).ok().map(Bytes::from);
+            remove_header_map(&mut user_defined, SUFFIX_REPLICATION_SSEC_CRC);
         }
 
         let parts_metadata = vec![fi.clone(); disks.len()];
@@ -2808,8 +2807,8 @@ impl MultipartOperations for SetDisks {
             }
         }
 
-        if let Some(rc_crc) = opts.user_defined.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM) {
-            if let Ok(rc_crc_bytes) = base64_simd::STANDARD.decode_to_vec(rc_crc) {
+        if let Some(rc_crc) = get_header_map(&opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC) {
+            if let Ok(rc_crc_bytes) = base64_simd::STANDARD.decode_to_vec(&rc_crc) {
                 fi.checksum = Some(Bytes::from(rc_crc_bytes));
             } else {
                 error!("complete_multipart_upload decode rc_crc failed rc_crc={}", rc_crc);

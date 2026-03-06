@@ -15,8 +15,9 @@
 use super::msgp_decode::{PrependByteReader, read_nil_or_array_len, read_nil_or_map_len, skip_msgp_value};
 use super::*;
 use rustfs_utils::http::{
-    MINIO_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER,
-    SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, contains_key_bytes, get_bytes, insert_bytes, remove_bytes,
+    MINIO_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TRANSITION_STATUS,
+    SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, contains_key_bytes, get_bytes,
+    has_internal_suffix, insert_bytes, remove_bytes,
 };
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Eq, PartialOrd, Ord)]
@@ -1175,11 +1176,7 @@ impl MetaObject {
                 continue;
             }
 
-            if k.starts_with(RESERVED_METADATA_PREFIX)
-                || k.starts_with(RESERVED_METADATA_PREFIX_LOWER)
-                || lower_k == VERSION_PURGE_STATUS_KEY.to_lowercase()
-                || lower_k.starts_with(MINIO_INTERNAL_PREFIX)
-            {
+            if lower_k.starts_with(RESERVED_METADATA_PREFIX_LOWER) || lower_k.starts_with(MINIO_INTERNAL_PREFIX) {
                 metadata.insert(k.to_owned(), String::from_utf8(v.to_owned()).unwrap_or_default());
             }
         }
@@ -1369,7 +1366,7 @@ impl From<FileInfo> for MetaObject {
                 || lower.starts_with("x-minio-internal-")
                 || lower.starts_with("x-minio-")
             {
-                if k == headers::X_RUSTFS_HEALING || k == headers::X_RUSTFS_DATA_MOV {
+                if is_skip_meta_key(k) {
                     continue;
                 }
 
@@ -1431,7 +1428,7 @@ fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<
     let mut has = false;
 
     for (k, v) in metadata.iter() {
-        if k == VERSION_PURGE_STATUS_KEY {
+        if has_internal_suffix(k, SUFFIX_PURGESTATUS) {
             rs.version_purge_status_internal = Some(v.clone());
             rs.purge_targets = version_purge_statuses_map(v.as_str());
             has = true;

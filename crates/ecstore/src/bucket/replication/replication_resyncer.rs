@@ -53,8 +53,12 @@ use rustfs_filemeta::{
 };
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
-    RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER, RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE,
-    RUSTFS_REPLICATION_RESET_STATUS, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, headers,
+    RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
+    headers,
+};
+use rustfs_utils::http::{
+    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_SSEC_CRC, get_header_map,
+    insert_header_map,
 };
 use rustfs_utils::path::path_join_buf;
 use rustfs_utils::string::strings_has_prefix_fold;
@@ -890,8 +894,8 @@ pub fn resync_target(
     let rs = oi
         .user_defined
         .get(target_reset_header(arn).as_str())
-        .or(oi.user_defined.get(RUSTFS_REPLICATION_RESET_STATUS))
-        .map(|s| s.to_string());
+        .cloned()
+        .or_else(|| get_header_map(&oi.user_defined, SUFFIX_REPLICATION_RESET_STATUS));
 
     let mut dec = ResyncTargetDecision::default();
 
@@ -2520,8 +2524,6 @@ static VALID_SSE_REPLICATION_HEADERS: &[(&str, &str)] = &[
     ("X-Rustfs-Internal-Actual-Object-Size", "X-Rustfs-Replication-Actual-Object-Size"),
 ];
 
-const REPLICATION_SSEC_CHECKSUM_HEADER: &str = "X-Rustfs-Replication-Ssec-Crc";
-
 fn is_valid_sse_header(k: &str) -> Option<&str> {
     VALID_SSE_REPLICATION_HEADERS
         .iter()
@@ -2569,7 +2571,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
         // Add encrypted CRC to metadata for SSE-C objects
         if is_ssec {
             let encoded = BASE64_STANDARD.encode(checksum_data);
-            meta.insert(REPLICATION_SSEC_CHECKSUM_HEADER.to_string(), encoded);
+            insert_header_map(&mut meta, SUFFIX_REPLICATION_SSEC_CRC, encoded);
         } else {
             // Get checksum metadata for non-SSE-C objects
             let (cs_meta, is_mp) = object_info.decrypt_checksums(0, &http::HeaderMap::new())?;
@@ -2830,8 +2832,9 @@ async fn replicate_object_with_multipart<S: StorageAPI>(ctx: MultipartReplicatio
 
     let mut user_metadata = HashMap::new();
 
-    user_metadata.insert(
-        RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE.to_string(),
+    insert_header_map(
+        &mut user_metadata,
+        SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
         rustfs_utils::http::get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE).unwrap_or_default(),
     );
 
