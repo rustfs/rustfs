@@ -64,9 +64,12 @@ fn test_version_name_ordering() {
     for i in 0..versions.len() - 1 {
         // Note: Due to inverted timestamps, later-generated versions are smaller
         // So we check >= to allow for equal timestamps on low-precision systems
-        assert!(versions[i] >= versions[i + 1],
+        assert!(
+            versions[i] >= versions[i + 1],
             "Version {} (later) should have smaller or equal timestamp than version {} (earlier)",
-            versions[i], versions[i + 1]);
+            versions[i],
+            versions[i + 1]
+        );
     }
 }
 
@@ -77,7 +80,7 @@ fn test_version_name_special_chars() {
         ("container", "file with spaces.txt"),
         ("container", "file-with-dashes.txt"),
         ("container", "file_with_underscores.txt"),
-        ("photos/2024", "cat.jpg"), // Nested container-like path
+        ("photos/2024", "cat.jpg"),      // Nested container-like path
         ("container", "παράδειγμα.txt"), // Unicode
     ];
 
@@ -249,9 +252,12 @@ fn test_version_sorting_realistic() {
 
     // Verify they sort in correct order (recent first)
     for i in 0..versions.len() - 1 {
-        assert!(versions[i] > versions[i + 1],
+        assert!(
+            versions[i] > versions[i + 1],
             "Version {} should sort after (be newer than) {}",
-            versions[i], versions[i + 1]);
+            versions[i],
+            versions[i + 1]
+        );
     }
 }
 
@@ -354,9 +360,11 @@ fn test_version_high_count_performance() {
     let duration = start.elapsed();
 
     // Should complete in reasonable time (< 200ms with delays)
-    assert!(duration.as_millis() < 200,
+    assert!(
+        duration.as_millis() < 200,
         "Generating 1000 versions took {}ms (expected < 200ms)",
-        duration.as_millis());
+        duration.as_millis()
+    );
 
     // Check uniqueness - allow some collisions on low-precision systems
     let unique_count = versions.iter().collect::<std::collections::HashSet<_>>().len();
@@ -404,9 +412,12 @@ fn test_version_comparison() {
     let version2 = generate_version_name("container", "object");
 
     // Later version should have smaller string value (inverted timestamp)
-    assert!(version2 < version1,
+    assert!(
+        version2 < version1,
         "Later version {} should sort before earlier version {}",
-        version2, version1);
+        version2,
+        version1
+    );
 }
 
 /// Test version prefix extraction
@@ -426,9 +437,11 @@ fn test_version_prefix_extraction() {
 #[test]
 fn test_version_cleanup_structure() {
     // Test that version structure supports cleanup
-    let versions = [generate_version_name("container", "old-file.txt"),
+    let versions = [
         generate_version_name("container", "old-file.txt"),
-        generate_version_name("container", "old-file.txt")];
+        generate_version_name("container", "old-file.txt"),
+        generate_version_name("container", "old-file.txt"),
+    ];
 
     // All versions should be unique and sortable
     assert_eq!(versions.len(), 3);

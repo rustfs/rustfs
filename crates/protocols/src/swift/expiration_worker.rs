@@ -217,7 +217,10 @@ impl ExpirationWorker {
             return;
         }
 
-        let entry = ExpirationEntry { expires_at, path: path.clone() };
+        let entry = ExpirationEntry {
+            expires_at,
+            path: path.clone(),
+        };
 
         let mut queue = self.priority_queue.write().await;
         queue.push(Reverse(entry));
@@ -355,12 +358,7 @@ impl ExpirationWorker {
     /// - Ok(true) if object was deleted
     /// - Ok(false) if object doesn't exist or expiration was removed
     /// - Err if deletion failed
-    async fn delete_expired_object(
-        account: &str,
-        container: &str,
-        object: &str,
-        expected_expires_at: u64,
-    ) -> SwiftResult<bool> {
+    async fn delete_expired_object(account: &str, container: &str, object: &str, expected_expires_at: u64) -> SwiftResult<bool> {
         // Note: This is a placeholder implementation
         // In a real system, this would:
         // 1. HEAD the object to verify it still exists and has X-Delete-At metadata
@@ -504,10 +502,12 @@ mod tests {
 
     #[test]
     fn test_hash_path_distribution() {
-        let paths = ["account/container/obj1",
+        let paths = [
+            "account/container/obj1",
             "account/container/obj2",
             "account/container/obj3",
-            "account/container/obj4"];
+            "account/container/obj4",
+        ];
 
         let hashes: Vec<u64> = paths.iter().map(|p| ExpirationWorker::hash_path(p)).collect();
 

@@ -257,10 +257,12 @@ fn test_symlink_metadata_preservation() {
 #[test]
 fn test_listing_prefix_structure() {
     // Test that prefix filtering structure works correctly
-    let objects = ["photos/2024/cat.jpg",
+    let objects = [
+        "photos/2024/cat.jpg",
         "photos/2024/dog.jpg",
         "photos/2023/bird.jpg",
-        "documents/report.pdf"];
+        "documents/report.pdf",
+    ];
 
     // Filter by prefix "photos/2024/"
     let prefix = "photos/2024/";
@@ -335,10 +337,7 @@ fn test_listing_marker_and_end_marker() {
     let marker = "b.txt";
     let end_marker = "e.txt";
 
-    let filtered: Vec<_> = objects
-        .iter()
-        .filter(|o| *o > &marker && *o < &end_marker)
-        .collect();
+    let filtered: Vec<_> = objects.iter().filter(|o| *o > &marker && *o < &end_marker).collect();
 
     assert_eq!(filtered.len(), 2);
     assert_eq!(*filtered[0], "c.txt");
@@ -362,20 +361,18 @@ fn test_listing_limit_structure() {
 /// Test container listing with prefix and limit
 #[test]
 fn test_listing_prefix_and_limit() {
-    let objects = ["photos/a.jpg",
+    let objects = [
+        "photos/a.jpg",
         "photos/b.jpg",
         "photos/c.jpg",
         "photos/d.jpg",
-        "documents/x.pdf"];
+        "documents/x.pdf",
+    ];
 
     let prefix = "photos/";
     let limit = 2;
 
-    let filtered: Vec<_> = objects
-        .iter()
-        .filter(|o| o.starts_with(prefix))
-        .take(limit)
-        .collect();
+    let filtered: Vec<_> = objects.iter().filter(|o| o.starts_with(prefix)).take(limit).collect();
 
     assert_eq!(filtered.len(), 2);
     assert_eq!(*filtered[0], "photos/a.jpg");
@@ -385,10 +382,12 @@ fn test_listing_prefix_and_limit() {
 /// Test container listing with delimiter and prefix
 #[test]
 fn test_listing_delimiter_and_prefix() {
-    let objects = ["photos/2024/cat.jpg",
+    let objects = [
+        "photos/2024/cat.jpg",
         "photos/2024/dog.jpg",
         "photos/2023/bird.jpg",
-        "documents/report.pdf"];
+        "documents/report.pdf",
+    ];
 
     let prefix = "photos/";
     let delimiter = '/';
