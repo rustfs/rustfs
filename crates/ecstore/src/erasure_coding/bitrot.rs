@@ -179,7 +179,7 @@ where
 }
 
 pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: HashAlgorithm) -> usize {
-    if algo != HashAlgorithm::HighwayHash256S {
+    if algo != HashAlgorithm::HighwayHash256S && algo != HashAlgorithm::HighwayHash256SLegacy {
         return size;
     }
     size.div_ceil(shard_size) * algo.size() + size

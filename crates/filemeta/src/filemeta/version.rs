@@ -343,23 +343,21 @@ impl TryFrom<&[u8]> for FileMetaVersion {
 
 impl From<FileInfo> for FileMetaVersion {
     fn from(value: FileInfo) -> Self {
-        {
-            if value.deleted {
-                FileMetaVersion {
-                    version_type: VersionType::Delete,
-                    delete_marker: Some(MetaDeleteMarker::from(value)),
-                    object: None,
-                    write_version: 0,
-                    uses_legacy_checksum: value.uses_legacy_checksum,
-                }
-            } else {
-                FileMetaVersion {
-                    version_type: VersionType::Object,
-                    delete_marker: None,
-                    object: Some(MetaObject::from(value)),
-                    write_version: 0,
-                    uses_legacy_checksum: value.uses_legacy_checksum,
-                }
+        if value.deleted {
+            FileMetaVersion {
+                version_type: VersionType::Delete,
+                delete_marker: Some(MetaDeleteMarker::from(value)),
+                object: None,
+                write_version: 0,
+                uses_legacy_checksum: false,
+            }
+        } else {
+            FileMetaVersion {
+                version_type: VersionType::Object,
+                delete_marker: None,
+                object: Some(MetaObject::from(value)),
+                write_version: 0,
+                uses_legacy_checksum: false,
             }
         }
     }
@@ -1176,6 +1174,7 @@ impl MetaObject {
             if k.starts_with(RESERVED_METADATA_PREFIX)
                 || k.starts_with(RESERVED_METADATA_PREFIX_LOWER)
                 || lower_k == VERSION_PURGE_STATUS_KEY.to_lowercase()
+                || k.starts_with("x-minio-internal-")
             {
                 metadata.insert(k.to_owned(), String::from_utf8(v.to_owned()).unwrap_or_default());
             }
@@ -1292,8 +1291,10 @@ impl MetaObject {
     }
 
     pub fn inlinedata(&self) -> bool {
-        self.meta_sys
+        (self
+            .meta_sys
             .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").as_str())
+            || self.meta_sys.contains_key("x-minio-internal-inline-data"))
     }
 
     pub fn reset_inline_data(&mut self) {

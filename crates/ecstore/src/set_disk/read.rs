@@ -647,6 +647,14 @@ impl SetDisks {
                 "Streaming multipart part"
             );
 
+            let checksum_info = fi.erasure.get_checksum_info(part_number);
+            let checksum_algo =
+                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                } else {
+                    checksum_info.algorithm
+                };
+
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
@@ -658,7 +666,7 @@ impl SetDisks {
                     read_offset,
                     till_offset,
                     erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256S,
+                    checksum_algo.clone(),
                 )
                 .await
                 {
