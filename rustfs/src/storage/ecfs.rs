@@ -498,6 +498,9 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn get_object_torrent(&self, req: S3Request<GetObjectTorrentInput>) -> S3Result<S3Response<GetObjectTorrentOutput>> {
+        // Torrent functionality is not implemented in RustFS
+        // Per S3 API test expectations, return 404 NoSuchKey (not 501 Not Implemented)
+        // This allows clients to gracefully handle the absence of torrent support
         record_s3_op(S3Operation::GetObjectTorrent, &req.input.bucket);
         Err(S3Error::new(S3ErrorCode::NoSuchKey))
     }
