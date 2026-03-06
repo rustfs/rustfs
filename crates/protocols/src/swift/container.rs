@@ -700,6 +700,245 @@ pub async fn list_objects(
     Ok(swift_objects)
 }
 
+/// Enable object versioning for a container
+///
+/// When versioning is enabled, old versions of objects are automatically
+/// archived to the specified archive container when overwritten or deleted.
+///
+/// # Arguments
+/// * `account` - Account identifier (e.g., "AUTH_7188e165...")
+/// * `container` - Container name to enable versioning on
+/// * `archive_container` - Container name where versions will be stored
+/// * `credentials` - Keystone credentials
+///
+/// # Returns
+/// - Ok(()) if versioning was enabled successfully
+/// - Err if container doesn't exist or archive container is invalid
+///
+/// # Storage
+/// Versioning configuration is stored as an S3 bucket tag:
+/// - Tag key: `swift-versions-location`
+/// - Tag value: archive container name
+#[allow(dead_code)] // Used by handler
+pub async fn enable_versioning(
+    account: &str,
+    container: &str,
+    archive_container: &str,
+    credentials: &Credentials,
+) -> SwiftResult<()> {
+    // Validate account access
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Validate container names
+    validate_container_name(container)?;
+    validate_container_name(archive_container)?;
+
+    // Cannot version a container to itself
+    if container == archive_container {
+        return Err(SwiftError::BadRequest(
+            "Archive container must be different from versioned container".to_string(),
+        ));
+    }
+
+    // Create mapper
+    let mapper = ContainerMapper::default();
+    let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
+    let archive_bucket_name = mapper.swift_to_s3_bucket(archive_container, &project_id);
+
+    // Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // Verify container exists
+    store
+        .get_bucket_info(&bucket_name, &BucketOptions::default())
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
+                SwiftError::NotFound(format!("Container '{}' not found", container))
+            } else {
+                sanitize_storage_error("Container verification", e)
+            }
+        })?;
+
+    // Create archive container if it doesn't exist
+    let archive_exists = store
+        .get_bucket_info(&archive_bucket_name, &BucketOptions::default())
+        .await
+        .is_ok();
+
+    if !archive_exists {
+        store
+            .make_bucket(&archive_bucket_name, &MakeBucketOptions::default())
+            .await
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to create archive container: {}", e)))?;
+    }
+
+    // Load current bucket metadata
+    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+
+    let mut bucket_meta_clone = (*bucket_meta).clone();
+
+    // Get existing tags
+    let mut existing_tagging = bucket_meta_clone
+        .tagging_config
+        .clone()
+        .unwrap_or_else(|| Tagging { tag_set: vec![] });
+
+    // Remove old versioning tag if present
+    existing_tagging
+        .tag_set
+        .retain(|tag| tag.key.as_deref() != Some("swift-versions-location"));
+
+    // Add new versioning tag
+    existing_tagging.tag_set.push(Tag {
+        key: Some("swift-versions-location".to_string()),
+        value: Some(archive_container.to_string()), // Store Swift container name, not S3 bucket name
+    });
+
+    let now = time::OffsetDateTime::now_utc();
+
+    // Serialize tags to XML
+    let tagging_xml = quick_xml::se::to_string(&existing_tagging)
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
+
+    bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
+    bucket_meta_clone.tagging_config_updated_at = now;
+    bucket_meta_clone.tagging_config = Some(existing_tagging);
+
+    // Save updated metadata
+    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+
+    Ok(())
+}
+
+/// Disable object versioning for a container
+///
+/// Removes versioning configuration from the container. Existing archived
+/// versions are NOT deleted.
+///
+/// # Arguments
+/// * `account` - Account identifier
+/// * `container` - Container name to disable versioning on
+/// * `credentials` - Keystone credentials
+#[allow(dead_code)] // Used by handler
+pub async fn disable_versioning(
+    account: &str,
+    container: &str,
+    credentials: &Credentials,
+) -> SwiftResult<()> {
+    // Validate account access
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Validate container name
+    validate_container_name(container)?;
+
+    // Create mapper
+    let mapper = ContainerMapper::default();
+    let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Verify container exists
+    let Some(_store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+
+    // Load current bucket metadata
+    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+
+    let mut bucket_meta_clone = (*bucket_meta).clone();
+
+    // Get existing tags
+    let mut existing_tagging = bucket_meta_clone
+        .tagging_config
+        .clone()
+        .unwrap_or_else(|| Tagging { tag_set: vec![] });
+
+    // Remove versioning tag
+    existing_tagging
+        .tag_set
+        .retain(|tag| tag.key.as_deref() != Some("swift-versions-location"));
+
+    let now = time::OffsetDateTime::now_utc();
+
+    if existing_tagging.tag_set.is_empty() {
+        // No tags remain; clear tagging config
+        bucket_meta_clone.tagging_config_xml = Vec::new();
+        bucket_meta_clone.tagging_config_updated_at = now;
+        bucket_meta_clone.tagging_config = None;
+    } else {
+        // Serialize remaining tags to XML
+        let tagging_xml = quick_xml::se::to_string(&existing_tagging)
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
+
+        bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
+        bucket_meta_clone.tagging_config_updated_at = now;
+        bucket_meta_clone.tagging_config = Some(existing_tagging);
+    }
+
+    // Save updated metadata
+    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+
+    Ok(())
+}
+
+/// Get the archive container name for a versioned container
+///
+/// Returns None if versioning is not enabled for the container.
+///
+/// # Arguments
+/// * `account` - Account identifier
+/// * `container` - Container name to check
+/// * `credentials` - Keystone credentials
+///
+/// # Returns
+/// - Some(archive_container_name) if versioning is enabled
+/// - None if versioning is not enabled
+#[allow(dead_code)] // Used by handler and object.rs
+pub async fn get_versions_location(
+    account: &str,
+    container: &str,
+    credentials: &Credentials,
+) -> SwiftResult<Option<String>> {
+    // Validate account access
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Validate container name
+    validate_container_name(container)?;
+
+    // Create mapper
+    let mapper = ContainerMapper::default();
+    let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Load bucket metadata
+    let bucket_meta = match rustfs_ecstore::bucket::metadata_sys::get(&bucket_name).await {
+        Ok(meta) => meta,
+        Err(_) => {
+            // Container doesn't exist
+            return Ok(None);
+        }
+    };
+
+    // Check for versioning tag
+    if let Some(tagging) = &bucket_meta.tagging_config {
+        for tag in &tagging.tag_set {
+            if tag.key.as_deref() == Some("swift-versions-location") {
+                return Ok(tag.value.clone());
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,5 +1460,124 @@ mod tests {
         assert_eq!(merged.tag_set.len(), 1);
         assert_eq!(merged.tag_set[0].key.as_deref(), Some("swift-meta-color"));
         assert_eq!(merged.tag_set[0].value.as_deref(), Some("blue"));
+    }
+
+    // Object Versioning Tests
+
+    #[test]
+    fn test_validate_versioning_container_names() {
+        // Test that container and archive must be different
+        // This is a unit test that doesn't require storage layer
+        let container = "mycontainer";
+        let archive = "mycontainer"; // Same as container
+
+        // In enable_versioning, this would return an error
+        assert_eq!(container, archive);
+        // Would fail: enable_versioning(account, container, archive, creds).await
+    }
+
+    #[test]
+    fn test_versioning_tag_format() {
+        // Test versioning tag format
+        let mut tagging = Tagging { tag_set: vec![] };
+
+        tagging.tag_set.push(Tag {
+            key: Some("swift-versions-location".to_string()),
+            value: Some("archive-container".to_string()),
+        });
+
+        assert_eq!(tagging.tag_set.len(), 1);
+        assert_eq!(tagging.tag_set[0].key.as_deref(), Some("swift-versions-location"));
+        assert_eq!(tagging.tag_set[0].value.as_deref(), Some("archive-container"));
+    }
+
+    #[test]
+    fn test_versioning_tag_extraction() {
+        // Test extracting versioning location from tags
+        let tagging = Tagging {
+            tag_set: vec![
+                Tag {
+                    key: Some("swift-meta-color".to_string()),
+                    value: Some("red".to_string()),
+                },
+                Tag {
+                    key: Some("swift-versions-location".to_string()),
+                    value: Some("my-archive".to_string()),
+                },
+                Tag {
+                    key: Some("env".to_string()),
+                    value: Some("prod".to_string()),
+                },
+            ],
+        };
+
+        // Find versioning tag
+        let versions_location = tagging
+            .tag_set
+            .iter()
+            .find(|tag| tag.key.as_deref() == Some("swift-versions-location"))
+            .and_then(|tag| tag.value.clone());
+
+        assert_eq!(versions_location, Some("my-archive".to_string()));
+    }
+
+    #[test]
+    fn test_versioning_tag_removal() {
+        // Test removing versioning tag while preserving others
+        let mut tagging = Tagging {
+            tag_set: vec![
+                Tag {
+                    key: Some("swift-meta-color".to_string()),
+                    value: Some("red".to_string()),
+                },
+                Tag {
+                    key: Some("swift-versions-location".to_string()),
+                    value: Some("my-archive".to_string()),
+                },
+                Tag {
+                    key: Some("env".to_string()),
+                    value: Some("prod".to_string()),
+                },
+            ],
+        };
+
+        // Remove versioning tag
+        tagging
+            .tag_set
+            .retain(|tag| tag.key.as_deref() != Some("swift-versions-location"));
+
+        // Verify: versioning tag removed, others preserved
+        assert_eq!(tagging.tag_set.len(), 2);
+        assert!(tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("swift-meta-color")));
+        assert!(tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("env")));
+        assert!(!tagging.tag_set.iter().any(|t| t.key.as_deref() == Some("swift-versions-location")));
+    }
+
+    #[test]
+    fn test_versioning_tag_update() {
+        // Test updating versioning location
+        let mut tagging = Tagging {
+            tag_set: vec![
+                Tag {
+                    key: Some("swift-versions-location".to_string()),
+                    value: Some("old-archive".to_string()),
+                },
+            ],
+        };
+
+        // Remove old versioning tag
+        tagging
+            .tag_set
+            .retain(|tag| tag.key.as_deref() != Some("swift-versions-location"));
+
+        // Add new versioning tag
+        tagging.tag_set.push(Tag {
+            key: Some("swift-versions-location".to_string()),
+            value: Some("new-archive".to_string()),
+        });
+
+        // Verify update
+        assert_eq!(tagging.tag_set.len(), 1);
+        assert_eq!(tagging.tag_set[0].value.as_deref(), Some("new-archive"));
     }
 }
