@@ -350,8 +350,8 @@ pub async fn handle_slo_get(
         .and_then(|v| v.to_str().ok())
         .and_then(|r| parse_range_header(r, manifest.total_size()).ok());
 
-    // 3. Collect segment data
-    let segment_data = collect_slo_segments(account, &manifest, credentials, range).await?;
+    // 3. Create streaming body for segments
+    let segment_stream = create_slo_stream(account, &manifest, credentials, range).await?;
 
     // 4. Build response
     let trans_id = generate_trans_id();
@@ -362,30 +362,38 @@ pub async fn handle_slo_get(
         .header("x-openstack-request-id", &trans_id);
 
     if let Some((start, end)) = range {
+        let length = end - start + 1;
         response = response
             .status(StatusCode::PARTIAL_CONTENT)
             .header("content-range", format!("bytes {}-{}/{}", start, end, manifest.total_size()))
-            .header("content-length", segment_data.len().to_string());
+            .header("content-length", length.to_string());
     } else {
         response = response
             .status(StatusCode::OK)
-            .header("content-length", segment_data.len().to_string());
+            .header("content-length", manifest.total_size().to_string());
     }
 
-    Ok(response.body(Body::from(segment_data))
+    // Convert stream to Body
+    let axum_body = axum::body::Body::from_stream(segment_stream);
+    let body = Body::http_body_unsync(axum_body);
+
+    Ok(response.body(body)
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
 }
 
-/// Collect segment data by fetching and concatenating segments
-async fn collect_slo_segments(
+/// Create streaming body that chains segment readers without buffering
+async fn create_slo_stream(
     account: &str,
     manifest: &SLOManifest,
     credentials: &Option<Credentials>,
     range: Option<(u64, u64)>,
-) -> Result<Vec<u8>, SwiftError> {
+) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>, SwiftError> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+
     // Require credentials
     let creds = credentials.as_ref()
-        .ok_or_else(|| SwiftError::Unauthorized("Credentials required".to_string()))?;
+        .ok_or_else(|| SwiftError::Unauthorized("Credentials required".to_string()))?
+        .clone();
 
     // Determine which segments to fetch based on range
     let segments_to_fetch = if let Some((start, end)) = range {
@@ -397,32 +405,39 @@ async fn collect_slo_segments(
         }).collect()
     };
 
-    let mut result = Vec::new();
+    let account = account.to_string();
 
-    // Fetch each segment
-    for (_seg_idx, byte_start, byte_end, segment) in segments_to_fetch {
-        let (container, object_name) = parse_segment_path(&segment.path)?;
+    // Create stream that fetches and streams segments on-demand
+    let stream = stream::iter(segments_to_fetch)
+        .then(move |(_seg_idx, byte_start, byte_end, segment)| {
+            let account = account.clone();
+            let creds = creds.clone();
 
-        // Fetch segment with range
-        let range_spec = if byte_start > 0 || byte_end < segment.size_bytes - 1 {
-            Some(rustfs_ecstore::store_api::HTTPRangeSpec {
-                is_suffix_length: false,
-                start: byte_start as i64,
-                end: byte_end as i64,
-            })
-        } else {
-            None
-        };
+            async move {
+                let (container, object_name) = parse_segment_path(&segment.path)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
 
-        let mut reader = object::get_object(account, &container, &object_name, creds, range_spec).await?;
+                // Fetch segment with range
+                let range_spec = if byte_start > 0 || byte_end < segment.size_bytes - 1 {
+                    Some(rustfs_ecstore::store_api::HTTPRangeSpec {
+                        is_suffix_length: false,
+                        start: byte_start as i64,
+                        end: byte_end as i64,
+                    })
+                } else {
+                    None
+                };
 
-        // Read segment into buffer
-        use tokio::io::AsyncReadExt;
-        reader.stream.read_to_end(&mut result).await
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to read segment: {}", e)))?;
-    }
+                let reader = object::get_object(&account, &container, &object_name, &creds, range_spec).await
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-    Ok(result)
+                // Convert AsyncRead to Stream using ReaderStream
+                Ok::<_, std::io::Error>(tokio_util::io::ReaderStream::new(reader.stream))
+            }
+        })
+        .try_flatten();
+
+    Ok(Box::pin(stream))
 }
 
 /// Handle GET /v1/{account}/{container}/{object}?multipart-manifest=get (return manifest JSON)
