@@ -467,48 +467,55 @@ pub async fn update_container_metadata(
             }
         })?;
 
-    // Convert Swift metadata to S3 tags and store
-    if let Some(tagging) = swift_metadata_to_s3_tags(&metadata) {
-        // Load current bucket metadata
-        let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
-            .await
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+    // Load current bucket metadata
+    let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
 
-        // Clone the metadata so we can modify it
-        let mut bucket_meta_clone = (*bucket_meta).clone();
+    let mut bucket_meta_clone = (*bucket_meta).clone();
 
-        // Serialize tagging to XML
-        let tagging_xml = quick_xml::se::to_string(&tagging)
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
+    // Get existing tags, preserving non-Swift tags
+    let mut existing_tagging = bucket_meta_clone.tagging_config.clone()
+        .unwrap_or_else(|| Tagging { tag_set: vec![] });
 
-        // Update bucket metadata with new tags
-        let now = time::OffsetDateTime::now_utc();
-        bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
-        bucket_meta_clone.tagging_config_updated_at = now;
-        bucket_meta_clone.tagging_config = Some(tagging);
+    // Remove old swift-meta-* tags while preserving other tags
+    existing_tagging.tag_set.retain(|tag| {
+        if let Some(key) = &tag.key {
+            !key.starts_with("swift-meta-")
+        } else {
+            true // Keep tags with no key (shouldn't happen, but be safe)
+        }
+    });
 
-        // Save updated metadata
-        rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
-            .await
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
-    } else if metadata.is_empty() {
-        // If metadata is empty, clear existing tags
-        let bucket_meta = rustfs_ecstore::bucket::metadata_sys::get(&bucket_name)
-            .await
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to load bucket metadata: {}", e)))?;
+    // Add new Swift metadata tags if provided
+    if let Some(mut new_tagging) = swift_metadata_to_s3_tags(&metadata) {
+        // Merge: existing non-Swift tags + new Swift tags
+        existing_tagging.tag_set.append(&mut new_tagging.tag_set);
+    }
+    // If metadata.is_empty() and swift_metadata_to_s3_tags returns None,
+    // we've already removed swift-meta-* tags above, so only non-Swift tags remain
 
-        let mut bucket_meta_clone = (*bucket_meta).clone();
+    let now = time::OffsetDateTime::now_utc();
 
-        // Clear tags
-        let now = time::OffsetDateTime::now_utc();
+    if existing_tagging.tag_set.is_empty() {
+        // No tags remain after removing swift-meta-* tags; clear tagging config
         bucket_meta_clone.tagging_config_xml = Vec::new();
         bucket_meta_clone.tagging_config_updated_at = now;
         bucket_meta_clone.tagging_config = None;
+    } else {
+        // Serialize the merged tags to XML
+        let tagging_xml = quick_xml::se::to_string(&existing_tagging)
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to serialize tags: {}", e)))?;
 
-        rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
-            .await
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
+        bucket_meta_clone.tagging_config_xml = tagging_xml.into_bytes();
+        bucket_meta_clone.tagging_config_updated_at = now;
+        bucket_meta_clone.tagging_config = Some(existing_tagging);
     }
+
+    // Save updated metadata
+    rustfs_ecstore::bucket::metadata_sys::set_bucket_metadata(bucket_name, bucket_meta_clone)
+        .await
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to save metadata: {}", e)))?;
 
     Ok(())
 }
@@ -1065,5 +1072,154 @@ mod tests {
                 key
             );
         }
+    }
+
+    #[test]
+    fn test_tag_preservation_merge_with_existing() {
+        // Test merging Swift metadata with existing non-Swift tags
+        let mut existing_tagging = Tagging {
+            tag_set: vec![
+                Tag {
+                    key: Some("swift-meta-color".to_string()),
+                    value: Some("blue".to_string()),
+                },
+                Tag {
+                    key: Some("env".to_string()),
+                    value: Some("production".to_string()),
+                },
+                Tag {
+                    key: Some("team".to_string()),
+                    value: Some("backend".to_string()),
+                },
+            ],
+        };
+
+        // Remove old swift-meta-* tags
+        existing_tagging.tag_set.retain(|tag| {
+            if let Some(key) = &tag.key {
+                !key.starts_with("swift-meta-")
+            } else {
+                true
+            }
+        });
+
+        // Add new Swift metadata
+        let mut new_metadata = std::collections::HashMap::new();
+        new_metadata.insert("description".to_string(), "test".to_string());
+        let mut new_tagging = swift_metadata_to_s3_tags(&new_metadata).unwrap();
+
+        // Merge
+        existing_tagging.tag_set.append(&mut new_tagging.tag_set);
+
+        // Verify: should have env, team, and new swift-meta-description
+        assert_eq!(existing_tagging.tag_set.len(), 3);
+
+        let has_env = existing_tagging.tag_set.iter()
+            .any(|t| t.key.as_deref() == Some("env"));
+        let has_team = existing_tagging.tag_set.iter()
+            .any(|t| t.key.as_deref() == Some("team"));
+        let has_description = existing_tagging.tag_set.iter()
+            .any(|t| t.key.as_deref() == Some("swift-meta-description"));
+
+        assert!(has_env, "env tag should be preserved");
+        assert!(has_team, "team tag should be preserved");
+        assert!(has_description, "swift-meta-description should be added");
+    }
+
+    #[test]
+    fn test_tag_preservation_remove_only_swift() {
+        // Test that clearing Swift metadata preserves non-Swift tags
+        let mut existing_tagging = Tagging {
+            tag_set: vec![
+                Tag {
+                    key: Some("swift-meta-color".to_string()),
+                    value: Some("blue".to_string()),
+                },
+                Tag {
+                    key: Some("swift-meta-owner".to_string()),
+                    value: Some("alice".to_string()),
+                },
+                Tag {
+                    key: Some("env".to_string()),
+                    value: Some("production".to_string()),
+                },
+                Tag {
+                    key: Some("cost-center".to_string()),
+                    value: Some("engineering".to_string()),
+                },
+            ],
+        };
+
+        // Remove swift-meta-* tags (simulating empty metadata update)
+        existing_tagging.tag_set.retain(|tag| {
+            if let Some(key) = &tag.key {
+                !key.starts_with("swift-meta-")
+            } else {
+                true
+            }
+        });
+
+        // Verify: should only have env and cost-center
+        assert_eq!(existing_tagging.tag_set.len(), 2);
+
+        let has_env = existing_tagging.tag_set.iter()
+            .any(|t| t.key.as_deref() == Some("env"));
+        let has_cost_center = existing_tagging.tag_set.iter()
+            .any(|t| t.key.as_deref() == Some("cost-center"));
+        let has_swift_meta = existing_tagging.tag_set.iter()
+            .any(|t| t.key.as_ref().map_or(false, |k| k.starts_with("swift-meta-")));
+
+        assert!(has_env, "env tag should be preserved");
+        assert!(has_cost_center, "cost-center tag should be preserved");
+        assert!(!has_swift_meta, "all swift-meta-* tags should be removed");
+    }
+
+    #[test]
+    fn test_tag_preservation_empty_after_swift_removal() {
+        // Test that if only Swift tags exist, clearing them results in empty tagging
+        let mut existing_tagging = Tagging {
+            tag_set: vec![
+                Tag {
+                    key: Some("swift-meta-color".to_string()),
+                    value: Some("blue".to_string()),
+                },
+                Tag {
+                    key: Some("swift-meta-owner".to_string()),
+                    value: Some("alice".to_string()),
+                },
+            ],
+        };
+
+        // Remove swift-meta-* tags
+        existing_tagging.tag_set.retain(|tag| {
+            if let Some(key) = &tag.key {
+                !key.starts_with("swift-meta-")
+            } else {
+                true
+            }
+        });
+
+        // Verify: should be empty
+        assert!(existing_tagging.tag_set.is_empty(), "tagging should be empty after removing all swift-meta-* tags");
+    }
+
+    #[test]
+    fn test_tag_preservation_no_existing_tags() {
+        // Test adding Swift metadata when no tags exist
+        let existing_tagging = Tagging {
+            tag_set: vec![],
+        };
+
+        let mut new_metadata = std::collections::HashMap::new();
+        new_metadata.insert("color".to_string(), "blue".to_string());
+        let mut new_tagging = swift_metadata_to_s3_tags(&new_metadata).unwrap();
+
+        let mut merged = existing_tagging.clone();
+        merged.tag_set.append(&mut new_tagging.tag_set);
+
+        // Verify: should have only the new Swift tag
+        assert_eq!(merged.tag_set.len(), 1);
+        assert_eq!(merged.tag_set[0].key.as_deref(), Some("swift-meta-color"));
+        assert_eq!(merged.tag_set[0].value.as_deref(), Some("blue"));
     }
 }
