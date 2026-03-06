@@ -34,6 +34,7 @@
 //! to enforce tenant isolation.
 
 pub mod account;
+pub mod acl;
 pub mod container;
 pub mod dlo;
 pub mod errors;
