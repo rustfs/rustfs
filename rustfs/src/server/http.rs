@@ -584,8 +584,9 @@ fn process_connection(
         // It also ensures that each connection has an independent service instance.
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
 
-        // Wrap S3 service with Swift service to handle Swift API requests (when swift feature is enabled)
-        // Swift is enabled by default with no URL prefix (direct /v1/AUTH_* paths)
+        // Wrap S3 service with Swift service to handle Swift API requests
+        // Swift API is only available when compiled with the 'swift' feature
+        // When enabled, Swift routes are handled at /v1/AUTH_* paths by default
         #[cfg(feature = "swift")]
         let http_service = SwiftService::new(true, None, s3_service);
         #[cfg(not(feature = "swift"))]

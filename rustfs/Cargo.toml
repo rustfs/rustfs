@@ -137,9 +137,6 @@ aes-gcm = { workspace = true }
 metrics = { workspace = true }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-regex.workspace = true
-percent-encoding = { workspace = true }
-sha2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
