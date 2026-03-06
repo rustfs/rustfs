@@ -504,12 +504,10 @@ mod tests {
 
     #[test]
     fn test_hash_path_distribution() {
-        let paths = vec![
-            "account/container/obj1",
+        let paths = ["account/container/obj1",
             "account/container/obj2",
             "account/container/obj3",
-            "account/container/obj4",
-        ];
+            "account/container/obj4"];
 
         let hashes: Vec<u64> = paths.iter().map(|p| ExpirationWorker::hash_path(p)).collect();
 

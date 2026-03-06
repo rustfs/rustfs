@@ -257,12 +257,10 @@ fn test_symlink_metadata_preservation() {
 #[test]
 fn test_listing_prefix_structure() {
     // Test that prefix filtering structure works correctly
-    let objects = vec![
-        "photos/2024/cat.jpg",
+    let objects = ["photos/2024/cat.jpg",
         "photos/2024/dog.jpg",
         "photos/2023/bird.jpg",
-        "documents/report.pdf",
-    ];
+        "documents/report.pdf"];
 
     // Filter by prefix "photos/2024/"
     let prefix = "photos/2024/";
@@ -302,7 +300,7 @@ fn test_listing_delimiter_structure() {
 /// Test container listing with marker (pagination)
 #[test]
 fn test_listing_marker_structure() {
-    let objects = vec!["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
+    let objects = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
 
     // List starting after marker "b.txt"
     let marker = "b.txt";
@@ -317,7 +315,7 @@ fn test_listing_marker_structure() {
 /// Test container listing with end_marker
 #[test]
 fn test_listing_end_marker_structure() {
-    let objects = vec!["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
+    let objects = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
 
     // List up to (but not including) end_marker "d.txt"
     let end_marker = "d.txt";
@@ -332,7 +330,7 @@ fn test_listing_end_marker_structure() {
 /// Test container listing with both marker and end_marker
 #[test]
 fn test_listing_marker_and_end_marker() {
-    let objects = vec!["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
+    let objects = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
 
     let marker = "b.txt";
     let end_marker = "e.txt";
@@ -350,7 +348,7 @@ fn test_listing_marker_and_end_marker() {
 /// Test container listing with limit
 #[test]
 fn test_listing_limit_structure() {
-    let objects = vec!["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
+    let objects = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
 
     let limit = 3;
     let limited: Vec<_> = objects.iter().take(limit).collect();
@@ -364,13 +362,11 @@ fn test_listing_limit_structure() {
 /// Test container listing with prefix and limit
 #[test]
 fn test_listing_prefix_and_limit() {
-    let objects = vec![
-        "photos/a.jpg",
+    let objects = ["photos/a.jpg",
         "photos/b.jpg",
         "photos/c.jpg",
         "photos/d.jpg",
-        "documents/x.pdf",
-    ];
+        "documents/x.pdf"];
 
     let prefix = "photos/";
     let limit = 2;
@@ -389,12 +385,10 @@ fn test_listing_prefix_and_limit() {
 /// Test container listing with delimiter and prefix
 #[test]
 fn test_listing_delimiter_and_prefix() {
-    let objects = vec![
-        "photos/2024/cat.jpg",
+    let objects = ["photos/2024/cat.jpg",
         "photos/2024/dog.jpg",
         "photos/2023/bird.jpg",
-        "documents/report.pdf",
-    ];
+        "documents/report.pdf"];
 
     let prefix = "photos/";
     let delimiter = '/';
@@ -454,7 +448,7 @@ fn test_listing_empty_container() {
 /// Test listing lexicographic ordering
 #[test]
 fn test_listing_lexicographic_order() {
-    let mut objects = vec!["z.txt", "a.txt", "m.txt", "b.txt"];
+    let mut objects = ["z.txt", "a.txt", "m.txt", "b.txt"];
     objects.sort();
 
     assert_eq!(objects[0], "a.txt");
@@ -466,7 +460,7 @@ fn test_listing_lexicographic_order() {
 /// Test listing with numeric-like names
 #[test]
 fn test_listing_numeric_names() {
-    let mut objects = vec!["file10.txt", "file2.txt", "file1.txt", "file20.txt"];
+    let mut objects = ["file10.txt", "file2.txt", "file1.txt", "file20.txt"];
     objects.sort();
 
     // Lexicographic sort, not numeric

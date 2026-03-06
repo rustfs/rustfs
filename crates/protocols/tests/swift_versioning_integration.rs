@@ -240,7 +240,7 @@ fn test_version_name_determinism() {
 #[test]
 fn test_version_sorting_realistic() {
     // Simulate versions created at different times
-    let versions = vec![
+    let versions = [
         "8290260199.876543210/photos/cat.jpg", // Recent
         "8290260198.123456789/photos/cat.jpg", // 1 second earlier
         "8290259199.999999999/photos/cat.jpg", // ~1000 seconds earlier
@@ -426,11 +426,9 @@ fn test_version_prefix_extraction() {
 #[test]
 fn test_version_cleanup_structure() {
     // Test that version structure supports cleanup
-    let versions = vec![
+    let versions = [generate_version_name("container", "old-file.txt"),
         generate_version_name("container", "old-file.txt"),
-        generate_version_name("container", "old-file.txt"),
-        generate_version_name("container", "old-file.txt"),
-    ];
+        generate_version_name("container", "old-file.txt")];
 
     // All versions should be unique and sortable
     assert_eq!(versions.len(), 3);
