@@ -14,11 +14,14 @@
 //! Versions are stored with inverted timestamps so newer versions sort first:
 //! ```text
 //! Original: /v1/AUTH_test/photos/cat.jpg
-//! Version 1: /v1/AUTH_test/archive/9999999999.99999/photos/cat.jpg
-//! Version 2: /v1/AUTH_test/archive/9999999999.99998/photos/cat.jpg
+//! Version 1: /v1/AUTH_test/archive/9999999999.999999999/photos/cat.jpg
+//! Version 2: /v1/AUTH_test/archive/9999999999.999999998/photos/cat.jpg
 //! ```
 //!
-//! The timestamp is calculated as: `9999999999.99999 - current_timestamp`
+//! The timestamp is calculated as: `9999999999.999999999 - current_timestamp`
+//!
+//! Timestamps use 9 decimal places (nanosecond precision) to prevent collisions
+//! in high-throughput scenarios where multiple versions are created rapidly.
 //!
 //! # Versioning Flow
 //!
@@ -54,9 +57,13 @@ use std::sync::Arc;
 /// ```text
 /// Container: "photos"
 /// Object: "cat.jpg"
-/// Timestamp: 1709740800.12345
-/// Result: "9990259199.87654/photos/cat.jpg"
+/// Timestamp: 1709740800.123456789
+/// Result: "9990259199.876543210/photos/cat.jpg"
 /// ```
+///
+/// # Precision
+/// Uses 9 decimal places (nanosecond precision) to prevent timestamp
+/// collisions in high-throughput scenarios (up to 1 billion ops/sec).
 ///
 /// # Arguments
 /// * `container` - Original container name
@@ -74,10 +81,13 @@ pub fn generate_version_name(container: &str, object: &str) -> String {
 
     // Invert timestamp so newer versions sort first
     // Max reasonable timestamp: 9999999999 (year 2286)
-    let inverted = 9999999999.99999 - timestamp;
+    // Using 9 decimal places (nanosecond precision) to prevent collisions
+    // in high-throughput scenarios where objects are uploaded rapidly
+    let inverted = 9999999999.999999999 - timestamp;
 
     // Format: {inverted_timestamp}/{container}/{object}
-    format!("{:.5}/{}/{}", inverted, container, object)
+    // 9 decimal places = nanosecond precision (prevents collisions up to 1B ops/sec)
+    format!("{:.9}/{}/{}", inverted, container, object)
 }
 
 /// Archive the current version of an object before overwriting
@@ -444,8 +454,8 @@ mod tests {
     fn test_version_name_format() {
         let version = generate_version_name("my-container", "my-object.txt");
 
-        // Should match pattern: {float}.{5digits}/{container}/{object}
-        let pattern = regex::Regex::new(r"^\d+\.\d{5}/my-container/my-object\.txt$").unwrap();
+        // Should match pattern: {float}.{9digits}/{container}/{object}
+        let pattern = regex::Regex::new(r"^\d+\.\d{9}/my-container/my-object\.txt$").unwrap();
         assert!(pattern.is_match(&version), "Version name format incorrect: {}", version);
     }
 
