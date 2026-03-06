@@ -22,6 +22,7 @@ use super::container;
 use super::dlo;
 use super::object;
 use super::slo;
+use super::tempurl;
 use super::{SwiftError, SwiftRoute, SwiftRouter};
 use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
@@ -112,10 +113,94 @@ async fn handle_swift_request(
 {
     // Extract parts
     let (parts, body) = req.into_parts();
+    let method = parts.method.clone();
+    let uri = parts.uri.clone();
+    let headers = parts.headers.clone();
+
+    // Check for TempURL before requiring authentication
+    // TempURL only applies to Object operations (GET, HEAD, PUT)
+    if let SwiftRoute::Object { ref account, ref container, ref object, .. } = route {
+        if let Some(query) = uri.query() {
+            if let Some(tempurl_params) = tempurl::TempURLParams::from_query(query) {
+                // TempURL detected - validate it
+                debug!("TempURL detected for {}/{}/{}", account, container, object);
+
+                // Get account TempURL key
+                let tempurl_key = super::account::get_tempurl_key(account, &credentials).await?;
+
+                if let Some(key) = tempurl_key {
+                    // Validate TempURL signature
+                    let tempurl = tempurl::TempURL::new(key);
+                    let path = uri.path();
+
+                    tempurl.validate_request(method.as_str(), path, &tempurl_params)?;
+
+                    // TempURL is valid - proceed with request (no credentials needed)
+                    debug!("TempURL validated successfully");
+
+                    // Reconstruct request for object operation
+                    let req = Request::from_parts(parts, body);
+                    return handle_tempurl_object_request(req, route).await;
+                } else {
+                    // No TempURL key configured for this account
+                    return Err(SwiftError::Unauthorized(
+                        "TempURL key not configured for this account".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // No TempURL or TempURL validation failed - require normal authentication
+    let credentials = credentials.ok_or_else(|| SwiftError::Unauthorized("Authentication required".to_string()))?;
+
+    // Reconstruct request
+    let req = Request::from_parts(parts, body);
+    handle_authenticated_request(req, route, credentials).await
+}
+
+/// Handle TempURL-authenticated object requests
+async fn handle_tempurl_object_request(
+    req: Request<Body>,
+    route: SwiftRoute,
+) -> Result<Response<Body>, SwiftError> {
+    let SwiftRoute::Object { account, container, object, method } = route else {
+        return Err(SwiftError::InternalServerError("Invalid route for TempURL".to_string()));
+    };
+
+    let (parts, body) = req.into_parts();
     let headers = parts.headers;
 
-    // Credentials are required for all Swift operations
-    let credentials = credentials.ok_or_else(|| SwiftError::Unauthorized("Authentication required".to_string()))?;
+    match method {
+        Method::GET => {
+            // TempURL GET request
+            handle_object_get(&account, &container, &object, &headers, &None).await
+        }
+        Method::HEAD => {
+            // TempURL HEAD request
+            handle_object_head(&account, &container, &object, &None).await
+        }
+        Method::PUT => {
+            // TempURL PUT request (upload via TempURL)
+            handle_object_put(&account, &container, &object, body, &headers, &None).await
+        }
+        _ => Err(SwiftError::BadRequest(format!(
+            "Method {} not allowed via TempURL",
+            method
+        ))),
+    }
+}
+
+/// Handle authenticated Swift API requests
+async fn handle_authenticated_request(
+    req: Request<Body>,
+    route: SwiftRoute,
+    credentials: Credentials,
+) -> Result<Response<Body>, SwiftError>
+{
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
+    let credentials_opt = Some(credentials.clone());
 
     match route {
         SwiftRoute::Account { account, method } => {
@@ -142,8 +227,41 @@ async fn handle_swift_request(
                     Err(SwiftError::NotImplemented("Swift Account HEAD operation not yet implemented".to_string()))
                 }
                 Method::POST => {
-                    // Account metadata update not yet implemented
-                    Err(SwiftError::NotImplemented("Swift Account POST operation not yet implemented".to_string()))
+                    // Account metadata update - extract headers
+                    let mut metadata = std::collections::HashMap::new();
+
+                    // Extract X-Account-Meta-* headers
+                    for (key, value) in &headers {
+                        let key_str = key.as_str();
+                        if key_str.starts_with("x-account-meta-") {
+                            let meta_key = &key_str[15..]; // Strip "x-account-meta-"
+                            if let Ok(value_str) = value.to_str() {
+                                metadata.insert(meta_key.to_string(), value_str.to_string());
+                            }
+                        }
+                    }
+
+                    // Special handling for TempURL key headers
+                    // X-Account-Meta-Temp-URL-Key or X-Account-Meta-Temp-Url-Key
+                    if let Some(tempurl_key) = headers.get("x-account-meta-temp-url-key")
+                        .or_else(|| headers.get("x-account-meta-temp-Url-key")) {
+                        if let Ok(key_str) = tempurl_key.to_str() {
+                            metadata.insert("temp-url-key".to_string(), key_str.to_string());
+                        }
+                    }
+
+                    // Update account metadata
+                    super::account::update_account_metadata(&account, &metadata, &credentials_opt).await?;
+
+                    let trans_id = generate_trans_id();
+                    Response::builder()
+                        .status(StatusCode::NO_CONTENT) // 204 - Success
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("content-length", "0")
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::empty())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 _ => Err(SwiftError::BadRequest(format!("Unsupported method for account: {}", method))),
             }
@@ -592,6 +710,220 @@ async fn handle_swift_request(
             }
         }
     }
+}
+
+/// Helper function for object GET operations (used by both authenticated and TempURL requests)
+async fn handle_object_get(
+    account: &str,
+    container: &str,
+    object: &str,
+    headers: &axum::http::HeaderMap,
+    credentials: &Option<Credentials>,
+) -> Result<Response<Body>, SwiftError> {
+    // For TempURL requests, credentials will be None
+    // Operations that require credentials will fail appropriately
+
+    // Check if object is SLO (via metadata)
+    if slo::is_slo_object(account, container, object, credentials).await? {
+        return slo::handle_slo_get(account, container, object, headers, credentials).await;
+    }
+
+    // Check if object is DLO (via x-object-manifest metadata)
+    if let Some(manifest_value) = dlo::is_dlo_object(account, container, object, credentials).await? {
+        return dlo::handle_dlo_get(account, container, object, headers, credentials, manifest_value).await;
+    }
+
+    // Regular object download - parse Range header if present
+    let range_header = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok());
+
+    // Get object metadata first (needed for Range validation)
+    let info = if let Some(creds) = credentials {
+        object::head_object(account, container, object, creds).await?
+    } else {
+        // TempURL access - try without credentials
+        // Note: This will fail if the object requires authentication
+        // In production, we'd need a special path for TempURL access
+        return Err(SwiftError::InternalServerError("TempURL object access not fully implemented".to_string()));
+    };
+
+    // Parse and validate Range header, returning 416 for invalid ranges
+    let parsed_range = if let Some(rh) = range_header {
+        match object::parse_range_header(rh) {
+            Ok(r) => Some(r),
+            Err(_) => {
+                // Invalid range - return 416 Range Not Satisfiable
+                let trans_id = generate_trans_id();
+                let mut response = Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header("content-type", info.content_type.as_deref().unwrap_or("application/octet-stream"))
+                    .header("content-length", "0")
+                    .header("x-trans-id", trans_id.clone())
+                    .header("x-openstack-request-id", trans_id)
+                    .header("accept-ranges", "bytes")
+                    .header("content-range", format!("bytes */{}", info.size));
+
+                if let Some(etag) = info.etag {
+                    response = response.header("etag", etag);
+                }
+
+                for (key, value) in info.user_defined {
+                    if key != "content-type" {
+                        let header_name = format!("x-object-meta-{}", key);
+                        response = response.header(header_name, value);
+                    }
+                }
+
+                return response
+                    .body(Body::empty())
+                    .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Determine status code based on range presence
+    let status = if parsed_range.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+
+    let reader = if let Some(creds) = credentials {
+        object::get_object(account, container, object, creds, parsed_range).await?
+    } else {
+        return Err(SwiftError::InternalServerError("TempURL object access not fully implemented".to_string()));
+    };
+
+    let trans_id = generate_trans_id();
+
+    let mut response = Response::builder()
+        .status(status)
+        .header("content-type", info.content_type.as_deref().unwrap_or("application/octet-stream"))
+        .header("x-trans-id", trans_id.clone())
+        .header("x-openstack-request-id", trans_id);
+
+    // Set Content-Length and range-specific headers
+    if status == StatusCode::PARTIAL_CONTENT {
+        response = response.header("accept-ranges", "bytes");
+        if let Some(rh) = range_header {
+            if let Ok(range_spec) = object::parse_range_header(rh) {
+                // range_spec is HTTPRangeSpec struct with start and end as i64
+                let start = range_spec.start;
+                let end = range_spec.end;
+                let length = end - start + 1;
+                response = response
+                    .header("content-range", format!("bytes {}-{}/{}", start, end, info.size))
+                    .header("content-length", length.to_string());
+            }
+        }
+    } else {
+        response = response
+            .header("content-length", info.size.to_string())
+            .header("accept-ranges", "bytes");
+    }
+
+    if let Some(etag) = info.etag {
+        response = response.header("etag", etag);
+    }
+
+    for (key, value) in info.user_defined {
+        if key != "content-type" {
+            let header_name = format!("x-object-meta-{}", key);
+            response = response.header(header_name, value);
+        }
+    }
+
+    // Convert GetObjectReader AsyncRead stream to Body
+    // Use ReaderStream to convert AsyncRead to Stream
+    let stream = tokio_util::io::ReaderStream::new(reader.stream);
+    let axum_body = axum::body::Body::from_stream(stream);
+    let body = Body::http_body_unsync(axum_body);
+
+    response
+        .body(body)
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
+}
+
+/// Helper function for object HEAD operations
+async fn handle_object_head(
+    account: &str,
+    container: &str,
+    object: &str,
+    credentials: &Option<Credentials>,
+) -> Result<Response<Body>, SwiftError> {
+    let info = if let Some(creds) = credentials {
+        object::head_object(account, container, object, creds).await?
+    } else {
+        return Err(SwiftError::InternalServerError("TempURL object access not fully implemented".to_string()));
+    };
+
+    let trans_id = generate_trans_id();
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", info.content_type.as_deref().unwrap_or("application/octet-stream"))
+        .header("content-length", info.size.to_string())
+        .header("x-trans-id", trans_id.clone())
+        .header("x-openstack-request-id", trans_id)
+        .header("accept-ranges", "bytes");
+
+    if let Some(etag) = info.etag {
+        response = response.header("etag", etag);
+    }
+
+    for (key, value) in info.user_defined {
+        if key != "content-type" {
+            let header_name = format!("x-object-meta-{}", key);
+            response = response.header(header_name, value);
+        }
+    }
+
+    response
+        .body(Body::empty())
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
+}
+
+/// Helper function for object PUT operations
+async fn handle_object_put(
+    account: &str,
+    container: &str,
+    object: &str,
+    body: Body,
+    headers: &axum::http::HeaderMap,
+    credentials: &Option<Credentials>,
+) -> Result<Response<Body>, SwiftError> {
+    let creds = credentials.as_ref()
+        .ok_or_else(|| SwiftError::InternalServerError("TempURL object upload not fully implemented".to_string()))?;
+
+    // Convert HTTP body to AsyncRead stream using StreamReader
+    use http_body_util::BodyExt;
+    use futures::StreamExt;
+
+    // Convert body into data stream with proper error mapping
+    let stream = body
+        .into_data_stream()
+        .map(|result| result.map_err(|e| std::io::Error::other(e.to_string())));
+
+    // Create streaming reader from the body stream
+    let reader = StreamReader::new(stream);
+
+    // Add buffering for optimal streaming performance (64KB buffer)
+    let buffered_reader = tokio::io::BufReader::with_capacity(65536, reader);
+
+    let etag = object::put_object(account, container, object, creds, buffered_reader, headers).await?;
+
+    let trans_id = generate_trans_id();
+    Response::builder()
+        .status(StatusCode::CREATED)
+        .header("content-type", "text/html; charset=utf-8")
+        .header("content-length", "0")
+        .header("etag", etag)
+        .header("x-trans-id", trans_id.clone())
+        .header("x-openstack-request-id", trans_id)
+        .body(Body::empty())
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 
 /// Generate a transaction ID for Swift responses
