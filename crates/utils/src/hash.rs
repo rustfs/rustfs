@@ -24,6 +24,11 @@ const MAGIC_HIGHWAY_HASH256_KEY: [u8; 32] = [
     0x9f, 0x44, 0x14, 0x97, 0xe0, 0x9d, 0x13, 0x22, 0xde, 0x36, 0xa0,
 ];
 
+/// Legacy HH-256 key (main branch): fixed [3,4,2,1] as u64 LE.
+const LEGACY_HIGHWAY_HASH256_KEY: [u8; 32] = [
+    3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+];
+
 fn highway_key_from_bytes(bytes: &[u8; 32]) -> [u64; 4] {
     let mut key = [0u64; 4];
     for (i, chunk) in bytes.chunks_exact(8).enumerate() {
@@ -42,6 +47,8 @@ pub enum HashAlgorithm {
     // HighwayHash256S represents the Streaming HighwayHash-256 hash function
     #[default]
     HighwayHash256S,
+    /// Legacy HighwayHash256S (main branch) with fixed key [3,4,2,1]
+    HighwayHash256SLegacy,
     // BLAKE2b512 represents the BLAKE2b-512 hash function
     BLAKE2b512,
     /// MD5 (128-bit)
@@ -55,6 +62,7 @@ enum HashEncoded {
     Sha256([u8; 32]),
     HighwayHash256([u8; 32]),
     HighwayHash256S([u8; 32]),
+    HighwayHash256SLegacy([u8; 32]),
     Blake2b512([u8; 64]),
     None,
 }
@@ -67,6 +75,7 @@ impl AsRef<[u8]> for HashEncoded {
             HashEncoded::Sha256(hash) => hash.as_ref(),
             HashEncoded::HighwayHash256(hash) => hash.as_ref(),
             HashEncoded::HighwayHash256S(hash) => hash.as_ref(),
+            HashEncoded::HighwayHash256SLegacy(hash) => hash.as_ref(),
             HashEncoded::Blake2b512(hash) => hash.as_ref(),
             HashEncoded::None => &[],
         }
@@ -107,6 +116,12 @@ impl HashAlgorithm {
                 hasher.append(data);
                 HashEncoded::HighwayHash256S(u8x32_from_u64x4(hasher.finalize256()))
             }
+            HashAlgorithm::HighwayHash256SLegacy => {
+                let key = Key(highway_key_from_bytes(&LEGACY_HIGHWAY_HASH256_KEY));
+                let mut hasher = HighwayHasher::new(key);
+                hasher.append(data);
+                HashEncoded::HighwayHash256SLegacy(u8x32_from_u64x4(hasher.finalize256()))
+            }
             HashAlgorithm::BLAKE2b512 => {
                 let hash = Blake2b512::digest(data);
                 let mut out = [0u8; 64];
@@ -127,6 +142,7 @@ impl HashAlgorithm {
             HashAlgorithm::SHA256 => 32,
             HashAlgorithm::HighwayHash256 => 32,
             HashAlgorithm::HighwayHash256S => 32,
+            HashAlgorithm::HighwayHash256SLegacy => 32,
             HashAlgorithm::BLAKE2b512 => 64,
             HashAlgorithm::Md5 => 16,
             HashAlgorithm::None => 0,
@@ -248,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_bitrot_selftest() {
-        let checksums: [(HashAlgorithm, &str); 4] = [
+        let checksums: [(HashAlgorithm, &str); 5] = [
             (HashAlgorithm::SHA256, "a7677ff19e0182e4d52e3a3db727804abc82a5818749336369552e54b838b004"),
             (
                 HashAlgorithm::BLAKE2b512,
@@ -262,12 +278,16 @@ mod tests {
                 HashAlgorithm::HighwayHash256S,
                 "39c0407ed3f01b18d22c85db4aeff11e060ca5f43131b0126731ca197cd42313",
             ),
+            (
+                HashAlgorithm::HighwayHash256SLegacy,
+                "a5592a831588836b0f61bff43da4bd957c376d9b6412a9ecbbd144a3ecf34649",
+            ),
         ];
         for (algo, expected_hex) in checksums {
             let block_size = match algo {
                 HashAlgorithm::SHA256 => 64,
                 HashAlgorithm::BLAKE2b512 => 128,
-                HashAlgorithm::HighwayHash256 | HashAlgorithm::HighwayHash256S => 32,
+                HashAlgorithm::HighwayHash256 | HashAlgorithm::HighwayHash256S | HashAlgorithm::HighwayHash256SLegacy => 32,
                 _ => continue,
             };
             let mut msg = Vec::new();

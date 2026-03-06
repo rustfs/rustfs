@@ -1498,6 +1498,12 @@ impl DiskAPI for LocalDisk {
         let erasure = &fi.erasure;
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
+            let checksum_algo =
+                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                } else {
+                    checksum_info.algorithm
+                };
             let part_path = self.get_object_path(
                 volume,
                 path_join_buf(&[
@@ -1511,7 +1517,7 @@ impl DiskAPI for LocalDisk {
                 .bitrot_verify(
                     &part_path,
                     erasure.shard_file_size(part.size as i64) as usize,
-                    checksum_info.algorithm,
+                    checksum_algo,
                     &checksum_info.hash,
                     erasure.shard_size(),
                 )

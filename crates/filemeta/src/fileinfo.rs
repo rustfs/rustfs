@@ -412,8 +412,12 @@ impl FileInfo {
     }
 
     pub fn inline_data(&self) -> bool {
-        self.metadata
+        // check if the object is inline data,
+
+        (self
+            .metadata
             .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").as_str())
+            || self.metadata.contains_key("x-minio-internal-inline-data"))
             && !self.is_remote()
     }
 
