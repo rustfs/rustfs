@@ -22,7 +22,6 @@ use super::container;
 use super::dlo;
 use super::object;
 use super::slo;
-use super::tempurl;
 use super::{SwiftError, SwiftRoute, SwiftRouter};
 use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
@@ -111,30 +110,11 @@ async fn handle_swift_request(
     credentials: Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError>
 {
-    // Extract parts before checking TempURL or credentials
+    // Extract parts
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
-    let query = parts.uri.query().unwrap_or("");
 
-    // Check for TempURL request (skip authentication if valid TempURL)
-    if tempurl::is_tempurl_request(query) {
-        if let Some(_tempurl_params) = tempurl::parse_tempurl_params(query) {
-            // For TempURL, we need to get the account's secret key
-            // In a real implementation, this would be stored in account metadata
-            // For now, we'll use a placeholder that can be configured
-
-            // TODO: Retrieve TempURL key from account metadata
-            // For MVP, allow TempURL if credentials are not provided but signature validates
-            // This is a simplified implementation - production would need proper key storage
-
-            // For now, since we don't have account-level key storage yet,
-            // we'll just fall through to normal authentication.
-            // TempURL will be fully functional once account metadata storage is added.
-            debug!("TempURL detected but account key storage not yet implemented");
-        }
-    }
-
-    // Credentials are required for all Swift operations (TempURL will bypass this in future)
+    // Credentials are required for all Swift operations
     let credentials = credentials.ok_or_else(|| SwiftError::Unauthorized("Authentication required".to_string()))?;
 
     match route {
