@@ -49,6 +49,8 @@ static XL_FILE_VERSION_MAJOR: u16 = 1;
 static XL_FILE_VERSION_MINOR: u16 = 3;
 static XL_HEADER_VERSION: u8 = 3;
 pub static XL_META_VERSION: u8 = 3;
+/// Legacy format (main branch): meta_ver=2 with file/header versions 1.3.3.
+pub(crate) const LEGACY_META_VERSION: u8 = 2;
 static XXHASH_SEED: u64 = 0;
 
 const XL_FLAG_FREE_VERSION: u8 = 1 << 0;
@@ -805,29 +807,9 @@ impl FileMeta {
         self.versions.first().unwrap().header.mod_time
     }
 
-    /// Load or convert from buffer
+    /// Load or convert from buffer. Handles both current (meta_ver=3) and legacy (meta_ver=2) formats.
     pub fn load_or_convert(buf: &[u8]) -> Result<Self> {
-        // Try to load as current format first
-        match Self::load(buf) {
-            Ok(meta) => Ok(meta),
-            Err(_) => {
-                // Try to convert from legacy format
-                Self::load_legacy(buf)
-            }
-        }
-    }
-
-    /// Load legacy format
-    pub fn load_legacy(_buf: &[u8]) -> Result<Self> {
-        // Implementation for loading legacy xl.meta formats
-        // This would handle conversion from older  formats
-        Err(Error::other("Legacy format not yet implemented"))
-    }
-
-    /// Add legacy version
-    pub fn add_legacy(&mut self, _legacy_obj: &str) -> Result<()> {
-        // Implementation for adding legacy xl.meta v1 objects
-        Err(Error::other("Legacy version addition not yet implemented"))
+        Self::load(buf)
     }
 
     /// List all versions as FileInfo
