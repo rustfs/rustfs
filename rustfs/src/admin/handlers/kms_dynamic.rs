@@ -43,7 +43,7 @@ fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceMa
 }
 
 /// Save KMS configuration to cluster storage
-#[instrument]
+#[instrument(skip(config))]
 async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
     let Some(store) = new_object_layer_fn() else {
         return Err("Storage layer not initialized".to_string());
