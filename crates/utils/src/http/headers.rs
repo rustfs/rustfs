@@ -151,12 +151,6 @@ pub const AMZ_META_UNENCRYPTED_CONTENT_MD5: &str = "X-Amz-Meta-X-Amz-Unencrypted
 
 pub const AMZ_TAGGING_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 
-pub const RUSTFS_ENCRYPTION: &str = "X-Rustfs-Encryption-";
-pub const RUSTFS_ENCRYPTION_LOWER: &str = "x-rustfs-encryption-";
-
-pub const RESERVED_METADATA_PREFIX: &str = "X-RustFS-Internal-";
-pub const RESERVED_METADATA_PREFIX_LOWER: &str = "x-rustfs-internal-";
-
 // SSEC encryption header constants
 pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
 pub const SSEC_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
