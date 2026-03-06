@@ -2667,6 +2667,7 @@ impl DefaultObjectUsecase {
         }
 
         if obj_info.replication_status == ReplicationStatusType::Replica
+            || obj_info.replication_status == ReplicationStatusType::Pending
             || obj_info.version_purge_status == VersionPurgeStatusType::Pending
         {
             schedule_replication_delete(DeletedObjectReplicationInfo {
