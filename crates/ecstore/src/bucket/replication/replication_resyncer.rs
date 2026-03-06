@@ -2832,11 +2832,7 @@ async fn replicate_object_with_multipart<S: StorageAPI>(ctx: MultipartReplicatio
 
     user_metadata.insert(
         RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE.to_string(),
-        object_info
-            .user_defined
-            .get(&format!("{RESERVED_METADATA_PREFIX}actual-size"))
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
+        rustfs_utils::http::get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE).unwrap_or_default(),
     );
 
     cli.complete_multipart_upload(

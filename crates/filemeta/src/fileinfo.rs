@@ -17,6 +17,7 @@ use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::headers::{RESERVED_METADATA_PREFIX_LOWER, RUSTFS_HEALING};
+use rustfs_utils::http::{SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_INLINE_DATA, contains_key_str, insert_str};
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
@@ -402,29 +403,20 @@ impl FileInfo {
     }
 
     pub fn set_inline_data(&mut self) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").to_owned(), "true".to_owned());
+        insert_str(&mut self.metadata, SUFFIX_INLINE_DATA, "true".to_string());
     }
 
     pub fn set_data_moved(&mut self) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}data-moved").to_owned(), "true".to_owned());
+        insert_str(&mut self.metadata, SUFFIX_DATA_MOVED, "true".to_string());
     }
 
     pub fn inline_data(&self) -> bool {
-        // check if the object is inline data,
-
-        (self
-            .metadata
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").as_str())
-            || self.metadata.contains_key("x-minio-internal-inline-data"))
-            && !self.is_remote()
+        contains_key_str(&self.metadata, SUFFIX_INLINE_DATA) && !self.is_remote()
     }
 
     /// Check if the object is compressed
     pub fn is_compressed(&self) -> bool {
-        self.metadata
-            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"))
+        contains_key_str(&self.metadata, SUFFIX_COMPRESSION)
     }
 
     /// Check if the object is remote (transitioned to another tier)

@@ -340,15 +340,11 @@ impl Clone for ObjectInfo {
 
 impl ObjectInfo {
     pub fn is_compressed(&self) -> bool {
-        self.user_defined
-            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"))
+        rustfs_utils::http::contains_key_str(&self.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
     }
 
     pub fn is_compressed_ok(&self) -> Result<(CompressionAlgorithm, bool)> {
-        let scheme = self
-            .user_defined
-            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"))
-            .cloned();
+        let scheme = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         if let Some(scheme) = scheme {
             let algorithm = CompressionAlgorithm::from_str(&scheme)?;
@@ -368,7 +364,7 @@ impl ObjectInfo {
         }
 
         if self.is_compressed() {
-            if let Some(size_str) = self.user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"))
+            if let Some(size_str) = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE)
                 && !size_str.is_empty()
             {
                 // Todo: deal with error

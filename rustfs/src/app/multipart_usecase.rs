@@ -47,7 +47,7 @@ use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_CHECKSUM_TYPE,
-    headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
+    headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING},
 };
 use s3s::dto::*;
 use s3s::region::Region;
@@ -478,8 +478,9 @@ impl DefaultMultipartUsecase {
         };
 
         if is_compressible(&req.headers, &key) {
-            metadata.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
+            rustfs_utils::http::insert_str(
+                &mut metadata,
+                rustfs_utils::http::SUFFIX_COMPRESSION,
                 CompressionAlgorithm::default().to_string(),
             );
         }
@@ -599,9 +600,7 @@ impl DefaultMultipartUsecase {
             StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
         );
 
-        let is_compressible = fi
-            .user_defined
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}compression").as_str());
+        let is_compressible = rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
 
@@ -1010,9 +1009,7 @@ impl DefaultMultipartUsecase {
             .map_err(ApiError::from)?;
         let src_stream = src_reader.stream;
 
-        let is_compressible = mp_info
-            .user_defined
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}compression").as_str());
+        let is_compressible = rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(src_stream));
 

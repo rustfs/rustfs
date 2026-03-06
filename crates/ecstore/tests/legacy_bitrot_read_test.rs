@@ -55,7 +55,7 @@ fn legacy_test_data_exists() -> bool {
     format_path.exists() && (ktvzip_meta.exists() || path_traversal_meta.exists())
 }
 
-async fn run_legacy_bitrot_test_for_object(root: &PathBuf, disk_name: &str, bucket: &str, object: &str) -> bool {
+async fn run_legacy_bitrot_test_for_object(root: &std::path::Path, disk_name: &str, bucket: &str, object: &str) -> bool {
     let xl_meta_path = root.join(disk_name).join(bucket).join(object).join(STORAGE_FORMAT_FILE);
     if !xl_meta_path.exists() {
         eprintln!("xl_meta_path not found: {:?}", xl_meta_path);
@@ -197,7 +197,7 @@ async fn run_legacy_bitrot_test_for_object(root: &PathBuf, disk_name: &str, buck
         }
         _ => {
             eprintln!("Failed to read EC part: {:?}", part_path);
-            return false;
+            false
         }
     }
 }

@@ -14,6 +14,10 @@
 
 use super::msgp_decode::{PrependByteReader, read_nil_or_array_len, read_nil_or_map_len, skip_msgp_value};
 use super::*;
+use rustfs_utils::http::{
+    MINIO_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER,
+    SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, contains_key_bytes, get_bytes, insert_bytes, remove_bytes,
+};
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Eq, PartialOrd, Ord)]
 pub struct FileMetaShallowVersion {
@@ -1174,7 +1178,7 @@ impl MetaObject {
             if k.starts_with(RESERVED_METADATA_PREFIX)
                 || k.starts_with(RESERVED_METADATA_PREFIX_LOWER)
                 || lower_k == VERSION_PURGE_STATUS_KEY.to_lowercase()
-                || k.starts_with("x-minio-internal-")
+                || lower_k.starts_with(MINIO_INTERNAL_PREFIX)
             {
                 metadata.insert(k.to_owned(), String::from_utf8(v.to_owned()).unwrap_or_default());
             }
@@ -1195,10 +1199,7 @@ impl MetaObject {
             }
         }
 
-        let checksum = self
-            .meta_sys
-            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}crc").as_str())
-            .map(|v| Bytes::from(v.clone()));
+        let checksum = get_bytes(&self.meta_sys, SUFFIX_CRC).map(Bytes::from);
 
         let erasure = ErasureInfo {
             algorithm: self.erasure_algorithm.to_string(),
@@ -1210,24 +1211,16 @@ impl MetaObject {
             ..Default::default()
         };
 
-        let transition_status = self
-            .meta_sys
-            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}").as_str())
-            .map(|v| String::from_utf8_lossy(v).to_string())
+        let transition_status = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_STATUS)
+            .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
-        let transitioned_objname = self
-            .meta_sys
-            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}").as_str())
-            .map(|v| String::from_utf8_lossy(v).to_string())
+        let transitioned_objname = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME)
+            .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
-        let transition_version_id = self
-            .meta_sys
-            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}").as_str())
-            .map(|v| Uuid::from_slice(v.as_slice()).unwrap_or_default());
-        let transition_tier = self
-            .meta_sys
-            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}").as_str())
-            .map(|v| String::from_utf8_lossy(v).to_string())
+        let transition_version_id =
+            get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID).map(|v| Uuid::from_slice(v.as_slice()).unwrap_or_default());
+        let transition_tier = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER)
+            .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
 
         FileInfo {
@@ -1252,24 +1245,20 @@ impl MetaObject {
     }
 
     pub fn set_transition(&mut self, fi: &FileInfo) {
-        self.meta_sys.insert(
-            format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"),
-            fi.transition_status.as_bytes().to_vec(),
-        );
-        self.meta_sys.insert(
-            format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}"),
+        insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_STATUS, fi.transition_status.as_bytes().to_vec());
+        insert_bytes(
+            &mut self.meta_sys,
+            SUFFIX_TRANSITIONED_OBJECTNAME,
             fi.transitioned_objname.as_bytes().to_vec(),
         );
         if let Some(transition_version_id) = fi.transition_version_id.as_ref() {
-            self.meta_sys.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}"),
+            insert_bytes(
+                &mut self.meta_sys,
+                SUFFIX_TRANSITIONED_VERSION_ID,
                 transition_version_id.as_bytes().to_vec(),
             );
         }
-        self.meta_sys.insert(
-            format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}"),
-            fi.transition_tier.as_bytes().to_vec(),
-        );
+        insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_TIER, fi.transition_tier.as_bytes().to_vec());
     }
 
     pub fn remove_restore_hdrs(&mut self) {
@@ -1279,10 +1268,8 @@ impl MetaObject {
     }
 
     pub fn uses_data_dir(&self) -> bool {
-        if let Some(status) = self
-            .meta_sys
-            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"))
-            && *status == TRANSITION_COMPLETE.as_bytes().to_vec()
+        if let Some(status) = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_STATUS)
+            && status == TRANSITION_COMPLETE.as_bytes().to_vec()
         {
             return false;
         }
@@ -1291,15 +1278,11 @@ impl MetaObject {
     }
 
     pub fn inlinedata(&self) -> bool {
-        (self
-            .meta_sys
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").as_str())
-            || self.meta_sys.contains_key("x-minio-internal-inline-data"))
+        contains_key_bytes(&self.meta_sys, SUFFIX_INLINE_DATA)
     }
 
     pub fn reset_inline_data(&mut self) {
-        self.meta_sys
-            .remove(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").as_str());
+        remove_bytes(&mut self.meta_sys, SUFFIX_INLINE_DATA);
     }
 
     /// Remove restore headers
@@ -1325,10 +1308,8 @@ impl MetaObject {
         if fi.skip_tier_free_version() {
             return (FileMetaVersion::default(), false);
         }
-        if let Some(status) = self
-            .meta_sys
-            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"))
-            && *status == TRANSITION_COMPLETE.as_bytes().to_vec()
+        if let Some(status) = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_STATUS)
+            && status == TRANSITION_COMPLETE.as_bytes().to_vec()
         {
             let vid = Uuid::parse_str(&fi.tier_free_version_id());
             if let Err(err) = vid {
@@ -1348,18 +1329,15 @@ impl MetaObject {
 
             let delete_marker = free_entry.delete_marker.as_mut().unwrap();
 
-            delete_marker
-                .meta_sys
-                .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{FREE_VERSION}"), vec![]);
+            insert_bytes(&mut delete_marker.meta_sys, SUFFIX_FREE_VERSION, vec![]);
 
-            let tier_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}");
-            let tier_obj_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}");
-            let tier_obj_vid_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}");
-
-            let aa = [tier_key, tier_obj_key, tier_obj_vid_key];
-            for (k, v) in &self.meta_sys {
-                if aa.contains(k) {
-                    delete_marker.meta_sys.insert(k.clone(), v.clone());
+            for suffix in [
+                SUFFIX_TRANSITION_TIER,
+                SUFFIX_TRANSITIONED_OBJECTNAME,
+                SUFFIX_TRANSITIONED_VERSION_ID,
+            ] {
+                if let Some(v) = get_bytes(&self.meta_sys, suffix) {
+                    insert_bytes(&mut delete_marker.meta_sys, suffix, v);
                 }
             }
             return (free_entry, true);
@@ -1385,8 +1363,11 @@ impl From<FileInfo> for MetaObject {
         let mut meta_sys = HashMap::new();
         let mut meta_user = HashMap::new();
         for (k, v) in value.metadata.iter() {
-            if k.len() > RESERVED_METADATA_PREFIX.len()
-                && (k.starts_with(RESERVED_METADATA_PREFIX) || k.starts_with(RESERVED_METADATA_PREFIX_LOWER))
+            let lower = k.to_lowercase();
+            if (k.len() > RESERVED_METADATA_PREFIX.len()
+                && (k.starts_with(RESERVED_METADATA_PREFIX) || k.starts_with(RESERVED_METADATA_PREFIX_LOWER)))
+                || lower.starts_with("x-minio-internal-")
+                || lower.starts_with("x-minio-")
             {
                 if k == headers::X_RUSTFS_HEALING || k == headers::X_RUSTFS_DATA_MOV {
                     continue;
@@ -1399,35 +1380,27 @@ impl From<FileInfo> for MetaObject {
         }
 
         if !value.transition_status.is_empty() {
-            meta_sys.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"),
-                value.transition_status.as_bytes().to_vec(),
-            );
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_STATUS, value.transition_status.as_bytes().to_vec());
         }
 
         if !value.transitioned_objname.is_empty() {
-            meta_sys.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}"),
+            insert_bytes(
+                &mut meta_sys,
+                SUFFIX_TRANSITIONED_OBJECTNAME,
                 value.transitioned_objname.as_bytes().to_vec(),
             );
         }
 
         if let Some(vid) = &value.transition_version_id {
-            meta_sys.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}"),
-                vid.as_bytes().to_vec(),
-            );
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, vid.as_bytes().to_vec());
         }
 
         if !value.transition_tier.is_empty() {
-            meta_sys.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}"),
-                value.transition_tier.as_bytes().to_vec(),
-            );
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_TIER, value.transition_tier.as_bytes().to_vec());
         }
 
         if let Some(content_hash) = value.checksum {
-            meta_sys.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}crc"), content_hash.to_vec());
+            insert_bytes(&mut meta_sys, SUFFIX_CRC, content_hash.to_vec());
         }
 
         Self {
@@ -1465,7 +1438,10 @@ fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<
             continue;
         }
 
-        if let Some(sub_key) = k.strip_prefix(RESERVED_METADATA_PREFIX_LOWER) {
+        let sub_key = k
+            .strip_prefix(RESERVED_METADATA_PREFIX_LOWER)
+            .or_else(|| k.strip_prefix(rustfs_utils::http::MINIO_INTERNAL_PREFIX));
+        if let Some(sub_key) = sub_key {
             match sub_key {
                 "replica-timestamp" => {
                     has = true;
@@ -1509,8 +1485,7 @@ pub struct MetaDeleteMarker {
 
 impl MetaDeleteMarker {
     pub fn free_version(&self) -> bool {
-        self.meta_sys
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}{FREE_VERSION}").as_str())
+        contains_key_bytes(&self.meta_sys, SUFFIX_FREE_VERSION)
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, _all_parts: bool) -> FileInfo {
@@ -1535,21 +1510,15 @@ impl MetaDeleteMarker {
 
         if self.free_version() {
             fi.set_tier_free_version();
-            fi.transition_tier = self
-                .meta_sys
-                .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}").as_str())
-                .map(|v| String::from_utf8_lossy(v).to_string())
+            fi.transition_tier = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER)
+                .map(|v| String::from_utf8_lossy(&v).to_string())
                 .unwrap_or_default();
 
-            fi.transitioned_objname = self
-                .meta_sys
-                .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}").as_str())
-                .map(|v| String::from_utf8_lossy(v).to_string())
+            fi.transitioned_objname = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME)
+                .map(|v| String::from_utf8_lossy(&v).to_string())
                 .unwrap_or_default();
 
-            fi.transition_version_id = self
-                .meta_sys
-                .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}").as_str())
+            fi.transition_version_id = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
                 .map(|v| Uuid::from_slice(v.as_slice()).unwrap_or_default());
         }
 

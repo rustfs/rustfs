@@ -19,12 +19,12 @@ use crate::{
 };
 use byteorder::ByteOrder;
 use bytes::Bytes;
-use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
 use rustfs_utils::http::headers::{
     self, AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_RESTORE_EXPIRY_DAYS,
     AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER,
     VERSION_PURGE_STATUS_KEY,
 };
+use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX};
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -50,7 +50,6 @@ static XL_FILE_VERSION_MINOR: u16 = 3;
 static XL_HEADER_VERSION: u8 = 3;
 pub static XL_META_VERSION: u8 = 3;
 /// Legacy format (main branch): meta_ver=2 with file/header versions 1.3.3.
-pub(crate) const LEGACY_META_VERSION: u8 = 2;
 static XXHASH_SEED: u64 = 0;
 
 const XL_FLAG_FREE_VERSION: u8 = 1 << 0;
@@ -186,9 +185,10 @@ impl FileMeta {
                             for (k, v) in fi.metadata.iter() {
                                 // Split metadata into meta_user and meta_sys based on prefix
                                 // This logic must match From<FileInfo> for MetaObject
-                                if k.len() > RESERVED_METADATA_PREFIX.len()
-                                    && (k.starts_with(RESERVED_METADATA_PREFIX) || k.starts_with(RESERVED_METADATA_PREFIX_LOWER))
-                                {
+                                let lower = k.to_lowercase();
+                                let is_system =
+                                    lower.starts_with(RESERVED_METADATA_PREFIX_LOWER) || lower.starts_with(MINIO_INTERNAL_PREFIX);
+                                if is_system {
                                     // Skip internal flags that shouldn't be persisted
                                     if k == headers::X_RUSTFS_HEALING || k == headers::X_RUSTFS_DATA_MOV {
                                         continue;

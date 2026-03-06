@@ -251,7 +251,11 @@ pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> s
             .get(RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE)
             .and_then(|h| h.to_str().ok())
         {
-            user_defined.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}Actual-Object-Size"), actual_size_str.to_string());
+            rustfs_utils::http::insert_str(
+                &mut user_defined,
+                rustfs_utils::http::SUFFIX_ACTUAL_OBJECT_SIZE_CAP,
+                actual_size_str.to_string(),
+            );
         } else {
             tracing::warn!("Failed to get or parse {} header", RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE);
         }
