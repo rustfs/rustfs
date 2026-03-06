@@ -338,6 +338,11 @@ async fn handle_authenticated_request(
                         response = response.header("x-timestamp", timestamp_str);
                     }
 
+                    // Add versioning location header if versioning is enabled
+                    if let Ok(Some(archive_container)) = container::get_versions_location(&account, &container, &credentials).await {
+                        response = response.header("x-versions-location", archive_container);
+                    }
+
                     // Add custom metadata headers (X-Container-Meta-*)
                     for (key, value) in metadata.custom_metadata {
                         let header_name = format!("x-container-meta-{}", key.to_lowercase());
