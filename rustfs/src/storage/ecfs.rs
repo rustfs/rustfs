@@ -521,7 +521,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
-        record_s3_op(S3Operation::ListBuckets, "");
+        // List buckets not associated with a bucket, give it bucket label "*" to denote "all".
+        record_s3_op(S3Operation::ListBuckets, "*");
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_list_buckets(req).await
     }
