@@ -15,9 +15,9 @@
 //! System metadata compatibility: write both x-rustfs-internal-* and x-minio-internal-*
 //! for MinIO interoperability. Read prefers RustFS, fallback to MinIO.
 
-use super::RESERVED_METADATA_PREFIX_LOWER;
 use std::collections::HashMap;
 
+pub const RUSTFS_INTERNAL_PREFIX: &str = "x-rustfs-internal-";
 pub const MINIO_INTERNAL_PREFIX: &str = "x-minio-internal-";
 
 // Key suffixes (lowercase, no prefix)
@@ -58,13 +58,13 @@ pub const SUFFIX_TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
 /// for xl.meta compatibility. Case-insensitive.
 pub fn is_internal_key(key: &str) -> bool {
     let lower = key.to_lowercase();
-    lower.starts_with(RESERVED_METADATA_PREFIX_LOWER) || lower.starts_with(MINIO_INTERNAL_PREFIX)
+    lower.starts_with(RUSTFS_INTERNAL_PREFIX) || lower.starts_with(MINIO_INTERNAL_PREFIX)
 }
 
 /// Returns true if the key matches the given suffix for either x-rustfs-internal-* or x-minio-internal-*.
 pub fn has_internal_suffix(key: &str, suffix: &str) -> bool {
     let lower = key.to_lowercase();
-    let rustfs_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{suffix}");
+    let rustfs_key = format!("{RUSTFS_INTERNAL_PREFIX}{suffix}");
     let minio_key = format!("{MINIO_INTERNAL_PREFIX}{suffix}");
     lower == rustfs_key || lower == minio_key
 }
@@ -74,7 +74,7 @@ pub fn has_internal_suffix(key: &str, suffix: &str) -> bool {
 pub fn strip_internal_prefix(key: &str) -> Option<String> {
     let lower = key.to_lowercase();
     lower
-        .strip_prefix(RESERVED_METADATA_PREFIX_LOWER)
+        .strip_prefix(RUSTFS_INTERNAL_PREFIX)
         .or_else(|| lower.strip_prefix(MINIO_INTERNAL_PREFIX))
         .map(|s| s.to_string())
 }
@@ -93,16 +93,13 @@ pub fn internal_key_strip_suffix_prefix(key: &str, suffix_prefix: &str) -> Optio
 }
 
 fn both_keys(suffix: &str) -> (String, String) {
-    (
-        format!("{RESERVED_METADATA_PREFIX_LOWER}{suffix}"),
-        format!("{MINIO_INTERNAL_PREFIX}{suffix}"),
-    )
+    (format!("{RUSTFS_INTERNAL_PREFIX}{suffix}"), format!("{MINIO_INTERNAL_PREFIX}{suffix}"))
 }
 
 /// Builds the RustFS internal key for the given suffix. Use when a single key is needed (e.g. for
 /// backward compat). Prefer insert_str/get_str when both keys should be written/read.
 pub fn internal_key_rustfs(suffix: &str) -> String {
-    format!("{RESERVED_METADATA_PREFIX_LOWER}{suffix}")
+    format!("{RUSTFS_INTERNAL_PREFIX}{suffix}")
 }
 
 // === String type (FileInfo.metadata, user_defined) ===
