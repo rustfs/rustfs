@@ -347,7 +347,14 @@ impl SetDisks {
 
                             for (part_index, part) in latest_meta.parts.iter().enumerate() {
                                 let till_offset = erasure.shard_file_offset(0, part.size, part.size);
-                                let checksum_algo = erasure_info.get_checksum_info(part.number).algorithm;
+                                let checksum_info = erasure_info.get_checksum_info(part.number);
+                                let checksum_algo = if latest_meta.uses_legacy_checksum
+                                    && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
+                                {
+                                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                                } else {
+                                    checksum_info.algorithm
+                                };
                                 let mut readers = Vec::with_capacity(latest_disks.len());
                                 let mut writers = Vec::with_capacity(out_dated_disks.len());
                                 // let mut errors = Vec::with_capacity(out_dated_disks.len());

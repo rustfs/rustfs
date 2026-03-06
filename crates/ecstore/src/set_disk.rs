@@ -3351,12 +3351,18 @@ async fn disks_with_all_parts(
         if (meta.data.is_some() || meta.size == 0) && !meta.parts.is_empty() {
             if let Some(data) = &meta.data {
                 let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
+                let checksum_algo =
+                    if meta.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                        rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                    } else {
+                        checksum_info.algorithm
+                    };
                 let data_len = data.len();
                 let verify_err = bitrot_verify(
                     Box::new(Cursor::new(data.clone())),
                     data_len,
                     meta.erasure.shard_file_size(meta.size) as usize,
-                    checksum_info.algorithm,
+                    checksum_algo,
                     checksum_info.hash,
                     meta.erasure.shard_size(),
                 )
