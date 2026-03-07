@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{instrument, warn};
 
 /// Process start time for calculating uptime.
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
@@ -44,6 +44,7 @@ fn get_process_start() -> &'static Instant {
 }
 
 /// Collect cluster statistics from the storage layer.
+#[instrument]
 async fn collect_cluster_stats() -> ClusterStats {
     let Some(store) = new_object_layer_fn() else {
         return ClusterStats::default();

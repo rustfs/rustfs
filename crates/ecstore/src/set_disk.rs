@@ -519,7 +519,7 @@ impl ObjectIO for SetDisks {
         Ok(reader)
     }
 
-    #[tracing::instrument(level = "debug", skip(self, data,))]
+    #[tracing::instrument(skip(self, data,))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let disks = self.get_disks_internal().await;
 

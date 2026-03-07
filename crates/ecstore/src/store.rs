@@ -281,7 +281,6 @@ impl BucketOperations for ECStore {
 
 #[async_trait::async_trait]
 impl ObjectOperations for ECStore {
-    #[instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.handle_get_object_info(bucket, object, opts).await
     }
@@ -561,7 +560,6 @@ impl HealOperations for ECStore {
 
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
-    #[instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.handle_new_ns_lock(bucket, object).await
     }
