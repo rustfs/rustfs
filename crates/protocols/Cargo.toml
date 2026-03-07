@@ -28,6 +28,36 @@ categories = ["network-programming", "filesystem"]
 [features]
 default = []
 ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls"]
+swift = [
+    "dep:rustfs-keystone",
+    "dep:rustfs-ecstore",
+    "dep:rustfs-rio",
+    "dep:axum",
+    "dep:http",
+    "dep:hyper",
+    "dep:tower",
+    "dep:regex",
+    "dep:percent-encoding",
+    "dep:sha2",
+    "dep:uuid",
+    "dep:pin-project-lite",
+    "dep:futures",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:tokio-util",
+    "dep:serde",
+    "dep:urlencoding",
+    "dep:md5",
+    "dep:quick-xml",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:hex",
+    "dep:tar",
+    "dep:flate2",
+    "dep:bzip2",
+    "dep:base64",
+    "dep:rand",
+]
 
 [dependencies]
 # Core RustFS dependencies
@@ -59,6 +89,36 @@ s3s = { workspace = true }
 libunftp = { workspace = true, optional = true }
 unftp-core = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
+
+# Swift specific dependencies (optional)
+rustfs-keystone = { workspace = true, optional = true }
+rustfs-ecstore = { workspace = true, optional = true }
+rustfs-rio = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
+percent-encoding = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+pin-project-lite = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+urlencoding = { workspace = true, optional = true }
+md5 = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true, features = ["serialize"] }
+hmac = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+tar = { version = "0.4", optional = true }
+flate2 = { workspace = true, optional = true }
+bzip2 = { version = "0.4", optional = true }
+base64 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
 all-features = true

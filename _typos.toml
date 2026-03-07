@@ -42,6 +42,8 @@ GAE = "GAE"
 # s3-tests original test names (cannot be changed)
 nonexisted = "nonexisted"
 consts = "consts"
+# Swift API - company/product names
+Hashi = "Hashi"  # HashiCorp
 
 [files]
 extend-exclude = []

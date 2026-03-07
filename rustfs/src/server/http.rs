@@ -39,6 +39,8 @@ use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_keystone::KeystoneAuthLayer;
+#[cfg(feature = "swift")]
+use rustfs_protocols::SwiftService;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -581,7 +583,16 @@ fn process_connection(
         // Build services inside each connected task to avoid passing complex service types across tasks,
         // It also ensures that each connection has an independent service instance.
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
-        let service = hybrid(s3_service, rpc_service);
+
+        // Wrap S3 service with Swift service to handle Swift API requests
+        // Swift API is only available when compiled with the 'swift' feature
+        // When enabled, Swift routes are handled at /v1/AUTH_* paths by default
+        #[cfg(feature = "swift")]
+        let http_service = SwiftService::new(true, None, s3_service);
+        #[cfg(not(feature = "swift"))]
+        let http_service = s3_service;
+
+        let service = hybrid(http_service, rpc_service);
 
         let remote_addr = match socket.peer_addr() {
             Ok(addr) => Some(RemoteAddr(addr)),
