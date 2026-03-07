@@ -87,6 +87,7 @@ pub trait ScannerIODisk: Send + Sync + Debug + 'static {
 
 #[async_trait::async_trait]
 impl ScannerIO for ECStore {
+    #[tracing::instrument(skip(self, updates))]
     async fn nsscanner(
         &self,
         ctx: CancellationToken,
@@ -223,6 +224,7 @@ impl ScannerIO for ECStore {
 
 #[async_trait::async_trait]
 impl ScannerIOCache for SetDisks {
+    #[tracing::instrument(skip(self, updates))]
     async fn nsscanner_cache(
         self: Arc<Self>,
         ctx: CancellationToken,
@@ -563,6 +565,8 @@ impl ScannerIODisk for Disk {
 
         Ok(size_summary)
     }
+
+    #[tracing::instrument(skip(self, updates, cache))]
     async fn nsscanner_disk(
         &self,
         ctx: CancellationToken,

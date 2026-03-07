@@ -34,7 +34,7 @@ use std::{
 };
 use tokio::fs;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, instrument};
 
 // Data usage storage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
@@ -77,6 +77,7 @@ lazy_static::lazy_static! {
 }
 
 /// Store data usage info to backend storage
+#[instrument(skip(store))]
 pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
     // Prevent older data from overwriting newer persisted stats
     if let Ok(buf) = read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await
@@ -103,6 +104,7 @@ pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: 
 }
 
 /// Load data usage info from backend storage
+#[instrument(skip(store))]
 pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
     let buf: Vec<u8> = match read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await {
         Ok(data) => data,
@@ -633,6 +635,7 @@ pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str
     Ok(d)
 }
 
+#[instrument(skip(cache))]
 pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate::error::Result<()> {
     use crate::config::com::save_config;
     use crate::disk::BUCKET_META_PREFIX;

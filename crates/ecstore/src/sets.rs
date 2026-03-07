@@ -381,7 +381,6 @@ impl BucketOperations for Sets {
 
 #[async_trait::async_trait]
 impl ObjectOperations for Sets {
-    #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
     }
@@ -826,7 +825,6 @@ impl HealOperations for Sets {
 
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
-    #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.disk_set[0].new_ns_lock(bucket, object).await
     }

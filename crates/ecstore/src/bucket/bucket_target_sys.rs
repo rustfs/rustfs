@@ -862,7 +862,6 @@ fn should_force_path_style(target: &BucketTarget) -> bool {
         // Explicit path-style or legacy boolean-like values.
         "path" | "on" | "true" => true,
         // `auto` and empty are defaulted to path-style for custom S3-compatible endpoints.
-        // RustFS/MinIO-style deployments typically do not configure virtual-hosted-style routing.
         "auto" | "" => true,
         // Unknown values: prefer compatibility with S3-compatible services.
         _ => true,

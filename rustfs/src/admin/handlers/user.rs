@@ -25,7 +25,7 @@ use crate::{
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
-use rustfs_credentials::get_global_action_cred;
+use rustfs_credentials::{Credentials, get_global_action_cred};
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
     sys::NewServiceAccountOpts,
@@ -64,6 +64,13 @@ pub fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
     user_policy_binding::register_user_policy_binding_route(r)?;
 
     Ok(())
+}
+
+fn should_check_deny_only(target_access_key: &str, requester: &Credentials) -> bool {
+    target_access_key == requester.access_key
+        && requester.parent_user.is_empty()
+        && !requester.is_temp()
+        && !requester.is_service_account()
 }
 
 pub struct AddUser {}
@@ -134,14 +141,14 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is not utf8"));
         }
 
-        // Security fix: Always require explicit Allow permission for CreateUser
-        // Do not use deny_only to bypass permission checks, even when creating for self
-        // This ensures consistent security semantics and prevents privilege escalation
+        let check_deny_only = should_check_deny_only(ak, &cred);
+
+        // For eligible self operations, only explicit Deny should block the request.
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
-            false, // Always require explicit Allow permission
+            check_deny_only,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
@@ -393,14 +400,14 @@ impl Operation for GetUserInfo {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        // Security fix: Always require explicit Allow permission for GetUser
-        // Users should have explicit GetUser permission to view account information
-        // This ensures consistent security semantics across all admin operations
+        let check_deny_only = should_check_deny_only(ak, &cred);
+
+        // For eligible self operations, only explicit Deny should block the request.
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
-            false, // Always require explicit Allow permission
+            check_deny_only,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
@@ -1052,5 +1059,64 @@ impl Operation for ImportIam {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_check_deny_only;
+    use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_should_check_deny_only_for_regular_self_request() {
+        let cred = Credentials {
+            access_key: "alice".to_string(),
+            ..Default::default()
+        };
+        assert!(should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_should_not_check_deny_only_for_other_user_request() {
+        let cred = Credentials {
+            access_key: "bob".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_should_not_check_deny_only_for_temp_credentials() {
+        let cred = Credentials {
+            access_key: "alice".to_string(),
+            session_token: "temp-token".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_should_not_check_deny_only_for_service_account_credentials() {
+        let mut claims = HashMap::new();
+        claims.insert(IAM_POLICY_CLAIM_NAME_SA.to_string(), Value::String("policy".to_string()));
+        let cred = Credentials {
+            access_key: "alice".to_string(),
+            parent_user: "parent-user".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+        assert!(!should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_should_not_check_deny_only_when_parent_user_present() {
+        let cred = Credentials {
+            access_key: "alice".to_string(),
+            parent_user: "parent-user".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_check_deny_only("alice", &cred));
     }
 }

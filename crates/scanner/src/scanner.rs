@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Returns the base cycle interval. If `RUSTFS_DATA_SCANNER_START_DELAY_SECS`
 /// is set, it takes precedence; otherwise the value is derived from the
@@ -118,6 +118,7 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
 }
 
 /// Save background healing information to storage
+#[instrument(skip(storeapi))]
 pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundHealInfo) {
     // Skip for ErasureSD setup
     if is_erasure_sd().await {
@@ -144,6 +145,77 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
 /// For distributed environments with multiple nodes, a longer timeout may be needed
 fn get_lock_acquire_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+}
+
+#[instrument(skip_all)]
+async fn run_scan_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
+    cycle_info.current = cycle_info.next;
+    cycle_info.started = Utc::now();
+
+    global_metrics().set_cycle(Some(cycle_info.clone())).await;
+
+    let background_heal_info = read_background_heal_info(storeapi.clone()).await;
+
+    let scan_mode = get_cycle_scan_mode(
+        cycle_info.current,
+        background_heal_info.bitrot_start_cycle,
+        background_heal_info.bitrot_start_time,
+    );
+    if background_heal_info.current_scan_mode != scan_mode {
+        let mut new_heal_info = background_heal_info.clone();
+        new_heal_info.current_scan_mode = scan_mode;
+
+        if scan_mode == HealScanMode::Deep {
+            new_heal_info.bitrot_start_cycle = cycle_info.current;
+            new_heal_info.bitrot_start_time = Some(Utc::now());
+        }
+
+        save_background_heal_info(storeapi.clone(), new_heal_info).await;
+    }
+
+    let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
+    let storeapi_clone = storeapi.clone();
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        store_data_usage_in_backend(ctx_clone, storeapi_clone, receiver).await;
+    });
+
+    let done_cycle = Metrics::time(Metric::ScanCycle);
+    let cycle_start = std::time::Instant::now();
+    if let Err(e) = storeapi
+        .clone()
+        .nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode)
+        .await
+    {
+        error!("Failed to scan namespace: {e}");
+        emit_scan_cycle_complete(false, cycle_start.elapsed());
+    } else {
+        done_cycle();
+        emit_scan_cycle_complete(true, cycle_start.elapsed());
+        info!("Namespace scanned successfully");
+
+        cycle_info.next += 1;
+        cycle_info.current = 0;
+        cycle_info.cycle_completed.push(Utc::now());
+
+        if cycle_info.cycle_completed.len() >= data_usage_update_dir_cycles() as usize {
+            cycle_info.cycle_completed = cycle_info.cycle_completed.split_off(data_usage_update_dir_cycles() as usize);
+        }
+
+        global_metrics().set_cycle(Some(cycle_info.clone())).await;
+
+        let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
+
+        let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
+        buf.extend_from_slice(&cycle_info.next.to_le_bytes());
+        buf.extend_from_slice(&cycle_info_buf);
+
+        if let Err(e) = save_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
+            error!("Failed to save data usage bloom name to {}: {}", &*DATA_USAGE_BLOOM_NAME_PATH, e);
+        } else {
+            info!("Data usage bloom name saved successfully");
+        }
+    }
 }
 
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
@@ -254,7 +326,9 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
         // Randomized inter-cycle delay
         tokio::select! {
             _ = ctx.cancelled() => break,
-            _ = tokio::time::sleep(randomized_cycle_delay()) => {},
+            _ = tokio::time::sleep(randomized_cycle_delay()) => {
+                run_scan_cycle(&ctx, &storeapi, &mut cycle_info).await;
+            },
         }
     }
 
@@ -266,6 +340,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
 }
 
 /// Store data usage info in backend. Will store all objects sent on the receiver until closed.
+#[instrument(skip(ctx, storeapi))]
 pub async fn store_data_usage_in_backend(
     ctx: CancellationToken,
     storeapi: Arc<ECStore>,
