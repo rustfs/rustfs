@@ -665,10 +665,7 @@ fn process_connection(
                     .on_request(|request: &HttpRequest<_>, span: &Span| {
                         let _enter = span.enter();
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
-                        let labels = [
-                            ("key_request_method", format!("{}", request.method())),
-                            ("key_request_uri_path", request.uri().path().to_owned().to_string()),
-                        ];
+                        let labels = [("key_request_method", request.method().to_string())];
                         counter!("rustfs.api.requests.total", &labels).increment(1);
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
