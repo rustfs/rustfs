@@ -13,15 +13,166 @@
 // limitations under the License.
 
 //! Erasure coding implementation using reed-solomon-erasure (GF(2^8)).
+//! Supports legacy (reed-solomon-simd) for reading/healing old-version files.
 //!
 
 use bytes::{Bytes, BytesMut};
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use reed_solomon_simd;
 use smallvec::SmallVec;
 use std::io;
 use tokio::io::AsyncRead;
 use tracing::warn;
 use uuid::Uuid;
+
+/// Legacy calc_shard_size formula: (block_size.div_ceil(data_shards) + 1) & !1
+/// Matches main branch and filemeta::ErasureInfo for old-version files.
+pub fn calc_shard_size_legacy(block_size: usize, data_shards: usize) -> usize {
+    (block_size.div_ceil(data_shards) + 1) & !1
+}
+
+/// Reed-Solomon encoder for legacy (main branch) format using reed-solomon-simd.
+/// Used when decoding/encoding files with uses_legacy_checksum == true.
+struct LegacyReedSolomonEncoder {
+    data_shards: usize,
+    parity_shards: usize,
+    encoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
+    decoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
+}
+
+impl Clone for LegacyReedSolomonEncoder {
+    fn clone(&self) -> Self {
+        Self {
+            data_shards: self.data_shards,
+            parity_shards: self.parity_shards,
+            encoder_cache: std::sync::RwLock::new(None),
+            decoder_cache: std::sync::RwLock::new(None),
+        }
+    }
+}
+
+impl LegacyReedSolomonEncoder {
+    fn new(_data_shards: usize, _parity_shards: usize) -> io::Result<Self> {
+        Ok(Self {
+            data_shards: _data_shards,
+            parity_shards: _parity_shards,
+            encoder_cache: std::sync::RwLock::new(None),
+            decoder_cache: std::sync::RwLock::new(None),
+        })
+    }
+
+    fn encode(&self, shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
+        let mut shards_vec: Vec<&mut [u8]> = shards.into_vec();
+        if shards_vec.is_empty() {
+            return Ok(());
+        }
+        let shard_len = shards_vec[0].len();
+        let mut encoder = {
+            let mut cache_guard = self
+                .encoder_cache
+                .write()
+                .map_err(|_| io::Error::other("Failed to acquire encoder cache lock"))?;
+            match cache_guard.take() {
+                Some(mut cached) => {
+                    if cached.reset(self.data_shards, self.parity_shards, shard_len).is_err() {
+                        reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
+                            .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {e:?}")))?
+                    } else {
+                        cached
+                    }
+                }
+                None => reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
+                    .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {e:?}")))?,
+            }
+        };
+        for (i, shard) in shards_vec.iter().enumerate().take(self.data_shards) {
+            encoder
+                .add_original_shard(shard)
+                .map_err(|e| io::Error::other(format!("Failed to add shard {i}: {e:?}")))?;
+        }
+        let result = encoder
+            .encode()
+            .map_err(|e| io::Error::other(format!("SIMD encoding failed: {e:?}")))?;
+        for (i, recovery_shard) in result.recovery_iter().enumerate() {
+            if i + self.data_shards < shards_vec.len() {
+                shards_vec[i + self.data_shards].copy_from_slice(recovery_shard);
+            }
+        }
+        drop(result);
+        *self
+            .encoder_cache
+            .write()
+            .map_err(|_| io::Error::other("Failed to return encoder to cache"))? = Some(encoder);
+        Ok(())
+    }
+
+    fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        let shard_len = shards
+            .iter()
+            .find_map(|s| s.as_ref().map(|v| v.len()))
+            .ok_or_else(|| io::Error::other("No valid shards found for reconstruction"))?;
+
+        let mut decoder = {
+            let mut cache_guard = self
+                .decoder_cache
+                .write()
+                .map_err(|_| io::Error::other("Failed to acquire decoder cache lock"))?;
+
+            match cache_guard.take() {
+                Some(mut cached_decoder) => {
+                    if let Err(e) = cached_decoder.reset(self.data_shards, self.parity_shards, shard_len) {
+                        warn!("Failed to reset SIMD decoder: {:?}, creating new one", e);
+                        reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
+                            .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {e:?}")))?
+                    } else {
+                        cached_decoder
+                    }
+                }
+                None => reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
+                    .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {e:?}")))?,
+            }
+        };
+
+        for (i, shard_opt) in shards.iter().enumerate() {
+            if let Some(shard) = shard_opt {
+                if i < self.data_shards {
+                    decoder
+                        .add_original_shard(i, shard)
+                        .map_err(|e| io::Error::other(format!("Failed to add original shard for reconstruction: {e:?}")))?;
+                } else {
+                    let recovery_idx = i - self.data_shards;
+                    decoder
+                        .add_recovery_shard(recovery_idx, shard)
+                        .map_err(|e| io::Error::other(format!("Failed to add recovery shard for reconstruction: {e:?}")))?;
+                }
+            }
+        }
+
+        let result = decoder
+            .decode()
+            .map_err(|e| io::Error::other(format!("SIMD decode error: {e:?}")))?;
+
+        for (i, shard_opt) in shards.iter_mut().enumerate() {
+            if shard_opt.is_none() && i < self.data_shards {
+                for (restored_index, restored_data) in result.restored_original_iter() {
+                    if restored_index == i {
+                        *shard_opt = Some(restored_data.to_vec());
+                        break;
+                    }
+                }
+            }
+        }
+
+        drop(result);
+
+        *self
+            .decoder_cache
+            .write()
+            .map_err(|_| io::Error::other("Failed to return decoder to cache"))? = Some(decoder);
+
+        Ok(())
+    }
+}
 
 /// Reed-Solomon encoder using reed-solomon-erasure
 pub struct ReedSolomonEncoder {
@@ -106,15 +257,30 @@ impl ReedSolomonEncoder {
 /// let shards = erasure.encode_data(data).unwrap();
 /// // Simulate loss and recovery...
 /// ```
-
-#[derive(Default)]
 pub struct Erasure {
     pub data_shards: usize,
     pub parity_shards: usize,
     encoder: Option<ReedSolomonEncoder>,
+    legacy_encoder: Option<LegacyReedSolomonEncoder>,
     pub block_size: usize,
+    uses_legacy: bool,
     _id: Uuid,
     _buf: Vec<u8>,
+}
+
+impl Default for Erasure {
+    fn default() -> Self {
+        Self {
+            data_shards: 0,
+            parity_shards: 0,
+            encoder: None,
+            legacy_encoder: None,
+            block_size: 0,
+            uses_legacy: false,
+            _id: Uuid::nil(),
+            _buf: vec![],
+        }
+    }
 }
 
 impl Clone for Erasure {
@@ -123,7 +289,9 @@ impl Clone for Erasure {
             data_shards: self.data_shards,
             parity_shards: self.parity_shards,
             encoder: self.encoder.clone(),
+            legacy_encoder: self.legacy_encoder.clone(),
             block_size: self.block_size,
+            uses_legacy: self.uses_legacy,
             _id: Uuid::new_v4(), // Generate new ID for clone
             _buf: vec![0u8; self.block_size],
         }
@@ -135,15 +303,29 @@ pub fn calc_shard_size(block_size: usize, data_shards: usize) -> usize {
 }
 
 impl Erasure {
-    /// Create a new Erasure instance.
+    /// Create a new Erasure instance
     ///
     /// # Arguments
     /// * `data_shards` - Number of data shards.
     /// * `parity_shards` - Number of parity shards.
     /// * `block_size` - Block size for each shard.
     pub fn new(data_shards: usize, parity_shards: usize, block_size: usize) -> Self {
-        let encoder = if parity_shards > 0 {
+        Self::new_with_options(data_shards, parity_shards, block_size, false)
+    }
+
+    /// Create a new Erasure instance with legacy format support.
+    ///
+    /// When `uses_legacy` is true, uses main-branch shard_size formula and reed-solomon-simd
+    /// for decode/reconstruct (for reading and healing old-version files).
+    pub fn new_with_options(data_shards: usize, parity_shards: usize, block_size: usize, uses_legacy: bool) -> Self {
+        let encoder = if !uses_legacy && parity_shards > 0 {
             Some(ReedSolomonEncoder::new(data_shards, parity_shards).unwrap())
+        } else {
+            None
+        };
+
+        let legacy_encoder = if uses_legacy && parity_shards > 0 {
+            Some(LegacyReedSolomonEncoder::new(data_shards, parity_shards).unwrap())
         } else {
             None
         };
@@ -153,6 +335,8 @@ impl Erasure {
             parity_shards,
             block_size,
             encoder,
+            legacy_encoder,
+            uses_legacy,
             _id: Uuid::new_v4(),
             _buf: vec![0u8; block_size],
         }
@@ -167,28 +351,29 @@ impl Erasure {
     /// A vector of encoded shards as `Bytes`.
     #[tracing::instrument(level = "info", skip_all, fields(data_len=data.len()))]
     pub fn encode_data(&self, data: &[u8]) -> io::Result<Vec<Bytes>> {
-        // let shard_size = self.shard_size();
-        // let total_size = shard_size * self.total_shard_count();
-
-        // Data shard count
-        let per_shard_size = calc_shard_size(data.len(), self.data_shards);
-        // Total required size
+        let shard_size_fn = if self.uses_legacy {
+            calc_shard_size_legacy
+        } else {
+            calc_shard_size
+        };
+        let per_shard_size = shard_size_fn(data.len(), self.data_shards);
         let need_total_size = per_shard_size * self.total_shard_count();
 
-        // Create a new buffer with the required total length for all shards
         let mut data_buffer = BytesMut::with_capacity(need_total_size);
-
-        // Copy source data
         data_buffer.extend_from_slice(data);
         data_buffer.resize(need_total_size, 0u8);
 
         {
-            // EC encode, the result will be written into data_buffer
             let data_slices: SmallVec<[&mut [u8]; 16]> = data_buffer.chunks_exact_mut(per_shard_size).collect();
 
-            // Only do EC if parity_shards > 0
             if self.parity_shards > 0 {
-                if let Some(encoder) = self.encoder.as_ref() {
+                if self.uses_legacy {
+                    if let Some(encoder) = self.legacy_encoder.as_ref() {
+                        encoder.encode(data_slices)?;
+                    } else {
+                        warn!("parity_shards > 0, uses_legacy but legacy_encoder is None");
+                    }
+                } else if let Some(encoder) = self.encoder.as_ref() {
                     encoder.encode(data_slices)?;
                 } else {
                     warn!("parity_shards > 0, but encoder is None");
@@ -216,7 +401,13 @@ impl Erasure {
     /// Ok if reconstruction succeeds, error otherwise.
     pub fn decode_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         if self.parity_shards > 0 {
-            if let Some(encoder) = self.encoder.as_ref() {
+            if self.uses_legacy {
+                if let Some(encoder) = self.legacy_encoder.as_ref() {
+                    encoder.reconstruct(shards)?;
+                } else {
+                    warn!("parity_shards > 0, uses_legacy but legacy_encoder is None");
+                }
+            } else if let Some(encoder) = self.encoder.as_ref() {
                 encoder.reconstruct(shards)?;
             } else {
                 warn!("parity_shards > 0, but encoder is None");
@@ -239,7 +430,11 @@ impl Erasure {
 
     /// Calculate the size of each shard.
     pub fn shard_size(&self) -> usize {
-        calc_shard_size(self.block_size, self.data_shards)
+        if self.uses_legacy {
+            calc_shard_size_legacy(self.block_size, self.data_shards)
+        } else {
+            calc_shard_size(self.block_size, self.data_shards)
+        }
     }
     /// Calculate the total erasure file size for a given original size.
     // Returns the final erasure size from the original size
@@ -252,10 +447,15 @@ impl Erasure {
         }
 
         let total_length = total_length as usize;
+        let shard_size_fn = if self.uses_legacy {
+            calc_shard_size_legacy
+        } else {
+            calc_shard_size
+        };
 
         let num_shards = total_length / self.block_size;
         let last_block_size = total_length % self.block_size;
-        let last_shard_size = calc_shard_size(last_block_size, self.data_shards);
+        let last_shard_size = shard_size_fn(last_block_size, self.data_shards);
         (num_shards * self.shard_size() + last_shard_size) as i64
     }
 
@@ -449,6 +649,66 @@ mod tests {
         let erasure = Erasure::new(4, 2, 8);
         assert_eq!(erasure.shard_file_size(33), 9);
         assert_eq!(erasure.shard_file_size(0), 0);
+    }
+
+    #[test]
+    fn test_legacy_shard_size_and_file_size() {
+        let erasure = Erasure::new_with_options(4, 2, 8, true);
+        assert_eq!(erasure.shard_size(), 2);
+        assert_eq!(calc_shard_size_legacy(8, 4), 2);
+        assert_eq!(calc_shard_size_legacy(1, 4), 2);
+        assert_eq!(erasure.shard_file_size(33), 10);
+        assert_eq!(erasure.shard_file_size(0), 0);
+    }
+
+    #[test]
+    fn test_legacy_encode_decode_roundtrip() {
+        let data_shards = 4;
+        let parity_shards = 2;
+        let block_size = 1024;
+        let erasure = Erasure::new_with_options(data_shards, parity_shards, block_size, true);
+
+        let data = b"Legacy encode/decode roundtrip test data with sufficient length.".repeat(20);
+        let encoded_shards = erasure.encode_data(&data).unwrap();
+        assert_eq!(encoded_shards.len(), data_shards + parity_shards);
+
+        let mut decode_input: Vec<Option<Vec<u8>>> = vec![None; data_shards + parity_shards];
+        for i in 0..data_shards {
+            decode_input[i] = Some(encoded_shards[i].to_vec());
+        }
+
+        erasure.decode_data(&mut decode_input).unwrap();
+
+        let mut recovered = Vec::new();
+        for shard in decode_input.iter().take(data_shards) {
+            recovered.extend_from_slice(shard.as_ref().unwrap());
+        }
+        recovered.truncate(data.len());
+        assert_eq!(&recovered, &data);
+    }
+
+    #[test]
+    fn test_legacy_decode_with_missing_shards() {
+        let data_shards = 4;
+        let parity_shards = 2;
+        let block_size = 256;
+        let erasure = Erasure::new_with_options(data_shards, parity_shards, block_size, true);
+
+        let data = b"Legacy decode with missing shards test.".repeat(10);
+        let encoded_shards = erasure.encode_data(&data).unwrap();
+
+        let mut shards_opt: Vec<Option<Vec<u8>>> = encoded_shards.iter().map(|s| Some(s.to_vec())).collect();
+        shards_opt[1] = None;
+        shards_opt[5] = None;
+
+        erasure.decode_data(&mut shards_opt).unwrap();
+
+        let mut recovered = Vec::new();
+        for shard in shards_opt.iter().take(data_shards) {
+            recovered.extend_from_slice(shard.as_ref().unwrap());
+        }
+        recovered.truncate(data.len());
+        assert_eq!(&recovered, &data);
     }
 
     #[test]
