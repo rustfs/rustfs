@@ -648,6 +648,9 @@ fn process_connection(
                             uri = %request.uri(),
                             version = ?request.version(),
                         );
+                        if span.is_disabled() {
+                            return span;
+                        }
                         if let Err(e) = span.set_parent(parent_context) {
                             warn!("Failed to propagate tracing context: `{:?}`", e);
                         }

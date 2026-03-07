@@ -680,6 +680,7 @@ impl SetDisks {
         Ok((result, None))
     }
 
+    #[tracing::instrument(skip(self))]
     pub(super) async fn heal_object_dir(
         &self,
         bucket: &str,
