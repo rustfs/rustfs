@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::Parser;
 use clap::builder::NonEmptyStringValueParser;
+use clap::{Args, Parser, Subcommand};
 use const_str::concat;
 use rustfs_config::RUSTFS_REGION;
 use std::path::PathBuf;
@@ -50,9 +50,47 @@ const LONG_VERSION: &str = concat!(
     concat!("git status   :\n", build::GIT_STATUS_FILE),
 );
 
+/// Known subcommands. When the first arg matches one of these, it is treated as a subcommand.
+const KNOWN_SUBCOMMANDS: &[&str] = &["server"];
+
+/// Preprocess argv for legacy compatibility: `rustfs <volume>` and `rustfs --address ...` are
+/// treated as `rustfs server <volume>` and `rustfs server --address ...` respectively.
+/// Also: `rustfs` with no args becomes `rustfs server` (volumes from env).
+fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
+    if args.len() < 2 {
+        // rustfs -> rustfs server (volumes from RUSTFS_VOLUMES env)
+        return vec![args[0].clone(), "server".to_string()];
+    }
+    let first = &args[1];
+    // If first arg looks like a subcommand, do nothing
+    if KNOWN_SUBCOMMANDS.contains(&first.as_str()) {
+        return args;
+    }
+    // If first arg is a global flag (--help, --version), do nothing
+    if first == "--help" || first == "-h" || first == "--version" || first == "-V" {
+        return args;
+    }
+    // Legacy: rustfs <volume> or rustfs --address ... -> rustfs server <volume|--address ...>
+    let mut out = vec![args[0].clone(), "server".to_string()];
+    out.extend(args[1..].iter().cloned());
+    out
+}
+
 #[derive(Parser, Clone)]
-#[command(version = SHORT_VERSION, long_version = LONG_VERSION)]
-pub struct Opt {
+#[command(name = "rustfs", version = SHORT_VERSION, long_version = LONG_VERSION)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Clone)]
+enum Commands {
+    /// Start the object storage server (default when no subcommand is given)
+    Server(ServerOpts),
+}
+
+#[derive(Args, Clone)]
+struct ServerOpts {
     /// DIR points to a directory on a filesystem.
     #[arg(
         required = true,
@@ -164,6 +202,94 @@ pub struct Opt {
     pub buffer_profile: String,
 }
 
+/// Parsed server options. Public for tests and backward compatibility.
+/// Use `Opt::parse_from` or `Config::parse()` to obtain.
+#[derive(Clone)]
+pub struct Opt {
+    pub volumes: Vec<String>,
+    pub address: String,
+    pub server_domains: Vec<String>,
+    pub access_key: Option<String>,
+    pub access_key_file: Option<PathBuf>,
+    pub secret_key: Option<String>,
+    pub secret_key_file: Option<PathBuf>,
+    pub console_enable: bool,
+    pub console_address: String,
+    pub obs_endpoint: String,
+    pub tls_path: Option<String>,
+    pub license: Option<String>,
+    pub region: Option<String>,
+    pub kms_enable: bool,
+    pub kms_backend: String,
+    pub kms_key_dir: Option<String>,
+    pub kms_vault_address: Option<String>,
+    pub kms_vault_token: Option<String>,
+    pub kms_default_key_id: Option<String>,
+    pub buffer_profile_disable: bool,
+    pub buffer_profile: String,
+}
+
+impl Opt {
+    fn from_server_opts(o: ServerOpts) -> Self {
+        Self {
+            volumes: o.volumes,
+            address: o.address,
+            server_domains: o.server_domains,
+            access_key: o.access_key,
+            access_key_file: o.access_key_file,
+            secret_key: o.secret_key,
+            secret_key_file: o.secret_key_file,
+            console_enable: o.console_enable,
+            console_address: o.console_address,
+            obs_endpoint: o.obs_endpoint,
+            tls_path: o.tls_path,
+            license: o.license,
+            region: o.region,
+            kms_enable: o.kms_enable,
+            kms_backend: o.kms_backend,
+            kms_key_dir: o.kms_key_dir,
+            kms_vault_address: o.kms_vault_address,
+            kms_vault_token: o.kms_vault_token,
+            kms_default_key_id: o.kms_default_key_id,
+            buffer_profile_disable: o.buffer_profile_disable,
+            buffer_profile: o.buffer_profile,
+        }
+    }
+
+    /// Parse from preprocessed args. Supports both `rustfs <volume>` and `rustfs server <volume>`.
+    pub fn parse_from<I, T>(args: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let args: Vec<String> = args.into_iter().map(|a| a.into().to_string_lossy().into_owned()).collect();
+        let args = preprocess_args_for_legacy(args);
+        let cli = Cli::parse_from(args);
+        let Commands::Server(opts) = cli.command.expect("server is the default subcommand");
+        Self::from_server_opts(opts)
+    }
+
+    /// Try parse from args, returns error on invalid input.
+    #[allow(dead_code)] // used in config_test
+    pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let args: Vec<String> = args.into_iter().map(|a| a.into().to_string_lossy().into_owned()).collect();
+        let args = preprocess_args_for_legacy(args);
+        let cli = Cli::try_parse_from(args)?;
+        let Commands::Server(opts) = cli.command.expect("server is the default subcommand");
+        Ok(Self::from_server_opts(opts))
+    }
+
+    /// Parse from env::args(). Used by Config::parse().
+    fn parse() -> Self {
+        let args: Vec<String> = std::env::args().collect();
+        Self::parse_from(args)
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     /// DIR points to a directory on a filesystem.
@@ -227,11 +353,14 @@ pub struct Config {
 }
 
 impl Config {
-    /// parse the command line arguments and environment arguments from [`Opt`] and convert them
-    /// into a ready to use [`Config`]
+    /// Parse the command line arguments and environment arguments from [`Opt`] and convert them
+    /// into a ready to use [`Config`].
     ///
-    /// This includes some intermediate checks for mutually exclusive options
+    /// Supports both `rustfs <volume>` (legacy) and `rustfs server <volume>`.
+    ///
+    /// This includes some intermediate checks for mutually exclusive options.
     pub fn parse() -> std::io::Result<Self> {
+        let opt = Opt::parse();
         let Opt {
             volumes,
             address,
@@ -254,7 +383,7 @@ impl Config {
             kms_default_key_id,
             buffer_profile_disable,
             buffer_profile,
-        } = Opt::parse();
+        } = opt;
 
         let access_key = access_key
             .map(Ok)

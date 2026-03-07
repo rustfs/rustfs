@@ -16,7 +16,6 @@
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
     use crate::config::Opt;
-    use clap::Parser;
     use rustfs_ecstore::disks_layout::DisksLayout;
     use serial_test::serial;
     use std::env;
@@ -54,6 +53,19 @@ mod tests {
     {
         let layout = DisksLayout::from_volumes(volumes).expect("Failed to parse volumes");
         verify_fn(&layout);
+    }
+
+    #[test]
+    #[serial]
+    fn test_server_subcommand_and_legacy_equivalence() {
+        // rustfs server <volume> and rustfs <volume> (legacy) must produce identical results
+        let legacy_args = vec!["rustfs", "/data/vol1"];
+        let server_args = vec!["rustfs", "server", "/data/vol1"];
+        let opt_legacy = Opt::parse_from(legacy_args);
+        let opt_server = Opt::parse_from(server_args);
+        assert_eq!(opt_legacy.volumes, opt_server.volumes);
+        assert_eq!(opt_legacy.address, opt_server.address);
+        assert_eq!(opt_legacy.console_address, opt_server.console_address);
     }
 
     #[test]
