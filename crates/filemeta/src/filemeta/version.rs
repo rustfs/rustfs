@@ -12,6 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Version meta parsing with legacy compatibility.
+//!
+//! **Rule**: To parse version meta bytes (from `FileMetaShallowVersion.meta` or raw `&[u8]`),
+//! always use one of:
+//! - `FileMetaShallowVersion::parse_version_meta()` or `into_fileinfo()`
+//! - `FileMetaVersion::try_from(buf)`
+//!
+//! Do NOT use `FileMetaVersion::default()` + `unmarshal_msg()` directly, as that fails on
+//! legacy (rmp_serde) format. `try_from` falls back to rmp_serde when hand-written decode fails.
+
 use super::msgp_decode::{PrependByteReader, read_nil_or_array_len, read_nil_or_map_len, skip_msgp_value};
 use super::*;
 use rustfs_utils::http::{
@@ -27,9 +37,14 @@ pub struct FileMetaShallowVersion {
 }
 
 impl FileMetaShallowVersion {
-    pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
-        let file_version = FileMetaVersion::try_from(self.meta.as_slice())?;
+    /// Parse version meta with legacy format compatibility.
+    /// Use this instead of `FileMetaVersion::default()` + `unmarshal_msg()` to handle old-version xl.meta.
+    pub fn parse_version_meta(&self) -> Result<FileMetaVersion> {
+        FileMetaVersion::try_from(self.meta.as_slice())
+    }
 
+    pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
+        let file_version = self.parse_version_meta()?;
         Ok(file_version.into_fileinfo(volume, path, all_parts))
     }
 }
