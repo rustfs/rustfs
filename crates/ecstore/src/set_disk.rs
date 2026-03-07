@@ -493,6 +493,7 @@ impl ObjectIO for SetDisks {
         let object = object.to_owned();
         let set_index = self.set_index;
         let pool_index = self.pool_index;
+        let hash_algo_clone = opts.hash_algo.clone();
         // Move the read-lock guard into the task so it lives for the duration of the read
         // let _guard_to_hold = _read_lock_guard; // moved into closure below
         tokio::spawn(async move {
@@ -509,7 +510,7 @@ impl ObjectIO for SetDisks {
                 &disks,
                 set_index,
                 pool_index,
-                opts.alg_checksum,
+                hash_algo_clone,
             )
             .await
             {
@@ -1654,6 +1655,7 @@ impl ObjectOperations for SetDisks {
         let cloned_fi = fi.clone();
         let set_index = self.set_index;
         let pool_index = self.pool_index;
+        let hash_algo_clone = opts.hash_algo.clone();
         tokio::spawn(async move {
             if let Err(e) = Self::get_object_with_fileinfo(
                 &cloned_bucket,
@@ -1666,6 +1668,7 @@ impl ObjectOperations for SetDisks {
                 &online_disks,
                 set_index,
                 pool_index,
+                hash_algo_clone,
             )
             .await
             {

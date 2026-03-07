@@ -165,13 +165,11 @@ pub async fn get_opts(
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
 
-    // When reading object from disk, don't do bitrot checks.
-    // Assume we trust the disks and the integrity is checked during scans.
-    // By not checking bitrot on object get, we save lots of cpu cycles
-    // that would otherwise compute hashes.
+    // When getting object from disk, don't do bitrot checks.
+    // Assume we trust the disks, let scanner handle async integrity checks.
+    // By not checking bitrot on get object, we save lots of cpu cycles.
     // TODO: Get this from ENV_VAR
-    // opts.alg_checksum = Some(HashAlgorithm::HighwayHash256); // old default
-    opts.alg_checksum = Some(HashAlgorithm::None); // new default
+    opts.hash_algo = HashAlgorithm::None; // new default
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 

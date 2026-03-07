@@ -1,4 +1,3 @@
-use rustfs_checksums::ChecksumAlgorithm;
 use rustfs_utils::HashAlgorithm;
 
 use super::*;
@@ -73,7 +72,7 @@ pub struct ObjectOptions {
     pub eval_metadata: Option<HashMap<String, String>>,
 
     pub want_checksum: Option<Checksum>,
-    pub alg_checksum: Option<HashAlgorithm>,
+    pub hash_algo: HashAlgorithm,
 }
 
 impl ObjectOptions {
