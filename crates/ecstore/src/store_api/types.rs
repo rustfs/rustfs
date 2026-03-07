@@ -1,3 +1,6 @@
+use rustfs_checksums::ChecksumAlgorithm;
+use rustfs_utils::HashAlgorithm;
+
 use super::*;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -70,6 +73,7 @@ pub struct ObjectOptions {
     pub eval_metadata: Option<HashMap<String, String>>,
 
     pub want_checksum: Option<Checksum>,
+    pub alg_checksum: Option<HashAlgorithm>,
 }
 
 impl ObjectOptions {

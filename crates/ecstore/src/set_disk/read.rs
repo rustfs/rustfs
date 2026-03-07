@@ -568,6 +568,7 @@ impl SetDisks {
         disks: &[Option<DiskStore>],
         set_index: usize,
         pool_index: usize,
+        hash_algo: Option<HashAlgorithm>,
     ) -> Result<()>
     where
         W: AsyncWrite + Send + Sync + Unpin + 'static,
@@ -606,6 +607,15 @@ impl SetDisks {
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
+
+        // Default hash algorithm from object opts is Option::None.
+        // If Option::None, use the previous default (HH256).
+        // If alg is Some(alg), use that alg.
+        // We use this to set HashAlgorithm::None to effectivly
+        // disable bitrot checks on straight object checks, while
+        // maintaining bitrot checks for all other reads (heal, verifiy, etc).
+        let checksum_algo = hash_algo.unwrap_or(HashAlgorithm::HighwayHash256);
+        // let checksum_algo = hash_algo.as_ref().unwrap_or(&HashAlgorithm::HighwayHash256);
 
         let mut total_read = 0;
         for current_part in part_indices {
@@ -658,7 +668,7 @@ impl SetDisks {
                     read_offset,
                     till_offset,
                     erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256,
+                    checksum_algo.clone(),
                 )
                 .await
                 {

@@ -509,6 +509,7 @@ impl ObjectIO for SetDisks {
                 &disks,
                 set_index,
                 pool_index,
+                opts.alg_checksum,
             )
             .await
             {
