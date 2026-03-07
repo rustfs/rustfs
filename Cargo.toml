@@ -232,6 +232,7 @@ rand = { version = "0.10.0", features = ["serde"] }
 ratelimit = "0.10.0"
 rayon = "1.11.0"
 reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"] }
+reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.3" }
 rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.4", features = ["fs"] }
