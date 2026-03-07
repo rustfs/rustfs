@@ -21,6 +21,7 @@ use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, SizeSummary, hash_path};
 use crate::error::ScannerError;
 use crate::scanner_io::ScannerIODisk as _;
+use crate::sleeper::DynamicSleeper;
 use rustfs_common::heal_channel::{HEAL_DELETE_DANGLING, HealChannelRequest, HealOpts, HealScanMode, send_heal_request};
 use rustfs_common::metrics::{IlmAction, Metric, Metrics, UpdateCurrentPathFn, current_path_updater};
 use rustfs_ecstore::StorageAPI;
@@ -50,10 +51,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-// Constants from Go code
-const DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1);
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16;
 const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
+const YIELD_EVERY_N_OBJECTS: u64 = 128;
 const DATA_SCANNER_COMPACT_AT_CHILDREN: usize = 10000;
 const DATA_SCANNER_COMPACT_AT_FOLDERS: usize = DATA_SCANNER_COMPACT_AT_CHILDREN / 4;
 const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
@@ -397,7 +397,7 @@ pub struct FolderScanner {
     failed_object_ttl_secs: u64,
     failed_objects_max: usize,
 
-    we_sleep: Box<dyn Fn() -> bool + Send + Sync>,
+    sleeper: DynamicSleeper,
     // should_heal: Arc<dyn Fn() -> bool + Send + Sync>,
     disks: Vec<Arc<Disk>>,
     disks_quorum: usize,
@@ -561,8 +561,6 @@ impl FolderScanner {
         // Store initial compaction state.
         let was_compacted = into.compacted;
 
-        let wait_time = None;
-
         loop {
             if ctx.is_cancelled() {
                 return Err(ScannerError::Other("Operation cancelled".to_string()));
@@ -599,13 +597,12 @@ impl FolderScanner {
                     None
                 };
 
-            if (self.we_sleep)() {
-                tokio::time::sleep(DATA_SCANNER_SLEEP_PER_FOLDER).await;
-            }
+            self.sleeper.sleep_folder().await;
 
             let mut existing_folders: Vec<CachedFolder> = Vec::new();
             let mut new_folders: Vec<CachedFolder> = Vec::new();
             let mut found_objects = false;
+            let mut object_count: u64 = 0;
 
             let dir_path = path_join_buf(&[&self.root, &folder.name]);
 
@@ -679,11 +676,7 @@ impl FolderScanner {
                     continue;
                 }
 
-                let mut wait = wait_time;
-
-                if (self.we_sleep)() {
-                    wait = Some(SystemTime::now());
-                }
+                let timer = self.sleeper.timer();
 
                 let heal_enabled = this_hash.mod_alt(
                     self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
@@ -724,15 +717,9 @@ impl FolderScanner {
 
                             // Only log non-skip errors to avoid noise
                             warn!("scan_folder: failed to get size for item {}: {}", item.path, e);
-
-                            // Apply sleep if configured
-                            if let Some(t) = wait
-                                && let Ok(elapsed) = t.elapsed()
-                            {
-                                tokio::time::sleep(elapsed).await;
-                            }
                         }
 
+                        timer.sleep().await;
                         continue;
                     }
                 };
@@ -743,14 +730,14 @@ impl FolderScanner {
 
                 abandoned_children.remove(&path_join_buf(&[&item.bucket, &item.object_path()]));
 
-                // TODO: check err
                 into.add_sizes(&sz);
                 into.objects += 1;
+                object_count += 1;
 
-                if let Some(t) = wait
-                    && let Ok(elapsed) = t.elapsed()
-                {
-                    tokio::time::sleep(elapsed).await;
+                timer.sleep().await;
+
+                if object_count.is_multiple_of(YIELD_EVERY_N_OBJECTS) {
+                    tokio::task::yield_now().await;
                 }
             }
 
@@ -830,6 +817,7 @@ impl FolderScanner {
                 // Use Box::pin for recursive async call
                 let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
                 fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                tokio::task::yield_now().await;
 
                 if !into.compacted {
                     let h = DataUsageHash(folder_item.name.clone());
@@ -878,6 +866,7 @@ impl FolderScanner {
                 // Use Box::pin for recursive async call
                 let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
                 fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                tokio::task::yield_now().await;
 
                 if !into.compacted {
                     let h = DataUsageHash(folder_item.name.clone());
@@ -1088,6 +1077,7 @@ impl FolderScanner {
                     // Use Box::pin for recursive async call
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
                     fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                    tokio::task::yield_now().await;
 
                     if !into.compacted {
                         let h = DataUsageHash(folder_item.name.clone());
@@ -1167,7 +1157,7 @@ impl FolderScanner {
 /// Scan a data folder
 /// This function scans the basepath+cache.info.name and returns an updated cache.
 /// The returned cache will always be valid, but may not be updated from the existing.
-/// Before each operation sleepDuration is called which can be used to temporarily halt the scanner.
+/// Throttling between operations is controlled by the provided [`DynamicSleeper`].
 /// If the supplied context is canceled the function will return at the first chance.
 #[allow(clippy::too_many_arguments)]
 pub async fn scan_data_folder(
@@ -1177,7 +1167,7 @@ pub async fn scan_data_folder(
     cache: DataUsageCache,
     updates: Option<mpsc::Sender<DataUsageEntry>>,
     scan_mode: HealScanMode,
-    we_sleep: Box<dyn Fn() -> bool + Send + Sync>,
+    sleeper: DynamicSleeper,
 ) -> Result<DataUsageCache, ScannerError> {
     use crate::data_usage_define::DATA_USAGE_ROOT;
 
@@ -1224,7 +1214,7 @@ pub async fn scan_data_folder(
         scan_mode,
         failed_object_ttl_secs: failed_object_ttl,
         failed_objects_max,
-        we_sleep,
+        sleeper,
         disks,
         disks_quorum,
         updates,
@@ -1269,6 +1259,8 @@ pub async fn scan_data_folder(
 
 #[cfg(test)]
 mod tests {
+    use crate::SCANNER_SLEEPER;
+
     use super::*;
     use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
     use serial_test::serial;
@@ -1304,7 +1296,7 @@ mod tests {
             scan_mode: HealScanMode::Normal,
             failed_object_ttl_secs: u64::MAX,
             failed_objects_max: usize::MAX,
-            we_sleep: Box::new(|| false),
+            sleeper: SCANNER_SLEEPER.clone(),
             disks: Vec::new(),
             disks_quorum: 0,
             updates: None,
