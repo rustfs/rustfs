@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use metrics::{counter, describe_counter};
+use std::sync::OnceLock;
 
 const S3_OPS_METRIC: &str = "rustfs_s3_operations_total";
 
