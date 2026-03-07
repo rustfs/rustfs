@@ -430,7 +430,7 @@ impl Store for ObjectStore {
     /// # Returns
     ///
     /// * `Result<()>` - `Ok(())` on success, or an `Error` if all attempts fail.
-    #[tracing::instrument(level = "debug", skip(self, item, path))]
+    #[tracing::instrument(skip(self, item, path))]
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()> {
         let mut data = serde_json::to_vec(&item)?;
         data = Self::encrypt_data(&data)?;
