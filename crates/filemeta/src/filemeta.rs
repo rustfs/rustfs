@@ -666,13 +666,14 @@ impl FileMeta {
             // TODO: freeVersion
             if header.free_version() {
                 non_free_versions -= 1;
-                if include_free_versions && found_free_version.is_none() {
-                    let mut found_free_fi = FileMetaVersion::default();
-                    if found_free_fi.unmarshal_msg(&ver.meta).is_ok() && found_free_fi.version_type != VersionType::Invalid {
-                        let mut free_fi = found_free_fi.into_fileinfo(volume, path, all_parts);
-                        free_fi.is_latest = true;
-                        found_free_version = Some(free_fi);
-                    }
+                if include_free_versions
+                    && found_free_version.is_none()
+                    && let Ok(found_free_fi) = ver.parse_version_meta()
+                    && found_free_fi.version_type != VersionType::Invalid
+                {
+                    let mut free_fi = found_free_fi.into_fileinfo(volume, path, all_parts);
+                    free_fi.is_latest = true;
+                    found_free_version = Some(free_fi);
                 }
 
                 if header.version_id != Some(vid) {
@@ -774,9 +775,7 @@ impl FileMeta {
     pub fn into_file_info_versions(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfoVersions> {
         let mut versions = Vec::new();
         for version in self.versions.iter() {
-            let mut file_version = FileMetaVersion::default();
-            file_version.unmarshal_msg(&version.meta)?;
-            let fi = file_version.into_fileinfo(volume, path, all_parts);
+            let fi = version.into_fileinfo(volume, path, all_parts)?;
             versions.push(fi);
         }
 
