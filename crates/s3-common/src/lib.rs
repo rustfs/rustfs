@@ -12,26 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod arn;
-mod check;
-pub mod error;
-pub mod store;
-pub mod target;
+mod event_name;
+mod s3_metrics;
 
-pub use check::check_mqtt_broker_available;
-pub use error::{StoreError, TargetError};
-pub use rustfs_s3_common::EventName;
-use serde::{Deserialize, Serialize};
-pub use target::Target;
-
-/// Represents a log of events for sending to targets
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct TargetLog<E> {
-    /// The event name
-    pub event_name: EventName,
-    /// The object key
-    pub key: String,
-    /// The list of events
-    pub records: Vec<E>,
-}
+pub use event_name::{EventName, ParseEventNameError, S3Operation};
+pub use s3_metrics::{init_s3_metrics, record_s3_op};

@@ -14,7 +14,7 @@
 
 use crate::rules::{BucketRulesSnapshot, BucketSnapshotRef, DynRulesContainer};
 use arc_swap::ArcSwap;
-use rustfs_targets::EventName;
+use rustfs_s3_common::EventName;
 use starshard::ShardedHashMap;
 use std::fmt;
 use std::sync::Arc;
