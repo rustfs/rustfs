@@ -375,6 +375,8 @@ impl BucketMetadata {
     fn parse_all_configs(&mut self, _api: Arc<ECStore>) -> Result<()> {
         if !self.policy_config_json.is_empty() {
             self.policy_config = Some(serde_json::from_slice(&self.policy_config_json)?);
+        } else {
+            self.policy_config = None;
         }
         if !self.notification_config_xml.is_empty() {
             self.notification_config = Some(deserialize::<NotificationConfiguration>(&self.notification_config_xml)?);

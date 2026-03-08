@@ -129,7 +129,18 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
         let bucket_name = req_info.bucket.as_deref().unwrap_or("");
 
+        // Per AWS S3: root can always perform GetBucketPolicy, PutBucketPolicy, DeleteBucketPolicy
+        // even if bucket policy explicitly denies. Other actions (ListBucket, GetObject, etc.) are
+        // subject to bucket policy Deny for root as well. See: repost.aws/knowledge-center/s3-accidentally-denied-access
+        let owner_can_bypass_deny = req_info.is_owner
+            && matches!(
+                action,
+                Action::S3Action(S3Action::GetBucketPolicyAction)
+                    | Action::S3Action(S3Action::PutBucketPolicyAction)
+                    | Action::S3Action(S3Action::DeleteBucketPolicyAction)
+            );
         if !bucket_name.is_empty()
+            && !owner_can_bypass_deny
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
