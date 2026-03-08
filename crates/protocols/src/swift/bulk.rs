@@ -76,10 +76,10 @@
 
 use super::{SwiftError, SwiftResult, container, object};
 use axum::http::{Response, StatusCode};
+use futures::StreamExt;
 use rustfs_credentials::Credentials;
 use s3s::Body;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use tracing::{debug, error};
 
 /// Result of a single delete operation
@@ -340,8 +340,8 @@ pub async fn handle_bulk_extract(
         return Err(SwiftError::NotFound(format!("Container not found: {}", container)));
     }
 
-    // Parse archive and collect entries (without holding the archive)
-    let entries = extract_tar_entries(format, body)?;
+    // Parse archive and collect all entries into memory (entire archive and file contents are buffered)
+    let entries = extract_tar_entries(format, body).await?;
 
     // Now upload each entry (async operations)
     for (path_str, contents) in entries {
@@ -352,7 +352,7 @@ pub async fn handle_bulk_extract(
             &path_str,
             credentials,
             std::io::Cursor::new(contents),
-            &axum::http::HeaderMap::new(),
+            &http::HeaderMap::new(),
         )
         .await
         {
@@ -395,30 +395,30 @@ pub async fn handle_bulk_extract(
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 
-/// Extract tar entries synchronously to avoid Send issues
-fn extract_tar_entries(format: ArchiveFormat, body: Vec<u8>) -> SwiftResult<Vec<(String, Vec<u8>)>> {
+/// Extract tar entries using async I/O and return them as in-memory buffers
+async fn extract_tar_entries(format: ArchiveFormat, body: Vec<u8>) -> SwiftResult<Vec<(String, Vec<u8>)>> {
     // Create appropriate reader based on format
-    let reader: Box<dyn Read> = match format {
+    let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match format {
         ArchiveFormat::Tar => Box::new(std::io::Cursor::new(body)),
         ArchiveFormat::TarGz => {
             let cursor = std::io::Cursor::new(body);
-            Box::new(flate2::read::GzDecoder::new(cursor))
+            Box::new(async_compression::tokio::bufread::GzipDecoder::new(tokio::io::BufReader::new(cursor)))
         }
         ArchiveFormat::TarBz2 => {
             let cursor = std::io::Cursor::new(body);
-            Box::new(bzip2::read::BzDecoder::new(cursor))
+            Box::new(async_compression::tokio::bufread::BzDecoder::new(tokio::io::BufReader::new(cursor)))
         }
     };
 
     // Parse tar archive
-    let mut archive = tar::Archive::new(reader);
+    let mut archive = tokio_tar::Archive::new(reader);
     let mut entries = Vec::new();
+    let mut entries_iter = archive
+        .entries()
+        .map_err(|e| SwiftError::BadRequest(format!("Failed to read tar archive: {}", e)))?;
 
     // Extract each entry
-    for entry in archive
-        .entries()
-        .map_err(|e| SwiftError::BadRequest(format!("Failed to read tar archive: {}", e)))?
-    {
+    while let Some(entry) = entries_iter.next().await {
         let mut entry = entry.map_err(|e| SwiftError::BadRequest(format!("Failed to read tar entry: {}", e)))?;
 
         // Get entry path
@@ -436,7 +436,7 @@ fn extract_tar_entries(format: ArchiveFormat, body: Vec<u8>) -> SwiftResult<Vec<
 
         // Read file contents
         let mut contents = Vec::new();
-        if let Err(e) = entry.read_to_end(&mut contents) {
+        if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut entry, &mut contents).await {
             error!("Failed to read tar entry {}: {}", path_str, e);
             continue;
         }
@@ -551,5 +551,118 @@ mod tests {
         let paths: Vec<&str> = body.lines().filter(|line| !line.trim().is_empty()).collect();
 
         assert_eq!(paths.len(), 3);
+    }
+
+    /// Tests for the `extract_tar_entries` async function.
+    ///
+    /// Conditionally compiled with the `swift` feature, which gates the
+    /// `tokio_tar` (astral-tokio-tar) and `async_compression` dependencies.
+    #[cfg(feature = "swift")]
+    mod tar_extraction {
+        use super::*;
+        use tokio::io::AsyncWriteExt;
+
+        /// Builds an uncompressed tar archive in memory.
+        ///
+        /// * `files` – `(path, content)` pairs added as regular files.
+        /// * `dirs`  – paths added as directory entries.
+        async fn make_tar(files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
+            let buf = std::io::Cursor::new(Vec::new());
+            let mut builder = tokio_tar::Builder::new(buf);
+
+            for &dir in dirs {
+                let mut header = tokio_tar::Header::new_gnu();
+                header.set_entry_type(tokio_tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, dir, std::io::Cursor::new(&[] as &[u8]))
+                    .await
+                    .unwrap();
+            }
+
+            for &(name, data) in files {
+                let mut header = tokio_tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, std::io::Cursor::new(data))
+                    .await
+                    .unwrap();
+            }
+
+            builder.into_inner().await.unwrap().into_inner()
+        }
+
+        #[tokio::test]
+        async fn test_extract_plain_tar_paths_and_contents() {
+            let tar_bytes = make_tar(&[("file1.txt", b"hello"), ("dir/file2.txt", b"world")], &[]).await;
+            let entries = extract_tar_entries(ArchiveFormat::Tar, tar_bytes).await.unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].0, "file1.txt");
+            assert_eq!(entries[0].1, b"hello");
+            assert_eq!(entries[1].0, "dir/file2.txt");
+            assert_eq!(entries[1].1, b"world");
+        }
+
+        #[tokio::test]
+        async fn test_extract_tar_skips_directories() {
+            let tar_bytes = make_tar(&[("file.txt", b"content")], &["subdir/", "another/"]).await;
+            let entries = extract_tar_entries(ArchiveFormat::Tar, tar_bytes).await.unwrap();
+            // Directory entries must be filtered out; only the regular file is returned.
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, "file.txt");
+        }
+
+        #[tokio::test]
+        async fn test_extract_tar_gz() {
+            let tar_bytes = make_tar(&[("file.txt", b"compressed content")], &[]).await;
+
+            // Compress with gzip.
+            let cursor = std::io::Cursor::new(Vec::new());
+            let mut encoder = async_compression::tokio::write::GzipEncoder::new(cursor);
+            encoder.write_all(&tar_bytes).await.unwrap();
+            encoder.shutdown().await.unwrap();
+            let gz_bytes = encoder.into_inner().into_inner();
+
+            let entries = extract_tar_entries(ArchiveFormat::TarGz, gz_bytes).await.unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, "file.txt");
+            assert_eq!(entries[0].1, b"compressed content");
+        }
+
+        #[tokio::test]
+        async fn test_extract_tar_bz2() {
+            let tar_bytes = make_tar(&[("file.txt", b"bzip2 content")], &[]).await;
+
+            // Compress with bzip2.
+            let cursor = std::io::Cursor::new(Vec::new());
+            let mut encoder = async_compression::tokio::write::BzEncoder::new(cursor);
+            encoder.write_all(&tar_bytes).await.unwrap();
+            encoder.shutdown().await.unwrap();
+            let bz2_bytes = encoder.into_inner().into_inner();
+
+            let entries = extract_tar_entries(ArchiveFormat::TarBz2, bz2_bytes).await.unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, "file.txt");
+            assert_eq!(entries[0].1, b"bzip2 content");
+        }
+
+        #[tokio::test]
+        async fn test_extract_invalid_tar_returns_error() {
+            // Fewer than 512 bytes → parser cannot read a complete tar header block.
+            let bad_bytes = b"this is not a valid tar archive".to_vec();
+            let result = extract_tar_entries(ArchiveFormat::Tar, bad_bytes).await;
+            assert!(result.is_err(), "expected error for invalid tar data");
+        }
+
+        #[tokio::test]
+        async fn test_extract_empty_tar() {
+            let tar_bytes = make_tar(&[], &[]).await;
+            let entries = extract_tar_entries(ArchiveFormat::Tar, tar_bytes).await.unwrap();
+            assert!(entries.is_empty());
+        }
     }
 }

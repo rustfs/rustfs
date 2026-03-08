@@ -128,7 +128,7 @@ impl SymlinkTarget {
 }
 
 /// Extract symlink target from request headers
-pub fn extract_symlink_target(headers: &axum::http::HeaderMap) -> SwiftResult<Option<SymlinkTarget>> {
+pub fn extract_symlink_target(headers: &http::HeaderMap) -> SwiftResult<Option<SymlinkTarget>> {
     if let Some(target_header) = headers.get("x-object-symlink-target") {
         let target_str = target_header
             .to_str()
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_extract_symlink_target_present() {
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         headers.insert("x-object-symlink-target", "target.txt".parse().unwrap());
 
         let result = extract_symlink_target(&headers).unwrap();
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_extract_symlink_target_absent() {
-        let headers = axum::http::HeaderMap::new();
+        let headers = http::HeaderMap::new();
         let result = extract_symlink_target(&headers).unwrap();
         assert!(result.is_none());
     }
