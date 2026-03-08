@@ -14,7 +14,7 @@
 
 use crate::BucketNotificationConfig;
 use crate::rules::{BucketRulesSnapshot, DynRulesContainer, SubscriberIndex};
-use rustfs_targets::EventName;
+use rustfs_s3_common::EventName;
 
 /// NotificationSystemSubscriberView - Provides an interface to manage and query
 /// the subscription status of buckets in the notification system.

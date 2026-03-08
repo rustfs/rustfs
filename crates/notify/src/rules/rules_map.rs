@@ -14,7 +14,7 @@
 
 use crate::rules::{PatternRules, TargetIdSet};
 use hashbrown::HashMap;
-use rustfs_targets::EventName;
+use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
 
