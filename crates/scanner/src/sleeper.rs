@@ -169,21 +169,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_fastest_never_sleeps() {
+        let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(true, Ordering::Relaxed);
+
         let s = DynamicSleeper::new(ScannerSpeed::Fastest);
         let start = Instant::now();
         s.sleep_folder().await;
         assert!(start.elapsed() < Duration::from_millis(5));
+
+        SCANNER_IDLE_MODE.store(prev_mode, Ordering::Relaxed);
     }
 
     #[tokio::test]
     async fn test_idle_mode_off_skips_sleep() {
+        let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(false, Ordering::Relaxed);
+
         let s = DynamicSleeper::new(ScannerSpeed::Slowest);
         let start = Instant::now();
         s.sleep_folder().await;
         assert!(start.elapsed() < Duration::from_millis(5));
+
         // Restore
-        SCANNER_IDLE_MODE.store(true, Ordering::Relaxed);
+        SCANNER_IDLE_MODE.store(prev_mode, Ordering::Relaxed);
     }
 }
