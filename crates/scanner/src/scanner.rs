@@ -46,11 +46,14 @@ fn cycle_interval() -> Duration {
     ScannerSpeed::from_env_str(&speed_str).cycle_interval()
 }
 
-/// Compute a randomized inter-cycle sleep with a floor of 1 second.
+/// Compute a randomized inter-cycle sleep.
+// Delay is scan interval +- 10%, with a floor of 1 second.
 fn randomized_cycle_delay() -> Duration {
-    let interval = cycle_interval();
-    let jitter = Duration::from_secs_f64(rand::random::<f64>() * interval.as_secs_f64());
-    jitter.max(Duration::from_secs(1))
+    let interval = cycle_interval().max(Duration::from_secs(1));
+    // Uniform in [-0.1, 0.1), keeping actual delay within 10% of interval.
+    let jitter_factor = (rand::random::<f64>() * 0.2) - 0.1;
+    let delay = interval.mul_f64(1.0 + jitter_factor);
+    delay.max(Duration::from_secs(1))
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
