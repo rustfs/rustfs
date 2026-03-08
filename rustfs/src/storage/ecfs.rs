@@ -15,6 +15,7 @@
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
+use crate::storage::s3_metrics::{S3Operation, record_s3_op};
 use rustfs_ecstore::{
     bucket::tagging::decode_tags_to_map,
     error::{is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
@@ -97,7 +98,7 @@ impl AsyncSeek for InMemoryAsyncReader {
 
 impl FS {
     pub fn new() -> Self {
-        // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
+        crate::storage::s3_metrics::init_s3_metrics();
         Self {}
     }
 
@@ -189,6 +190,7 @@ impl S3 for FS {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        record_s3_op(S3Operation::AbortMultipartUpload, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_abort_multipart_upload(req).await
     }
@@ -198,6 +200,7 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        record_s3_op(S3Operation::CompleteMultipartUpload, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_complete_multipart_upload(req).await
     }
@@ -205,6 +208,7 @@ impl S3 for FS {
     /// Copy an object from one location to another
     #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+        record_s3_op(S3Operation::CopyObject, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_copy_object(req).await
     }
@@ -215,6 +219,7 @@ impl S3 for FS {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
+        record_s3_op(S3Operation::CreateBucket, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_create_bucket(req).await
     }
@@ -224,6 +229,7 @@ impl S3 for FS {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        record_s3_op(S3Operation::CreateMultipartUpload, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_create_multipart_upload(req).await
     }
@@ -231,12 +237,14 @@ impl S3 for FS {
     /// Delete a bucket
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+        record_s3_op(S3Operation::DeleteBucket, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_delete_bucket(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn delete_bucket_cors(&self, req: S3Request<DeleteBucketCorsInput>) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        record_s3_op(S3Operation::DeleteBucketCors, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_delete_bucket_cors(req).await
     }
@@ -245,6 +253,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        record_s3_op(S3Operation::DeleteBucketEncryption, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_delete_bucket_encryption(req).await
     }
@@ -254,6 +263,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        record_s3_op(S3Operation::DeleteBucketLifecycle, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_delete_bucket_lifecycle(req).await
     }
@@ -262,6 +272,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
+        record_s3_op(S3Operation::DeleteBucketPolicy, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_delete_bucket_policy(req).await
     }
@@ -270,6 +281,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        record_s3_op(S3Operation::DeleteBucketReplication, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_delete_bucket_replication(req).await
     }
@@ -279,6 +291,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+        record_s3_op(S3Operation::DeleteBucketTagging, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_delete_bucket_tagging(req).await
     }
@@ -288,6 +301,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
+        record_s3_op(S3Operation::DeletePublicAccessBlock, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_delete_public_access_block(req).await
     }
@@ -295,6 +309,7 @@ impl S3 for FS {
     /// Delete an object
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+        record_s3_op(S3Operation::DeleteObject, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_delete_object(req).await
     }
@@ -304,6 +319,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        record_s3_op(S3Operation::DeleteObjectTagging, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_delete_object_tagging(req).await
     }
@@ -311,17 +327,20 @@ impl S3 for FS {
     /// Delete multiple objects
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        record_s3_op(S3Operation::DeleteObjects, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_delete_objects(req).await
     }
 
     async fn get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
+        record_s3_op(S3Operation::GetBucketAcl, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_acl(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        record_s3_op(S3Operation::GetBucketCors, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_cors(req).await
     }
@@ -330,6 +349,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketEncryptionInput>,
     ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+        record_s3_op(S3Operation::GetBucketEncryption, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_encryption(req).await
     }
@@ -339,6 +359,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        record_s3_op(S3Operation::GetBucketLifecycleConfiguration, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_lifecycle_configuration(req).await
     }
@@ -346,6 +367,7 @@ impl S3 for FS {
     /// Get bucket location
     #[instrument(level = "debug", skip(self, req))]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        record_s3_op(S3Operation::GetBucketLocation, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_location(req).await
     }
@@ -354,11 +376,13 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
+        record_s3_op(S3Operation::GetBucketNotificationConfiguration, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_notification_configuration(req).await
     }
 
     async fn get_bucket_policy(&self, req: S3Request<GetBucketPolicyInput>) -> S3Result<S3Response<GetBucketPolicyOutput>> {
+        record_s3_op(S3Operation::GetBucketPolicy, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_policy(req).await
     }
@@ -367,6 +391,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketPolicyStatusInput>,
     ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
+        record_s3_op(S3Operation::GetBucketPolicyStatus, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_policy_status(req).await
     }
@@ -375,12 +400,14 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketReplicationInput>,
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+        record_s3_op(S3Operation::GetBucketReplication, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_replication(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+        record_s3_op(S3Operation::GetBucketTagging, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_tagging(req).await
     }
@@ -390,6 +417,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetPublicAccessBlockInput>,
     ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
+        record_s3_op(S3Operation::GetPublicAccessBlock, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_public_access_block(req).await
     }
@@ -399,6 +427,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        record_s3_op(S3Operation::GetBucketVersioning, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_versioning(req).await
     }
@@ -410,11 +439,13 @@ impl S3 for FS {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        record_s3_op(S3Operation::GetObject, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_get_object(req).await
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
+        record_s3_op(S3Operation::GetObjectAcl, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_get_object_acl(req).await
     }
@@ -423,6 +454,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        record_s3_op(S3Operation::GetObjectAttributes, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_get_object_attributes(req).await
     }
@@ -431,6 +463,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectLegalHoldInput>,
     ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        record_s3_op(S3Operation::GetObjectLegalHold, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_get_object_legal_hold(req).await
     }
@@ -440,6 +473,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        record_s3_op(S3Operation::GetObjectLockConfiguration, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_get_object_lock_configuration(req).await
     }
@@ -448,38 +482,45 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectRetentionInput>,
     ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        record_s3_op(S3Operation::GetObjectRetention, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_get_object_retention(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        record_s3_op(S3Operation::GetObjectTagging, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_get_object_tagging(req).await
     }
 
-    #[instrument(level = "debug", skip(self, _req))]
-    async fn get_object_torrent(&self, _req: S3Request<GetObjectTorrentInput>) -> S3Result<S3Response<GetObjectTorrentOutput>> {
+    #[instrument(level = "debug", skip(self, req))]
+    async fn get_object_torrent(&self, req: S3Request<GetObjectTorrentInput>) -> S3Result<S3Response<GetObjectTorrentOutput>> {
         // Torrent functionality is not implemented in RustFS
         // Per S3 API test expectations, return 404 NoSuchKey (not 501 Not Implemented)
         // This allows clients to gracefully handle the absence of torrent support
+        record_s3_op(S3Operation::GetObjectTorrent, &req.input.bucket);
         Err(S3Error::new(S3ErrorCode::NoSuchKey))
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
+        record_s3_op(S3Operation::HeadBucket, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_head_bucket(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
+        record_s3_op(S3Operation::HeadObject, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_head_object(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
+        // List buckets not associated with a bucket, give it bucket label "*" to denote "all".
+        record_s3_op(S3Operation::ListBuckets, "*");
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_list_buckets(req).await
     }
@@ -488,6 +529,7 @@ impl S3 for FS {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        record_s3_op(S3Operation::ListMultipartUploads, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_list_multipart_uploads(req).await
     }
@@ -496,40 +538,47 @@ impl S3 for FS {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        record_s3_op(S3Operation::ListObjectVersions, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_list_object_versions(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
+        record_s3_op(S3Operation::ListObjects, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_list_objects(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
+        record_s3_op(S3Operation::ListObjectsV2, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_list_objects_v2(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+        record_s3_op(S3Operation::ListParts, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_list_parts(req).await
     }
 
     async fn put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
+        record_s3_op(S3Operation::PutBucketAcl, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_acl(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        record_s3_op(S3Operation::PutBucketCors, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_cors(req).await
     }
 
     async fn get_bucket_logging(&self, req: S3Request<GetBucketLoggingInput>) -> S3Result<S3Response<GetBucketLoggingOutput>> {
+        record_s3_op(S3Operation::GetBucketLogging, &req.input.bucket);
         let Some(store) = new_object_layer_fn() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -541,6 +590,7 @@ impl S3 for FS {
     }
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
+        record_s3_op(S3Operation::PutBucketLogging, &req.input.bucket);
         let Some(store) = new_object_layer_fn() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -555,6 +605,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        record_s3_op(S3Operation::PutBucketEncryption, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_encryption(req).await
     }
@@ -564,6 +615,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        record_s3_op(S3Operation::PutBucketLifecycleConfiguration, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_lifecycle_configuration(req).await
     }
@@ -572,11 +624,13 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        record_s3_op(S3Operation::PutBucketNotificationConfiguration, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_notification_configuration(req).await
     }
 
     async fn put_bucket_policy(&self, req: S3Request<PutBucketPolicyInput>) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        record_s3_op(S3Operation::PutBucketPolicy, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_policy(req).await
     }
@@ -585,6 +639,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        record_s3_op(S3Operation::PutBucketReplication, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_replication(req).await
     }
@@ -594,12 +649,14 @@ impl S3 for FS {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
+        record_s3_op(S3Operation::PutPublicAccessBlock, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_public_access_block(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn put_bucket_tagging(&self, req: S3Request<PutBucketTaggingInput>) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        record_s3_op(S3Operation::PutBucketTagging, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_tagging(req).await
     }
@@ -609,17 +666,20 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        record_s3_op(S3Operation::PutBucketVersioning, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_versioning(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        record_s3_op(S3Operation::PutObject, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_put_object(self, req).await
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
+        record_s3_op(S3Operation::PutObjectAcl, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_put_object_acl(req).await
     }
@@ -628,6 +688,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutObjectLegalHoldInput>,
     ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        record_s3_op(S3Operation::PutObjectLegalHold, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_put_object_legal_hold(req).await
     }
@@ -637,6 +698,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        record_s3_op(S3Operation::PutObjectLockConfiguration, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_put_object_lock_configuration(req).await
     }
@@ -645,17 +707,20 @@ impl S3 for FS {
         &self,
         req: S3Request<PutObjectRetentionInput>,
     ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        record_s3_op(S3Operation::PutObjectRetention, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_put_object_retention(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        record_s3_op(S3Operation::PutObjectTagging, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_put_object_tagging(req).await
     }
 
     async fn restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
+        record_s3_op(S3Operation::RestoreObject, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_restore_object(req).await
     }
@@ -664,18 +729,21 @@ impl S3 for FS {
         &self,
         req: S3Request<SelectObjectContentInput>,
     ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        record_s3_op(S3Operation::SelectObjectContent, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_select_object_content(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+        record_s3_op(S3Operation::UploadPart, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_upload_part(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        record_s3_op(S3Operation::UploadPartCopy, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_upload_part_copy(req).await
     }
