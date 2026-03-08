@@ -39,9 +39,10 @@ pub static SCANNER_SLEEPER: LazyLock<DynamicSleeper> = LazyLock::new(|| {
 
 /// Proportional-backoff sleeper for the data scanner.
 ///
-/// Sleeps are computed as `elapsed_work_time * factor`, clamped to
-/// `[MIN_SLEEP, max_sleep]`. All sleeps are gated on [`SCANNER_IDLE_MODE`];
-/// when idle mode is off, no sleeping occurs regardless of factor.
+/// For operations timed via [`SleepTimer`], sleeps are computed as
+/// `elapsed_work_time * factor`, clamped to `[MIN_SLEEP, max_sleep]`.
+/// For folder-level gaps, [`sleep_folder`] uses `MIN_SLEEP * factor`,
+/// clamped only by `max_sleep`. All sleeps are gated on [`SCANNER_IDLE_MODE`];
 #[derive(Clone)]
 pub struct DynamicSleeper {
     inner: Arc<SleeperParams>,
