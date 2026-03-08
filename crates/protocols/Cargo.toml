@@ -52,11 +52,10 @@ swift = [
     "dep:hmac",
     "dep:sha1",
     "dep:hex",
-    "dep:tar",
-    "dep:flate2",
-    "dep:bzip2",
+    "dep:astral-tokio-tar",
     "dep:base64",
     "dep:rand",
+    "dep:async-compression",
 ]
 
 [dependencies]
@@ -114,11 +113,10 @@ quick-xml = { workspace = true, optional = true, features = ["serialize"] }
 hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
-tar = { version = "0.4", optional = true }
-flate2 = { workspace = true, optional = true }
-bzip2 = { version = "0.4", optional = true }
+astral-tokio-tar = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+async-compression = { workspace = true, optional = true, features = ["tokio", "gzip", "bzip2"] }
 
 [package.metadata.docs.rs]
 all-features = true
