@@ -86,7 +86,7 @@ pub fn parse_delete_after(value: &str) -> SwiftResult<u64> {
 ///
 /// Checks both X-Delete-At and X-Delete-After headers.
 /// X-Delete-After takes precedence and is converted to X-Delete-At.
-pub fn extract_expiration(headers: &axum::http::HeaderMap) -> SwiftResult<Option<u64>> {
+pub fn extract_expiration(headers: &http::HeaderMap) -> SwiftResult<Option<u64>> {
     // Check X-Delete-After first (takes precedence)
     if let Some(delete_after) = headers.get("x-delete-after")
         && let Ok(value_str) = delete_after.to_str()
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_extract_expiration_delete_at() {
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         headers.insert("x-delete-at", "1740000000".parse().unwrap());
 
         let result = extract_expiration(&headers);
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_extract_expiration_delete_after() {
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         headers.insert("x-delete-after", "3600".parse().unwrap());
 
         let result = extract_expiration(&headers);
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_extract_expiration_delete_after_precedence() {
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         headers.insert("x-delete-at", "1740000000".parse().unwrap());
         headers.insert("x-delete-after", "3600".parse().unwrap());
 
@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn test_extract_expiration_none() {
-        let headers = axum::http::HeaderMap::new();
+        let headers = http::HeaderMap::new();
 
         let result = extract_expiration(&headers);
         assert!(result.is_ok());
