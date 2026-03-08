@@ -26,7 +26,7 @@ pub const ENV_DATA_SCANNER_START_DELAY_SECS: &str = "RUSTFS_DATA_SCANNER_START_D
 /// - Example: `export RUSTFS_SCANNER_SPEED=slow`
 pub const ENV_SCANNER_SPEED: &str = "RUSTFS_SCANNER_SPEED";
 
-/// Default data speed preset.
+/// Default scanner speed preset.
 pub const DEFAULT_SCANNER_SPEED: &str = "default";
 
 /// Environment variable that controls whether the scanner sleeps between operations.
