@@ -71,7 +71,7 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
             if let Err(e) = run_data_scanner(ctx_clone.clone(), storeapi_clone.clone()).await {
                 error!("Failed to run data scanner: {e}");
             }
-            // Sleep if couldn't aquire lock or scan failed
+            // Sleep if couldn't acquire lock or scan failed
             tokio::time::sleep(randomized_cycle_delay()).await;
         }
     });
