@@ -364,7 +364,7 @@ pub async fn handle_formpost(
     body: Vec<u8>,
     tempurl_key: &str,
     credentials: &rustfs_credentials::Credentials,
-) -> SwiftResult<axum::http::Response<s3s::Body>> {
+) -> SwiftResult<http::Response<s3s::Body>> {
     use axum::http::{Response, StatusCode};
 
     // Parse multipart boundary
@@ -424,9 +424,9 @@ pub async fn handle_formpost(
         let reader = std::io::Cursor::new(file.contents.clone());
 
         // Create headers for upload
-        let mut upload_headers = axum::http::HeaderMap::new();
+        let mut upload_headers = http::HeaderMap::new();
         if let Some(ct) = &file.content_type
-            && let Ok(header_value) = axum::http::HeaderValue::from_str(ct)
+            && let Ok(header_value) = http::HeaderValue::from_str(ct)
         {
             upload_headers.insert("content-type", header_value);
         }
