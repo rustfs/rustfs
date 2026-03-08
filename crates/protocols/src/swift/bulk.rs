@@ -340,7 +340,7 @@ pub async fn handle_bulk_extract(
         return Err(SwiftError::NotFound(format!("Container not found: {}", container)));
     }
 
-    // Parse archive and collect entries (without holding the archive)
+    // Parse archive and collect all entries into memory (entire archive and file contents are buffered)
     let entries = extract_tar_entries(format, body).await?;
 
     // Now upload each entry (async operations)
@@ -395,7 +395,7 @@ pub async fn handle_bulk_extract(
         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
 }
 
-/// Extract tar entries synchronously to avoid Send issues
+/// Extract tar entries using async I/O and return them as in-memory buffers
 async fn extract_tar_entries(format: ArchiveFormat, body: Vec<u8>) -> SwiftResult<Vec<(String, Vec<u8>)>> {
     // Create appropriate reader based on format
     let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match format {
