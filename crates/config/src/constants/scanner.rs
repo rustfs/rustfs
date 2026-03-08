@@ -20,9 +20,6 @@ use std::time::Duration;
 /// - Example: `export RUSTFS_DATA_SCANNER_START_DELAY_SECS=10`
 pub const ENV_DATA_SCANNER_START_DELAY_SECS: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
-/// Default data scanner start delay in seconds if not specified in the environment variable.
-pub const DEFAULT_DATA_SCANNER_START_DELAY_SECS: u64 = 60;
-
 /// Environment variable that selects the scanner speed preset.
 /// Valid values: `fastest`, `fast`, `default`, `slow`, `slowest`.
 /// Controls the sleep factor, maximum sleep duration, and cycle interval.
