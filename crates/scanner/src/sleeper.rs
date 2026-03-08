@@ -167,30 +167,29 @@ mod tests {
         assert_eq!(max_sleep, Duration::from_secs(15));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_fastest_never_sleeps() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(true, Ordering::Relaxed);
 
         let s = DynamicSleeper::new(ScannerSpeed::Fastest);
-        let start = Instant::now();
+        let start = tokio::time::Instant::now();
         s.sleep_folder().await;
-        assert!(start.elapsed() < Duration::from_millis(5));
+        assert_eq!(start.elapsed(), Duration::ZERO);
 
         SCANNER_IDLE_MODE.store(prev_mode, Ordering::Relaxed);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_idle_mode_off_skips_sleep() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(false, Ordering::Relaxed);
 
         let s = DynamicSleeper::new(ScannerSpeed::Slowest);
-        let start = Instant::now();
+        let start = tokio::time::Instant::now();
         s.sleep_folder().await;
-        assert!(start.elapsed() < Duration::from_millis(5));
+        assert_eq!(start.elapsed(), Duration::ZERO);
 
-        // Restore
         SCANNER_IDLE_MODE.store(prev_mode, Ordering::Relaxed);
     }
 }
