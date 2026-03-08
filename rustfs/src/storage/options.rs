@@ -16,7 +16,6 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
-use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
 use rustfs_utils::http::RUSTFS_FORCE_DELETE;
@@ -165,11 +164,12 @@ pub async fn get_opts(
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
 
-    // When getting object from disk, don't do bitrot checks.
-    // Assume we trust the disks, let scanner handle async integrity checks.
-    // By not checking bitrot on get object, we save lots of cpu cycles.
-    // TODO: Get this from ENV_VAR
-    opts.hash_algo = HashAlgorithm::None; // new default
+    // Optionally skip per-shard bitrot hash verification on reads to save CPU.
+    // Background scanner still performs full integrity checks asynchronously.
+    opts.skip_verify_bitrot = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_GET_SKIP_BITROT_VERIFY,
+        rustfs_config::DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY,
+    );
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 

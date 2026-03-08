@@ -1,5 +1,3 @@
-use rustfs_utils::HashAlgorithm;
-
 use super::*;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -72,7 +70,7 @@ pub struct ObjectOptions {
     pub eval_metadata: Option<HashMap<String, String>>,
 
     pub want_checksum: Option<Checksum>,
-    pub hash_algo: HashAlgorithm,
+    pub skip_verify_bitrot: bool,
 }
 
 impl ObjectOptions {
