@@ -76,10 +76,10 @@
 
 use super::{SwiftError, SwiftResult, container, object};
 use axum::http::{Response, StatusCode};
+use futures::StreamExt;
 use rustfs_credentials::Credentials;
 use s3s::Body;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use tracing::{debug, error};
 
 /// Result of a single delete operation
@@ -341,7 +341,7 @@ pub async fn handle_bulk_extract(
     }
 
     // Parse archive and collect entries (without holding the archive)
-    let entries = extract_tar_entries(format, body)?;
+    let entries = extract_tar_entries(format, body).await?;
 
     // Now upload each entry (async operations)
     for (path_str, contents) in entries {
@@ -352,7 +352,7 @@ pub async fn handle_bulk_extract(
             &path_str,
             credentials,
             std::io::Cursor::new(contents),
-            &axum::http::HeaderMap::new(),
+            &http::HeaderMap::new(),
         )
         .await
         {
@@ -396,29 +396,29 @@ pub async fn handle_bulk_extract(
 }
 
 /// Extract tar entries synchronously to avoid Send issues
-fn extract_tar_entries(format: ArchiveFormat, body: Vec<u8>) -> SwiftResult<Vec<(String, Vec<u8>)>> {
+async fn extract_tar_entries(format: ArchiveFormat, body: Vec<u8>) -> SwiftResult<Vec<(String, Vec<u8>)>> {
     // Create appropriate reader based on format
-    let reader: Box<dyn Read> = match format {
+    let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match format {
         ArchiveFormat::Tar => Box::new(std::io::Cursor::new(body)),
         ArchiveFormat::TarGz => {
             let cursor = std::io::Cursor::new(body);
-            Box::new(flate2::read::GzDecoder::new(cursor))
+            Box::new(async_compression::tokio::bufread::GzipDecoder::new(tokio::io::BufReader::new(cursor)))
         }
         ArchiveFormat::TarBz2 => {
             let cursor = std::io::Cursor::new(body);
-            Box::new(bzip2::read::BzDecoder::new(cursor))
+            Box::new(async_compression::tokio::bufread::BzDecoder::new(tokio::io::BufReader::new(cursor)))
         }
     };
 
     // Parse tar archive
-    let mut archive = tar::Archive::new(reader);
+    let mut archive = tokio_tar::Archive::new(reader);
     let mut entries = Vec::new();
+    let mut entries_iter = archive
+        .entries()
+        .map_err(|e| SwiftError::BadRequest(format!("Failed to read tar archive: {}", e)))?;
 
     // Extract each entry
-    for entry in archive
-        .entries()
-        .map_err(|e| SwiftError::BadRequest(format!("Failed to read tar archive: {}", e)))?
-    {
+    while let Some(entry) = entries_iter.next().await {
         let mut entry = entry.map_err(|e| SwiftError::BadRequest(format!("Failed to read tar entry: {}", e)))?;
 
         // Get entry path
@@ -436,7 +436,7 @@ fn extract_tar_entries(format: ArchiveFormat, body: Vec<u8>) -> SwiftResult<Vec<
 
         // Read file contents
         let mut contents = Vec::new();
-        if let Err(e) = entry.read_to_end(&mut contents) {
+        if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut entry, &mut contents).await {
             error!("Failed to read tar entry {}: {}", path_str, e);
             continue;
         }

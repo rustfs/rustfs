@@ -260,7 +260,7 @@ impl EncryptionMetadata {
 }
 
 /// Check if object should be encrypted based on configuration and headers
-pub fn should_encrypt(config: &EncryptionConfig, headers: &axum::http::HeaderMap) -> bool {
+pub fn should_encrypt(config: &EncryptionConfig, headers: &http::HeaderMap) -> bool {
     // Check if encryption is globally enabled
     if !config.enabled {
         return false;
@@ -447,7 +447,7 @@ mod tests {
         let key = vec![0u8; 32];
         let config = EncryptionConfig::new(true, "test".to_string(), key).unwrap();
 
-        let headers = axum::http::HeaderMap::new();
+        let headers = http::HeaderMap::new();
         assert!(should_encrypt(&config, &headers));
 
         // Test with disabled config

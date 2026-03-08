@@ -132,7 +132,7 @@ async fn handle_swift_request(
         // Get account TempURL key
         let tempurl_key = super::account::get_tempurl_key(account, &credentials).await?;
 
-        if let Some(key) = tempurl_key {
+        return if let Some(key) = tempurl_key {
             // Validate TempURL signature
             let tempurl = tempurl::TempURL::new(key);
             let path = uri.path();
@@ -144,11 +144,11 @@ async fn handle_swift_request(
 
             // Reconstruct request for object operation
             let req = Request::from_parts(parts, body);
-            return handle_tempurl_object_request(req, route).await;
+            handle_tempurl_object_request(req, route).await
         } else {
             // No TempURL key configured for this account
-            return Err(SwiftError::Unauthorized("TempURL key not configured for this account".to_string()));
-        }
+            Err(SwiftError::Unauthorized("TempURL key not configured for this account".to_string()))
+        };
     }
 
     // No TempURL or TempURL validation failed - require normal authentication
@@ -476,7 +476,7 @@ async fn handle_authenticated_request(
                         // FormPost upload - get TempURL key for signature validation
                         let tempurl_key = super::account::get_tempurl_key(&account, &Some(credentials.clone())).await?;
 
-                        if let Some(key) = tempurl_key {
+                        return if let Some(key) = tempurl_key {
                             // Collect body for multipart parsing
                             use http_body_util::BodyExt;
                             let body_bytes = body
@@ -489,19 +489,11 @@ async fn handle_authenticated_request(
                             // Build path for signature validation
                             let path = format!("/v1/{}/{}", account, container);
 
-                            return super::formpost::handle_formpost(
-                                &account,
-                                &container,
-                                &path,
-                                ct_str,
-                                body_bytes,
-                                &key,
-                                &credentials,
-                            )
-                            .await;
+                            super::formpost::handle_formpost(&account, &container, &path, ct_str, body_bytes, &key, &credentials)
+                                .await
                         } else {
-                            return Err(SwiftError::Unauthorized("TempURL key not configured for FormPost".to_string()));
-                        }
+                            Err(SwiftError::Unauthorized("TempURL key not configured for FormPost".to_string()))
+                        };
                     }
 
                     // Check for versioning headers first
@@ -1018,9 +1010,8 @@ async fn handle_authenticated_request(
 }
 
 // Type alias for complex symlink resolution future
-type SymlinkResolutionFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(String, String, String, Option<String>), SwiftError>> + Send + 'a>,
->;
+type SymlinkResolutionFuture<'a> =
+    Pin<Box<dyn std::future::Future<Output = Result<(String, String, String, Option<String>), SwiftError>> + Send + 'a>>;
 
 /// Resolve symlink chain recursively
 ///
@@ -1073,7 +1064,7 @@ async fn handle_object_get(
     account: &str,
     container: &str,
     object: &str,
-    headers: &axum::http::HeaderMap,
+    headers: &http::HeaderMap,
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
     // For TempURL requests, credentials will be None
@@ -1269,7 +1260,7 @@ async fn handle_object_put(
     container: &str,
     object: &str,
     body: Body,
-    headers: &axum::http::HeaderMap,
+    headers: &http::HeaderMap,
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
     let creds = credentials
@@ -1323,7 +1314,7 @@ async fn check_container_acl(
     container: &str,
     credentials: &Credentials,
     is_write: bool,
-    headers: &axum::http::HeaderMap,
+    headers: &http::HeaderMap,
 ) -> Result<(), SwiftError> {
     // Get container ACLs
     let acl = container::get_container_acl(account, container, credentials).await?;
@@ -1396,7 +1387,7 @@ async fn inject_cors_headers(
     container: Option<&str>,
     account: &str,
     credentials: &Credentials,
-    request_headers: &axum::http::HeaderMap,
+    request_headers: &http::HeaderMap,
 ) -> Response<Body> {
     // Only inject CORS for container/object routes
     if let Some(container_name) = container {

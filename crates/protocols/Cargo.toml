@@ -34,13 +34,11 @@ swift = [
     "dep:rustfs-rio",
     "dep:axum",
     "dep:http",
-    "dep:hyper",
     "dep:tower",
     "dep:regex",
     "dep:percent-encoding",
     "dep:sha2",
     "dep:uuid",
-    "dep:pin-project-lite",
     "dep:futures",
     "dep:http-body",
     "dep:http-body-util",
@@ -54,7 +52,6 @@ swift = [
     "dep:hex",
     "dep:astral-tokio-tar",
     "dep:base64",
-    "dep:rand",
     "dep:async-compression",
 ]
 
@@ -95,13 +92,11 @@ rustfs-ecstore = { workspace = true, optional = true }
 rustfs-rio = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
-pin-project-lite = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 http-body = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
@@ -115,7 +110,6 @@ sha1 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 astral-tokio-tar = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
 async-compression = { workspace = true, optional = true, features = ["tokio", "gzip", "bzip2"] }
 
 [package.metadata.docs.rs]
