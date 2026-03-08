@@ -99,12 +99,10 @@ impl DynamicSleeper {
 
     /// Swap in parameters from a new speed preset (for runtime reconfiguration).
     pub fn update(&self, speed: ScannerSpeed) {
-        if let Ok(mut f) = self.inner.factor.write() {
-            *f = speed.sleep_factor();
-        }
-        if let Ok(mut m) = self.inner.max_sleep.write() {
-            *m = speed.max_sleep();
-        }
+        let mut f = self.inner.factor.write().unwrap_or_else(|e| e.into_inner());
+        *f = speed.sleep_factor();
+        let mut m = self.inner.max_sleep.write().unwrap_or_else(|e| e.into_inner());
+        *m = speed.max_sleep();
     }
 }
 
