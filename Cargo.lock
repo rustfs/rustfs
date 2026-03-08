@@ -7215,6 +7215,7 @@ dependencies = [
  "rustfs-protocols",
  "rustfs-protos",
  "rustfs-rio",
+ "rustfs-s3-common",
  "rustfs-s3select-api",
  "rustfs-s3select-query",
  "rustfs-scanner",
@@ -7277,6 +7278,7 @@ dependencies = [
  "rumqttc",
  "rustfs-config",
  "rustfs-ecstore",
+ "rustfs-s3-common",
  "rustfs-targets",
  "serde",
  "serde_json",
@@ -7415,6 +7417,7 @@ dependencies = [
  "rustfs-policy",
  "rustfs-protos",
  "rustfs-rio",
+ "rustfs-s3-common",
  "rustfs-signer",
  "rustfs-utils",
  "rustfs-workers",
@@ -7652,6 +7655,7 @@ dependencies = [
  "rustc-hash",
  "rustfs-config",
  "rustfs-ecstore",
+ "rustfs-s3-common",
  "rustfs-targets",
  "rustfs-utils",
  "serde",
@@ -7814,6 +7818,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-s3-common"
+version = "0.0.5"
+dependencies = [
+ "metrics",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustfs-s3select-api"
 version = "0.0.5"
 dependencies = [
@@ -7908,6 +7921,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rumqttc",
  "rustfs-config",
+ "rustfs-s3-common",
  "rustfs-utils",
  "serde",
  "serde_json",

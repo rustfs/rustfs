@@ -19,7 +19,8 @@ use rustfs_audit::{
 };
 use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
-use rustfs_targets::EventName;
+use rustfs_s3_common::record_s3_op;
+use rustfs_s3_common::{EventName, S3Operation};
 use rustfs_utils::{
     extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
@@ -54,7 +55,7 @@ pub struct OperationHelper {
 
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
-    pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, trigger: &'static str) -> Self {
+    pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
         // Parse path -> bucket/object
         let path = req.uri.path().trim_start_matches('/');
         let mut segs = path.splitn(2, '/');
@@ -69,6 +70,11 @@ impl OperationHelper {
             .or_else(|| req.headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
             .unwrap_or("")
             .to_string();
+
+        let trigger = op.as_str();
+
+        let bucket_label = if bucket.is_empty() { "*" } else { &bucket };
+        record_s3_op(op, bucket_label);
 
         // Initialize audit builder
         let mut api_builder = ApiDetailsBuilder::new().name(trigger);

@@ -15,7 +15,7 @@
 #![allow(unused_variables)]
 
 use crate::bucket::metadata::BucketMetadata;
-use crate::event::name::EventName;
+// use crate::event::name::EventName;
 use crate::event::targetlist::TargetList;
 use crate::store::ECStore;
 use crate::store_api::ObjectInfo;

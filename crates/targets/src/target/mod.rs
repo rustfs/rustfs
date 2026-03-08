@@ -14,8 +14,9 @@
 
 use crate::arn::TargetID;
 use crate::store::{Key, Store};
-use crate::{EventName, StoreError, TargetError};
+use crate::{StoreError, TargetError};
 use async_trait::async_trait;
+use rustfs_s3_common::EventName;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
