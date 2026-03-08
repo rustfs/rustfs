@@ -35,6 +35,8 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+const LOCK_RETRY_MAX: Duration = Duration::from_secs(30);
+
 /// Returns the base cycle interval. If `RUSTFS_DATA_SCANNER_START_DELAY_SECS`
 /// is set, it takes precedence; otherwise the value is derived from the
 /// `RUSTFS_SCANNER_SPEED` preset.
@@ -75,7 +77,7 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
                 error!("Failed to run data scanner: {e}");
             }
             // Sleep if couldn't acquire lock or scan failed
-            tokio::time::sleep(randomized_cycle_delay()).await;
+            tokio::time::sleep(randomized_cycle_delay().min(LOCK_RETRY_MAX)).await;
         }
     });
 }
