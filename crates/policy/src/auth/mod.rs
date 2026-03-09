@@ -26,6 +26,8 @@ use time::OffsetDateTime;
 pub struct UserIdentity {
     pub version: i64,
     pub credentials: Credentials,
+    /// updatedAt (RFC3339), legacy RustFS: update_at. Serialize as updatedAt
+    #[serde(rename = "updatedAt", alias = "update_at", default, with = "crate::serde_datetime::option")]
     pub update_at: Option<OffsetDateTime>,
 }
 
@@ -72,5 +74,21 @@ impl From<Credentials> for UserIdentity {
             credentials: value,
             update_at: Some(OffsetDateTime::now_utc()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserIdentity;
+
+    /// Deserialize UserIdentity from MinIO-style JSON (RFC3339 updatedAt).
+    #[test]
+    fn test_user_identity_deserialize_minio_style_rfc3339() {
+        let minio_style =
+            r#"{"version":1,"credentials":{"accessKey":"ak","secretKey":"sk12345678"},"updatedAt":"2025-03-07T12:00:00Z"}"#;
+        let u: UserIdentity = serde_json::from_str(minio_style).expect("deserialize MinIO-style identity");
+        assert_eq!(u.version, 1);
+        assert_eq!(u.credentials.access_key, "ak");
+        assert!(u.update_at.is_some());
     }
 }
