@@ -153,8 +153,8 @@ fn get_lock_acquire_timeout() -> Duration {
 }
 
 #[instrument(skip_all)]
-async fn run_scan_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
-    info!("Start run scan cycle");
+async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
+    info!("Start run data scanner cycle");
     cycle_info.current = cycle_info.next;
     let now = Instant::now();
     cycle_info.started = Utc::now();
@@ -194,7 +194,7 @@ async fn run_scan_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_
         .nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode)
         .await
     {
-        error!(duration = ?now.elapsed(), "Fail run scan cycle: {e}");
+        error!(duration = ?now.elapsed(), "Fail run data scanner cycle: {e}");
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         return;
     }
@@ -205,7 +205,7 @@ async fn run_scan_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_
     cycle_info.current = 0;
     cycle_info.cycle_completed.push(Utc::now());
 
-    info!(duration = ?now.elapsed(), cycles_total=cycle_info.cycle_completed.len(), "Success run scan cycle");
+    info!(duration = ?now.elapsed(), cycles_total=cycle_info.cycle_completed.len(), "Success run data scanner cycle");
 
     if cycle_info.cycle_completed.len() >= data_usage_update_dir_cycles() as usize {
         cycle_info.cycle_completed = cycle_info.cycle_completed.split_off(data_usage_update_dir_cycles() as usize);
@@ -267,7 +267,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
         tokio::select! {
             _ = ctx.cancelled() => break,
             _ = tokio::time::sleep(randomized_cycle_delay()) => {
-                run_scan_cycle(&ctx, &storeapi, &mut cycle_info).await;
+                run_data_scanner_cycle(&ctx, &storeapi, &mut cycle_info).await;
             },
         }
     }
