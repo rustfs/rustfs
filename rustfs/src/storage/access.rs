@@ -93,6 +93,19 @@ impl FS {
     }
 }
 
+/// Returns true when the owner (root or parent=root credentials) may bypass bucket policy
+/// explicit Deny for this action. Per AWS S3, only GetBucketPolicy, PutBucketPolicy, and
+/// DeleteBucketPolicy have this bypass so the admin can recover from a misconfigured policy.
+pub(crate) fn owner_can_bypass_policy_deny(is_owner: bool, action: &Action) -> bool {
+    is_owner
+        && matches!(
+            action,
+            Action::S3Action(S3Action::GetBucketPolicyAction)
+                | Action::S3Action(S3Action::PutBucketPolicyAction)
+                | Action::S3Action(S3Action::DeleteBucketPolicyAction)
+        )
+}
+
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
@@ -132,13 +145,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         // Per AWS S3: root can always perform GetBucketPolicy, PutBucketPolicy, DeleteBucketPolicy
         // even if bucket policy explicitly denies. Other actions (ListBucket, GetObject, etc.) are
         // subject to bucket policy Deny for root as well. See: repost.aws/knowledge-center/s3-accidentally-denied-access
-        let owner_can_bypass_deny = req_info.is_owner
-            && matches!(
-                action,
-                Action::S3Action(S3Action::GetBucketPolicyAction)
-                    | Action::S3Action(S3Action::PutBucketPolicyAction)
-                    | Action::S3Action(S3Action::DeleteBucketPolicyAction)
-            );
+        // Here "owner" means root or credentials whose parent_user is root (e.g. Console admin via STS).
+        let owner_can_bypass_deny = owner_can_bypass_policy_deny(req_info.is_owner, &action);
         if !bucket_name.is_empty()
             && !owner_can_bypass_deny
             && !PolicySys::is_allowed(&BucketPolicyArgs {
@@ -1485,5 +1493,25 @@ mod tests {
     async fn test_bucket_policy_uses_existing_object_tag_no_policy() {
         let result = bucket_policy_uses_existing_object_tag("test-bucket-no-policy-xyz-absent").await;
         assert!(!result, "bucket with no policy should not use ExistingObjectTag");
+    }
+
+    /// Owner can bypass bucket policy Deny only for the three policy management APIs (per AWS S3).
+    #[test]
+    fn test_owner_can_bypass_policy_deny_only_for_policy_apis() {
+        // Owner + policy management actions -> bypass allowed
+        assert!(owner_can_bypass_policy_deny(true, &Action::S3Action(S3Action::GetBucketPolicyAction)));
+        assert!(owner_can_bypass_policy_deny(true, &Action::S3Action(S3Action::PutBucketPolicyAction)));
+        assert!(owner_can_bypass_policy_deny(true, &Action::S3Action(S3Action::DeleteBucketPolicyAction)));
+
+        // Owner + other actions -> no bypass (still subject to bucket policy Deny)
+        assert!(!owner_can_bypass_policy_deny(true, &Action::S3Action(S3Action::ListBucketAction)));
+        assert!(!owner_can_bypass_policy_deny(true, &Action::S3Action(S3Action::GetObjectAction)));
+
+        // Non-owner -> no bypass for any action
+        assert!(!owner_can_bypass_policy_deny(false, &Action::S3Action(S3Action::GetBucketPolicyAction)));
+        assert!(!owner_can_bypass_policy_deny(
+            false,
+            &Action::S3Action(S3Action::DeleteBucketPolicyAction)
+        ));
     }
 }
