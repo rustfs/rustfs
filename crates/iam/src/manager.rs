@@ -1728,6 +1728,15 @@ where
         }
 
         let u = m[name].clone();
+        match user_type {
+            UserType::Sts => {
+                Cache::add_or_update(&self.cache.sts_accounts, name, &u, OffsetDateTime::now_utc());
+            }
+            UserType::Reg | UserType::Svc => {
+                Cache::add_or_update(&self.cache.users, name, &u, OffsetDateTime::now_utc());
+            }
+            UserType::None => {}
+        }
 
         match user_type {
             UserType::Sts => {
@@ -1752,7 +1761,7 @@ where
                     return Ok(());
                 }
 
-                Cache::add_or_update(&self.cache.sts_policies, name, &m[name], OffsetDateTime::now_utc());
+                Cache::add_or_update(&self.cache.user_policies, name, &m[name], OffsetDateTime::now_utc());
             }
 
             UserType::Svc => {
