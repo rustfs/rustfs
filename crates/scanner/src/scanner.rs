@@ -31,7 +31,7 @@ use rustfs_ecstore::global::is_erasure_sd;
 use rustfs_ecstore::store::ECStore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -156,6 +156,7 @@ fn get_lock_acquire_timeout() -> Duration {
 async fn run_scan_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
     info!("Start run scan cycle");
     cycle_info.current = cycle_info.next;
+    let now = Instant::now();
     cycle_info.started = Utc::now();
 
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
@@ -193,17 +194,18 @@ async fn run_scan_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_
         .nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode)
         .await
     {
-        error!("Fail run scan cycle: {e}");
+        error!(duration = ?now.elapsed(), "Fail run scan cycle: {e}");
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         return;
     }
     done_cycle();
     emit_scan_cycle_complete(true, cycle_start.elapsed());
-    info!("Success run scan cycle");
 
     cycle_info.next += 1;
     cycle_info.current = 0;
     cycle_info.cycle_completed.push(Utc::now());
+
+    info!(duration = ?now.elapsed(), cycles_total=cycle_info.cycle_completed.len(), "Success run scan cycle");
 
     if cycle_info.cycle_completed.len() >= data_usage_update_dir_cycles() as usize {
         cycle_info.cycle_completed = cycle_info.cycle_completed.split_off(data_usage_update_dir_cycles() as usize);
