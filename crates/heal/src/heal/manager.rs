@@ -509,7 +509,7 @@ impl HealManager {
                         }
 
                         if endpoints.is_empty() {
-                            info!("start_auto_disk_scanner: No endpoints need healing");
+                            debug!("start_auto_disk_scanner: No endpoints need healing");
                             continue;
                         }
 
