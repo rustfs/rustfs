@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Migration of bucket metadata from legacy format to RustFS format.
+//! Migration of bucket metadata and IAM config from legacy format to RustFS format.
 
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
-use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::store_api::{BucketOptions, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Legacy metadata bucket path, used when migrating bucket metadata.
-pub(crate) const MIGRATING_META_BUCKET: &str = ".minio.sys";
+/// IAM config prefix under meta bucket (e.g. config/iam/).
+const IAM_CONFIG_PREFIX: &str = "config/iam";
 
 /// Migrates bucket metadata from legacy format to RustFS.
 /// Uses list_bucket (from disk volumes) to get bucket names, since list_objects_v2 on the legacy
@@ -98,5 +98,86 @@ pub async fn try_migrate_bucket_metadata<S: StorageAPI>(store: Arc<S>) {
         } else {
             info!("Migrated bucket metadata: {bucket}");
         }
+    }
+}
+
+/// Migrates IAM config from legacy `.minio.sys/config/iam/` to `.rustfs.sys/config/iam/`.
+/// Lists all objects under the IAM prefix in the source, copies each to the target if not present.
+/// Skips objects that already exist in RustFS (idempotent).
+/// If list_objects_v2 on the legacy bucket fails (e.g. format differs), migration is skipped.
+pub async fn try_migrate_iam_config<S: StorageAPI>(store: Arc<S>) {
+    let opts = ObjectOptions {
+        max_parity: true,
+        no_lock: true,
+        ..Default::default()
+    };
+    let h = HeaderMap::new();
+    let prefix = format!("{IAM_CONFIG_PREFIX}/");
+    let mut continuation: Option<String> = None;
+    let mut total_migrated = 0usize;
+
+    loop {
+        let list_result = match store
+            .clone()
+            .list_objects_v2(MIGRATING_META_BUCKET, &prefix, continuation, None, 500, false, None, false)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("list IAM config from legacy bucket failed (skip migration): {e}");
+                return;
+            }
+        };
+
+        for obj in list_result.objects {
+            let path = &obj.name;
+            if path.is_empty() || path.ends_with('/') {
+                continue;
+            }
+            if store
+                .get_object_info(RUSTFS_META_BUCKET, path, &ObjectOptions::default())
+                .await
+                .is_ok()
+            {
+                debug!("IAM config already exists in RustFS, skip: {path}");
+                continue;
+            }
+            let mut rd = match store
+                .get_object_reader(MIGRATING_META_BUCKET, path, None, h.clone(), &opts)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("read migrating IAM config {path}: {e}");
+                    continue;
+                }
+            };
+            let data = match rd.read_all().await {
+                Ok(d) if !d.is_empty() => d,
+                Ok(_) => continue,
+                Err(e) => {
+                    debug!("read migrating IAM config {path} body: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = store
+                .put_object(RUSTFS_META_BUCKET, path, &mut PutObjReader::from_vec(data), &opts)
+                .await
+            {
+                warn!("write IAM config {path}: {e}");
+            } else {
+                info!("Migrated IAM config: {path}");
+                total_migrated += 1;
+            }
+        }
+
+        continuation = list_result.next_continuation_token.or(list_result.continuation_token);
+        if !list_result.is_truncated || continuation.is_none() {
+            break;
+        }
+    }
+
+    if total_migrated > 0 {
+        info!("IAM migration complete: {} object(s) migrated", total_migrated);
     }
 }

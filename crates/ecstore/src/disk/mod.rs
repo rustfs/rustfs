@@ -23,6 +23,7 @@ pub mod local;
 pub mod os;
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
+pub const MIGRATING_META_BUCKET: &str = ".minio.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
 pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
