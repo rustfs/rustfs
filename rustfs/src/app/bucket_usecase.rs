@@ -25,7 +25,6 @@ use crate::storage::s3_api::{acl, encryption, replication, tagging};
 use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
-use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::bucket::{
     lifecycle::bucket_lifecycle_ops::validate_transition_tier,
@@ -47,6 +46,7 @@ use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
 };
+use rustfs_s3_common::S3Operation;
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},
@@ -146,7 +146,7 @@ impl DefaultBucketUsecase {
             let _ = context.object_store();
         }
 
-        let helper = OperationHelper::new(&req, EventName::BucketCreated, "s3:CreateBucket");
+        let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
         let requester_id = match req_info_ref(&req) {
             Ok(r) => r.cred.as_ref().map(|c| c.access_key.clone()),
             Err(_) => {
@@ -162,8 +162,6 @@ impl DefaultBucketUsecase {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-
-        counter!("rustfs_create_bucket_total").increment(1);
 
         let make_result = store
             .make_bucket(
@@ -242,7 +240,7 @@ impl DefaultBucketUsecase {
             let _ = context.object_store();
         }
 
-        let helper = OperationHelper::new(&req, EventName::BucketRemoved, "s3:DeleteBucket");
+        let helper = OperationHelper::new(&req, EventName::BucketRemoved, S3Operation::DeleteBucket);
         let input = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {

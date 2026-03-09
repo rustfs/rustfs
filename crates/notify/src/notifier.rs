@@ -15,7 +15,7 @@
 use crate::{error::NotificationError, event::Event, rules::RulesMap};
 use hashbrown::HashMap;
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
-use rustfs_targets::EventName;
+use rustfs_s3_common::EventName;
 use rustfs_targets::Target;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::EntityTarget;

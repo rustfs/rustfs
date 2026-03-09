@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_targets::EventName;
+use rustfs_s3_common::EventName;
 use std::sync::Arc;
 
 /// Let the rules structure provide "what events it is subscribed to".

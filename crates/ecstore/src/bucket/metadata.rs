@@ -372,10 +372,17 @@ impl BucketMetadata {
         Ok(())
     }
 
-    fn parse_all_configs(&mut self, _api: Arc<ECStore>) -> Result<()> {
+    fn parse_policy_config(&mut self) -> Result<()> {
         if !self.policy_config_json.is_empty() {
             self.policy_config = Some(serde_json::from_slice(&self.policy_config_json)?);
+        } else {
+            self.policy_config = None;
         }
+        Ok(())
+    }
+
+    fn parse_all_configs(&mut self, _api: Arc<ECStore>) -> Result<()> {
+        self.parse_policy_config()?;
         if !self.notification_config_xml.is_empty() {
             self.notification_config = Some(deserialize::<NotificationConfiguration>(&self.notification_config_xml)?);
         }
@@ -665,5 +672,22 @@ mod test {
         println!("   - Policy config size: {} bytes", deserialized_bm.policy_config_json.len());
         println!("   - Lifecycle config size: {} bytes", deserialized_bm.lifecycle_config_xml.len());
         println!("   - Serialized buffer size: {} bytes", buf.len());
+    }
+
+    /// After policy deletion (policy_config_json cleared), parse_policy_config sets policy_config to None.
+    #[test]
+    fn test_parse_policy_config_clears_cache_when_json_empty() {
+        let policy_json = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}"#;
+        let mut bm = BucketMetadata::new("b");
+        bm.policy_config_json = policy_json.as_bytes().to_vec();
+        bm.parse_policy_config().unwrap();
+        assert!(bm.policy_config.is_some(), "policy_config should be set when JSON non-empty");
+
+        bm.policy_config_json.clear();
+        bm.parse_policy_config().unwrap();
+        assert!(
+            bm.policy_config.is_none(),
+            "policy_config should be None after JSON cleared (e.g. policy deleted)"
+        );
     }
 }
