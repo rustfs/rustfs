@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{decrypt_data, encrypt_data};
+use crate::{decrypt_data, decrypt_stream_io, encrypt_data, encrypt_stream_io};
 
 const PASSWORD: &[u8] = "test_password".as_bytes();
 const LONG_PASSWORD: &[u8] = "very_long_password_with_many_characters_for_testing_purposes_123456789".as_bytes();
@@ -315,5 +315,25 @@ fn test_concurrent_encryption_safety() -> Result<(), crate::Error> {
         handle.join().expect("Thread should complete successfully");
     }
 
+    Ok(())
+}
+
+#[test]
+fn test_stream_io_roundtrip() -> Result<(), crate::Error> {
+    let password = b"access:secret";
+    let data = br#"{"Version":1,"policy":"readonly"}"#;
+    let encrypted = encrypt_stream_io(password, data)?;
+    let decrypted = decrypt_stream_io(password, &encrypted)?;
+    assert_eq!(data, decrypted.as_slice());
+    Ok(())
+}
+
+#[test]
+fn test_stream_io_large_data_roundtrip() -> Result<(), crate::Error> {
+    let password = b"access:secret";
+    let data = vec![0xAB; 32 * 1024]; // > SIO_BUF_SIZE to test fragmentation
+    let encrypted = encrypt_stream_io(password, &data)?;
+    let decrypted = decrypt_stream_io(password, &encrypted)?;
+    assert_eq!(data, decrypted);
     Ok(())
 }
