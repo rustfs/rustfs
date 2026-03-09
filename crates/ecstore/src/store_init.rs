@@ -18,7 +18,7 @@ use crate::disk::{self, DiskAPI};
 use crate::error::{Error, Result};
 use crate::{
     disk::{
-        DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
+        DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET,
         error::DiskError,
         format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
         new_disk,
@@ -150,8 +150,6 @@ async fn init_format_erasure(
 
     get_format_erasure_in_quorum(&fms)
 }
-
-const MIGRATING_META_BUCKET: &str = ".minio.sys";
 
 /// Tries to migrate format
 /// Returns Ok(FormatV3) if migration succeeds, Err otherwise.

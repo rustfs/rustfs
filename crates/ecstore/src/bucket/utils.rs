@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::migration::MIGRATING_META_BUCKET;
-use crate::disk::RUSTFS_META_BUCKET;
+use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, StorageError};
 use regex::Regex;
 use rustfs_utils::path::SLASH_SEPARATOR;
