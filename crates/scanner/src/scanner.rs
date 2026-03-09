@@ -154,6 +154,7 @@ fn get_lock_acquire_timeout() -> Duration {
 
 #[instrument(skip_all)]
 async fn run_scan_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
+    info!("Start run scan cycle");
     cycle_info.current = cycle_info.next;
     cycle_info.started = Utc::now();
 
@@ -192,34 +193,34 @@ async fn run_scan_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_
         .nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode)
         .await
     {
-        error!("Failed to scan namespace: {e}");
+        error!("Fail run scan cycle: {e}");
         emit_scan_cycle_complete(false, cycle_start.elapsed());
+        return;
+    }
+    done_cycle();
+    emit_scan_cycle_complete(true, cycle_start.elapsed());
+    info!("Success run scan cycle");
+
+    cycle_info.next += 1;
+    cycle_info.current = 0;
+    cycle_info.cycle_completed.push(Utc::now());
+
+    if cycle_info.cycle_completed.len() >= data_usage_update_dir_cycles() as usize {
+        cycle_info.cycle_completed = cycle_info.cycle_completed.split_off(data_usage_update_dir_cycles() as usize);
+    }
+
+    global_metrics().set_cycle(Some(cycle_info.clone())).await;
+
+    let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
+
+    let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
+    buf.extend_from_slice(&cycle_info.next.to_le_bytes());
+    buf.extend_from_slice(&cycle_info_buf);
+
+    if let Err(e) = save_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
+        error!("Failed to save data usage bloom name to {}: {}", &*DATA_USAGE_BLOOM_NAME_PATH, e);
     } else {
-        done_cycle();
-        emit_scan_cycle_complete(true, cycle_start.elapsed());
-        info!("Namespace scanned successfully");
-
-        cycle_info.next += 1;
-        cycle_info.current = 0;
-        cycle_info.cycle_completed.push(Utc::now());
-
-        if cycle_info.cycle_completed.len() >= data_usage_update_dir_cycles() as usize {
-            cycle_info.cycle_completed = cycle_info.cycle_completed.split_off(data_usage_update_dir_cycles() as usize);
-        }
-
-        global_metrics().set_cycle(Some(cycle_info.clone())).await;
-
-        let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
-
-        let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
-        buf.extend_from_slice(&cycle_info.next.to_le_bytes());
-        buf.extend_from_slice(&cycle_info_buf);
-
-        if let Err(e) = save_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
-            error!("Failed to save data usage bloom name to {}: {}", &*DATA_USAGE_BLOOM_NAME_PATH, e);
-        } else {
-            info!("Data usage bloom name saved successfully");
-        }
+        info!("Data usage bloom name saved successfully");
     }
 }
 
