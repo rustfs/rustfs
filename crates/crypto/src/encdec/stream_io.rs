@@ -73,9 +73,8 @@ where
 
     while pos < body.len() {
         let remaining = body.len() - pos;
-        let is_last = remaining < ciphertext_len;
-
-        let frag_len = if is_last { remaining } else { ciphertext_len };
+        let frag_len = remaining.min(ciphertext_len);
+        let is_last = (pos + frag_len) == body.len();
 
         if frag_len < overhead {
             return Err(Error::ErrDecryptFailed(aes_gcm::aead::Error));
@@ -118,7 +117,7 @@ where
 {
     let mut nonce = [0u8; 12];
     nonce[0..SIO_NONCE_PREFIX_LEN].copy_from_slice(nonce_prefix);
-    nonce[8..12].copy_from_slice(&1u32.to_le_bytes());
+    nonce[8..12].copy_from_slice(&0u32.to_le_bytes());
 
     let nonce_arr = Array::<u8, <A as AeadCore>::NonceSize>::try_from(&nonce[..])
         .map_err(|_| Error::ErrEncryptFailed(aes_gcm::aead::Error))?;
