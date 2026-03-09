@@ -24,6 +24,8 @@ use tracing::{debug, info, warn};
 
 /// IAM config prefix under meta bucket (e.g. config/iam/).
 const IAM_CONFIG_PREFIX: &str = "config/iam";
+const REPLICATION_META_DIR: &str = ".replication";
+const RESYNC_META_FILE: &str = "resync.bin";
 
 /// Migrates bucket metadata from legacy format to RustFS.
 /// Uses list_bucket (from disk volumes) to get bucket names, since list_objects_v2 on the legacy
@@ -62,46 +64,62 @@ pub async fn try_migrate_bucket_metadata<S: StorageAPI>(store: Arc<S>) {
 
     for bucket in buckets {
         let meta_path = format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{bucket}{SLASH_SEPARATOR}{BUCKET_METADATA_FILE}");
-        if store
-            .get_object_info(RUSTFS_META_BUCKET, &meta_path, &ObjectOptions::default())
-            .await
-            .is_ok()
-        {
-            debug!("Bucket metadata already exists in RustFS, skip: {bucket}");
-            continue;
-        }
-        let mut rd = match store
-            .get_object_reader(MIGRATING_META_BUCKET, &meta_path, None, h.clone(), &opts)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("read migrating bucket metadata {bucket}: {e}");
-                continue;
-            }
-        };
+        migrate_one_if_missing(store.clone(), &opts, &h, &meta_path, &format!("bucket metadata: {bucket}")).await;
 
-        let data = match rd.read_all().await {
-            Ok(d) if !d.is_empty() => d,
-            Ok(_) => continue,
-            Err(e) => {
-                debug!("read migrating bucket metadata {bucket} body: {e}");
-                continue;
-            }
-        };
-
-        if let Err(e) = store
-            .put_object(RUSTFS_META_BUCKET, &meta_path, &mut PutObjReader::from_vec(data), &opts)
-            .await
-        {
-            warn!("write bucket metadata {bucket}: {e}");
-        } else {
-            info!("Migrated bucket metadata: {bucket}");
-        }
+        let resync_path = format!(
+            "{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{bucket}{SLASH_SEPARATOR}{REPLICATION_META_DIR}{SLASH_SEPARATOR}{RESYNC_META_FILE}"
+        );
+        migrate_one_if_missing(store.clone(), &opts, &h, &resync_path, &format!("bucket replication resync: {bucket}")).await;
     }
 }
 
-/// Migrates IAM config from legacy `.minio.sys/config/iam/` to `.rustfs.sys/config/iam/`.
+async fn migrate_one_if_missing<S: StorageAPI>(
+    store: Arc<S>,
+    opts: &ObjectOptions,
+    headers: &HeaderMap,
+    path: &str,
+    label: &str,
+) {
+    if store
+        .get_object_info(RUSTFS_META_BUCKET, path, &ObjectOptions::default())
+        .await
+        .is_ok()
+    {
+        debug!("{label} already exists in RustFS, skip");
+        return;
+    }
+
+    let mut rd = match store
+        .get_object_reader(MIGRATING_META_BUCKET, path, None, headers.clone(), opts)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("read migrating {label}: {e}");
+            return;
+        }
+    };
+
+    let data = match rd.read_all().await {
+        Ok(d) if !d.is_empty() => d,
+        Ok(_) => return,
+        Err(e) => {
+            debug!("read migrating {label} body: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = store
+        .put_object(RUSTFS_META_BUCKET, path, &mut PutObjReader::from_vec(data), opts)
+        .await
+    {
+        warn!("write {label}: {e}");
+    } else {
+        info!("Migrated {label}");
+    }
+}
+
+/// Migrates IAM config from legacy meta bucket `config/iam/` to RustFS meta bucket.
 /// Lists all objects under the IAM prefix in the source, copies each to the target if not present.
 /// Skips objects that already exist in RustFS (idempotent).
 /// If list_objects_v2 on the legacy bucket fails (e.g. format differs), migration is skipped.
