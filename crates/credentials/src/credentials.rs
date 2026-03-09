@@ -498,10 +498,12 @@ mod tests {
     fn test_credentials_expiration_serialize_as_rfc3339() {
         use time::OffsetDateTime;
 
-        let mut c = Credentials::default();
-        c.access_key = "ak".to_string();
-        c.secret_key = "sk12345678".to_string();
-        c.expiration = Some(OffsetDateTime::now_utc());
+        let c = Credentials {
+            access_key: "ak".to_string(),
+            secret_key: "sk12345678".to_string(),
+            expiration: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
 
         let json = serde_json::to_string(&c).expect("serialize");
         assert!(
