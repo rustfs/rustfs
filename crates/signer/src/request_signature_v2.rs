@@ -99,10 +99,7 @@ pub fn sign_v2(
     let string_to_sign = string_to_sign_v2(&req, virtual_host);
     let headers = req.headers_mut();
 
-    let need_default_date = headers
-        .get("Date")
-        .and_then(|v| v.to_str().ok())
-        .is_none_or(|v| v.is_empty());
+    let need_default_date = headers.get("Date").and_then(|v| v.to_str().ok()).is_none_or(|v| v.is_empty());
     if need_default_date {
         headers.insert(
             "Date",
@@ -137,26 +134,11 @@ fn pre_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> St
 fn write_pre_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
     let _ = buf.write_str(req.method().as_str());
     let _ = buf.write_char('\n');
-    let _ = buf.write_str(
-        req.headers()
-            .get("Content-Md5")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-    );
+    let _ = buf.write_str(req.headers().get("Content-Md5").and_then(|v| v.to_str().ok()).unwrap_or(""));
     let _ = buf.write_char('\n');
-    let _ = buf.write_str(
-        req.headers()
-            .get("Content-Type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-    );
+    let _ = buf.write_str(req.headers().get("Content-Type").and_then(|v| v.to_str().ok()).unwrap_or(""));
     let _ = buf.write_char('\n');
-    let _ = buf.write_str(
-        req.headers()
-            .get("Expires")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-    );
+    let _ = buf.write_str(req.headers().get("Expires").and_then(|v| v.to_str().ok()).unwrap_or(""));
     let _ = buf.write_char('\n');
 }
 
@@ -172,26 +154,11 @@ fn write_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
     let headers = req.headers();
     let _ = buf.write_str(req.method().as_str());
     let _ = buf.write_char('\n');
-    let _ = buf.write_str(
-        headers
-            .get("Content-Md5")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-    );
+    let _ = buf.write_str(headers.get("Content-Md5").and_then(|v| v.to_str().ok()).unwrap_or(""));
     let _ = buf.write_char('\n');
-    let _ = buf.write_str(
-        headers
-            .get("Content-Type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-    );
+    let _ = buf.write_str(headers.get("Content-Type").and_then(|v| v.to_str().ok()).unwrap_or(""));
     let _ = buf.write_char('\n');
-    let _ = buf.write_str(
-        headers
-            .get("Date")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-    );
+    let _ = buf.write_str(headers.get("Date").and_then(|v| v.to_str().ok()).unwrap_or(""));
     let _ = buf.write_char('\n');
 }
 
