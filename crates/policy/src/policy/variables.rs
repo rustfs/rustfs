@@ -311,10 +311,11 @@ async fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolve
             let mut brace_count = 1;
             let mut end_pos = actual_pos + 2; // Start after "${"
 
-            while end_pos < results[i].len() && brace_count > 0 {
-                match results[i].chars().nth(end_pos).unwrap() {
-                    '{' => brace_count += 1,
-                    '}' => brace_count -= 1,
+            let bytes = results[i].as_bytes();
+            while end_pos < bytes.len() && brace_count > 0 {
+                match bytes[end_pos] {
+                    b'{' => brace_count += 1,
+                    b'}' => brace_count -= 1,
                     _ => {}
                 }
                 if brace_count > 0 {
@@ -443,6 +444,16 @@ mod tests {
 
         let result = resolve_aws_variables("test-bucket", &resolver).await;
         assert_eq!(result, vec!["test-bucket".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_aws_variables_with_unicode_prefix() {
+        let mut context = VariableContext::new();
+        context.username = Some("alice".to_string());
+        let resolver = VariableResolver::new(context);
+
+        let result = resolve_aws_variables("中文${aws:username}", &resolver).await;
+        assert_eq!(result, vec!["中文alice".to_string()]);
     }
 
     #[tokio::test]
