@@ -395,10 +395,11 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use rustfs_targets::{
-        store::{Key, Store, StoreError},
+        store::{Key, Store},
         target::EntityTarget,
         TargetError,
     };
+    use rustfs_targets::StoreError;
     use rustfs_s3_common::EventName;
     use serde::{de::DeserializeOwned, Serialize};
     use std::sync::{
