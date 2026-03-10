@@ -332,10 +332,7 @@ mod tests {
     fn test_randomized_cycle_delay_keeps_configured_start_delay() {
         // 120s with ±10% jitter should stay clearly above the historic 30s cap.
         let delay = randomized_cycle_delay_for(Duration::from_secs(120));
-        assert!(
-            delay > Duration::from_secs(30),
-            "expected delay > 30s, got {delay:?}"
-        );
+        assert!(delay > Duration::from_secs(30), "expected delay > 30s, got {delay:?}");
         // Jitter window should stay within configured bounds.
         assert!(delay >= Duration::from_secs(108));
         assert!(delay <= Duration::from_secs(132));

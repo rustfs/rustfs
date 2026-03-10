@@ -136,8 +136,8 @@ impl SleepTimer {
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_scanner_speed_presets() {
