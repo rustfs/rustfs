@@ -394,17 +394,17 @@ impl TargetList {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use rustfs_s3_common::EventName;
+    use rustfs_targets::StoreError;
     use rustfs_targets::{
+        TargetError,
         store::{Key, Store},
         target::EntityTarget,
-        TargetError,
     };
-    use rustfs_targets::StoreError;
-    use rustfs_s3_common::EventName;
-    use serde::{de::DeserializeOwned, Serialize};
+    use serde::{Serialize, de::DeserializeOwned};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     #[derive(Clone)]
@@ -476,16 +476,8 @@ mod tests {
         let disabled_target = TestTarget::new("disabled-target", "webhook", false);
 
         let mut rules_map = RulesMap::new();
-        rules_map.add_rule_config(
-            &[EventName::ObjectCreatedPut],
-            "*".to_string(),
-            enabled_target.id.clone(),
-        );
-        rules_map.add_rule_config(
-            &[EventName::ObjectCreatedPut],
-            "*".to_string(),
-            disabled_target.id.clone(),
-        );
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), enabled_target.id.clone());
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), disabled_target.id.clone());
 
         notifier.add_rules_map("bucket", rules_map).await;
         notifier
