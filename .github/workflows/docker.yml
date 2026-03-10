@@ -163,14 +163,7 @@ jobs:
                 if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                   build_type="prerelease"
                   is_prerelease=true
-                  # TODO: Temporary change - currently allows alpha versions to also create latest tags
-                  # After the version is stable, you need to remove the following line and restore the original logic (latest is created only for stable versions)
-                  if [[ "$version" == *"alpha"* ]]; then
-                    create_latest=true
-                     echo "🧪 Building Docker image for prerelease: $version (temporarily allowing creation of latest tag)"
-                  else
-                    echo "🧪 Building Docker image for prerelease: $version"
-                  fi
+                  echo "🧪 Building Docker image for prerelease: $version"
                 else
                   build_type="release"
                   create_latest=true
@@ -216,14 +209,7 @@ jobs:
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
                 build_type="prerelease"
                 is_prerelease=true
-                # TODO: Temporary change - currently allows alpha versions to also create latest tags
-                # After the version is stable, you need to remove the if block below and restore the original logic.
-                if [[ "$input_version" == *"alpha"* ]]; then
-                  create_latest=true
-                   echo "🧪 Building with prerelease version: $input_version (temporarily allowing creation of latest tag)"
-                else
-                  echo "🧪 Building with prerelease version: $input_version"
-                fi
+                echo "🧪 Building with prerelease version: $input_version"
                 ;;
               # Release versions (match after prereleases, more general)
               v[0-9]*|[0-9]*.*.*)
@@ -450,10 +436,8 @@ jobs:
             "prerelease")
               echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
               echo "⚠️  This is a prerelease image - use with caution"
-              # TODO: Temporary change - alpha versions currently create the latest tag
-              # After the version is stable, you need to restore the following prompt information
-              if [[ "$VERSION" == *"alpha"* ]] && [[ "$CREATE_LATEST" == "true" ]]; then
-                echo "🏷️  Latest tag has been created for alpha version (temporary measures)"
+              if [[ "$CREATE_LATEST" == "true" ]]; then
+                echo "🏷️  Latest tag has been explicitly created for prerelease"
               else
                 echo "🚫 Latest tag NOT created for prerelease"
               fi
