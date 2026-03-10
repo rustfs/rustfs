@@ -74,7 +74,7 @@ config:
       # keep_files: 30 # number of rotated log files to keep
     metrics:
       enabled: false
-      endpoint: "" # If specified, rustfs will expose metrics on this endpoint. e.g. "http://localhost:9090/api/v1/otlp/v1/metrics"
+      endpoint: "" # If specified, rustfs will export metrics to this OTLP endpoint. e.g. "http://localhost:4318/v1/metrics"
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
