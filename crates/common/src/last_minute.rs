@@ -155,10 +155,7 @@ impl LastMinuteLatency {
     }
 
     pub fn add(&mut self, t: &Duration) {
-        let sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let sec = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         self.forward_to(sec);
         let win_idx = sec % 60;
         self.totals[win_idx as usize].add(t);
@@ -174,10 +171,7 @@ impl LastMinuteLatency {
 
     pub fn get_total(&mut self) -> AccElem {
         let mut res = AccElem::default();
-        let sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let sec = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         self.forward_to(sec);
         for elem in self.totals.iter() {
             res.merge(elem);

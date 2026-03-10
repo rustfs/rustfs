@@ -458,9 +458,7 @@ impl DataUsageEntry {
         self.size += other.size;
 
         if let Some(o_rep) = &other.replication_stats {
-            let s_rep = self
-                .replication_stats
-                .get_or_insert_with(ReplicationAllStats::default);
+            let s_rep = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
             s_rep.targets.clear();
             s_rep.replica_size += o_rep.replica_size;
             s_rep.replica_count += o_rep.replica_count;
@@ -585,11 +583,7 @@ impl DataUsageCache {
                     return Some(root);
                 }
                 let mut flat = self.flatten(&root);
-                if flat
-                    .replication_stats
-                    .as_ref()
-                    .map_or(false, |stats| stats.empty())
-                {
+                if flat.replication_stats.as_ref().map_or(false, |stats| stats.empty()) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
@@ -740,8 +734,7 @@ impl DataUsageCache {
         }
 
         existing_root.merge(&other_root);
-        self.cache
-            .insert(hash_path(&self.info.name).key(), existing_root);
+        self.cache.insert(hash_path(&self.info.name).key(), existing_root);
 
         let root_hash = self.root_hash();
         for key in other_root.children.iter() {

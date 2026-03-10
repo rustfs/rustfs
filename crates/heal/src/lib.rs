@@ -73,8 +73,7 @@ pub async fn init_heal_manager(
         .map_err(|_| Error::Config("Heal manager already initialized".to_string()))?;
 
     // Initialize heal channel
-    let channel_receiver = rustfs_common::heal_channel::init_heal_channel()
-        .map_err(|err| Error::Config(err.to_string()))?;
+    let channel_receiver = rustfs_common::heal_channel::init_heal_channel().map_err(|err| Error::Config(err.to_string()))?;
 
     // Create channel processor
     let channel_processor = HealChannelProcessor::new(heal_manager.clone());
