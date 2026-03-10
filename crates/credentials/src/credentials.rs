@@ -233,15 +233,18 @@ impl<'a> fmt::Debug for Masked<'a> {
         match self.0 {
             None => Ok(()),
             Some(s) => {
-                let len = s.len();
+                let len = s.chars().count();
                 if len == 0 {
                     Ok(())
                 } else if len == 1 {
                     write!(f, "***")
                 } else if len == 2 {
-                    write!(f, "{}***|{}", &s[0..1], len)
+                    let first = s.chars().next().ok_or(fmt::Error)?;
+                    write!(f, "{}***|{}", first, len)
                 } else {
-                    write!(f, "{}***{}|{}", &s[0..1], &s[len - 1..], len)
+                    let first = s.chars().next().ok_or(fmt::Error)?;
+                    let last = s.chars().last().ok_or(fmt::Error)?;
+                    write!(f, "{}***{}|{}", first, last, len)
                 }
             }
         }
@@ -482,5 +485,10 @@ mod tests {
 
         // Test longer string
         assert_eq!(format!("{:?}", Masked(Some("secretpassword"))), "s***d|14");
+
+        // Test Unicode input should not panic and should keep character boundary
+        assert_eq!(format!("{:?}", Masked(Some("中")), "***");
+        assert_eq!(format!("{:?}", Masked(Some("中文"))), "中***|2");
+        assert_eq!(format!("{:?}", Masked(Some("中文测试"))), "中***试|4");
     }
 }
