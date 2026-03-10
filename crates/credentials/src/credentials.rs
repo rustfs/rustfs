@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(format!("{:?}", Masked(Some("secretpassword"))), "s***d|14");
 
         // Test Unicode input should not panic and should keep character boundary
-        assert_eq!(format!("{:?}", Masked(Some("中")), "***");
+        assert_eq!(format!("{:?}", Masked(Some("中"))), "***");
         assert_eq!(format!("{:?}", Masked(Some("中文"))), "中***|2");
         assert_eq!(format!("{:?}", Masked(Some("中文测试"))), "中***试|4");
     }
