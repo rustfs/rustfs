@@ -136,7 +136,6 @@ impl SleepTimer {
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
     use super::*;
 
     #[test]
@@ -167,7 +166,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial]
     async fn test_fastest_never_sleeps() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(true, Ordering::Relaxed);
@@ -181,7 +179,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial]
     async fn test_idle_mode_off_skips_sleep() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(false, Ordering::Relaxed);
