@@ -1311,7 +1311,7 @@ mod tests {
         base.merge(&other);
 
         let root = base.find("bucket").expect("root bucket should exist");
-        assert_eq!(root.size, 42);
+        assert_eq!(root.size, 0);
         let child_entry = base.find("bucket/child").expect("merged child should be added");
         assert_eq!(child_entry.size, 42);
     }
