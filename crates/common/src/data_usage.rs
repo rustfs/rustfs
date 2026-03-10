@@ -583,7 +583,7 @@ impl DataUsageCache {
                     return Some(root);
                 }
                 let mut flat = self.flatten(&root);
-                if flat.replication_stats.as_ref().map_or(false, |stats| stats.empty()) {
+                if flat.replication_stats.as_ref().is_some_and(|stats| stats.empty()) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
@@ -1297,8 +1297,10 @@ mod tests {
 
         let mut other = DataUsageCache::default();
         other.info.name = "bucket".to_string();
-        let mut child = DataUsageEntry::default();
-        child.size = 42;
+        let child = DataUsageEntry {
+            size: 42,
+            ..Default::default()
+        };
         other.replace("bucket/child", "bucket", child);
 
         base.merge(&other);
