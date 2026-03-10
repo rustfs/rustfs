@@ -53,8 +53,8 @@ fn test_sync_signatures() {
     let path = "/v1/AUTH_test/container/object.txt";
     let key = "sharedsecret";
 
-    let sig1 = sync::generate_sync_signature(path, key);
-    let sig2 = sync::generate_sync_signature(path, key);
+    let sig1 = sync::generate_sync_signature(path, key).expect("failed to generate sync signature");
+    let sig2 = sync::generate_sync_signature(path, key).expect("failed to generate sync signature");
 
     assert_eq!(sig1, sig2);
     assert_eq!(sig1.len(), 40); // HMAC-SHA1 = 40 hex chars
