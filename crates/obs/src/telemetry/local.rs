@@ -206,7 +206,7 @@ fn init_file_logging_internal(
 
         builder
             .build(log_directory)
-            .expect("failed to initialize rolling file appender")
+            .map_err(|e| TelemetryError::Io(format!("failed to initialize rolling file appender: {e}")))?
     };
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -416,4 +416,25 @@ fn spawn_cleanup_task(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OtelConfig;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_init_file_logging_invalid_filename_does_not_panic() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let temp_path = temp_dir.path().to_str().expect("temp dir path is utf-8");
+        let config = OtelConfig {
+            log_filename: Some("invalid\0name.log".to_string()),
+            ..OtelConfig::default()
+        };
+
+        let result = init_file_logging_internal(&config, temp_path, "info", true);
+
+        assert!(result.is_err());
+    }
 }
