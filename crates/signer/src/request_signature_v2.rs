@@ -253,14 +253,23 @@ fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Request<Body>
     let request_url = req.uri();
     let _ = buf.write_str(&encode_url2path(req, virtual_host));
     if let Some(query_str) = request_url.query().filter(|query| !query.is_empty()) {
-        let result = serde_urlencoded::from_str::<HashMap<String, Vec<String>>>(query_str);
-        let vals = result.unwrap_or_default();
+        let mut query_vals = HashMap::new();
+        for pair in query_str.split('&') {
+            let mut iter = pair.splitn(2, '=');
+            let key = match iter.next() {
+                Some(k) if !k.is_empty() => k,
+                _ => continue,
+            };
+            let value = iter.next().unwrap_or("");
+            query_vals.insert(key.to_string(), value.to_string());
+        }
+
         let mut canonical = Vec::<String>::new();
         for resource in INCLUDED_QUERY {
-            if let Some(vv) = vals.get(*resource) && !vv.is_empty() {
+            if let Some(value) = query_vals.get(*resource) {
                 let mut item = resource.to_string();
-                if !vv[0].is_empty() {
-                    let _ = write!(&mut item, "={}", &vv[0]);
+                if !value.is_empty() {
+                    let _ = write!(&mut item, "={value}");
                 }
                 canonical.push(item);
             }
@@ -295,7 +304,7 @@ mod tests {
 
         assert!(values.contains_key("AWSAccessKeyId"));
         assert!(values.contains_key("Expires"));
-        assert!(query.contains("X-Amz-Algorithm"));
+        assert!(values.contains_key("Signature"));
     }
 
     #[test]
