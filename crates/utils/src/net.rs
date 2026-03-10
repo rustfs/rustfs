@@ -232,7 +232,8 @@ pub fn get_available_port() -> u16 {
 }
 
 fn try_get_available_port() -> std::io::Result<u16> {
-    let listener = TcpListener::bind("0.0.0.0:0").map_err(|err| Error::other(format!("Failed to bind for ephemeral port: {err}")))?;
+    let listener =
+        TcpListener::bind("0.0.0.0:0").map_err(|err| Error::other(format!("Failed to bind for ephemeral port: {err}")))?;
     listener
         .local_addr()
         .map(|addr| addr.port())
