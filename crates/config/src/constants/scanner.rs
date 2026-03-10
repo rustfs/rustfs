@@ -12,17 +12,102 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::Duration;
+
 /// Environment variable name that specifies the data scanner start delay in seconds.
-/// - Purpose: Define the delay between data scanner operations.
+/// If set, this overrides the cycle interval derived from `RUSTFS_SCANNER_SPEED`.
 /// - Unit: seconds (u64).
-/// - Valid values: any positive integer.
-/// - Semantics: This delay controls how frequently the data scanner checks for and processes data; shorter delays lead to more responsive scanning but may increase system load.
 /// - Example: `export RUSTFS_DATA_SCANNER_START_DELAY_SECS=10`
-/// - Note: Choose an appropriate delay that balances scanning responsiveness with overall system performance.
 pub const ENV_DATA_SCANNER_START_DELAY_SECS: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
-/// Default data scanner start delay in seconds if not specified in the environment variable.
-/// - Value: 10 seconds.
-/// - Rationale: This default interval provides a reasonable balance between scanning responsiveness and system load for most deployments.
-/// - Adjustments: Users may modify this value via the `RUSTFS_DATA_SCANNER_START_DELAY_SECS` environment variable based on their specific scanning requirements and system performance.
-pub const DEFAULT_DATA_SCANNER_START_DELAY_SECS: u64 = 60;
+/// Environment variable that selects the scanner speed preset.
+/// Valid values: `fastest`, `fast`, `default`, `slow`, `slowest`.
+/// Controls the sleep factor, maximum sleep duration, and cycle interval.
+/// - Example: `export RUSTFS_SCANNER_SPEED=slow`
+pub const ENV_SCANNER_SPEED: &str = "RUSTFS_SCANNER_SPEED";
+
+/// Default scanner speed preset.
+pub const DEFAULT_SCANNER_SPEED: &str = "default";
+
+/// Environment variable that controls whether the scanner sleeps between operations.
+/// When `true` (default), the scanner throttles itself. When `false`, it runs at full speed.
+/// - Example: `export RUSTFS_SCANNER_IDLE_MODE=false`
+pub const ENV_SCANNER_IDLE_MODE: &str = "RUSTFS_SCANNER_IDLE_MODE";
+
+/// Default scanner idle mode.
+pub const DEFAULT_SCANNER_IDLE_MODE: bool = true;
+
+/// Scanner speed preset controlling throttling behavior.
+///
+/// Each preset defines three parameters:
+/// - **sleep_factor**: Multiplier applied to elapsed work time to compute inter-object sleep.
+/// - **max_sleep**: Upper bound on any single throttle sleep.
+/// - **cycle_interval**: Base delay between scan cycles.
+///
+/// | Preset    | Factor | Max Sleep | Cycle Interval |
+/// |-----------|--------|-----------|----------------|
+/// | `fastest` | 0      | 0         | 1 second       |
+/// | `fast`    | 1x     | 100ms     | 1 minute       |
+/// | `default` | 2x     | 1 second  | 1 minute       |
+/// | `slow`    | 10x    | 15 seconds| 1 minute       |
+/// | `slowest` | 100x   | 15 seconds| 30 minutes     |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScannerSpeed {
+    Fastest,
+    Fast,
+    #[default]
+    Default,
+    Slow,
+    Slowest,
+}
+
+impl ScannerSpeed {
+    pub fn sleep_factor(self) -> f64 {
+        match self {
+            Self::Fastest => 0.0,
+            Self::Fast => 1.0,
+            Self::Default => 2.0,
+            Self::Slow => 10.0,
+            Self::Slowest => 100.0,
+        }
+    }
+
+    pub fn max_sleep(self) -> Duration {
+        match self {
+            Self::Fastest => Duration::ZERO,
+            Self::Fast => Duration::from_millis(100),
+            Self::Default => Duration::from_secs(1),
+            Self::Slow | Self::Slowest => Duration::from_secs(15),
+        }
+    }
+
+    pub fn cycle_interval(self) -> Duration {
+        match self {
+            Self::Fastest => Duration::from_secs(1),
+            Self::Fast | Self::Default | Self::Slow => Duration::from_secs(60),
+            Self::Slowest => Duration::from_secs(30 * 60),
+        }
+    }
+
+    pub fn from_env_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fastest" => Self::Fastest,
+            "fast" => Self::Fast,
+            "slow" => Self::Slow,
+            "slowest" => Self::Slowest,
+            _ => Self::Default,
+        }
+    }
+}
+
+impl std::fmt::Display for ScannerSpeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fastest => write!(f, "fastest"),
+            Self::Fast => write!(f, "fast"),
+            Self::Default => write!(f, "default"),
+            Self::Slow => write!(f, "slow"),
+            Self::Slowest => write!(f, "slowest"),
+        }
+    }
+}
