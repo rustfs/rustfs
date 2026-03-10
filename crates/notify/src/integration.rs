@@ -355,7 +355,7 @@ impl NotificationSystem {
                         changed = true;
                     }
                     if targets.is_empty() {
-                        config.0.remove(target_type);
+                        config.0.remove(&ttype);
                     }
                 }
                 if !changed {
