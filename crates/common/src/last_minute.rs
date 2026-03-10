@@ -157,7 +157,7 @@ impl LastMinuteLatency {
     pub fn add(&mut self, t: &Duration) {
         let sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .unwrap_or_default()
             .as_secs();
         self.forward_to(sec);
         let win_idx = sec % 60;
@@ -176,7 +176,7 @@ impl LastMinuteLatency {
         let mut res = AccElem::default();
         let sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .unwrap_or_default()
             .as_secs();
         self.forward_to(sec);
         for elem in self.totals.iter() {
