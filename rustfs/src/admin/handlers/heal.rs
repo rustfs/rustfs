@@ -21,7 +21,6 @@ use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
-use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_utils::path::path_join;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -141,8 +140,7 @@ impl Operation for HealHandler {
         #[derive(Default)]
         struct HealResp {
             resp_bytes: Vec<u8>,
-            _api_err: Option<StorageError>,
-            _err_body: String,
+            api_err: Option<String>,
         }
 
         let heal_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
@@ -156,7 +154,6 @@ impl Operation for HealHandler {
             spawn(async move {
                 match rustfs_common::heal_channel::query_heal_status(heal_path_str, client_token).await {
                     Ok(_) => {
-                        // TODO: Get actual response from channel
                         let _ = tx_clone
                             .send(HealResp {
                                 resp_bytes: vec![],
@@ -167,7 +164,7 @@ impl Operation for HealHandler {
                     Err(e) => {
                         let _ = tx_clone
                             .send(HealResp {
-                                _api_err: Some(StorageError::other(e)),
+                                api_err: Some(e),
                                 ..Default::default()
                             })
                             .await;
@@ -181,7 +178,6 @@ impl Operation for HealHandler {
             spawn(async move {
                 match rustfs_common::heal_channel::cancel_heal_task(heal_path_str).await {
                     Ok(_) => {
-                        // TODO: Get actual response from channel
                         let _ = tx_clone
                             .send(HealResp {
                                 resp_bytes: vec![],
@@ -192,7 +188,7 @@ impl Operation for HealHandler {
                     Err(e) => {
                         let _ = tx_clone
                             .send(HealResp {
-                                _api_err: Some(StorageError::other(e)),
+                                api_err: Some(e),
                                 ..Default::default()
                             })
                             .await;
@@ -229,7 +225,7 @@ impl Operation for HealHandler {
                         // Error - send error response
                         let _ = tx_clone
                             .send(HealResp {
-                                _api_err: Some(StorageError::other(e)),
+                                api_err: Some(e),
                                 ..Default::default()
                             })
                             .await;
@@ -239,7 +235,12 @@ impl Operation for HealHandler {
         }
 
         match rx.recv().await {
-            Some(result) => Ok(S3Response::new((StatusCode::OK, Body::from(result.resp_bytes)))),
+            Some(result) => {
+                if let Some(api_err) = result.api_err {
+                    return Err(s3_error!(InternalError, "{api_err}"));
+                }
+                Ok(S3Response::new((StatusCode::OK, Body::from(result.resp_bytes))))
+            }
             None => Ok(S3Response::new((StatusCode::INTERNAL_SERVER_ERROR, Body::from(vec![])))),
         }
     }
