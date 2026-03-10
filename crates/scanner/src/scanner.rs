@@ -35,8 +35,6 @@ use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-const LOCK_RETRY_MAX: Duration = Duration::from_secs(30);
-
 /// Returns the base cycle interval. If `RUSTFS_DATA_SCANNER_START_DELAY_SECS`
 /// is set, it takes precedence; otherwise the value is derived from the
 /// `RUSTFS_SCANNER_SPEED` preset.
@@ -76,8 +74,8 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
             if let Err(e) = run_data_scanner(ctx_clone.clone(), storeapi_clone.clone()).await {
                 error!("Failed to run data scanner: {e}");
             }
-            // Sleep if couldn't acquire lock or scan failed
-            tokio::time::sleep(randomized_cycle_delay().min(LOCK_RETRY_MAX)).await;
+            // Sleep between scanner cycles.
+            tokio::time::sleep(randomized_cycle_delay()).await;
         }
     });
 }
@@ -317,5 +315,53 @@ pub async fn store_data_usage_in_backend(
         }
 
         attempts += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn with_env_var(key: &str, value: Option<&str>, test: impl FnOnce()) {
+        let prev = std::env::var_os(key);
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+
+        test();
+
+        match prev {
+            Some(prev) => std::env::set_var(key, prev),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_randomized_cycle_delay_keeps_configured_start_delay() {
+        with_env_var(ENV_DATA_SCANNER_START_DELAY_SECS, Some("120"), || {
+            // 120s with ±10% jitter should stay clearly above the historic 30s cap.
+            let delay = randomized_cycle_delay();
+            assert!(
+                delay > Duration::from_secs(30),
+                "expected delay > 30s, got {delay:?}"
+            );
+            // Jitter window should stay within configured bounds.
+            assert!(delay >= Duration::from_secs(108));
+            assert!(delay <= Duration::from_secs(132));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_randomized_cycle_delay_handles_small_start_delay() {
+        with_env_var(ENV_DATA_SCANNER_START_DELAY_SECS, Some("0"), || {
+            // 0 is treated as minimum 1 second before jitter, with lower bound preserved.
+            let delay = randomized_cycle_delay();
+            assert!(delay >= Duration::from_secs(1), "expected delay >= 1s");
+            assert!(delay < Duration::from_secs(2), "expected delay < 2s");
+        });
     }
 }
