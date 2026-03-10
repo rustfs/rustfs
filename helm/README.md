@@ -31,6 +31,8 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.log_rotation.size | int | `"100"` | Default log rotation size mb for rustfs. |
 | config.rustfs.log_rotation.time | string | `"hour"` | Default log rotation time for rustfs. |
 | config.rustfs.log_rotation.keep_files | int | `"30"` | Default log keep files for rustfs.  |
+| config.rustfs.metrics.enabled | bool | `true` | Toggle metrics export. |
+| config.rustfs.metrics.endpoint | string | `""` | Dedicated metrics endpoint. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
