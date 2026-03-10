@@ -200,8 +200,8 @@ impl std::fmt::Display for ParsedURL {
             && let Some(port) = url.port()
             && ((url.scheme() == "http" && port == 80) || (url.scheme() == "https" && port == 443))
         {
-            url.set_host(Some(&host)).unwrap();
-            url.set_port(None).unwrap();
+            let _ = url.set_host(Some(&host));
+            let _ = url.set_port(None);
         }
         let mut s = url.to_string();
 
