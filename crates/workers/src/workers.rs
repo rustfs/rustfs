@@ -93,7 +93,8 @@ mod tests {
             let workers = workers.clone();
             tokio::spawn(async move {
                 workers.take().await;
-                sleep(Duration::from_secs(3)).await;
+                sleep(Duration::from_millis(50)).await;
+                workers.give().await;
             });
         }
 
@@ -101,7 +102,7 @@ mod tests {
             workers.give().await;
         }
         // Sleep: wait for spawn task started
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(20)).await;
         workers.wait().await;
         assert_eq!(workers.available().await, workers.limit);
     }
