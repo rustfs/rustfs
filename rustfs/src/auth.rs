@@ -94,23 +94,32 @@ pub enum AuthType {
 #[derive(Debug)]
 pub struct IAMAuth {
     simple_auth: SimpleAuth,
+    access_key: String,
+    secret_key: SecretKey,
 }
 
 impl Clone for IAMAuth {
     fn clone(&self) -> Self {
-        // Since SimpleAuth doesn't implement Clone, we create a new one
-        // This is a simplified implementation - in a real scenario, you might need
-        // to store the credentials separately to properly clone
+        // Re-create the SimpleAuth verifier with concrete credentials to avoid
+        // losing the bootstrap key behavior in clone scenarios.
         Self {
-            simple_auth: SimpleAuth::new(),
+            simple_auth: SimpleAuth::from_single(self.access_key.clone(), self.secret_key.clone()),
+            access_key: self.access_key.clone(),
+            secret_key: self.secret_key.clone(),
         }
     }
 }
 
 impl IAMAuth {
     pub fn new(ak: impl Into<String>, sk: impl Into<SecretKey>) -> Self {
-        let simple_auth = SimpleAuth::from_single(ak, sk);
-        Self { simple_auth }
+        let access_key = ak.into();
+        let secret_key = sk.into();
+        let simple_auth = SimpleAuth::from_single(access_key.clone(), secret_key.clone());
+        Self {
+            simple_auth,
+            access_key,
+            secret_key,
+        }
     }
 }
 
@@ -270,7 +279,10 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
                 return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
             }
 
-            return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
+            return Err(s3_error!(
+                InvalidAccessKeyId,
+                "The Access Key Id you provided does not exist in our records."
+            ));
         }
 
         let Some(u) = u else {
@@ -897,6 +909,18 @@ mod tests {
         // We can't easily test internal state without exposing it,
         // but we can test it doesn't panic on creation
         assert_eq!(size_of_val(&iam_auth), size_of::<IAMAuth>());
+    }
+
+    #[tokio::test]
+    async fn test_iam_auth_clone_keeps_secret_key() {
+        let iam_auth = IAMAuth::new("test-access-key", SecretKey::from("test-secret-key"));
+        let iam_auth_clone = iam_auth.clone();
+
+        let secret = iam_auth_clone
+            .get_secret_key("test-access-key")
+            .await
+            .expect("clone should keep secret key mapping");
+        assert_eq!(secret.expose(), "test-secret-key");
     }
 
     #[tokio::test]
