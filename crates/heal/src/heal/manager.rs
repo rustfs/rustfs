@@ -31,7 +31,7 @@ use tokio::{
     time::interval,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Priority queue wrapper for heal requests
 /// Uses BinaryHeap for priority-based ordering while maintaining FIFO for same-priority items
@@ -509,7 +509,7 @@ impl HealManager {
                         }
 
                         if endpoints.is_empty() {
-                            info!("start_auto_disk_scanner: No endpoints need healing");
+                            debug!("start_auto_disk_scanner: No endpoints need healing");
                             continue;
                         }
 

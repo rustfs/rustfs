@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::scanner_folder::{ScannerItem, scan_data_folder};
+use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
     DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo,
     DataUsageInfo, SizeSummary, TierStats,
@@ -636,10 +637,7 @@ impl ScannerIODisk for Disk {
 
         let disks = disks_result.into_iter().flatten().collect::<Vec<Arc<Disk>>>();
 
-        // Create we_sleep function (always return false for now, can be enhanced later)
-        let we_sleep: Box<dyn Fn() -> bool + Send + Sync> = Box::new(|| false);
-
-        let result = scan_data_folder(ctx, disks, local_disk, cache, updates, scan_mode, we_sleep).await;
+        let result = scan_data_folder(ctx, disks, local_disk, cache, updates, scan_mode, SCANNER_SLEEPER.clone()).await;
 
         match result {
             Ok(mut data_usage_info) => {
