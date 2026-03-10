@@ -204,9 +204,7 @@ fn init_file_logging_internal(
             FileMatchMode::Suffix => builder = builder.filename_suffix(log_filename),
         }
 
-        builder
-            .build(log_directory)
-            .map_err(|e| TelemetryError::Io(e.to_string()))?
+        builder.build(log_directory).map_err(|e| TelemetryError::Io(e.to_string()))?
     };
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -283,27 +281,6 @@ fn init_file_logging_internal(
         stdout_guard,
         cleanup_handle: Some(cleanup_handle),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::OtelConfig;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_init_file_logging_invalid_filename_does_not_panic() {
-        let temp_dir = tempdir().expect("create temp dir");
-        let temp_path = temp_dir.path().to_str().expect("temp dir path is utf-8");
-        let config = OtelConfig {
-            log_filename: Some("invalid\0name.log".to_string()),
-            ..OtelConfig::default()
-        };
-
-        let result = init_file_logging_internal(&config, temp_path, "info", true);
-
-        assert!(result.is_err());
-    }
 }
 
 // ─── Directory permissions (Unix) ─────────────────────────────────────────────
@@ -437,4 +414,25 @@ fn spawn_cleanup_task(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OtelConfig;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_init_file_logging_invalid_filename_does_not_panic() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let temp_path = temp_dir.path().to_str().expect("temp dir path is utf-8");
+        let config = OtelConfig {
+            log_filename: Some("invalid\0name.log".to_string()),
+            ..OtelConfig::default()
+        };
+
+        let result = init_file_logging_internal(&config, temp_path, "info", true);
+
+        assert!(result.is_err());
+    }
 }
