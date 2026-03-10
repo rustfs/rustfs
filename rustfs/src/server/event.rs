@@ -62,14 +62,15 @@ pub(crate) async fn init_event_notifier() {
         target: "rustfs::main::init_event_notifier",
         "Global server configuration loaded successfully"
     );
-    // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
-    if server_config
+    // 2. Check if at least one notify subsystem exists in the configuration, and skip only when neither is present.
+    let mqtt_configured = server_config
         .get_value(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)
-        .is_none()
-        || server_config
-            .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
-            .is_none()
-    {
+        .is_some();
+    let webhook_configured = server_config
+        .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
+        .is_some();
+
+    if !mqtt_configured && !webhook_configured {
         info!(
             target: "rustfs::main::init_event_notifier",
             "'notify' subsystem not configured, skipping event notifier initialization."
