@@ -204,7 +204,9 @@ fn init_file_logging_internal(
             FileMatchMode::Suffix => builder = builder.filename_suffix(log_filename),
         }
 
-        builder.build(log_directory).map_err(|e| TelemetryError::Io(format!("failed to initialize rolling file appender: {e}")))?
+        builder
+            .build(log_directory)
+            .map_err(|e| TelemetryError::Io(format!("failed to initialize rolling file appender: {e}")))?
     };
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
