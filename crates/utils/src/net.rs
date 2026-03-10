@@ -26,7 +26,7 @@ use tracing::{error, info};
 use transform_stream::AsyncTryStream;
 use url::{Host, Url};
 
-static LOCAL_IPS: LazyLock<Vec<IpAddr>> = LazyLock::new(|| get_local_ips_with_fallback());
+static LOCAL_IPS: LazyLock<Vec<IpAddr>> = LazyLock::new(get_local_ips_with_fallback);
 
 #[derive(Debug, Clone)]
 struct DnsCacheEntry {
