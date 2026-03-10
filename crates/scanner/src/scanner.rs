@@ -49,7 +49,11 @@ fn cycle_interval() -> Duration {
 /// Compute a randomized inter-cycle sleep.
 // Delay is scan interval +- 10%, with a floor of 1 second.
 fn randomized_cycle_delay() -> Duration {
-    let interval = cycle_interval().max(Duration::from_secs(1));
+    randomized_cycle_delay_for(cycle_interval())
+}
+
+fn randomized_cycle_delay_for(interval: Duration) -> Duration {
+    let interval = interval.max(Duration::from_secs(1));
     // Uniform in [-0.1, 0.1), keeping actual delay within 10% of interval.
     let jitter_factor = (rand::random::<f64>() * 0.2) - 0.1;
     let delay = interval.mul_f64(1.0 + jitter_factor);
@@ -323,45 +327,26 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    fn with_env_var(key: &str, value: Option<&str>, test: impl FnOnce()) {
-        let prev = std::env::var_os(key);
-        match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
-
-        test();
-
-        match prev {
-            Some(prev) => std::env::set_var(key, prev),
-            None => std::env::remove_var(key),
-        }
-    }
-
     #[test]
     #[serial]
     fn test_randomized_cycle_delay_keeps_configured_start_delay() {
-        with_env_var(ENV_DATA_SCANNER_START_DELAY_SECS, Some("120"), || {
-            // 120s with ±10% jitter should stay clearly above the historic 30s cap.
-            let delay = randomized_cycle_delay();
-            assert!(
-                delay > Duration::from_secs(30),
-                "expected delay > 30s, got {delay:?}"
-            );
-            // Jitter window should stay within configured bounds.
-            assert!(delay >= Duration::from_secs(108));
-            assert!(delay <= Duration::from_secs(132));
-        });
+        // 120s with ±10% jitter should stay clearly above the historic 30s cap.
+        let delay = randomized_cycle_delay_for(Duration::from_secs(120));
+        assert!(
+            delay > Duration::from_secs(30),
+            "expected delay > 30s, got {delay:?}"
+        );
+        // Jitter window should stay within configured bounds.
+        assert!(delay >= Duration::from_secs(108));
+        assert!(delay <= Duration::from_secs(132));
     }
 
     #[test]
     #[serial]
     fn test_randomized_cycle_delay_handles_small_start_delay() {
-        with_env_var(ENV_DATA_SCANNER_START_DELAY_SECS, Some("0"), || {
-            // 0 is treated as minimum 1 second before jitter, with lower bound preserved.
-            let delay = randomized_cycle_delay();
-            assert!(delay >= Duration::from_secs(1), "expected delay >= 1s");
-            assert!(delay < Duration::from_secs(2), "expected delay < 2s");
-        });
+        // 0 is treated as minimum 1 second before jitter, with lower bound preserved.
+        let delay = randomized_cycle_delay_for(Duration::from_secs(0));
+        assert!(delay >= Duration::from_secs(1), "expected delay >= 1s");
+        assert!(delay < Duration::from_secs(2), "expected delay < 2s");
     }
 }
