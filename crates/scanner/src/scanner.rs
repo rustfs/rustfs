@@ -38,7 +38,6 @@ use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-const LOCK_RETRY_MAX: Duration = Duration::from_secs(30);
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
 /// Returns the base cycle interval. If `RUSTFS_SCANNER_START_DELAY_SECS`
