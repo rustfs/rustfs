@@ -78,8 +78,12 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
             if let Err(e) = run_data_scanner(ctx_clone.clone(), storeapi_clone.clone()).await {
                 error!("Failed to run data scanner: {e}");
             }
-            // Sleep between scanner cycles.
-            tokio::time::sleep(randomized_cycle_delay()).await;
+            // Backoff before retrying after lock contention or scanner-level failures.
+            // Keep this cancellation-aware so shutdown is not delayed by backoff sleep.
+            tokio::select! {
+                _ = ctx_clone.cancelled() => break,
+                _ = tokio::time::sleep(randomized_cycle_delay()) => {}
+            }
         }
     });
 }
