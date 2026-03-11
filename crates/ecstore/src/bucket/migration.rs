@@ -18,14 +18,144 @@ use crate::bucket::metadata::BUCKET_METADATA_FILE;
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::store_api::{BucketOptions, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
+use rustfs_policy::auth::UserIdentity;
+use rustfs_policy::policy::PolicyDoc;
 use rustfs_utils::path::SLASH_SEPARATOR;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
 /// IAM config prefix under meta bucket (e.g. config/iam/).
 const IAM_CONFIG_PREFIX: &str = "config/iam";
+const IAM_FORMAT_FILE_PATH: &str = "config/iam/format.json";
+const IAM_USERS_PREFIX: &str = "config/iam/users/";
+const IAM_SERVICE_ACCOUNTS_PREFIX: &str = "config/iam/service-accounts/";
+const IAM_STS_PREFIX: &str = "config/iam/sts/";
+const IAM_GROUPS_PREFIX: &str = "config/iam/groups/";
+const IAM_POLICIES_PREFIX: &str = "config/iam/policies/";
+const IAM_POLICY_DB_PREFIX: &str = "config/iam/policydb/";
 const REPLICATION_META_DIR: &str = ".replication";
 const RESYNC_META_FILE: &str = "resync.bin";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompatIamFormat {
+    #[serde(default)]
+    version: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompatGroupInfo {
+    #[serde(default)]
+    version: i64,
+    #[serde(default = "default_group_status")]
+    status: String,
+    #[serde(default)]
+    members: Vec<String>,
+    #[serde(
+        rename = "updatedAt",
+        alias = "update_at",
+        default,
+        with = "rustfs_policy::serde_datetime::option"
+    )]
+    update_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompatMappedPolicy {
+    #[serde(default)]
+    version: i64,
+    #[serde(rename = "policy", alias = "policies", default)]
+    policy: String,
+    #[serde(
+        rename = "updatedAt",
+        alias = "update_at",
+        default,
+        with = "rustfs_policy::serde_datetime::option"
+    )]
+    update_at: Option<OffsetDateTime>,
+}
+
+fn default_group_status() -> String {
+    "enabled".to_string()
+}
+
+fn normalize_iam_config_blob(path: &str, data: &[u8]) -> std::result::Result<Option<Vec<u8>>, String> {
+    if path == IAM_FORMAT_FILE_PATH {
+        let mut format: CompatIamFormat =
+            serde_json::from_slice(data).map_err(|err| format!("parse IAM format failed: {err}"))?;
+        if format.version <= 0 {
+            format.version = 1;
+        }
+        return serde_json::to_vec(&format)
+            .map(Some)
+            .map_err(|err| format!("serialize IAM format failed: {err}"));
+    }
+
+    if is_identity_path(path) {
+        let mut identity: UserIdentity =
+            serde_json::from_slice(data).map_err(|err| format!("parse IAM identity failed: {err}"))?;
+        if identity.update_at.is_none() {
+            identity.update_at = Some(OffsetDateTime::now_utc());
+        }
+        return serde_json::to_vec(&identity)
+            .map(Some)
+            .map_err(|err| format!("serialize IAM identity failed: {err}"));
+    }
+
+    if is_group_path(path) {
+        let mut group: CompatGroupInfo = serde_json::from_slice(data).map_err(|err| format!("parse IAM group failed: {err}"))?;
+        if group.update_at.is_none() {
+            group.update_at = Some(OffsetDateTime::now_utc());
+        }
+        return serde_json::to_vec(&group)
+            .map(Some)
+            .map_err(|err| format!("serialize IAM group failed: {err}"));
+    }
+
+    if is_policy_doc_path(path) {
+        let mut doc = PolicyDoc::try_from(data.to_vec()).map_err(|err| format!("parse IAM policy doc failed: {err}"))?;
+        if doc.create_date.is_none() {
+            doc.create_date = doc.update_date;
+        }
+        if doc.update_date.is_none() {
+            doc.update_date = doc.create_date;
+        }
+        return serde_json::to_vec(&doc)
+            .map(Some)
+            .map_err(|err| format!("serialize IAM policy doc failed: {err}"));
+    }
+
+    if is_policy_mapping_path(path) {
+        let mut mapped: CompatMappedPolicy =
+            serde_json::from_slice(data).map_err(|err| format!("parse IAM policy mapping failed: {err}"))?;
+        if mapped.update_at.is_none() {
+            mapped.update_at = Some(OffsetDateTime::now_utc());
+        }
+        return serde_json::to_vec(&mapped)
+            .map(Some)
+            .map_err(|err| format!("serialize IAM policy mapping failed: {err}"));
+    }
+
+    Ok(None)
+}
+
+fn is_identity_path(path: &str) -> bool {
+    (path.starts_with(IAM_USERS_PREFIX) || path.starts_with(IAM_SERVICE_ACCOUNTS_PREFIX) || path.starts_with(IAM_STS_PREFIX))
+        && path.ends_with("/identity.json")
+}
+
+fn is_group_path(path: &str) -> bool {
+    path.starts_with(IAM_GROUPS_PREFIX) && path.ends_with("/members.json")
+}
+
+fn is_policy_doc_path(path: &str) -> bool {
+    path.starts_with(IAM_POLICIES_PREFIX) && path.ends_with("/policy.json")
+}
+
+fn is_policy_mapping_path(path: &str) -> bool {
+    path.starts_with(IAM_POLICY_DB_PREFIX) && path.ends_with(".json")
+}
 
 /// Migrates bucket metadata from legacy format to RustFS.
 /// Uses list_bucket (from disk volumes) to get bucket names, since list_objects_v2 on the legacy
@@ -178,6 +308,17 @@ pub async fn try_migrate_iam_config<S: StorageAPI>(store: Arc<S>) {
                     continue;
                 }
             };
+            let data = match normalize_iam_config_blob(path, &data) {
+                Ok(Some(normalized)) => normalized,
+                Ok(None) => {
+                    debug!("skip unsupported IAM config path during migration: {path}");
+                    continue;
+                }
+                Err(e) => {
+                    warn!("skip IAM config migration due to incompatible format, path: {path}, err: {e}");
+                    continue;
+                }
+            };
             if let Err(e) = store
                 .put_object(RUSTFS_META_BUCKET, path, &mut PutObjReader::from_vec(data), &opts)
                 .await
@@ -197,5 +338,30 @@ pub async fn try_migrate_iam_config<S: StorageAPI>(store: Arc<S>) {
 
     if total_migrated > 0 {
         info!("IAM migration complete: {} object(s) migrated", total_migrated);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_iam_config_blob;
+
+    #[test]
+    fn test_normalize_policy_mapping_legacy_timestamp_and_fields() {
+        let path = "config/iam/policydb/users/alice.json";
+        let input = r#"{"version":1,"policies":"readwrite","update_at":"2026-03-09 02:22:44.998954 +00:00:00"}"#;
+
+        let output = normalize_iam_config_blob(path, input.as_bytes())
+            .expect("normalize should succeed")
+            .expect("path should be supported");
+
+        let v: serde_json::Value = serde_json::from_slice(&output).expect("output should be valid JSON");
+        assert_eq!(v.get("policy").and_then(|x| x.as_str()), Some("readwrite"));
+        assert!(v.get("policies").is_none(), "legacy field should be normalized");
+
+        let updated_at = v
+            .get("updatedAt")
+            .and_then(|x| x.as_str())
+            .expect("updatedAt should exist as string");
+        assert!(updated_at.contains('T'), "updatedAt should be RFC3339-like");
     }
 }
