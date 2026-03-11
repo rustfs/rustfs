@@ -375,6 +375,7 @@ impl SetDisks {
                                             till_offset,
                                             erasure.shard_size(),
                                             checksum_algo.clone(),
+                                            false,
                                         )
                                         .await
                                         {

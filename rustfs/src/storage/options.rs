@@ -164,6 +164,13 @@ pub async fn get_opts(
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
 
+    // Optionally skip per-shard bitrot hash verification on reads to save CPU.
+    // Background scanner still performs full integrity checks asynchronously.
+    opts.skip_verify_bitrot = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_GET_SKIP_BITROT_VERIFY,
+        rustfs_config::DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY,
+    );
+
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 
     Ok(opts)

@@ -568,6 +568,7 @@ impl SetDisks {
         disks: &[Option<DiskStore>],
         set_index: usize,
         pool_index: usize,
+        skip_verify_bitrot: bool,
     ) -> Result<()>
     where
         W: AsyncWrite + Send + Sync + Unpin + 'static,
@@ -659,6 +660,7 @@ impl SetDisks {
                     till_offset,
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,
+                    skip_verify_bitrot,
                 )
                 .await
                 {
