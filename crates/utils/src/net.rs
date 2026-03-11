@@ -165,7 +165,14 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
 }
 
 fn get_custom_dns_resolver() -> Option<Arc<DynDnsResolver>> {
-    CUSTOM_DNS_RESOLVER.read().ok().and_then(|guard| guard.clone())
+    match CUSTOM_DNS_RESOLVER.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            error!("CUSTOM_DNS_RESOLVER RwLock is poisoned; using resolver value despite poisoning");
+            let guard = poisoned.into_inner();
+            guard.clone()
+        }
+    }
 }
 
 fn has_custom_dns_resolver() -> bool {
