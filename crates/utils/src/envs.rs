@@ -324,11 +324,11 @@ pub fn get_env_opt_u64_with_aliases(key: &str, deprecated: &[&str]) -> Option<u6
     let (used_key, value) = resolve_env_with_aliases(key, deprecated)?;
     value
         .parse::<u64>()
-        .or_else(|_| {
+        .map_err(|_| {
             log_once(&format!("env_invalid_u64:{used_key}"), || {
                 format!("Invalid u64 value for {used_key}: {value}. Using default behavior.")
             });
-            Err(())
+            ()
         })
         .ok()
 }
