@@ -46,16 +46,18 @@ const LOCK_RETRY_MAX: Duration = Duration::from_secs(30);
 /// it takes precedence; otherwise the value is derived from the
 /// `RUSTFS_SCANNER_SPEED` preset.
 fn cycle_interval() -> Duration {
-    let scanner_start_delay_secs = rustfs_utils::get_env_opt_u64_with_aliases(
-        ENV_SCANNER_START_DELAY_SECS,
-        &[ENV_DATA_SCANNER_START_DELAY_SECS],
-    );
-
-    if let Some(secs) = scanner_start_delay_secs {
+    if let Some(secs) = scanner_start_delay_secs() {
         return Duration::from_secs(secs);
     }
     let speed_str = rustfs_utils::get_env_str(ENV_SCANNER_SPEED, DEFAULT_SCANNER_SPEED);
     ScannerSpeed::from_env_str(&speed_str).cycle_interval()
+}
+
+fn scanner_start_delay_secs() -> Option<u64> {
+    rustfs_utils::get_env_opt_u64_with_aliases(
+        ENV_SCANNER_START_DELAY_SECS,
+        &[ENV_DATA_SCANNER_START_DELAY_SECS],
+    )
 }
 
 /// Compute a randomized inter-cycle sleep.
