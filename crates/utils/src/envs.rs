@@ -310,6 +310,28 @@ pub fn get_env_u64(key: &str, default: u64) -> u64 {
     env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// Retrieve an environment variable as an unsigned 64-bit integer, returning `None` if not set or parsing fails.
+/// Deprecated aliases are also supported with warning logging.
+///
+/// #Parameters
+/// - `key`: The canonical environment variable key to look up.
+/// - `deprecated`: A list of deprecated keys kept for compatibility.
+///
+/// #Returns
+/// - `Option<u64>`: The parsed value if a key is found and valid, otherwise `None`.
+///
+pub fn get_env_opt_u64_with_aliases(key: &str, deprecated: &[&str]) -> Option<u64> {
+    let (used_key, value) = resolve_env_with_aliases(key, deprecated)?;
+    value
+        .parse::<u64>()
+        .map_err(|_| {
+            log_once(&format!("env_invalid_u64:{used_key}"), || {
+                format!("Invalid u64 value for {used_key}: {value}. Using default behavior.")
+            });
+        })
+        .ok()
+}
+
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
 ///
 /// #Parameters
