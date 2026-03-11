@@ -51,6 +51,11 @@ Current guidance:
   - `RUSTFS_ENABLE_HEAL` -> `RUSTFS_HEAL_ENABLED`
   - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` -> `RUSTFS_SCANNER_START_DELAY_SECS`
 
+## Scanner environment aliases
+
+- `RUSTFS_SCANNER_START_DELAY_SECS` (canonical)
+- `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
+
 ## 📄 License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

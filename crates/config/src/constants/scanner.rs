@@ -22,6 +22,7 @@ pub const ENV_SCANNER_START_DELAY_SECS: &str = "RUSTFS_SCANNER_START_DELAY_SECS"
 
 /// Deprecated compatibility alias for scanner start delay.
 /// Prefer `RUSTFS_SCANNER_START_DELAY_SECS`.
+#[deprecated(note = "Use RUSTFS_SCANNER_START_DELAY_SECS instead")]
 pub const ENV_DATA_SCANNER_START_DELAY_SECS: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
 /// Environment variable that selects the scanner speed preset.

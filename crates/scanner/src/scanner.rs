@@ -23,7 +23,6 @@ use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
 use rustfs_config::DEFAULT_SCANNER_SPEED;
-use rustfs_config::ENV_DATA_SCANNER_START_DELAY_SECS;
 use rustfs_config::ENV_SCANNER_SPEED;
 use rustfs_config::ENV_SCANNER_START_DELAY_SECS;
 use rustfs_config::ScannerSpeed;
@@ -40,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 const LOCK_RETRY_MAX: Duration = Duration::from_secs(30);
+const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
 /// Returns the base cycle interval. If `RUSTFS_SCANNER_START_DELAY_SECS`
 /// is set (or `RUSTFS_DATA_SCANNER_START_DELAY_SECS` as deprecated alias),
@@ -54,7 +54,7 @@ fn cycle_interval() -> Duration {
 }
 
 fn scanner_start_delay_secs() -> Option<u64> {
-    let deprecated = [ENV_DATA_SCANNER_START_DELAY_SECS];
+    let deprecated = [ENV_SCANNER_START_DELAY_SECS_DEPRECATED];
     rustfs_utils::get_env_opt_u64_with_aliases(ENV_SCANNER_START_DELAY_SECS, &deprecated)
 }
 
