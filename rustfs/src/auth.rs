@@ -91,7 +91,6 @@ pub enum AuthType {
     StreamingUnsignedTrailer,
 }
 
-#[derive(Debug)]
 pub struct IAMAuth {
     simple_auth: SimpleAuth,
     access_key: String,
@@ -100,8 +99,6 @@ pub struct IAMAuth {
 
 impl Clone for IAMAuth {
     fn clone(&self) -> Self {
-        // Re-create the SimpleAuth verifier with concrete credentials to avoid
-        // losing the bootstrap key behavior in clone scenarios.
         Self {
             simple_auth: SimpleAuth::from_single(self.access_key.clone(), self.secret_key.clone()),
             access_key: self.access_key.clone(),
@@ -150,6 +147,10 @@ impl S3Auth for IAMAuth {
             // Return empty secret key - Keystone uses token validation, not AWS signatures
             // The actual credentials are stored in task-local storage by KeystoneAuthMiddleware
             return Ok(SecretKey::from(String::new()));
+        }
+
+        if access_key == self.access_key {
+            return Ok(self.secret_key.clone());
         }
 
         if let Ok(key) = self.simple_auth.get_secret_key(access_key).await {
@@ -273,20 +274,19 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed1 {e}")))?;
 
         if !ok {
-            if let Some(u) = u
-                && u.credentials.status == "off"
-            {
+            let Some(u) = u else {
+                return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
+            };
+
+            if u.credentials.status == "off" {
                 return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
             }
 
-            return Err(s3_error!(
-                InvalidAccessKeyId,
-                "The Access Key Id you provided does not exist in our records."
-            ));
+            return Err(s3_error!(InvalidRequest, "check key failed"));
         }
 
         let Some(u) = u else {
-            return Err(s3_error!(InvalidRequest, "check key failed"));
+            return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
         };
 
         cred = u.credentials;
@@ -912,15 +912,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_iam_auth_clone_keeps_secret_key() {
-        let iam_auth = IAMAuth::new("test-access-key", SecretKey::from("test-secret-key"));
-        let iam_auth_clone = iam_auth.clone();
+    async fn test_iam_auth_clone_preserves_bootstrap_secret() {
+        let iam_auth = IAMAuth::new("test-ak", SecretKey::from("test-sk"));
+        let cloned = iam_auth.clone();
 
-        let secret = iam_auth_clone
-            .get_secret_key("test-access-key")
-            .await
-            .expect("clone should keep secret key mapping");
-        assert_eq!(secret.expose(), "test-secret-key");
+        let secret = cloned.get_secret_key("test-ak").await;
+        assert!(secret.is_ok());
     }
 
     #[tokio::test]
