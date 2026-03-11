@@ -47,3 +47,14 @@ data:
   RUSTFS_OBS_METRIC_ENDPOINT: ""
   RUSTFS_OBS_METRICS_EXPORT_ENABLED: "false"
   {{- end }}
+  {{- with .Values.config.rustfs.scanner }}
+    {{- if .speed }}
+  RUSTFS_SCANNER_SPEED: {{ .speed | quote }}
+    {{- end }}
+    {{- if .start_delay_secs }}
+  RUSTFS_DATA_SCANNER_START_DELAY_SECS: {{ .start_delay_secs | quote }}
+    {{- end }}
+    {{- if .idle_mode }}
+  RUSTFS_SCANNER_IDLE_MODE: {{ .idle_mode | quote }}
+    {{- end }}
+  {{- end }}
