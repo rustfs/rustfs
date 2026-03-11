@@ -55,7 +55,7 @@ impl Workers {
     pub async fn give(&self) {
         let mut available = self.available.lock().await;
         info!("worker give, {}", *available);
-        *available += 1; // Increase available slots
+        *available = (*available).saturating_add(1).min(self.limit); // avoid over-release beyond limit
         self.notify.notify_one(); // Notify a waiting task
     }
 
@@ -87,13 +87,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_workers() {
-        let workers = Arc::new(Workers::new(5).unwrap());
+        let workers = Workers::new(5).unwrap();
 
         for _ in 0..5 {
             let workers = workers.clone();
             tokio::spawn(async move {
                 workers.take().await;
-                sleep(Duration::from_secs(3)).await;
+                sleep(Duration::from_millis(50)).await;
+                workers.give().await;
             });
         }
 
@@ -101,10 +102,20 @@ mod tests {
             workers.give().await;
         }
         // Sleep: wait for spawn task started
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(20)).await;
         workers.wait().await;
-        if workers.available().await != workers.limit {
-            unreachable!();
-        }
+        assert_eq!(workers.available().await, workers.limit);
+    }
+
+    #[tokio::test]
+    async fn test_workers_over_release_is_clamped() {
+        let workers = Workers::new(2).unwrap();
+
+        workers.take().await;
+        workers.give().await;
+        workers.give().await;
+        workers.give().await;
+
+        assert_eq!(workers.available().await, 2);
     }
 }
