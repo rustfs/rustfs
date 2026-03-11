@@ -70,6 +70,7 @@ pub struct ObjectOptions {
     pub eval_metadata: Option<HashMap<String, String>>,
 
     pub want_checksum: Option<Checksum>,
+    pub skip_verify_bitrot: bool,
 }
 
 impl ObjectOptions {
