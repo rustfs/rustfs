@@ -28,10 +28,7 @@ pin_project! {
         shard_size: usize,
         buf: Vec<u8>,
         hash_buf: Vec<u8>,
-        // hash_read: usize,
-        // data_buf: Vec<u8>,
-        // data_read: usize,
-        // hash_checked: bool,
+        skip_verify: bool,
         id: Uuid,
     }
 }
@@ -41,7 +38,7 @@ where
     R: AsyncRead + Unpin + Send + Sync,
 {
     /// Create a new BitrotReader.
-    pub fn new(inner: R, shard_size: usize, algo: HashAlgorithm) -> Self {
+    pub fn new(inner: R, shard_size: usize, algo: HashAlgorithm, skip_verify: bool) -> Self {
         let hash_size = algo.size();
         Self {
             inner,
@@ -49,10 +46,7 @@ where
             shard_size,
             buf: Vec::new(),
             hash_buf: vec![0u8; hash_size],
-            // hash_read: 0,
-            // data_buf: Vec::new(),
-            // data_read: 0,
-            // hash_checked: false,
+            skip_verify,
             id: Uuid::new_v4(),
         }
     }
@@ -90,7 +84,7 @@ where
             data_len += n;
         }
 
-        if hash_size > 0 {
+        if hash_size > 0 && !self.skip_verify {
             let actual_hash = self.hash_algo.hash_encode(&out[..data_len]);
             if actual_hash.as_ref() != self.hash_buf.as_slice() {
                 error!("bitrot reader hash mismatch, id={} data_len={}, out_len={}", self.id, data_len, out.len());
@@ -388,7 +382,7 @@ mod tests {
         // Read
         let reader = bitrot_writer.into_inner();
         let reader = Cursor::new(reader.into_inner());
-        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256);
+        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256, false);
         let mut out = Vec::new();
         let mut n = 0;
         while n < data_size {
@@ -420,7 +414,7 @@ mod tests {
         let pos = written.len() - 1;
         written[pos] ^= 0xFF;
         let reader = Cursor::new(written);
-        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256);
+        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256, false);
 
         let count = data_size.div_ceil(shard_size);
 
@@ -464,7 +458,7 @@ mod tests {
 
         let reader = bitrot_writer.into_inner();
         let reader = Cursor::new(reader.into_inner());
-        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::None);
+        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::None, false);
         let mut out = Vec::new();
         let mut n = 0;
         while n < data_size {
