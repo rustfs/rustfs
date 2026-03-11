@@ -218,12 +218,12 @@ impl Monitor {
     }
 
     pub fn get_report(&self, select_bucket: impl Fn(&str) -> bool) -> BucketBandwidthReport {
-        let m_guard = self.m_lock.read().unwrap_or_else(|e| {
-            warn!("bucket monitor measurement rwlock read poisoned, recovering");
-            e.into_inner()
-        });
         let t_guard = self.t_lock.read().unwrap_or_else(|e| {
             warn!("bucket monitor throttle rwlock read poisoned, recovering");
+            e.into_inner()
+        });
+        let m_guard = self.m_lock.read().unwrap_or_else(|e| {
+            warn!("bucket monitor measurement rwlock read poisoned, recovering");
             e.into_inner()
         });
         let mut bucket_stats = HashMap::new();
