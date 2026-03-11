@@ -332,6 +332,7 @@ async fn run(config: config::Config) -> Result<()> {
         })?;
 
     ecconfig::init();
+    ecconfig::try_migrate_server_config(store.clone()).await;
 
     // // Initialize global configuration system
     let mut retry_count = 0;

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::config::{Config, GLOBAL_STORAGE_CLASS, storageclass};
-use crate::disk::RUSTFS_META_BUCKET;
+use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
@@ -22,7 +22,7 @@ use rustfs_utils::path::SLASH_SEPARATOR;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 pub const CONFIG_PREFIX: &str = "config";
 const CONFIG_FILE: &str = "config.json";
@@ -132,6 +132,81 @@ fn get_config_file() -> String {
     format!("{CONFIG_PREFIX}{SLASH_SEPARATOR}{CONFIG_FILE}")
 }
 
+fn normalize_server_config_blob(data: &[u8]) -> Result<Vec<u8>> {
+    let cfg = Config::unmarshal(data)?;
+    cfg.marshal()
+}
+
+fn is_object_not_found(err: &Error) -> bool {
+    *err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _))
+}
+
+pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {
+    let config_file = get_config_file();
+    match api
+        .get_object_info(RUSTFS_META_BUCKET, &config_file, &ObjectOptions::default())
+        .await
+    {
+        Ok(_) => {
+            debug!("server config already exists in RustFS metadata bucket, skip migration");
+            return;
+        }
+        Err(err) if is_object_not_found(&err) => {}
+        Err(err) => {
+            warn!("check target server config failed, skip migration: {:?}", err);
+            return;
+        }
+    }
+
+    let opts = ObjectOptions {
+        max_parity: true,
+        no_lock: true,
+        ..Default::default()
+    };
+
+    let mut rd = match api
+        .get_object_reader(MIGRATING_META_BUCKET, &config_file, None, HeaderMap::new(), &opts)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            if !is_object_not_found(&err) {
+                warn!("read legacy server config failed: {:?}", err);
+            }
+            return;
+        }
+    };
+
+    let data = match rd.read_all().await {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => {
+            debug!("legacy server config is empty, skip migration");
+            return;
+        }
+        Err(err) => {
+            warn!("read legacy server config body failed: {:?}", err);
+            return;
+        }
+    };
+
+    let normalized = match normalize_server_config_blob(&data) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!("legacy server config format is incompatible, skip migration: {:?}", err);
+            return;
+        }
+    };
+
+    match save_config(api, &config_file, normalized).await {
+        Ok(()) => {
+            info!("Migrated compatible server config from legacy metadata bucket");
+        }
+        Err(err) => {
+            warn!("write migrated server config failed: {:?}", err);
+        }
+    }
+}
+
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
 async fn handle_missing_config<S: StorageAPI>(api: Arc<S>, context: &str) -> Result<Config> {
     warn!("Configuration not found ({}): Start initializing new configuration", context);
@@ -227,4 +302,28 @@ async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_server_config_blob;
+    use crate::config::Config;
+
+    #[test]
+    fn test_normalize_server_config_accepts_legacy_hidden_if_empty_alias() {
+        let input = r#"{"storage_class":{"_":[{"key":"standard","value":"EC:2","hiddenIfEmpty":true}]}}"#;
+        let normalized = normalize_server_config_blob(input.as_bytes()).expect("normalize should succeed");
+        let cfg = Config::unmarshal(&normalized).expect("normalized config should be readable");
+        let kvs = cfg.get_value("storage_class", "_").expect("storage_class should exist");
+        assert!(kvs.0[0].hidden_if_empty);
+    }
+
+    #[test]
+    fn test_normalize_server_config_accepts_missing_hidden_if_empty() {
+        let input = r#"{"storage_class":{"_":[{"key":"standard","value":"EC:2"}]}}"#;
+        let normalized = normalize_server_config_blob(input.as_bytes()).expect("normalize should succeed");
+        let cfg = Config::unmarshal(&normalized).expect("normalized config should be readable");
+        let kvs = cfg.get_value("storage_class", "_").expect("storage_class should exist");
+        assert!(!kvs.0[0].hidden_if_empty);
+    }
 }
