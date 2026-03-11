@@ -96,20 +96,22 @@ pub fn sign_v2(
     let d = OffsetDateTime::now_utc();
     let d2 = d.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
 
+    {
+        let headers = req.headers_mut();
+        let need_default_date = headers.get("Date").and_then(|v| v.to_str().ok()).is_none_or(|v| v.is_empty());
+        if need_default_date {
+            headers.insert(
+                "Date",
+                d2.format(&format_description::well_known::Rfc2822)
+                    .unwrap()
+                    .to_string()
+                    .parse()
+                    .unwrap(),
+            );
+        }
+    }
     let string_to_sign = string_to_sign_v2(&req, virtual_host);
     let headers = req.headers_mut();
-
-    let need_default_date = headers.get("Date").and_then(|v| v.to_str().ok()).is_none_or(|v| v.is_empty());
-    if need_default_date {
-        headers.insert(
-            "Date",
-            d2.format(&format_description::well_known::Rfc2822)
-                .unwrap()
-                .to_string()
-                .parse()
-                .unwrap(),
-        );
-    }
 
     let auth_header = format!("{SIGN_V2_ALGORITHM} {access_key_id}:");
     let auth_header = format!(
@@ -301,5 +303,25 @@ mod tests {
         let mut buf = BytesMut::new();
         write_canonicalized_resource(&mut buf, &req, false);
         assert_eq!(String::from_utf8(buf.to_vec()).unwrap(), "/object?acl");
+    }
+
+    #[test]
+    fn test_sign_v2_signature_matches_injected_date() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+
+        let req = sign_v2(req, 0, "AKIAEXAMPLE", "SECRET", false);
+        let expected_string_to_sign = string_to_sign_v2(&req, false);
+        let expected_signature = base64_simd::URL_SAFE_NO_PAD.encode_to_string(hmac_sha1("SECRET", expected_string_to_sign));
+
+        assert_eq!(
+            req.headers().get("Authorization").unwrap().to_str().unwrap(),
+            format!("AWS AKIAEXAMPLE:{expected_signature}")
+        );
     }
 }
