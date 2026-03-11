@@ -96,11 +96,7 @@ pub(super) fn init_observability_http(
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME).to_owned();
     let use_stdout = config.use_stdout.unwrap_or(!is_production);
     let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
-    let sampler = if (0.0..1.0).contains(&sample_ratio) {
-        Sampler::TraceIdRatioBased(sample_ratio)
-    } else {
-        Sampler::AlwaysOn
-    };
+    let sampler = build_tracer_sampler(sample_ratio);
 
     // ── Endpoint resolution ───────────────────────────────────────────────────
     // Each signal may have a dedicated endpoint; if absent, fall back to the
@@ -239,6 +235,14 @@ fn build_tracer_provider(
     Ok(Some(provider))
 }
 
+fn build_tracer_sampler(sample_ratio: f64) -> Sampler {
+    if sample_ratio.is_finite() && (0.0..=1.0).contains(&sample_ratio) {
+        Sampler::TraceIdRatioBased(sample_ratio)
+    } else {
+        Sampler::AlwaysOn
+    }
+}
+
 /// Build an optional [`SdkMeterProvider`] for the given metrics endpoint.
 ///
 /// Returns `None` when the endpoint is empty or metric export is disabled.
@@ -359,4 +363,30 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
     PeriodicReader::builder(opentelemetry_stdout::MetricExporter::default())
         .with_interval(Duration::from_secs(interval))
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_tracer_sampler_uses_trace_ratio_for_valid_values() {
+        let sampler = build_tracer_sampler(0.0);
+        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+
+        let sampler = build_tracer_sampler(1.0);
+        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+
+        let sampler = build_tracer_sampler(0.5);
+        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+    }
+
+    #[test]
+    fn test_build_tracer_sampler_rejects_invalid_ratio_with_always_on() {
+        let sampler = build_tracer_sampler(-0.1);
+        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+
+        let sampler = build_tracer_sampler(1.2);
+        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+    }
 }
