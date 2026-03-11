@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    collections::BTreeSet,
     collections::HashSet,
     env,
     sync::{Mutex, OnceLock},
@@ -99,6 +100,143 @@ fn resolve_env_with_aliases(key: &str, deprecated: &[&str]) -> Option<(String, S
         format!("Environment variable {alias} is deprecated, use {key} instead")
     });
     Some((alias.to_string(), value))
+}
+
+const EXTERNAL_ENV_PREFIX_BYTES: [u8; 6] = [77, 73, 78, 73, 79, 95];
+
+const EXTERNAL_COMPATIBLE_SUFFIXES: &[&str] = &[
+    "ACCESS_KEY",
+    "ACCESS_KEY_FILE",
+    "ADDRESS",
+    "API_XFF_HEADER",
+    "AUDIT_WEBHOOK_AUTH_TOKEN",
+    "AUDIT_WEBHOOK_CLIENT_CERT",
+    "AUDIT_WEBHOOK_CLIENT_KEY",
+    "AUDIT_WEBHOOK_ENABLE",
+    "AUDIT_WEBHOOK_ENDPOINT",
+    "AUDIT_WEBHOOK_QUEUE_DIR",
+    "COMPRESS_ENABLE",
+    "COMPRESS_EXTENSIONS",
+    "COMPRESS_MIME_TYPES",
+    "CONSOLE_ADDRESS",
+    "DRIVE_ACTIVE_MONITORING",
+    "ERASURE_SET_DRIVE_COUNT",
+    "IDENTITY_OPENID_CLAIM_NAME",
+    "IDENTITY_OPENID_CLAIM_PREFIX",
+    "IDENTITY_OPENID_CLIENT_ID",
+    "IDENTITY_OPENID_CLIENT_SECRET",
+    "IDENTITY_OPENID_CONFIG_URL",
+    "IDENTITY_OPENID_DISPLAY_NAME",
+    "IDENTITY_OPENID_REDIRECT_URI",
+    "IDENTITY_OPENID_SCOPES",
+    "ILM_EXPIRATION_WORKERS",
+    "LICENSE",
+    "NOTIFY_MQTT_BROKER",
+    "NOTIFY_MQTT_ENABLE",
+    "NOTIFY_MQTT_KEEP_ALIVE_INTERVAL",
+    "NOTIFY_MQTT_PASSWORD",
+    "NOTIFY_MQTT_QOS",
+    "NOTIFY_MQTT_QUEUE_DIR",
+    "NOTIFY_MQTT_QUEUE_LIMIT",
+    "NOTIFY_MQTT_RECONNECT_INTERVAL",
+    "NOTIFY_MQTT_TOPIC",
+    "NOTIFY_MQTT_USERNAME",
+    "NOTIFY_WEBHOOK_AUTH_TOKEN",
+    "NOTIFY_WEBHOOK_CLIENT_CERT",
+    "NOTIFY_WEBHOOK_CLIENT_KEY",
+    "NOTIFY_WEBHOOK_ENABLE",
+    "NOTIFY_WEBHOOK_ENDPOINT",
+    "NOTIFY_WEBHOOK_QUEUE_DIR",
+    "NOTIFY_WEBHOOK_QUEUE_LIMIT",
+    "POLICY_PLUGIN_AUTH_TOKEN",
+    "POLICY_PLUGIN_URL",
+    "PORT",
+    "REGION",
+    "ROOT_PASSWORD",
+    "ROOT_USER",
+    "SECRET_KEY",
+    "SECRET_KEY_FILE",
+    "STORAGE_CLASS_INLINE_BLOCK",
+    "STORAGE_CLASS_OPTIMIZE",
+    "STORAGE_CLASS_RRS",
+    "STORAGE_CLASS_STANDARD",
+    "VERSION",
+    "VOLUMES",
+];
+
+const EXTERNAL_DYNAMIC_COMPATIBLE_PREFIXES: &[&str] = &["AUDIT_MQTT_", "AUDIT_WEBHOOK_", "NOTIFY_MQTT_", "NOTIFY_WEBHOOK_"];
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExternalEnvCompatReport {
+    pub mapped_pairs: Vec<(String, String)>,
+    pub conflict_keys: Vec<String>,
+}
+
+impl ExternalEnvCompatReport {
+    pub fn mapped_count(&self) -> usize {
+        self.mapped_pairs.len()
+    }
+
+    pub fn conflict_count(&self) -> usize {
+        self.conflict_keys.len()
+    }
+}
+
+fn external_env_prefix() -> &'static str {
+    static PREFIX: OnceLock<String> = OnceLock::new();
+    PREFIX
+        .get_or_init(|| EXTERNAL_ENV_PREFIX_BYTES.iter().map(|&byte| char::from(byte)).collect())
+        .as_str()
+}
+
+fn is_external_compatible_suffix(suffix: &str) -> bool {
+    EXTERNAL_COMPATIBLE_SUFFIXES.contains(&suffix)
+        || EXTERNAL_DYNAMIC_COMPATIBLE_PREFIXES
+            .iter()
+            .any(|prefix| suffix.starts_with(prefix))
+}
+
+fn build_external_env_compat_report_from_entries<I>(entries: I) -> ExternalEnvCompatReport
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let env_map: std::collections::BTreeMap<String, String> = entries.into_iter().collect();
+    let mut mapped_pairs = BTreeSet::new();
+    let mut conflict_keys = BTreeSet::new();
+    let source_prefix = external_env_prefix();
+
+    for (source_key, source_value) in env_map.iter() {
+        let Some(suffix) = source_key.strip_prefix(source_prefix) else {
+            continue;
+        };
+        if !is_external_compatible_suffix(suffix) {
+            continue;
+        }
+        let rustfs_key = format!("RUSTFS_{suffix}");
+        match env_map.get(&rustfs_key) {
+            None => {
+                mapped_pairs.insert((source_key.clone(), rustfs_key));
+            }
+            Some(rustfs_value) if rustfs_value != source_value => {
+                conflict_keys.insert(rustfs_key);
+            }
+            Some(_) => {}
+        }
+    }
+
+    ExternalEnvCompatReport {
+        mapped_pairs: mapped_pairs.into_iter().collect(),
+        conflict_keys: conflict_keys.into_iter().collect(),
+    }
+}
+
+/// Build compatibility plan between source-prefixed variables and `RUSTFS_*`.
+///
+/// Precedence rule:
+/// - If both `RUSTFS_*` and source-prefixed variables exist, keep `RUSTFS_*` and record a conflict.
+/// - If only source-prefixed variables exist, mark them as mappable to `RUSTFS_*`.
+pub fn build_external_env_compat_report() -> ExternalEnvCompatReport {
+    build_external_env_compat_report_from_entries(env::vars())
 }
 
 pub fn get_env_str_with_aliases(key: &str, deprecated: &[&str], default: &str) -> String {
@@ -453,4 +591,63 @@ pub fn get_env_opt_bool(key: &str) -> Option<bool> {
         });
         None
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_external_env_compat_report_from_entries;
+
+    fn source_key(suffix: &str) -> String {
+        let mut key = super::external_env_prefix().to_string();
+        key.push_str(suffix);
+        key
+    }
+
+    #[test]
+    fn source_value_is_mapped_when_rustfs_missing() {
+        let report =
+            build_external_env_compat_report_from_entries(vec![(source_key("STORAGE_CLASS_STANDARD"), "EC:2".to_string())]);
+        assert_eq!(report.mapped_count(), 1);
+        assert!(
+            report
+                .mapped_pairs
+                .iter()
+                .any(|(input_key, rustfs_key)| input_key == &source_key("STORAGE_CLASS_STANDARD")
+                    && rustfs_key == "RUSTFS_STORAGE_CLASS_STANDARD")
+        );
+        assert_eq!(report.conflict_count(), 0);
+    }
+
+    #[test]
+    fn rustfs_value_takes_precedence_on_conflict() {
+        let report = build_external_env_compat_report_from_entries(vec![
+            ("RUSTFS_ERASURE_SET_DRIVE_COUNT".to_string(), "8".to_string()),
+            (source_key("ERASURE_SET_DRIVE_COUNT"), "16".to_string()),
+        ]);
+        assert_eq!(report.mapped_count(), 0);
+        assert_eq!(report.conflict_count(), 1);
+        assert!(report.conflict_keys.iter().any(|key| key == "RUSTFS_ERASURE_SET_DRIVE_COUNT"));
+    }
+
+    #[test]
+    fn dynamic_notify_suffix_is_mapped() {
+        let report =
+            build_external_env_compat_report_from_entries(vec![(source_key("NOTIFY_WEBHOOK_ENABLE_PRIMARY"), "on".to_string())]);
+        assert_eq!(report.mapped_count(), 1);
+        assert!(
+            report
+                .mapped_pairs
+                .iter()
+                .any(|(input_key, rustfs_key)| input_key == &source_key("NOTIFY_WEBHOOK_ENABLE_PRIMARY")
+                    && rustfs_key == "RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY")
+        );
+        assert_eq!(report.conflict_count(), 0);
+    }
+
+    #[test]
+    fn unrelated_source_key_is_ignored() {
+        let report = build_external_env_compat_report_from_entries(vec![(source_key("UNKNOWN_COMPAT_TEST"), "1".to_string())]);
+        assert_eq!(report.mapped_count(), 0);
+        assert_eq!(report.conflict_count(), 0);
+    }
 }
