@@ -276,24 +276,27 @@ pub fn extract_target_container(sync_to: &str) -> SwiftResult<String> {
 /// Generate sync signature for authentication
 ///
 /// Uses HMAC-SHA1 of the request path with shared secret
-pub fn generate_sync_signature(path: &str, key: &str) -> String {
+pub fn generate_sync_signature(path: &str, key: &str) -> SwiftResult<String> {
     use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
 
     type HmacSha1 = Hmac<Sha1>;
 
-    let mut mac = HmacSha1::new_from_slice(key.as_bytes()).unwrap_or_else(|_| panic!("HMAC key error"));
+    let mut mac = HmacSha1::new_from_slice(key.as_bytes())
+        .map_err(|_| SwiftError::BadRequest("Invalid X-Container-Sync-Key".to_string()))?;
 
     mac.update(path.as_bytes());
 
     let result = mac.finalize();
-    hex::encode(result.into_bytes())
+    Ok(hex::encode(result.into_bytes()))
 }
 
 /// Verify sync signature
 pub fn verify_sync_signature(path: &str, key: &str, signature: &str) -> bool {
-    let expected = generate_sync_signature(path, key);
-    expected == signature
+    match generate_sync_signature(path, key) {
+        Ok(expected) => expected == signature,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -454,15 +457,15 @@ mod tests {
         let path = "/v1/AUTH_test/container/object.txt";
         let key = "mysecretkey";
 
-        let sig1 = generate_sync_signature(path, key);
-        let sig2 = generate_sync_signature(path, key);
+        let sig1 = generate_sync_signature(path, key).expect("failed to generate sync signature");
+        let sig2 = generate_sync_signature(path, key).expect("failed to generate sync signature");
 
         // Signature should be deterministic
         assert_eq!(sig1, sig2);
         assert_eq!(sig1.len(), 40); // SHA1 = 20 bytes = 40 hex chars
 
         // Different key produces different signature
-        let sig3 = generate_sync_signature(path, "differentkey");
+        let sig3 = generate_sync_signature(path, "differentkey").expect("failed to generate sync signature");
         assert_ne!(sig1, sig3);
     }
 
@@ -471,7 +474,7 @@ mod tests {
         let path = "/v1/AUTH_test/container/object.txt";
         let key = "mysecretkey";
 
-        let signature = generate_sync_signature(path, key);
+        let signature = generate_sync_signature(path, key).expect("failed to generate sync signature");
         assert!(verify_sync_signature(path, key, &signature));
 
         // Wrong signature

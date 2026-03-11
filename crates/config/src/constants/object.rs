@@ -167,3 +167,16 @@ pub const DEFAULT_OBJECT_CACHE_TTI_SECS: u64 = 120;
 ///
 /// Default is set to 5 hits.
 pub const DEFAULT_OBJECT_HOT_MIN_HITS_TO_EXTEND: usize = 5;
+
+/// Skip bitrot hash verification on GetObject reads.
+///
+/// When enabled, GetObject reads skip the per-shard hash
+/// computation and comparison, reducing CPU usage on the read path.
+/// The background scanner still performs full integrity verification.
+/// Does not affect writes, heals, or scanner operations.
+///
+/// Default is false (verify on every read, matching pre-existing behavior).
+pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITROT_VERIFY";
+
+/// Default: bitrot verification is enabled on GetObject reads (do not skip).
+pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
