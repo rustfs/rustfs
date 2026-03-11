@@ -189,8 +189,6 @@ impl ScannerIO for ECStore {
                             if let Err(e) = updates.send(dui).await {
                                 error!("Failed to send data usage info: {}", e);
                             }
-                            has_sent_once = true;
-                            last_update = merged_last_update;
                         }
                         break;
                     }
