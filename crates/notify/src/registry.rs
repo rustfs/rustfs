@@ -293,10 +293,17 @@ impl TargetRegistry {
                 }
             }
 
-            let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
-                return Err(TargetError::ServerNotInitialized(
-                    "Failed to save target configuration: server storage not initialized".to_string(),
-                ));
+            let store = match rustfs_ecstore::global::new_object_layer_fn() {
+                Some(s) => s,
+                None => {
+                    warn!(
+                        "Object store not available at notification init; skipping config persistence. \
+                         {} target(s) active in memory.",
+                        successful_targets.len()
+                    );
+                    info!(count = successful_targets.len(), "All target processing completed");
+                    return Ok(successful_targets);
+                }
             };
 
             match rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
