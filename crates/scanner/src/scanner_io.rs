@@ -160,7 +160,8 @@ impl ScannerIO for ECStore {
 
         let all_buckets_clone = all_buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>();
         tokio::spawn(async move {
-            let mut last_update = SystemTime::now();
+            let mut last_update = SystemTime::UNIX_EPOCH;
+            let mut has_sent_once = false;
 
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
             loop {
@@ -182,11 +183,14 @@ impl ScannerIO for ECStore {
                             all_merged.merge(result);
                         }
 
-                        if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update {
+                        let merged_last_update = all_merged.info.last_update.unwrap_or(SystemTime::UNIX_EPOCH);
+                        if all_merged.root().is_some() && (!has_sent_once || merged_last_update > last_update) {
                             let dui = all_merged.dui(&all_merged.info.name, &all_buckets_clone);
                             if let Err(e) = updates.send(dui).await {
                                 error!("Failed to send data usage info: {}", e);
                             }
+                            has_sent_once = true;
+                            last_update = merged_last_update;
                         }
                         break;
                     }
@@ -200,12 +204,14 @@ impl ScannerIO for ECStore {
                             all_merged.merge(result);
                         }
 
-                        if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update {
+                        let merged_last_update = all_merged.info.last_update.unwrap_or(SystemTime::UNIX_EPOCH);
+                        if all_merged.root().is_some() && (!has_sent_once || merged_last_update > last_update) {
                             let dui = all_merged.dui(&all_merged.info.name, &all_buckets_clone);
                             if let Err(e) = updates.send(dui).await {
                                 error!("Failed to send data usage info: {}", e);
                             }
-                            last_update = all_merged.info.last_update.unwrap();
+                            has_sent_once = true;
+                            last_update = merged_last_update;
                         }
                     }
                 }
