@@ -322,12 +322,15 @@ pub fn get_env_u64(key: &str, default: u64) -> u64 {
 ///
 pub fn get_env_opt_u64_with_aliases(key: &str, deprecated: &[&str]) -> Option<u64> {
     let (used_key, value) = resolve_env_with_aliases(key, deprecated)?;
-    value.parse::<u64>().or_else(|_| {
-        log_once(&format!("env_invalid_u64:{used_key}"), || {
-            format!("Invalid u64 value for {used_key}: {value}. Using default behavior.")
-        });
-        Err(())
-    }).ok()
+    value
+        .parse::<u64>()
+        .or_else(|_| {
+            log_once(&format!("env_invalid_u64:{used_key}"), || {
+                format!("Invalid u64 value for {used_key}: {value}. Using default behavior.")
+            });
+            Err(())
+        })
+        .ok()
 }
 
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
