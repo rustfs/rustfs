@@ -13,7 +13,6 @@
 //  limitations under the License.
 
 use crate::app::context::resolve_server_config;
-use rustfs_config::DEFAULT_DELIMITER;
 use tracing::{error, info, instrument, warn};
 
 fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
@@ -60,30 +59,10 @@ pub(crate) async fn init_event_notifier() {
 
     info!(
         target: "rustfs::main::init_event_notifier",
-        "Global server configuration loaded successfully"
-    );
-    // 2. Check if at least one notify subsystem exists in the configuration, and skip only when neither is present.
-    let mqtt_configured = server_config
-        .get_value(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)
-        .is_some();
-    let webhook_configured = server_config
-        .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
-        .is_some();
-
-    if !mqtt_configured && !webhook_configured {
-        info!(
-            target: "rustfs::main::init_event_notifier",
-            "'notify' subsystem not configured, skipping event notifier initialization."
-        );
-        return;
-    }
-
-    info!(
-        target: "rustfs::main::init_event_notifier",
         "Event notifier configuration found, proceeding with initialization."
     );
 
-    // 3. Initialize the notification system asynchronously with a global configuration
+    // 2. Initialize the notification system asynchronously with a global configuration
     // Use direct await for better error handling and faster initialization
     if let Err(e) = rustfs_notify::initialize(server_config).await {
         error!("Failed to initialize event notifier system: {}", e);
