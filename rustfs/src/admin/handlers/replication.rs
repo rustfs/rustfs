@@ -21,11 +21,16 @@ use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_ecstore::bucket::bandwidth::reader::BucketOptions as ReaderBucketOptions;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
+use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
+use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
+use rustfs_ecstore::bucket::replication::replication_state::BucketStats;
 use rustfs_ecstore::bucket::target::BucketTarget;
-use rustfs_ecstore::global::global_rustfs_port;
+use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::global::{get_global_bucket_monitor, global_rustfs_port};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -98,12 +103,65 @@ pub struct GetReplicationMetricsHandler {}
 #[async_trait::async_trait]
 impl Operation for GetReplicationMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        error!("GetReplicationMetricsHandler");
+        validate_replication_admin_request(&req, AdminAction::GetReplicationMetricsAction).await?;
+
         let queries = extract_query_params(&req.uri);
-        if let Some(bucket) = queries.get("bucket") {
-            error!("get bucket:{} metrics", bucket);
+
+        let Some(bucket) = queries.get("bucket") else {
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
+        };
+
+        if bucket.is_empty() {
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
-        Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))))
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        if let Err(err) = get_replication_config(bucket).await {
+            error!("get_replication_config err {:?}", err);
+            if err == StorageError::ConfigNotFound {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::ReplicationConfigurationNotFoundError,
+                    "replication not found".to_string(),
+                ));
+            }
+            return Err(ApiError::from(err).into());
+        }
+
+        // TODO cluster cache
+        // In actual implementation, statistics would be obtained from cluster
+        // This is simplified to get from local cache
+        let mut bucket_stats = match GLOBAL_REPLICATION_STATS.get() {
+            Some(s) => s.get_latest_replication_stats(bucket).await,
+            None => BucketStats::default(),
+        };
+
+        if let Some(monitor) = get_global_bucket_monitor() {
+            let bw_report = monitor.get_report(|name| name == bucket);
+            for (arn, stat) in bucket_stats.replication_stats.stats.iter_mut() {
+                let key = ReaderBucketOptions {
+                    name: bucket.to_string(),
+                    replication_arn: arn.clone(),
+                };
+                if let Some(bw) = bw_report.bucket_stats.get(&key) {
+                    stat.bandwidth_limit_bytes_per_sec = bw.limit_bytes_per_sec;
+                    stat.current_bandwidth_bytes_per_sec = bw.current_bandwidth_bytes_per_sec;
+                }
+            }
+        }
+
+        let data = serde_json::to_vec(&bucket_stats.replication_stats)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "serialize failed"))?;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
 }
 

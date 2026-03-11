@@ -14,10 +14,15 @@
 
 use crate::bucket::bandwidth::reader::BucketOptions;
 use ratelimit::{Error as RatelimitError, Ratelimiter};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// BETA_BUCKET is the weight used to calculate exponential moving average
+const BETA_BUCKET: f64 = 0.1;
 
 #[derive(Clone)]
 pub struct BucketThrottle {
@@ -71,25 +76,186 @@ impl BucketThrottle {
     }
 }
 
+#[derive(Debug)]
+pub struct BucketMeasurement {
+    bytes_since_last_window: AtomicU64,
+    start_time: Mutex<Option<Instant>>,
+    exp_moving_avg: Mutex<f64>,
+}
+
+impl BucketMeasurement {
+    pub fn new(init_time: Instant) -> Self {
+        Self {
+            bytes_since_last_window: AtomicU64::new(0),
+            start_time: Mutex::new(Some(init_time)),
+            exp_moving_avg: Mutex::new(0.0),
+        }
+    }
+
+    pub fn increment_bytes(&self, bytes: u64) {
+        self.bytes_since_last_window.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn update_exponential_moving_average(&self, end_time: Instant) {
+        let mut start_time = self.start_time.lock().unwrap_or_else(|e| {
+            warn!("bucket measurement start_time mutex poisoned, recovering");
+            e.into_inner()
+        });
+        let previous_start = *start_time;
+        *start_time = Some(end_time);
+
+        let Some(prev_start) = previous_start else {
+            return;
+        };
+
+        if prev_start > end_time {
+            return;
+        }
+
+        let duration = end_time.duration_since(prev_start);
+        if duration.is_zero() {
+            return;
+        }
+
+        let bytes_since_last_window = self.bytes_since_last_window.swap(0, Ordering::Relaxed);
+        let increment = bytes_since_last_window as f64 / duration.as_secs_f64();
+
+        let mut exp_moving_avg = self.exp_moving_avg.lock().unwrap_or_else(|e| {
+            warn!("bucket measurement exp_moving_avg mutex poisoned, recovering");
+            e.into_inner()
+        });
+
+        if *exp_moving_avg == 0.0 {
+            *exp_moving_avg = increment;
+            return;
+        }
+
+        *exp_moving_avg = exponential_moving_average(BETA_BUCKET, *exp_moving_avg, increment);
+    }
+
+    pub fn get_exp_moving_avg_bytes_per_second(&self) -> f64 {
+        *self.exp_moving_avg.lock().unwrap_or_else(|e| {
+            warn!("bucket measurement exp_moving_avg mutex poisoned, recovering");
+            e.into_inner()
+        })
+    }
+}
+
+fn exponential_moving_average(beta: f64, previous_avg: f64, increment_avg: f64) -> f64 {
+    (1f64 - beta) * increment_avg + beta * previous_avg
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BandwidthDetails {
+    pub limit_bytes_per_sec: i64,
+    pub current_bandwidth_bytes_per_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketBandwidthReport {
+    pub bucket_stats: HashMap<BucketOptions, BandwidthDetails>,
+}
+
 pub struct Monitor {
     t_lock: RwLock<HashMap<BucketOptions, BucketThrottle>>,
+    m_lock: RwLock<HashMap<BucketOptions, BucketMeasurement>>,
     pub node_count: u64,
 }
 
 impl Monitor {
     pub fn new(num_nodes: u64) -> Arc<Self> {
         let node_cnt = num_nodes.max(1);
-        Arc::new(Monitor {
+        let m = Arc::new(Monitor {
             t_lock: RwLock::new(HashMap::new()),
+            m_lock: RwLock::new(HashMap::new()),
             node_count: node_cnt,
-        })
+        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let weak = Arc::downgrade(&m);
+            handle.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(2));
+                loop {
+                    interval.tick().await;
+                    let Some(monitor) = weak.upgrade() else { break };
+                    monitor.update_moving_avg();
+                }
+            });
+        }
+        m
+    }
+
+    pub fn init_measurement(&self, opts: &BucketOptions) {
+        let mut guard = self.m_lock.write().unwrap_or_else(|e| {
+            warn!("bucket monitor measurement rwlock write poisoned, recovering");
+            e.into_inner()
+        });
+        guard
+            .entry(opts.clone())
+            .or_insert_with(|| BucketMeasurement::new(Instant::now()));
+    }
+
+    pub fn update_measurement(&self, opts: &BucketOptions, bytes: u64) {
+        self.m_lock
+            .write()
+            .unwrap_or_else(|e| {
+                warn!("bucket monitor measurement rwlock write poisoned, recovering");
+                e.into_inner()
+            })
+            .entry(opts.clone())
+            .or_insert_with(|| BucketMeasurement::new(Instant::now()))
+            .increment_bytes(bytes);
+    }
+
+    pub fn update_moving_avg(&self) {
+        let now = Instant::now();
+        let guard = self.m_lock.read().unwrap_or_else(|e| {
+            warn!("bucket monitor measurement rwlock read poisoned, recovering");
+            e.into_inner()
+        });
+        for measurement in guard.values() {
+            measurement.update_exponential_moving_average(now);
+        }
+    }
+
+    pub fn get_report(&self, select_bucket: impl Fn(&str) -> bool) -> BucketBandwidthReport {
+        let m_guard = self.m_lock.read().unwrap_or_else(|e| {
+            warn!("bucket monitor measurement rwlock read poisoned, recovering");
+            e.into_inner()
+        });
+        let t_guard = self.t_lock.read().unwrap_or_else(|e| {
+            warn!("bucket monitor throttle rwlock read poisoned, recovering");
+            e.into_inner()
+        });
+        let mut bucket_stats = HashMap::new();
+        for (opts, measurement) in m_guard.iter() {
+            if !select_bucket(&opts.name) {
+                continue;
+            }
+            if let Some(throttle) = t_guard.get(opts) {
+                bucket_stats.insert(
+                    opts.clone(),
+                    BandwidthDetails {
+                        limit_bytes_per_sec: throttle.node_bandwidth_per_sec * self.node_count as i64,
+                        current_bandwidth_bytes_per_sec: measurement.get_exp_moving_avg_bytes_per_second(),
+                    },
+                );
+            }
+        }
+        BucketBandwidthReport { bucket_stats }
     }
 
     pub fn delete_bucket(&self, bucket: &str) {
         self.t_lock
             .write()
             .unwrap_or_else(|e| {
-                warn!("bucket monitor rwlock write poisoned, recovering");
+                warn!("bucket monitor throttle rwlock write poisoned, recovering");
+                e.into_inner()
+            })
+            .retain(|opts, _| opts.name != bucket);
+        self.m_lock
+            .write()
+            .unwrap_or_else(|e| {
+                warn!("bucket monitor measurement rwlock write poisoned, recovering");
                 e.into_inner()
             })
             .retain(|opts, _| opts.name != bucket);
@@ -103,7 +269,14 @@ impl Monitor {
         self.t_lock
             .write()
             .unwrap_or_else(|e| {
-                warn!("bucket monitor rwlock write poisoned, recovering");
+                warn!("bucket monitor throttle rwlock write poisoned, recovering");
+                e.into_inner()
+            })
+            .remove(&opts);
+        self.m_lock
+            .write()
+            .unwrap_or_else(|e| {
+                warn!("bucket monitor measurement rwlock write poisoned, recovering");
                 e.into_inner()
             })
             .remove(&opts);
@@ -113,7 +286,7 @@ impl Monitor {
         self.t_lock
             .read()
             .unwrap_or_else(|e| {
-                warn!("bucket monitor rwlock read poisoned, recovering");
+                warn!("bucket monitor throttle rwlock read poisoned, recovering");
                 e.into_inner()
             })
             .get(opts)
@@ -160,7 +333,7 @@ impl Monitor {
         self.t_lock
             .write()
             .unwrap_or_else(|e| {
-                warn!("bucket monitor rwlock write poisoned, recovering");
+                warn!("bucket monitor throttle rwlock write poisoned, recovering");
                 e.into_inner()
             })
             .insert(opts, throttle);
@@ -174,7 +347,7 @@ impl Monitor {
         self.t_lock
             .read()
             .unwrap_or_else(|e| {
-                warn!("bucket monitor rwlock read poisoned, recovering");
+                warn!("bucket monitor throttle rwlock read poisoned, recovering");
                 e.into_inner()
             })
             .contains_key(&opt)
@@ -184,6 +357,7 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[test]
     fn test_set_and_get_throttle_with_node_split() {
@@ -317,5 +491,28 @@ mod tests {
         let t2 = monitor.throttle(&opts).expect("throttle should exist after update");
         assert_eq!(t2.burst(), 500);
         assert_eq!(t2.node_bandwidth_per_sec, 500);
+    }
+
+    #[test]
+    fn test_bucket_measurement_recovers_from_poisoned_mutexes() {
+        let measurement = BucketMeasurement::new(Instant::now());
+
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = measurement.start_time.lock().unwrap();
+            panic!("poison start_time mutex");
+        }));
+        measurement.increment_bytes(64);
+        measurement.update_exponential_moving_average(Instant::now() + Duration::from_secs(1));
+
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = measurement.exp_moving_avg.lock().unwrap();
+            panic!("poison exp_moving_avg mutex");
+        }));
+        measurement.increment_bytes(32);
+        measurement.update_exponential_moving_average(Instant::now() + Duration::from_secs(2));
+
+        let value = measurement.get_exp_moving_avg_bytes_per_second();
+        assert!(value.is_finite());
+        assert!(value >= 0.0);
     }
 }

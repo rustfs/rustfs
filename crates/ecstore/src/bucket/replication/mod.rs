@@ -16,7 +16,7 @@ mod config;
 pub mod datatypes;
 mod replication_pool;
 mod replication_resyncer;
-mod replication_state;
+pub mod replication_state;
 mod rule;
 
 pub use config::*;
