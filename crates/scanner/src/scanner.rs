@@ -258,6 +258,11 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
         }
     }
 
+    if !ctx.is_cancelled() {
+        // Preserve previous behavior: run one cycle immediately after lock acquisition.
+        run_data_scanner_cycle(&ctx, &storeapi, &mut cycle_info).await;
+    }
+
     loop {
         if ctx.is_cancelled() {
             break;
