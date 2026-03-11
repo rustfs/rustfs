@@ -54,10 +54,8 @@ fn cycle_interval() -> Duration {
 }
 
 fn scanner_start_delay_secs() -> Option<u64> {
-    rustfs_utils::get_env_opt_u64_with_aliases(
-        ENV_SCANNER_START_DELAY_SECS,
-        &[ENV_DATA_SCANNER_START_DELAY_SECS],
-    )
+    let deprecated = [ENV_DATA_SCANNER_START_DELAY_SECS];
+    rustfs_utils::get_env_opt_u64_with_aliases(ENV_SCANNER_START_DELAY_SECS, &deprecated)
 }
 
 /// Compute a randomized inter-cycle sleep.
