@@ -67,8 +67,9 @@ use rustfs_iam::{init_iam_sys, init_oidc_sys};
 use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
-use rustfs_utils::{get_env_bool_with_aliases, net::parse_and_resolve_address};
+use rustfs_utils::{build_external_env_compat_report, get_env_bool_with_aliases, net::parse_and_resolve_address};
 use std::io::{Error, Result};
+use std::process::Command;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -77,6 +78,7 @@ const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
 const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
+const ENV_EXTERNAL_COMPAT_BOOTSTRAPPED: &str = "_RUSTFS_EXTERNAL_PREFIX_COMPAT_BOOTSTRAPPED";
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
@@ -95,6 +97,10 @@ static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
+    if let Err(err) = bootstrap_external_prefix_compat() {
+        eprintln!("[WARN] Failed to bootstrap external-prefix compatibility: {err}");
+    }
+
     let runtime = server::tokio_runtime_builder()
         .build()
         .expect("Failed to build Tokio runtime");
@@ -105,6 +111,47 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+fn bootstrap_external_prefix_compat() -> Result<()> {
+    if std::env::var_os(ENV_EXTERNAL_COMPAT_BOOTSTRAPPED).is_some() {
+        return Ok(());
+    }
+
+    let env_compat_report = build_external_env_compat_report();
+    if env_compat_report.conflict_count() > 0 {
+        // RUSTFS_* is the canonical namespace in this codebase, so on key conflicts we keep RUSTFS_*
+        // to preserve explicit user/operator overrides and avoid changing existing runtime behavior.
+        eprintln!(
+            "[WARN] Found {} source/RUSTFS_ conflict(s), keeping RUSTFS_ values: {}",
+            env_compat_report.conflict_count(),
+            env_compat_report.conflict_keys.join(", ")
+        );
+    }
+
+    if env_compat_report.mapped_count() == 0 {
+        return Ok(());
+    }
+
+    eprintln!(
+        "[INFO] Applying external-prefix compatibility for {} variable(s) and re-executing process.",
+        env_compat_report.mapped_count()
+    );
+
+    // Re-exec ensures the child process starts with RUSTFS_* already present in its environment,
+    // so all subsequent config/env reads (including early startup paths) observe consistent keys.
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(std::env::args_os().skip(1));
+    cmd.env(ENV_EXTERNAL_COMPAT_BOOTSTRAPPED, "1");
+    for (source_key, rustfs_key) in env_compat_report.mapped_pairs {
+        if let Some(value) = std::env::var_os(source_key.as_str()) {
+            cmd.env(rustfs_key, value);
+        }
+    }
+
+    let status = cmd.status()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 async fn async_main() -> Result<()> {
     // Parse the obtained parameters
     let config = config::Config::parse()?;
