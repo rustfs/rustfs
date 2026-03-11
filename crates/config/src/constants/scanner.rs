@@ -12,17 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Environment variable name that specifies the data scanner start delay in seconds.
+/// Canonical environment variable name that specifies the data scanner start delay in seconds.
 /// - Purpose: Define the delay between data scanner operations.
 /// - Unit: seconds (u64).
 /// - Valid values: any positive integer.
 /// - Semantics: This delay controls how frequently the data scanner checks for and processes data; shorter delays lead to more responsive scanning but may increase system load.
-/// - Example: `export RUSTFS_DATA_SCANNER_START_DELAY_SECS=10`
-/// - Note: Choose an appropriate delay that balances scanning responsiveness with overall system performance.
+/// - Example: `export RUSTFS_SCANNER_START_DELAY_SECS=10`
+pub const ENV_SCANNER_START_DELAY_SECS: &str = "RUSTFS_SCANNER_START_DELAY_SECS";
+
+/// Deprecated compatibility alias for scanner start delay.
+/// Prefer `RUSTFS_SCANNER_START_DELAY_SECS`.
 pub const ENV_DATA_SCANNER_START_DELAY_SECS: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
 /// Default data scanner start delay in seconds if not specified in the environment variable.
 /// - Value: 10 seconds.
-/// - Rationale: This default interval provides a reasonable balance between scanning responsiveness and system load for most deployments.
-/// - Adjustments: Users may modify this value via the `RUSTFS_DATA_SCANNER_START_DELAY_SECS` environment variable based on their specific scanning requirements and system performance.
+/// - Rationale: This default interval provides a reasonable balance between scanning responsiveness and overall system load for most deployments.
+/// - Adjustments: Users may modify this value via the `RUSTFS_SCANNER_START_DELAY_SECS` environment variable
+///   (or `RUSTFS_DATA_SCANNER_START_DELAY_SECS`, deprecated alias) based on their specific scanning requirements and
+///   system performance.
 pub const DEFAULT_DATA_SCANNER_START_DELAY_SECS: u64 = 60;

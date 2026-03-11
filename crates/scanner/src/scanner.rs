@@ -21,7 +21,11 @@ use crate::{DataUsageInfo, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
-use rustfs_config::{DEFAULT_DATA_SCANNER_START_DELAY_SECS, ENV_DATA_SCANNER_START_DELAY_SECS};
+use rustfs_config::{
+    DEFAULT_DATA_SCANNER_START_DELAY_SECS,
+    ENV_DATA_SCANNER_START_DELAY_SECS,
+    ENV_SCANNER_START_DELAY_SECS,
+};
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
@@ -35,26 +39,42 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 fn data_scanner_start_delay() -> Duration {
-    let secs = rustfs_utils::get_env_u64(ENV_DATA_SCANNER_START_DELAY_SECS, DEFAULT_DATA_SCANNER_START_DELAY_SECS);
+    let secs = get_env_u64_with_aliases(
+        ENV_SCANNER_START_DELAY_SECS,
+        &[ENV_DATA_SCANNER_START_DELAY_SECS],
+        DEFAULT_DATA_SCANNER_START_DELAY_SECS,
+    );
     Duration::from_secs(secs)
+}
+
+fn get_env_u64_with_aliases(key: &str, deprecated: &[&str], default: u64) -> u64 {
+    rustfs_utils::get_env_str_with_aliases(key, deprecated, &default.to_string())
+        .parse::<u64>()
+        .unwrap_or(default)
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     let ctx_clone = ctx.clone();
     let storeapi_clone = storeapi.clone();
     tokio::spawn(async move {
-        let sleep_time = Duration::from_secs(rand::random::<u64>() % 5);
-        tokio::time::sleep(sleep_time).await;
+        // Randomized startup delay helps stagger scanner startup across nodes.
+        let startup_delay = Duration::from_secs(rand::random::<u64>() % 5);
+        let run_interval = data_scanner_start_delay();
+
+        tokio::select! {
+            _ = ctx_clone.cancelled() => return,
+            _ = tokio::time::sleep(startup_delay) => {}
+        }
 
         loop {
-            if ctx_clone.is_cancelled() {
-                break;
+            tokio::select! {
+                _ = ctx_clone.cancelled() => break,
+                _ = tokio::time::sleep(run_interval) => {
+                    if let Err(e) = run_data_scanner(ctx_clone.clone(), storeapi_clone.clone()).await {
+                        error!("Failed to run data scanner: {e}");
+                    }
+                }
             }
-
-            if let Err(e) = run_data_scanner(ctx_clone.clone(), storeapi_clone.clone()).await {
-                error!("Failed to run data scanner: {e}");
-            }
-            tokio::time::sleep(data_scanner_start_delay()).await;
         }
     });
 }
