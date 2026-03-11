@@ -14,10 +14,14 @@
 
 use std::time::Duration;
 
-/// Environment variable name that specifies the data scanner start delay in seconds.
+/// Canonical environment variable name that specifies the data scanner start delay in seconds.
 /// If set, this overrides the cycle interval derived from `RUSTFS_SCANNER_SPEED`.
 /// - Unit: seconds (u64).
-/// - Example: `export RUSTFS_DATA_SCANNER_START_DELAY_SECS=10`
+/// - Example: `export RUSTFS_SCANNER_START_DELAY_SECS=10`
+pub const ENV_SCANNER_START_DELAY_SECS: &str = "RUSTFS_SCANNER_START_DELAY_SECS";
+
+/// Deprecated compatibility alias for scanner start delay.
+/// Prefer `RUSTFS_SCANNER_START_DELAY_SECS`.
 pub const ENV_DATA_SCANNER_START_DELAY_SECS: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
 /// Environment variable that selects the scanner speed preset.

@@ -22,7 +22,7 @@ use crate::{DataUsageInfo, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
-use rustfs_config::{DEFAULT_SCANNER_SPEED, ENV_DATA_SCANNER_START_DELAY_SECS, ENV_SCANNER_SPEED, ScannerSpeed};
+use rustfs_config::{DEFAULT_SCANNER_SPEED, ENV_DATA_SCANNER_START_DELAY_SECS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS, ScannerSpeed};
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
@@ -39,11 +39,17 @@ use tracing::{debug, error, info, instrument, warn};
 /// is set, it takes precedence; otherwise the value is derived from the
 /// `RUSTFS_SCANNER_SPEED` preset.
 fn cycle_interval() -> Duration {
-    if let Some(secs) = rustfs_utils::get_env_opt_u64(ENV_DATA_SCANNER_START_DELAY_SECS) {
+    if let Some(secs) = scanner_start_delay_secs() {
         return Duration::from_secs(secs);
     }
     let speed_str = rustfs_utils::get_env_str(ENV_SCANNER_SPEED, DEFAULT_SCANNER_SPEED);
     ScannerSpeed::from_env_str(&speed_str).cycle_interval()
+}
+
+fn scanner_start_delay_secs() -> Option<u64> {
+    rustfs_utils::get_env_str_with_aliases(ENV_SCANNER_START_DELAY_SECS, &[ENV_DATA_SCANNER_START_DELAY_SECS], "")
+        .parse::<u64>()
+        .ok()
 }
 
 /// Compute a randomized inter-cycle sleep.
