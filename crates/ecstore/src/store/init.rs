@@ -265,6 +265,7 @@ impl ECStore {
         init_background_expiry(self.clone()).await;
 
         TransitionState::init(self.clone()).await;
+        crate::tier::tier::try_migrate_tiering_config(self.clone()).await;
 
         if let Err(err) = GLOBAL_TierConfigMgr.write().await.init(self.clone()).await {
             info!("TierConfigMgr init error: {}", err);
