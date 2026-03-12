@@ -135,7 +135,7 @@ mod tests {
         create_log_file(&dir, "app.log.2024-01-02", 1024)?;
         create_log_file(&dir, "other.log", 512)?; // different prefix
 
-        let cleaner = make_cleaner(dir.clone(), 1, 512);
+        let cleaner = make_cleaner(dir.clone(), 1, 1500);
         let (deleted, _) = cleaner.cleanup()?;
 
         // "other.log" must not be counted or deleted.
