@@ -1349,23 +1349,15 @@ mod tests {
     #[test]
     fn tls_path_unset_returns_none() {
         let result = temp_env::with_var_unset(rustfs_config::ENV_RUSTFS_TLS_PATH, || load_root_store_from_tls_path());
-        assert!(
-            result.is_none(),
-            "expected None when RUSTFS_TLS_PATH is unset, but got a root store"
-        );
+        assert!(result.is_none(), "expected None when RUSTFS_TLS_PATH is unset, but got a root store");
     }
 
     /// When RUSTFS_TLS_PATH is set to an empty string, `load_root_store_from_tls_path` must
     /// return `None` to avoid accidentally trusting a CA bundle in the current directory.
     #[test]
     fn tls_path_empty_returns_none() {
-        let result = temp_env::with_var(rustfs_config::ENV_RUSTFS_TLS_PATH, Some(""), || {
-            load_root_store_from_tls_path()
-        });
-        assert!(
-            result.is_none(),
-            "expected None when RUSTFS_TLS_PATH is empty, but got a root store"
-        );
+        let result = temp_env::with_var(rustfs_config::ENV_RUSTFS_TLS_PATH, Some(""), || load_root_store_from_tls_path());
+        assert!(result.is_none(), "expected None when RUSTFS_TLS_PATH is empty, but got a root store");
     }
 
     /// Installing the rustls crypto provider when one is already set must not panic or return

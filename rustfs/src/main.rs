@@ -67,6 +67,7 @@ use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
 use rustfs_utils::{get_env_bool_with_aliases, net::parse_and_resolve_address};
+use rustls::crypto::aws_lc_rs::default_provider;
 use std::io::{Error, Result};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -141,6 +142,11 @@ async fn async_main() -> Result<()> {
     // Initialize trusted proxies system
     rustfs_trusted_proxies::init();
 
+    // Make sure to use a modern encryption suite
+    if default_provider().install_default().is_err() {
+        // A crypto provider is already installed (e.g. by the host process); this is fine.
+        debug!("rustls crypto provider already installed, skipping aws-lc-rs default install");
+    }
     // Initialize TLS if a certificate path is provided
     if let Some(tls_path) = &config.tls_path {
         match init_cert(tls_path).await {

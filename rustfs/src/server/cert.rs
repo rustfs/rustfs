@@ -102,8 +102,6 @@ pub(crate) async fn init_cert(tls_path: &str) -> Result<(), RustFSError> {
         info!("No TLS path configured; skipping certificate initialization");
         return Ok(());
     }
-    // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let tls_dir = PathBuf::from(tls_path);
 
