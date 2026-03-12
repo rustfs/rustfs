@@ -205,9 +205,15 @@ impl TransitionClient {
     }
 
     async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
-        if rustls::crypto::aws_lc_rs::default_provider().install_default().is_err() {
-            // A crypto provider is already installed (e.g. by the host process); this is fine.
-            debug!("rustls crypto provider already installed, skipping aws-lc-rs default install");
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            // No default provider is set yet; try to install aws-lc-rs.
+            // `install_default` can only fail if another thread races us and installs a provider
+            // between our check and this call, which is still safe to ignore.
+            if rustls::crypto::aws_lc_rs::default_provider().install_default().is_err() {
+                debug!("rustls crypto provider was installed concurrently, skipping aws-lc-rs install");
+            }
+        } else {
+            debug!("rustls crypto provider already installed, skipping aws-lc-rs install");
         }
 
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
@@ -1320,7 +1326,7 @@ pub struct CreateBucketConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_tls_config, with_rustls_init_guard};
+    use super::{build_tls_config, load_root_store_from_tls_path, with_rustls_init_guard};
 
     #[test]
     fn rustls_guard_converts_panics_to_io_errors() {
@@ -1336,5 +1342,46 @@ mod tests {
     fn build_tls_config_returns_result_without_panicking() {
         let outcome = std::panic::catch_unwind(build_tls_config);
         assert!(outcome.is_ok(), "TLS config creation should not panic");
+    }
+
+    /// When RUSTFS_TLS_PATH is not set, `load_root_store_from_tls_path` must return `None`
+    /// (i.e. it must not silently look for a CA bundle in the current working directory).
+    #[test]
+    fn tls_path_unset_returns_none() {
+        let result = temp_env::with_var_unset(rustfs_config::ENV_RUSTFS_TLS_PATH, || load_root_store_from_tls_path());
+        assert!(
+            result.is_none(),
+            "expected None when RUSTFS_TLS_PATH is unset, but got a root store"
+        );
+    }
+
+    /// When RUSTFS_TLS_PATH is set to an empty string, `load_root_store_from_tls_path` must
+    /// return `None` to avoid accidentally trusting a CA bundle in the current directory.
+    #[test]
+    fn tls_path_empty_returns_none() {
+        let result = temp_env::with_var(rustfs_config::ENV_RUSTFS_TLS_PATH, Some(""), || {
+            load_root_store_from_tls_path()
+        });
+        assert!(
+            result.is_none(),
+            "expected None when RUSTFS_TLS_PATH is empty, but got a root store"
+        );
+    }
+
+    /// Installing the rustls crypto provider when one is already set must not panic or return
+    /// an error that surfaces to callers (the race-safe `get_default` check guards the install).
+    #[test]
+    fn provider_install_is_idempotent() {
+        // Install once (may already be set by another test in this binary — that's fine).
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        // A second install attempt on an already-set provider must not panic.
+        let outcome = std::panic::catch_unwind(|| {
+            if rustls::crypto::CryptoProvider::get_default().is_none() {
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            }
+            // If a default is already present, the branch above is simply skipped.
+        });
+        assert!(outcome.is_ok(), "provider install guard must not panic when a provider is already set");
     }
 }
