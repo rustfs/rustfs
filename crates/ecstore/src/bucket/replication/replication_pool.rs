@@ -56,8 +56,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
-use tracing::warn;
+use tracing::{info, instrument, warn};
 
 // Worker limits
 pub const WORKER_MAX_LIMIT: usize = 500;
@@ -796,6 +795,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
     }
 
     /// Load bucket replication resync statuses into memory
+    #[instrument(skip(cancellation_token))]
     async fn load_resync(self: Arc<Self>, buckets: &[String], cancellation_token: CancellationToken) -> Result<(), EcstoreError> {
         // TODO: add leader_lock
         // Make sure only one node running resync on the cluster

@@ -13,6 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Defines the EventName enum which represents the various S3 event types that can trigger notifications.
+//! This enum includes both specific event types (e.g., ObjectCreated:Put) and aggregate types (e.g., ObjectCreated:*). Each variant has methods to expand into its constituent event types and to compute a bitmask for efficient filtering.
+//! The EventName enum is used in the event notification system to determine which events should trigger notifications based on the configured rules.
+//!
+//! @Deprecated: This module is currently not fully implemented and serves as a placeholder for future development of the event notification system. The EventName enum and its associated methods are defined, but the actual logic for handling events and sending notifications is not yet implemented.
+
 #[derive(Default, Clone)]
 pub enum EventName {
     ObjectAccessedGet,

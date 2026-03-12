@@ -41,5 +41,20 @@ data:
   RUSTFS_TLS_KEYLOG: "1"
   RUSTFS_TLS_PATH: "/opt/tls"
   {{- end }}
-  # RUSTFS_MTLS_CLIENT_CERT: "/opt/tls/client_cert.pem"
-  # RUSTFS_MTLS_CLIENT_KEY: "/opt/tls/client_key.pem"
+  {{- if .Values.config.rustfs.metrics.enabled }}
+  RUSTFS_OBS_METRIC_ENDPOINT: {{ .Values.config.rustfs.metrics.endpoint | quote }}
+  {{- else }}
+  RUSTFS_OBS_METRIC_ENDPOINT: ""
+  RUSTFS_OBS_METRICS_EXPORT_ENABLED: "false"
+  {{- end }}
+  {{- with .Values.config.rustfs.scanner }}
+    {{- if .speed }}
+  RUSTFS_SCANNER_SPEED: {{ .speed | quote }}
+    {{- end }}
+    {{- if .start_delay_secs }}
+  RUSTFS_SCANNER_START_DELAY_SECS: {{ .start_delay_secs | quote }}
+    {{- end }}
+    {{- if .idle_mode }}
+  RUSTFS_SCANNER_IDLE_MODE: {{ .idle_mode | quote }}
+    {{- end }}
+  {{- end }}

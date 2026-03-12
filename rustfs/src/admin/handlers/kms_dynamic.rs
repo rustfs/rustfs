@@ -30,7 +30,7 @@ use rustfs_kms::{
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 /// Path to store KMS configuration in the cluster metadata
 const KMS_CONFIG_PATH: &str = "config/kms_config.json";
@@ -43,6 +43,7 @@ fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceMa
 }
 
 /// Save KMS configuration to cluster storage
+#[instrument(skip(config))]
 async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
     let Some(store) = new_object_layer_fn() else {
         return Err("Storage layer not initialized".to_string());
@@ -59,6 +60,7 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
 }
 
 /// Load KMS configuration from cluster storage
+#[instrument]
 pub async fn load_kms_config() -> Option<KmsConfig> {
     let Some(store) = new_object_layer_fn() else {
         warn!("Storage layer not initialized, cannot load KMS config");

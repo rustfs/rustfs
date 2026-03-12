@@ -66,6 +66,7 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY_DOCKERHUB: rustfs/rustfs
   REGISTRY_GHCR: ghcr.io/${{ github.repository }}
+  REGISTRY_QUAY: quay.io/${{ secrets.QUAY_USERNAME }}/rustfs
   DOCKER_PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
@@ -162,14 +163,7 @@ jobs:
                 if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                   build_type="prerelease"
                   is_prerelease=true
-                  # TODO: Temporary change - currently allows alpha versions to also create latest tags
-                  # After the version is stable, you need to remove the following line and restore the original logic (latest is created only for stable versions)
-                  if [[ "$version" == *"alpha"* ]]; then
-                    create_latest=true
-                     echo "🧪 Building Docker image for prerelease: $version (temporarily allowing creation of latest tag)"
-                  else
-                    echo "🧪 Building Docker image for prerelease: $version"
-                  fi
+                  echo "🧪 Building Docker image for prerelease: $version"
                 else
                   build_type="release"
                   create_latest=true
@@ -215,14 +209,7 @@ jobs:
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
                 build_type="prerelease"
                 is_prerelease=true
-                # TODO: Temporary change - currently allows alpha versions to also create latest tags
-                # After the version is stable, you need to remove the if block below and restore the original logic.
-                if [[ "$input_version" == *"alpha"* ]]; then
-                  create_latest=true
-                   echo "🧪 Building with prerelease version: $input_version (temporarily allowing creation of latest tag)"
-                else
-                  echo "🧪 Building with prerelease version: $input_version"
-                fi
+                echo "🧪 Building with prerelease version: $input_version"
                 ;;
               # Release versions (match after prereleases, more general)
               v[0-9]*|[0-9]*.*.*)
@@ -287,12 +274,19 @@ jobs:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # - name: Login to GitHub Container Registry
-      #   uses: docker/login-action@v3
-      #   with:
-      #     registry: ghcr.io
-      #     username: ${{ github.actor }}
-      #     password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PASSWORD }}
+
+      - name: Login to Quay.io
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -338,14 +332,15 @@ jobs:
 
           # Generate tags based on build type
           # Only support release and prerelease builds (no development builds)
-          TAGS="${{ env.REGISTRY_DOCKERHUB }}:${VERSION}${VARIANT_SUFFIX}"
+          TAG_BASE="${VERSION}${VARIANT_SUFFIX}"
+          TAGS="${{ env.REGISTRY_DOCKERHUB }}:$TAG_BASE,${{ env.REGISTRY_GHCR }}:$TAG_BASE,${{ env.REGISTRY_QUAY }}:$TAG_BASE"
 
           # Add channel tags for prereleases and latest for stable
           if [[ "$CREATE_LATEST" == "true" ]]; then
             # TODO: Temporary change - the current alpha version will also create the latest tag
             # After the version is stabilized, the logic here remains unchanged, but the upstream CREATE_LATEST setting needs to be restored.
             # Stable release (and temporary alpha versions)
-            TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest${VARIANT_SUFFIX}"
+            TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest${VARIANT_SUFFIX},${{ env.REGISTRY_GHCR }}:latest${VARIANT_SUFFIX},${{ env.REGISTRY_QUAY }}:latest${VARIANT_SUFFIX}"
           elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Prerelease channel tags (alpha, beta, rc)
             if [[ "$VERSION" == *"alpha"* ]]; then
@@ -357,7 +352,7 @@ jobs:
             fi
 
             if [[ -n "$CHANNEL" ]]; then
-              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}${VARIANT_SUFFIX}"
+              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}${VARIANT_SUFFIX},${{ env.REGISTRY_GHCR }}:${CHANNEL}${VARIANT_SUFFIX},${{ env.REGISTRY_QUAY }}:${CHANNEL}${VARIANT_SUFFIX}"
             fi
           fi
 
@@ -441,10 +436,8 @@ jobs:
             "prerelease")
               echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
               echo "⚠️  This is a prerelease image - use with caution"
-              # TODO: Temporary change - alpha versions currently create the latest tag
-              # After the version is stable, you need to restore the following prompt information
-              if [[ "$VERSION" == *"alpha"* ]] && [[ "$CREATE_LATEST" == "true" ]]; then
-                echo "🏷️  Latest tag has been created for alpha version (temporary measures)"
+              if [[ "$CREATE_LATEST" == "true" ]]; then
+                echo "🏷️  Latest tag has been explicitly created for prerelease"
               else
                 echo "🚫 Latest tag NOT created for prerelease"
               fi

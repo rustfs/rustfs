@@ -43,6 +43,7 @@ use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResu
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
+use rustfs_s3_common::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
@@ -145,8 +146,11 @@ impl DefaultMultipartUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper =
-            OperationHelper::new(&req, EventName::ObjectCreatedCompleteMultipartUpload, "s3:CompleteMultipartUpload");
+        let mut helper = OperationHelper::new(
+            &req,
+            EventName::ObjectCreatedCompleteMultipartUpload,
+            S3Operation::CompleteMultipartUpload,
+        );
         let input = req.input;
         let CompleteMultipartUploadInput {
             multipart_upload,
@@ -425,7 +429,7 @@ impl DefaultMultipartUsecase {
             let _ = context.object_store();
         }
 
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:CreateMultipartUpload");
+        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::CreateMultipartUpload);
         let CreateMultipartUploadInput {
             bucket,
             key,

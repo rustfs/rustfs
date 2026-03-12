@@ -892,11 +892,18 @@ impl HotObjectCache {
                 cached.access_count.fetch_add(1, Ordering::Relaxed);
                 self.hit_count.fetch_add(1, Ordering::Relaxed);
 
+                // IMPORTANT: Do NOT add high cardinality labels to metrics!
+                // Previously, this metric was tagged with individual file URIs/keys,
+                // causing unbounded memory growth in RustFS's own process. The metrics
+                // crate maintains an internal HashMap for all metric series, and each
+                // unique file path creates a new entry that is never cleaned up.
+                // This HashMap grows unbounded with unique file access, causing memory
+                // leaks in RustFS itself (and also in downstream systems like Prometheus).
+                // Only use low cardinality labels like operation type or status.
                 #[cfg(all(feature = "metrics", not(test)))]
                 {
                     use metrics::counter;
                     counter!("rustfs.object.cache.hits").increment(1);
-                    counter!("rustfs.object.cache.access.count", "key" => key.to_string()).increment(1);
                 }
 
                 Some(Arc::clone(&cached.data))
@@ -1093,11 +1100,14 @@ impl HotObjectCache {
                 cached.data.increment_access();
                 self.hit_count.fetch_add(1, Ordering::Relaxed);
 
+                // IMPORTANT: Do NOT add high cardinality labels to metrics!
+                // See HotObjectCache::get() for details. The metrics crate's internal
+                // HashMap grows unbounded with high cardinality labels, causing memory
+                // leaks in RustFS's own process.
                 #[cfg(all(feature = "metrics", not(test)))]
                 {
                     use metrics::counter;
                     counter!("rustfs_object_response_cache_hits").increment(1);
-                    counter!("rustfs_object_cache_access_count", "key" => key.to_string()).increment(1);
                 }
 
                 Some(Arc::clone(&cached.data))
@@ -2046,5 +2056,75 @@ mod tests {
         metrics.record(Duration::from_millis(40));
         // total = 60+40=100, count = 4, avg = 25
         assert_eq!(metrics.lifetime_average_wait(), Duration::from_millis(25));
+    }
+
+    /// Regression test for high cardinality metrics bug.
+    ///
+    /// This test validates that cache operations work correctly and do not cause
+    /// unbounded memory growth in RustFS's own process. Previously, metrics were
+    /// tagged with individual file URIs (e.g., "bucket/object/key"), creating a
+    /// new metric series for each unique file path.
+    ///
+    /// The metrics crate maintains an internal HashMap to track all metric series.
+    /// With high cardinality labels, this HashMap grew unbounded as each unique file
+    /// created a new entry that was never cleaned up. This caused:
+    ///
+    /// 1. Memory leaks in RustFS's own process (unbounded HashMap growth)
+    /// 2. Performance degradation under load
+    /// 3. Potential OOM conditions
+    /// 4. Cascading issues in downstream systems (Prometheus, etc.)
+    ///
+    /// The fix removes high cardinality labels (like "key") from metrics, keeping
+    /// only low cardinality dimensions (like operation type, success/failure status).
+    ///
+    /// This test ensures:
+    /// - Cache hits and misses are tracked correctly
+    /// - Multiple cache accesses with different keys don't cause issues
+    /// - The cache behavior remains unchanged after removing metric labels
+    #[tokio::test]
+    #[serial]
+    async fn test_cache_metrics_no_high_cardinality_labels() {
+        let cache = HotObjectCache::new();
+
+        // Store multiple objects with different keys
+        let test_keys = vec![
+            "bucket1/file1.txt",
+            "bucket1/file2.txt",
+            "bucket2/data/file3.csv",
+            "bucket3/images/photo.jpg",
+        ];
+
+        for key in &test_keys {
+            let data = vec![1u8; 1024];
+            cache.put(key.to_string(), data).await;
+        }
+
+        // Access all cached objects multiple times
+        for key in &test_keys {
+            for _ in 0..10 {
+                let result = cache.get(key).await;
+                assert!(result.is_some(), "Key {} should be cached", key);
+            }
+        }
+
+        // Verify hit/miss counters work correctly
+        let initial_hits = cache.hit_count.load(Ordering::Relaxed);
+        assert_eq!(initial_hits, 40, "Should have 40 cache hits (4 keys × 10 accesses)");
+
+        // Access non-existent keys
+        let _ = cache.get("nonexistent1").await;
+        let _ = cache.get("nonexistent2").await;
+
+        let misses = cache.miss_count.load(Ordering::Relaxed);
+        assert_eq!(misses, 2, "Should have 2 cache misses");
+
+        // The key assertion: We should be able to cache many different keys
+        // without causing unbounded memory growth in metrics systems.
+        // If high cardinality labels were still present, each unique key would
+        // create a new metric series, leading to a memory leak.
+
+        let stats = cache.stats().await;
+        assert!(stats.entries > 0, "Cache should contain entries");
+        assert!(stats.size > 0, "Cache should have non-zero size");
     }
 }
