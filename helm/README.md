@@ -33,7 +33,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.metrics.enabled | bool | `false` | Toggle metrics export. |
 | config.rustfs.metrics.endpoint | string | `""` | Dedicated metrics endpoint. |
 | config.rustfs.scanner.speed | string | `""` | Scanner speed preset: `fastest`, `fast`, `default`, `slow`, `slowest` |
-| config.rustfs.scanner.start_delay_secs | string | `""` | Override scanner cycle interval in seconds with `RUSTFS_DATA_SCANNER_START_DELAY_SECS` |
+| config.rustfs.scanner.start_delay_secs | string | `""` | Override scanner cycle interval in seconds with `RUSTFS_SCANNER_START_DELAY_SECS` |
 | config.rustfs.scanner.idle_mode | string | `""` | Override scanner idle throttling flag (`RUSTFS_SCANNER_IDLE_MODE`) |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
