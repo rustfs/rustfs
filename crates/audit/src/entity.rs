@@ -14,7 +14,7 @@
 
 use chrono::{DateTime, Utc};
 use hashbrown::HashMap;
-use rustfs_targets::EventName;
+use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

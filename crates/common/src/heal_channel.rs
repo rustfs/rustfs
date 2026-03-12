@@ -296,12 +296,13 @@ type HealResponseSender = broadcast::Sender<HealChannelResponse>;
 static GLOBAL_HEAL_RESPONSE_SENDER: OnceLock<HealResponseSender> = OnceLock::new();
 
 /// Initialize global heal channel
-pub fn init_heal_channel() -> HealChannelReceiver {
+pub fn init_heal_channel() -> Result<HealChannelReceiver, &'static str> {
     let (tx, rx) = mpsc::unbounded_channel();
-    GLOBAL_HEAL_CHANNEL_SENDER
-        .set(tx)
-        .expect("Heal channel sender already initialized");
-    rx
+    if GLOBAL_HEAL_CHANNEL_SENDER.set(tx).is_ok() {
+        Ok(rx)
+    } else {
+        Err("Heal channel sender already initialized")
+    }
 }
 
 /// Get global heal channel sender

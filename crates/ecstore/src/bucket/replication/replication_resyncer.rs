@@ -27,7 +27,6 @@ use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 use crate::config::com::save_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
-use crate::event::name::EventName;
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::get_global_bucket_monitor;
@@ -42,6 +41,10 @@ use aws_smithy_types::body::SdkBody;
 use byteorder::ByteOrder;
 use futures::future::join_all;
 use futures::stream::StreamExt;
+use headers::{
+    AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_SERVER_SIDE_ENCRYPTION,
+    AMZ_STORAGE_CLASS, AMZ_TAG_COUNT, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LANGUAGE, CONTENT_TYPE,
+};
 use http::HeaderMap;
 use http_body::Frame;
 use http_body_util::StreamBody;
@@ -52,6 +55,7 @@ use rustfs_filemeta::{
     ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
+use rustfs_s3_common::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
     SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
@@ -80,7 +84,7 @@ use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 pub(crate) const REPLICATION_DIR: &str = ".replication";
 pub(crate) const RESYNC_FILE_NAME: &str = "resync.bin";
@@ -501,6 +505,7 @@ impl ReplicationResyncer {
         // TODO: Metrics
     }
 
+    #[instrument(skip(cancellation_token, storage))]
     pub async fn resync_bucket<S: StorageAPI>(
         self: Arc<Self>,
         cancellation_token: CancellationToken,
@@ -776,7 +781,7 @@ impl ReplicationResyncer {
                 return;
             }
 
-            let worker_idx = sip_hash(&roi.name, RESYNC_WORKER_COUNT, &DEFAULT_SIP_HASH_KEY) as usize;
+            let worker_idx = sip_hash(&roi.name, RESYNC_WORKER_COUNT, &DEFAULT_SIP_HASH_KEY);
 
             if let Err(err) = worker_txs[worker_idx].send(roi).await {
                 error!("Failed to send object info to worker: {}", err);
@@ -795,6 +800,10 @@ impl ReplicationResyncer {
         self.resync_bucket_mark_status(ResyncStatusType::ResyncCompleted, opts.clone(), storage.clone())
             .await;
     }
+}
+
+fn heal_should_use_check_replicate_delete(oi: &ObjectInfo) -> bool {
+    oi.delete_marker || (!oi.replication_status.is_empty() && oi.replication_status != ReplicationStatusType::Failed)
 }
 
 pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationConfig) -> ReplicateObjectInfo {
@@ -824,7 +833,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         }
     }
 
-    let dsc = if oi.delete_marker || !oi.replication_status.is_empty() {
+    let dsc = if heal_should_use_check_replicate_delete(&oi) {
         check_replicate_delete(
             oi.bucket.as_str(),
             &ObjectToDelete {
@@ -1277,7 +1286,7 @@ pub async fn check_replicate_delete(
 }
 
 /// Check if the user-defined metadata contains SSEC encryption headers
-fn is_ssec_encrypted(user_defined: &std::collections::HashMap<String, String>) -> bool {
+fn is_ssec_encrypted(user_defined: &HashMap<String, String>) -> bool {
     user_defined.contains_key(SSEC_ALGORITHM_HEADER)
         || user_defined.contains_key(SSEC_KEY_HEADER)
         || user_defined.contains_key(SSEC_KEY_MD5_HEADER)
@@ -1406,7 +1415,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         Ok(None) => {
             warn!("No replication config found for bucket: {}", bucket);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1425,7 +1434,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         Err(err) => {
             warn!("replication config for bucket: {} error: {}", bucket, err);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1458,7 +1467,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
                 bucket, dobj.target_arn, err
             );
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1486,7 +1495,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
                 bucket, dobj.delete_object.object_name, e
             );
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1511,7 +1520,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
                 bucket, dobj.delete_object.object_name, e
             );
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1552,7 +1561,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(&bucket, &tgt_entry.arn).await else {
             warn!("failed to get target for bucket:{:?}, arn:{:?}", &bucket, &tgt_entry.arn);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1583,7 +1592,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
             Err(e) => {
                 error!("replicate_delete task failed: {}", e);
                 send_event(EventArgs {
-                    event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                    event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
                         bucket: bucket.clone(),
@@ -1636,9 +1645,9 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
     }
 
     let event_name = if replication_status == ReplicationStatusType::Completed {
-        EventName::ObjectReplicationComplete.as_ref().to_string()
+        EventName::ObjectReplicationComplete.to_string()
     } else {
-        EventName::ObjectReplicationFailed.as_ref().to_string()
+        EventName::ObjectReplicationFailed.to_string()
     };
 
     match storage
@@ -1691,7 +1700,7 @@ async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectRe
         Ok(None) => {
             warn!("replicate force-delete: no replication config for bucket:{}", bucket);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1707,7 +1716,7 @@ async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectRe
         Err(err) => {
             warn!("replicate force-delete: replication config error bucket:{} error:{}", bucket, err);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1733,7 +1742,7 @@ async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectRe
                 bucket, object_name, e
             );
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1756,7 +1765,7 @@ async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectRe
                 bucket, object_name, e
             );
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1786,7 +1795,7 @@ async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectRe
         let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(bucket, &arn).await else {
             warn!("replicate force-delete: failed to get target client bucket:{} arn:{}", bucket, arn);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
                     bucket: bucket.clone(),
@@ -1807,7 +1816,7 @@ async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectRe
             if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
                 error!("replicate force-delete: target offline bucket:{} arn:{}", bucket, tgt_client.arn);
                 send_event(EventArgs {
-                    event_name: EventName::ObjectReplicationFailed.as_ref().to_string(),
+                    event_name: EventName::ObjectReplicationFailed.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
                         bucket: bucket.clone(),
@@ -1843,7 +1852,7 @@ async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectRe
                     bucket, object_name, tgt_client.arn, e
                 );
                 send_event(EventArgs {
-                    event_name: EventName::ObjectReplicationFailed.as_ref().to_string(),
+                    event_name: EventName::ObjectReplicationFailed.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
                         bucket: bucket.clone(),
@@ -1976,7 +1985,7 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         Ok(None) => {
             warn!("No replication config found for bucket: {}", bucket);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
                 host: GLOBAL_LocalNodeName.to_string(),
@@ -1988,7 +1997,7 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         Err(err) => {
             error!("Failed to get replication config for bucket {}: {}", bucket, err);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
                 host: GLOBAL_LocalNodeName.to_string(),
@@ -2014,7 +2023,7 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(&bucket, &arn).await else {
             warn!("failed to get target for bucket:{:?}, arn:{:?}", &bucket, &arn);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
                 host: GLOBAL_LocalNodeName.to_string(),
@@ -2048,7 +2057,7 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
             Err(e) => {
                 error!("replicate_object task failed: {}", e);
                 send_event(EventArgs {
-                    event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                    event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: roi.to_object_info(),
                     host: GLOBAL_LocalNodeName.to_string(),
@@ -2082,9 +2091,9 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     }
 
     let event_name = if replication_status == ReplicationStatusType::Completed {
-        EventName::ObjectReplicationComplete.as_ref().to_string()
+        EventName::ObjectReplicationComplete.to_string()
     } else {
-        EventName::ObjectReplicationFailed.as_ref().to_string()
+        EventName::ObjectReplicationFailed.to_string()
     };
 
     send_event(EventArgs {
@@ -2139,7 +2148,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
             warn!("target is offline: {}", tgt_client.to_url());
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: self.to_object_info(),
                 host: GLOBAL_LocalNodeName.to_string(),
@@ -2170,7 +2179,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     warn!("failed to get object reader for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
 
                     send_event(EventArgs {
-                        event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                        event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: self.to_object_info(),
                         host: GLOBAL_LocalNodeName.to_string(),
@@ -2192,7 +2201,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             Err(e) => {
                 warn!("failed to get actual size for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
                 send_event(EventArgs {
-                    event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                    event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
                     host: GLOBAL_LocalNodeName.to_string(),
@@ -2206,7 +2215,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         if tgt_client.bucket.is_empty() {
             warn!("target bucket is empty: {}", tgt_client.bucket);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: object_info,
                 host: GLOBAL_LocalNodeName.to_string(),
@@ -2263,7 +2272,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     bucket, tgt_client.arn, e
                 );
                 send_event(EventArgs {
-                    event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                    event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
                     host: GLOBAL_LocalNodeName.to_string(),
@@ -2336,7 +2345,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
             warn!("target is offline: {}", tgt_client.to_url());
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: self.to_object_info(),
                 host: GLOBAL_LocalNodeName.to_string(),
@@ -2366,7 +2375,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 if !is_err_object_not_found(&e) || is_err_version_not_found(&e) {
                     warn!("failed to get object reader for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
                     send_event(EventArgs {
-                        event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                        event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: self.to_object_info(),
                         host: GLOBAL_LocalNodeName.to_string(),
@@ -2397,7 +2406,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             Err(e) => {
                 warn!("failed to get actual size for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
                 send_event(EventArgs {
-                    event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                    event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
                     host: GLOBAL_LocalNodeName.to_string(),
@@ -2413,7 +2422,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         if tgt_client.bucket.is_empty() {
             warn!("target bucket is empty: {}", tgt_client.bucket);
             send_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: object_info,
                 host: GLOBAL_LocalNodeName.to_string(),
@@ -2444,9 +2453,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 if replication_action == ReplicationAction::None {
                     if self.op_type == ReplicationType::ExistingObject
                         && object_info.mod_time
-                            > oi.last_modified.map(|dt| {
-                                time::OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
-                            })
+                            > oi.last_modified
+                                .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
                         && object_info.version_id.is_none()
                     {
                         warn!(
@@ -2456,7 +2464,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                             tgt_client.to_url()
                         );
                         send_event(EventArgs {
-                            event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                            event_name: EventName::ObjectReplicationNotTracked.to_string(),
                             bucket_name: bucket.clone(),
                             object: object_info.clone(),
                             host: GLOBAL_LocalNodeName.to_string(),
@@ -2496,7 +2504,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         warn!("failed to head object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
 
                         send_event(EventArgs {
-                            event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                            event_name: EventName::ObjectReplicationNotTracked.to_string(),
                             bucket_name: bucket.clone(),
                             object: object_info,
                             host: GLOBAL_LocalNodeName.to_string(),
@@ -2512,7 +2520,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     warn!("failed to head object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
 
                     send_event(EventArgs {
-                        event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                        event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: object_info,
                         host: GLOBAL_LocalNodeName.to_string(),
@@ -2542,7 +2550,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         bucket, tgt_client.arn, e
                     );
                     send_event(EventArgs {
-                        event_name: EventName::ObjectReplicationNotTracked.as_ref().to_string(),
+                        event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: object_info,
                         host: GLOBAL_LocalNodeName.to_string(),
@@ -2613,19 +2621,19 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
 
 // Standard headers that needs to be extracted from User metadata.
 static STANDARD_HEADERS: &[&str] = &[
-    headers::CONTENT_TYPE,
-    headers::CACHE_CONTROL,
-    headers::CONTENT_ENCODING,
-    headers::CONTENT_LANGUAGE,
-    headers::CONTENT_DISPOSITION,
-    headers::AMZ_STORAGE_CLASS,
-    headers::AMZ_OBJECT_TAGGING,
-    headers::AMZ_BUCKET_REPLICATION_STATUS,
-    headers::AMZ_OBJECT_LOCK_MODE,
-    headers::AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-    headers::AMZ_OBJECT_LOCK_LEGAL_HOLD,
-    headers::AMZ_TAG_COUNT,
-    headers::AMZ_SERVER_SIDE_ENCRYPTION,
+    CONTENT_TYPE,
+    CACHE_CONTROL,
+    CONTENT_ENCODING,
+    CONTENT_LANGUAGE,
+    CONTENT_DISPOSITION,
+    AMZ_STORAGE_CLASS,
+    AMZ_OBJECT_TAGGING,
+    AMZ_BUCKET_REPLICATION_STATUS,
+    AMZ_OBJECT_LOCK_MODE,
+    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
+    AMZ_OBJECT_LOCK_LEGAL_HOLD,
+    AMZ_TAG_COUNT,
+    AMZ_SERVER_SIDE_ENCRYPTION,
 ];
 
 fn calc_put_object_header_size(put_opts: &PutObjectOptions) -> usize {
@@ -2757,7 +2765,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
             insert_header_map(&mut meta, SUFFIX_REPLICATION_SSEC_CRC, encoded);
         } else {
             // Get checksum metadata for non-SSE-C objects
-            let (cs_meta, is_mp) = object_info.decrypt_checksums(0, &http::HeaderMap::new())?;
+            let (cs_meta, is_mp) = object_info.decrypt_checksums(0, &HeaderMap::new())?;
             is_multipart = is_mp;
 
             // Set object checksum metadata
@@ -2826,24 +2834,24 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
     // Use case-insensitive lookup for headers
     let lk_map = object_info.user_defined.clone();
 
-    if let Some(lang) = lk_map.lookup(headers::CONTENT_LANGUAGE) {
+    if let Some(lang) = lk_map.lookup(CONTENT_LANGUAGE) {
         put_op.content_language = lang.to_string();
     }
 
-    if let Some(cd) = lk_map.lookup(headers::CONTENT_DISPOSITION) {
+    if let Some(cd) = lk_map.lookup(CONTENT_DISPOSITION) {
         put_op.content_disposition = cd.to_string();
     }
 
-    if let Some(v) = lk_map.lookup(headers::CACHE_CONTROL) {
+    if let Some(v) = lk_map.lookup(CACHE_CONTROL) {
         put_op.cache_control = v.to_string();
     }
 
-    if let Some(v) = lk_map.lookup(headers::AMZ_OBJECT_LOCK_MODE) {
+    if let Some(v) = lk_map.lookup(AMZ_OBJECT_LOCK_MODE) {
         let mode = v.to_string().to_uppercase();
         put_op.mode = Some(aws_sdk_s3::types::ObjectLockRetentionMode::from(mode.as_str()));
     }
 
-    if let Some(v) = lk_map.lookup(headers::AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE) {
+    if let Some(v) = lk_map.lookup(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE) {
         put_op.retain_until_date =
             OffsetDateTime::parse(v, &Rfc3339).map_err(|e| Error::other(format!("Failed to parse retain until date: {}", e)))?;
         // set retention timestamp in opts
@@ -2855,7 +2863,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
             };
     }
 
-    if let Some(v) = lk_map.lookup(headers::AMZ_OBJECT_LOCK_LEGAL_HOLD) {
+    if let Some(v) = lk_map.lookup(AMZ_OBJECT_LOCK_LEGAL_HOLD) {
         let hold = v.to_uppercase();
         put_op.legalhold = Some(ObjectLockLegalHoldStatus::from(hold.as_str()));
         // set legalhold timestamp in opts
@@ -3035,7 +3043,7 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
         && oi1.mod_time
             > oi2
                 .last_modified
-                .map(|dt| time::OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(time::OffsetDateTime::UNIX_EPOCH))
+                .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
         && oi1.version_id.is_none()
     {
         return ReplicationAction::None;
@@ -3054,7 +3062,7 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
         || oi1.mod_time
             != oi2
                 .last_modified
-                .map(|dt| time::OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(time::OffsetDateTime::UNIX_EPOCH))
+                .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
     {
         return ReplicationAction::All;
     }
@@ -3143,6 +3151,7 @@ mod tests {
     use crate::bucket::msgp_decode::write_msgp_time;
     use std::collections::HashMap;
     use time::OffsetDateTime;
+    use uuid::Uuid;
 
     #[test]
     fn test_part_range_spec_from_actual_size() {
@@ -3326,5 +3335,72 @@ mod tests {
         assert_eq!(target.start_time, None);
         assert_eq!(target.last_update, None);
         assert_eq!(target.resync_before_date, None);
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_failed_non_delete_marker() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: false,
+            replication_status: ReplicationStatusType::Failed,
+            ..Default::default()
+        };
+        assert!(
+            !heal_should_use_check_replicate_delete(&oi),
+            "Failed non-delete-marker object must use must_replicate path so it can be re-queued for heal"
+        );
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_pending_uses_delete_path() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: false,
+            replication_status: ReplicationStatusType::Pending,
+            ..Default::default()
+        };
+        assert!(
+            heal_should_use_check_replicate_delete(&oi),
+            "Pending (non-Failed) status with non-empty replication uses check_replicate_delete path"
+        );
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_delete_marker() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: true,
+            replication_status: ReplicationStatusType::Failed,
+            ..Default::default()
+        };
+        assert!(
+            heal_should_use_check_replicate_delete(&oi),
+            "Delete marker always uses check_replicate_delete path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_heal_replicate_object_info_failed_object_returns_heal_roi() {
+        let oi = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "key".to_string(),
+            delete_marker: false,
+            replication_status: ReplicationStatusType::Failed,
+            version_id: Some(Uuid::nil()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let rcfg = ReplicationConfig::new(None, None);
+        let roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+
+        assert_eq!(roi.replication_status, ReplicationStatusType::Failed);
+        assert_eq!(roi.op_type, ReplicationType::Heal);
+        assert!(
+            roi.dsc.replicate_any() || roi.dsc.targets_map.is_empty(),
+            "With no replication config, dsc may be empty; with config, replicate_any() would be true and queueing would occur"
+        );
     }
 }

@@ -7296,6 +7296,7 @@ dependencies = [
  "rustfs-protocols",
  "rustfs-protos",
  "rustfs-rio",
+ "rustfs-s3-common",
  "rustfs-s3select-api",
  "rustfs-s3select-query",
  "rustfs-scanner",
@@ -7358,6 +7359,7 @@ dependencies = [
  "rumqttc",
  "rustfs-config",
  "rustfs-ecstore",
+ "rustfs-s3-common",
  "rustfs-targets",
  "serde",
  "serde_json",
@@ -7497,6 +7499,7 @@ dependencies = [
  "rustfs-policy",
  "rustfs-protos",
  "rustfs-rio",
+ "rustfs-s3-common",
  "rustfs-signer",
  "rustfs-utils",
  "rustfs-workers",
@@ -7735,6 +7738,7 @@ dependencies = [
  "rustc-hash",
  "rustfs-config",
  "rustfs-ecstore",
+ "rustfs-s3-common",
  "rustfs-targets",
  "rustfs-utils",
  "serde",
@@ -7811,22 +7815,46 @@ dependencies = [
 name = "rustfs-protocols"
 version = "0.0.5"
 dependencies = [
+ "astral-tokio-tar",
+ "async-compression",
  "async-trait",
+ "axum",
+ "base64 0.22.1",
  "bytes",
+ "futures",
  "futures-util",
+ "hex",
+ "hmac 0.13.0-rc.5",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
  "libunftp",
+ "md5",
+ "percent-encoding",
+ "quick-xml 0.39.2",
+ "regex",
  "rustfs-credentials",
+ "rustfs-ecstore",
  "rustfs-iam",
+ "rustfs-keystone",
  "rustfs-policy",
+ "rustfs-rio",
  "rustfs-utils",
  "rustls",
  "s3s",
+ "serde",
  "serde_json",
+ "sha1 0.11.0-rc.5",
+ "sha2 0.11.0-rc.5",
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-util",
+ "tower",
  "tracing",
  "unftp-core",
+ "urlencoding",
+ "uuid",
 ]
 
 [[package]]
@@ -7870,6 +7898,15 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-s3-common"
+version = "0.0.5"
+dependencies = [
+ "metrics",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -7967,6 +8004,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rumqttc",
  "rustfs-config",
+ "rustfs-s3-common",
  "rustfs-utils",
  "serde",
  "serde_json",
@@ -8249,7 +8287,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.0-dev"
-source = "git+https://github.com/weisd/s3s?branch=feature%2Fminio-compatibility#a22d8032c350c699c9faec73a4747f884b77f83c"
+source = "git+https://github.com/weisd/s3s?rev=a22d8032c350c699c9faec73a4747f884b77f83c#a22d8032c350c699c9faec73a4747f884b77f83c"
 dependencies = [
  "arc-swap",
  "arrayvec",

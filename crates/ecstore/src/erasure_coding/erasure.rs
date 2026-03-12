@@ -349,7 +349,7 @@ impl Erasure {
     ///
     /// # Returns
     /// A vector of encoded shards as `Bytes`.
-    #[tracing::instrument(level = "info", skip_all, fields(data_len=data.len()))]
+    #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
     pub fn encode_data(&self, data: &[u8]) -> io::Result<Vec<Bytes>> {
         let shard_size_fn = if self.uses_legacy {
             calc_shard_size_legacy

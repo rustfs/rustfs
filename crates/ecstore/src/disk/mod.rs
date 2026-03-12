@@ -61,7 +61,6 @@ pub enum Disk {
 
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
-    #[tracing::instrument(skip(self))]
     fn to_string(&self) -> String {
         match self {
             Disk::Local(local_disk) => local_disk.to_string(),
@@ -69,7 +68,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
         match self {
             Disk::Local(local_disk) => local_disk.is_online().await,
@@ -77,7 +75,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn is_local(&self) -> bool {
         match self {
             Disk::Local(local_disk) => local_disk.is_local(),
@@ -85,7 +82,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn host_name(&self) -> String {
         match self {
             Disk::Local(local_disk) => local_disk.host_name(),
@@ -93,7 +89,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn endpoint(&self) -> Endpoint {
         match self {
             Disk::Local(local_disk) => local_disk.endpoint(),
@@ -101,7 +96,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn close(&self) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.close().await,
@@ -109,7 +103,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
         match self {
             Disk::Local(local_disk) => local_disk.get_disk_id().await,
@@ -117,7 +110,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.set_disk_id(id).await,
@@ -125,7 +117,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn path(&self) -> PathBuf {
         match self {
             Disk::Local(local_disk) => local_disk.path(),
@@ -133,7 +124,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn get_disk_location(&self) -> DiskLocation {
         match self {
             Disk::Local(local_disk) => local_disk.get_disk_location(),
@@ -165,7 +155,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
         match self {
             Disk::Local(local_disk) => local_disk.stat_volume(volume).await,

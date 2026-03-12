@@ -16,7 +16,7 @@ use super::rules_map::RulesMap;
 use super::xml_config::ParseConfigError as BucketNotificationConfigError;
 use crate::rules::NotificationConfiguration;
 use crate::rules::subscriber_snapshot::{BucketRulesSnapshot, DynRulesContainer, RuleEvents, RulesContainer};
-use rustfs_targets::EventName;
+use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
