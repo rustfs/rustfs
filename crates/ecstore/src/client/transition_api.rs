@@ -139,7 +139,7 @@ pub enum BucketLookupType {
 fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
     // Load the root certificate bundle from the path specified by the
     // RUSTFS_TLS_PATH environment variable.
-    let tp = std::env::var("RUSTFS_TLS_PATH").ok()?;
+    let tp = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
     let ca = std::path::Path::new(&tp).join(rustfs_config::RUSTFS_CA_CERT);
     if !ca.exists() {
         return None;
@@ -171,15 +171,12 @@ fn with_rustls_init_guard<T, F>(build: F) -> Result<T, std::io::Error>
 where
     F: FnOnce() -> Result<T, std::io::Error>,
 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
-        Ok(result) => result,
-        Err(payload) => {
-            let panic_message = panic_payload_to_message(payload);
-            Err(std::io::Error::other(format!(
-                "failed to initialize rustls crypto provider: {panic_message}. Ensure exactly one rustls crypto provider feature is enabled (aws-lc-rs or ring), or install one with CryptoProvider::install_default()"
-            )))
-        }
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)).unwrap_or_else(|payload| {
+        let panic_message = panic_payload_to_message(payload);
+        Err(std::io::Error::other(format!(
+            "failed to initialize rustls crypto provider: {panic_message}. Ensure exactly one rustls crypto provider feature is enabled (aws-lc-rs or ring), or install one with CryptoProvider::install_default()"
+        )))
+    })
 }
 
 fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
@@ -198,15 +195,19 @@ fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
 
 impl TransitionClient {
     pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
-        let clnt = Self::private_new(endpoint, opts, tier_type).await?;
+        let client = Self::private_new(endpoint, opts, tier_type).await?;
 
-        Ok(clnt)
+        Ok(client)
     }
 
     async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
+        if rustls::crypto::aws_lc_rs::default_provider().install_default().is_err() {
+            // A crypto provider is already installed (e.g. by the host process); this is fine.
+            debug!("rustls crypto provider already installed, skipping aws-lc-rs default install");
+        }
+
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        let client;
         let tls = build_tls_config()?;
 
         let https = hyper_rustls::HttpsConnectorBuilder::new()
@@ -215,14 +216,14 @@ impl TransitionClient {
             .enable_http1()
             .enable_http2()
             .build();
-        client = Client::builder(TokioExecutor::new()).build(https);
+        let http_client = Client::builder(TokioExecutor::new()).build(https);
 
-        let mut clnt = TransitionClient {
+        let mut client = TransitionClient {
             endpoint_url,
             creds_provider: Arc::new(Mutex::new(opts.creds)),
             override_signer_type: SignatureType::SignatureDefault,
             secure: opts.secure,
-            http_client: client,
+            http_client,
             bucket_loc_cache: Arc::new(Mutex::new(BucketLocationCache::new())),
             is_trace_enabled: Arc::new(Mutex::new(false)),
             trace_errors_only: Arc::new(Mutex::new(false)),
@@ -240,23 +241,23 @@ impl TransitionClient {
         };
 
         {
-            let mut md5_hasher = clnt.md5_hasher.lock().unwrap();
+            let mut md5_hasher = client.md5_hasher.lock().unwrap();
             if md5_hasher.is_none() {
                 *md5_hasher = Some(HashAlgorithm::Md5);
             }
         }
-        if clnt.sha256_hasher.is_none() {
-            clnt.sha256_hasher = Some(HashAlgorithm::SHA256);
+        if client.sha256_hasher.is_none() {
+            client.sha256_hasher = Some(HashAlgorithm::SHA256);
         }
 
-        clnt.trailing_header_support = opts.trailing_headers && clnt.override_signer_type == SignatureType::SignatureV4;
+        client.trailing_header_support = opts.trailing_headers && client.override_signer_type == SignatureType::SignatureV4;
 
-        clnt.max_retries = MAX_RETRY;
+        client.max_retries = MAX_RETRY;
         if opts.max_retries > 0 {
-            clnt.max_retries = opts.max_retries;
+            client.max_retries = opts.max_retries;
         }
 
-        Ok(clnt)
+        Ok(client)
     }
 
     fn endpoint_url(&self) -> Url {
