@@ -426,8 +426,16 @@ mod tests {
             ..OtelConfig::default()
         };
 
-        let result = init_file_logging_internal(&config, temp_path, "info", true);
-
-        assert!(result.is_err());
+        // We must run within a Tokio runtime because init_file_logging_internal spawns a background task.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let result = init_file_logging_internal(&config, temp_path, "info", true);
+            // This assertion might fail if RollingAppender doesn't error on invalid filename,
+            // but the test name implies we are testing for "not panic".
+            // If result is Ok, it means it didn't error.
+            // However, the original test asserted is_err().
+            // If we want to strictly follow the original test:
+            assert!(result.is_err());
+        });
     }
 }
