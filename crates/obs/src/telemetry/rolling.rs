@@ -57,14 +57,24 @@ pub struct RollingAppender {
 }
 
 impl RollingAppender {
+    /// Create and immediately validate a new `RollingAppender`.
+    ///
+    /// The log directory is created if it does not already exist, and the
+    /// active log file is opened (or created) eagerly so that configuration
+    /// errors — e.g. an invalid filename — surface at initialisation time
+    /// rather than on the first write.
+    ///
+    /// # Errors
+    /// Returns an [`io::Error`] if the directory cannot be created, the file
+    /// cannot be opened/created, or the path contains invalid characters.
     pub fn new(
         dir: impl AsRef<Path>,
         filename: String,
         rotation: Rotation,
         max_size_bytes: u64,
         match_mode: FileMatchMode,
-    ) -> Self {
-        Self {
+    ) -> io::Result<Self> {
+        let mut appender = Self {
             dir: dir.as_ref().to_path_buf(),
             filename,
             rotation,
@@ -73,7 +83,11 @@ impl RollingAppender {
             file: None,
             size: 0,
             last_roll_ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-        }
+        };
+        // Eagerly open the file to validate the path and capture accurate
+        // initial size / last-roll timestamp.
+        appender.open_file()?;
+        Ok(appender)
     }
 
     fn active_file_path(&self) -> PathBuf {
@@ -94,7 +108,19 @@ impl RollingAppender {
         // Open in append mode
         let file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
 
-        self.size = file.metadata()?.len();
+        let meta = file.metadata()?;
+        self.size = meta.len();
+
+        // Seed `last_roll_ts` from the file's modification time so that a
+        // process restart correctly triggers time-based rotation if the active
+        // file belongs to a previous period (e.g. yesterday's file opened
+        // after midnight).  If `mtime` is unavailable, fall back to the
+        // current time (already set in `new`).
+        if let Ok(modified) = meta.modified()
+            && let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+                self.last_roll_ts = dur.as_secs();
+            }
+
         self.file = Some(file);
         Ok(())
     }
@@ -123,31 +149,61 @@ impl RollingAppender {
             return Ok(());
         }
 
-        // 2. Generate archive name
-        // Use unix timestamp prefix for easy sorting and uniqueness
-        let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        // 2. Generate archive name.
+        // Use nanosecond resolution to reduce same-second collision risk
+        // (e.g. rapid size-based rotations during log bursts).
+        let now_duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let now_ts = now_duration.as_secs();
+        let unique_suffix = now_duration.as_nanos();
 
-        // Match naming strategy with LogCleaner expectations
-        let archive_name = match self.match_mode {
+        // Match naming strategy with LogCleaner expectations.
+        let base_archive_name = match self.match_mode {
             FileMatchMode::Suffix => {
                 // Suffix mode: timestamp BEFORE filename.
-                // e.g. rustfs.log -> 1678886400.rustfs.log
-                format!("{}.{}", now_ts, self.filename)
+                // e.g. rustfs.log -> 1678886400123456789.rustfs.log
+                format!("{}.{}", unique_suffix, self.filename)
             }
             FileMatchMode::Prefix => {
                 // Prefix mode: timestamp AFTER filename.
-                // e.g. rustfs -> rustfs.1678886400
-                format!("{}.{}", self.filename, now_ts)
+                // e.g. rustfs -> rustfs.1678886400123456789
+                format!("{}.{}", self.filename, unique_suffix)
             }
         };
 
-        let archive_path = self.dir.join(archive_name);
+        // 3. Rename with collision fallback.
+        // On POSIX, `fs::rename` is atomic but silently overwrites the
+        // destination, so we pre-check for existence instead of relying on
+        // `ErrorKind::AlreadyExists` (which is only reliable on Windows).
+        let mut attempt: u32 = 0;
+        loop {
+            let archive_name = if attempt == 0 {
+                base_archive_name.clone()
+            } else {
+                format!("{}.{}", base_archive_name, attempt)
+            };
+            let archive_path = self.dir.join(&archive_name);
 
-        // 3. Rename
-        // Note: Rename is atomic on POSIX.
-        if let Err(e) = fs::rename(&active_path, &archive_path) {
-            eprintln!("RollingAppender: Failed to rename log file during rotation: {}", e);
-            return Err(e);
+            if !archive_path.exists() {
+                match fs::rename(&active_path, &archive_path) {
+                    Ok(_) => break,
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        // Race on Windows; bump counter and retry.
+                        attempt = attempt.saturating_add(1);
+                    }
+                    Err(e) => {
+                        eprintln!("RollingAppender: Failed to rename log file during rotation: {}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                attempt = attempt.saturating_add(1);
+            }
+
+            if attempt > 100 {
+                // Exhausted retries; log a warning and give up for this cycle.
+                eprintln!("RollingAppender: Could not find a unique archive name after 100 attempts; skipping rotation.");
+                return Ok(());
+            }
         }
 
         // 4. Reset state
@@ -197,5 +253,165 @@ impl Write for RollingAppender {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn count_files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().is_file())
+            .count()
+    }
+
+    // ── Construction ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_new_creates_file_eagerly() {
+        let tmp = TempDir::new().unwrap();
+        let _appender = RollingAppender::new(tmp.path(), "test.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix)
+            .expect("should create appender without error");
+        assert!(tmp.path().join("test.log").exists(), "active log file should be created on new()");
+    }
+
+    #[test]
+    fn test_new_invalid_filename_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        // Null byte is invalid on both Unix and Windows.
+        let result = RollingAppender::new(tmp.path(), "invalid\0name.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix);
+        assert!(result.is_err(), "null byte in filename must produce an error");
+    }
+
+    // ── Basic writes ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_write_stores_content() {
+        let tmp = TempDir::new().unwrap();
+        let mut appender =
+            RollingAppender::new(tmp.path(), "test.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix).unwrap();
+
+        appender.write_all(b"hello world\n").expect("write should succeed");
+        appender.flush().expect("flush should succeed");
+
+        let content = fs::read_to_string(tmp.path().join("test.log")).unwrap();
+        assert_eq!(content, "hello world\n");
+    }
+
+    // ── Size-based rotation ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_size_rotation_creates_archive() {
+        let tmp = TempDir::new().unwrap();
+        // Allow only 5 bytes before rotating.
+        let mut appender =
+            RollingAppender::new(tmp.path(), "app.log".to_string(), Rotation::Never, 5, FileMatchMode::Suffix).unwrap();
+
+        // First write: 5 bytes exactly — no rotation yet.
+        appender.write_all(b"12345").expect("write should succeed");
+        // Second write: would push past the limit — rotation should occur first.
+        appender.write_all(b"abcde").expect("write after rotation should succeed");
+        appender.flush().unwrap();
+
+        // There should now be 2 files: the active log + 1 archive.
+        assert_eq!(count_files(tmp.path()), 2, "one rotation should have produced one archive");
+
+        // The active file should only contain the second write.
+        let content = fs::read_to_string(tmp.path().join("app.log")).unwrap();
+        assert_eq!(content, "abcde");
+    }
+
+    #[test]
+    fn test_multiple_size_rotations_produce_unique_archives() {
+        let tmp = TempDir::new().unwrap();
+        // Force a rotation on every write of 4+ bytes.
+        let mut appender =
+            RollingAppender::new(tmp.path(), "app.log".to_string(), Rotation::Never, 3, FileMatchMode::Suffix).unwrap();
+
+        for _ in 0..5 {
+            appender.write_all(b"abcd").expect("write should succeed");
+        }
+        appender.flush().unwrap();
+
+        let file_count = count_files(tmp.path());
+        // At least 5 archives (one per rotation) plus the active file.
+        assert!(
+            file_count >= 5,
+            "each burst write should produce a distinct archive; got {file_count} files"
+        );
+    }
+
+    // ── Archive filename format ────────────────────────────────────────────────
+
+    #[test]
+    fn test_suffix_mode_archive_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut appender =
+            RollingAppender::new(tmp.path(), "app.log".to_string(), Rotation::Never, 3, FileMatchMode::Suffix).unwrap();
+
+        appender.write_all(b"1234").expect("write should succeed");
+        appender.flush().unwrap();
+
+        let archives: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "app.log")
+            .collect();
+
+        assert_eq!(archives.len(), 1);
+        // Suffix mode: "<nanos>.app.log"
+        assert!(
+            archives[0].ends_with(".app.log"),
+            "archive should end with '.app.log' in Suffix mode; got '{}'",
+            archives[0]
+        );
+    }
+
+    #[test]
+    fn test_prefix_mode_archive_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut appender =
+            RollingAppender::new(tmp.path(), "app".to_string(), Rotation::Never, 3, FileMatchMode::Prefix).unwrap();
+
+        appender.write_all(b"1234").expect("write should succeed");
+        appender.flush().unwrap();
+
+        let archives: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "app")
+            .collect();
+
+        assert_eq!(archives.len(), 1);
+        // Prefix mode: "app.<nanos>"
+        assert!(
+            archives[0].starts_with("app."),
+            "archive should start with 'app.' in Prefix mode; got '{}'",
+            archives[0]
+        );
+    }
+
+    // ── Restart with existing file ─────────────────────────────────────────────
+
+    #[test]
+    fn test_restart_with_existing_file_reads_size() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("app.log");
+        fs::write(&log_path, b"existing content").unwrap();
+
+        let appender =
+            RollingAppender::new(tmp.path(), "app.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix).unwrap();
+
+        assert_eq!(
+            appender.size,
+            b"existing content".len() as u64,
+            "size should reflect existing file content"
+        );
     }
 }

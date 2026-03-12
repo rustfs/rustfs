@@ -199,7 +199,8 @@ fn init_file_logging_internal(
         .log_max_single_file_size_bytes
         .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
 
-    let file_appender = RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode);
+    let file_appender = RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)
+        .map_err(|e| TelemetryError::Io(e.to_string()))?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 

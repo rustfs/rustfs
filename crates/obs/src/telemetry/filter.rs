@@ -75,17 +75,24 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
         .map(EnvFilter::new)
         .unwrap_or_else(|| EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)));
 
-    // Suppress chatty infrastructure crates unless the operator explicitly
-    // requests trace/debug output.
     if should_suppress_noisy_crates(logger_level, default_level, rust_log.as_deref()) {
-        let directives: SmallVec<[&str; 6]> =
-            smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower", "rustfs::server::http"];
-        for directive in directives {
-            if directive == "rustfs::server::http" {
-                // For HTTP request logs, default to WARN to reduce volume in benchmarks/production
-                filter = filter.add_directive(format!("{directive}=warn").parse().unwrap());
-            } else {
-                filter = filter.add_directive(format!("{directive}=off").parse().unwrap());
+        let directives: SmallVec<[(&str, &str); 6]> = smallvec::smallvec![
+            ("hyper", "off"),
+            ("tonic", "off"),
+            ("h2", "off"),
+            ("reqwest", "off"),
+            ("tower", "off"),
+            // HTTP request logs are demoted to WARN to reduce volume in production.
+            ("rustfs::server::http", "warn"),
+        ];
+        for (crate_name, level) in directives {
+            match format!("{crate_name}={level}").parse() {
+                Ok(directive) => filter = filter.add_directive(directive),
+                Err(e) => {
+                    // The directive strings are compile-time constants, so this
+                    // branch should never be reached; emit a diagnostic just in case.
+                    eprintln!("obs: invalid log filter directive '{crate_name}={level}': {e}");
+                }
             }
         }
     }
