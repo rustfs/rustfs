@@ -52,7 +52,7 @@ data:
   RUSTFS_SCANNER_SPEED: {{ .speed | quote }}
     {{- end }}
     {{- if .start_delay_secs }}
-  RUSTFS_DATA_SCANNER_START_DELAY_SECS: {{ .start_delay_secs | quote }}
+  RUSTFS_SCANNER_START_DELAY_SECS: {{ .start_delay_secs | quote }}
     {{- end }}
     {{- if .idle_mode }}
   RUSTFS_SCANNER_IDLE_MODE: {{ .idle_mode | quote }}
