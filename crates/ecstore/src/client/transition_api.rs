@@ -140,6 +140,10 @@ fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
     // Load the root certificate bundle from the path specified by the
     // RUSTFS_TLS_PATH environment variable.
     let tp = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
+    // If no TLS path is configured, do not fall back to a CA bundle in the current directory.
+    if tp.is_empty() {
+        return None;
+    }
     let ca = std::path::Path::new(&tp).join(rustfs_config::RUSTFS_CA_CERT);
     if !ca.exists() {
         return None;
