@@ -155,6 +155,47 @@ fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
     Some(store)
 }
 
+fn panic_payload_to_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+
+    "unknown panic payload".to_string()
+}
+
+fn with_rustls_init_guard<T, F>(build: F) -> Result<T, std::io::Error>
+where
+    F: FnOnce() -> Result<T, std::io::Error>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let panic_message = panic_payload_to_message(payload);
+            Err(std::io::Error::other(format!(
+                "failed to initialize rustls crypto provider: {panic_message}. Ensure exactly one rustls crypto provider feature is enabled (aws-lc-rs or ring), or install one with CryptoProvider::install_default()"
+            )))
+        }
+    }
+}
+
+fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
+    with_rustls_init_guard(|| {
+        let config = if let Some(store) = load_root_store_from_tls_path() {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(store)
+                .with_no_client_auth()
+        } else {
+            rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth()
+        };
+
+        Ok(config)
+    })
+}
+
 impl TransitionClient {
     pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let clnt = Self::private_new(endpoint, opts, tier_type).await?;
@@ -165,15 +206,8 @@ impl TransitionClient {
     async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        let scheme = endpoint_url.scheme();
         let client;
-        let tls = if let Some(store) = load_root_store_from_tls_path() {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(store)
-                .with_no_client_auth()
-        } else {
-            rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth()
-        };
+        let tls = build_tls_config()?;
 
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
@@ -1277,4 +1311,25 @@ pub struct LocationConstraint {
 pub struct CreateBucketConfiguration {
     #[serde(rename = "LocationConstraint")]
     pub location_constraint: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_tls_config, with_rustls_init_guard};
+
+    #[test]
+    fn rustls_guard_converts_panics_to_io_errors() {
+        let err = with_rustls_init_guard(|| -> Result<(), std::io::Error> { panic!("missing provider") })
+            .expect_err("panic should be converted into an io::Error");
+        assert!(
+            err.to_string().contains("missing provider"),
+            "expected panic message to be preserved, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_tls_config_returns_result_without_panicking() {
+        let outcome = std::panic::catch_unwind(build_tls_config);
+        assert!(outcome.is_ok(), "TLS config creation should not panic");
+    }
 }
