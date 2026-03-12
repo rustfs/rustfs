@@ -71,7 +71,7 @@ use serde::Serialize;
 use std::any::Any;
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
@@ -87,8 +87,23 @@ pub(crate) const RESYNC_FILE_NAME: &str = "resync.bin";
 pub(crate) const RESYNC_META_FORMAT: u16 = 1;
 pub(crate) const RESYNC_META_VERSION: u16 = 1;
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
+const WIRE_ZERO_TIME_UNIX: i64 = -62_135_596_800;
+
+static WIRE_ZERO_TIME: LazyLock<OffsetDateTime> =
+    LazyLock::new(|| OffsetDateTime::from_unix_timestamp(WIRE_ZERO_TIME_UNIX).unwrap_or(OffsetDateTime::UNIX_EPOCH));
 
 static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
+
+fn wire_time_or_default(value: Option<OffsetDateTime>) -> OffsetDateTime {
+    value.unwrap_or(*WIRE_ZERO_TIME)
+}
+
+fn normalize_wire_time(value: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
+    match value {
+        Some(v) if v == *WIRE_ZERO_TIME || v == OffsetDateTime::UNIX_EPOCH => None,
+        other => other,
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ResyncOpts {
@@ -154,7 +169,7 @@ impl BucketReplicationResyncStatus {
         rmp::encode::write_str(&mut wr, "id")?;
         rmp::encode::write_i32(&mut wr, self.id)?;
         rmp::encode::write_str(&mut wr, "lu")?;
-        write_msgp_time(&mut wr, self.last_update.unwrap_or(OffsetDateTime::UNIX_EPOCH))?;
+        write_msgp_time(&mut wr, wire_time_or_default(self.last_update))?;
         Ok(wr)
     }
 
@@ -185,7 +200,7 @@ impl BucketReplicationResyncStatus {
                     out.id = rmp::decode::read_int::<i32, _>(&mut rd)?;
                 }
                 "lu" => {
-                    out.last_update = read_msgp_time_or_nil(&mut rd)?;
+                    out.last_update = normalize_wire_time(read_msgp_time_or_nil(&mut rd)?);
                 }
                 _ => skip_msgp_value(&mut rd)?,
             }
@@ -242,13 +257,13 @@ impl TargetReplicationResyncStatus {
     fn marshal_wire_msg(&self, wr: &mut Vec<u8>) -> Result<()> {
         rmp::encode::write_map_len(wr, 11)?;
         rmp::encode::write_str(wr, "st")?;
-        write_msgp_time(wr, self.start_time.unwrap_or(OffsetDateTime::UNIX_EPOCH))?;
+        write_msgp_time(wr, wire_time_or_default(self.start_time))?;
         rmp::encode::write_str(wr, "lst")?;
-        write_msgp_time(wr, self.last_update.unwrap_or(OffsetDateTime::UNIX_EPOCH))?;
+        write_msgp_time(wr, wire_time_or_default(self.last_update))?;
         rmp::encode::write_str(wr, "id")?;
         rmp::encode::write_str(wr, &self.resync_id)?;
         rmp::encode::write_str(wr, "rdt")?;
-        write_msgp_time(wr, self.resync_before_date.unwrap_or(OffsetDateTime::UNIX_EPOCH))?;
+        write_msgp_time(wr, wire_time_or_default(self.resync_before_date))?;
         rmp::encode::write_str(wr, "rst")?;
         rmp::encode::write_i32(wr, resync_status_to_i32(self.resync_status))?;
         rmp::encode::write_str(wr, "fs")?;
@@ -274,10 +289,10 @@ impl TargetReplicationResyncStatus {
             fields -= 1;
             let key = read_msgp_str(rd)?;
             match key.as_str() {
-                "st" => out.start_time = read_msgp_time_or_nil(rd)?,
-                "lst" => out.last_update = read_msgp_time_or_nil(rd)?,
+                "st" => out.start_time = normalize_wire_time(read_msgp_time_or_nil(rd)?),
+                "lst" => out.last_update = normalize_wire_time(read_msgp_time_or_nil(rd)?),
                 "id" => out.resync_id = read_msgp_str(rd)?,
-                "rdt" => out.resync_before_date = read_msgp_time_or_nil(rd)?,
+                "rdt" => out.resync_before_date = normalize_wire_time(read_msgp_time_or_nil(rd)?),
                 "rst" => {
                     let v: i32 = rmp::decode::read_int(rd)?;
                     out.resync_status = resync_status_from_i32(v)?;
@@ -3272,5 +3287,44 @@ mod tests {
         assert_eq!(got.id, 7);
         assert_eq!(got.targets_map["legacy-arn"].resync_id, "legacy-v1");
         assert_eq!(got.targets_map["legacy-arn"].resync_status, ResyncStatusType::ResyncCompleted);
+    }
+
+    #[test]
+    fn test_resync_none_time_encodes_as_wire_zero_and_decodes_to_none() {
+        let wire_zero = OffsetDateTime::from_unix_timestamp(WIRE_ZERO_TIME_UNIX).expect("valid wire zero timestamp");
+
+        let mut with_none = BucketReplicationResyncStatus::new();
+        with_none.id = 77;
+        with_none.targets_map = HashMap::from([(
+            "arn:replication::1:dest".to_string(),
+            TargetReplicationResyncStatus {
+                resync_id: "wire-none".to_string(),
+                resync_status: ResyncStatusType::ResyncStarted,
+                replicated_count: 1,
+                ..Default::default()
+            },
+        )]);
+
+        let mut with_zero = with_none.clone();
+        with_zero.last_update = Some(wire_zero);
+        if let Some(target) = with_zero.targets_map.get_mut("arn:replication::1:dest") {
+            target.start_time = Some(wire_zero);
+            target.last_update = Some(wire_zero);
+            target.resync_before_date = Some(wire_zero);
+        }
+
+        let encoded_none = encode_resync_file(&with_none).expect("encode with none");
+        let encoded_zero = encode_resync_file(&with_zero).expect("encode with zero");
+        assert_eq!(encoded_none, encoded_zero);
+
+        let decoded = decode_resync_file(&encoded_none).expect("decode");
+        let target = decoded
+            .targets_map
+            .get("arn:replication::1:dest")
+            .expect("target should exist");
+        assert_eq!(decoded.last_update, None);
+        assert_eq!(target.start_time, None);
+        assert_eq!(target.last_update, None);
+        assert_eq!(target.resync_before_date, None);
     }
 }

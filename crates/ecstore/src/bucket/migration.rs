@@ -15,6 +15,7 @@
 //! Migration of bucket metadata and IAM config from legacy format to RustFS format.
 
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
+use crate::bucket::replication::{decode_resync_file, encode_resync_file};
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::store_api::{BucketOptions, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
@@ -157,6 +158,20 @@ fn is_policy_mapping_path(path: &str) -> bool {
     path.starts_with(IAM_POLICY_DB_PREFIX) && path.ends_with(".json")
 }
 
+fn is_resync_meta_path(path: &str) -> bool {
+    path.ends_with(&format!("{REPLICATION_META_DIR}/{RESYNC_META_FILE}"))
+}
+
+fn normalize_bucket_meta_blob(path: &str, data: &[u8]) -> std::result::Result<Option<Vec<u8>>, String> {
+    if !is_resync_meta_path(path) {
+        return Ok(None);
+    }
+    let status = decode_resync_file(data).map_err(|err| format!("decode resync meta failed: {err}"))?;
+    encode_resync_file(&status)
+        .map(Some)
+        .map_err(|err| format!("encode resync meta failed: {err}"))
+}
+
 /// Migrates bucket metadata from legacy format to RustFS.
 /// Uses list_bucket (from disk volumes) to get bucket names, since list_objects_v2 on the legacy
 /// meta bucket may not work (legacy format differs from object layer expectations).
@@ -235,6 +250,15 @@ async fn migrate_one_if_missing<S: StorageAPI>(
         Ok(_) => return,
         Err(e) => {
             debug!("read migrating {label} body: {e}");
+            return;
+        }
+    };
+
+    let data = match normalize_bucket_meta_blob(path, &data) {
+        Ok(Some(normalized)) => normalized,
+        Ok(None) => data,
+        Err(e) => {
+            warn!("skip {label} migration due to incompatible format: {e}");
             return;
         }
     };
@@ -343,7 +367,11 @@ pub async fn try_migrate_iam_config<S: StorageAPI>(store: Arc<S>) {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_iam_config_blob;
+    use super::{normalize_bucket_meta_blob, normalize_iam_config_blob};
+    use crate::bucket::replication::{
+        BucketReplicationResyncStatus, ResyncStatusType, TargetReplicationResyncStatus, decode_resync_file, encode_resync_file,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn test_normalize_policy_mapping_legacy_timestamp_and_fields() {
@@ -363,5 +391,30 @@ mod tests {
             .and_then(|x| x.as_str())
             .expect("updatedAt should exist as string");
         assert!(updated_at.contains('T'), "updatedAt should be RFC3339-like");
+    }
+
+    #[test]
+    fn test_normalize_bucket_meta_blob_resync_reencode() {
+        let path = ".buckets/test/.replication/resync.bin";
+        let mut status = BucketReplicationResyncStatus::new();
+        status.id = 123;
+        status.targets_map = HashMap::from([(
+            "arn:replication::1:dest".to_string(),
+            TargetReplicationResyncStatus {
+                resync_id: "reset-1".to_string(),
+                resync_status: ResyncStatusType::ResyncStarted,
+                replicated_count: 1,
+                ..Default::default()
+            },
+        )]);
+
+        let input = encode_resync_file(&status).expect("encode should succeed");
+        let output = normalize_bucket_meta_blob(path, &input)
+            .expect("normalize should succeed")
+            .expect("resync path should be normalized");
+
+        let decoded = decode_resync_file(&output).expect("decode should succeed");
+        assert_eq!(decoded.id, 123);
+        assert_eq!(decoded.targets_map["arn:replication::1:dest"].resync_id, "reset-1");
     }
 }
