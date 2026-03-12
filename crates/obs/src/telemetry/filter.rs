@@ -78,9 +78,14 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
     // Suppress chatty infrastructure crates unless the operator explicitly
     // requests trace/debug output.
     if should_suppress_noisy_crates(logger_level, default_level, rust_log.as_deref()) {
-        let directives: SmallVec<[&str; 5]> = smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower"];
+        let directives: SmallVec<[&str; 6]> = smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower", "rustfs::server::http"];
         for directive in directives {
-            filter = filter.add_directive(format!("{directive}=off").parse().unwrap());
+             if *directive == "rustfs::server::http" {
+                 // For HTTP request logs, default to WARN to reduce volume in benchmarks/production
+                 filter = filter.add_directive(format!("{directive}=warn").parse().unwrap());
+             } else {
+                 filter = filter.add_directive(format!("{directive}=off").parse().unwrap());
+             }
         }
     }
 

@@ -45,13 +45,14 @@ mod local;
 mod otel;
 mod recorder;
 mod resource;
+mod rolling;
 
-use crate::TelemetryError;
 use crate::config::OtelConfig;
+use crate::TelemetryError;
 pub use guard::OtelGuard;
 pub use recorder::Recorder;
 use rustfs_config::observability::ENV_OBS_LOG_DIRECTORY;
-use rustfs_config::{DEFAULT_LOG_LEVEL, ENVIRONMENT, observability::DEFAULT_OBS_ENVIRONMENT_PRODUCTION};
+use rustfs_config::{observability::DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_LOG_LEVEL, ENVIRONMENT};
 use rustfs_utils::get_env_opt_str;
 
 /// Initialize the telemetry subsystem according to the provided configuration.

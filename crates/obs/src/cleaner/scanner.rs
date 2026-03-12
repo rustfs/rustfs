@@ -19,49 +19,60 @@
 
 use super::types::{FileInfo, FileMatchMode};
 use rustfs_config::observability::DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION;
+use std::fs;
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use tracing::debug;
-use walkdir::WalkDir;
 
-/// Collect all log files in `log_dir` whose name matches `file_pattern` based on `match_mode`.
+/// Result of a single pass directory scan.
+pub(super) struct LogScanResult {
+    /// Regular log files eligible for deletion/compression.
+    pub logs: Vec<FileInfo>,
+    /// Already compressed files eligible for expiry deletion.
+    pub compressed_archives: Vec<FileInfo>,
+}
+
+/// Perform a single-pass scan of the log directory.
 ///
-/// Files that:
-/// - are already compressed (`.gz` extension),
-/// - are zero-byte and `delete_empty_files` is `true` (these are handled
-///   immediately by the caller), or
-/// - match one of the `exclude_patterns`,
-/// - were modified more recently than `min_file_age_seconds` seconds ago,
-///
-/// are skipped and not returned in the result list.
+/// This function iterates over the directory entries once and categorizes them
+/// into regular logs or compressed archives based on extensions and patterns.
 ///
 /// # Arguments
 /// * `log_dir` - Root directory to scan (depth 1 only, no recursion).
 /// * `file_pattern` - Pattern string to match filenames.
+/// * `active_filename` - The name of the currently active log file (to be excluded).
 /// * `match_mode` - Whether to match by prefix or suffix.
 /// * `exclude_patterns` - Compiled glob patterns; matching files are skipped.
-/// * `min_file_age_seconds` - Files younger than this threshold are skipped.
+/// * `min_file_age_seconds` - Files younger than this threshold are skipped (for regular logs).
 /// * `delete_empty_files` - When `true`, zero-byte files trigger an immediate
 ///   delete by the caller before the rest of cleanup runs.
-pub(super) fn collect_log_files(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scan_log_directory(
     log_dir: &Path,
     file_pattern: &str,
+    active_filename: Option<&str>,
     match_mode: FileMatchMode,
     exclude_patterns: &[glob::Pattern],
     min_file_age_seconds: u64,
     delete_empty_files: bool,
     dry_run: bool,
-) -> Result<Vec<FileInfo>, std::io::Error> {
-    let mut files = Vec::new();
+) -> Result<LogScanResult, std::io::Error> {
+    let mut logs = Vec::new();
+    let mut compressed_archives = Vec::new();
     let now = SystemTime::now();
 
-    for entry in WalkDir::new(log_dir)
-        .max_depth(1)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    // Use read_dir for a lightweight, non-recursive scan.
+    let entries = fs::read_dir(log_dir)?;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue, // Skip unreadable entries
+        };
+
         let path = entry.path();
+
+        // We only care about files, not subdirectories.
         if !path.is_file() {
             continue;
         }
@@ -71,42 +82,56 @@ pub(super) fn collect_log_files(
             None => continue,
         };
 
-        // Match filename based on mode
+        // 1. Explicitly skip the active log file (if known).
+        if let Some(active) = active_filename {
+            if filename == active {
+                continue;
+            }
+        }
+
+        // 2. Check exclusion patterns early.
+        if is_excluded(filename, exclude_patterns) {
+            debug!("Excluding file from cleanup: {:?}", filename);
+            continue;
+        }
+
+        // 3. Classify file type and check pattern match.
+        let is_compressed = filename.ends_with(DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION);
+
+        // For matching, we need the "base" name.
+        // If compressed: "foo.log.gz" -> check "foo.log"
+        // If regular: "foo.log" -> check "foo.log"
+        let name_to_match = if is_compressed {
+            &filename[..filename.len() - DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION.len()]
+        } else {
+            filename
+        };
+
         let matches = match match_mode {
-            FileMatchMode::Prefix => filename.starts_with(file_pattern),
-            FileMatchMode::Suffix => filename.ends_with(file_pattern),
+            FileMatchMode::Prefix => name_to_match.starts_with(file_pattern),
+            FileMatchMode::Suffix => name_to_match.ends_with(file_pattern),
         };
 
         if !matches {
             continue;
         }
 
-        // Compressed files are handled by collect_compressed_files.
-        if filename.ends_with(DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION) {
-            continue;
-        }
-
-        // Honour exclusion patterns.
-        if is_excluded(filename, exclude_patterns) {
-            debug!("Excluding file from cleanup: {:?}", filename);
-            continue;
-        }
-
+        // 4. Gather metadata (only for interesting files).
         let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
         };
+        let file_size = metadata.len();
         let modified = match metadata.modified() {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(_) => continue, // Skip files where we can't read modification time
         };
-        let file_size = metadata.len();
 
-        // Delete zero-byte files immediately (outside the normal selection
-        // logic) when the feature is enabled.
-        if file_size == 0 && delete_empty_files {
+        // 5. Handle zero-byte files (Regular logs only).
+        // We generally don't delete empty compressed files implicitly, but let's stick to regular files logic.
+        if !is_compressed && file_size == 0 && delete_empty_files {
             if !dry_run {
-                if let Err(e) = std::fs::remove_file(path) {
+                if let Err(e) = std::fs::remove_file(&path) {
                     tracing::warn!("Failed to delete empty file {:?}: {}", path, e);
                 } else {
                     debug!("Deleted empty file: {:?}", path);
@@ -117,99 +142,34 @@ pub(super) fn collect_log_files(
             continue;
         }
 
-        // Skip files that are too young.
-        if let Ok(age) = now.duration_since(modified)
-            && age.as_secs() < min_file_age_seconds
-        {
-            debug!(
-                "Skipping file (too new): {:?}, age: {}s, min_age: {}s",
-                filename,
-                age.as_secs(),
-                min_file_age_seconds
-            );
-            continue;
+        // 6. Age Check (Regular logs only).
+        // Compressed files have their own retention check in the caller.
+        if !is_compressed {
+            if let Ok(age) = now.duration_since(modified)
+                && age.as_secs() < min_file_age_seconds
+            {
+                // Too young to be touched.
+                continue;
+            }
         }
 
-        files.push(FileInfo {
-            path: path.to_path_buf(),
+        let info = FileInfo {
+            path,
             size: file_size,
             modified,
-        });
-    }
-
-    Ok(files)
-}
-
-/// Collect compressed `.gz` log files whose age exceeds the retention period.
-///
-/// When `compressed_file_retention_days` is `0` the function returns immediately
-/// without collecting anything (files are kept indefinitely).
-///
-/// # Arguments
-/// * `log_dir` - Root directory to scan.
-/// * `file_pattern` - Pattern string to match filenames.
-/// * `match_mode` - Whether to match by prefix or suffix.
-/// * `compressed_file_retention_days` - Files older than this are eligible for
-///   deletion; `0` means never delete compressed files.
-pub(super) fn collect_expired_compressed_files(
-    log_dir: &Path,
-    file_pattern: &str,
-    match_mode: FileMatchMode,
-    compressed_file_retention_days: u64,
-) -> Result<Vec<FileInfo>, std::io::Error> {
-    if compressed_file_retention_days == 0 {
-        return Ok(Vec::new());
-    }
-
-    let retention = Duration::from_secs(compressed_file_retention_days * 24 * 3600);
-    let now = SystemTime::now();
-    let mut files = Vec::new();
-
-    for entry in WalkDir::new(log_dir)
-        .max_depth(1)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let filename = match path.file_name().and_then(|n| n.to_str()) {
-            Some(f) => f,
-            None => continue,
         };
 
-        if !filename.ends_with(DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION) {
-            continue;
-        }
-
-        // Check if the base filename (without .gz) matches the pattern
-        let base_filename = &filename[..filename.len() - 3];
-        let matches = match match_mode {
-            FileMatchMode::Prefix => base_filename.starts_with(file_pattern),
-            FileMatchMode::Suffix => base_filename.ends_with(file_pattern),
-        };
-
-        if !matches {
-            continue;
-        }
-
-        let Ok(metadata) = entry.metadata() else { continue };
-        let Ok(modified) = metadata.modified() else { continue };
-        let Ok(age) = now.duration_since(modified) else { continue };
-
-        if age > retention {
-            files.push(FileInfo {
-                path: path.to_path_buf(),
-                size: metadata.len(),
-                modified,
-            });
+        if is_compressed {
+            compressed_archives.push(info);
+        } else {
+            logs.push(info);
         }
     }
 
-    Ok(files)
+    Ok(LogScanResult {
+        logs,
+        compressed_archives,
+    })
 }
 
 /// Returns `true` if `filename` matches any of the compiled exclusion patterns.

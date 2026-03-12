@@ -32,6 +32,7 @@ use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::OBSERVABILITY_METRIC_ENABLED;
 use crate::telemetry::filter::build_env_filter;
+use crate::telemetry::rolling::{RollingAppender, Rotation};
 use metrics::counter;
 use rustfs_config::observability::{
     DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES, DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS,
@@ -175,7 +176,7 @@ fn init_file_logging_internal(
 
     // ── 3. Choose rotation strategy ──────────────────────────────────────────
     // `log_rotation_time` drives the rolling-appender rotation period.
-    let rotation = config
+    let rotation_str = config
         .log_rotation_time
         .as_deref()
         .unwrap_or(DEFAULT_LOG_ROTATION_TIME)
@@ -187,27 +188,24 @@ fn init_file_logging_internal(
         _ => FileMatchMode::Suffix,
     };
 
-    use tracing_appender::rolling::{RollingFileAppender, Rotation};
-    let file_appender = {
-        let rotation = match rotation.as_str() {
-            "minutely" => Rotation::MINUTELY,
-            "hourly" => Rotation::HOURLY,
-            _ => Rotation::DAILY,
-        };
-
-        let mut builder = RollingFileAppender::builder()
-            .rotation(rotation)
-            .max_log_files(keep_files * 3); // Make sure there are some data files to archive to avoid premature deletion
-
-        match match_mode {
-            FileMatchMode::Prefix => builder = builder.filename_prefix(log_filename),
-            FileMatchMode::Suffix => builder = builder.filename_suffix(log_filename),
-        }
-
-        builder
-            .build(log_directory)
-            .map_err(|e| TelemetryError::Io(format!("failed to initialize rolling file appender: {e}")))?
+    let rotation = match rotation_str.as_str() {
+        "minutely" => Rotation::Minutely,
+        "hourly" => Rotation::Hourly,
+        "daily" => Rotation::Daily,
+        _ => Rotation::Daily,
     };
+
+    let max_single_file_size = config
+        .log_max_single_file_size_bytes
+        .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
+
+    let file_appender = RollingAppender::new(
+        log_directory,
+        log_filename.to_string(),
+        rotation,
+        max_single_file_size,
+        match_mode,
+    );
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -270,7 +268,7 @@ fn init_file_logging_internal(
 
     info!(
         "Init file logging at '{}', rotation: {}, keep {} files",
-        log_directory, rotation, keep_files
+        log_directory, rotation_str, keep_files
     );
 
     Ok(OtelGuard {
@@ -352,6 +350,7 @@ fn spawn_cleanup_task(
     // Use suffix matching for log files like "2026-03-01-06-21.rustfs.log"
     // where "rustfs.log" is the suffix.
     let file_pattern = config.log_filename.as_deref().unwrap_or(log_filename).to_string();
+    let active_filename = file_pattern.clone();
 
     // Determine match mode from config, defaulting to Suffix
     let match_mode = match config.log_match_mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
@@ -389,6 +388,7 @@ fn spawn_cleanup_task(
     let cleaner = Arc::new(LogCleaner::new(
         log_dir,
         file_pattern,
+        active_filename,
         match_mode,
         keep_files,
         max_total_size,
