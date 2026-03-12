@@ -93,7 +93,11 @@ pub fn build_webpki_client_verifier(tls_path: &str) -> io::Result<Option<Arc<dyn
         ))
     })?;
 
-    let der_list = load_cert_bundle_der_bytes(ca_path.to_str().unwrap_or_default())?;
+    let ca_path = ca_path
+        .to_str()
+        .ok_or_else(|| Error::other(format!("Invalid UTF-8 in mTLS CA path: {ca_path:?}")))?;
+
+    let der_list = load_cert_bundle_der_bytes(ca_path)?;
 
     let mut store = RootCertStore::empty();
     for der in der_list {
@@ -219,7 +223,23 @@ pub fn load_all_certs_from_directory(
 
             if cert_path.exists() && key_path.exists() {
                 debug!("find the domain name certificate: {} in {:?}", domain_name, cert_path);
-                match load_cert_key_pair(cert_path.to_str().unwrap(), key_path.to_str().unwrap()) {
+                let cert_path = match cert_path.to_str() {
+                    Some(path) => path,
+                    None => {
+                        warn!("skip domain certificate load, invalid UTF-8 path: {:?}", cert_path);
+                        continue;
+                    }
+                };
+
+                let key_path = match key_path.to_str() {
+                    Some(path) => path,
+                    None => {
+                        warn!("skip domain key load, invalid UTF-8 path: {:?}", key_path);
+                        continue;
+                    }
+                };
+
+                match load_cert_key_pair(cert_path, key_path) {
                     Ok((certs, key)) => {
                         cert_key_pairs.insert(domain_name.to_string(), (certs, key));
                     }

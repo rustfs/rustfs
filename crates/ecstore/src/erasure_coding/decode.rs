@@ -454,6 +454,6 @@ mod tests {
         }
 
         let reader_cursor = Cursor::new(buf);
-        BitrotReader::new(reader_cursor, shard_size, hash_algo.clone())
+        BitrotReader::new(reader_cursor, shard_size, hash_algo.clone(), false)
     }
 }

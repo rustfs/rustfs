@@ -19,7 +19,7 @@ use http::Request;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::Service;
-use tracing::{Span, debug, instrument};
+use tracing::debug;
 
 /// Tower Service for the trusted proxy middleware.
 #[derive(Clone)]
@@ -61,25 +61,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    #[instrument(
-        name = "trusted_proxy_middleware",
-        skip_all,
-        fields(
-            http.method = %req.method(),
-            http.uri = %req.uri(),
-            http.version = ?req.version(),
-            enabled = self.enabled,
-            peer.addr = tracing::field::Empty,
-            client.ip = tracing::field::Empty,
-            client.trusted = tracing::field::Empty,
-            client.hops = tracing::field::Empty,
-            error = tracing::field::Empty,
-            error.message = tracing::field::Empty,
-        )
-    )]
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
-        let span = Span::current();
-
         // If the middleware is disabled, pass the request through immediately.
         if !self.enabled {
             debug!("Trusted proxy middleware is disabled");
@@ -91,17 +73,9 @@ where
         // Extract the direct peer address from the request extensions.
         let peer_addr = req.extensions().get::<std::net::SocketAddr>().copied();
 
-        if let Some(addr) = peer_addr {
-            span.record("peer.addr", addr.to_string());
-        }
-
         // Validate the request and extract client information.
         match self.validator.validate_request(peer_addr, req.headers()) {
             Ok(client_info) => {
-                span.record("client.ip", client_info.real_ip.to_string());
-                span.record("client.trusted", client_info.is_from_trusted_proxy);
-                span.record("client.hops", client_info.proxy_hops as i64);
-
                 // Insert the verified client info into the request extensions.
                 req.extensions_mut().insert(client_info);
 
@@ -109,9 +83,6 @@ where
                 debug!("Proxy validation successful in {:?}", duration);
             }
             Err(err) => {
-                span.record("error", true);
-                span.record("error.message", err.to_string());
-
                 // If the error is recoverable, fallback to a direct connection info.
                 if err.is_recoverable() {
                     let client_info = ClientInfo::direct(

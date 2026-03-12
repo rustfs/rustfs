@@ -14,7 +14,8 @@
 
 use crate::{BucketNotificationConfig, Event, EventArgs, LifecycleError, NotificationError, NotificationSystem};
 use rustfs_ecstore::config::Config;
-use rustfs_targets::{EventName, arn::TargetID};
+use rustfs_s3_common::EventName;
+use rustfs_targets::arn::TargetID;
 use std::sync::{Arc, OnceLock};
 use tracing::error;
 

@@ -28,7 +28,6 @@ use crate::client::object_api_utils::new_getobjectreader;
 use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
-use crate::event::name::EventName;
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
@@ -45,6 +44,7 @@ use rustfs_common::data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
 use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, is_restored_object_on_disk};
+use rustfs_s3_common::EventName;
 use rustfs_utils::path::encode_dir_object;
 use rustfs_utils::string::strings_has_prefix_fold;
 use s3s::Body;
@@ -471,7 +471,7 @@ impl TransitionState {
     }
 
     pub async fn init(api: Arc<ECStore>) {
-        let max_workers = std::env::var("RUSTFS_MAX_TRANSITION_WORKERS")
+        let max_workers = env::var("RUSTFS_MAX_TRANSITION_WORKERS")
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
@@ -569,14 +569,14 @@ impl TransitionState {
     pub async fn update_workers_inner(api: Arc<ECStore>, n: i64) {
         let mut n = n;
         if n == 0 {
-            let max_workers = std::env::var("RUSTFS_MAX_TRANSITION_WORKERS")
+            let max_workers = env::var("RUSTFS_MAX_TRANSITION_WORKERS")
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
             n = max_workers;
         }
         // Allow environment override of maximum workers
-        let absolute_max = std::env::var("RUSTFS_ABSOLUTE_MAX_WORKERS")
+        let absolute_max = env::var("RUSTFS_ABSOLUTE_MAX_WORKERS")
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(32);
@@ -603,7 +603,7 @@ impl TransitionState {
 }
 
 pub async fn init_background_expiry(api: Arc<ECStore>) {
-    let mut workers = std::env::var("RUSTFS_MAX_EXPIRY_WORKERS")
+    let mut workers = env::var("RUSTFS_MAX_EXPIRY_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(|| std::cmp::min(num_cpus::get(), 16));
@@ -615,7 +615,7 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     }
 
     if workers == 0 {
-        workers = std::env::var("RUSTFS_DEFAULT_EXPIRY_WORKERS")
+        workers = env::var("RUSTFS_DEFAULT_EXPIRY_WORKERS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(8);
@@ -689,13 +689,13 @@ pub async fn expire_transitioned_object(
     //let tags = LcAuditEvent::new(src, lcEvent).Tags();
     if lc_event.action == IlmAction::DeleteRestoredAction {
         opts.transition.expire_restored = true;
-        match api.delete_object(&oi.bucket, &oi.name, opts).await {
+        return match api.delete_object(&oi.bucket, &oi.name, opts).await {
             Ok(dobj) => {
                 //audit_log_lifecycle(*oi, ILMExpiry, tags, traceFn);
-                return Ok(dobj);
+                Ok(dobj)
             }
-            Err(err) => return Err(std::io::Error::other(err)),
-        }
+            Err(err) => Err(std::io::Error::other(err)),
+        };
     }
 
     let ret = delete_object_from_remote_tier(
@@ -732,7 +732,7 @@ pub async fn expire_transitioned_object(
         ..Default::default()
     };
     send_event(EventArgs {
-        event_name: event_name.as_ref().to_string(),
+        event_name: event_name.to_string(),
         bucket_name: obj_info.bucket.clone(),
         object: obj_info,
         user_agent: "Internal: [ILM-Expiry]".to_string(),
@@ -847,8 +847,8 @@ pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> 
         }
     }
     Ok(ObjectOptions {
-        versioned: versioned,
-        version_suspended: version_suspended,
+        versioned,
+        version_suspended,
         version_id: Some(vid.to_string()),
         ..Default::default()
     })
@@ -1033,12 +1033,12 @@ pub async fn eval_action_from_lifecycle(
     let lock_enabled = if let Some(lr) = lr { lr.mode.is_some() } else { false };
 
     match event.action {
-        lifecycle::IlmAction::DeleteAllVersionsAction | lifecycle::IlmAction::DelMarkerDeleteAllVersionsAction => {
+        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
             if lock_enabled {
                 return lifecycle::Event::default();
             }
         }
-        lifecycle::IlmAction::DeleteVersionAction | lifecycle::IlmAction::DeleteRestoredVersionAction => {
+        IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction => {
             if oi.version_id.is_none() {
                 return lifecycle::Event::default();
             }
@@ -1139,12 +1139,12 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         event_name = EventName::ObjectRemovedDeleteMarkerCreated;
     }
     match lc_event.action {
-        lifecycle::IlmAction::DeleteAllVersionsAction => event_name = EventName::ObjectRemovedDeleteAllVersions,
-        lifecycle::IlmAction::DelMarkerDeleteAllVersionsAction => event_name = EventName::ILMDelMarkerExpirationDelete,
+        IlmAction::DeleteAllVersionsAction => event_name = EventName::ObjectRemovedDeleteAllVersions,
+        IlmAction::DelMarkerDeleteAllVersionsAction => event_name = EventName::LifecycleDelMarkerExpirationDelete,
         _ => (),
     }
     send_event(EventArgs {
-        event_name: event_name.as_ref().to_string(),
+        event_name: event_name.to_string(),
         bucket_name: dobj.bucket.clone(),
         object: dobj,
         user_agent: "Internal: [ILM-Expiry]".to_string(),
@@ -1152,7 +1152,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         ..Default::default()
     });
 
-    if lc_event.action != lifecycle::IlmAction::NoneAction {
+    if lc_event.action != IlmAction::NoneAction {
         let mut num_versions = 1_u64;
         if lc_event.action.delete_all() {
             num_versions = oi.num_versions as u64;
@@ -1172,15 +1172,15 @@ pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &
 pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let mut success = false;
     match event.action {
-        lifecycle::IlmAction::DeleteVersionAction
-        | lifecycle::IlmAction::DeleteAction
-        | lifecycle::IlmAction::DeleteRestoredAction
-        | lifecycle::IlmAction::DeleteRestoredVersionAction
-        | lifecycle::IlmAction::DeleteAllVersionsAction
-        | lifecycle::IlmAction::DelMarkerDeleteAllVersionsAction => {
+        IlmAction::DeleteVersionAction
+        | IlmAction::DeleteAction
+        | IlmAction::DeleteRestoredAction
+        | IlmAction::DeleteRestoredVersionAction
+        | IlmAction::DeleteAllVersionsAction
+        | IlmAction::DelMarkerDeleteAllVersionsAction => {
             success = apply_expiry_rule(event, src, oi).await;
         }
-        lifecycle::IlmAction::TransitionAction | lifecycle::IlmAction::TransitionVersionAction => {
+        IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
             success = apply_transition_rule(event, src, oi).await;
         }
         _ => (),

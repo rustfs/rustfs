@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::LazyLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 pub const CONFIG_PREFIX: &str = "config";
 const CONFIG_FILE: &str = "config.json";
@@ -37,6 +37,8 @@ static SUB_SYSTEMS_DYNAMIC: LazyLock<HashSet<String>> = LazyLock::new(|| {
     h.insert(STORAGE_CLASS_SUB_SYS.to_owned());
     h
 });
+
+#[instrument(skip(api))]
 pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
     Ok(data)
@@ -69,6 +71,7 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
     Ok((data, rd.object_info))
 }
 
+#[instrument(skip(api, data))]
 pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
     save_config_with_opts(
         api,
@@ -82,6 +85,7 @@ pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) 
     .await
 }
 
+#[instrument(skip(api))]
 pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()> {
     match api
         .delete_object(

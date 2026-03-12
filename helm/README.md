@@ -22,31 +22,35 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.address | string | `":9000"` |  |
 | config.rustfs.console_address | string | `":9001"` |  |
 | config.rustfs.console_enable | string | `"true"` |  |
-| config.rustfs.log_level | string | `"debug"` |  |
-| config.rustfs.obs_environment | string | `"develop"` |  |
+| config.rustfs.log_level | string | `"info"` |  |
+| config.rustfs.obs_environment | string | `"development"` |  |
 | config.rustfs.obs_log_directory | string | `"/logs"` |  |
 | config.rustfs.region | string | `"us-east-1"` |  |
-| config.rustfs.rust_log | string | `"debug"` |  |
 | config.rustfs.volumes | string | `""` |  |
 | config.rustfs.log_rotation.size | int | `"100"` | Default log rotation size mb for rustfs. |
 | config.rustfs.log_rotation.time | string | `"hour"` | Default log rotation time for rustfs. |
 | config.rustfs.log_rotation.keep_files | int | `"30"` | Default log keep files for rustfs.  |
+| config.rustfs.metrics.enabled | bool | `false` | Toggle metrics export. |
+| config.rustfs.metrics.endpoint | string | `""` | Dedicated metrics endpoint. |
+| config.rustfs.scanner.speed | string | `""` | Scanner speed preset: `fastest`, `fast`, `default`, `slow`, `slowest` |
+| config.rustfs.scanner.start_delay_secs | string | `""` | Override scanner cycle interval in seconds with `RUSTFS_SCANNER_START_DELAY_SECS` |
+| config.rustfs.scanner.idle_mode | string | `""` | Override scanner idle throttling flag (`RUSTFS_SCANNER_IDLE_MODE`) |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
 | enableServiceLinks | bool | `false` |  |
 | extraManifests | list | `[]` | List of additional k8s manifests. |
 | fullnameOverride | string | `""` |  |
-| image.pullPolicy | string | `"IfNotPresent"` |  |
-| image.repository | string | `"rustfs/rustfs"` | RustFS docker image repository. |
-| image.tag | string | `"latest"` | The tag for rustfs docker image.  |
+| image.rustfs.pullPolicy | string | `"IfNotPresent"` |  |
+| image.rustfs.repository | string | `"rustfs/rustfs"` | RustFS docker image repository. |
+| image.rustfs.tag | string | `""` | Chart appVersion default if unset. |
 | imagePullSecrets | list | `[]` | A List of secrets to pull image from private registry. |
 | imageRegistryCredentials.email | string | `""` | The email to pull rustfs image from private registry.  |
 | imageRegistryCredentials.enabled | bool | `false` | To indicate whether pull image from private registry.  |
 | imageRegistryCredentials.password | string | `""` | The password to pull rustfs image from private registry.  |
 | imageRegistryCredentials.registry | string | `""` | Private registry url to pull rustfs image. |
 | imageRegistryCredentials.username | string | `""` | The username to pull rustfs image from private registry. |
-| ingress.className | string | `"traefik"` | Specify the ingress class, traefik or nginx. |
+| ingress.className | string | `"nginx"` | Specify the ingress class, traefik or nginx. |
 | ingress.enabled | bool | `true` |  |
 | ingress.hosts[0].host | string | `"example.rustfs.com"` |  |
 | ingress.hosts[0].paths[0].path | string | `"/"` |  |
@@ -90,7 +94,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | podSecurityContext.runAsGroup | int | `10001` |  |
 | podSecurityContext.runAsUser | int | `10001` |  |
 | readinessProbe.failureThreshold | int | `3` |  |
-| readinessProbe.httpGet.path | string | `"/health"` |  |
+| readinessProbe.httpGet.path | string | `"/health/ready"` |  |
 | readinessProbe.httpGet.port | string | `"endpoint"` |  |
 | readinessProbe.initialDelaySeconds | int | `30` |  |
 | readinessProbe.periodSeconds | int | `5` |  |
@@ -104,7 +108,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | secret.existingSecret | string | `""` | Use existing secret with a credentials. |
 | secret.rustfs.access_key | string | `"rustfsadmin"` | RustFS Access Key ID |
 | secret.rustfs.secret_key | string | `"rustfsadmin"` | RustFS Secret Key ID |
-| service.type | string | `"NodePort"` |  |
+| service.type | string | `"ClusterIP"` |  |
 | service.console.nodePort | int | `32001` |  |
 | service.console.port | int | `9001` |  |
 | service.endpoint.nodePort | int | `32000` |  |
@@ -152,7 +156,7 @@ The chart pulls the rustfs image from Docker Hub by default. For private registr
 
 Both approaches support pulling from private registries seamlessly and you can also combine them.
 
-- The chart default pull rustfs image from dockerhub, if your rustfs image stores in private registry, you can use either existing image Pull secrets with parameter `imagePullSecrets` or create one setting `imageRegistryCredentials.enabled` to `true`,and then specify the `imageRegistryCredentials.registry/username/password/email` as well as `image.repository`,`image.tag` to pull rustfs image from your private registry.
+- The chart default pull rustfs image from dockerhub, if your rustfs image stores in private registry, you can use either existing image Pull secrets with parameter `imagePullSecrets` or create one setting `imageRegistryCredentials.enabled` to `true`,and then specify the `imageRegistryCredentials.registry/username/password/email` as well as `image.rustfs.repository`,`image.rustfs.tag` to pull rustfs image from your private registry.
 
 - The default storageclass is [`local-path`](https://github.com/rancher/local-path-provisioner),if you want to specify your own storageclass, try to set parameter `storageclass.name`.
 
