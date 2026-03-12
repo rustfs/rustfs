@@ -199,13 +199,7 @@ fn init_file_logging_internal(
         .log_max_single_file_size_bytes
         .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
 
-    let file_appender = RollingAppender::new(
-        log_directory,
-        log_filename.to_string(),
-        rotation,
-        max_single_file_size,
-        match_mode,
-    );
+    let file_appender = RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode);
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -385,22 +379,21 @@ fn spawn_cleanup_task(
         .log_cleanup_interval_seconds
         .unwrap_or(DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS);
 
-    let cleaner = Arc::new(LogCleaner::new(
-        log_dir,
-        file_pattern,
-        active_filename,
-        match_mode,
-        keep_files,
-        max_total_size,
-        max_single_file_size,
-        compress,
-        gzip_level,
-        retention_days,
-        exclude_patterns,
-        delete_empty,
-        min_age,
-        dry_run,
-    ));
+    let cleaner = Arc::new(
+        LogCleaner::builder(log_dir, file_pattern, active_filename)
+            .match_mode(match_mode)
+            .keep_files(keep_files)
+            .max_total_size_bytes(max_total_size)
+            .max_single_file_size_bytes(max_single_file_size)
+            .compress_old_files(compress)
+            .gzip_compression_level(gzip_level)
+            .compressed_file_retention_days(retention_days)
+            .exclude_patterns(exclude_patterns)
+            .delete_empty_files(delete_empty)
+            .min_file_age_seconds(min_age)
+            .dry_run(dry_run)
+            .build(),
+    );
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval));

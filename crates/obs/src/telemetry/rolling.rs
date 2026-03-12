@@ -29,6 +29,7 @@ pub enum Rotation {
     Minutely,
     Hourly,
     Daily,
+    #[allow(dead_code)]
     Never,
 }
 
@@ -71,10 +72,7 @@ impl RollingAppender {
             match_mode,
             file: None,
             size: 0,
-            last_roll_ts: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            last_roll_ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         }
     }
 
@@ -94,10 +92,7 @@ impl RollingAppender {
         }
 
         // Open in append mode
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
 
         self.size = file.metadata()?.len();
         self.file = Some(file);
@@ -113,10 +108,7 @@ impl RollingAppender {
 
         // 2. Time-based check (Requires syscall for time)
         // We check this after size check to avoid unnecessary time calls if size forces a roll.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         self.rotation.check_should_roll(self.last_roll_ts, now)
     }
@@ -133,10 +125,7 @@ impl RollingAppender {
 
         // 2. Generate archive name
         // Use unix timestamp prefix for easy sorting and uniqueness
-        let now_ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         // Match naming strategy with LogCleaner expectations
         let archive_name = match self.match_mode {
@@ -144,12 +133,12 @@ impl RollingAppender {
                 // Suffix mode: timestamp BEFORE filename.
                 // e.g. rustfs.log -> 1678886400.rustfs.log
                 format!("{}.{}", now_ts, self.filename)
-            },
+            }
             FileMatchMode::Prefix => {
                 // Prefix mode: timestamp AFTER filename.
                 // e.g. rustfs -> rustfs.1678886400
                 format!("{}.{}", self.filename, now_ts)
-            },
+            }
         };
 
         let archive_path = self.dir.join(archive_name);
@@ -157,8 +146,8 @@ impl RollingAppender {
         // 3. Rename
         // Note: Rename is atomic on POSIX.
         if let Err(e) = fs::rename(&active_path, &archive_path) {
-             eprintln!("RollingAppender: Failed to rename log file during rotation: {}", e);
-             return Err(e);
+            eprintln!("RollingAppender: Failed to rename log file during rotation: {}", e);
+            return Err(e);
         }
 
         // 4. Reset state
@@ -180,17 +169,17 @@ impl Write for RollingAppender {
         }
 
         // Check rotation
-        if self.should_roll(buf.len() as u64) {
-            if let Err(e) = self.roll() {
-                // If rotation fails, we log to stderr and try to continue writing to the active file
-                // to avoid losing logs if possible.
-                eprintln!("RollingAppender: failed to rotate log file: {}", e);
-            }
+        if self.should_roll(buf.len() as u64)
+            && let Err(e) = self.roll()
+        {
+            // If rotation fails, we log to stderr and try to continue writing to the active file
+            // to avoid losing logs if possible.
+            eprintln!("RollingAppender: failed to rotate log file: {}", e);
         }
 
         // Ensure file is open (in case roll closed it and failed to open new one, or open_file failed above)
         if self.file.is_none() {
-             self.open_file()?;
+            self.open_file()?;
         }
 
         if let Some(file) = &mut self.file {
@@ -198,7 +187,7 @@ impl Write for RollingAppender {
             self.size += n as u64;
             Ok(n)
         } else {
-            Err(io::Error::new(io::ErrorKind::Other, "Failed to open log file"))
+            Err(io::Error::other("Failed to open log file"))
         }
     }
 

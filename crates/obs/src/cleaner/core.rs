@@ -15,7 +15,7 @@
 //! Core log-file cleanup orchestration.
 //!
 //! [`LogCleaner`] is the public entry point for the cleanup subsystem.
-//! Construct it with [`LogCleaner::new`] and call [`LogCleaner::cleanup`]
+//! Construct it with [`LogCleaner::builder`] and call [`LogCleaner::cleanup`]
 //! periodically (e.g. from a `tokio::spawn`-ed loop).
 //!
 //! Internally the cleaner delegates to:
@@ -24,7 +24,7 @@
 //! - [`LogCleaner::select_files_to_delete`] — to apply count / size limits.
 
 use super::compress::compress_file;
-use super::scanner::{scan_log_directory, LogScanResult};
+use super::scanner::{LogScanResult, scan_log_directory};
 use super::types::{FileInfo, FileMatchMode};
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -73,50 +73,13 @@ pub struct LogCleaner {
 }
 
 impl LogCleaner {
-    /// Build a new [`LogCleaner`] with the supplied policy parameters.
-    ///
-    /// `exclude_patterns` is a list of glob strings (e.g. `"*.lock"`).  Invalid
-    /// glob patterns are silently ignored.
-    ///
-    /// `gzip_compression_level` is clamped to the range `[1, 9]`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        log_dir: PathBuf,
-        file_pattern: String,
-        active_filename: String,
-        match_mode: FileMatchMode,
-        keep_files: usize,
-        max_total_size_bytes: u64,
-        max_single_file_size_bytes: u64,
-        compress_old_files: bool,
-        gzip_compression_level: u32,
-        compressed_file_retention_days: u64,
-        exclude_patterns: Vec<String>,
-        delete_empty_files: bool,
-        min_file_age_seconds: u64,
-        dry_run: bool,
-    ) -> Self {
-        let patterns = exclude_patterns
-            .into_iter()
-            .filter_map(|p| glob::Pattern::new(&p).ok())
-            .collect();
-
-        Self {
-            log_dir,
-            file_pattern,
-            active_filename,
-            match_mode,
-            keep_files,
-            max_total_size_bytes,
-            max_single_file_size_bytes,
-            compress_old_files,
-            gzip_compression_level: gzip_compression_level.clamp(1, 9),
-            compressed_file_retention_days,
-            exclude_patterns: patterns,
-            delete_empty_files,
-            min_file_age_seconds,
-            dry_run,
-        }
+    /// Create a builder to construct a `LogCleaner`.
+    pub fn builder(
+        log_dir: impl Into<PathBuf>,
+        file_pattern: impl Into<String>,
+        active_filename: impl Into<String>,
+    ) -> LogCleanerBuilder {
+        LogCleanerBuilder::new(log_dir, file_pattern, active_filename)
     }
 
     /// Perform one full cleanup pass.
@@ -144,7 +107,10 @@ impl LogCleaner {
 
         // ── 1. Discover active log files (Archives only) ──────────────────────
         // We explicitly pass `active_filename` to exclude it from the list.
-        let LogScanResult { mut logs, mut compressed_archives } = scan_log_directory(
+        let LogScanResult {
+            mut logs,
+            mut compressed_archives,
+        } = scan_log_directory(
             &self.log_dir,
             &self.file_pattern,
             Some(&self.active_filename),
@@ -258,10 +224,10 @@ impl LogCleaner {
         let mut expired = Vec::new();
 
         for file in files {
-            if let Ok(age) = now.duration_since(file.modified) {
-                if age > retention {
-                    expired.push(file.clone());
-                }
+            if let Ok(age) = now.duration_since(file.modified)
+                && age > retention
+            {
+                expired.push(file.clone());
             }
         }
 
@@ -279,25 +245,25 @@ impl LogCleaner {
         let mut total_freed = 0;
 
         for f in files {
-             let mut deleted_size = 0;
+            let mut deleted_size = 0;
             if self.compress_old_files {
                 match compress_file(&f.path, self.gzip_compression_level, self.dry_run) {
-                     Ok(_) => {},
-                     Err(e) => {
-                         tracing::warn!("Failed to compress {:?}: {}", f.path, e);
-                     }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Failed to compress {:?}: {}", f.path, e);
+                    }
                 }
             }
 
             // Now delete
             if self.dry_run {
                 info!("[DRY RUN] Would delete: {:?} ({} bytes)", f.path, f.size);
-                 deleted_size = f.size;
+                deleted_size = f.size;
             } else {
-                 match std::fs::remove_file(&f.path) {
+                match std::fs::remove_file(&f.path) {
                     Ok(()) => {
                         debug!("Deleted: {:?}", f.path);
-                         deleted_size = f.size;
+                        deleted_size = f.size;
                     }
                     Err(e) => {
                         error!("Failed to delete {:?}: {}", f.path, e);
@@ -343,5 +309,124 @@ impl LogCleaner {
         }
 
         Ok((deleted, freed))
+    }
+}
+
+/// Builder for [`LogCleaner`].
+pub struct LogCleanerBuilder {
+    log_dir: PathBuf,
+    file_pattern: String,
+    active_filename: String,
+    match_mode: FileMatchMode,
+    keep_files: usize,
+    max_total_size_bytes: u64,
+    max_single_file_size_bytes: u64,
+    compress_old_files: bool,
+    gzip_compression_level: u32,
+    compressed_file_retention_days: u64,
+    exclude_patterns: Vec<String>,
+    delete_empty_files: bool,
+    min_file_age_seconds: u64,
+    dry_run: bool,
+}
+
+impl LogCleanerBuilder {
+    pub fn new(log_dir: impl Into<PathBuf>, file_pattern: impl Into<String>, active_filename: impl Into<String>) -> Self {
+        Self {
+            log_dir: log_dir.into(),
+            file_pattern: file_pattern.into(),
+            active_filename: active_filename.into(),
+            match_mode: FileMatchMode::Prefix,
+            keep_files: 0,
+            max_total_size_bytes: 0,
+            max_single_file_size_bytes: 0,
+            compress_old_files: false,
+            gzip_compression_level: 6,
+            compressed_file_retention_days: 0,
+            exclude_patterns: Vec::new(),
+            delete_empty_files: false,
+            min_file_age_seconds: 0,
+            dry_run: false,
+        }
+    }
+
+    pub fn match_mode(mut self, match_mode: FileMatchMode) -> Self {
+        self.match_mode = match_mode;
+        self
+    }
+
+    pub fn keep_files(mut self, keep_files: usize) -> Self {
+        self.keep_files = keep_files;
+        self
+    }
+
+    pub fn max_total_size_bytes(mut self, max_total_size_bytes: u64) -> Self {
+        self.max_total_size_bytes = max_total_size_bytes;
+        self
+    }
+
+    pub fn max_single_file_size_bytes(mut self, max_single_file_size_bytes: u64) -> Self {
+        self.max_single_file_size_bytes = max_single_file_size_bytes;
+        self
+    }
+
+    pub fn compress_old_files(mut self, compress_old_files: bool) -> Self {
+        self.compress_old_files = compress_old_files;
+        self
+    }
+
+    pub fn gzip_compression_level(mut self, gzip_compression_level: u32) -> Self {
+        self.gzip_compression_level = gzip_compression_level;
+        self
+    }
+
+    pub fn compressed_file_retention_days(mut self, days: u64) -> Self {
+        self.compressed_file_retention_days = days;
+        self
+    }
+
+    pub fn exclude_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.exclude_patterns = patterns;
+        self
+    }
+
+    pub fn delete_empty_files(mut self, delete_empty_files: bool) -> Self {
+        self.delete_empty_files = delete_empty_files;
+        self
+    }
+
+    pub fn min_file_age_seconds(mut self, seconds: u64) -> Self {
+        self.min_file_age_seconds = seconds;
+        self
+    }
+
+    pub fn dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    pub fn build(self) -> LogCleaner {
+        let patterns = self
+            .exclude_patterns
+            .into_iter()
+            .filter_map(|p| glob::Pattern::new(&p).ok())
+            .collect();
+
+        LogCleaner {
+            log_dir: self.log_dir,
+            file_pattern: self.file_pattern,
+            active_filename: self.active_filename,
+            match_mode: self.match_mode,
+            keep_files: self.keep_files,
+            max_total_size_bytes: self.max_total_size_bytes,
+            max_single_file_size_bytes: self.max_single_file_size_bytes,
+            compress_old_files: self.compress_old_files,
+            gzip_compression_level: self.gzip_compression_level.clamp(1, 9),
+            compressed_file_retention_days: self.compressed_file_retention_days,
+            exclude_patterns: patterns,
+            delete_empty_files: self.delete_empty_files,
+            min_file_age_seconds: self.min_file_age_seconds,
+            dry_run: self.dry_run,
+        }
     }
 }

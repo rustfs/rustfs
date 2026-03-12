@@ -83,10 +83,10 @@ pub(super) fn scan_log_directory(
         };
 
         // 1. Explicitly skip the active log file (if known).
-        if let Some(active) = active_filename {
-            if filename == active {
-                continue;
-            }
+        if let Some(active) = active_filename
+            && filename == active
+        {
+            continue;
         }
 
         // 2. Check exclusion patterns early.
@@ -144,13 +144,12 @@ pub(super) fn scan_log_directory(
 
         // 6. Age Check (Regular logs only).
         // Compressed files have their own retention check in the caller.
-        if !is_compressed {
-            if let Ok(age) = now.duration_since(modified)
-                && age.as_secs() < min_file_age_seconds
-            {
-                // Too young to be touched.
-                continue;
-            }
+        if !is_compressed
+            && let Ok(age) = now.duration_since(modified)
+            && age.as_secs() < min_file_age_seconds
+        {
+            // Too young to be touched.
+            continue;
         }
 
         let info = FileInfo {

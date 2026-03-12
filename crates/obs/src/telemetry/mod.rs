@@ -47,12 +47,12 @@ mod recorder;
 mod resource;
 mod rolling;
 
-use crate::config::OtelConfig;
 use crate::TelemetryError;
+use crate::config::OtelConfig;
 pub use guard::OtelGuard;
 pub use recorder::Recorder;
 use rustfs_config::observability::ENV_OBS_LOG_DIRECTORY;
-use rustfs_config::{observability::DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_LOG_LEVEL, ENVIRONMENT};
+use rustfs_config::{DEFAULT_LOG_LEVEL, ENVIRONMENT, observability::DEFAULT_OBS_ENVIRONMENT_PRODUCTION};
 use rustfs_utils::get_env_opt_str;
 
 /// Initialize the telemetry subsystem according to the provided configuration.
@@ -118,8 +118,9 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> Result<OtelGuard, Telemetry
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use rustfs_config::observability::DEFAULT_OBS_ENVIRONMENT_PRODUCTION;
-    use rustfs_config::{ENVIRONMENT, USE_STDOUT};
+    use rustfs_config::{DEFAULT_OBS_LOG_STDOUT_ENABLED, ENVIRONMENT};
 
     #[test]
     fn test_production_environment_detection() {
@@ -161,7 +162,7 @@ mod tests {
             TestCase {
                 is_production: false,
                 config_use_stdout: None,
-                expected_use_stdout: USE_STDOUT,
+                expected_use_stdout: DEFAULT_OBS_LOG_STDOUT_ENABLED,
                 description: "Non-production with no config should use default",
             },
             TestCase {
@@ -185,7 +186,11 @@ mod tests {
         ];
 
         for case in &test_cases {
-            let default_use_stdout = if case.is_production { false } else { USE_STDOUT };
+            let default_use_stdout = if case.is_production {
+                false
+            } else {
+                DEFAULT_OBS_LOG_STDOUT_ENABLED
+            };
             let actual = case.config_use_stdout.unwrap_or(default_use_stdout);
             assert_eq!(actual, case.expected_use_stdout, "Test case failed: {}", case.description);
         }
@@ -222,7 +227,6 @@ mod tests {
     #[test]
     fn test_otel_config_environment_defaults() {
         // Verify that environment field defaults behave correctly.
-        use crate::config::OtelConfig;
         let config = OtelConfig {
             endpoint: "".to_string(),
             use_stdout: None,
