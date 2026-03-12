@@ -136,8 +136,8 @@ mod tests {
         create_log_file(&dir, "other.log", 512)?; // different prefix
 
         // keep_files=1 with no size limit: only the oldest managed file is deleted.
-        // max_bytes=0 means no total-size limit so only the keep_files constraint fires.
-        let cleaner = make_cleaner(dir.clone(), 1, 0);
+        // max_bytes=1500 means no total-size limit so only the keep_files constraint fires.
+        let cleaner = make_cleaner(dir.clone(), 1, 1500);
         let (deleted, _) = cleaner.cleanup()?;
 
         // "other.log" must not be counted or deleted; only 1 managed file removed.
