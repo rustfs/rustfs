@@ -20,7 +20,7 @@ use crate::{
 use hashbrown::HashMap;
 use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
 use rustfs_ecstore::config::{Config, KVS};
-use rustfs_targets::EventName;
+use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::store::{Key, Store};
 use rustfs_targets::target::EntityTarget;
@@ -355,7 +355,7 @@ impl NotificationSystem {
                         changed = true;
                     }
                     if targets.is_empty() {
-                        config.0.remove(target_type);
+                        config.0.remove(&ttype);
                     }
                 }
                 if !changed {

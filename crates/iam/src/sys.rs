@@ -1083,7 +1083,16 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn load_user(&self, _name: &str, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+        async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            if user_type == UserType::Reg && name == "notify-user" {
+                let user = UserIdentity::from(Credentials {
+                    access_key: name.to_string(),
+                    secret_key: "notify-user-secret".to_string(),
+                    status: ACCOUNT_ON.to_string(),
+                    ..Default::default()
+                });
+                m.insert(name.to_string(), user);
+            }
             Ok(())
         }
 
@@ -1148,11 +1157,14 @@ mod tests {
 
         async fn load_mapped_policy(
             &self,
-            _name: &str,
-            _user_type: UserType,
-            _is_group: bool,
-            _m: &mut HashMap<String, MappedPolicy>,
+            name: &str,
+            user_type: UserType,
+            is_group: bool,
+            m: &mut HashMap<String, MappedPolicy>,
         ) -> Result<()> {
+            if user_type == UserType::Reg && !is_group && name == "notify-user" {
+                m.insert(name.to_string(), MappedPolicy::new("readwrite"));
+            }
             Ok(())
         }
 
@@ -1245,6 +1257,31 @@ mod tests {
         assert!(
             allowed,
             "STS temp credentials with no groups in args should still be allowed via parent user's group policy (readwrite)"
+        );
+    }
+
+    /// Regression test for cross-node IAM notifications:
+    /// `load_user` must populate user cache, and regular-user mapped policy must be written to
+    /// `user_policies` (not `sts_policies`), otherwise list-users and bucket-scoped user listing
+    /// may miss users on follower nodes.
+    #[tokio::test]
+    async fn test_load_user_notification_populates_user_and_policy_caches() {
+        let store = StsGroupsFallbackMockStore;
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        iam_sys.load_user("notify-user", UserType::Reg).await.unwrap();
+
+        let users = iam_sys.list_users().await.unwrap();
+        assert!(
+            users.contains_key("notify-user"),
+            "regular user loaded via notification must appear in list_users cache view"
+        );
+
+        let bucket_users = iam_sys.list_bucket_users("notification-regression-bucket").await.unwrap();
+        assert!(
+            bucket_users.contains_key("notify-user"),
+            "regular user mapped policy must be written to user_policies for bucket user listing"
         );
     }
 }

@@ -34,7 +34,8 @@ path = "src/main.rs"
 default = ["metrics"]
 metrics = []
 ftps = ["rustfs-protocols/ftps"]
-full = ["metrics", "ftps"]
+swift = ["rustfs-protocols/swift"]
+full = ["metrics", "ftps", "swift"]
 
 [lints]
 workspace = true
@@ -61,6 +62,7 @@ rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio.workspace = true
+rustfs-s3-common = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }

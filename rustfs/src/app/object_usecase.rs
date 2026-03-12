@@ -74,6 +74,7 @@ use rustfs_filemeta::{
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, EtagReader, HashReader, Reader, WarpReader};
+use rustfs_s3_common::S3Operation;
 use rustfs_s3select_api::{
     object_store::bytes_stream,
     query::{Context, Query},
@@ -267,7 +268,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject);
         if req
             .headers
             .get("X-Amz-Meta-Snowball-Auto-Extract")
@@ -614,7 +615,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, "s3:PutObjectLegalHold");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, S3Operation::PutObjectLegalHold);
         let PutObjectLegalHoldInput {
             bucket,
             key,
@@ -743,7 +744,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, "s3:PutObjectRetention");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, S3Operation::PutObjectRetention);
         let PutObjectRetentionInput {
             bucket,
             key,
@@ -835,7 +836,7 @@ impl DefaultObjectUsecase {
         }
 
         let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, "s3:PutObjectTagging");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, S3Operation::PutObjectTagging);
         let PutObjectTaggingInput {
             bucket,
             key: object,
@@ -944,7 +945,7 @@ impl DefaultObjectUsecase {
 
         debug!("GetObject request started with {} concurrent requests", concurrent_requests);
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, "s3:GetObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
         // mc get 3
 
         let GetObjectInput {
@@ -1524,7 +1525,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, "s3:GetObjectAttributes");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, S3Operation::GetObjectAttributes);
         let GetObjectAttributesInput {
             bucket,
             key,
@@ -1756,7 +1757,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, "s3:GetObjectLegalHold");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, S3Operation::GetObjectLegalHold);
         let GetObjectLegalHoldInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -1847,7 +1848,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, "s3:GetObjectRetention");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, S3Operation::GetObjectRetention);
         let GetObjectRetentionInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -1941,7 +1942,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedCopy, "s3:CopyObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedCopy, S3Operation::CopyObject);
         let CopyObjectInput {
             copy_source,
             bucket,
@@ -2219,7 +2220,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, "s3:DeleteObjects").suppress_event();
+        let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObjects).suppress_event();
         let (bucket, delete) = {
             let bucket = req.input.bucket.clone();
             let delete = req.input.delete.clone();
@@ -2520,7 +2521,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, "s3:DeleteObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObject);
         let DeleteObjectInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -2649,6 +2650,7 @@ impl DefaultObjectUsecase {
         }
 
         if obj_info.replication_status == ReplicationStatusType::Replica
+            || obj_info.replication_status == ReplicationStatusType::Pending
             || obj_info.version_purge_status == VersionPurgeStatusType::Pending
         {
             schedule_replication_delete(DeletedObjectReplicationInfo {
@@ -2703,7 +2705,7 @@ impl DefaultObjectUsecase {
         }
 
         let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedDeleteTagging, "s3:DeleteObjectTagging");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedDeleteTagging, S3Operation::DeleteObjectTagging);
         let DeleteObjectTaggingInput {
             bucket,
             key: object,
@@ -2757,7 +2759,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, "s3:HeadObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, S3Operation::HeadObject);
         // mc get 2
         let HeadObjectInput {
             bucket,
@@ -3333,7 +3335,7 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject").suppress_event();
+        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         let input = req.input;
 
         let PutObjectInput {

@@ -48,7 +48,7 @@ use crate::{
         UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
     },
     error::{StorageError, to_object_err},
-    event::name::EventName,
+    // event::name::EventName,
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
@@ -79,6 +79,7 @@ use rustfs_lock::local_lock::LocalLock;
 use rustfs_lock::{FastLockGuard, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
+use rustfs_s3_common::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::{
@@ -496,6 +497,7 @@ impl ObjectIO for SetDisks {
         let object = object.to_owned();
         let set_index = self.set_index;
         let pool_index = self.pool_index;
+        let skip_verify = opts.skip_verify_bitrot;
         // Move the read-lock guard into the task so it lives for the duration of the read
         // let _guard_to_hold = _read_lock_guard; // moved into closure below
         tokio::spawn(async move {
@@ -512,6 +514,7 @@ impl ObjectIO for SetDisks {
                 &disks,
                 set_index,
                 pool_index,
+                skip_verify,
             )
             .await
             {
@@ -522,7 +525,7 @@ impl ObjectIO for SetDisks {
         Ok(reader)
     }
 
-    #[tracing::instrument(level = "debug", skip(self, data,))]
+    #[tracing::instrument(skip(self, data,))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let disks = self.get_disks_internal().await;
 
@@ -1656,6 +1659,7 @@ impl ObjectOperations for SetDisks {
         let cloned_fi = fi.clone();
         let set_index = self.set_index;
         let pool_index = self.pool_index;
+        let skip_verify = opts.skip_verify_bitrot;
         tokio::spawn(async move {
             if let Err(e) = Self::get_object_with_fileinfo(
                 &cloned_bucket,
@@ -1668,6 +1672,7 @@ impl ObjectOperations for SetDisks {
                 &online_disks,
                 set_index,
                 pool_index,
+                skip_verify,
             )
             .await
             {
@@ -1685,17 +1690,17 @@ impl ObjectOperations for SetDisks {
         if let Err(err) = rv {
             return Err(StorageError::Io(err));
         }
-        let rv = rv.unwrap();
+        let rv = rv?;
         fi.transition_status = TRANSITION_COMPLETE.to_string();
         fi.transitioned_objname = dest_obj;
         fi.transition_tier = opts.transition.tier.clone();
         fi.transition_version_id = if rv.is_empty() { None } else { Some(Uuid::parse_str(&rv)?) };
-        let mut event_name = EventName::ObjectTransitionComplete.as_ref();
+        let mut event_name = EventName::ObjectTransitionComplete.as_str();
 
         let disks = self.get_disks(0, 0).await?;
 
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
-            event_name = EventName::ObjectTransitionFailed.as_ref();
+            event_name = EventName::ObjectTransitionFailed.as_str();
         }
 
         for disk in disks.iter() {
