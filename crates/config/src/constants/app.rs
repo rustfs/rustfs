@@ -134,7 +134,7 @@ pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
 /// Environment variable for server tls path.
 pub const ENV_RUSTFS_TLS_PATH: &str = "RUSTFS_TLS_PATH";
 
-/// Environment variable for server tls path default value.
+/// Default value for the server TLS path if `ENV_RUSTFS_TLS_PATH` is not set.
 pub const DEFAULT_RUSTFS_TLS_PATH: &str = "";
 
 /// Default port for rustfs
