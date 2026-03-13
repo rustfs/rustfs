@@ -135,7 +135,7 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_LOGGER_LEVEL` | `info` | Log level; `RUST_LOG` syntax supported |
 | `RUSTFS_OBS_LOG_STDOUT_ENABLED` | `false` | When file logging is active, also mirror to stdout |
 | `RUSTFS_OBS_LOG_DIRECTORY` | _(empty)_ | **Directory for rolling log files. When empty, logs go to stdout only** |
-| `RUSTFS_OBS_LOG_FILENAME` | `rustfs.log` | Base filename for rolling logs. A high-precision timestamp is added automatically (e.g., `rustfs.log.20231027103001.123456-0`). |
+| `RUSTFS_OBS_LOG_FILENAME` | `rustfs.log` | Base filename for rolling logs. Rotated archives include a high-precision timestamp and counter. With the default `RUSTFS_OBS_LOG_MATCH_MODE=suffix`, names look like `<timestamp>-<counter>.rustfs.log` (e.g., `20231027103001.123456-0.rustfs.log`); with `prefix`, they look like `rustfs.log.<timestamp>-<counter>` (e.g., `rustfs.log.20231027103001.123456-0`). |
 | `RUSTFS_OBS_LOG_ROTATION_TIME` | `hourly` | Rotation granularity: `minutely`, `hourly`, or `daily` |
 | `RUSTFS_OBS_LOG_KEEP_FILES` | `30` | Number of rolling files to keep (also used by cleaner) |
 | `RUSTFS_OBS_LOG_MATCH_MODE` | `suffix` | File matching mode: `prefix` or `suffix` |
