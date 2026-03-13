@@ -188,12 +188,11 @@ impl RollingAppender {
     fn roll(&mut self) -> io::Result<()> {
         // 1. Close current file first to ensure all buffers are flushed to OS (if any)
         // and handle released.
-        if let Some(mut file) = self.file.take() {
-            if let Err(e) = file.flush() {
+        if let Some(mut file) = self.file.take()
+            && let Err(e) = file.flush() {
                 eprintln!("Failed to flush log file before rotation: {}", e);
                 return Err(e);
             }
-        }
 
         let active_path = self.active_file_path();
         if !active_path.exists() {
