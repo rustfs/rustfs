@@ -211,7 +211,7 @@ impl OtelConfig {
         // `log_keep_files` is the single source of truth for file retention count.
         // It defaults to `DEFAULT_LOG_KEEP_FILES` (30).
         let mut log_keep_files = get_env_usize(ENV_OBS_LOG_KEEP_FILES, DEFAULT_LOG_KEEP_FILES);
-        if log_keep_files <= 0 {
+        if log_keep_files == 0 {
             log_keep_files = DEFAULT_LOG_KEEP_FILES;
         }
         let log_keep_files = Some(log_keep_files);

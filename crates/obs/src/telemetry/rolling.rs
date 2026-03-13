@@ -49,7 +49,7 @@ impl Rotation {
             Rotation::Daily => {
                 // Align daily rotation with the local day boundary rather than UTC midnight.
                 // We shift both timestamps by the current local offset before bucketing into days.
-                let offset_secs = Zoned::now().offset().whole_seconds() as i64;
+                let offset_secs = Zoned::now().offset().seconds() as i64;
                 (now + offset_secs) / 86400 != (last + offset_secs) / 86400
             }
             Rotation::Never => false,
