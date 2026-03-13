@@ -40,3 +40,8 @@ pub const DEFAULT_NODE_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 pub const ENV_RESOURCE_METRICS_INTERVAL: &str = "RUSTFS_METRICS_RESOURCE_INTERVAL_SEC";
 /// Default interval for collecting system resource metrics (CPU, memory).
 pub const DEFAULT_RESOURCE_METRICS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Environment variable key for replication bandwidth metrics interval (seconds).
+pub const ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL: &str = "RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL_SEC";
+/// Default interval for collecting replication bandwidth metrics.
+pub const DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL: Duration = Duration::from_secs(30);
