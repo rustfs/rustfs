@@ -24,6 +24,8 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Rotation {
@@ -139,10 +141,10 @@ impl RollingAppender {
         // process restart correctly triggers time-based rotation if the active
         // file belongs to a previous period.
         if let Ok(modified) = meta.modified() {
-             // Convert SystemTime to jiff::Timestamp
-             if let Ok(ts) = jiff::Timestamp::try_from(modified) {
-                 self.last_roll_ts = ts.as_second();
-             }
+            // Convert SystemTime to jiff::Timestamp
+            if let Ok(ts) = jiff::Timestamp::try_from(modified) {
+                self.last_roll_ts = ts.as_second();
+            }
         }
 
         self.file = Some(file);
@@ -201,23 +203,61 @@ impl RollingAppender {
         };
 
         // 3. Rename the active file to the archive path.
-        //
-        // On POSIX `fs::rename` is atomic but will silently overwrite any
-        // existing destination. Because we include both a high-resolution
-        // timestamp and a per-process monotonic counter in the archive name,
-        // archive name collisions (and thus overwrites) are effectively
-        // prevented without relying on a racy existence check.
         let archive_path = self.dir.join(&archive_name);
-        fs::rename(&active_path, &archive_path)?;
 
-        // 4. Reset state
-        self.size = 0;
-        self.last_roll_ts = now.timestamp().as_second();
+        // Robust Rename Strategy:
+        // On Windows, file locking (e.g. by AV software or indexers) can cause `rename` to fail
+        // spuriously with PermissionDenied. We implement a short retry loop with backoff.
+        const MAX_RETRIES: u32 = 3;
+        let mut last_error = None;
 
-        // 5. Re-open (creates new active file)
+        for i in 0..MAX_RETRIES {
+            match fs::rename(&active_path, &archive_path) {
+                Ok(_) => {
+                    // Success!
+                    // 4. Reset state
+                    self.size = 0;
+                    self.last_roll_ts = now.timestamp().as_second();
+
+                    // 5. Re-open (creates new active file)
+                    self.open_file()?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Decide if we should retry based on error kind
+                    let should_retry = match e.kind() {
+                        // Windows often returns PermissionDenied for locked files
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::AlreadyExists => true,
+                        io::ErrorKind::Interrupted => true,
+                        _ => false,
+                    };
+
+                    last_error = Some(e);
+
+                    if !should_retry {
+                        break;
+                    }
+
+                    // Exponential backoff: 10ms, 20ms, 40ms...
+                    thread::sleep(Duration::from_millis(10 * (1 << i)));
+                }
+            }
+        }
+
+        // 6. Recovery Failure
+        // If we exhausted retries, we MUST NOT lose log data.
+        // We re-open the ACTIVE file (which is still there because rename failed).
+        // The file will grow beyond max_size, but availability > strict sizing.
+        eprintln!(
+            "RollingAppender: Failed to rotate log file after {} retries. Error: {:?}",
+            MAX_RETRIES, last_error
+        );
+
+        // Attempt to re-open existing active file to allow continued writing
         self.open_file()?;
 
-        Ok(())
+        // Return the error so it can be logged/handled, even though we recovered the handle.
+        Err(last_error.unwrap_or_else(|| io::Error::other("Unknown rename error")))
     }
 }
 

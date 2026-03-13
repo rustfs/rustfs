@@ -1,7 +1,7 @@
 # rustfs-obs
 
 Observability library for [RustFS](https://github.com/rustfs/rustfs) providing structured JSON
-logging, distributed tracing, and metrics via OpenTelemetry.
+logging, distributed tracing, metrics via OpenTelemetry, and continuous profiling via Pyroscope.
 
 ---
 
@@ -13,6 +13,7 @@ logging, distributed tracing, and metrics via OpenTelemetry.
 | **Rolling-file logging** | Daily / hourly rotation with automatic cleanup and high-precision timestamps |
 | **Distributed tracing** | OTLP/HTTP export to Jaeger, Tempo, or any OTel collector |
 | **Metrics** | OTLP/HTTP export, bridged from the `metrics` crate facade |
+| **Continuous Profiling** | CPU/Memory profiling export to Pyroscope |
 | **Log cleanup** | Background task: size limits, gzip compression, retention policies |
 | **GPU metrics** *(optional)* | Enable with the `gpu` feature flag |
 
@@ -79,7 +80,7 @@ The library selects a backend automatically based on configuration:
 
 ```
 1. Any OTLP endpoint set?
-   └─ YES → Full OTLP/HTTP pipeline (traces + metrics + logs)
+   └─ YES → Full OTLP/HTTP pipeline (traces + metrics + logs + profiling)
 
 2. RUSTFS_OBS_LOG_DIRECTORY set to a non-empty path?
    └─ YES → Rolling-file JSON logging
@@ -110,9 +111,11 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_TRACE_ENDPOINT` | _(empty)_ | Dedicated trace endpoint (overrides root + `/v1/traces`) |
 | `RUSTFS_OBS_METRIC_ENDPOINT` | _(empty)_ | Dedicated metrics endpoint |
 | `RUSTFS_OBS_LOG_ENDPOINT` | _(empty)_ | Dedicated log endpoint |
+| `RUSTFS_OBS_PROFILING_ENDPOINT` | _(empty)_ | Dedicated profiling endpoint (e.g. Pyroscope) |
 | `RUSTFS_OBS_TRACES_EXPORT_ENABLED` | `true` | Toggle trace export |
 | `RUSTFS_OBS_METRICS_EXPORT_ENABLED` | `true` | Toggle metrics export |
 | `RUSTFS_OBS_LOGS_EXPORT_ENABLED` | `true` | Toggle OTLP log export |
+| `RUSTFS_OBS_PROFILING_EXPORT_ENABLED` | `true` | Toggle profiling export |
 | `RUSTFS_OBS_USE_STDOUT` | `false` | Mirror all signals to stdout alongside OTLP |
 | `RUSTFS_OBS_SAMPLE_RATIO` | `0.1` | Trace sampling ratio `0.0`–`1.0` |
 | `RUSTFS_OBS_METER_INTERVAL` | `15` | Metrics export interval (seconds) |

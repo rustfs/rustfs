@@ -237,6 +237,31 @@ impl LogCleaner {
 
     // ─── Compression + deletion ───────────────────────────────────────────────
 
+    /// Securely delete a file, preventing symlink attacks (TOCTOU).
+    ///
+    /// This function verifies that the path is not a symlink before attempting deletion.
+    /// While strictly speaking a race condition is still theoretically possible between
+    /// `symlink_metadata` and `remove_file`, this check covers the vast majority of
+    /// privilege escalation vectors where a user replaces a log file with a symlink
+    /// to a system file.
+    fn secure_delete(&self, path: &PathBuf) -> std::io::Result<()> {
+        // 1. Lstat (symlink_metadata) - do not follow links
+        let meta = std::fs::symlink_metadata(path)?;
+
+        // 2. Symlink Check
+        // If it's a symlink, we NEVER delete it. It might point to /etc/passwd.
+        // In a log directory, symlinks are unexpected and dangerous.
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Security: refusing to delete symlink: {:?}", path),
+            ));
+        }
+
+        // 3. Perform Deletion
+        std::fs::remove_file(path)
+    }
+
     /// Optionally compress and then delete the given files.
     ///
     /// This function is synchronous and blocking. It should be called within a
@@ -261,7 +286,7 @@ impl LogCleaner {
                 info!("[DRY RUN] Would delete: {:?} ({} bytes)", f.path, f.size);
                 deleted_size = f.size;
             } else {
-                match std::fs::remove_file(&f.path) {
+                match self.secure_delete(&f.path) {
                     Ok(()) => {
                         debug!("Deleted: {:?}", f.path);
                         deleted_size = f.size;
@@ -296,7 +321,7 @@ impl LogCleaner {
                 deleted += 1;
                 freed += f.size;
             } else {
-                match std::fs::remove_file(&f.path) {
+                match self.secure_delete(&f.path) {
                     Ok(()) => {
                         debug!("Deleted: {:?}", f.path);
                         deleted += 1;
