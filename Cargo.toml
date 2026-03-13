@@ -239,7 +239,7 @@ rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { git = "https://github.com/s3s-project/s3s", rev = "4189c86154ed1fa4b89d2eaf2acfe04b7dcd0990", features = ["minio"] }
+s3s = { git = "https://github.com/s3s-project/s3s", rev = "c2dc7b16535659904d4efff52c558fc039be1ef3", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.1", default-features = false }
 siphasher = "1.0.2"

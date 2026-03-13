@@ -7682,6 +7682,7 @@ version = "0.0.5"
 dependencies = [
  "flate2",
  "glob",
+ "jiff",
  "metrics",
  "nvml-wrapper",
  "opentelemetry",
@@ -8209,7 +8210,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.0-dev"
-source = "git+https://github.com/s3s-project/s3s?rev=4189c86154ed1fa4b89d2eaf2acfe04b7dcd0990#4189c86154ed1fa4b89d2eaf2acfe04b7dcd0990"
+source = "git+https://github.com/s3s-project/s3s?rev=c2dc7b16535659904d4efff52c558fc039be1ef3#c2dc7b16535659904d4efff52c558fc039be1ef3"
 dependencies = [
  "arc-swap",
  "arrayvec",
