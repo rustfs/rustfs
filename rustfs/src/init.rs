@@ -508,3 +508,76 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
         Ok(Some(shutdown_tx))
     }
 }
+
+/// Initialize the WebDAV system
+///
+/// This function initializes the WebDAV server if enabled in the configuration.
+/// It sets up the WebDAV server with the appropriate configuration and starts
+/// the server in a background task.
+#[cfg(feature = "webdav")]
+#[instrument(skip_all)]
+pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>>
+{
+    {
+        use crate::protocols::ProtocolStorageClient;
+        use rustfs_config::{
+            DEFAULT_WEBDAV_ADDRESS, ENV_WEBDAV_ADDRESS, ENV_WEBDAV_CA_FILE, ENV_WEBDAV_CERTS_DIR, ENV_WEBDAV_ENABLE,
+            ENV_WEBDAV_MAX_BODY_SIZE, ENV_WEBDAV_REQUEST_TIMEOUT, ENV_WEBDAV_TLS_ENABLED,
+        };
+        use rustfs_protocols::{WebDavConfig, WebDavServer};
+
+        // Check if WebDAV is enabled
+        let webdav_enable = rustfs_utils::get_env_bool(ENV_WEBDAV_ENABLE, false);
+        if !webdav_enable {
+            debug!("WebDAV system is disabled");
+            return Ok(None);
+        }
+
+        // Parse WebDAV address
+        let webdav_address_str = rustfs_utils::get_env_str(ENV_WEBDAV_ADDRESS, DEFAULT_WEBDAV_ADDRESS);
+        let addr = rustfs_utils::net::parse_and_resolve_address(&webdav_address_str)
+            .map_err(|e| format!("Invalid WebDAV address '{webdav_address_str}': {e}"))?;
+
+        // Get WebDAV configuration from environment variables
+        let tls_enabled = rustfs_utils::get_env_bool(ENV_WEBDAV_TLS_ENABLED, true);
+        let cert_dir = rustfs_utils::get_env_opt_str(ENV_WEBDAV_CERTS_DIR);
+        let ca_file = rustfs_utils::get_env_opt_str(ENV_WEBDAV_CA_FILE);
+        let max_body_size = rustfs_utils::get_env_u64(ENV_WEBDAV_MAX_BODY_SIZE, WebDavConfig::DEFAULT_MAX_BODY_SIZE);
+        let request_timeout_secs =
+            rustfs_utils::get_env_u64(ENV_WEBDAV_REQUEST_TIMEOUT, WebDavConfig::DEFAULT_REQUEST_TIMEOUT_SECS);
+
+        // Create WebDAV configuration
+        let config = WebDavConfig {
+            bind_addr: addr,
+            tls_enabled,
+            cert_dir,
+            ca_file,
+            max_body_size,
+            request_timeout_secs,
+        };
+
+        // Validate WebDAV configuration
+        config.validate().await?;
+
+        // Create WebDAV server with protocol storage client
+        let fs = crate::storage::ecfs::FS::new();
+        let storage_client = ProtocolStorageClient::new(fs);
+        let server: WebDavServer<crate::protocols::ProtocolStorageClient> = WebDavServer::new(config, storage_client).await?;
+
+        // Log server configuration
+        info!("WebDAV server configured on {}", server.config().bind_addr);
+
+        // Start WebDAV server in background task with proper shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        tokio::spawn(async move {
+            if let Err(e) = server.start(shutdown_rx).await {
+                error!("WebDAV server error: {}", e);
+            }
+            info!("WebDAV server shutdown completed");
+        });
+
+        info!("WebDAV system initialized successfully");
+        Ok(Some(shutdown_tx))
+    }
+}

@@ -1,6 +1,6 @@
 # Protocol E2E Tests
 
-FTPS protocol end-to-end tests for RustFS.
+FTPS and WebDAV protocol end-to-end tests for RustFS.
 
 ## Prerequisites
 
@@ -19,9 +19,19 @@ brew install sshpass openssh
 
 ## Running Tests
 
-Run all protocol tests:
+Run all protocol tests (FTPS + WebDAV):
+```bash
+RUSTFS_BUILD_FEATURES=ftps,webdav cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
+```
+
+Run FTPS tests only:
 ```bash
 RUSTFS_BUILD_FEATURES=ftps cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
+```
+
+Run WebDAV tests only:
+```bash
+RUSTFS_BUILD_FEATURES=webdav cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
 ```
 
 ## Test Coverage
@@ -37,4 +47,14 @@ RUSTFS_BUILD_FEATURES=ftps cargo test --package e2e_test test_protocol_core_suit
 - delete object
 - cdup
 - rmdir delete bucket
+
+### WebDAV Tests
+- PROPFIND at root (list buckets)
+- MKCOL (create bucket)
+- PUT (upload file)
+- GET (download file)
+- PROPFIND on bucket (list objects)
+- DELETE file
+- DELETE bucket
+- Authentication failure test
 

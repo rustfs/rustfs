@@ -46,6 +46,15 @@ pub mod ftps {
     pub const PASSIVE_PORTS_PART_COUNT: usize = 2;
 }
 
+/// WebDAV constants
+#[cfg(feature = "webdav")]
+pub mod webdav {
+    /// Maximum body size (5GB)
+    pub const MAX_BODY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+    /// Default request timeout in seconds
+    pub const REQUEST_TIMEOUT_SECS: u64 = 300;
+}
+
 /// Default configuration values
 pub mod defaults {
     /// Default protocol addresses
@@ -55,4 +64,8 @@ pub mod defaults {
     /// Default FTPS passive port range
     #[cfg(feature = "ftps")]
     pub const DEFAULT_FTPS_PASSIVE_PORTS: &str = "40000-50000";
+
+    /// Default WebDAV server address
+    #[cfg(feature = "webdav")]
+    pub const DEFAULT_WEBDAV_ADDRESS: &str = "0.0.0.0:8080";
 }

@@ -54,6 +54,7 @@ swift = [
     "dep:base64",
     "dep:async-compression",
 ]
+webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls"]
 
 [dependencies]
 # Core RustFS dependencies
@@ -111,6 +112,12 @@ hex = { workspace = true, optional = true }
 astral-tokio-tar = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 async-compression = { workspace = true, optional = true, features = ["tokio", "gzip", "bzip2"] }
+
+# WebDAV specific dependencies (optional)
+dav-server = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
 all-features = true
