@@ -55,7 +55,9 @@ impl<R> MonitoredReader<R> {
             header_size = opts.header_size,
             "MonitoredReader created"
         );
-        m.init_measurement(&opts.bucket_options);
+        if throttle.is_some() {
+            m.init_measurement(&opts.bucket_options);
+        }
         MonitoredReader {
             r,
             m,

@@ -21,7 +21,6 @@ use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_ecstore::bucket::bandwidth::reader::BucketOptions as ReaderBucketOptions;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
@@ -30,7 +29,7 @@ use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::bucket::replication::replication_state::BucketStats;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::global::{get_global_bucket_monitor, global_rustfs_port};
+use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -142,20 +141,6 @@ impl Operation for GetReplicationMetricsHandler {
             Some(s) => s.get_latest_replication_stats(bucket).await,
             None => BucketStats::default(),
         };
-
-        if let Some(monitor) = get_global_bucket_monitor() {
-            let bw_report = monitor.get_report(|name| name == bucket);
-            for (arn, stat) in bucket_stats.replication_stats.stats.iter_mut() {
-                let key = ReaderBucketOptions {
-                    name: bucket.to_string(),
-                    replication_arn: arn.clone(),
-                };
-                if let Some(bw) = bw_report.bucket_stats.get(&key) {
-                    stat.bandwidth_limit_bytes_per_sec = bw.limit_bytes_per_sec;
-                    stat.current_bandwidth_bytes_per_sec = bw.current_bandwidth_bytes_per_sec;
-                }
-            }
-        }
 
         let data = serde_json::to_vec(&bucket_stats.replication_stats)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "serialize failed"))?;

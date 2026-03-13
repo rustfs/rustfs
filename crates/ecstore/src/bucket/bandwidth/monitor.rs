@@ -195,15 +195,29 @@ impl Monitor {
     }
 
     pub fn update_measurement(&self, opts: &BucketOptions, bytes: u64) {
-        self.m_lock
-            .write()
-            .unwrap_or_else(|e| {
+        {
+            let guard = self.m_lock.read().unwrap_or_else(|e| {
                 warn!("bucket monitor measurement rwlock write poisoned, recovering");
                 e.into_inner()
-            })
+            });
+            if let Some(measurement) = guard.get(opts) {
+                measurement.increment_bytes(bytes);
+                return;
+            }
+        }
+
+        // Miss path: write lock + insert once, then increment.
+        let mut guard = self.m_lock.write().unwrap_or_else(|e| {
+            warn!("bucket monitor measurement rwlock write poisoned, recovering");
+            e.into_inner()
+        });
+
+        // Double-check after lock upgrade in case another thread inserted it.
+        let measurement = guard
             .entry(opts.clone())
-            .or_insert_with(|| BucketMeasurement::new(Instant::now()))
-            .increment_bytes(bytes);
+            .or_insert_with(|| BucketMeasurement::new(Instant::now()));
+
+        measurement.increment_bytes(bytes);
     }
 
     pub fn update_moving_avg(&self) {
@@ -227,19 +241,21 @@ impl Monitor {
             e.into_inner()
         });
         let mut bucket_stats = HashMap::new();
-        for (opts, measurement) in m_guard.iter() {
+        for (opts, throttle) in t_guard.iter() {
             if !select_bucket(&opts.name) {
                 continue;
             }
-            if let Some(throttle) = t_guard.get(opts) {
-                bucket_stats.insert(
-                    opts.clone(),
-                    BandwidthDetails {
-                        limit_bytes_per_sec: throttle.node_bandwidth_per_sec * self.node_count as i64,
-                        current_bandwidth_bytes_per_sec: measurement.get_exp_moving_avg_bytes_per_second(),
-                    },
-                );
+            let mut current_bandwidth_bytes_per_sec = 0.0;
+            if let Some(measurement) = m_guard.get(opts) {
+                current_bandwidth_bytes_per_sec = measurement.get_exp_moving_avg_bytes_per_second();
             }
+            bucket_stats.insert(
+                opts.clone(),
+                BandwidthDetails {
+                    limit_bytes_per_sec: throttle.node_bandwidth_per_sec * self.node_count as i64,
+                    current_bandwidth_bytes_per_sec,
+                },
+            );
         }
         BucketBandwidthReport { bucket_stats }
     }
@@ -514,5 +530,60 @@ mod tests {
         let value = measurement.get_exp_moving_avg_bytes_per_second();
         assert!(value.is_finite());
         assert!(value >= 0.0);
+    }
+
+    #[test]
+    fn test_get_report_limit_and_current_bandwidth_after_measurement() {
+        let monitor = Monitor::new(4);
+        monitor.set_bandwidth_limit("b1", "arn1", 400);
+        let opts = BucketOptions {
+            name: "b1".to_string(),
+            replication_arn: "arn1".to_string(),
+        };
+        monitor.init_measurement(&opts);
+        monitor.update_measurement(&opts, 500);
+        monitor.update_measurement(&opts, 500);
+        std::thread::sleep(Duration::from_millis(110));
+        monitor.update_moving_avg();
+
+        let report = monitor.get_report(|name| name == "b1");
+        let details = report.bucket_stats.get(&opts).expect("report should contain b1/arn1");
+        assert_eq!(details.limit_bytes_per_sec, 400);
+        assert!(
+            details.current_bandwidth_bytes_per_sec > 0.0,
+            "current_bandwidth should be positive after update_measurement and update_moving_avg"
+        );
+        assert!(
+            details.current_bandwidth_bytes_per_sec < 20000.0,
+            "current_bandwidth should be in reasonable range"
+        );
+    }
+
+    #[test]
+    fn test_get_report_select_bucket_filters() {
+        let monitor = Monitor::new(2);
+        monitor.set_bandwidth_limit("b1", "arn1", 100);
+        monitor.set_bandwidth_limit("b2", "arn2", 200);
+        let opts_b1 = BucketOptions {
+            name: "b1".to_string(),
+            replication_arn: "arn1".to_string(),
+        };
+        let opts_b2 = BucketOptions {
+            name: "b2".to_string(),
+            replication_arn: "arn2".to_string(),
+        };
+        monitor.init_measurement(&opts_b1);
+        monitor.init_measurement(&opts_b2);
+
+        let report_all = monitor.get_report(|_| true);
+        assert_eq!(report_all.bucket_stats.len(), 2);
+
+        let report_b1 = monitor.get_report(|name| name == "b1");
+        assert_eq!(report_b1.bucket_stats.len(), 1);
+        assert_eq!(report_b1.bucket_stats.get(&opts_b1).unwrap().limit_bytes_per_sec, 100);
+
+        let report_b2 = monitor.get_report(|name| name == "b2");
+        assert_eq!(report_b2.bucket_stats.len(), 1);
+        assert_eq!(report_b2.bucket_stats.get(&opts_b2).unwrap().limit_bytes_per_sec, 200);
     }
 }
