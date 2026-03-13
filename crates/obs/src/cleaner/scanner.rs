@@ -65,7 +65,18 @@ pub(super) fn scan_log_directory(
     let now = SystemTime::now();
 
     // Use read_dir for a lightweight, non-recursive scan.
-    let entries = fs::read_dir(log_dir)?;
+    let entries = match fs::read_dir(log_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // If the log directory does not exist (or was removed), treat this
+            // as "no files found" instead of failing the whole cleanup pass.
+            return Ok(LogScanResult {
+                logs,
+                compressed_archives,
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     for entry in entries {
         let entry = match entry {

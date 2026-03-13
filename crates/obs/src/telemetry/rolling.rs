@@ -46,7 +46,12 @@ impl Rotation {
         match self {
             Rotation::Minutely => now / 60 != last / 60,
             Rotation::Hourly => now / 3600 != last / 3600,
-            Rotation::Daily => now / 86400 != last / 86400,
+            Rotation::Daily => {
+                // Align daily rotation with the local day boundary rather than UTC midnight.
+                // We shift both timestamps by the current local offset before bucketing into days.
+                let offset_secs = Zoned::now().offset().whole_seconds() as i64;
+                (now + offset_secs) / 86400 != (last + offset_secs) / 86400
+            }
             Rotation::Never => false,
         }
     }
@@ -227,7 +232,7 @@ impl RollingAppender {
                     // Decide if we should retry based on error kind
                     let should_retry = match e.kind() {
                         // Windows often returns PermissionDenied for locked files
-                        io::ErrorKind::PermissionDenied | io::ErrorKind::AlreadyExists => true,
+                        io::ErrorKind::PermissionDenied => true,
                         io::ErrorKind::Interrupted => true,
                         _ => false,
                     };
