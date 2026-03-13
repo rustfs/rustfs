@@ -137,7 +137,7 @@ impl Operation for GetReplicationMetricsHandler {
         // TODO cluster cache
         // In actual implementation, statistics would be obtained from cluster
         // This is simplified to get from local cache
-        let mut bucket_stats = match GLOBAL_REPLICATION_STATS.get() {
+        let bucket_stats = match GLOBAL_REPLICATION_STATS.get() {
             Some(s) => s.get_latest_replication_stats(bucket).await,
             None => BucketStats::default(),
         };
