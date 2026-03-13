@@ -138,6 +138,7 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temp_env;
 
     #[test]
     fn test_is_verbose_level() {
@@ -174,5 +175,61 @@ mod tests {
 
         // Case 5: RUST_LOG="rustfs=debug" -> no suppress
         assert!(!should_suppress_noisy_crates("info", None, Some("rustfs=debug")));
+    }
+
+    #[test]
+    fn test_build_env_filter_injects_suppressions_without_rust_log() {
+        // When RUST_LOG is not set and the base level is non-verbose ("info"),
+        // build_env_filter should inject suppression directives for noisy crates.
+        temp_env::with_var("RUST_LOG", None::<&str>, || {
+            let filter = build_env_filter("info", None);
+            let filter_str = filter.to_string();
+
+            for noisy_crate in ["hyper", "tonic", "h2", "reqwest", "tower"] {
+                assert!(
+                    filter_str.contains(noisy_crate),
+                    "expected EnvFilter to contain suppression directive for `{}`; got `{}`",
+                    noisy_crate,
+                    filter_str
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_build_env_filter_respects_verbose_rust_log() {
+        // When RUST_LOG requests a verbose level, automatic noisy-crate suppression
+        // should not be applied, even if the logger_level is non-verbose.
+        temp_env::with_var("RUST_LOG", Some("debug"), || {
+            let filter = build_env_filter("info", None);
+            let filter_str = filter.to_string();
+
+            // We assume "off" is used to silence noisy crates; absence of these
+            // directives indicates that suppression was not injected.
+            for noisy_crate in ["hyper", "tonic", "h2", "reqwest", "tower"] {
+                let directive = format!("{}=off", noisy_crate);
+                assert!(
+                    !filter_str.contains(&directive),
+                    "did not expect EnvFilter to contain `{}` when RUST_LOG is verbose; got `{}`",
+                    directive,
+                    filter_str
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_build_env_filter_precedence_of_rust_log_over_logger_level() {
+        // When default_level is None, RUST_LOG should override logger_level.
+        temp_env::with_var("RUST_LOG", Some("warn"), || {
+            let filter = build_env_filter("debug", None);
+            let filter_str = filter.to_string();
+
+            assert!(
+                filter_str.contains("warn"),
+                "expected EnvFilter to reflect RUST_LOG=warn; got `{}`",
+                filter_str
+            );
+        });
     }
 }
