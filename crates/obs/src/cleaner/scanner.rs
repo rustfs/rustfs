@@ -81,10 +81,11 @@ pub(super) fn scan_log_directory(
         // prevent an attacker from placing a symlink in the log directory
         // and causing the cleaner to read/compress arbitrary files outside
         // the tree.
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(md) => md,
             Err(_) => continue,
         };
+        let file_type = metadata.file_type();
         if !file_type.is_file() {
             continue;
         }
