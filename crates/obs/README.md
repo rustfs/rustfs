@@ -150,11 +150,11 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES`     | `0`          | Per-file size cap; `0` = unlimited                          |
 | `RUSTFS_OBS_LOG_COMPRESS_OLD_FILES`             | `true`       | Gzip-compress files before deleting                         |
 | `RUSTFS_OBS_LOG_GZIP_COMPRESSION_LEVEL`         | `6`          | Gzip level `1` (fastest) – `9` (best)                       |
-| `RUSTFS_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS` | `7`          | Delete `.gz` archives older than N days; `0` = keep forever |
+| `RUSTFS_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS` | `30`         | Delete `.gz` archives older than N days; `0` = keep forever |
 | `RUSTFS_OBS_LOG_EXCLUDE_PATTERNS`               | _(empty)_    | Comma-separated glob patterns to never clean up             |
 | `RUSTFS_OBS_LOG_DELETE_EMPTY_FILES`             | `true`       | Remove zero-byte files                                      |
 | `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS`           | `3600`       | Minimum file age (seconds) before cleanup                   |
-| `RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS`       | `60`         | How often the cleanup task runs (0.5 hours)                 |
+| `RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS`       | `1800`       | How often the cleanup task runs (0.5 hours)                 |
 | `RUSTFS_OBS_LOG_DRY_RUN`                        | `false`      | Report deletions without actually removing files            |
 
 ---

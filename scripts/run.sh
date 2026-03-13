@@ -36,7 +36,7 @@ mkdir -p ./target/volume/test{1..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-    export RUST_LOG="rustfs=debug,rustfs_ecstore=info,s3s=debug,rustfs_iam=info,rustfs_notify=info"
+    export RUST_LOG="info,rustfs=debug,rustfs_ecstore=info,s3s=debug,rustfs_iam=info,rustfs_notify=info"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -74,6 +74,8 @@ export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="minutely" # Log rotation time unit, can be "minutely", "hourly", "daily"
 export RUSTFS_OBS_LOG_KEEP_FILES=10 # Number of log files to keep
 export RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS=30
+export RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS=60
+export RUSTFS_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS=7
 
 
 #tokio runtime

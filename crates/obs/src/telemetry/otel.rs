@@ -171,8 +171,8 @@ pub(super) fn init_observability_http(
     // ── Case 1: OTLP Logging
     if !log_ep.is_empty() {
         // Init OTLP logger logic.
-        // We initialize the OTLP collector but EXPLICITLY disable stdout output in the provider builder
-        // (use_stdout = false), as per requirement.
+        // We initialize the OTLP collector and honor the configured stdout setting
+        // (e.g. via RUSTFS_OBS_USE_STDOUT / config.use_stdout) when building the provider.
         logger_provider = build_logger_provider(&log_ep, config, res, false)?;
 
         // Build bridge to capture `tracing` events.
@@ -180,13 +180,13 @@ pub(super) fn init_observability_http(
             .as_ref()
             .map(|p| OpenTelemetryTracingBridge::new(p).with_filter(build_env_filter(logger_level, None)));
 
-        // Note: We do NOT create a separate `fmt_layer_opt` here, effectively disabling OTLP-path stdout.
+        // Note: We do NOT create a separate `fmt_layer_opt` here; stdout behavior is driven by the provider.
     }
     let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
     // ── Case 2: File Logging
     // Supplement: If log_directory is set and no OTLP log endpoint is configured, we enable file logging logic.
     if let Some(log_directory) = config.log_directory.as_deref().filter(|s| !s.is_empty())
-        && log_ep.is_empty()
+        && logger_provider.is_none()
     {
         let log_filename = config.log_filename.as_deref().unwrap_or(&service_name);
         let keep_files = config.log_keep_files.unwrap_or(DEFAULT_LOG_KEEP_FILES);
