@@ -23,6 +23,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Rotation {
@@ -32,6 +33,11 @@ pub enum Rotation {
     #[allow(dead_code)]
     Never,
 }
+
+/// Global per-process counter used to disambiguate archive filenames that
+/// may otherwise collide when multiple rotations occur within the same
+/// SystemTime tick.
+static ROLL_UNIQUIFIER: AtomicU64 = AtomicU64::new(0);
 
 impl Rotation {
     fn check_should_roll(&self, last: u64, now: u64) -> bool {
@@ -167,22 +173,25 @@ impl RollingAppender {
         }
 
         // 2. Generate archive name.
-        // Use nanosecond resolution to reduce same-second collision risk
-        // (e.g. rapid size-based rotations during log bursts).
+        // Use nanosecond resolution plus a per-process monotonic counter to
+        // avoid collisions even when multiple rotations happen within the
+        // same SystemTime tick (e.g. rapid size-based rotations during
+        // log bursts).
         let now_duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         let now_ts = now_duration.as_secs();
-        let unique_suffix = now_duration.as_nanos();
+        let counter = ROLL_UNIQUIFIER.fetch_add(1, Ordering::Relaxed);
+        let unique_suffix = format!("{}-{}", now_duration.as_nanos(), counter);
 
         // Match naming strategy with LogCleaner expectations.
         let base_archive_name = match self.match_mode {
             FileMatchMode::Suffix => {
                 // Suffix mode: timestamp BEFORE filename.
-                // e.g. rustfs.log -> 1678886400123456789.rustfs.log
+                // e.g. rustfs.log -> 1678886400123456789-0.rustfs.log
                 format!("{}.{}", unique_suffix, self.filename)
             }
             FileMatchMode::Prefix => {
                 // Prefix mode: timestamp AFTER filename.
-                // e.g. rustfs -> rustfs.1678886400123456789
+                // e.g. rustfs -> rustfs.1678886400123456789-0
                 format!("{}.{}", self.filename, unique_suffix)
             }
         };
@@ -190,12 +199,10 @@ impl RollingAppender {
         // 3. Rename the active file to the archive path.
         //
         // On POSIX `fs::rename` is atomic but will silently overwrite any
-        // existing destination.  An `exists()` pre-check would appear to help
-        // but is inherently racy (TOCTOU), so we instead rely on the
-        // nanosecond timestamp in the archive name to make collisions
-        // exceedingly unlikely in practice.  The active file is only rotated
-        // once per write cycle, so two rotations in the same nanosecond would
-        // require sub-nanosecond log bursts which are not realistic.
+        // existing destination. Because we include both a high-resolution
+        // timestamp and a per-process monotonic counter in the archive name,
+        // archive name collisions (and thus overwrites) are effectively
+        // prevented without relying on a racy existence check.
         let archive_path = self.dir.join(&base_archive_name);
         if let Err(e) = fs::rename(&active_path, &archive_path) {
             return Err(e);
