@@ -38,6 +38,7 @@ rustfs-config = { workspace = true, features = ["constants", "observability"] }
 rustfs-utils = { workspace = true, features = ["ip", "path"] }
 flate2 = { workspace = true }
 glob = { workspace = true }
+jiff = { workspace = true }
 metrics = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }

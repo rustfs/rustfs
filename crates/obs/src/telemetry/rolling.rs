@@ -19,11 +19,11 @@
 //! log files do not grow indefinitely by rotating them when they exceed a configured size.
 
 use crate::cleaner::types::FileMatchMode;
+use jiff::Zoned;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Rotation {
@@ -36,11 +36,11 @@ pub enum Rotation {
 
 /// Global per-process counter used to disambiguate archive filenames that
 /// may otherwise collide when multiple rotations occur within the same
-/// SystemTime tick.
+/// timestamp tick.
 static ROLL_UNIQUIFIER: AtomicU64 = AtomicU64::new(0);
 
 impl Rotation {
-    fn check_should_roll(&self, last: u64, now: u64) -> bool {
+    fn check_should_roll(&self, last: i64, now: i64) -> bool {
         match self {
             Rotation::Minutely => now / 60 != last / 60,
             Rotation::Hourly => now / 3600 != last / 3600,
@@ -59,7 +59,8 @@ pub struct RollingAppender {
 
     file: Option<File>,
     size: u64,
-    last_roll_ts: u64,
+    // Store as seconds since Unix epoch
+    last_roll_ts: i64,
 }
 
 impl RollingAppender {
@@ -105,7 +106,7 @@ impl RollingAppender {
             match_mode,
             file: None,
             size: 0,
-            last_roll_ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            last_roll_ts: Zoned::now().timestamp().as_second(),
         };
         // Eagerly open the file to validate the path and capture accurate
         // initial size / last-roll timestamp.
@@ -136,13 +137,12 @@ impl RollingAppender {
 
         // Seed `last_roll_ts` from the file's modification time so that a
         // process restart correctly triggers time-based rotation if the active
-        // file belongs to a previous period (e.g. yesterday's file opened
-        // after midnight).  If `mtime` is unavailable, fall back to the
-        // current time (already set in `new`).
-        if let Ok(modified) = meta.modified()
-            && let Ok(dur) = modified.duration_since(UNIX_EPOCH)
-        {
-            self.last_roll_ts = dur.as_secs();
+        // file belongs to a previous period.
+        if let Ok(modified) = meta.modified() {
+             // Convert SystemTime to jiff::Timestamp
+             if let Ok(ts) = jiff::Timestamp::try_from(modified) {
+                 self.last_roll_ts = ts.as_second();
+             }
         }
 
         self.file = Some(file);
@@ -156,9 +156,9 @@ impl RollingAppender {
             return true;
         }
 
-        // 2. Time-based check (Requires syscall for time)
+        // 2. Time-based check
         // We check this after size check to avoid unnecessary time calls if size forces a roll.
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = Zoned::now().timestamp().as_second();
 
         self.rotation.check_should_roll(self.last_roll_ts, now)
     }
@@ -174,26 +174,29 @@ impl RollingAppender {
         }
 
         // 2. Generate archive name.
-        // Use nanosecond resolution plus a per-process monotonic counter to
-        // avoid collisions even when multiple rotations happen within the
-        // same SystemTime tick (e.g. rapid size-based rotations during
-        // log bursts).
-        let now_duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-        let now_ts = now_duration.as_secs();
+        // Format: YYYYMMDDHHMMSS.uuuuuu (Microsecond/Nanosecond precision)
+        // We use jiff's strftime. "%Y%m%d%H%M%S%.6f" gives microsecond precision.
+        let now = Zoned::now();
+        let timestamp_str = now.strftime("%Y%m%d%H%M%S%.6f").to_string();
+
+        // Add a unique counter to prevent collisions in high-concurrency/fast-rotation scenarios.
         let counter = ROLL_UNIQUIFIER.fetch_add(1, Ordering::Relaxed);
-        let unique_suffix = format!("{}-{}", now_duration.as_nanos(), counter);
+
+        // Final suffix/prefix part: timestamp + counter
+        // Example: 20231027103001.123456-0
+        let unique_part = format!("{}-{}", timestamp_str, counter);
 
         // Match naming strategy with LogCleaner expectations.
-        let base_archive_name = match self.match_mode {
+        let archive_name = match self.match_mode {
             FileMatchMode::Suffix => {
                 // Suffix mode: timestamp BEFORE filename.
-                // e.g. rustfs.log -> 1678886400123456789-0.rustfs.log
-                format!("{}.{}", unique_suffix, self.filename)
+                // e.g. rustfs.log -> 20231027103001.123456-0.rustfs.log
+                format!("{}.{}", unique_part, self.filename)
             }
             FileMatchMode::Prefix => {
                 // Prefix mode: timestamp AFTER filename.
-                // e.g. rustfs -> rustfs.1678886400123456789-0
-                format!("{}.{}", self.filename, unique_suffix)
+                // e.g. rustfs -> rustfs.20231027103001.123456-0
+                format!("{}.{}", self.filename, unique_part)
             }
         };
 
@@ -204,12 +207,12 @@ impl RollingAppender {
         // timestamp and a per-process monotonic counter in the archive name,
         // archive name collisions (and thus overwrites) are effectively
         // prevented without relying on a racy existence check.
-        let archive_path = self.dir.join(&base_archive_name);
+        let archive_path = self.dir.join(&archive_name);
         fs::rename(&active_path, &archive_path)?;
 
         // 4. Reset state
         self.size = 0;
-        self.last_roll_ts = now_ts;
+        self.last_roll_ts = now.timestamp().as_second();
 
         // 5. Re-open (creates new active file)
         self.open_file()?;
@@ -397,10 +400,20 @@ mod tests {
             .collect();
 
         assert_eq!(archives.len(), 1);
-        // Suffix mode: "<nanos>.app.log"
+        // Suffix mode: "<timestamp>-<counter>.app.log"
+        // Since timestamp contains digits and we use high precision, checking strictly is hard,
+        // but it should definitely NOT be the old unix timestamp format (just digits).
+        // It should contain "-" before "app.log" due to our new format.
         assert!(
             archives[0].ends_with(".app.log"),
             "archive should end with '.app.log' in Suffix mode; got '{}'",
+            archives[0]
+        );
+        // Check for new format chars (YMD)
+        // 20xx...
+        assert!(
+            archives[0].starts_with("20"),
+            "archive should start with year (20xx); got '{}'",
             archives[0]
         );
     }
@@ -422,10 +435,10 @@ mod tests {
             .collect();
 
         assert_eq!(archives.len(), 1);
-        // Prefix mode: "app.<nanos>"
+        // Prefix mode: "app.<timestamp>-<counter>"
         assert!(
-            archives[0].starts_with("app."),
-            "archive should start with 'app.' in Prefix mode; got '{}'",
+            archives[0].starts_with("app.20"),
+            "archive should start with 'app.20' in Prefix mode; got '{}'",
             archives[0]
         );
     }

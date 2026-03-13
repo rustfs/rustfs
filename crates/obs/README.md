@@ -10,7 +10,7 @@ logging, distributed tracing, and metrics via OpenTelemetry.
 | Feature | Description |
 |---------|-------------|
 | **Structured logging** | JSON-formatted logs via `tracing-subscriber` |
-| **Rolling-file logging** | Daily / hourly rotation with automatic cleanup |
+| **Rolling-file logging** | Daily / hourly rotation with automatic cleanup and high-precision timestamps |
 | **Distributed tracing** | OTLP/HTTP export to Jaeger, Tempo, or any OTel collector |
 | **Metrics** | OTLP/HTTP export, bridged from the `metrics` crate facade |
 | **Log cleanup** | Background task: size limits, gzip compression, retention policies |
@@ -132,7 +132,7 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_LOGGER_LEVEL` | `info` | Log level; `RUST_LOG` syntax supported |
 | `RUSTFS_OBS_LOG_STDOUT_ENABLED` | `false` | When file logging is active, also mirror to stdout |
 | `RUSTFS_OBS_LOG_DIRECTORY` | _(empty)_ | **Directory for rolling log files. When empty, logs go to stdout only** |
-| `RUSTFS_OBS_LOG_FILENAME` | `rustfs.log` | Base filename for rolling logs (date suffix added automatically) |
+| `RUSTFS_OBS_LOG_FILENAME` | `rustfs.log` | Base filename for rolling logs. A high-precision timestamp is added automatically (e.g., `rustfs.log.20231027103001.123456-0`). |
 | `RUSTFS_OBS_LOG_ROTATION_TIME` | `hourly` | Rotation granularity: `minutely`, `hourly`, or `daily` |
 | `RUSTFS_OBS_LOG_KEEP_FILES` | `30` | Number of rolling files to keep (also used by cleaner) |
 | `RUSTFS_OBS_LOG_MATCH_MODE` | `suffix` | File matching mode: `prefix` or `suffix` |
@@ -247,21 +247,23 @@ use std::path::PathBuf;
 use rustfs_obs::LogCleaner;
 use rustfs_obs::types::FileMatchMode;
 
-let cleaner = LogCleaner::new(
+let cleaner = LogCleaner::builder(
     PathBuf::from("/var/log/rustfs"),
     "rustfs.log.".to_string(),  // file_pattern
-    FileMatchMode::Prefix,       // match_mode
-    10,                          // keep_count
-    2 * 1024 * 1024 * 1024,      // max_total_size_bytes (2 GiB)
-    0,                           // max_single_file_size_bytes (unlimited)
-    true,                        // compress_old_files
-    6,                           // gzip_compression_level
-    30,                          // compressed_file_retention_days
-    vec!["current.log".to_string()], // exclude_patterns
-    true,                        // delete_empty_files
-    3600,                        // min_file_age_seconds (1 hour)
-    false,                       // dry_run
-);
+    "rustfs.log".to_string(),   // active_filename
+)
+.match_mode(FileMatchMode::Prefix)
+.keep_files(10)
+.max_total_size_bytes(2 * 1024 * 1024 * 1024) // 2 GiB
+.max_single_file_size_bytes(0) // unlimited
+.compress_old_files(true)
+.gzip_compression_level(6)
+.compressed_file_retention_days(30)
+.exclude_patterns(vec!["current.log".to_string()])
+.delete_empty_files(true)
+.min_file_age_seconds(3600) // 1 hour
+.dry_run(false)
+.build();
 
 let (deleted, freed_bytes) = cleaner.cleanup().expect("cleanup failed");
 println!("Deleted {deleted} files, freed {freed_bytes} bytes");
