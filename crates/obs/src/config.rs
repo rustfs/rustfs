@@ -210,7 +210,11 @@ impl OtelConfig {
 
         // `log_keep_files` is the single source of truth for file retention count.
         // It defaults to `DEFAULT_LOG_KEEP_FILES` (30).
-        let log_keep_files = Some(get_env_usize(ENV_OBS_LOG_KEEP_FILES, DEFAULT_LOG_KEEP_FILES));
+        let mut log_keep_files = get_env_usize(ENV_OBS_LOG_KEEP_FILES, DEFAULT_LOG_KEEP_FILES);
+        if log_keep_files == 0 {
+            log_keep_files = DEFAULT_LOG_KEEP_FILES;
+        }
+        let log_keep_files = Some(log_keep_files);
 
         // `log_rotation_time` drives the rolling-appender rotation period.
         let log_rotation_time = Some(get_env_str(ENV_OBS_LOG_ROTATION_TIME, DEFAULT_LOG_ROTATION_TIME));
