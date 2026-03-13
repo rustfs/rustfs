@@ -912,8 +912,76 @@ where
                 return Err(FsError::Forbidden);
             }
 
-            if key.is_some() {
-                // S3 doesn't have real directories, just return success
+            if let Some(prefix) = key {
+                // Delete all objects with this prefix (subdirectory)
+                let prefix_with_slash = if prefix.ends_with('/') {
+                    prefix.to_string()
+                } else {
+                    format!("{}/", prefix)
+                };
+
+                authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&prefix_with_slash))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+
+                // List and delete all objects with this prefix
+                let mut continuation_token = None;
+                loop {
+                    let mut list_input = ListObjectsV2Input::builder()
+                        .bucket(bucket.clone())
+                        .prefix(Some(prefix_with_slash.clone()));
+
+                    if let Some(token) = continuation_token {
+                        list_input = list_input.continuation_token(token);
+                    }
+
+                    let list_input = list_input.build().map_err(|_| FsError::GeneralFailure)?;
+
+                    if let Ok(output) = self
+                        .storage
+                        .list_objects_v2(
+                            list_input,
+                            &self.session_context.principal.user_identity.credentials.access_key,
+                            &self.session_context.principal.user_identity.credentials.secret_key,
+                        )
+                        .await
+                    {
+                        if let Some(objects) = output.contents {
+                            for obj in objects {
+                                if let Some(obj_key) = obj.key {
+                                    let _ = self
+                                        .storage
+                                        .delete_object(
+                                            &bucket,
+                                            &obj_key,
+                                            &self.session_context.principal.user_identity.credentials.access_key,
+                                            &self.session_context.principal.user_identity.credentials.secret_key,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+
+                        if !output.is_truncated.unwrap_or(false) {
+                            break;
+                        }
+                        continuation_token = Some(output.next_continuation_token);
+                    } else {
+                        break;
+                    }
+                }
+
+                // Also delete the directory marker itself
+                let _ = self
+                    .storage
+                    .delete_object(
+                        &bucket,
+                        &prefix_with_slash,
+                        &self.session_context.principal.user_identity.credentials.access_key,
+                        &self.session_context.principal.user_identity.credentials.secret_key,
+                    )
+                    .await;
+
                 return Ok(());
             }
 
