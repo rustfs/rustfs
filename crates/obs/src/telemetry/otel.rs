@@ -184,7 +184,7 @@ pub(super) fn init_observability_http(
     }
     let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
     // ── Case 2: File Logging
-    // Supplement: If log_directory is set, we enable file logging logic concurrently with OTLP logging.
+    // Supplement: If log_directory is set and no OTLP log endpoint is configured, we enable file logging logic.
     if let Some(log_directory) = config.log_directory.as_deref().filter(|s| !s.is_empty())
         && log_ep.is_empty()
     {
