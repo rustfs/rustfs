@@ -76,11 +76,12 @@ pub(super) fn scan_log_directory(
         let path = entry.path();
 
         // We only care about regular files inside the log directory.
-        // Use `DirEntry::file_type()` (which does *not* follow symlinks on
-        // Unix) rather than `Path::is_file()` (which follows them) to
-        // prevent an attacker from placing a symlink in the log directory
-        // and causing the cleaner to read/compress arbitrary files outside
-        // the tree.
+        // Use `fs::symlink_metadata` (which does *not* follow symlinks) for
+        // both the file-type check *and* size/mtime collection below.  Using
+        // `entry.metadata()` or `Path::is_file()` (both of which follow
+        // symlinks) would allow a symlink placed in the log directory to reach
+        // files outside the tree, and would introduce a TOCTOU window between
+        // the type-check and the metadata read.
         let metadata = match fs::symlink_metadata(&path) {
             Ok(md) => md,
             Err(_) => continue,
@@ -129,11 +130,8 @@ pub(super) fn scan_log_directory(
             continue;
         }
 
-        // 4. Gather metadata (only for interesting files).
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        // 4. Gather size and mtime from the already-fetched symlink_metadata
+        // (reuse; no second syscall, no symlink following).
         let file_size = metadata.len();
         let modified = match metadata.modified() {
             Ok(t) => t,

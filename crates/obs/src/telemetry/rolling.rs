@@ -22,8 +22,8 @@ use crate::cleaner::types::FileMatchMode;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Rotation {
@@ -140,9 +140,10 @@ impl RollingAppender {
         // after midnight).  If `mtime` is unavailable, fall back to the
         // current time (already set in `new`).
         if let Ok(modified) = meta.modified()
-            && let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
-                self.last_roll_ts = dur.as_secs();
-            }
+            && let Ok(dur) = modified.duration_since(UNIX_EPOCH)
+        {
+            self.last_roll_ts = dur.as_secs();
+        }
 
         self.file = Some(file);
         Ok(())
@@ -204,9 +205,7 @@ impl RollingAppender {
         // archive name collisions (and thus overwrites) are effectively
         // prevented without relying on a racy existence check.
         let archive_path = self.dir.join(&base_archive_name);
-        if let Err(e) = fs::rename(&active_path, &archive_path) {
-            return Err(e);
-        }
+        fs::rename(&active_path, &archive_path)?;
 
         // 4. Reset state
         self.size = 0;
@@ -317,8 +316,7 @@ mod tests {
     #[test]
     fn test_new_rejects_backslash_path_separator_on_windows() {
         let tmp = TempDir::new().unwrap();
-        let result =
-            RollingAppender::new(tmp.path(), "subdir\\app.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix);
+        let result = RollingAppender::new(tmp.path(), "subdir\\app.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix);
         assert!(result.is_err(), "backslash path separator in filename must be rejected on Windows");
     }
 
