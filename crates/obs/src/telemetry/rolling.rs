@@ -189,7 +189,10 @@ impl RollingAppender {
         // 1. Close current file first to ensure all buffers are flushed to OS (if any)
         // and handle released.
         if let Some(mut file) = self.file.take() {
-            let _ = file.flush();
+            if let Err(e) = file.flush() {
+                eprintln!("Failed to flush log file before rotation: {}", e);
+                return Err(e);
+            }
         }
 
         let active_path = self.active_file_path();
