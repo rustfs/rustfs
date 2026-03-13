@@ -413,11 +413,12 @@ async fn run(config: config::Config) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
+    try_migrate_bucket_metadata(store.clone()).await;
+
     if let Some(pool) = get_global_replication_pool() {
         pool.init_resync(ctx.clone(), buckets.clone()).await?;
     }
 
-    try_migrate_bucket_metadata(store.clone()).await;
     try_migrate_iam_config(store.clone()).await;
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 

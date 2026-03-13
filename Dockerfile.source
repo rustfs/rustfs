@@ -157,11 +157,7 @@ WORKDIR /app
 ENV CARGO_INCREMENTAL=1
 
 # Ensure we have the same default env vars available
-ENV RUSTFS_ADDRESS=":9000" \
-    RUSTFS_ACCESS_KEY="rustfsadmin" \
-    RUSTFS_SECRET_KEY="rustfsadmin" \
-    RUSTFS_CONSOLE_ENABLE="true" \
-    RUSTFS_VOLUMES="/data" \
+ENV RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
     RUSTFS_OBS_LOG_DIRECTORY="/logs" \
     RUSTFS_USERNAME="rustfs" \
@@ -222,11 +218,7 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /usr/bin/rustfs /entrypoint.sh
 
 # Default environment (override in docker run/compose as needed)
-ENV RUSTFS_ADDRESS=":9000" \
-    RUSTFS_ACCESS_KEY="rustfsadmin" \
-    RUSTFS_SECRET_KEY="rustfsadmin" \
-    RUSTFS_CONSOLE_ENABLE="true" \
-    RUSTFS_VOLUMES="/data" \
+ENV RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
     RUSTFS_USERNAME="rustfs" \
     RUSTFS_GROUPNAME="rustfs" \
