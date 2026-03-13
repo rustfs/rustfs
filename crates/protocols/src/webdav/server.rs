@@ -17,8 +17,8 @@ use super::driver::WebDavDriver;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
 use bytes::Bytes;
-use dav_server::fakels::FakeLs;
 use dav_server::DavHandler;
+use dav_server::fakels::FakeLs;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -78,7 +78,9 @@ where
 
                 let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-                let server_config = ServerConfig::builder().with_no_client_auth().with_cert_resolver(Arc::new(resolver));
+                let server_config = ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(resolver));
 
                 Some(TlsAcceptor::from(Arc::new(server_config)))
             } else {
@@ -274,7 +276,11 @@ where
 
         info!("WebDAV user '{}' authenticated successfully", access_key);
 
-        Ok(SessionContext::new(ProtocolPrincipal::new(Arc::new(identity)), Protocol::WebDav, source_ip))
+        Ok(SessionContext::new(
+            ProtocolPrincipal::new(Arc::new(identity)),
+            Protocol::WebDav,
+            source_ip,
+        ))
     }
 
     /// Get server configuration

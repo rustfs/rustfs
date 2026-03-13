@@ -18,8 +18,7 @@ use crate::common::session::SessionContext;
 use bytes::Bytes;
 use dav_server::davpath::DavPath;
 use dav_server::fs::{
-    DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, FsStream, OpenOptions,
-    ReadDirMeta,
+    DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, FsStream, OpenOptions, ReadDirMeta,
 };
 use futures_util::{FutureExt, StreamExt, stream};
 use rustfs_utils::path;
@@ -387,7 +386,10 @@ where
 {
     /// Create a new WebDAV driver with the given storage backend and session context
     pub fn new(storage: S, session_context: Arc<SessionContext>) -> Self {
-        Self { storage, session_context }
+        Self {
+            storage,
+            session_context,
+        }
     }
 
     /// Parse WebDAV path to bucket and object key

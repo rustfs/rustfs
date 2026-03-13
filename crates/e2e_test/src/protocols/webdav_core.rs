@@ -85,10 +85,7 @@ pub async fn test_webdav_core_operations() -> Result<()> {
         let bucket_name = "webdav-test-bucket";
         info!("Testing WebDAV: MKCOL (create bucket '{}')", bucket_name);
         let resp = client
-            .request(
-                reqwest::Method::from_bytes(b"MKCOL").unwrap(),
-                format!("{}/{}", base_url, bucket_name),
-            )
+            .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), format!("{}/{}", base_url, bucket_name))
             .header("Authorization", &auth_header)
             .send()
             .await?;
@@ -125,19 +122,13 @@ pub async fn test_webdav_core_operations() -> Result<()> {
             .await?;
         assert!(resp.status().is_success(), "GET should succeed, got: {}", resp.status());
         let downloaded_content = resp.text().await?;
-        assert_eq!(
-            downloaded_content, file_content,
-            "Downloaded content should match uploaded content"
-        );
+        assert_eq!(downloaded_content, file_content, "Downloaded content should match uploaded content");
         info!("PASS: GET file '{}' successful, content matches", filename);
 
         // Test PROPFIND on bucket (list objects)
         info!("Testing WebDAV: PROPFIND on bucket (list objects)");
         let resp = client
-            .request(
-                reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
-                format!("{}/{}", base_url, bucket_name),
-            )
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), format!("{}/{}", base_url, bucket_name))
             .header("Authorization", &auth_header)
             .header("Depth", "1")
             .send()
@@ -200,12 +191,7 @@ pub async fn test_webdav_core_operations() -> Result<()> {
             .header("Authorization", "Basic aW52YWxpZDppbnZhbGlk") // invalid:invalid
             .send()
             .await?;
-        assert_eq!(
-            resp.status().as_u16(),
-            401,
-            "Invalid auth should return 401, got: {}",
-            resp.status()
-        );
+        assert_eq!(resp.status().as_u16(), 401, "Invalid auth should return 401, got: {}", resp.status());
         info!("PASS: Authentication failure test successful");
 
         info!("WebDAV core tests passed");
