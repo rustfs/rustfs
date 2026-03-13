@@ -36,7 +36,7 @@ mkdir -p ./target/volume/test{1..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug,iam=info,notify=info"
+    export RUST_LOG="rustfs=debug,rustfs_ecstore=info,s3s=debug,rustfs_iam=info,rustfs_notify=info"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -69,18 +69,17 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
 export RUSTFS_OBS_ENVIRONMENT=production # Environment name development, staging, production
 export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
-export RUSTFS_OBS_LOG_STDOUT_ENABLED=false # Whether to enable local stdout logging
+export RUSTFS_OBS_LOG_STDOUT_ENABLED=true # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="minutely" # Log rotation time unit, can be "minutely", "hourly", "daily"
-export RUSTFS_OBS_LOG_KEEP_FILES=30 # Number of log files to keep
-export RUSTFS_OBS_LOG_MESSAGE_CAPA=32768 # Log message capacity
-export RUSTFS_OBS_LOG_FLUSH_MS=300 # Log flush interval in milliseconds
+export RUSTFS_OBS_LOG_KEEP_FILES=10 # Number of log files to keep
+export RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS=30
+
 
 #tokio runtime
 export RUSTFS_RUNTIME_WORKER_THREADS=16
 export RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=1024
 export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=false
-export RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS=300
 # shellcheck disable=SC2125
 export RUSTFS_RUNTIME_THREAD_STACK_SIZE=1024*1024
 export RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=60

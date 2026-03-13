@@ -136,24 +136,39 @@ impl RollingAppender {
             fs::create_dir_all(parent)?;
         }
 
-        // Open in append mode
-        let file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        // Add retry logic to handle transient FS issues (e.g. anti-virus, indexing, or quick rename race)
+        const MAX_RETRIES: u32 = 3;
+        let mut last_error = None;
 
-        let meta = file.metadata()?;
-        self.size = meta.len();
+        for i in 0..MAX_RETRIES {
+            // Open in append mode
+            match fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(file) => {
+                    let meta = file.metadata()?;
+                    self.size = meta.len();
 
-        // Seed `last_roll_ts` from the file's modification time so that a
-        // process restart correctly triggers time-based rotation if the active
-        // file belongs to a previous period.
-        if let Ok(modified) = meta.modified() {
-            // Convert SystemTime to jiff::Timestamp
-            if let Ok(ts) = jiff::Timestamp::try_from(modified) {
-                self.last_roll_ts = ts.as_second();
+                    // Seed `last_roll_ts` from the file's modification time so that a
+                    // process restart correctly triggers time-based rotation if the active
+                    // file belongs to a previous period.
+                    if let Ok(modified) = meta.modified() {
+                        // Convert SystemTime to jiff::Timestamp
+                        if let Ok(ts) = jiff::Timestamp::try_from(modified) {
+                            self.last_roll_ts = ts.as_second();
+                        }
+                    }
+
+                    self.file = Some(file);
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    // Exponential backoff: 10ms, 20ms, 40ms
+                    thread::sleep(Duration::from_millis(10 * (1 << i)));
+                }
             }
         }
 
-        self.file = Some(file);
-        Ok(())
+        Err(last_error.unwrap_or_else(|| io::Error::other("Failed to open log file after retries")))
     }
 
     fn should_roll(&self, write_len: u64) -> bool {
@@ -173,7 +188,9 @@ impl RollingAppender {
     fn roll(&mut self) -> io::Result<()> {
         // 1. Close current file first to ensure all buffers are flushed to OS (if any)
         // and handle released.
-        self.file = None;
+        if let Some(mut file) = self.file.take() {
+            let _ = file.flush();
+        }
 
         let active_path = self.active_file_path();
         if !active_path.exists() {
@@ -222,10 +239,14 @@ impl RollingAppender {
                     // Success!
                     // 4. Reset state
                     self.size = 0;
-                    self.last_roll_ts = now.timestamp().as_second();
 
                     // 5. Re-open (creates new active file)
                     self.open_file()?;
+
+                    // Explicitly update last_roll_ts to the rotation time.
+                    // This overrides whatever open_file() derived from mtime, ensuring
+                    // we stick to the logical rotation time.
+                    self.last_roll_ts = now.timestamp().as_second();
                     return Ok(());
                 }
                 Err(e) => {
