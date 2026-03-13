@@ -184,7 +184,7 @@ atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.15" }
 aws-credential-types = { version = "1.2.14" }
-aws-sdk-s3 = { version = "1.125.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.126.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-http-client = { version = "1.1.12", default-features = false, features = ["default-client", "rustls-aws-lc"] }
 aws-smithy-types = { version = "1.4.6" }
 backtrace = "0.3.76"
@@ -192,7 +192,7 @@ base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"
 cfg-if = "1.0.4"
-clap = { version = "4.5.60", features = ["derive", "env"] }
+clap = { version = "4.6.0", features = ["derive", "env"] }
 const-str = { version = "1.1.0", features = ["std", "proc"] }
 convert_case = "0.11.0"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -203,8 +203,8 @@ enumset = "1.1.10"
 faster-hex = "0.10.0"
 flate2 = "1.1.9"
 glob = "0.3.3"
-google-cloud-storage = "1.8.0"
-google-cloud-auth = "1.6.0"
+google-cloud-storage = "1.9.0"
+google-cloud-auth = "1.7.0"
 hashbrown = { version = "0.16.1", features = ["serde", "rayon"] }
 hex = "0.4.3"
 hex-simd = "0.8.0"
