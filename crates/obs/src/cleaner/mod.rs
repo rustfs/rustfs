@@ -135,11 +135,15 @@ mod tests {
         create_log_file(&dir, "app.log.2024-01-02", 1024)?;
         create_log_file(&dir, "other.log", 512)?; // different prefix
 
+        // keep_files=1 and max_bytes=1500: deleting one managed file (1024 bytes) leaves
+        // a single managed file of 1024 bytes, which satisfies both the file-count and
+        // size limits.  "other.log" (different prefix) must never be touched.
         let cleaner = make_cleaner(dir.clone(), 1, 1500);
         let (deleted, _) = cleaner.cleanup()?;
 
-        // "other.log" must not be counted or deleted.
+        // "other.log" must not be counted or deleted; only 1 managed file removed.
         assert_eq!(deleted, 1, "only managed files should be deleted");
+        assert!(dir.join("other.log").exists(), "unrelated file must not be deleted");
         Ok(())
     }
 

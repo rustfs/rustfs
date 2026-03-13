@@ -14,8 +14,10 @@
 
 //! Filesystem scanner for discovering log files eligible for cleanup.
 //!
-//! This module is intentionally kept read-only: it does **not** delete or
-//! compress any files — it only reports what it found.
+//! This module is primarily read-only: it reports what files it found.
+//! The one exception is zero-byte file removal — when `delete_empty_files`
+//! is enabled, `scan_log_directory` removes empty regular files as part of
+//! the scan so that they are not counted in retention calculations.
 
 use super::types::{FileInfo, FileMatchMode};
 use rustfs_config::observability::DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION;
@@ -44,8 +46,9 @@ pub(super) struct LogScanResult {
 /// * `match_mode` - Whether to match by prefix or suffix.
 /// * `exclude_patterns` - Compiled glob patterns; matching files are skipped.
 /// * `min_file_age_seconds` - Files younger than this threshold are skipped (for regular logs).
-/// * `delete_empty_files` - When `true`, zero-byte files trigger an immediate
-///   delete by the caller before the rest of cleanup runs.
+/// * `delete_empty_files` - When `true`, zero-byte regular files that match
+///   the pattern are deleted immediately inside this function and excluded
+///   from the returned [`LogScanResult`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_log_directory(
     log_dir: &Path,
@@ -72,8 +75,19 @@ pub(super) fn scan_log_directory(
 
         let path = entry.path();
 
-        // We only care about files, not subdirectories.
-        if !path.is_file() {
+        // We only care about regular files inside the log directory.
+        // Use `fs::symlink_metadata` (which does *not* follow symlinks) for
+        // both the file-type check *and* size/mtime collection below.  Using
+        // `entry.metadata()` or `Path::is_file()` (both of which follow
+        // symlinks) would allow a symlink placed in the log directory to reach
+        // files outside the tree, and would introduce a TOCTOU window between
+        // the type-check and the metadata read.
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(md) => md,
+            Err(_) => continue,
+        };
+        let file_type = metadata.file_type();
+        if !file_type.is_file() {
             continue;
         }
 
@@ -116,11 +130,8 @@ pub(super) fn scan_log_directory(
             continue;
         }
 
-        // 4. Gather metadata (only for interesting files).
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        // 4. Gather size and mtime from the already-fetched symlink_metadata
+        // (reuse; no second syscall, no symlink following).
         let file_size = metadata.len();
         let modified = match metadata.modified() {
             Ok(t) => t,

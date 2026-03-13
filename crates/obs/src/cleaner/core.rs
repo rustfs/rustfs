@@ -26,6 +26,7 @@
 use super::compress::compress_file;
 use super::scanner::{LogScanResult, scan_log_directory};
 use super::types::{FileInfo, FileMatchMode};
+use rustfs_config::DEFAULT_LOG_KEEP_FILES;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use tracing::{debug, error, info};
@@ -127,7 +128,7 @@ impl LogCleaner {
             let total_size: u64 = logs.iter().map(|f| f.size).sum();
 
             info!(
-                "Found {} log archives, total size: {} bytes ({:.2} MB)",
+                "Found {} regular log files, total size: {} bytes ({:.2} MB)",
                 logs.len(),
                 total_size,
                 total_size as f64 / 1024.0 / 1024.0
@@ -337,7 +338,10 @@ impl LogCleanerBuilder {
             file_pattern: file_pattern.into(),
             active_filename: active_filename.into(),
             match_mode: FileMatchMode::Prefix,
-            keep_files: 0,
+            // Default to a safe non-zero value so that a builder created
+            // without an explicit `keep_files()` call does not immediately
+            // delete all matching log files.
+            keep_files: DEFAULT_LOG_KEEP_FILES,
             max_total_size_bytes: 0,
             max_single_file_size_bytes: 0,
             compress_old_files: false,
