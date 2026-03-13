@@ -65,8 +65,11 @@ impl RollingAppender {
     /// rather than on the first write.
     ///
     /// # Errors
-    /// Returns an [`io::Error`] if the directory cannot be created, the file
-    /// cannot be opened/created, or the path contains invalid characters.
+    /// Returns an [`io::Error`] if:
+    /// - `filename` is not a plain file name (absolute path, path separators,
+    ///   or `..` components are rejected to prevent path traversal).
+    /// - The directory cannot be created.
+    /// - The active log file cannot be opened/created.
     pub fn new(
         dir: impl AsRef<Path>,
         filename: String,
@@ -74,6 +77,20 @@ impl RollingAppender {
         max_size_bytes: u64,
         match_mode: FileMatchMode,
     ) -> io::Result<Self> {
+        // Validate that `filename` is a plain file name: not absolute and no
+        // directory components (separators or `..`).  If `file_name()` equals
+        // the entire path, there can be no parent-directory traversal.
+        {
+            let p = Path::new(&filename);
+            let is_plain_name = !p.is_absolute() && p.file_name().map(|n| n == p.as_os_str()).unwrap_or(false);
+            if !is_plain_name {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("log filename must be a plain file name with no path components, got: {filename:?}"),
+                ));
+            }
+        }
+
         let mut appender = Self {
             dir: dir.as_ref().to_path_buf(),
             filename,
@@ -170,40 +187,18 @@ impl RollingAppender {
             }
         };
 
-        // 3. Rename with collision fallback.
-        // On POSIX, `fs::rename` is atomic but silently overwrites the
-        // destination, so we pre-check for existence instead of relying on
-        // `ErrorKind::AlreadyExists` (which is only reliable on Windows).
-        let mut attempt: u32 = 0;
-        loop {
-            let archive_name = if attempt == 0 {
-                base_archive_name.clone()
-            } else {
-                format!("{}.{}", base_archive_name, attempt)
-            };
-            let archive_path = self.dir.join(&archive_name);
-
-            if !archive_path.exists() {
-                match fs::rename(&active_path, &archive_path) {
-                    Ok(_) => break,
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                        // Race on Windows; bump counter and retry.
-                        attempt = attempt.saturating_add(1);
-                    }
-                    Err(e) => {
-                        eprintln!("RollingAppender: Failed to rename log file during rotation: {}", e);
-                        return Err(e);
-                    }
-                }
-            } else {
-                attempt = attempt.saturating_add(1);
-            }
-
-            if attempt > 100 {
-                // Exhausted retries; log a warning and give up for this cycle.
-                eprintln!("RollingAppender: Could not find a unique archive name after 100 attempts; skipping rotation.");
-                return Ok(());
-            }
+        // 3. Rename the active file to the archive path.
+        //
+        // On POSIX `fs::rename` is atomic but will silently overwrite any
+        // existing destination.  An `exists()` pre-check would appear to help
+        // but is inherently racy (TOCTOU), so we instead rely on the
+        // nanosecond timestamp in the archive name to make collisions
+        // exceedingly unlikely in practice.  The active file is only rotated
+        // once per write cycle, so two rotations in the same nanosecond would
+        // require sub-nanosecond log bursts which are not realistic.
+        let archive_path = self.dir.join(&base_archive_name);
+        if let Err(e) = fs::rename(&active_path, &archive_path) {
+            return Err(e);
         }
 
         // 4. Reset state
@@ -285,6 +280,39 @@ mod tests {
         // Null byte is invalid on both Unix and Windows.
         let result = RollingAppender::new(tmp.path(), "invalid\0name.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix);
         assert!(result.is_err(), "null byte in filename must produce an error");
+    }
+
+    #[test]
+    fn test_new_rejects_path_with_separators() {
+        let tmp = TempDir::new().unwrap();
+        // A filename containing path separators could escape the log directory.
+        let result = RollingAppender::new(tmp.path(), "subdir/app.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix);
+        assert!(result.is_err(), "filename with path separator must be rejected");
+    }
+
+    #[test]
+    fn test_new_rejects_parent_directory_traversal() {
+        let tmp = TempDir::new().unwrap();
+        // "../secret.log" would write outside the log directory.
+        let result = RollingAppender::new(tmp.path(), "../secret.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix);
+        assert!(result.is_err(), "parent-directory traversal in filename must be rejected");
+    }
+
+    #[test]
+    fn test_new_rejects_absolute_path_as_filename() {
+        let tmp = TempDir::new().unwrap();
+        let result = RollingAppender::new(tmp.path(), "/etc/app.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix);
+        assert!(result.is_err(), "absolute path as filename must be rejected");
+    }
+
+    /// On Windows, backslash is a path separator and must be rejected.
+    #[cfg(windows)]
+    #[test]
+    fn test_new_rejects_backslash_path_separator_on_windows() {
+        let tmp = TempDir::new().unwrap();
+        let result =
+            RollingAppender::new(tmp.path(), "subdir\\app.log".to_string(), Rotation::Daily, 0, FileMatchMode::Suffix);
+        assert!(result.is_err(), "backslash path separator in filename must be rejected on Windows");
     }
 
     // ── Basic writes ──────────────────────────────────────────────────────────

@@ -199,8 +199,8 @@ fn init_file_logging_internal(
         .log_max_single_file_size_bytes
         .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
 
-    let file_appender = RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)
-        .map_err(|e| TelemetryError::Io(e.to_string()))?;
+    let file_appender =
+        RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -431,10 +431,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let result = init_file_logging_internal(&config, temp_path, "info", true);
-            // The function should not panic, but it also won't return an error at this stage
-            // because the file is opened lazily. The original `is_err()` assertion is incorrect
-            // for the current lazy-open implementation.
-            assert!(result.is_ok());
+            // With eager file opening, an invalid filename (null byte) causes the OS to reject
+            // the open() call, so the function returns Err instead of panicking.
+            assert!(result.is_err(), "invalid filename must return Err, not panic");
         });
     }
 }
