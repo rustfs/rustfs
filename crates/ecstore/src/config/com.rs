@@ -281,7 +281,7 @@ fn configs_semantically_equal(lhs: &Config, rhs: &Config) -> bool {
 }
 
 fn is_object_not_found(err: &Error) -> bool {
-    *err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _))
+    *err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _) | Error::BucketNotFound(_))
 }
 
 pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {

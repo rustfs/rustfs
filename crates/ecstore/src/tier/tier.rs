@@ -1212,7 +1212,7 @@ pub async fn try_migrate_tiering_config<S: StorageAPI>(api: Arc<S>) {
 }
 
 pub fn is_err_config_not_found(err: &StorageError) -> bool {
-    matches!(err, StorageError::ObjectNotFound(_, _)) || err == &StorageError::ConfigNotFound
+    matches!(err, StorageError::ObjectNotFound(_, _) | StorageError::BucketNotFound(_)) || err == &StorageError::ConfigNotFound
 }
 
 #[cfg(test)]
