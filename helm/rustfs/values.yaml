@@ -72,6 +72,13 @@ config:
       # size: 100 # Default value: 100 MB
       # time: hour # Default value: hour, eg: day,hour,minute,second
       # keep_files: 30 # number of rotated log files to keep
+    scanner:
+      # Scanner speed preset: fastest|fast|default|slow|slowest
+      speed: ""
+      # Override start delay in seconds (optional)
+      start_delay_secs: ""
+      # Enable/disable scanner sleeps for throttling
+      idle_mode: ""
     metrics:
       enabled: false
       endpoint: "" # If specified, rustfs will export metrics to this OTLP endpoint. e.g. "http://localhost:4318/v1/metrics"
