@@ -15,7 +15,8 @@
 $ErrorActionPreference = "Stop"
 
 # Check if ./rustfs/static/index.html exists
-if (-not (Test-Path "./rustfs/static/index.html")) {
+if (-not (Test-Path "./rustfs/static/index.html"))
+{
     Write-Host "Downloading rustfs-console-latest.zip"
     # Download rustfs-console-latest.zip
     Invoke-WebRequest -Uri "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -OutFile "tempfile.zip"
@@ -27,7 +28,8 @@ if (-not (Test-Path "./rustfs/static/index.html")) {
     Remove-Item "tempfile.zip"
 }
 
-if (-not $env:SKIP_BUILD) {
+if (-not $env:SKIP_BUILD)
+{
     cargo build -p rustfs --bins
 }
 
@@ -39,7 +41,8 @@ Write-Host "Current directory: $current_dir"
     New-Item -ItemType Directory -Force -Path "./target/volume/test$_" | Out-Null
 }
 
-if (-not $env:RUST_LOG) {
+if (-not $env:RUST_LOG)
+{
     $env:RUST_BACKTRACE = "1"
     $env:RUST_LOG = "rustfs=debug,ecstore=info,s3s=debug,iam=info,notify=info"
 }
@@ -76,9 +79,6 @@ $env:RUSTFS_OBS_LOG_STDOUT_ENABLED = "false" # Whether to enable local stdout lo
 $env:RUSTFS_OBS_LOG_DIRECTORY = "$current_dir/deploy/logs" # Log directory
 $env:RUSTFS_OBS_LOG_ROTATION_TIME = "hour" # Log rotation time unit
 $env:RUSTFS_OBS_LOG_ROTATION_SIZE_MB = "100" # Log rotation size in MB
-$env:RUSTFS_OBS_LOG_POOL_CAPA = "10240" # Log pool capacity
-$env:RUSTFS_OBS_LOG_MESSAGE_CAPA = "32768" # Log message capacity
-$env:RUSTFS_OBS_LOG_FLUSH_MS = "300" # Log flush interval in milliseconds
 
 # tokio runtime
 $env:RUSTFS_RUNTIME_WORKER_THREADS = "16"
@@ -180,12 +180,14 @@ $env:RUSTFS_FTPS_ENABLE = "false"
 # Reduce timeout for low-latency local storage
 $env:RUSTFS_LOCK_ACQUIRE_TIMEOUT = "30"
 
-if ($args.Count -gt 0) {
+if ($args.Count -gt 0)
+{
     $env:RUSTFS_VOLUMES = $args[0]
 }
 
 # Enable jemalloc for memory profiling
-if (-not $env:MALLOC_CONF) {
+if (-not $env:MALLOC_CONF)
+{
     $env:MALLOC_CONF = "prof:true,prof_active:true,lg_prof_sample:16,log:true,narenas:2,lg_chunk:21,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
 }
 
