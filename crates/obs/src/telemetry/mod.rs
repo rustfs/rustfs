@@ -76,7 +76,7 @@ use rustfs_utils::get_env_opt_str;
 /// application.  Dropping it triggers ordered shutdown of all providers.
 ///
 /// # Errors
-/// Returns [`TelemetryError`] when a backend fails to initialise (e.g., cannot
+/// Returns [`TelemetryError`] when a backend fails to initialize (e.g., cannot
 /// create the log directory, or an OTLP exporter cannot connect).
 pub(crate) fn init_telemetry(config: &OtelConfig) -> Result<OtelGuard, TelemetryError> {
     let environment = config.environment.as_deref().unwrap_or(ENVIRONMENT);

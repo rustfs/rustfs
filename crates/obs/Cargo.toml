@@ -48,7 +48,6 @@ opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 serde = { workspace = true }
-smallvec = { workspace = true, features = ["serde"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
 tracing-appender = { workspace = true }
 tracing-error = { workspace = true }
@@ -65,3 +64,4 @@ pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
+temp-env = { workspace = true }
