@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Protocol tests for FTPS
+//! Protocol tests for FTPS and WebDAV
 
 pub mod ftps_core;
 pub mod test_env;
 pub mod test_runner;
+pub mod webdav_core;
