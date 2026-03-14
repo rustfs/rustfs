@@ -287,6 +287,9 @@ unftp-core = "0.1.0"
 suppaftp = { version = "8.0.2", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.7"
 
+# WebDAV
+dav-server = "0.11.0"
+
 # Performance Analysis and Memory Profiling
 mimalloc = "0.1"
 # Use tikv-jemallocator as memory allocator and enable performance analysis

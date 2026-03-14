@@ -182,6 +182,35 @@ pub fn is_operation_supported(protocol: super::session::Protocol, action: &S3Act
             S3Action::GetObjectAcl => false,
             S3Action::PutObjectAcl => false,
         },
+        super::session::Protocol::WebDav => match action {
+            // Bucket operations
+            S3Action::CreateBucket => true, // MKCOL at root level
+            S3Action::DeleteBucket => true, // DELETE at root level
+            S3Action::ListBucket => true,   // PROPFIND
+            S3Action::ListBuckets => true,  // PROPFIND at root
+            S3Action::HeadBucket => true,   // PROPFIND/HEAD
+
+            // Object operations
+            S3Action::GetObject => true,    // GET
+            S3Action::PutObject => true,    // PUT
+            S3Action::DeleteObject => true, // DELETE
+            S3Action::HeadObject => true,   // HEAD/PROPFIND
+            S3Action::CopyObject => false,  // COPY (not implemented yet)
+
+            // Multipart operations (not supported in WebDAV)
+            S3Action::CreateMultipartUpload => false,
+            S3Action::UploadPart => false,
+            S3Action::CompleteMultipartUpload => false,
+            S3Action::AbortMultipartUpload => false,
+            S3Action::ListMultipartUploads => false,
+            S3Action::ListParts => false,
+
+            // ACL operations (not supported in WebDAV)
+            S3Action::GetBucketAcl => false,
+            S3Action::PutBucketAcl => false,
+            S3Action::GetObjectAcl => false,
+            S3Action::PutObjectAcl => false,
+        },
     }
 }
 
