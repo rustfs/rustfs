@@ -41,6 +41,13 @@ fn is_verbose_level(level: &str) -> bool {
     s.contains("trace") || s.contains("debug")
 }
 
+fn is_level_token(level: &str) -> bool {
+    matches!(
+        level.trim().to_ascii_lowercase().as_str(),
+        "trace" | "debug" | "info" | "warn" | "error" | "off"
+    )
+}
+
 fn rust_log_requests_verbose(rust_log: &str) -> bool {
     rust_log.split(',').any(|directive| {
         let directive = directive.trim();
@@ -48,14 +55,16 @@ fn rust_log_requests_verbose(rust_log: &str) -> bool {
             return false;
         }
 
-        // If the directive is just a level (e.g. "debug"), check it.
-        // If it's a module=level (e.g. "my_crate=debug"), we split by '='.
-        // Note: rsplit keeps the last part as the first element of iterator if we take next().
-        if let Some(level_part) = directive.rsplit('=').next() {
-            is_verbose_level(level_part)
-        } else {
-            false
+        // Resolve by suffix token after the last '=', then classify:
+        // - known level token => evaluate verbosity from that level
+        // - otherwise => treat as target-only directive (verbose in EnvFilter)
+        if let Some(level_candidate) = directive.rsplit('=').next().map(str::trim)
+            && is_level_token(level_candidate)
+        {
+            return is_verbose_level(level_candidate);
         }
+
+        true
     })
 }
 
@@ -153,7 +162,10 @@ mod tests {
     fn test_rust_log_requests_verbose() {
         assert!(rust_log_requests_verbose("debug"));
         assert!(rust_log_requests_verbose("rustfs=debug"));
+        assert!(rust_log_requests_verbose("hyper"));
+        assert!(rust_log_requests_verbose("rustfs[{request_id=abc=def}]"));
         assert!(rust_log_requests_verbose("info,rustfs=trace"));
+        assert!(!rust_log_requests_verbose("rustfs= info"));
         assert!(!rust_log_requests_verbose("info"));
         assert!(!rust_log_requests_verbose("rustfs=info"));
     }
@@ -228,6 +240,21 @@ mod tests {
                 filter_str.contains("warn"),
                 "expected EnvFilter to reflect RUST_LOG=warn; got `{}`",
                 filter_str
+            );
+        });
+    }
+
+    #[test]
+    fn test_build_env_filter_target_only_rust_log_keeps_target_verbose() {
+        // `RUST_LOG=hyper` is a target-only directive and should not be treated
+        // as a non-verbose global level.
+        temp_env::with_var("RUST_LOG", Some("hyper"), || {
+            let filter = build_env_filter("info", None);
+            let filter_str = filter.to_string();
+
+            assert!(
+                !filter_str.contains("hyper=off"),
+                "target-only verbose directive must not be overridden by suppression: {filter_str}"
             );
         });
     }
