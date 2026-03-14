@@ -21,7 +21,7 @@ mod error;
 mod init;
 mod license;
 mod profiling;
-#[cfg(feature = "ftps")]
+#[cfg(any(feature = "ftps", feature = "webdav"))]
 mod protocols;
 mod server;
 mod storage;
@@ -36,6 +36,9 @@ use crate::init::{
 
 #[cfg(feature = "ftps")]
 use crate::init::{init_ftp_system, init_ftps_system};
+
+#[cfg(feature = "webdav")]
+use crate::init::init_webdav_system;
 
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
@@ -348,6 +351,26 @@ async fn run(config: config::Config) -> Result<()> {
     #[cfg(not(feature = "ftps"))]
     let ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
 
+    // Initialize WebDAV system if enabled
+    #[cfg(feature = "webdav")]
+    let webdav_shutdown_tx = match init_webdav_system().await {
+        Ok(Some(tx)) => {
+            info!("WebDAV system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("WebDAV system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize WebDAV system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "webdav"))]
+    let webdav_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+
     // Initialize buffer profiling system
     init_buffer_profile_system(&config);
 
@@ -471,6 +494,7 @@ async fn run(config: config::Config) -> Result<()> {
                 console_shutdown_tx,
                 ftp_shutdown_tx,
                 ftps_shutdown_tx,
+                webdav_shutdown_tx,
                 ctx.clone(),
             )
             .await;
@@ -483,6 +507,7 @@ async fn run(config: config::Config) -> Result<()> {
                 console_shutdown_tx,
                 ftp_shutdown_tx,
                 ftps_shutdown_tx,
+                webdav_shutdown_tx,
                 ctx.clone(),
             )
             .await;
@@ -500,6 +525,7 @@ async fn handle_shutdown(
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    webdav_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -550,6 +576,15 @@ async fn handle_shutdown(
             "Shutting down FTPS server..."
         );
         let _ = ftps_shutdown_tx.send(());
+    }
+
+    // Shutdown WebDAV server
+    if let Some(webdav_shutdown_tx) = webdav_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down WebDAV server..."
+        );
+        let _ = webdav_shutdown_tx.send(());
     }
 
     // Stop the notification system
